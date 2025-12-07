@@ -145,7 +145,10 @@ impl RadixExecutor {
             // Execute
             let user_tx = tx.transaction();
             let receipt = context.execute_user_transaction(user_tx)?;
-            let result = self.receipt_to_result(tx.hash(), &receipt);
+            // Use cross-shard result which filters writes to declared_writes
+            // so all shards compute the same merkle root
+            let result =
+                self.receipt_to_cross_shard_result(tx.hash(), &receipt, &tx.declared_writes);
 
             // Commit local shard writes if successful
             if result.success {
@@ -200,6 +203,36 @@ impl RadixExecutor {
             let state_writes = extract_substate_writes(receipt);
             let merkle_root = compute_merkle_root(&state_writes);
             SingleTxResult::success(tx_hash, merkle_root, state_writes)
+        } else {
+            let error = format!("{:?}", receipt.result);
+            SingleTxResult::failure(tx_hash, error)
+        }
+    }
+
+    /// Convert a receipt to a result for cross-shard transactions.
+    ///
+    /// For cross-shard transactions, each shard only sees its local writes,
+    /// but the merkle root must be computed over the DECLARED writes so all
+    /// shards agree on the same root. We filter the actual writes to only
+    /// include those in declared_writes.
+    fn receipt_to_cross_shard_result(
+        &self,
+        tx_hash: Hash,
+        receipt: &TransactionReceipt,
+        declared_writes: &[NodeId],
+    ) -> SingleTxResult {
+        let success = is_commit_success(receipt);
+
+        if success {
+            let all_writes = extract_substate_writes(receipt);
+            // Filter writes to only include nodes in declared_writes
+            let declared_set: std::collections::HashSet<_> = declared_writes.iter().collect();
+            let filtered_writes: Vec<_> = all_writes
+                .into_iter()
+                .filter(|w| declared_set.contains(&w.node_id))
+                .collect();
+            let merkle_root = compute_merkle_root(&filtered_writes);
+            SingleTxResult::success(tx_hash, merkle_root, filtered_writes)
         } else {
             let error = format!("{:?}", receipt.result);
             SingleTxResult::failure(tx_hash, error)
