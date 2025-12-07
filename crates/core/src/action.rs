@@ -59,6 +59,9 @@ pub enum Action {
         vote: BlockVote,
         /// Public key of the voter (pre-resolved by state machine).
         public_key: PublicKey,
+        /// The signing message (domain_tag || shard_group || height || round || block_hash).
+        /// Pre-computed by state machine since it has the shard_group context.
+        signing_message: Vec<u8>,
     },
 
     /// Verify a state provision's signature (cross-shard Phase 2).
@@ -110,6 +113,9 @@ pub enum Action {
         /// The block hash this QC verification is associated with (for correlation).
         /// This is the hash of the block whose header contains this QC as parent_qc.
         block_hash: Hash,
+        /// The signing message (domain_tag || shard_group || height || round || qc.block_hash).
+        /// Pre-computed by state machine since it has the shard_group context.
+        signing_message: Vec<u8>,
     },
 
     /// Verify a view change vote's signature.
@@ -141,6 +147,9 @@ pub enum Action {
         vote: ViewChangeVote,
         /// Public keys of the QC signers (pre-resolved from highest_qc.signers bitfield).
         public_keys: Vec<PublicKey>,
+        /// The signing message for the QC (domain_tag || shard_group || height || round || block_hash).
+        /// Pre-computed by state machine since it has the shard_group context.
+        signing_message: Vec<u8>,
     },
 
     /// Execute a batch of single-shard transactions.

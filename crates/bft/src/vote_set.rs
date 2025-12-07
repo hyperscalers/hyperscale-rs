@@ -208,7 +208,13 @@ impl VoteSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::BftState;
     use hyperscale_types::{KeyPair, QuorumCertificate, ValidatorId};
+
+    /// Test shard group hash (matches what BftState would create for shard 0).
+    fn test_shard_group() -> Hash {
+        Hash::from_bytes(&0u64.to_le_bytes())
+    }
 
     fn make_header(height: u64) -> BlockHeader {
         BlockHeader {
@@ -223,11 +229,16 @@ mod tests {
     }
 
     fn make_vote(keys: &[KeyPair], voter_index: usize, block_hash: Hash, height: u64) -> BlockVote {
-        let signature = keys[voter_index].sign(block_hash.as_bytes());
+        // Use domain-separated signing message (matches BftState::block_vote_message)
+        let shard_group = test_shard_group();
+        let round = 0u64;
+        let signing_message =
+            BftState::block_vote_message(&shard_group, height, round, &block_hash);
+        let signature = keys[voter_index].sign(&signing_message);
         BlockVote {
             block_hash,
             height: BlockHeight(height),
-            round: 0,
+            round,
             voter: ValidatorId(voter_index as u64),
             signature,
             timestamp: 1000000000000,

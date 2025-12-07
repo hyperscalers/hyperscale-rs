@@ -472,11 +472,15 @@ impl ProductionRunner {
             }
 
             // Crypto verification on dedicated crypto thread pool
-            Action::VerifyVoteSignature { vote, public_key } => {
+            Action::VerifyVoteSignature {
+                vote,
+                public_key,
+                signing_message,
+            } => {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
-                    // Verify single vote signature
-                    let valid = public_key.verify(vote.block_hash.as_bytes(), &vote.signature);
+                    // Verify vote signature against domain-separated message
+                    let valid = public_key.verify(&signing_message, &vote.signature);
                     let _ = event_tx.blocking_send(Event::VoteSignatureVerified { vote, valid });
                 });
             }
@@ -567,6 +571,7 @@ impl ProductionRunner {
                 qc,
                 public_keys,
                 block_hash,
+                signing_message,
             } => {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
@@ -582,10 +587,11 @@ impl ProductionRunner {
                         // No signers - invalid QC (genesis is handled before action is emitted)
                         false
                     } else {
-                        // Verify aggregated BLS signature against the QC's block_hash
+                        // Verify aggregated BLS signature against domain-separated message
                         match hyperscale_types::PublicKey::aggregate_bls(&signer_keys) {
-                            Ok(aggregated_pk) => aggregated_pk
-                                .verify(qc.block_hash.as_bytes(), &qc.aggregated_signature),
+                            Ok(aggregated_pk) => {
+                                aggregated_pk.verify(&signing_message, &qc.aggregated_signature)
+                            }
                             Err(_) => false,
                         }
                     };
@@ -608,7 +614,11 @@ impl ProductionRunner {
                 });
             }
 
-            Action::VerifyViewChangeHighestQc { vote, public_keys } => {
+            Action::VerifyViewChangeHighestQc {
+                vote,
+                public_keys,
+                signing_message,
+            } => {
                 let event_tx = self.event_tx.clone();
                 self.thread_pools.spawn_crypto(move || {
                     // Get signer keys based on the highest_qc's signer bitfield
@@ -622,11 +632,10 @@ impl ProductionRunner {
                     let valid = if signer_keys.is_empty() {
                         false
                     } else {
+                        // Verify against domain-separated signing message
                         match hyperscale_types::PublicKey::aggregate_bls(&signer_keys) {
-                            Ok(aggregated_pk) => aggregated_pk.verify(
-                                vote.highest_qc.block_hash.as_bytes(),
-                                &vote.highest_qc.aggregated_signature,
-                            ),
+                            Ok(aggregated_pk) => aggregated_pk
+                                .verify(&signing_message, &vote.highest_qc.aggregated_signature),
                             Err(_) => false,
                         }
                     };

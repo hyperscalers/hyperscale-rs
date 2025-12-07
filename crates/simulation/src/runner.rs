@@ -551,9 +551,13 @@ impl SimulationRunner {
             }
 
             // Delegated work executes instantly in simulation
-            Action::VerifyVoteSignature { vote, public_key } => {
-                // In simulation, actually verify the signature (instant, deterministic)
-                let valid = public_key.verify(vote.block_hash.as_bytes(), &vote.signature);
+            Action::VerifyVoteSignature {
+                vote,
+                public_key,
+                signing_message,
+            } => {
+                // In simulation, verify signature against domain-separated message (instant, deterministic)
+                let valid = public_key.verify(&signing_message, &vote.signature);
                 self.schedule_event(from, self.now, Event::VoteSignatureVerified { vote, valid });
             }
 
@@ -649,9 +653,10 @@ impl SimulationRunner {
                 qc,
                 public_keys,
                 block_hash,
+                signing_message,
             } => {
                 // Verify aggregated BLS signature on QC
-                // The QC's aggregated_signature is over the QC's block_hash
+                // The QC's aggregated_signature is over the domain-separated signing message
 
                 // Get the public keys of actual signers based on the QC's signer bitfield
                 let signer_keys: Vec<_> = public_keys
@@ -661,7 +666,7 @@ impl SimulationRunner {
                     .map(|(_, pk)| pk.clone())
                     .collect();
 
-                // Verify aggregated signature
+                // Verify aggregated signature against domain-separated message
                 let valid = if signer_keys.is_empty() {
                     // No signers - invalid QC (genesis QC is handled before action is emitted)
                     false
@@ -669,7 +674,7 @@ impl SimulationRunner {
                     // Aggregate the public keys and verify
                     match hyperscale_types::PublicKey::aggregate_bls(&signer_keys) {
                         Ok(aggregated_pk) => {
-                            aggregated_pk.verify(qc.block_hash.as_bytes(), &qc.aggregated_signature)
+                            aggregated_pk.verify(&signing_message, &qc.aggregated_signature)
                         }
                         Err(_) => false,
                     }
@@ -696,7 +701,11 @@ impl SimulationRunner {
                 );
             }
 
-            Action::VerifyViewChangeHighestQc { vote, public_keys } => {
+            Action::VerifyViewChangeHighestQc {
+                vote,
+                public_keys,
+                signing_message,
+            } => {
                 // Verify aggregated BLS signature on the highest_qc
                 let signer_keys: Vec<_> = public_keys
                     .iter()
@@ -705,14 +714,13 @@ impl SimulationRunner {
                     .map(|(_, pk)| pk.clone())
                     .collect();
 
+                // Verify against domain-separated signing message
                 let valid = if signer_keys.is_empty() {
                     false
                 } else {
                     match hyperscale_types::PublicKey::aggregate_bls(&signer_keys) {
-                        Ok(aggregated_pk) => aggregated_pk.verify(
-                            vote.highest_qc.block_hash.as_bytes(),
-                            &vote.highest_qc.aggregated_signature,
-                        ),
+                        Ok(aggregated_pk) => aggregated_pk
+                            .verify(&signing_message, &vote.highest_qc.aggregated_signature),
                         Err(_) => false,
                     }
                 };

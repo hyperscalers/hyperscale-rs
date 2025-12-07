@@ -83,6 +83,10 @@ pub struct BftState {
     /// Network topology (single source of truth for committee/shard info).
     topology: Arc<dyn Topology>,
 
+    /// Shard group identifier for vote signature domain separation.
+    /// Prevents cross-shard replay attacks when validators participate in multiple shards.
+    shard_group: Hash,
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Chain State
     // ═══════════════════════════════════════════════════════════════════════════
@@ -190,9 +194,13 @@ impl BftState {
         topology: Arc<dyn Topology>,
         config: BftConfig,
     ) -> Self {
+        // Create shard group hash for vote signature domain separation
+        let shard_group = Hash::from_bytes(&topology.local_shard().0.to_le_bytes());
+
         Self {
             node_index,
             signing_key,
+            shard_group,
             topology,
             view: 0,
             committed_height: 0,
@@ -265,6 +273,40 @@ impl BftState {
     /// Get committee index for a validator.
     fn committee_index(&self, validator_id: ValidatorId) -> Option<usize> {
         self.topology.local_committee_index(validator_id)
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Signature Message Construction
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Create the message bytes to sign for a block vote.
+    ///
+    /// Includes domain separation to prevent cross-shard replay attacks:
+    /// - Domain tag ("block_vote:")
+    /// - Shard group identifier
+    /// - Block height
+    /// - Round number
+    /// - Block hash
+    ///
+    /// This is a public method so the runner can use it for verification.
+    pub fn block_vote_message(
+        shard_group: &Hash,
+        height: u64,
+        round: u64,
+        block_hash: &Hash,
+    ) -> Vec<u8> {
+        let mut message = Vec::with_capacity(80);
+        message.extend_from_slice(b"block_vote:");
+        message.extend_from_slice(shard_group.as_bytes());
+        message.extend_from_slice(&height.to_le_bytes());
+        message.extend_from_slice(&round.to_le_bytes());
+        message.extend_from_slice(block_hash.as_bytes());
+        message
+    }
+
+    /// Get the shard group hash (needed for signing message construction).
+    pub fn shard_group(&self) -> &Hash {
+        &self.shard_group
     }
 
     /// Initialize with genesis block (for fresh start).
@@ -792,11 +834,20 @@ impl BftState {
                     },
                 );
 
+                // Construct signing message with domain separation
+                let signing_message = Self::block_vote_message(
+                    &self.shard_group,
+                    header.parent_qc.height.0,
+                    header.parent_qc.round,
+                    &header.parent_qc.block_hash,
+                );
+
                 // Delegate verification to runner
                 actions.push(Action::VerifyQcSignature {
                     qc: header.parent_qc.clone(),
                     public_keys,
                     block_hash,
+                    signing_message,
                 });
 
                 return actions;
@@ -1096,8 +1147,10 @@ impl BftState {
         // we can never vote for a different block at that height
         self.voted_heights.insert(height, (block_hash, round));
 
-        // Create signature
-        let signature = self.signing_key.sign(block_hash.as_bytes());
+        // Create signature with domain separation (prevents cross-shard replay)
+        let signing_message =
+            Self::block_vote_message(&self.shard_group, height, round, &block_hash);
+        let signature = self.signing_key.sign(&signing_message);
         let timestamp = self.now.as_millis() as u64;
 
         let vote = BlockVote {
@@ -1204,8 +1257,20 @@ impl BftState {
             },
         );
 
+        // Construct signing message with domain separation
+        let signing_message = Self::block_vote_message(
+            &self.shard_group,
+            vote.height.0,
+            vote.round,
+            &vote.block_hash,
+        );
+
         // Delegate signature verification to runner
-        vec![Action::VerifyVoteSignature { vote, public_key }]
+        vec![Action::VerifyVoteSignature {
+            vote,
+            public_key,
+            signing_message,
+        }]
     }
 
     /// Handle vote signature verification result.
@@ -1661,11 +1726,16 @@ impl BftState {
             },
         );
 
+        // Construct signing message with domain separation
+        let signing_message =
+            Self::block_vote_message(&self.shard_group, qc.height.0, qc.round, &qc.block_hash);
+
         // Delegate verification to runner
         vec![Action::VerifyQcSignature {
             qc,
             public_keys,
             block_hash,
+            signing_message,
         }]
     }
 

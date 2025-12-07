@@ -21,6 +21,8 @@ use tracing::{debug, info, warn};
 use hyperscale_core::{Action, Event, OutboundMessage, TimerId};
 use hyperscale_messages::{ViewChangeVote, ViewChangeVoteGossip};
 
+use crate::state::BftState;
+
 /// Marker for view change vote pending signature verification.
 /// The vote itself is returned in the verification callback event.
 #[derive(Debug, Clone, Copy)]
@@ -442,10 +444,19 @@ impl ViewChangeState {
         self.pending_qc_verifications
             .insert(vote_key, PendingHighestQcVerification);
 
+        // Construct signing message for the highest_qc with domain separation
+        let signing_message = BftState::block_vote_message(
+            &self.shard_group,
+            vote.highest_qc.height.0,
+            vote.highest_qc.round,
+            &vote.highest_qc.block_hash,
+        );
+
         // Delegate QC signature verification to runner
         vec![Action::VerifyViewChangeHighestQc {
             vote,
             public_keys: signer_keys,
+            signing_message,
         }]
     }
 
