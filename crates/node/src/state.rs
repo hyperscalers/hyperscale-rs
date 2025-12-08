@@ -99,7 +99,7 @@ impl NodeStateMachine {
                 bft_config.view_change_timeout,
             ),
             execution: ExecutionState::new(topology.clone(), signing_key),
-            mempool: MempoolState::new(),
+            mempool: MempoolState::new(topology.clone()),
             livelock: LivelockState::new(local_shard, topology),
             sync: SyncState::new(SyncConfig::default(), total_validators),
             now: Duration::ZERO,

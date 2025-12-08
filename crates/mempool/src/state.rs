@@ -4,10 +4,11 @@ use hyperscale_core::{
     Action, Event, OutboundMessage, RequestId, SubStateMachine, TransactionStatus,
 };
 use hyperscale_types::{
-    AbortReason, Block, BlockHeight, DeferReason, Hash, NodeId, RoutableTransaction,
+    AbortReason, Block, BlockHeight, DeferReason, Hash, NodeId, RoutableTransaction, Topology,
     TransactionAbort, TransactionDecision,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
 
@@ -48,7 +49,6 @@ struct PoolEntry {
 ///
 /// Handles transaction lifecycle from submission to completion.
 /// Uses `HashMap` instead of `DashMap` since access is serialized.
-#[derive(Debug)]
 pub struct MempoolState {
     /// Transaction pool (HashMap, not DashMap - no concurrent access).
     pool: HashMap<Hash, PoolEntry>,
@@ -62,15 +62,19 @@ pub struct MempoolState {
 
     /// Current time.
     now: Duration,
+
+    /// Network topology for shard-aware transaction routing.
+    topology: Arc<dyn Topology>,
 }
 
 impl MempoolState {
     /// Create a new mempool state machine.
-    pub fn new() -> Self {
+    pub fn new(topology: Arc<dyn Topology>) -> Self {
         Self {
             pool: HashMap::new(),
             blocked_by: HashMap::new(),
             now: Duration::ZERO,
+            topology,
         }
     }
 
@@ -103,23 +107,19 @@ impl MempoolState {
         );
         tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
 
-        // Return actions: accept the transaction, broadcast to peers, and notify client
-        let actions = vec![
-            Action::EnqueueInternal {
-                event: Event::TransactionAccepted { tx_hash: hash },
-            },
-            // Broadcast to all validators globally so cross-shard TXs reach all shards
-            Action::BroadcastGlobal {
-                message: OutboundMessage::TransactionGossip(Box::new(
-                    hyperscale_messages::TransactionGossip::new(tx),
-                )),
-            },
-            Action::EmitTransactionStatus {
-                request_id,
-                tx_hash: hash,
-                status: TransactionStatus::Pending,
-            },
-        ];
+        // Return actions: accept the transaction, broadcast to relevant shards, and notify client
+        let mut actions = vec![Action::EnqueueInternal {
+            event: Event::TransactionAccepted { tx_hash: hash },
+        }];
+
+        // Broadcast to all shards involved in this transaction (consensus + provisioning)
+        actions.extend(self.broadcast_to_transaction_shards(&tx));
+
+        actions.push(Action::EmitTransactionStatus {
+            request_id,
+            tx_hash: hash,
+            status: TransactionStatus::Pending,
+        });
         actions
     }
 
@@ -146,6 +146,23 @@ impl MempoolState {
         vec![Action::EnqueueInternal {
             event: Event::TransactionAccepted { tx_hash: hash },
         }]
+    }
+
+    /// Broadcast a transaction to all shards involved in it.
+    ///
+    /// Uses topology to determine which shards need to receive the transaction
+    /// based on its declared reads and writes.
+    fn broadcast_to_transaction_shards(&self, tx: &RoutableTransaction) -> Vec<Action> {
+        let shards = self.topology.all_shards_for_transaction(tx);
+        let gossip = hyperscale_messages::TransactionGossip::new(tx.clone());
+
+        shards
+            .into_iter()
+            .map(|shard| Action::BroadcastToShard {
+                shard,
+                message: OutboundMessage::TransactionGossip(Box::new(gossip.clone())),
+            })
+            .collect()
     }
 
     /// Process a committed block - update statuses and trigger retries.
@@ -280,11 +297,8 @@ impl MempoolState {
                     },
                 );
 
-                // Gossip the retry to other nodes
-                let gossip = hyperscale_messages::TransactionGossip::new(retry_tx);
-                actions.push(Action::BroadcastGlobal {
-                    message: OutboundMessage::TransactionGossip(Box::new(gossip)),
-                });
+                // Gossip the retry to relevant shards
+                actions.extend(self.broadcast_to_transaction_shards(&retry_tx));
             }
         }
 
@@ -568,12 +582,6 @@ impl MempoolState {
     }
 }
 
-impl Default for MempoolState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SubStateMachine for MempoolState {
     fn try_handle(&mut self, event: &Event) -> Option<Vec<Action>> {
         match event {
@@ -607,10 +615,23 @@ mod tests {
     use super::*;
     use hyperscale_core::RequestId;
     use hyperscale_types::{
-        test_utils::test_transaction, Block, BlockHeader, DeferReason, QuorumCertificate,
-        TransactionCertificate, TransactionDefer, ValidatorId,
+        test_utils::test_transaction, Block, BlockHeader, DeferReason, KeyPair, QuorumCertificate,
+        StaticTopology, TransactionCertificate, TransactionDefer, ValidatorId, ValidatorInfo,
+        ValidatorSet,
     };
     use std::collections::BTreeMap;
+
+    fn make_test_topology() -> Arc<dyn Topology> {
+        let validators: Vec<_> = (0..4)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId(i),
+                public_key: KeyPair::generate_ed25519().public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set))
+    }
 
     fn make_test_block(
         height: u64,
@@ -646,7 +667,7 @@ mod tests {
 
     #[test]
     fn test_deferral_updates_status_to_blocked() {
-        let mut mempool = MempoolState::new();
+        let mut mempool = MempoolState::new(make_test_topology());
 
         // Create and add a transaction
         let tx = test_transaction(1);
@@ -694,7 +715,7 @@ mod tests {
 
     #[test]
     fn test_winner_certificate_triggers_retry() {
-        let mut mempool = MempoolState::new();
+        let mut mempool = MempoolState::new(make_test_topology());
 
         // Create loser TX and submit
         let loser_tx = test_transaction(1);
@@ -768,7 +789,7 @@ mod tests {
 
     #[test]
     fn test_timeout_detection() {
-        let mut mempool = MempoolState::new();
+        let mut mempool = MempoolState::new(make_test_topology());
 
         // Create and commit a TX
         let tx = test_transaction(1);
@@ -794,7 +815,7 @@ mod tests {
 
     #[test]
     fn test_too_many_retries_detection() {
-        let mut mempool = MempoolState::new();
+        let mut mempool = MempoolState::new(make_test_topology());
 
         // Create a TX that has already been retried multiple times
         let tx = test_transaction(1);
@@ -821,7 +842,7 @@ mod tests {
 
     #[test]
     fn test_abort_updates_status() {
-        let mut mempool = MempoolState::new();
+        let mut mempool = MempoolState::new(make_test_topology());
 
         // Create and commit a TX
         let tx = test_transaction(1);
