@@ -4,7 +4,7 @@ use crate::{message::OutboundMessage, Event, RequestId, TimerId};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Hash, NodeId, PublicKey, QuorumCertificate, RoutableTransaction,
     ShardGroupId, StateCertificate, StateProvision, StateVoteBlock, SubstateWrite,
-    TransactionCertificate, TransactionDecision, ViewChangeVote,
+    TransactionCertificate, TransactionDecision, ViewChangeCertificate, ViewChangeVote,
 };
 use std::time::Duration;
 
@@ -148,6 +148,23 @@ pub enum Action {
         /// Public keys of the QC signers (pre-resolved from highest_qc.signers bitfield).
         public_keys: Vec<PublicKey>,
         /// The signing message for the QC (domain_tag || shard_group || height || round || block_hash).
+        /// Pre-computed by state machine since it has the shard_group context.
+        signing_message: Vec<u8>,
+    },
+
+    /// Verify a ViewChangeCertificate's aggregated BLS signature.
+    ///
+    /// The certificate proves quorum was reached for a view change. Its aggregated
+    /// signature must be verified before applying the view change.
+    ///
+    /// Delegated to a thread pool in production, instant in simulation.
+    /// Returns `Event::ViewChangeCertificateSignatureVerified` when complete.
+    VerifyViewChangeCertificateSignature {
+        /// The certificate to verify.
+        certificate: ViewChangeCertificate,
+        /// Public keys of the signers (pre-resolved from certificate's signer bitfield).
+        public_keys: Vec<PublicKey>,
+        /// The signing message (view_change: || shard_group || height || new_round).
         /// Pre-computed by state machine since it has the shard_group context.
         signing_message: Vec<u8>,
     },
@@ -298,6 +315,7 @@ impl Action {
                 | Action::VerifyQcSignature { .. }
                 | Action::VerifyViewChangeVoteSignature { .. }
                 | Action::VerifyViewChangeHighestQc { .. }
+                | Action::VerifyViewChangeCertificateSignature { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
                 | Action::ComputeMerkleRoot { .. }

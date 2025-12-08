@@ -734,6 +734,30 @@ impl SimulationRunner {
                 );
             }
 
+            Action::VerifyViewChangeCertificateSignature {
+                certificate,
+                public_keys,
+                signing_message,
+            } => {
+                // Verify aggregated BLS signature on the view change certificate
+                // The public_keys are pre-filtered by the state machine based on the signer bitfield
+                let valid = if public_keys.is_empty() {
+                    false
+                } else {
+                    match hyperscale_types::PublicKey::aggregate_bls(&public_keys) {
+                        Ok(aggregated_pk) => aggregated_pk
+                            .verify(&signing_message, &certificate.aggregated_signature),
+                        Err(_) => false,
+                    }
+                };
+
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::ViewChangeCertificateSignatureVerified { certificate, valid },
+                );
+            }
+
             Action::ExecuteTransactions {
                 block_hash,
                 transactions,

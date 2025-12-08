@@ -663,6 +663,32 @@ impl ProductionRunner {
                 });
             }
 
+            Action::VerifyViewChangeCertificateSignature {
+                certificate,
+                public_keys,
+                signing_message,
+            } => {
+                let event_tx = self.event_tx.clone();
+                self.thread_pools.spawn_crypto(move || {
+                    // Verify aggregated BLS signature on the view change certificate
+                    // The public_keys are pre-filtered by the state machine based on the signer bitfield
+                    let valid = if public_keys.is_empty() {
+                        false
+                    } else {
+                        match hyperscale_types::PublicKey::aggregate_bls(&public_keys) {
+                            Ok(aggregated_pk) => aggregated_pk
+                                .verify(&signing_message, &certificate.aggregated_signature),
+                            Err(_) => false,
+                        }
+                    };
+
+                    let _ = event_tx.blocking_send(Event::ViewChangeCertificateSignatureVerified {
+                        certificate,
+                        valid,
+                    });
+                });
+            }
+
             // Transaction execution on dedicated execution thread pool
             Action::ExecuteTransactions {
                 block_hash,

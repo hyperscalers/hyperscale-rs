@@ -33,6 +33,11 @@ struct PendingVoteVerification;
 #[derive(Debug, Clone, Copy)]
 struct PendingHighestQcVerification;
 
+/// Marker for view change certificate pending signature verification.
+/// The certificate itself is returned in the verification callback event.
+#[derive(Debug, Clone, Copy)]
+struct PendingCertificateVerification;
+
 /// View change state for a deterministic BFT node.
 ///
 /// Unlike the async version that uses DashMap and AtomicU64, this version
@@ -79,6 +84,10 @@ pub struct ViewChangeState {
     /// Key: (height, new_round, voter)
     pending_qc_verifications: HashMap<(u64, u64, ValidatorId), PendingHighestQcVerification>,
 
+    /// Certificates pending signature verification.
+    /// Key: (height, new_round)
+    pending_cert_verifications: HashMap<(u64, u64), PendingCertificateVerification>,
+
     /// Current simulation time.
     now: Duration,
 }
@@ -105,6 +114,7 @@ impl ViewChangeState {
             highest_qc_collector: HashMap::new(),
             pending_vote_verifications: HashMap::new(),
             pending_qc_verifications: HashMap::new(),
+            pending_cert_verifications: HashMap::new(),
             now: Duration::ZERO,
         }
     }
@@ -708,7 +718,12 @@ impl ViewChangeState {
     }
 
     /// Handle a received view change certificate.
-    pub fn on_view_change_certificate(&mut self, cert: &ViewChangeCertificate) -> Vec<Action> {
+    ///
+    /// Performs initial validation and delegates signature verification to the runner.
+    /// Returns actions to verify the certificate signature.
+    pub fn on_view_change_certificate(&mut self, cert: ViewChangeCertificate) -> Vec<Action> {
+        let cert_key = (cert.height.0, cert.new_round());
+
         // Verify certificate is for current height
         if cert.height.0 != self.current_height {
             debug!(
@@ -729,6 +744,16 @@ impl ViewChangeState {
             return vec![];
         }
 
+        // Check if already pending verification
+        if self.pending_cert_verifications.contains_key(&cert_key) {
+            debug!(
+                height = cert.height.0,
+                new_round = cert.new_round(),
+                "Certificate already pending verification"
+            );
+            return vec![];
+        }
+
         // Verify quorum
         let total_power = self.total_voting_power();
         if !cert.has_quorum(total_power) {
@@ -739,15 +764,89 @@ impl ViewChangeState {
             return vec![];
         }
 
-        // Verify aggregated signature
-        if let Err(e) = self.verify_certificate_signature(cert) {
-            warn!(error = ?e, "View change certificate has invalid signature");
+        // Verify embedded highest_qc has quorum (structural check only)
+        if !cert.highest_qc.is_genesis() && !cert.highest_qc.has_quorum(total_power) {
+            warn!("View change certificate contains QC without quorum");
             return vec![];
         }
 
-        // Verify embedded highest_qc
-        if !cert.highest_qc.is_genesis() && !cert.highest_qc.has_quorum(total_power) {
-            warn!("View change certificate contains QC without quorum");
+        // Get signer public keys from the bitfield
+        let signer_keys: Vec<PublicKey> = cert
+            .signers
+            .set_indices()
+            .filter_map(|idx| {
+                self.topology
+                    .local_validator_at_index(idx)
+                    .and_then(|v| self.public_key(v))
+            })
+            .collect();
+
+        if signer_keys.is_empty() {
+            warn!("No signers in view change certificate");
+            return vec![];
+        }
+
+        if signer_keys.len() != cert.signers.count() {
+            warn!(
+                expected = cert.signers.count(),
+                found = signer_keys.len(),
+                "Could not find public keys for all certificate signers"
+            );
+            return vec![];
+        }
+
+        // Store pending verification marker
+        self.pending_cert_verifications
+            .insert(cert_key, PendingCertificateVerification);
+
+        // Construct the message that was signed
+        let signing_message =
+            Self::view_change_message(&self.shard_group, cert.height, cert.new_round());
+
+        // Delegate signature verification to runner
+        vec![Action::VerifyViewChangeCertificateSignature {
+            certificate: cert,
+            public_keys: signer_keys,
+            signing_message,
+        }]
+    }
+
+    /// Handle certificate signature verification result.
+    ///
+    /// If valid, applies the view change.
+    pub fn on_certificate_signature_verified(
+        &mut self,
+        cert: ViewChangeCertificate,
+        valid: bool,
+    ) -> Vec<Action> {
+        let cert_key = (cert.height.0, cert.new_round());
+
+        // Remove from pending
+        if self.pending_cert_verifications.remove(&cert_key).is_none() {
+            warn!(
+                height = cert.height.0,
+                new_round = cert.new_round(),
+                "Certificate signature verified but not pending"
+            );
+            return vec![];
+        }
+
+        if !valid {
+            warn!(
+                height = cert.height.0,
+                new_round = cert.new_round(),
+                "View change certificate has invalid signature"
+            );
+            return vec![];
+        }
+
+        // Re-check round (may have advanced while waiting for verification)
+        if cert.new_round() <= self.current_round {
+            debug!(
+                cert_round = cert.new_round(),
+                current_round = self.current_round,
+                "View change certificate for old/current round after verification"
+            );
             return vec![];
         }
 
@@ -770,46 +869,6 @@ impl ViewChangeState {
                 new_round: cert.new_round(),
             },
         }]
-    }
-
-    /// Verify a ViewChangeCertificate's aggregated BLS signature.
-    fn verify_certificate_signature(&self, cert: &ViewChangeCertificate) -> Result<(), String> {
-        // Get signer public keys from the bitfield
-        let signer_keys: Vec<PublicKey> = cert
-            .signers
-            .set_indices()
-            .filter_map(|idx| {
-                self.topology
-                    .local_validator_at_index(idx)
-                    .and_then(|v| self.public_key(v))
-            })
-            .collect();
-
-        if signer_keys.is_empty() {
-            return Err("No signers in view change certificate".to_string());
-        }
-
-        if signer_keys.len() != cert.signers.count() {
-            return Err(format!(
-                "Could not find public keys for all signers: expected {}, found {}",
-                cert.signers.count(),
-                signer_keys.len()
-            ));
-        }
-
-        // Aggregate public keys
-        let aggregated_pubkey = PublicKey::aggregate_bls(&signer_keys)
-            .map_err(|e| format!("Failed to aggregate signer keys: {}", e))?;
-
-        // Construct the message that was signed
-        let message = Self::view_change_message(&self.shard_group, cert.height, cert.new_round());
-
-        // Verify the aggregated signature
-        if !aggregated_pubkey.verify(&message, &cert.aggregated_signature) {
-            return Err("View change certificate signature verification failed".to_string());
-        }
-
-        Ok(())
     }
 
     /// Clean up view change votes for old heights/rounds.

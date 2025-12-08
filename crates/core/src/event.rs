@@ -237,6 +237,16 @@ pub enum Event {
         valid: bool,
     },
 
+    /// View change certificate signature verification completed.
+    ///
+    /// Callback from `Action::VerifyViewChangeCertificateSignature`.
+    ViewChangeCertificateSignatureVerified {
+        /// The certificate that was verified.
+        certificate: ViewChangeCertificate,
+        /// Whether the aggregated signature is valid.
+        valid: bool,
+    },
+
     /// Single-shard transaction execution completed.
     TransactionsExecuted {
         block_hash: Hash,
@@ -361,6 +371,7 @@ impl Event {
             | Event::QcSignatureVerified { .. }
             | Event::ViewChangeVoteSignatureVerified { .. }
             | Event::ViewChangeHighestQcVerified { .. }
+            | Event::ViewChangeCertificateSignatureVerified { .. }
             | Event::TransactionsExecuted { .. }
             | Event::CrossShardTransactionExecuted { .. }
             | Event::MerkleRootComputed { .. }

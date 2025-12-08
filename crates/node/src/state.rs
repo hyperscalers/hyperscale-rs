@@ -294,6 +294,13 @@ impl StateMachine for NodeStateMachine {
                 return actions;
             }
 
+            // View change certificate signature verification completed
+            Event::ViewChangeCertificateSignatureVerified { certificate, valid } => {
+                return self
+                    .view_change
+                    .on_certificate_signature_verified(certificate.clone(), *valid);
+            }
+
             Event::ViewChangeCertificateReceived { cert } => {
                 // Check if the certificate is for a higher height - this means we're behind
                 let cert_height = cert.height.0;
@@ -318,7 +325,7 @@ impl StateMachine for NodeStateMachine {
                     }
                 }
 
-                return self.view_change.on_view_change_certificate(cert);
+                return self.view_change.on_view_change_certificate(cert.clone());
             }
 
             // ProposalTimer needs mempool transactions, pending deferrals, aborts, and certificates
