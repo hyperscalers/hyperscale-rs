@@ -562,14 +562,15 @@ impl BftState {
             .map(|c| c.transaction_hash)
             .collect();
 
-        // Filter out stale deferrals - those whose winner is being committed in this block.
-        // A deferral is "stale" if the winner TX already has a certificate in the same block,
-        // meaning the cycle has been resolved and the deferral is no longer needed.
+        // Filter out stale deferrals - those whose winner OR loser is being committed in this block.
+        // A deferral is "stale" if either:
+        // 1. The winner TX already has a certificate - cycle resolved, deferral not needed
+        // 2. The deferred TX (loser) already has a certificate - loser completed before defer
         let deferred_with_height: Vec<TransactionDefer> = deferred_with_height
             .into_iter()
             .filter(|d| {
                 let hyperscale_types::DeferReason::LivelockCycle { winner_tx_hash } = &d.reason;
-                !cert_hash_set.contains(winner_tx_hash)
+                !cert_hash_set.contains(winner_tx_hash) && !cert_hash_set.contains(&d.tx_hash)
             })
             .collect();
 
