@@ -1102,17 +1102,18 @@ impl BftState {
                 );
                 return vec![];
             } else {
-                // Would violate vote locking - this is a safety violation attempt
-                // This is CRITICAL: voting for different blocks at the same height
-                // enables equivocation attacks that can break BFT safety
-                warn!(
+                // Vote locking prevented voting for a different block at this height.
+                // This is expected during view changes: we voted in round N, then round N+1
+                // proposes a different block, but we're locked to our original vote.
+                // This is BFT safety working correctly, not a violation.
+                debug!(
                     validator = ?self.validator_id(),
                     existing = ?existing_hash,
                     existing_round = existing_round,
                     new = ?block_hash,
                     new_round = round,
                     height = height,
-                    "Vote locking violation: already voted for different block at this height"
+                    "Vote locking: already voted for different block at this height"
                 );
                 return vec![];
             }
