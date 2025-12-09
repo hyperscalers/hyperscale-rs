@@ -8,6 +8,10 @@ description = "Production runner with async I/O"
 name = "hyperscale-validator"
 path = "src/bin/validator.rs"
 
+[[bin]]
+name = "hyperscale-keygen"
+path = "src/bin/keygen.rs"
+
 [features]
 default = []
 # Enable cross-node trace context propagation in messages.

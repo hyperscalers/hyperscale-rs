@@ -43,6 +43,7 @@ LOG*
 # Validator data
 data/
 keys/
+cluster-data/
 
 # Modelling
 tla/

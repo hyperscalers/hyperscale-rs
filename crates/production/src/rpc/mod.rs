@@ -45,5 +45,6 @@ mod routes;
 mod server;
 mod types;
 
+pub use handlers::NodeStatusState;
 pub use server::{RpcServer, RpcServerConfig, RpcServerHandle};
 pub use types::*;

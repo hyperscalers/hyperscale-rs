@@ -454,7 +454,8 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<KeyPair> {
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("Key must be exactly 32 bytes"))?;
 
-                Ok(KeyPair::from_seed(KeyType::Ed25519, &seed))
+                // Use BLS12-381 for consensus (supports signature aggregation)
+                Ok(KeyPair::from_seed(KeyType::Bls12381, &seed))
             } else {
                 info!("Key file not found, generating new keypair");
 
@@ -463,7 +464,7 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<KeyPair> {
                 use rand::RngCore;
                 rand::rngs::OsRng.fill_bytes(&mut seed);
 
-                let keypair = KeyPair::from_seed(KeyType::Ed25519, &seed);
+                let keypair = KeyPair::from_seed(KeyType::Bls12381, &seed);
 
                 // Save the seed
                 if let Some(parent) = path.parent() {
@@ -477,7 +478,7 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<KeyPair> {
         }
         None => {
             warn!("No key path specified, generating ephemeral keypair");
-            Ok(KeyPair::generate_ed25519())
+            Ok(KeyPair::generate_bls())
         }
     }
 }
@@ -783,13 +784,20 @@ async fn main() -> Result<()> {
     };
 
     // Create production runner
-    let mut runner = ProductionRunner::builder()
+    let mut runner_builder = ProductionRunner::builder()
         .topology(topology)
         .signing_key(signing_keypair)
         .bft_config(bft_config)
         .thread_pools(thread_pools)
         .storage(storage)
-        .network(network_config, p2p_identity)
+        .network(network_config, p2p_identity);
+
+    // Wire up RPC status updates if RPC server is enabled
+    if let Some(ref handle) = rpc_handle {
+        runner_builder = runner_builder.rpc_status(handle.node_status().clone());
+    }
+
+    let mut runner = runner_builder
         .build()
         .await
         .context("Failed to create production runner")?;

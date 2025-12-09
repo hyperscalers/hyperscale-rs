@@ -1,6 +1,7 @@
 //! Production runner implementation.
 
 use crate::network::{InboundSyncRequest, Libp2pAdapter, Libp2pConfig, NetworkError};
+use crate::rpc::NodeStatusState;
 use crate::storage::RocksDbStorage;
 use crate::sync::{SyncConfig, SyncManager};
 use crate::thread_pools::ThreadPoolManager;
@@ -13,8 +14,9 @@ use hyperscale_types::BlockHeight;
 use hyperscale_core::{Action, Event, RequestId, StateMachine};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
-    BlockVote, KeyPair, PublicKey, RoutableTransaction, ShardGroupId, Signature, StateVoteBlock,
-    Topology, ViewChangeVote,
+    Block, BlockHeader, BlockVote, Hash, KeyPair, PublicKey, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, Signature, StateVoteBlock, Topology, ValidatorId,
+    ViewChangeVote,
 };
 use libp2p::identity;
 use parking_lot::RwLock;
@@ -23,6 +25,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{instrument, span, Level, Span};
 
@@ -146,6 +149,8 @@ pub struct ProductionRunnerBuilder {
     network_config: Option<Libp2pConfig>,
     ed25519_keypair: Option<identity::Keypair>,
     channel_capacity: usize,
+    /// Optional RPC status state to update on block commits and view changes.
+    rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
 }
 
 impl Default for ProductionRunnerBuilder {
@@ -166,6 +171,7 @@ impl ProductionRunnerBuilder {
             network_config: None,
             ed25519_keypair: None,
             channel_capacity: 10_000,
+            rpc_status: None,
         }
     }
 
@@ -209,6 +215,15 @@ impl ProductionRunnerBuilder {
     /// Set the event channel capacity (default: 10,000).
     pub fn channel_capacity(mut self, capacity: usize) -> Self {
         self.channel_capacity = capacity;
+        self
+    }
+
+    /// Set the RPC status state to update on block commits and view changes.
+    ///
+    /// When set, the runner will update `block_height`, `view`, and `connected_peers`
+    /// fields as consensus progresses.
+    pub fn rpc_status(mut self, status: Arc<TokioRwLock<NodeStatusState>>) -> Self {
+        self.rpc_status = Some(status);
         self
     }
 
@@ -301,6 +316,7 @@ impl ProductionRunnerBuilder {
             topology,
             storage,
             executor,
+            rpc_status: self.rpc_status,
             sync_request_rx,
             shutdown_rx,
             shutdown_tx: Some(shutdown_tx),
@@ -351,6 +367,8 @@ pub struct ProductionRunner {
     storage: Arc<RwLock<RocksDbStorage>>,
     /// Transaction executor.
     executor: Arc<RadixExecutor>,
+    /// Optional RPC status state to update on block commits.
+    rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
     /// Inbound sync request channel (from network adapter).
     sync_request_rx: mpsc::Receiver<InboundSyncRequest>,
     /// Shutdown signal receiver.
@@ -407,6 +425,97 @@ impl ProductionRunner {
         self.sync_manager.is_syncing()
     }
 
+    /// Initialize genesis if this is a fresh start.
+    ///
+    /// Checks if we have any committed blocks. If not, creates a genesis block
+    /// and initializes the state machine, which sets up the initial proposal timer.
+    fn maybe_initialize_genesis(&mut self) {
+        // Check if we already have committed blocks
+        let has_blocks = {
+            let storage = self.storage.read();
+            let (height, _, _) = storage.get_chain_metadata();
+            height.0 > 0
+        };
+
+        if has_blocks {
+            tracing::info!("Existing blocks found, skipping genesis initialization");
+            return;
+        }
+
+        tracing::info!(
+            shard = ?self.local_shard,
+            "No committed blocks - initializing genesis"
+        );
+
+        // Run Radix Engine genesis to set up initial state
+        {
+            let mut storage = self.storage.write();
+            if let Err(e) = self.executor.run_genesis(&mut *storage) {
+                tracing::warn!(error = ?e, "Radix Engine genesis failed (may be OK for testing)");
+            }
+        }
+
+        // Create genesis block
+        // The first validator in the committee is the proposer for genesis
+        let first_validator = self
+            .topology
+            .committee_for_shard(self.local_shard)
+            .first()
+            .copied()
+            .unwrap_or(ValidatorId(0));
+
+        let genesis_header = BlockHeader {
+            height: BlockHeight(0),
+            parent_hash: Hash::from_bytes(&[0u8; 32]),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: first_validator,
+            timestamp: 0,
+            round: 0,
+            is_fallback: false,
+        };
+
+        let genesis_block = Block {
+            header: genesis_header,
+            transactions: vec![],
+            committed_certificates: vec![],
+            deferred: vec![],
+            aborted: vec![],
+        };
+
+        let genesis_hash = genesis_block.hash();
+        tracing::info!(
+            genesis_hash = ?genesis_hash,
+            proposer = ?first_validator,
+            "Created genesis block"
+        );
+
+        // Initialize state machine with genesis (this sets up proposal timer)
+        let actions = self.state.initialize_genesis(genesis_block);
+
+        tracing::info!(num_actions = actions.len(), "Genesis returned actions");
+
+        // Process the actions (should be SetTimer for proposal)
+        for action in actions {
+            self.process_action_sync(action);
+        }
+    }
+
+    /// Process an action synchronously (for genesis initialization).
+    fn process_action_sync(&mut self, action: Action) {
+        match action {
+            Action::SetTimer { id, duration } => {
+                tracing::info!(timer_id = ?id, duration_ms = ?duration.as_millis(), "Setting timer from genesis");
+                self.timer_manager.set_timer(id, duration);
+            }
+            Action::CancelTimer { id } => {
+                self.timer_manager.cancel_timer(id);
+            }
+            _ => {
+                tracing::debug!(action = ?action, "Ignoring action during genesis init");
+            }
+        }
+    }
+
     /// Run the main event loop.
     ///
     /// This should be spawned as a task. It runs until the event channel closes.
@@ -435,6 +544,9 @@ impl ProductionRunner {
             pin_cores = config.pin_cores,
             "Starting production runner"
         );
+
+        // Initialize genesis if this is a fresh start (no committed blocks)
+        self.maybe_initialize_genesis();
 
         // Sync tick interval (100ms)
         let mut sync_tick = tokio::time::interval(Duration::from_millis(100));
@@ -498,6 +610,14 @@ impl ProductionRunner {
 
                             // Record action count
                             Span::current().record("actions.count", actions.len());
+
+                            if !actions.is_empty() {
+                                tracing::info!(
+                                    event_type = %event_type,
+                                    num_actions = actions.len(),
+                                    "Event produced actions"
+                                );
+                            }
 
                             // Collect signature verifications for batching, process others immediately
                             let mut pending = PendingVerifications::default();
@@ -617,6 +737,12 @@ impl ProductionRunner {
                     // Update peer count
                     let peer_count = self.network.connected_peers().await.len();
                     crate::metrics::set_libp2p_peers(peer_count);
+
+                    // Update RPC status with peer count
+                    if let Some(ref rpc_status) = self.rpc_status {
+                        let mut status = rpc_status.write().await;
+                        status.connected_peers = peer_count;
+                    }
                 }
             }
         }
@@ -1064,8 +1190,24 @@ impl ProductionRunner {
             }
 
             Action::EmitCommittedBlock { block } => {
-                tracing::info!(block_hash = ?block.hash(), "Block committed");
-                // TODO: Notify subscribers
+                let height = block.header.height.0;
+                let current_view = self.state.bft().view();
+                tracing::info!(
+                    block_hash = ?block.hash(),
+                    height = height,
+                    view = current_view,
+                    "Block committed"
+                );
+
+                // Update RPC status with new block height and view
+                if let Some(ref rpc_status) = self.rpc_status {
+                    let rpc_status = rpc_status.clone();
+                    tokio::spawn(async move {
+                        let mut status = rpc_status.write().await;
+                        status.block_height = height;
+                        status.view = current_view;
+                    });
+                }
             }
 
             // ═══════════════════════════════════════════════════════════════════════

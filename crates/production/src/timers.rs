@@ -50,8 +50,9 @@ impl TimerManager {
         let timer_id = id;
 
         let handle = tokio::spawn(async move {
+            tracing::info!(?timer_id, ?duration, "Timer task started, sleeping");
             tokio::time::sleep(duration).await;
-            trace!(?timer_id, "Timer fired");
+            tracing::info!(?timer_id, "Timer fired, sending event");
             let event = timer_event(timer_id);
             if event_tx.send(event).await.is_err() {
                 debug!(?timer_id, "Timer fired but event channel closed");

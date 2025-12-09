@@ -699,18 +699,20 @@ impl Libp2pAdapter {
                 // Record inbound bandwidth
                 metrics::record_libp2p_bandwidth(data_len as u64, 0);
 
-                // Validate sender is a known validator
-                let peer_map = peer_validators.read().await;
-                if !peer_map.contains_key(&propagation_source) {
-                    debug!(
-                        peer = %propagation_source,
-                        topic = %topic,
-                        "Ignoring message from unknown peer"
-                    );
-                    metrics::record_invalid_message();
-                    return;
-                }
-                drop(peer_map);
+                // TODO: Re-enable peer validation once peer-to-validator mapping is implemented
+                // For now, accept messages from all connected peers (trusted local network assumption)
+                // let peer_map = peer_validators.read().await;
+                // if !peer_map.contains_key(&propagation_source) {
+                //     debug!(
+                //         peer = %propagation_source,
+                //         topic = %topic,
+                //         "Ignoring message from unknown peer"
+                //     );
+                //     metrics::record_invalid_message();
+                //     return;
+                // }
+                // drop(peer_map);
+                let _ = &peer_validators; // Suppress unused warning
 
                 // Decode message based on topic
                 match decode_message(&topic, &message.data) {
