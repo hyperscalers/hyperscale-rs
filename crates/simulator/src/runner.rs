@@ -91,6 +91,10 @@ impl Simulator {
     /// This funds all generated accounts at genesis time with the configured
     /// initial balance, allowing transactions to execute without failing due
     /// to insufficient funds.
+    ///
+    /// Also runs a warmup period to let the consensus establish before
+    /// transaction submission begins. This ensures cross-shard provisioning
+    /// works correctly from the start.
     pub fn initialize(&mut self) {
         // Collect all account balances for genesis
         let balances: Vec<_> = self
@@ -109,6 +113,25 @@ impl Simulator {
         );
 
         self.runner.initialize_genesis_with_balances(balances);
+
+        // Run a warmup period to let consensus establish.
+        // This ensures at least a few blocks are committed before we start
+        // submitting transactions. Without this, cross-shard transactions
+        // submitted immediately after genesis may fail because provisioning
+        // requires blocks to be committed first.
+        //
+        // Warmup time: 3 block intervals (default 300ms each = 900ms)
+        // This allows:
+        // - Block 1 to be proposed and committed
+        // - Block 2 to be proposed and committed
+        // - Consensus to stabilize across all shards
+        let warmup_duration = Duration::from_millis(900);
+        info!(
+            warmup_ms = warmup_duration.as_millis(),
+            "Running warmup period for consensus to establish"
+        );
+        self.runner.run_until(self.runner.now() + warmup_duration);
+
         info!("Genesis initialized with funded accounts");
     }
 
