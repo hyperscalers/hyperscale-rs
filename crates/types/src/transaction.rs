@@ -531,8 +531,8 @@ impl RetryDetails {
 ///
 /// - **Pending**: Transaction has been submitted but not yet included in a committed block
 /// - **Committed**: Block containing transaction has been committed; execution is in progress
-/// - **Executed**: Execution complete, TransactionCertificate created, waiting for block inclusion
-/// - **Completed**: Certificate committed in block, transaction fully processed
+/// - **Executed**: Execution complete, certificate created (state NOT yet updated - waiting for block)
+/// - **Completed**: Certificate committed in block, state updated, transaction done
 /// - **Blocked**: Transaction was deferred due to cross-shard conflict, waiting for winner
 /// - **Retried**: Transaction was superseded by a retry transaction (terminal)
 ///
@@ -566,14 +566,18 @@ pub enum TransactionStatus {
     /// All StateCertificates have been collected and aggregated into a
     /// TransactionCertificate with Accept or Reject decision.
     ///
-    /// The transaction is waiting for the certificate to be included in a block.
+    /// **Important**: State is NOT yet updated at this point. The certificate
+    /// must be included in a block before state changes are applied. The
+    /// transaction is waiting for the certificate to be committed.
+    ///
     /// Still holds state locks until Completed.
     Executed(TransactionDecision),
 
     /// Transaction has been fully processed and can be evicted.
     ///
-    /// The TransactionCertificate has been committed in a block. This is the terminal
-    /// state - the transaction can now be safely removed from the mempool.
+    /// The TransactionCertificate has been committed in a block. State changes
+    /// have been applied (if accepted). This is the terminal state - the
+    /// transaction can now be safely removed from the mempool.
     Completed,
 
     /// Transaction was deferred due to a cross-shard cycle.

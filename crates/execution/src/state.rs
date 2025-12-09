@@ -1224,9 +1224,9 @@ impl ExecutionState {
                 // Store finalized certificate
                 self.finalized_certificates.insert(tx_hash, tx_cert);
 
-                // Notify mempool that transaction is finalized
+                // Notify mempool that transaction execution is complete
                 actions.push(Action::EnqueueInternal {
-                    event: Event::TransactionFinalized { tx_hash, accepted },
+                    event: Event::TransactionExecuted { tx_hash, accepted },
                 });
             } else {
                 tracing::warn!(

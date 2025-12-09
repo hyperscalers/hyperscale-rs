@@ -320,12 +320,12 @@ impl MempoolState {
         }
     }
 
-    /// Mark a transaction as finalized (execution complete).
+    /// Mark a transaction as executed (execution complete, certificate created).
     ///
     /// Called when ExecutionState creates a TransactionCertificate.
     /// Also triggers retries for any transactions blocked by this winner.
     #[instrument(skip(self), fields(tx_hash = ?tx_hash, accepted = accepted))]
-    pub fn on_transaction_finalized(&mut self, tx_hash: Hash, accepted: bool) -> Vec<Action> {
+    pub fn on_transaction_executed(&mut self, tx_hash: Hash, accepted: bool) -> Vec<Action> {
         let mut actions = Vec::new();
 
         if let Some(entry) = self.pool.get_mut(&tx_hash) {
@@ -337,8 +337,8 @@ impl MempoolState {
             entry.status = TransactionStatus::Executed(decision);
         }
 
-        // Check if any blocked transactions were waiting for this winner to finalize.
-        // This triggers retries immediately when the winner finalizes, rather than
+        // Check if any blocked transactions were waiting for this winner to complete.
+        // This triggers retries immediately when the winner executes, rather than
         // waiting for the certificate to be committed in a block.
         let blocked_losers: Vec<_> = self
             .blocked_by
@@ -675,8 +675,8 @@ impl SubStateMachine for MempoolState {
                 // Process block fully including deferrals, certificates, and aborts
                 Some(self.on_block_committed_full(block))
             }
-            Event::TransactionFinalized { tx_hash, accepted } => {
-                Some(self.on_transaction_finalized(*tx_hash, *accepted))
+            Event::TransactionExecuted { tx_hash, accepted } => {
+                Some(self.on_transaction_executed(*tx_hash, *accepted))
             }
             // Handle status update events from execution
             Event::TransactionStatusChanged { tx_hash, status } => {

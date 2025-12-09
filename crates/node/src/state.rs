@@ -509,9 +509,9 @@ impl StateMachine for NodeStateMachine {
                 return actions;
             }
 
-            // TransactionFinalized is emitted by execution, handled by mempool AND BFT
+            // TransactionExecuted is emitted by execution, handled by mempool AND BFT
             // BFT might have pending blocks waiting for this certificate
-            Event::TransactionFinalized { tx_hash, .. } => {
+            Event::TransactionExecuted { tx_hash, .. } => {
                 let mut actions = vec![];
 
                 // Notify mempool

@@ -139,12 +139,16 @@ pub enum Event {
     /// View change completed (round increment).
     ViewChangeCompleted { height: u64, new_round: u64 },
 
-    /// A transaction has been finalized (execution complete, certificate created).
+    /// Transaction execution completed.
     ///
     /// Emitted by the execution state machine when a TransactionCertificate
     /// is created (either single-shard or cross-shard 2PC completion).
-    /// This notifies mempool to update transaction status to Finalized.
-    TransactionFinalized {
+    /// This notifies mempool to update transaction status to Executed.
+    ///
+    /// Note: State is NOT yet updated at this point. The certificate must be
+    /// included in a block (triggering Completed status) before state changes
+    /// are applied.
+    TransactionExecuted {
         tx_hash: Hash,
         /// Whether the transaction was accepted or rejected.
         accepted: bool,
@@ -153,7 +157,7 @@ pub enum Event {
     /// A transaction's status has changed.
     ///
     /// Emitted by the execution state machine when a transaction transitions
-    /// through its lifecycle states (Provisioning, Executing, Finalizing, etc.).
+    /// through its lifecycle states (Committed, Executed, etc.).
     /// This allows mempool to track the detailed status of transactions
     /// and ensure proper state lock management.
     TransactionStatusChanged {
@@ -362,7 +366,7 @@ impl Event {
             | Event::BlockCommitted { .. }
             | Event::TransactionAccepted { .. }
             | Event::ViewChangeCompleted { .. }
-            | Event::TransactionFinalized { .. }
+            | Event::TransactionExecuted { .. }
             | Event::TransactionStatusChanged { .. }
             | Event::VoteSignatureVerified { .. }
             | Event::ProvisionSignatureVerified { .. }
@@ -451,7 +455,7 @@ impl Event {
             Event::BlockCommitted { .. } => "BlockCommitted",
             Event::TransactionAccepted { .. } => "TransactionAccepted",
             Event::ViewChangeCompleted { .. } => "ViewChangeCompleted",
-            Event::TransactionFinalized { .. } => "TransactionFinalized",
+            Event::TransactionExecuted { .. } => "TransactionExecuted",
             Event::TransactionStatusChanged { .. } => "TransactionStatusChanged",
 
             // Async Callbacks - Crypto Verification
