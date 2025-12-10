@@ -107,7 +107,6 @@ impl FundedAccount {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum SelectionMode {
     /// Pure random selection - can cause contention under high load.
-    #[default]
     Random,
 
     /// Round-robin selection - cycles through accounts sequentially.
@@ -120,6 +119,7 @@ pub enum SelectionMode {
     /// No contention - each call gets a disjoint pair of accounts.
     /// Uses a global counter to ensure no conflicts between transactions.
     /// With N accounts per shard, supports N/2 concurrent non-conflicting transactions.
+    #[default]
     NoContention,
 }
 
