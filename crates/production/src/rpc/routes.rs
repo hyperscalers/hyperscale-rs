@@ -1,6 +1,7 @@
 //! Route configuration for the RPC API.
 
 use super::handlers::*;
+use super::state::RpcState;
 use axum::{
     routing::{get, post},
     Router,
@@ -35,7 +36,7 @@ fn api_v1_routes() -> Router<RpcState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::{MempoolSnapshot, TransactionStatusCache};
+    use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
     use axum::{body::Body, http::Request};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;

@@ -1,7 +1,7 @@
 //! RPC server implementation.
 
-use super::handlers::{MempoolSnapshot, NodeStatusState, RpcState, TransactionStatusCache};
 use super::routes::create_router;
+use super::state::{MempoolSnapshot, NodeStatusState, RpcState, TransactionStatusCache};
 use crate::sync::SyncStatus;
 use hyperscale_types::RoutableTransaction;
 use std::net::SocketAddr;
