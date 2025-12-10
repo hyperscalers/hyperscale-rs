@@ -49,6 +49,7 @@ pub use transaction::{
     sign_and_notarize, sign_and_notarize_with_options, AbortReason, DeferReason, RetryDetails,
     RoutableTransaction, ShardExecutionProof, TransactionAbort, TransactionCertificate,
     TransactionDecision, TransactionDefer, TransactionError, TransactionStatus,
+    TransactionStatusParseError,
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
 pub use view_change::{ViewChangeCertificate, ViewChangeVote};

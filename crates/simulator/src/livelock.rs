@@ -418,7 +418,7 @@ impl LivelockAnalyzer {
 
 /// Get a human-readable name for a transaction status.
 fn status_name(status: &TransactionStatus) -> String {
-    status.name().to_string()
+    status.to_string()
 }
 
 #[cfg(test)]
@@ -428,14 +428,14 @@ mod tests {
 
     #[test]
     fn test_status_name() {
-        assert_eq!(status_name(&TransactionStatus::Pending), "Pending");
+        assert_eq!(status_name(&TransactionStatus::Pending), "pending");
         assert_eq!(
             status_name(&TransactionStatus::Committed(BlockHeight(1))),
-            "Committed"
+            "committed(1)"
         );
         assert_eq!(
             status_name(&TransactionStatus::Completed(TransactionDecision::Accept)),
-            "Completed"
+            "completed(accept)"
         );
     }
 }

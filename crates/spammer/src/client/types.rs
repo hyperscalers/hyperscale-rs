@@ -1,5 +1,6 @@
 //! Types for RPC client communication.
 
+use hyperscale_types::{AbortReason, BlockHeight, Hash, TransactionDecision, TransactionStatus};
 use serde::{Deserialize, Serialize};
 
 /// Request to submit a transaction.
@@ -90,21 +91,60 @@ pub struct TransactionStatusResponse {
 }
 
 impl TransactionStatusResponse {
+    /// Convert to a typed TransactionStatus if possible.
+    ///
+    /// Returns None for unknown statuses or parse errors.
+    pub fn to_status(&self) -> Option<TransactionStatus> {
+        let decision = || -> Option<TransactionDecision> {
+            match self.decision.as_deref()? {
+                "accept" => Some(TransactionDecision::Accept),
+                "reject" => Some(TransactionDecision::Reject),
+                _ => None,
+            }
+        };
+
+        match self.status.as_str() {
+            "pending" => Some(TransactionStatus::Pending),
+            "committed" => Some(TransactionStatus::Committed(BlockHeight(
+                self.committed_height.unwrap_or(0),
+            ))),
+            "executed" => Some(TransactionStatus::Executed(decision()?)),
+            "completed" => Some(TransactionStatus::Completed(decision()?)),
+            "blocked" => {
+                let hash = Hash::from_hex(self.blocked_by.as_deref()?).ok()?;
+                Some(TransactionStatus::Blocked { by: hash })
+            }
+            "retried" => {
+                let hash = Hash::from_hex(self.retry_tx.as_deref()?).ok()?;
+                Some(TransactionStatus::Retried { new_tx: hash })
+            }
+            "aborted" => {
+                // For aborted, we store the reason in error field as a string
+                // Parse it back if possible, otherwise use a generic rejected reason
+                let reason = self
+                    .error
+                    .as_deref()
+                    .and_then(|s| s.parse::<AbortReason>().ok())
+                    .unwrap_or(AbortReason::ExecutionRejected {
+                        reason: self.error.clone().unwrap_or_default(),
+                    });
+                Some(TransactionStatus::Aborted { reason })
+            }
+            _ => None,
+        }
+    }
+
     /// Check if the transaction has reached a terminal state.
     ///
-    /// A transaction is truly terminal when:
-    /// - `completed`: Certificate committed to a block, state locks released
-    /// - `retried`: Superseded by a retry transaction
-    /// - `aborted`: Transaction aborted due to timeout or too many retries
-    /// - `error`: Processing error
-    ///
-    /// Note: `executed` is NOT terminal - the certificate still needs to be
-    /// committed to a block to release state locks.
+    /// Uses the typed TransactionStatus.is_final() when possible,
+    /// falls back to string matching for unknown statuses.
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.status.as_str(),
-            "completed" | "retried" | "aborted" | "error"
-        )
+        if let Some(status) = self.to_status() {
+            status.is_final()
+        } else {
+            // Fallback for unknown statuses like "error"
+            self.status == "error"
+        }
     }
 
     /// Check if the transaction completed successfully.
@@ -112,6 +152,9 @@ impl TransactionStatusResponse {
     /// A transaction is successful when it reaches `completed` status with
     /// an `accept` decision.
     pub fn is_success(&self) -> bool {
-        self.status == "completed" && self.decision.as_deref() == Some("accept")
+        matches!(
+            self.to_status(),
+            Some(TransactionStatus::Completed(TransactionDecision::Accept))
+        )
     }
 }

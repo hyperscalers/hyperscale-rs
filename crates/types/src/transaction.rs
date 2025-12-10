@@ -378,14 +378,52 @@ impl std::fmt::Display for AbortReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AbortReason::ExecutionTimeout { committed_at } => {
-                write!(f, "ExecutionTimeout(committed: {})", committed_at.0)
+                write!(f, "timeout({})", committed_at.0)
             }
             AbortReason::TooManyRetries { retry_count } => {
-                write!(f, "TooManyRetries(count: {})", retry_count)
+                write!(f, "retries({})", retry_count)
             }
             AbortReason::ExecutionRejected { reason } => {
-                write!(f, "ExecutionRejected({})", reason)
+                write!(f, "rejected({})", reason)
             }
+        }
+    }
+}
+
+impl std::str::FromStr for AbortReason {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (name, inner) = if let Some(paren_start) = s.find('(') {
+            if !s.ends_with(')') {
+                return Err(format!("invalid abort reason format: {}", s));
+            }
+            let name = &s[..paren_start];
+            let inner = &s[paren_start + 1..s.len() - 1];
+            (name, inner)
+        } else {
+            return Err(format!("invalid abort reason format: {}", s));
+        };
+
+        match name {
+            "timeout" => {
+                let height = inner
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid height: {}", inner))?;
+                Ok(AbortReason::ExecutionTimeout {
+                    committed_at: BlockHeight(height),
+                })
+            }
+            "retries" => {
+                let count = inner
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid retry count: {}", inner))?;
+                Ok(AbortReason::TooManyRetries { retry_count: count })
+            }
+            "rejected" => Ok(AbortReason::ExecutionRejected {
+                reason: inner.to_string(),
+            }),
+            _ => Err(format!("unknown abort reason: {}", name)),
         }
     }
 }
@@ -657,19 +695,6 @@ impl TransactionStatus {
         )
     }
 
-    /// Get a short name for this status (for logging/debugging).
-    pub fn name(&self) -> &'static str {
-        match self {
-            TransactionStatus::Pending => "Pending",
-            TransactionStatus::Committed(_) => "Committed",
-            TransactionStatus::Executed(_) => "Executed",
-            TransactionStatus::Completed(_) => "Completed",
-            TransactionStatus::Blocked { .. } => "Blocked",
-            TransactionStatus::Retried { .. } => "Retried",
-            TransactionStatus::Aborted { .. } => "Aborted",
-        }
-    }
-
     /// Check if this transaction is blocked waiting for another transaction.
     pub fn is_blocked(&self) -> bool {
         matches!(self, TransactionStatus::Blocked { .. })
@@ -776,26 +801,128 @@ impl TransactionStatus {
 impl std::fmt::Display for TransactionStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TransactionStatus::Pending => write!(f, "Pending"),
-            TransactionStatus::Committed(height) => write!(f, "Committed({})", height.0),
+            TransactionStatus::Pending => write!(f, "pending"),
+            TransactionStatus::Committed(height) => write!(f, "committed({})", height.0),
             TransactionStatus::Executed(TransactionDecision::Accept) => {
-                write!(f, "Executed(Accept)")
+                write!(f, "executed(accept)")
             }
             TransactionStatus::Executed(TransactionDecision::Reject) => {
-                write!(f, "Executed(Reject)")
+                write!(f, "executed(reject)")
             }
             TransactionStatus::Completed(TransactionDecision::Accept) => {
-                write!(f, "Completed(Accept)")
+                write!(f, "completed(accept)")
             }
             TransactionStatus::Completed(TransactionDecision::Reject) => {
-                write!(f, "Completed(Reject)")
+                write!(f, "completed(reject)")
             }
-            TransactionStatus::Blocked { by } => write!(f, "Blocked(by: {})", by),
-            TransactionStatus::Retried { new_tx } => write!(f, "Retried(new_tx: {})", new_tx),
-            TransactionStatus::Aborted { reason } => write!(f, "Aborted({})", reason),
+            TransactionStatus::Blocked { by } => write!(f, "blocked({})", by),
+            TransactionStatus::Retried { new_tx } => write!(f, "retried({})", new_tx),
+            TransactionStatus::Aborted { reason } => write!(f, "aborted({})", reason),
         }
     }
 }
+
+impl std::str::FromStr for TransactionStatus {
+    type Err = TransactionStatusParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Handle simple cases first
+        if s == "pending" {
+            return Ok(TransactionStatus::Pending);
+        }
+
+        // Parse status(value) format
+        let (name, inner) = if let Some(paren_start) = s.find('(') {
+            if !s.ends_with(')') {
+                return Err(TransactionStatusParseError::InvalidFormat(s.to_string()));
+            }
+            let name = &s[..paren_start];
+            let inner = &s[paren_start + 1..s.len() - 1];
+            (name, Some(inner))
+        } else {
+            (s, None)
+        };
+
+        match name {
+            "pending" => Ok(TransactionStatus::Pending),
+            "committed" => {
+                let height = inner
+                    .ok_or_else(|| TransactionStatusParseError::MissingValue("committed".into()))?
+                    .parse::<u64>()
+                    .map_err(|_| TransactionStatusParseError::InvalidValue("height".into()))?;
+                Ok(TransactionStatus::Committed(BlockHeight(height)))
+            }
+            "executed" => {
+                let decision = parse_decision(inner.ok_or_else(|| {
+                    TransactionStatusParseError::MissingValue("executed".into())
+                })?)?;
+                Ok(TransactionStatus::Executed(decision))
+            }
+            "completed" => {
+                let decision = parse_decision(inner.ok_or_else(|| {
+                    TransactionStatusParseError::MissingValue("completed".into())
+                })?)?;
+                Ok(TransactionStatus::Completed(decision))
+            }
+            "blocked" => {
+                let hash_str = inner
+                    .ok_or_else(|| TransactionStatusParseError::MissingValue("blocked".into()))?;
+                let hash = Hash::from_hex(hash_str)
+                    .map_err(|_| TransactionStatusParseError::InvalidValue("hash".into()))?;
+                Ok(TransactionStatus::Blocked { by: hash })
+            }
+            "retried" => {
+                let hash_str = inner
+                    .ok_or_else(|| TransactionStatusParseError::MissingValue("retried".into()))?;
+                let hash = Hash::from_hex(hash_str)
+                    .map_err(|_| TransactionStatusParseError::InvalidValue("hash".into()))?;
+                Ok(TransactionStatus::Retried { new_tx: hash })
+            }
+            "aborted" => {
+                let reason_str = inner
+                    .ok_or_else(|| TransactionStatusParseError::MissingValue("aborted".into()))?;
+                let reason = AbortReason::from_str(reason_str)
+                    .map_err(|_| TransactionStatusParseError::InvalidValue("reason".into()))?;
+                Ok(TransactionStatus::Aborted { reason })
+            }
+            _ => Err(TransactionStatusParseError::UnknownStatus(name.to_string())),
+        }
+    }
+}
+
+fn parse_decision(s: &str) -> Result<TransactionDecision, TransactionStatusParseError> {
+    match s {
+        "accept" => Ok(TransactionDecision::Accept),
+        "reject" => Ok(TransactionDecision::Reject),
+        _ => Err(TransactionStatusParseError::InvalidValue("decision".into())),
+    }
+}
+
+/// Error parsing a TransactionStatus from a string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionStatusParseError {
+    /// Unknown status name.
+    UnknownStatus(String),
+    /// Invalid format (missing parentheses, etc).
+    InvalidFormat(String),
+    /// Missing required value in parentheses.
+    MissingValue(String),
+    /// Invalid value in parentheses.
+    InvalidValue(String),
+}
+
+impl std::fmt::Display for TransactionStatusParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownStatus(s) => write!(f, "unknown status: {}", s),
+            Self::InvalidFormat(s) => write!(f, "invalid format: {}", s),
+            Self::MissingValue(s) => write!(f, "missing value for {}", s),
+            Self::InvalidValue(s) => write!(f, "invalid {}", s),
+        }
+    }
+}
+
+impl std::error::Error for TransactionStatusParseError {}
 
 /// Certificate proving transaction execution across all required shards.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
