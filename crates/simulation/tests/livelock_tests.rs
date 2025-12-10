@@ -920,10 +920,13 @@ fn test_timeout_abort_mechanism() {
             last_status = current_status.clone();
         }
 
-        // Check if transaction completed or was aborted
+        // Check if transaction reached a terminal state
         if let Some(status) = &current_status {
-            if matches!(status, TransactionStatus::Completed(_)) {
-                println!("  ✓ Transaction completed (iteration {})", iteration);
+            if status.is_final() {
+                println!(
+                    "  ✓ Transaction finalized: {} (iteration {})",
+                    status, iteration
+                );
                 break;
             }
         }
