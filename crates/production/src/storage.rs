@@ -59,22 +59,26 @@ impl RocksDbStorage {
 
         // Performance tuning
         opts.set_max_background_jobs(config.max_background_jobs);
-        opts.set_bytes_per_sync(1024 * 1024); // 1MB
-        opts.set_keep_log_file_num(10);
+        if config.bytes_per_sync > 0 {
+            opts.set_bytes_per_sync(config.bytes_per_sync as u64);
+        }
+        opts.set_keep_log_file_num(config.keep_log_file_num);
         opts.set_max_write_buffer_number(config.max_write_buffer_number);
         opts.set_write_buffer_size(config.write_buffer_size);
 
         // Compression
-        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_compression_type(config.compression.to_rocksdb());
 
         // Block cache and bloom filter
+        let mut block_opts = rocksdb::BlockBasedOptions::default();
         if let Some(cache_size) = config.block_cache_size {
             let cache = rocksdb::Cache::new_lru_cache(cache_size);
-            let mut block_opts = rocksdb::BlockBasedOptions::default();
             block_opts.set_block_cache(&cache);
-            block_opts.set_bloom_filter(10.0, false);
-            opts.set_block_based_table_factory(&block_opts);
         }
+        if config.bloom_filter_bits > 0.0 {
+            block_opts.set_bloom_filter(config.bloom_filter_bits, false);
+        }
+        opts.set_block_based_table_factory(&block_opts);
 
         // Column families
         let cf_descriptors: Vec<_> = config
@@ -743,6 +747,31 @@ impl RocksDbStorage {
     }
 }
 
+/// Compression type for RocksDB.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum CompressionType {
+    None,
+    Snappy,
+    Zlib,
+    #[default]
+    Lz4,
+    Lz4hc,
+    Zstd,
+}
+
+impl CompressionType {
+    fn to_rocksdb(self) -> rocksdb::DBCompressionType {
+        match self {
+            CompressionType::None => rocksdb::DBCompressionType::None,
+            CompressionType::Snappy => rocksdb::DBCompressionType::Snappy,
+            CompressionType::Zlib => rocksdb::DBCompressionType::Zlib,
+            CompressionType::Lz4 => rocksdb::DBCompressionType::Lz4,
+            CompressionType::Lz4hc => rocksdb::DBCompressionType::Lz4hc,
+            CompressionType::Zstd => rocksdb::DBCompressionType::Zstd,
+        }
+    }
+}
+
 /// Configuration for RocksDB storage.
 #[derive(Debug, Clone)]
 pub struct RocksDbConfig {
@@ -754,6 +783,14 @@ pub struct RocksDbConfig {
     pub max_write_buffer_number: i32,
     /// Block cache size in bytes (None to disable)
     pub block_cache_size: Option<usize>,
+    /// Compression type
+    pub compression: CompressionType,
+    /// Bloom filter bits per key (0 to disable)
+    pub bloom_filter_bits: f64,
+    /// Bytes per sync (0 to disable)
+    pub bytes_per_sync: usize,
+    /// Number of log files to keep
+    pub keep_log_file_num: usize,
     /// Column families to create
     pub column_families: Vec<String>,
 }
@@ -765,6 +802,10 @@ impl Default for RocksDbConfig {
             write_buffer_size: 128 * 1024 * 1024, // 128MB
             max_write_buffer_number: 3,
             block_cache_size: Some(512 * 1024 * 1024), // 512MB
+            compression: CompressionType::Lz4,
+            bloom_filter_bits: 10.0,
+            bytes_per_sync: 1024 * 1024, // 1MB
+            keep_log_file_num: 10,
             column_families: vec![
                 "default".to_string(),
                 "blocks".to_string(),

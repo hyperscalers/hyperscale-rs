@@ -98,8 +98,24 @@ max_background_jobs = 4
 # Write buffer size (MB)
 write_buffer_mb = 128
 
+# Maximum number of write buffers (memtables) to keep in memory
+max_write_buffer_number = 3
+
 # Block cache size (MB) - 0 to disable
 block_cache_mb = 512
+
+# Compression algorithm: none, snappy, zlib, lz4, lz4hc, zstd
+compression = "lz4"
+
+# Bloom filter bits per key (0 to disable)
+# Higher values = better read performance, more memory
+bloom_filter_bits = 10.0
+
+# Bytes per sync (MB) - triggers fsync after this many bytes written (0 to disable)
+bytes_per_sync_mb = 1
+
+# Number of old log files to keep
+keep_log_file_num = 10
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Metrics Configuration

@@ -274,6 +274,32 @@ pub struct ThreadsConfig {
     pub pin_cores: bool,
 }
 
+/// Compression type for storage (maps to RocksDB compression).
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CompressionType {
+    None,
+    Snappy,
+    Zlib,
+    #[default]
+    Lz4,
+    Lz4hc,
+    Zstd,
+}
+
+impl From<CompressionType> for hyperscale_production::CompressionType {
+    fn from(ct: CompressionType) -> Self {
+        match ct {
+            CompressionType::None => hyperscale_production::CompressionType::None,
+            CompressionType::Snappy => hyperscale_production::CompressionType::Snappy,
+            CompressionType::Zlib => hyperscale_production::CompressionType::Zlib,
+            CompressionType::Lz4 => hyperscale_production::CompressionType::Lz4,
+            CompressionType::Lz4hc => hyperscale_production::CompressionType::Lz4hc,
+            CompressionType::Zstd => hyperscale_production::CompressionType::Zstd,
+        }
+    }
+}
+
 /// Storage configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
@@ -285,9 +311,29 @@ pub struct StorageConfig {
     #[serde(default = "default_write_buffer_mb")]
     pub write_buffer_mb: usize,
 
+    /// Maximum number of write buffers
+    #[serde(default = "default_max_write_buffer_number")]
+    pub max_write_buffer_number: i32,
+
     /// Block cache size in MB (0 to disable)
     #[serde(default = "default_block_cache_mb")]
     pub block_cache_mb: usize,
+
+    /// Compression type (none, snappy, zlib, lz4, lz4hc, zstd)
+    #[serde(default)]
+    pub compression: CompressionType,
+
+    /// Bloom filter bits per key (0 to disable)
+    #[serde(default = "default_bloom_filter_bits")]
+    pub bloom_filter_bits: f64,
+
+    /// Bytes per sync in MB (0 to disable)
+    #[serde(default = "default_bytes_per_sync_mb")]
+    pub bytes_per_sync_mb: usize,
+
+    /// Number of log files to keep
+    #[serde(default = "default_keep_log_file_num")]
+    pub keep_log_file_num: usize,
 }
 
 impl Default for StorageConfig {
@@ -295,7 +341,12 @@ impl Default for StorageConfig {
         Self {
             max_background_jobs: default_max_background_jobs(),
             write_buffer_mb: default_write_buffer_mb(),
+            max_write_buffer_number: default_max_write_buffer_number(),
             block_cache_mb: default_block_cache_mb(),
+            compression: CompressionType::default(),
+            bloom_filter_bits: default_bloom_filter_bits(),
+            bytes_per_sync_mb: default_bytes_per_sync_mb(),
+            keep_log_file_num: default_keep_log_file_num(),
         }
     }
 }
@@ -308,8 +359,24 @@ fn default_write_buffer_mb() -> usize {
     128
 }
 
+fn default_max_write_buffer_number() -> i32 {
+    3
+}
+
 fn default_block_cache_mb() -> usize {
     512
+}
+
+fn default_bloom_filter_bits() -> f64 {
+    10.0
+}
+
+fn default_bytes_per_sync_mb() -> usize {
+    1
+}
+
+fn default_keep_log_file_num() -> usize {
+    10
 }
 
 /// Metrics configuration.
@@ -669,12 +736,16 @@ fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
     RocksDbConfig {
         max_background_jobs: config.max_background_jobs,
         write_buffer_size: config.write_buffer_mb * 1024 * 1024,
-        max_write_buffer_number: 3,
+        max_write_buffer_number: config.max_write_buffer_number,
         block_cache_size: if config.block_cache_mb > 0 {
             Some(config.block_cache_mb * 1024 * 1024)
         } else {
             None
         },
+        compression: config.compression.into(),
+        bloom_filter_bits: config.bloom_filter_bits,
+        bytes_per_sync: config.bytes_per_sync_mb * 1024 * 1024,
+        keep_log_file_num: config.keep_log_file_num,
         ..RocksDbConfig::default()
     }
 }

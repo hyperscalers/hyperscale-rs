@@ -86,7 +86,7 @@ pub use timers::TimerManager;
 
 pub use network::Libp2pConfig;
 pub use runner::{ProductionRunner, RunnerError, ShutdownHandle};
-pub use storage::{RocksDbConfig, RocksDbStorage, StorageError};
+pub use storage::{CompressionType, RocksDbConfig, RocksDbStorage, StorageError};
 pub use thread_pools::{
     ThreadPoolConfig, ThreadPoolConfigBuilder, ThreadPoolError, ThreadPoolManager,
 };
