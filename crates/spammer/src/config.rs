@@ -37,6 +37,16 @@ pub struct SpammerConfig {
 
     /// Interval between progress reports.
     pub progress_interval: Duration,
+
+    /// Whether to track transaction latency by polling for completion.
+    pub latency_tracking: bool,
+
+    /// Sample rate for latency measurement (0.0 to 1.0).
+    /// Only this fraction of transactions will be tracked.
+    pub latency_sample_rate: f64,
+
+    /// Poll interval for checking transaction status.
+    pub latency_poll_interval: Duration,
 }
 
 impl Default for SpammerConfig {
@@ -55,6 +65,9 @@ impl Default for SpammerConfig {
             network: NetworkDefinition::simulator(),
             batch_size: 100,
             progress_interval: Duration::from_secs(10),
+            latency_tracking: false,
+            latency_sample_rate: 0.01,
+            latency_poll_interval: Duration::from_millis(100),
         }
     }
 }
@@ -113,6 +126,24 @@ impl SpammerConfig {
     /// Set batch size.
     pub fn with_batch_size(mut self, size: usize) -> Self {
         self.batch_size = size;
+        self
+    }
+
+    /// Enable or disable latency tracking.
+    pub fn with_latency_tracking(mut self, enabled: bool) -> Self {
+        self.latency_tracking = enabled;
+        self
+    }
+
+    /// Set the sample rate for latency tracking (0.0 to 1.0).
+    pub fn with_latency_sample_rate(mut self, rate: f64) -> Self {
+        self.latency_sample_rate = rate.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set the poll interval for latency tracking.
+    pub fn with_latency_poll_interval(mut self, interval: Duration) -> Self {
+        self.latency_poll_interval = interval;
         self
     }
 

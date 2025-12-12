@@ -79,6 +79,27 @@ enum Commands {
         /// Batch size for transaction generation
         #[arg(long, default_value = "100")]
         batch_size: usize,
+
+        /// Measure transaction latency by polling for completion
+        ///
+        /// When enabled, a sample of transactions will be tracked until they
+        /// reach a terminal state. This adds overhead but provides latency metrics.
+        #[arg(long)]
+        measure_latency: bool,
+
+        /// Sample rate for latency measurement (0.0 to 1.0)
+        ///
+        /// Controls what fraction of transactions are tracked for latency.
+        /// Lower values reduce overhead. Only used if --measure-latency is set.
+        #[arg(long, default_value = "0.01")]
+        latency_sample_rate: f64,
+
+        /// Poll interval for checking transaction status (e.g., "100ms")
+        ///
+        /// How frequently to poll for transaction completion.
+        /// Only used if --measure-latency is set.
+        #[arg(long, default_value = "100ms")]
+        latency_poll_interval: humantime::Duration,
     },
 
     /// Submit a single transaction and wait for it to complete (smoke test)
@@ -154,13 +175,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             selection,
             wait_ready,
             batch_size,
+            measure_latency,
+            latency_sample_rate,
+            latency_poll_interval,
         } => {
             // Initialize tracing for the run command
             tracing_subscriber::fmt::init();
 
             let selection_mode = parse_selection_mode(&selection)?;
 
-            let config = SpammerConfig::new(endpoints)
+            let mut config = SpammerConfig::new(endpoints)
                 .with_num_shards(num_shards)
                 .with_target_tps(tps)
                 .with_cross_shard_ratio(cross_shard_ratio)
@@ -168,6 +192,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_selection_mode(selection_mode)
                 .with_batch_size(batch_size)
                 .with_network(NetworkDefinition::simulator());
+
+            if measure_latency {
+                config = config
+                    .with_latency_tracking(true)
+                    .with_latency_sample_rate(latency_sample_rate)
+                    .with_latency_poll_interval(*latency_poll_interval);
+            }
 
             let mut spammer = Spammer::new(config)?;
 
@@ -178,6 +209,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             println!("Starting spammer for {:?}...", *duration);
+            if measure_latency {
+                println!(
+                    "Latency tracking enabled (sample rate: {:.1}%, poll interval: {:?})",
+                    latency_sample_rate * 100.0,
+                    *latency_poll_interval
+                );
+            }
             let report = spammer.run_for(*duration).await;
             report.print();
         }

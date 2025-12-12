@@ -3,11 +3,12 @@
 use crate::accounts::AccountPool;
 use crate::client::{RpcClient, RpcError};
 use crate::config::SpammerConfig;
+use crate::latency::{LatencyReport, LatencyTracker};
 use crate::workloads::{TransferWorkload, WorkloadGenerator};
 use hyperscale_types::{shard_for_node, RoutableTransaction};
 use radix_common::math::Decimal;
 use radix_common::types::ComponentAddress;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -22,6 +23,9 @@ pub struct Spammer {
     clients: Vec<RpcClient>,
     stats: SpammerStats,
     rng: ChaCha8Rng,
+    latency_tracker: Option<LatencyTracker>,
+    /// RNG for latency sampling (separate from tx generation).
+    latency_rng: ChaCha8Rng,
 }
 
 impl Spammer {
@@ -43,6 +47,16 @@ impl Spammer {
                 .with_selection_mode(config.selection_mode),
         );
 
+        // Create latency tracker if enabled
+        let latency_tracker = if config.latency_tracking {
+            Some(LatencyTracker::new(
+                clients.clone(),
+                config.latency_poll_interval,
+            ))
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             accounts,
@@ -50,6 +64,8 @@ impl Spammer {
             clients,
             stats: SpammerStats::default(),
             rng: ChaCha8Rng::seed_from_u64(12345),
+            latency_tracker,
+            latency_rng: ChaCha8Rng::seed_from_u64(67890),
         })
     }
 
@@ -74,10 +90,16 @@ impl Spammer {
         let mut last_progress = Instant::now();
         let batch_interval = self.config.batch_interval();
 
+        // Start latency tracking if enabled
+        if let Some(ref mut tracker) = self.latency_tracker {
+            tracker.start_polling();
+        }
+
         info!(
             target_tps = self.config.target_tps,
             batch_size = self.config.batch_size,
             batch_interval_ms = batch_interval.as_millis(),
+            latency_tracking = self.latency_tracker.is_some(),
             "Starting spammer"
         );
 
@@ -98,7 +120,7 @@ impl Spammer {
 
             // Print progress periodically
             if last_progress.elapsed() >= self.config.progress_interval {
-                self.print_progress(start.elapsed());
+                self.print_progress(start.elapsed()).await;
                 last_progress = Instant::now();
             }
 
@@ -107,7 +129,14 @@ impl Spammer {
         }
 
         // Print final progress
-        self.print_progress(start.elapsed());
+        self.print_progress(start.elapsed()).await;
+
+        // Finalize latency tracking
+        let latency_report = if let Some(tracker) = self.latency_tracker.take() {
+            Some(tracker.finalize().await)
+        } else {
+            None
+        };
 
         SpammerReport {
             duration: start.elapsed(),
@@ -116,6 +145,7 @@ impl Spammer {
             total_rejected: self.stats.rejected.load(Ordering::SeqCst),
             total_errors: self.stats.errors.load(Ordering::SeqCst),
             avg_tps: self.stats.tps(),
+            latency_report,
         }
     }
 
@@ -134,11 +164,22 @@ impl Spammer {
         let client_idx = target_shard % self.clients.len();
         let client = &self.clients[client_idx];
 
+        // Decide if we should track this transaction for latency
+        let should_track = self.latency_tracker.is_some()
+            && self.latency_rng.gen::<f64>() < self.config.latency_sample_rate;
+
         // Submit the transaction
         match client.submit_transaction(&tx).await {
             Ok(result) => {
                 if result.accepted {
                     self.stats.accepted.fetch_add(1, Ordering::SeqCst);
+
+                    // Track for latency measurement if sampled
+                    if should_track {
+                        if let Some(ref tracker) = self.latency_tracker {
+                            tracker.track(result.hash, client_idx).await;
+                        }
+                    }
                 } else {
                     self.stats.rejected.fetch_add(1, Ordering::SeqCst);
                     if let Some(error) = result.error {
@@ -154,21 +195,30 @@ impl Spammer {
     }
 
     /// Print progress statistics.
-    fn print_progress(&self, elapsed: Duration) {
+    async fn print_progress(&self, elapsed: Duration) {
         let submitted = self.stats.submitted.load(Ordering::SeqCst);
         let accepted = self.stats.accepted.load(Ordering::SeqCst);
         let rejected = self.stats.rejected.load(Ordering::SeqCst);
         let errors = self.stats.errors.load(Ordering::SeqCst);
         let tps = self.stats.tps();
 
+        // Get in-flight count for latency tracking
+        let in_flight_info = if let Some(ref tracker) = self.latency_tracker {
+            let count = tracker.in_flight_count().await;
+            format!(" | tracking: {}", count)
+        } else {
+            String::new()
+        };
+
         println!(
-            "[{:>3}s] submitted: {} | accepted: {} | rejected: {} | errors: {} | tps: {:.0}",
+            "[{:>3}s] submitted: {} | accepted: {} | rejected: {} | errors: {} | tps: {:.0}{}",
             elapsed.as_secs(),
             submitted,
             accepted,
             rejected,
             errors,
-            tps
+            tps,
+            in_flight_info
         );
     }
 
@@ -246,7 +296,6 @@ impl SpammerStats {
 }
 
 /// Report generated after a spammer run.
-#[derive(Debug)]
 pub struct SpammerReport {
     /// Total duration of the run.
     pub duration: Duration,
@@ -260,6 +309,8 @@ pub struct SpammerReport {
     pub total_errors: u64,
     /// Average transactions per second.
     pub avg_tps: f64,
+    /// Latency report (if latency tracking was enabled).
+    pub latency_report: Option<LatencyReport>,
 }
 
 impl SpammerReport {
@@ -272,6 +323,10 @@ impl SpammerReport {
         println!("Rejected: {}", self.total_rejected);
         println!("Errors: {}", self.total_errors);
         println!("Avg TPS: {:.2}", self.avg_tps);
+
+        if let Some(ref latency) = self.latency_report {
+            latency.print_summary();
+        }
     }
 }
 
