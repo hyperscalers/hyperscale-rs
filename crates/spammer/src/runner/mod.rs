@@ -37,6 +37,13 @@ impl Spammer {
         let accounts = AccountPool::generate(config.num_shards, config.accounts_per_shard)
             .map_err(SpammerError::AccountGeneration)?;
 
+        // Load nonces from file to continue where previous runs left off
+        match accounts.load_nonces_default() {
+            Ok(n) if n > 0 => info!(loaded = n, "Loaded account nonces from file"),
+            Ok(_) => {} // No file or empty, starting fresh
+            Err(e) => warn!(error = %e, "Failed to load nonces, starting fresh"),
+        }
+
         // Create RPC clients
         let clients: Vec<RpcClient> = config.rpc_endpoints.iter().map(RpcClient::new).collect();
 
@@ -57,15 +64,21 @@ impl Spammer {
             None
         };
 
+        // Use current time as seed to generate unique transactions each run
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+
         Ok(Self {
             config,
             accounts,
             workload,
             clients,
             stats: SpammerStats::default(),
-            rng: ChaCha8Rng::seed_from_u64(12345),
+            rng: ChaCha8Rng::seed_from_u64(seed),
             latency_tracker,
-            latency_rng: ChaCha8Rng::seed_from_u64(67890),
+            latency_rng: ChaCha8Rng::seed_from_u64(seed.wrapping_add(1)),
         })
     }
 
@@ -130,6 +143,12 @@ impl Spammer {
 
         // Print final progress
         self.print_progress(start.elapsed()).await;
+
+        // Save nonces for next run
+        match self.accounts.save_nonces_default() {
+            Ok(n) => info!(saved = n, "Saved account nonces to file"),
+            Err(e) => warn!(error = %e, "Failed to save nonces"),
+        }
 
         // Finalize latency tracking
         let latency_report = if let Some(tracker) = self.latency_tracker.take() {

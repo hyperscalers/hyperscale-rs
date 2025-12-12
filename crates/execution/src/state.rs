@@ -306,8 +306,17 @@ impl ExecutionState {
 
         // Handle single-shard transactions (now use voting like cross-shard)
         // All WRITE operations need BLS signature aggregation
-        for tx in single_shard {
-            actions.extend(self.start_single_shard_execution(tx, height, block_hash));
+        for tx in &single_shard {
+            actions.extend(self.start_single_shard_execution(tx.clone(), height, block_hash));
+        }
+
+        // Batch execute all single-shard transactions for this block
+        if !single_shard.is_empty() {
+            actions.push(Action::ExecuteTransactions {
+                block_hash,
+                transactions: single_shard,
+                state_root: Hash::from_bytes(&[0u8; 32]),
+            });
         }
 
         // Handle cross-shard transactions (2PC)
@@ -388,38 +397,11 @@ impl ExecutionState {
         }
 
         // Step 5: Track pending single-shard execution
+        // ExecuteTransactions is emitted by on_block_committed after all txs are collected
         self.pending_single_shard_executions
             .entry(block_hash)
             .or_default()
             .push(tx);
-
-        // Step 6: Request execution
-        // We batch single-shard txs by block for efficiency
-        // The actual execution request is made after all txs for this block are collected
-        // (done in on_block_committed, after processing all transactions)
-        if !self
-            .pending_single_shard_executions
-            .contains_key(&block_hash)
-            || self
-                .pending_single_shard_executions
-                .get(&block_hash)
-                .map(|v| v.len())
-                == Some(1)
-        {
-            // First tx for this block, schedule execution
-            let txs = self
-                .pending_single_shard_executions
-                .get(&block_hash)
-                .cloned()
-                .unwrap_or_default();
-            if !txs.is_empty() {
-                actions.push(Action::ExecuteTransactions {
-                    block_hash,
-                    transactions: txs,
-                    state_root: Hash::from_bytes(&[0u8; 32]),
-                });
-            }
-        }
 
         actions
     }

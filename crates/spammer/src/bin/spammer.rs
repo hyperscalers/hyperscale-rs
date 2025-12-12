@@ -274,11 +274,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let accounts = AccountPool::generate(num_shards, accounts_per_shard)
                 .expect("Failed to generate account pool");
 
+            // Load nonces from file to continue where previous runs left off
+            match accounts.load_nonces_default() {
+                Ok(n) if n > 0 => println!("Loaded {} account nonces from file", n),
+                Ok(_) => {} // No file or empty, starting fresh
+                Err(e) => eprintln!("Warning: failed to load nonces: {}", e),
+            }
+
             // Create a simple same-shard transfer
             let workload =
                 TransferWorkload::new(NetworkDefinition::simulator()).with_cross_shard_ratio(0.0); // Same-shard for simplicity
 
-            let mut rng = ChaCha8Rng::seed_from_u64(99999); // Different seed to avoid conflicts
+            // Use current time as seed to generate unique transactions each run
+            let seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
             let tx = workload
                 .generate_one(&accounts, &mut rng)
                 .expect("Failed to generate transaction");
@@ -351,6 +363,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                             if status.is_success() {
                                 println!("Result: SUCCESS");
+                                // Save nonces for next run
+                                if let Err(e) = accounts.save_nonces_default() {
+                                    eprintln!("Warning: failed to save nonces: {}", e);
+                                }
                             } else {
                                 println!("Result: FAILED");
                                 if let Some(error) = &status.error {

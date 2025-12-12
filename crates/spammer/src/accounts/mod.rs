@@ -500,6 +500,82 @@ pub enum AccountPoolError {
         shards: u64,
         accounts_per_shard: usize,
     },
+    #[error("Failed to load nonces: {0}")]
+    NonceLoadError(String),
+    #[error("Failed to save nonces: {0}")]
+    NonceSaveError(String),
+}
+
+/// Default path for nonce state file.
+pub const DEFAULT_NONCE_FILE: &str = ".hyperscale-nonces.json";
+
+impl AccountPool {
+    /// Load nonces from a JSON file.
+    ///
+    /// File format: `{"<address_hex>": <nonce>, ...}`
+    /// Accounts not in the file keep their current nonce (0 for fresh pools).
+    pub fn load_nonces(&self, path: &std::path::Path) -> Result<usize, AccountPoolError> {
+        use std::sync::atomic::Ordering;
+
+        let contents = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(AccountPoolError::NonceLoadError(e.to_string())),
+        };
+
+        let nonces: HashMap<String, u64> = serde_json::from_str(&contents)
+            .map_err(|e| AccountPoolError::NonceLoadError(e.to_string()))?;
+
+        let mut loaded = 0;
+        for accounts in self.by_shard.values() {
+            for account in accounts {
+                let addr_hex = hex::encode(account.address.as_bytes());
+                if let Some(&nonce) = nonces.get(&addr_hex) {
+                    account.nonce.store(nonce, Ordering::SeqCst);
+                    loaded += 1;
+                }
+            }
+        }
+
+        Ok(loaded)
+    }
+
+    /// Save current nonces to a JSON file.
+    ///
+    /// Only saves accounts with nonce > 0 to keep the file small.
+    pub fn save_nonces(&self, path: &std::path::Path) -> Result<usize, AccountPoolError> {
+        use std::sync::atomic::Ordering;
+
+        let mut nonces: HashMap<String, u64> = HashMap::new();
+
+        for accounts in self.by_shard.values() {
+            for account in accounts {
+                let nonce = account.nonce.load(Ordering::SeqCst);
+                if nonce > 0 {
+                    let addr_hex = hex::encode(account.address.as_bytes());
+                    nonces.insert(addr_hex, nonce);
+                }
+            }
+        }
+
+        let contents = serde_json::to_string_pretty(&nonces)
+            .map_err(|e| AccountPoolError::NonceSaveError(e.to_string()))?;
+
+        std::fs::write(path, contents)
+            .map_err(|e| AccountPoolError::NonceSaveError(e.to_string()))?;
+
+        Ok(nonces.len())
+    }
+
+    /// Load nonces from the default file path.
+    pub fn load_nonces_default(&self) -> Result<usize, AccountPoolError> {
+        self.load_nonces(std::path::Path::new(DEFAULT_NONCE_FILE))
+    }
+
+    /// Save nonces to the default file path.
+    pub fn save_nonces_default(&self) -> Result<usize, AccountPoolError> {
+        self.save_nonces(std::path::Path::new(DEFAULT_NONCE_FILE))
+    }
 }
 
 #[cfg(test)]

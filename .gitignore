@@ -44,6 +44,7 @@ LOG*
 data/
 keys/
 cluster-data/
+.hyperscale-nonces.json
 
 # Modelling
 tla/
