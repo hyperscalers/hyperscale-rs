@@ -34,7 +34,7 @@ pub struct Libp2pConfig {
 
     /// Maximum message size in bytes.
     ///
-    /// Default: 65536 (64KB)
+    /// Default: 1MB
     pub max_message_size: usize,
 
     /// Gossipsub heartbeat interval.
@@ -55,7 +55,7 @@ impl Default for Libp2pConfig {
             listen_addresses: vec!["/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap()],
             bootstrap_peers: vec![],
             request_timeout: Duration::from_secs(30),
-            max_message_size: 65536, // 64KB
+            max_message_size: 1024 * 1024, // 1MB
             gossipsub_heartbeat: Duration::from_secs(1),
             idle_connection_timeout: Duration::from_secs(60),
         }
@@ -107,7 +107,7 @@ impl Libp2pConfig {
                 .unwrap()],
             bootstrap_peers: vec![],
             request_timeout: Duration::from_secs(5),
-            max_message_size: 65536,
+            max_message_size: 1024 * 1024, // 1MB
             gossipsub_heartbeat: Duration::from_millis(500),
             idle_connection_timeout: Duration::from_secs(30),
         }
@@ -122,7 +122,7 @@ mod tests {
     fn test_default_config() {
         let config = Libp2pConfig::default();
         assert_eq!(config.request_timeout, Duration::from_secs(30));
-        assert_eq!(config.max_message_size, 65536);
+        assert_eq!(config.max_message_size, 1024 * 1024);
         assert_eq!(config.gossipsub_heartbeat, Duration::from_secs(1));
         assert!(!config.listen_addresses.is_empty());
         assert!(config.bootstrap_peers.is_empty());
