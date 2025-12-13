@@ -26,6 +26,9 @@ pub struct Spammer {
     latency_tracker: Option<LatencyTracker>,
     /// RNG for latency sampling (separate from tx generation).
     latency_rng: ChaCha8Rng,
+    /// Round-robin counter for distributing load across validators within each shard.
+    /// Indexed by shard number.
+    shard_round_robin: Vec<AtomicU64>,
 }
 
 impl Spammer {
@@ -70,6 +73,9 @@ impl Spammer {
             .unwrap()
             .as_nanos() as u64;
 
+        // Initialize round-robin counters for each shard
+        let shard_round_robin = (0..config.num_shards).map(|_| AtomicU64::new(0)).collect();
+
         Ok(Self {
             config,
             accounts,
@@ -79,6 +85,7 @@ impl Spammer {
             rng: ChaCha8Rng::seed_from_u64(seed),
             latency_tracker,
             latency_rng: ChaCha8Rng::seed_from_u64(seed.wrapping_add(1)),
+            shard_round_robin,
         })
     }
 
@@ -169,6 +176,8 @@ impl Spammer {
     }
 
     /// Submit a single transaction to the appropriate shard endpoint.
+    ///
+    /// Distributes load across all validators in the target shard using round-robin.
     async fn submit_transaction(&mut self, tx: RoutableTransaction) {
         self.stats.submitted.fetch_add(1, Ordering::SeqCst);
 
@@ -179,8 +188,16 @@ impl Spammer {
             0
         };
 
-        // Get the client for this shard (modulo number of clients)
-        let client_idx = target_shard % self.clients.len();
+        // Calculate client index using round-robin within the shard.
+        // Endpoints are expected to be organized as: shard0_v0, shard0_v1, ..., shard1_v0, ...
+        let validators_per_shard = self.config.validators_per_shard;
+        let base_idx = target_shard * validators_per_shard;
+
+        // Get round-robin offset for this shard
+        let rr_counter = &self.shard_round_robin[target_shard];
+        let offset = rr_counter.fetch_add(1, Ordering::Relaxed) as usize % validators_per_shard;
+
+        let client_idx = (base_idx + offset) % self.clients.len();
         let client = &self.clients[client_idx];
 
         // Decide if we should track this transaction for latency

@@ -268,11 +268,10 @@ echo "  View logs:     tail -f $DATA_DIR/validator-0/output.log"
 echo "  Stop cluster:  ./scripts/stop-cluster.sh"
 echo ""
 
-# Build spammer endpoint list
+# Build spammer endpoint list (all validators for load distribution)
 SPAMMER_ENDPOINTS=""
-for shard in $(seq 0 $((NUM_SHARDS - 1))); do
-    first_validator=$((shard * VALIDATORS_PER_SHARD))
-    rpc_port=$((BASE_RPC_PORT + first_validator))
+for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
+    rpc_port=$((BASE_RPC_PORT + i))
     if [ -n "$SPAMMER_ENDPOINTS" ]; then
         SPAMMER_ENDPOINTS="$SPAMMER_ENDPOINTS,"
     fi
@@ -283,6 +282,7 @@ echo "Run spammer:"
 echo "  $SPAMMER_BIN run \\"
 echo "    --endpoints $SPAMMER_ENDPOINTS \\"
 echo "    --num-shards $NUM_SHARDS \\"
+echo "    --validators-per-shard $VALIDATORS_PER_SHARD \\"
 echo "    --tps 100 \\"
 echo "    --duration 30s"
 echo ""

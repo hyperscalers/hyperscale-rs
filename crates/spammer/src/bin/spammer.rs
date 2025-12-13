@@ -52,6 +52,10 @@ enum Commands {
         #[arg(long, default_value = "2")]
         num_shards: u64,
 
+        /// Number of validators per shard (for load distribution)
+        #[arg(long, default_value = "1")]
+        validators_per_shard: usize,
+
         /// Target transactions per second
         #[arg(long, default_value = "1000")]
         tps: u64,
@@ -169,6 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Run {
             endpoints,
             num_shards,
+            validators_per_shard,
             tps,
             duration,
             cross_shard_ratio,
@@ -190,6 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut config = SpammerConfig::new(endpoints)
                 .with_num_shards(num_shards)
+                .with_validators_per_shard(validators_per_shard)
                 .with_target_tps(tps)
                 .with_cross_shard_ratio(cross_shard_ratio)
                 .with_accounts_per_shard(accounts_per_shard)

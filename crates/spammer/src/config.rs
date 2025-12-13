@@ -11,6 +11,10 @@ pub struct SpammerConfig {
     /// Number of shards in the network.
     pub num_shards: u64,
 
+    /// Number of validators (endpoints) per shard.
+    /// Used to distribute load across multiple nodes in each shard.
+    pub validators_per_shard: usize,
+
     /// RPC endpoints for each shard (at least one per shard).
     pub rpc_endpoints: Vec<String>,
 
@@ -53,6 +57,7 @@ impl Default for SpammerConfig {
     fn default() -> Self {
         Self {
             num_shards: 2,
+            validators_per_shard: 1,
             rpc_endpoints: vec![
                 "http://localhost:8080".into(),
                 "http://localhost:8083".into(),
@@ -84,6 +89,12 @@ impl SpammerConfig {
     /// Set the number of shards.
     pub fn with_num_shards(mut self, num_shards: u64) -> Self {
         self.num_shards = num_shards;
+        self
+    }
+
+    /// Set the number of validators per shard.
+    pub fn with_validators_per_shard(mut self, validators: usize) -> Self {
+        self.validators_per_shard = validators.max(1);
         self
     }
 
