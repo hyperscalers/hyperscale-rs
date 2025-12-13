@@ -1769,6 +1769,17 @@ fn test_partition_recovery_via_view_change_sync() {
     println!("  Min height: {}", min_height);
     println!("  Divergence: {}", max_height - min_height);
 
+    // CRITICAL: After partition heals, at least some nodes should make progress.
+    // This verifies that the system isn't completely stuck due to view change bugs.
+    assert!(
+        max_height > height_during,
+        "At least some nodes should make progress after partition heals. \
+         max_height={} should be > height_during={}. \
+         If all nodes are stuck, there may be a view change bug.",
+        max_height,
+        height_during
+    );
+
     // After view change votes trigger sync, all nodes should be at the same height.
     // The view change votes carry highest_qc, which allows lagging nodes to discover
     // committed blocks and sync up even without new proposals.

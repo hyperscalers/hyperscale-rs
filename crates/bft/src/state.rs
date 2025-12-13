@@ -860,36 +860,32 @@ impl BftState {
         // Check if this header reveals we're significantly behind and need to sync.
         // The parent_qc certifies block at height N-1 for a block at height N.
         //
-        // IMPORTANT: We use the maximum of committed_height and latest_qc height to
-        // determine our "known" height. This is critical because:
-        // - When we form a QC for block N, it commits block N-1 (two-chain rule)
-        // - But the commit is processed asynchronously, so committed_height may lag
-        // - If we only check committed_height, we may incorrectly trigger sync
-        //   when receiving proposals that build on our latest_qc
+        // IMPORTANT: We use committed_height (not latest_qc.height) to determine if
+        // we need to sync. The reason is that latest_qc can be updated from:
+        // 1. Block headers we receive but can't process (we update latest_qc below)
+        // 2. View change certificates/votes
+        // In both cases, we may have a high latest_qc without actually having the
+        // blocks, which would prevent sync from being triggered.
         //
-        // We can participate in consensus for blocks up to latest_qc.height + 2:
-        // - latest_qc certifies height N
-        // - We can vote on height N+1 (extends latest_qc)
-        // - We can receive proposals for height N+2 (which reference N+1's QC once formed)
+        // Using committed_height ensures we trigger sync when the incoming block
+        // references parents we haven't actually committed.
+        //
+        // The two-chain commit rule means we may receive blocks 1-2 heights ahead
+        // of our committed_height, but anything beyond that requires sync.
         if !header.parent_qc.is_genesis() {
             let parent_height = header.parent_qc.height.0;
-            // Use the highest certified height we know about, not just committed height
-            let our_known_height = self
-                .latest_qc
-                .as_ref()
-                .map(|qc| qc.height.0)
-                .unwrap_or(0)
-                .max(self.committed_height);
-            // Only trigger sync if parent_qc references a height beyond what we can reach
-            // through normal consensus (our_known_height + 1)
-            if parent_height > our_known_height + 1 {
+            // Trigger sync if the parent QC references a height beyond what we've committed + 2.
+            // The +2 accounts for:
+            // - Block at committed_height + 1 is pending (waiting for QC to commit committed_height)
+            // - Block at committed_height + 2 can be proposed once we have the QC
+            if parent_height > self.committed_height + 2 {
                 let target_height = parent_height;
                 let target_hash = header.parent_qc.block_hash;
 
                 info!(
                     validator = ?self.validator_id(),
-                    our_committed_height = self.committed_height,
-                    our_known_height = our_known_height,
+                    committed_height = self.committed_height,
+                    parent_height = parent_height,
                     target_height = target_height,
                     "Detected we're significantly behind, triggering sync"
                 );
@@ -2246,12 +2242,36 @@ impl BftState {
 
         // Update our latest_qc if the view change certificate has a newer one
         // This is critical: if there's a QC at the current height, we should know about it
+        //
+        // IMPORTANT: If the highest_qc height is significantly ahead of our committed_height,
+        // we need to trigger sync. This handles the case where we receive view change
+        // votes/certificates from validators who have seen more blocks than us.
+        // Without this check, we could update latest_qc to a high height without having
+        // the actual blocks, which would prevent the sync trigger in on_block_header
+        // (since it uses max(latest_qc.height, committed_height) to determine if we need sync).
+        let mut sync_action = None;
         if !highest_qc.is_genesis() {
             let should_update = self
                 .latest_qc
                 .as_ref()
                 .is_none_or(|existing| highest_qc.height.0 > existing.height.0);
             if should_update {
+                // Check if we need to sync before updating latest_qc
+                // We need sync if the QC references blocks we don't have
+                if highest_qc.height.0 > self.committed_height + 1 {
+                    info!(
+                        validator = ?self.validator_id(),
+                        qc_height = highest_qc.height.0,
+                        committed_height = self.committed_height,
+                        "View change has QC ahead of committed height, triggering sync"
+                    );
+                    sync_action = Some(Action::EnqueueInternal {
+                        event: Event::SyncNeeded {
+                            target_height: highest_qc.height.0,
+                            target_hash: highest_qc.block_hash,
+                        },
+                    });
+                }
                 info!(
                     validator = ?self.validator_id(),
                     qc_height = highest_qc.height.0,
@@ -2297,12 +2317,16 @@ impl BftState {
 
             // Emit a QuorumCertificateFormed event so the node state machine can handle it
             // (it has access to mempool data needed for the next proposal).
-            return vec![Action::EnqueueInternal {
+            let mut actions = vec![Action::EnqueueInternal {
                 event: Event::QuorumCertificateFormed {
                     block_hash: highest_qc.block_hash,
                     qc: highest_qc,
                 },
             }];
+            if let Some(action) = sync_action {
+                actions.push(action);
+            }
+            return actions;
         }
 
         // If the highest_qc from the view change is for a height BEFORE the current height,
@@ -2365,7 +2389,11 @@ impl BftState {
                 );
 
                 // Re-propose the block we're locked to so other validators can vote on it
-                return self.repropose_locked_block(existing_hash, height);
+                let mut actions = self.repropose_locked_block(existing_hash, height);
+                if let Some(action) = sync_action {
+                    actions.push(action);
+                }
+                return actions;
             }
 
             info!(
@@ -2376,14 +2404,22 @@ impl BftState {
             );
 
             // Build and broadcast fallback block
-            return self.build_and_broadcast_fallback_block(height, new_round);
+            let mut actions = self.build_and_broadcast_fallback_block(height, new_round);
+            if let Some(action) = sync_action {
+                actions.push(action);
+            }
+            return actions;
         }
 
         // Not the proposer - restart the proposal timer to wait for new proposer
-        vec![Action::SetTimer {
+        let mut actions = vec![Action::SetTimer {
             id: TimerId::Proposal,
             duration: self.config.proposal_interval,
-        }]
+        }];
+        if let Some(action) = sync_action {
+            actions.push(action);
+        }
+        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
