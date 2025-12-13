@@ -134,9 +134,6 @@ pub enum Event {
         block: Block,
     },
 
-    /// A transaction was accepted into the mempool.
-    TransactionAccepted { tx_hash: Hash },
-
     /// View change completed (round increment).
     ///
     /// Includes the highest QC from the view change certificate, which may allow
@@ -543,7 +540,6 @@ impl Event {
             Event::QuorumCertificateFormed { .. }
             | Event::BlockReadyToCommit { .. }
             | Event::BlockCommitted { .. }
-            | Event::TransactionAccepted { .. }
             | Event::ViewChangeCompleted { .. }
             | Event::ViewChangeQuorumReached { .. }
             | Event::TransactionExecuted { .. }
@@ -650,7 +646,6 @@ impl Event {
             Event::QuorumCertificateFormed { .. } => "QuorumCertificateFormed",
             Event::BlockReadyToCommit { .. } => "BlockReadyToCommit",
             Event::BlockCommitted { .. } => "BlockCommitted",
-            Event::TransactionAccepted { .. } => "TransactionAccepted",
             Event::ViewChangeCompleted { .. } => "ViewChangeCompleted",
             Event::ViewChangeQuorumReached { .. } => "ViewChangeQuorumReached",
             Event::TransactionExecuted { .. } => "TransactionExecuted",

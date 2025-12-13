@@ -308,10 +308,14 @@ impl ProductionRunnerBuilder {
             .ed25519_keypair
             .ok_or_else(|| RunnerError::SendError("network keypair is required".into()))?;
 
-        // Separate channels for consensus (high priority) and transactions (low priority)
+        // Separate channels for different event priorities:
+        // - consensus_tx/rx: High priority BFT events (votes, proposals, QCs, timers)
+        // - transaction_tx/rx: Transaction ingestion (gossip, submissions)
+        // - status_tx/rx: Transaction status updates (non-consensus-critical)
         // This prevents transaction floods from starving consensus events
         let (consensus_tx, consensus_rx) = mpsc::channel(self.channel_capacity);
         let (transaction_tx, transaction_rx) = mpsc::channel(self.channel_capacity);
+        let (status_tx, status_rx) = mpsc::channel(self.channel_capacity);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let validator_id = topology.local_validator_id();
         let local_shard = topology.local_shard();
@@ -379,6 +383,8 @@ impl ProductionRunnerBuilder {
             consensus_tx,
             transaction_rx,
             transaction_tx,
+            status_rx,
+            status_tx,
             state,
             start_time: Instant::now(),
             thread_pools,
@@ -425,6 +431,11 @@ pub struct ProductionRunner {
     transaction_rx: mpsc::Receiver<Event>,
     /// Clone this to send transaction events (used by submit_transaction).
     transaction_tx: mpsc::Sender<Event>,
+    /// Receives background status events (TransactionStatusChanged, TransactionExecuted).
+    /// These are non-consensus-critical and processed opportunistically.
+    status_rx: mpsc::Receiver<Event>,
+    /// Clone this to send status events.
+    status_tx: mpsc::Sender<Event>,
     /// The state machine (owned, not shared).
     state: NodeStateMachine,
     /// Start time for calculating elapsed duration.
@@ -897,43 +908,81 @@ impl ProductionRunner {
                     consensus_batch_count = 0;
                 }
 
+                // LOW PRIORITY: Transaction status updates (non-consensus-critical)
+                // These update mempool status for RPC queries but don't affect consensus
+                Some(event) = self.status_rx.recv() => {
+                    let event_type = event.type_name();
+                    let event_span = span!(
+                        Level::DEBUG,
+                        "handle_status_event",
+                        event.type = %event_type,
+                    );
+                    let _event_guard = event_span.enter();
+
+                    // Update time
+                    let now = self.start_time.elapsed();
+                    self.state.set_time(now);
+
+                    // Process status event (updates mempool state)
+                    let actions = self.state.handle(event);
+
+                    for action in actions {
+                        if let Err(e) = self.process_action(action).await {
+                            tracing::error!(error = ?e, "Error processing status action");
+                        }
+                    }
+
+                    // Reset batch counter - we yielded, now back to prioritizing consensus
+                    consensus_batch_count = 0;
+                }
+
                 // LOW PRIORITY: Periodic metrics update (1 second)
+                // IMPORTANT: This branch must NOT block on async operations to avoid
+                // delaying consensus processing. Use non-blocking variants only.
                 _ = metrics_tick.tick() => {
-                    // Update thread pool queue depths
+                    // Update thread pool queue depths (non-blocking)
                     crate::metrics::set_pool_queue_depths(
                         self.thread_pools.crypto_queue_depth(),
                         self.thread_pools.execution_queue_depth(),
                     );
 
-                    // Update sync status
+                    // Update sync status (non-blocking)
                     crate::metrics::set_sync_status(
                         self.sync_manager.blocks_behind(),
                         self.sync_manager.is_syncing(),
                     );
 
-                    // Update peer count
-                    let peer_count = self.network.connected_peers().await.len();
+                    // Update peer count using cached value (non-blocking)
+                    // The cache is updated by the network event loop on connection changes
+                    let peer_count = self.network.cached_peer_count();
                     crate::metrics::set_libp2p_peers(peer_count);
 
-                    // Update RPC status with peer count
+                    // Update RPC status with peer count (non-blocking: skip if contended)
                     if let Some(ref rpc_status) = self.rpc_status {
-                        let mut status = rpc_status.write().await;
-                        status.connected_peers = peer_count;
+                        if let Ok(mut status) = rpc_status.try_write() {
+                            status.connected_peers = peer_count;
+                        }
+                        // If lock is contended, skip this update - RPC is reading
                     }
 
-                    // Update mempool snapshot for RPC queries
+                    // Update mempool snapshot for RPC queries (non-blocking: skip if contended)
                     if let Some(ref snapshot) = self.mempool_snapshot {
                         let stats = self.state.mempool().lock_contention_stats();
                         let total = self.state.mempool().len();
-                        let mut snap = snapshot.write().await;
-                        snap.pending_count = stats.pending_count as usize;
-                        snap.blocked_count = stats.blocked_count as usize;
-                        // executing = total - pending - blocked (approximately)
-                        snap.executing_count = total.saturating_sub(stats.pending_count as usize)
-                            .saturating_sub(stats.blocked_count as usize);
-                        snap.total_count = total;
-                        snap.updated_at = Some(std::time::Instant::now());
+                        if let Ok(mut snap) = snapshot.try_write() {
+                            snap.pending_count = stats.pending_count as usize;
+                            snap.blocked_count = stats.blocked_count as usize;
+                            // executing = total - pending - blocked (approximately)
+                            snap.executing_count = total.saturating_sub(stats.pending_count as usize)
+                                .saturating_sub(stats.blocked_count as usize);
+                            snap.total_count = total;
+                            snap.updated_at = Some(std::time::Instant::now());
+                        }
+                        // If lock is contended, skip this update - RPC is reading
                     }
+
+                    // Reset batch counter - we yielded, now back to prioritizing consensus
+                    consensus_batch_count = 0;
                 }
             }
         }
@@ -1353,12 +1402,28 @@ impl ProductionRunner {
                 });
             }
 
-            // Internal events go back through the consensus channel (high priority)
+            // Internal events are routed based on criticality:
+            // - Status events (TransactionStatusChanged, TransactionExecuted) go to status channel
+            // - All other internal events (QC formed, block committed, etc.) go to consensus channel
             Action::EnqueueInternal { event } => {
-                self.consensus_tx
-                    .send(event)
-                    .await
-                    .map_err(|e| RunnerError::SendError(e.to_string()))?;
+                let is_status_event = matches!(
+                    &event,
+                    Event::TransactionStatusChanged { .. } | Event::TransactionExecuted { .. }
+                );
+
+                if is_status_event {
+                    // Non-consensus-critical: route to status channel
+                    self.status_tx
+                        .send(event)
+                        .await
+                        .map_err(|e| RunnerError::SendError(e.to_string()))?;
+                } else {
+                    // Consensus-critical: route to consensus channel
+                    self.consensus_tx
+                        .send(event)
+                        .await
+                        .map_err(|e| RunnerError::SendError(e.to_string()))?;
+                }
             }
 
             Action::EmitTransactionStatus { tx_hash, status } => {

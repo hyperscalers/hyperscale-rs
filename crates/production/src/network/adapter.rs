@@ -22,6 +22,7 @@ use libp2p::{
     Multiaddr, PeerId as Libp2pPeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -313,6 +314,10 @@ pub struct Libp2pAdapter {
     /// Channel for inbound transaction fetch requests (sent to runner for processing).
     #[allow(dead_code)]
     tx_request_tx: mpsc::Sender<InboundTransactionRequest>,
+
+    /// Cached connected peer count (updated by background task).
+    /// This avoids blocking the consensus loop to query peer count.
+    cached_peer_count: Arc<AtomicUsize>,
 }
 
 impl Libp2pAdapter {
@@ -433,6 +438,7 @@ impl Libp2pAdapter {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (sync_request_tx, sync_request_rx) = mpsc::channel(100); // Buffer for inbound sync requests
         let (tx_request_tx, tx_request_rx) = mpsc::channel(100); // Buffer for inbound transaction requests
+        let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
         let adapter = Arc::new(Self {
             local_peer_id,
@@ -447,6 +453,7 @@ impl Libp2pAdapter {
             shutdown_tx: Some(shutdown_tx),
             sync_request_tx: sync_request_tx.clone(),
             tx_request_tx: tx_request_tx.clone(),
+            cached_peer_count: cached_peer_count.clone(),
         });
 
         // Spawn event loop (takes ownership of swarm)
@@ -463,6 +470,7 @@ impl Libp2pAdapter {
             tx_request_tx,
             rate_limit_config,
             tx_validator,
+            cached_peer_count,
         ));
 
         Ok((adapter, sync_request_rx, tx_request_rx))
@@ -571,7 +579,20 @@ impl Libp2pAdapter {
         self.local_validator_id
     }
 
-    /// Get connected peers.
+    /// Get the cached connected peer count (non-blocking).
+    ///
+    /// This returns instantly from an atomic counter that's updated by the
+    /// network event loop whenever connections are established or closed.
+    /// Use this in hot paths like the consensus event loop.
+    pub fn cached_peer_count(&self) -> usize {
+        self.cached_peer_count.load(Ordering::Relaxed)
+    }
+
+    /// Get connected peers (blocking - sends command to swarm task).
+    ///
+    /// NOTE: This method blocks on a channel response from the swarm task.
+    /// For hot paths like metrics collection in the consensus loop, prefer
+    /// `cached_peer_count()` which returns instantly.
     pub async fn connected_peers(&self) -> Vec<Libp2pPeerId> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = SwarmCommand::GetConnectedPeers { response_tx: tx };
@@ -700,6 +721,7 @@ impl Libp2pAdapter {
         tx_request_tx: mpsc::Sender<InboundTransactionRequest>,
         rate_limit_config: RateLimitConfig,
         tx_validator: Arc<TransactionValidation>,
+        cached_peer_count: Arc<AtomicUsize>,
     ) {
         // Track pending sync requests (outbound)
         let mut pending_requests: HashMap<
@@ -729,6 +751,12 @@ impl Libp2pAdapter {
 
                 // Handle swarm events
                 event = swarm.select_next_some() => {
+                    // Check if this is a connection event that changes peer count
+                    let is_connection_event = matches!(
+                        &event,
+                        SwarmEvent::ConnectionEstablished { .. } | SwarmEvent::ConnectionClosed { .. }
+                    );
+
                     Self::handle_swarm_event(
                         event,
                         &consensus_tx,
@@ -742,6 +770,12 @@ impl Libp2pAdapter {
                         &mut rate_limiter,
                         &tx_validator,
                     ).await;
+
+                    // Update cached peer count after connection changes
+                    if is_connection_event {
+                        let count = swarm.connected_peers().count();
+                        cached_peer_count.store(count, Ordering::Relaxed);
+                    }
                 }
             }
         }

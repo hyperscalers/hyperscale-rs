@@ -108,13 +108,10 @@ impl MempoolState {
         );
         tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
 
-        // Return actions: accept the transaction, broadcast to relevant shards, and notify client
-        let mut actions = vec![Action::EnqueueInternal {
-            event: Event::TransactionAccepted { tx_hash: hash },
-        }];
-
         // Broadcast to all shards involved in this transaction (consensus + provisioning)
-        actions.extend(self.broadcast_to_transaction_shards(&tx));
+        // Note: We don't emit TransactionAccepted as an event - it was purely informational
+        // and would flood the consensus channel under high transaction load.
+        let mut actions = self.broadcast_to_transaction_shards(&tx);
 
         actions.push(Action::EmitTransactionStatus {
             tx_hash: hash,
@@ -147,10 +144,11 @@ impl MempoolState {
                 added_at: self.now,
             },
         );
+        tracing::debug!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
 
-        vec![Action::EnqueueInternal {
-            event: Event::TransactionAccepted { tx_hash: hash },
-        }]
+        // Note: We don't emit TransactionAccepted as an event - it was purely informational
+        // and would flood the consensus channel under high transaction load.
+        vec![]
     }
 
     /// Handle transaction received via gossip.

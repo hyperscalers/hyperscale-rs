@@ -537,12 +537,6 @@ impl StateMachine for NodeStateMachine {
                 return actions;
             }
 
-            // TransactionAccepted is informational - just log at debug level
-            Event::TransactionAccepted { tx_hash } => {
-                tracing::debug!(?tx_hash, "Transaction accepted into mempool");
-                return vec![];
-            }
-
             // Storage callback events - route to appropriate handler
             Event::StateEntriesFetched { .. } => {
                 // TODO: Route to execution for provisioning completion
