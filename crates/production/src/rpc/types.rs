@@ -50,6 +50,8 @@ pub struct NodeStatusResponse {
     pub uptime_secs: u64,
     /// Version string.
     pub version: String,
+    /// Mempool statistics.
+    pub mempool: MempoolStatusResponse,
 }
 
 /// Response for `/api/v1/sync` endpoint.

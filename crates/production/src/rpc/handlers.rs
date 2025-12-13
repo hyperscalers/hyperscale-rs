@@ -80,6 +80,7 @@ pub async fn metrics_handler() -> impl IntoResponse {
 /// Handler for `GET /api/v1/status` - node status.
 pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse {
     let node_status = state.node_status.read().await;
+    let mempool_snapshot = state.mempool_snapshot.read().await;
     let uptime = state.start_time.elapsed().as_secs();
 
     Json(NodeStatusResponse {
@@ -91,6 +92,12 @@ pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse 
         connected_peers: node_status.connected_peers,
         uptime_secs: uptime,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        mempool: MempoolStatusResponse {
+            pending_count: mempool_snapshot.pending_count,
+            executing_count: mempool_snapshot.executing_count,
+            total_count: mempool_snapshot.total_count,
+            blocked_count: mempool_snapshot.blocked_count,
+        },
     })
 }
 

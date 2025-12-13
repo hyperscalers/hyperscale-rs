@@ -21,6 +21,9 @@ pub struct LockContentionStats {
     pub pending_count: u64,
     /// Number of pending transactions that conflict with locked nodes.
     pub pending_blocked: u64,
+    /// Number of transactions currently executing (holding state locks).
+    /// This includes transactions in Committed or Executed status.
+    pub executing_count: u64,
 }
 
 impl LockContentionStats {
@@ -598,26 +601,33 @@ impl MempoolState {
     /// - `blocked_count`: Number of transactions blocked waiting for a winner
     /// - `pending_count`: Number of transactions in Pending status
     /// - `pending_blocked`: Number of pending transactions that conflict with locked nodes
+    /// - `executing_count`: Number of transactions holding state locks (Committed or Executed)
     pub fn lock_contention_stats(&self) -> LockContentionStats {
         let locked = self.locked_nodes();
         let locked_nodes = locked.len() as u64;
         let blocked_count = self.blocked_by.len() as u64;
 
-        // Single pass over pending transactions to count both total and blocked
-        let (pending_count, pending_blocked) = self
-            .pool
-            .values()
-            .filter(|e| e.status == TransactionStatus::Pending)
-            .fold((0u64, 0u64), |(total, blocked), e| {
-                let is_blocked = self.conflicts_with_locked(&e.tx, &locked);
-                (total + 1, blocked + is_blocked as u64)
-            });
+        // Single pass over pool to count pending and executing transactions
+        let (pending_count, pending_blocked, executing_count) = self.pool.values().fold(
+            (0u64, 0u64, 0u64),
+            |(pending, pending_blocked, executing), e| {
+                if e.status == TransactionStatus::Pending {
+                    let is_blocked = self.conflicts_with_locked(&e.tx, &locked);
+                    (pending + 1, pending_blocked + is_blocked as u64, executing)
+                } else if e.status.holds_state_lock() {
+                    (pending, pending_blocked, executing + 1)
+                } else {
+                    (pending, pending_blocked, executing)
+                }
+            },
+        );
 
         LockContentionStats {
             locked_nodes,
             blocked_count,
             pending_count,
             pending_blocked,
+            executing_count,
         }
     }
 

@@ -1018,9 +1018,7 @@ impl ProductionRunner {
                         if let Ok(mut snap) = snapshot.try_write() {
                             snap.pending_count = stats.pending_count as usize;
                             snap.blocked_count = stats.blocked_count as usize;
-                            // executing = total - pending - blocked (approximately)
-                            snap.executing_count = total.saturating_sub(stats.pending_count as usize)
-                                .saturating_sub(stats.blocked_count as usize);
+                            snap.executing_count = stats.executing_count as usize;
                             snap.total_count = total;
                             snap.updated_at = Some(std::time::Instant::now());
                         }
