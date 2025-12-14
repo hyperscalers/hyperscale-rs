@@ -450,6 +450,12 @@ impl SyncManager {
                 "Delivering synced block to BFT for verification"
             );
 
+            // Remove from fetched_heights when delivering - if BFT rejects the block,
+            // we need to be able to re-fetch it on the next sync cycle.
+            // The height will be cleaned up from fetched_heights when committed_height
+            // advances past it (in set_committed_height).
+            self.fetched_heights.remove(&next_height);
+
             // Use try_send (non-blocking) - safe within async runtime
             let event = Event::SyncBlockReadyToApply { block, qc };
             if let Err(e) = self.event_tx.try_send(event) {
@@ -714,6 +720,12 @@ impl SyncManager {
                 height = next_height,
                 "Delivering synced block to BFT for verification"
             );
+
+            // Remove from fetched_heights when delivering - if BFT rejects the block,
+            // we need to be able to re-fetch it on the next sync cycle.
+            // The height will be cleaned up from fetched_heights when committed_height
+            // advances past it (in set_committed_height).
+            self.fetched_heights.remove(&next_height);
 
             // Send directly to BFT - bypasses SyncState entirely
             let event = Event::SyncBlockReadyToApply { block, qc };
