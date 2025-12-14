@@ -304,13 +304,16 @@ impl ProductionRunnerBuilder {
             .ok_or_else(|| RunnerError::SendError("network keypair is required".into()))?;
 
         // Separate channels for different event priorities:
+        // - timer_tx/rx: Critical priority - Timer events (proposal, cleanup)
+        //   These MUST never be blocked by network floods. Small dedicated channel.
         // - callback_tx/rx: Highest priority - Internal events (crypto/execution callbacks)
         //   These are results of in-flight work and must be processed immediately to
         //   unblock consensus progress (e.g., vote signature verified -> can count vote)
-        // - consensus_tx/rx: High priority BFT events (votes, proposals, QCs, timers)
+        // - consensus_tx/rx: High priority BFT events (votes, proposals, QCs)
         // - transaction_tx/rx: Transaction ingestion (gossip, submissions)
         // - status_tx/rx: Transaction status updates (non-consensus-critical)
         // This prevents transaction floods from starving consensus events
+        let (timer_tx, timer_rx) = mpsc::channel(16); // Small channel, just for timers
         let (callback_tx, callback_rx) = mpsc::channel(self.channel_capacity);
         let (consensus_tx, consensus_rx) = mpsc::channel(self.channel_capacity);
         let (transaction_tx, transaction_rx) = mpsc::channel(self.channel_capacity);
@@ -330,7 +333,7 @@ impl ProductionRunnerBuilder {
             bft_config,
             recovered,
         );
-        let timer_manager = TimerManager::new(consensus_tx.clone());
+        let timer_manager = TimerManager::new(timer_tx);
 
         // Use configured network definition or default to simulator
         let network_definition = self
@@ -416,6 +419,7 @@ impl ProductionRunnerBuilder {
         let executor = Arc::new(RadixExecutor::new(network_definition));
 
         Ok(ProductionRunner {
+            timer_rx,
             callback_rx,
             callback_tx,
             consensus_rx,
@@ -464,14 +468,17 @@ impl ProductionRunnerBuilder {
 /// Use [`ProductionRunner::builder()`] to construct a runner with all required
 /// dependencies.
 pub struct ProductionRunner {
+    /// Receives critical-priority timer events (proposal, cleanup).
+    /// Dedicated channel ensures timers are never blocked by network floods.
+    timer_rx: mpsc::Receiver<Event>,
     /// Receives highest-priority callback events (crypto verification, execution results).
     /// These are Internal priority events that unblock in-flight consensus work.
     callback_rx: mpsc::Receiver<Event>,
     /// Clone this to send callback events from crypto/execution thread pools.
     callback_tx: mpsc::Sender<Event>,
-    /// Receives high-priority consensus events (BFT network messages, timers).
+    /// Receives high-priority consensus events (BFT network messages).
     consensus_rx: mpsc::Receiver<Event>,
-    /// Clone this to send consensus events from timers, network, etc.
+    /// Clone this to send consensus events from network.
     consensus_tx: mpsc::Sender<Event>,
     /// Receives low-priority transaction events (submissions, gossip).
     transaction_rx: mpsc::Receiver<Event>,
@@ -726,14 +733,15 @@ impl ProductionRunner {
         loop {
             // Use biased select for priority ordering:
             // 1. Shutdown (always first)
-            // 2. Callbacks (Internal priority - crypto/execution results that unblock consensus)
-            // 3. Consensus (Network/Timer priority - BFT messages, timers)
-            // 4. Transaction fetch requests (needed for active consensus)
-            // 5. Certificate fetch requests (needed for active consensus)
-            // 6. Transactions (Client priority - submissions, gossip)
-            // 7. Sync requests (background)
-            // 8. Status events (non-critical)
-            // 9. Ticks (periodic maintenance)
+            // 2. Timers (Critical priority - dedicated channel, never blocked by network)
+            // 3. Callbacks (Internal priority - crypto/execution results that unblock consensus)
+            // 4. Consensus (Network priority - BFT messages from network)
+            // 5. Transaction fetch requests (needed for active consensus)
+            // 6. Certificate fetch requests (needed for active consensus)
+            // 7. Transactions (Client priority - submissions, gossip)
+            // 8. Sync requests (background)
+            // 9. Status events (non-critical)
+            // 10. Ticks (periodic maintenance)
             tokio::select! {
                 biased;
 
@@ -741,6 +749,35 @@ impl ProductionRunner {
                 _ = &mut self.shutdown_rx => {
                     tracing::info!("Shutdown signal received");
                     break;
+                }
+
+                // CRITICAL PRIORITY: Timer events (proposal, cleanup)
+                // Timers have their own dedicated channel to ensure they are NEVER blocked
+                // by network floods. This is critical for liveness - if timers stop firing,
+                // the validator cannot make progress.
+                Some(event) = self.timer_rx.recv() => {
+                    let event_type = event.type_name();
+                    let event_span = span!(
+                        Level::INFO,
+                        "handle_timer",
+                        event.type = %event_type,
+                        node = self.state.node_index(),
+                        shard = ?self.state.shard(),
+                    );
+                    let _event_guard = event_span.enter();
+
+                    // Update time
+                    let now = self.start_time.elapsed();
+                    self.state.set_time(now);
+
+                    // Process timer event
+                    let actions = self.dispatch_event(event).await;
+
+                    for action in actions {
+                        if let Err(e) = self.process_action(action).await {
+                            tracing::error!(error = ?e, "Error processing action from timer");
+                        }
+                    }
                 }
 
                 // HIGHEST PRIORITY: Callback events (Internal priority)
@@ -772,7 +809,7 @@ impl ProductionRunner {
                     }
                 }
 
-                // HIGH PRIORITY: Handle incoming consensus events (BFT network messages, timers)
+                // HIGH PRIORITY: Handle incoming consensus events (BFT network messages)
                 // Only check this branch if we haven't hit the batch limit
                 event = self.consensus_rx.recv(), if consensus_batch_count < CONSENSUS_BATCH_SIZE => {
                     match event {
