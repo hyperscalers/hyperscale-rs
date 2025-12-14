@@ -1023,33 +1023,40 @@ impl BftState {
             return actions;
         }
 
-        // Block not complete yet - start timers to fetch missing data
+        // Block not complete yet - request missing data immediately
+        // The runner handles retries; BFT just requests what it needs
         if let Some(pending) = self.pending_blocks.get(&block_hash) {
-            // Start transaction fetch timer if missing transactions
-            if pending.missing_transaction_count() > 0 {
+            let proposer = pending.header().proposer;
+
+            // Request missing transactions
+            let missing_txs = pending.missing_transactions();
+            if !missing_txs.is_empty() {
                 debug!(
                     validator = ?self.validator_id(),
                     block_hash = ?block_hash,
-                    missing_tx_count = pending.missing_transaction_count(),
-                    "Starting transaction fetch timer for incomplete block"
+                    missing_tx_count = missing_txs.len(),
+                    "Requesting missing transactions for incomplete block"
                 );
-                actions.push(Action::SetTimer {
-                    id: TimerId::TransactionFetch { block_hash },
-                    duration: self.config.transaction_fetch_timeout,
+                actions.push(Action::FetchTransactions {
+                    block_hash,
+                    proposer,
+                    tx_hashes: missing_txs,
                 });
             }
 
-            // Start certificate fetch timer if missing certificates
-            if pending.missing_certificate_count() > 0 {
+            // Request missing certificates
+            let missing_certs = pending.missing_certificates();
+            if !missing_certs.is_empty() {
                 debug!(
                     validator = ?self.validator_id(),
                     block_hash = ?block_hash,
-                    missing_cert_count = pending.missing_certificate_count(),
-                    "Starting certificate fetch timer for incomplete block"
+                    missing_cert_count = missing_certs.len(),
+                    "Requesting missing certificates for incomplete block"
                 );
-                actions.push(Action::SetTimer {
-                    id: TimerId::CertificateFetch { block_hash },
-                    duration: self.config.certificate_fetch_timeout,
+                actions.push(Action::FetchCertificates {
+                    block_hash,
+                    proposer,
+                    cert_hashes: missing_certs,
                 });
             }
         }
@@ -2508,9 +2515,48 @@ impl BftState {
 
         // Check if block is now complete
         if !is_complete {
-            // Still missing transactions or certificates
-            // Could restart timer here for retry, but for now we'll let it timeout
-            return vec![];
+            // Still missing data - request remaining items
+            // The runner handles retries, so we just re-emit the request
+            let Some(pending) = self.pending_blocks.get(&block_hash) else {
+                return vec![];
+            };
+
+            let mut actions = Vec::new();
+            let proposer = pending.header().proposer;
+
+            // Request still-missing transactions
+            let missing_txs = pending.missing_transactions();
+            if !missing_txs.is_empty() {
+                debug!(
+                    validator = ?validator_id,
+                    block_hash = ?block_hash,
+                    still_missing = missing_txs.len(),
+                    "Re-requesting remaining missing transactions"
+                );
+                actions.push(Action::FetchTransactions {
+                    block_hash,
+                    proposer,
+                    tx_hashes: missing_txs,
+                });
+            }
+
+            // Request still-missing certificates
+            let missing_certs = pending.missing_certificates();
+            if !missing_certs.is_empty() {
+                debug!(
+                    validator = ?validator_id,
+                    block_hash = ?block_hash,
+                    still_missing = missing_certs.len(),
+                    "Re-requesting remaining missing certificates"
+                );
+                actions.push(Action::FetchCertificates {
+                    block_hash,
+                    proposer,
+                    cert_hashes: missing_certs,
+                });
+            }
+
+            return actions;
         }
 
         // Second phase: construct block if needed
@@ -2623,8 +2669,48 @@ impl BftState {
 
         // Check if block is now complete
         if !is_complete {
-            // Still missing transactions or certificates
-            return vec![];
+            // Still missing data - request remaining items
+            // The runner handles retries, so we just re-emit the request
+            let Some(pending) = self.pending_blocks.get(&block_hash) else {
+                return vec![];
+            };
+
+            let mut actions = Vec::new();
+            let proposer = pending.header().proposer;
+
+            // Request still-missing transactions
+            let missing_txs = pending.missing_transactions();
+            if !missing_txs.is_empty() {
+                debug!(
+                    validator = ?validator_id,
+                    block_hash = ?block_hash,
+                    still_missing = missing_txs.len(),
+                    "Re-requesting remaining missing transactions"
+                );
+                actions.push(Action::FetchTransactions {
+                    block_hash,
+                    proposer,
+                    tx_hashes: missing_txs,
+                });
+            }
+
+            // Request still-missing certificates
+            let missing_certs = pending.missing_certificates();
+            if !missing_certs.is_empty() {
+                debug!(
+                    validator = ?validator_id,
+                    block_hash = ?block_hash,
+                    still_missing = missing_certs.len(),
+                    "Re-requesting remaining missing certificates"
+                );
+                actions.push(Action::FetchCertificates {
+                    block_hash,
+                    proposer,
+                    cert_hashes: missing_certs,
+                });
+            }
+
+            return actions;
         }
 
         // Second phase: construct block if needed

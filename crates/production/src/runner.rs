@@ -1901,7 +1901,7 @@ impl ProductionRunner {
                 "Cannot fetch transactions: proposer peer ID not known"
             );
             // Re-arm timer to retry - proposer may become known later
-            self.rearm_transaction_fetch_timer(block_hash);
+            self.log_transaction_fetch_retry_needed(block_hash);
             return;
         };
 
@@ -1943,7 +1943,7 @@ impl ProductionRunner {
                                 requested = missing_tx_hashes.len(),
                                 "Partial transaction fetch - rearming timer for retry"
                             );
-                            self.rearm_transaction_fetch_timer(block_hash);
+                            self.log_transaction_fetch_retry_needed(block_hash);
                         }
                     }
                     Err(e) => {
@@ -1953,7 +1953,7 @@ impl ProductionRunner {
                             "Failed to decode transaction fetch response"
                         );
                         // Re-arm timer to retry
-                        self.rearm_transaction_fetch_timer(block_hash);
+                        self.log_transaction_fetch_retry_needed(block_hash);
                     }
                 }
             }
@@ -1965,30 +1965,20 @@ impl ProductionRunner {
                     "Failed to fetch transactions from proposer"
                 );
                 // Re-arm timer to retry
-                self.rearm_transaction_fetch_timer(block_hash);
+                self.log_transaction_fetch_retry_needed(block_hash);
             }
         }
     }
 
-    /// Re-arm the transaction fetch timer for retry with backoff.
+    /// Log that a transaction fetch needs to be retried.
     ///
-    /// Spawns a delayed task that sends the timer event to trigger a retry.
-    /// The BFT state machine will re-emit TransactionNeeded if still incomplete.
-    fn rearm_transaction_fetch_timer(&self, block_hash: Hash) {
-        // Use 100ms retry interval (2x the initial 50ms timeout)
-        const RETRY_INTERVAL: Duration = Duration::from_millis(100);
-
-        let consensus_tx = self.consensus_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(RETRY_INTERVAL).await;
-            let event = Event::TransactionTimer { block_hash };
-            if consensus_tx.send(event).await.is_err() {
-                tracing::warn!(
-                    ?block_hash,
-                    "Failed to send transaction fetch retry timer event"
-                );
-            }
-        });
+    /// Note: Retries are now driven by BFT re-emitting FetchTransactions when
+    /// it receives partial data (via on_transaction_fetch_received).
+    fn log_transaction_fetch_retry_needed(&self, block_hash: Hash) {
+        tracing::debug!(
+            ?block_hash,
+            "Transaction fetch incomplete - BFT will re-request when data arrives"
+        );
     }
 
     /// Handle an inbound transaction fetch request from a peer.
@@ -2074,7 +2064,7 @@ impl ProductionRunner {
                 "Cannot fetch certificates: proposer peer ID not known"
             );
             // Re-arm timer to retry - proposer may become known later
-            self.rearm_certificate_fetch_timer(block_hash);
+            self.log_certificate_fetch_retry_needed(block_hash);
             return;
         };
 
@@ -2116,7 +2106,7 @@ impl ProductionRunner {
                                 requested = missing_cert_hashes.len(),
                                 "Partial certificate fetch - rearming timer for retry"
                             );
-                            self.rearm_certificate_fetch_timer(block_hash);
+                            self.log_certificate_fetch_retry_needed(block_hash);
                         }
                     }
                     Err(e) => {
@@ -2126,7 +2116,7 @@ impl ProductionRunner {
                             "Failed to decode certificate fetch response"
                         );
                         // Re-arm timer to retry
-                        self.rearm_certificate_fetch_timer(block_hash);
+                        self.log_certificate_fetch_retry_needed(block_hash);
                     }
                 }
             }
@@ -2138,30 +2128,20 @@ impl ProductionRunner {
                     "Failed to fetch certificates from proposer"
                 );
                 // Re-arm timer to retry
-                self.rearm_certificate_fetch_timer(block_hash);
+                self.log_certificate_fetch_retry_needed(block_hash);
             }
         }
     }
 
-    /// Re-arm the certificate fetch timer for retry with backoff.
+    /// Log that a certificate fetch needs to be retried.
     ///
-    /// Spawns a delayed task that sends the timer event to trigger a retry.
-    /// The BFT state machine will re-emit CertificateNeeded if still incomplete.
-    fn rearm_certificate_fetch_timer(&self, block_hash: Hash) {
-        // Use 200ms retry interval (2x the initial 100ms timeout)
-        const RETRY_INTERVAL: Duration = Duration::from_millis(200);
-
-        let consensus_tx = self.consensus_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(RETRY_INTERVAL).await;
-            let event = Event::CertificateTimer { block_hash };
-            if consensus_tx.send(event).await.is_err() {
-                tracing::warn!(
-                    ?block_hash,
-                    "Failed to send certificate fetch retry timer event"
-                );
-            }
-        });
+    /// Note: Retries are now driven by BFT re-emitting FetchCertificates when
+    /// it receives partial data (via on_certificate_fetch_received).
+    fn log_certificate_fetch_retry_needed(&self, block_hash: Hash) {
+        tracing::debug!(
+            ?block_hash,
+            "Certificate fetch incomplete - BFT will re-request when data arrives"
+        );
     }
 
     /// Handle an inbound certificate fetch request from a peer.

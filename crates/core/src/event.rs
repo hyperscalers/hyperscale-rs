@@ -424,19 +424,10 @@ pub enum Event {
     },
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Transaction Fetch Protocol (priority: Internal/Network)
+    // Transaction Fetch Protocol (priority: Network)
     // Used when block header arrives but transactions are missing from mempool
-    // Note: TransactionNeeded is now Action::FetchTransactions (runner I/O request)
+    // BFT emits Action::FetchTransactions; runner handles retries and delivers results.
     // ═══════════════════════════════════════════════════════════════════════
-    /// Timer fired for fetching missing transactions (priority: Timer).
-    ///
-    /// If a pending block is still incomplete after the timeout, we request
-    /// the missing transactions from the proposer or a peer.
-    TransactionTimer {
-        /// Hash of the block that needs transactions.
-        block_hash: Hash,
-    },
-
     /// Received transactions from a fetch request (priority: Network).
     ///
     /// Delivered by the runner after fetching from a peer.
@@ -448,19 +439,10 @@ pub enum Event {
     },
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Certificate Fetch Protocol (priority: Internal/Network)
+    // Certificate Fetch Protocol (priority: Network)
     // Used when block header arrives but certificates are missing locally
-    // Note: CertificateNeeded is now Action::FetchCertificates (runner I/O request)
+    // BFT emits Action::FetchCertificates; runner handles retries and delivers results.
     // ═══════════════════════════════════════════════════════════════════════
-    /// Timer fired for fetching missing certificates (priority: Timer).
-    ///
-    /// If a pending block is still missing certificates after the timeout,
-    /// we request them from the proposer or a peer.
-    CertificateTimer {
-        /// Hash of the block that needs certificates.
-        block_hash: Hash,
-    },
-
     /// Received certificates from a fetch request (priority: Network).
     ///
     /// Delivered by the runner after fetching from a peer.
@@ -546,14 +528,10 @@ impl Event {
 
             Event::SyncBlockReceived { .. } => EventPriority::Network,
 
-            // Transaction fetch events
-            // Note: TransactionNeeded is now Action::FetchTransactions
-            Event::TransactionTimer { .. } => EventPriority::Timer,
+            // Transaction fetch events (runner handles retries)
             Event::TransactionReceived { .. } => EventPriority::Network,
 
-            // Certificate fetch events
-            // Note: CertificateNeeded is now Action::FetchCertificates
-            Event::CertificateTimer { .. } => EventPriority::Timer,
+            // Certificate fetch events (runner handles retries)
             Event::CertificateReceived { .. } => EventPriority::Network,
             Event::FetchedCertificateVerified { .. } => EventPriority::Internal,
         }
@@ -639,12 +617,10 @@ impl Event {
             Event::SyncBlockReadyToApply { .. } => "SyncBlockReadyToApply",
             Event::SyncComplete { .. } => "SyncComplete",
 
-            // Transaction Fetch Protocol (TransactionNeeded is now Action::FetchTransactions)
-            Event::TransactionTimer { .. } => "TransactionTimer",
+            // Transaction Fetch Protocol (runner handles retries)
             Event::TransactionReceived { .. } => "TransactionReceived",
 
-            // Certificate Fetch Protocol (CertificateNeeded is now Action::FetchCertificates)
-            Event::CertificateTimer { .. } => "CertificateTimer",
+            // Certificate Fetch Protocol (runner handles retries)
             Event::CertificateReceived { .. } => "CertificateReceived",
             Event::FetchedCertificateVerified { .. } => "FetchedCertificateVerified",
         }

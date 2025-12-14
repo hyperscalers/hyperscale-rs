@@ -1458,8 +1458,6 @@ impl SimulationRunner {
             TimerId::Proposal => Event::ProposalTimer,
             TimerId::Cleanup => Event::CleanupTimer,
             TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
-            TimerId::TransactionFetch { block_hash } => Event::TransactionTimer { block_hash },
-            TimerId::CertificateFetch { block_hash } => Event::CertificateTimer { block_hash },
         }
     }
 

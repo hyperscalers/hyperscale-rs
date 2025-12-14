@@ -36,6 +36,9 @@ pub use message::OutboundMessage;
 pub use traits::{StateMachine, SubStateMachine};
 
 /// Type alias for timer identification.
+///
+/// Note: Transaction/certificate fetch timers were removed - retries are now
+/// handled by the runner, not by BFT timers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TimerId {
     /// Block proposal timer (also used for implicit round advancement)
@@ -44,16 +47,4 @@ pub enum TimerId {
     Cleanup,
     /// Global consensus timer (epoch management)
     GlobalConsensus,
-    /// Transaction fetch timer for a specific block.
-    /// Fires after a timeout if pending block is still missing transactions.
-    TransactionFetch {
-        /// The block hash that needs transactions fetched.
-        block_hash: hyperscale_types::Hash,
-    },
-    /// Certificate fetch timer for a specific block.
-    /// Fires after a timeout if pending block is still missing certificates.
-    CertificateFetch {
-        /// The block hash that needs certificates fetched.
-        block_hash: hyperscale_types::Hash,
-    },
 }

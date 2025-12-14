@@ -582,12 +582,8 @@ impl StateMachine for NodeStateMachine {
 
             // ═══════════════════════════════════════════════════════════════════════
             // Transaction Fetch Protocol
-            // Note: TransactionNeeded is now Action::FetchTransactions (emitted by BFT, handled by runner).
+            // BFT emits Action::FetchTransactions; runner handles retries and delivers results.
             // ═══════════════════════════════════════════════════════════════════════
-            Event::TransactionTimer { block_hash } => {
-                return self.bft.on_transaction_fetch_timer(*block_hash);
-            }
-
             Event::TransactionReceived {
                 block_hash,
                 transactions,
@@ -599,12 +595,8 @@ impl StateMachine for NodeStateMachine {
 
             // ═══════════════════════════════════════════════════════════════════════
             // Certificate Fetch Protocol
-            // Note: CertificateNeeded is now Action::FetchCertificates (emitted by BFT, handled by runner).
+            // BFT emits Action::FetchCertificates; runner handles retries and delivers results.
             // ═══════════════════════════════════════════════════════════════════════
-            Event::CertificateTimer { block_hash } => {
-                return self.bft.on_certificate_fetch_timer(*block_hash);
-            }
-
             Event::CertificateReceived {
                 block_hash,
                 certificates,
