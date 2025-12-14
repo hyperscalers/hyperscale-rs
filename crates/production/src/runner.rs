@@ -699,14 +699,9 @@ impl ProductionRunner {
     ///
     /// # Priority Handling
     ///
-    /// Consensus events (from gossipsub) are prioritized over sync requests:
-    /// - Uses `biased` select to always check consensus channel first
-    /// - Drains up to `CONSENSUS_BATCH_SIZE` events before checking sync
-    /// - Ensures consensus stays responsive under sync load
+    /// Uses `biased` select for priority ordering - higher priority channels
+    /// are always checked first, but all channels get processed when ready.
     pub async fn run(mut self) -> Result<(), RunnerError> {
-        // Maximum consensus events to process before checking sync (10:1 ratio)
-        const CONSENSUS_BATCH_SIZE: usize = 10;
-
         let config = self.thread_pools.config();
         tracing::info!(
             node_index = self.state.node_index(),
@@ -728,9 +723,6 @@ impl ProductionRunner {
         // Metrics tick interval (1 second)
         let mut metrics_tick = tokio::time::interval(Duration::from_secs(1));
         metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        // Track consecutive consensus events for batch limiting
-        let mut consensus_batch_count: usize = 0;
 
         loop {
             // Use biased select for priority ordering:
@@ -812,12 +804,9 @@ impl ProductionRunner {
                 }
 
                 // HIGH PRIORITY: Handle incoming consensus events (BFT network messages)
-                // Only check this branch if we haven't hit the batch limit
-                event = self.consensus_rx.recv(), if consensus_batch_count < CONSENSUS_BATCH_SIZE => {
+                event = self.consensus_rx.recv() => {
                     match event {
                         Some(event) => {
-                            consensus_batch_count += 1;
-
                             // Create span for event handling
                             let event_type = event.type_name();
                             let event_span = span!(
@@ -876,8 +865,6 @@ impl ProductionRunner {
                             // Try to collect more verifications from queued consensus events
                             // This drains any immediately available events to maximize batch size
                             while let Ok(more_event) = self.consensus_rx.try_recv() {
-                                consensus_batch_count += 1;
-
                                 // Update time for each event
                                 let now = self.start_time.elapsed();
                                 self.state.set_time(now);
@@ -899,11 +886,6 @@ impl ProductionRunner {
                                         }
                                     }
                                 }
-
-                                // Respect batch limit
-                                if consensus_batch_count >= CONSENSUS_BATCH_SIZE {
-                                    break;
-                                }
                             }
 
                             // Dispatch collected verifications as batches
@@ -916,8 +898,7 @@ impl ProductionRunner {
                     }
                 }
 
-                // LOW PRIORITY: Handle transaction events (submissions, gossip)
-                // Only processed when consensus channel is empty or after batch limit
+                // Handle transaction events (submissions, gossip)
                 Some(event) = self.transaction_rx.recv() => {
                     // Filter out transactions that are already in terminal state
                     // This prevents re-adding evicted transactions via late gossip
@@ -970,12 +951,9 @@ impl ProductionRunner {
                             tracing::error!(error = ?e, "Error processing action");
                         }
                     }
-
-                    // Reset batch counter after processing transactions
-                    consensus_batch_count = 0;
                 }
 
-                // HIGH PRIORITY: Handle inbound transaction fetch requests from peers
+                // Handle inbound transaction fetch requests from peers
                 // These are needed for active consensus, so process before sync
                 Some(request) = self.tx_request_rx.recv() => {
                     let tx_span = span!(
@@ -989,11 +967,9 @@ impl ProductionRunner {
                     let _tx_guard = tx_span.enter();
 
                     self.handle_inbound_transaction_request(request);
-                    // Reset batch counter - we yielded, now back to prioritizing consensus
-                    consensus_batch_count = 0;
                 }
 
-                // HIGH PRIORITY: Handle inbound certificate fetch requests from peers
+                // Handle inbound certificate fetch requests from peers
                 // These are needed for active consensus, so process before sync
                 Some(request) = self.cert_request_rx.recv() => {
                     let cert_span = span!(
@@ -1007,12 +983,9 @@ impl ProductionRunner {
                     let _cert_guard = cert_span.enter();
 
                     self.handle_inbound_certificate_request(request);
-                    // Reset batch counter - we yielded, now back to prioritizing consensus
-                    consensus_batch_count = 0;
                 }
 
-                // LOW PRIORITY: Handle inbound sync requests from peers
-                // This branch is checked when consensus is idle OR after batch limit hit
+                // Handle inbound sync requests from peers
                 Some(request) = self.sync_request_rx.recv() => {
                     let sync_span = span!(
                         Level::DEBUG,
@@ -1024,11 +997,9 @@ impl ProductionRunner {
                     let _sync_guard = sync_span.enter();
 
                     self.handle_inbound_sync_request(request);
-                    // Reset batch counter - we yielded to sync, now back to prioritizing consensus
-                    consensus_batch_count = 0;
                 }
 
-                // MEDIUM PRIORITY: Periodic sync and fetch manager tick
+                // Periodic sync and fetch manager tick
                 // This drives outbound sync/fetch operations, so give it some priority
                 _ = sync_tick.tick() => {
                     let tick_span = span!(Level::TRACE, "sync_tick");
@@ -1041,12 +1012,9 @@ impl ProductionRunner {
                     // Tick both managers to process pending fetches
                     self.sync_manager.tick().await;
                     self.fetch_manager.tick().await;
-
-                    // Reset batch counter - we yielded, now back to prioritizing consensus
-                    consensus_batch_count = 0;
                 }
 
-                // LOW PRIORITY: Transaction status updates (non-consensus-critical)
+                // Transaction status updates (non-consensus-critical)
                 // These update mempool status for RPC queries but don't affect consensus
                 Some(event) = self.status_rx.recv() => {
                     let event_type = event.type_name();
@@ -1069,12 +1037,9 @@ impl ProductionRunner {
                             tracing::error!(error = ?e, "Error processing status action");
                         }
                     }
-
-                    // Reset batch counter - we yielded, now back to prioritizing consensus
-                    consensus_batch_count = 0;
                 }
 
-                // LOW PRIORITY: Periodic metrics update (1 second)
+                // Periodic metrics update (1 second)
                 // IMPORTANT: This branch must NOT block on async operations to avoid
                 // delaying consensus processing. Use non-blocking variants only.
                 _ = metrics_tick.tick() => {
@@ -1121,9 +1086,6 @@ impl ProductionRunner {
                         }
                         // If lock is contended, skip this update - RPC is reading
                     }
-
-                    // Reset batch counter - we yielded, now back to prioritizing consensus
-                    consensus_batch_count = 0;
                 }
             }
         }
