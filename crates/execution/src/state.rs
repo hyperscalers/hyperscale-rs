@@ -904,6 +904,16 @@ impl ExecutionState {
             return vec![];
         }
 
+        // Skip verification for our own vote - we just signed it, so we trust it.
+        // This can happen when our vote is gossiped back to us via the network.
+        if validator_id == self.validator_id() {
+            tracing::trace!(
+                tx_hash = ?tx_hash,
+                "Skipping verification for own vote"
+            );
+            return self.handle_vote_internal(vote);
+        }
+
         // Check if already pending verification (duplicate vote in parallel execution)
         if self
             .pending_vote_verifications

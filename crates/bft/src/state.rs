@@ -1545,8 +1545,11 @@ impl BftState {
     /// This performs initial validation and then delegates signature verification
     /// to the runner. When verification completes, `on_vote_signature_verified`
     /// is called to complete vote processing.
+    ///
+    /// For our own vote, we skip signature verification since we just signed it.
     fn on_block_vote_internal(&mut self, vote: BlockVote) -> Vec<Action> {
         let block_hash = vote.block_hash;
+        let is_own_vote = vote.voter == self.validator_id();
 
         // Validate voter is in committee
         let voter_index = match self.committee_index(vote.voter) {
@@ -1567,6 +1570,34 @@ impl BftState {
             return vec![];
         }
 
+        // Check for duplicate pending verification
+        let key = (block_hash, vote.voter);
+        if self.pending_vote_verifications.contains_key(&key) {
+            trace!("Vote verification already pending for {:?}", key);
+            return vec![];
+        }
+
+        // Skip verification for our own vote - we just signed it, so we trust it.
+        // This can happen when our vote is gossiped back to us via the network,
+        // or when processing our own vote after creating it.
+        if is_own_vote {
+            trace!(
+                block_hash = ?block_hash,
+                "Skipping verification for own block vote"
+            );
+            // Store pending verification info (needed by on_vote_signature_verified)
+            self.pending_vote_verifications.insert(
+                key,
+                PendingVoteVerification {
+                    vote: vote.clone(),
+                    voting_power,
+                    committee_index: voter_index,
+                },
+            );
+            // Directly process as verified
+            return self.on_vote_signature_verified(vote, true);
+        }
+
         // Get public key for verification
         let public_key = match self.public_key(vote.voter) {
             Some(pk) => pk,
@@ -1575,13 +1606,6 @@ impl BftState {
                 return vec![];
             }
         };
-
-        // Check for duplicate pending verification
-        let key = (block_hash, vote.voter);
-        if self.pending_vote_verifications.contains_key(&key) {
-            trace!("Vote verification already pending for {:?}", key);
-            return vec![];
-        }
 
         // Store pending verification info
         self.pending_vote_verifications.insert(
