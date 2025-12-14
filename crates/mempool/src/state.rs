@@ -5,7 +5,7 @@ use hyperscale_types::{
     AbortReason, Block, BlockHeight, DeferReason, Hash, NodeId, RoutableTransaction, Topology,
     TransactionAbort, TransactionDecision,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
@@ -50,10 +50,11 @@ struct PoolEntry {
 /// Mempool state machine.
 ///
 /// Handles transaction lifecycle from submission to completion.
-/// Uses `HashMap` instead of `DashMap` since access is serialized.
+/// Uses `BTreeMap` for the pool to maintain hash ordering, which allows
+/// ready_transactions() to iterate in sorted order without sorting.
 pub struct MempoolState {
-    /// Transaction pool (HashMap, not DashMap - no concurrent access).
-    pool: HashMap<Hash, PoolEntry>,
+    /// Transaction pool sorted by hash (BTreeMap for ordered iteration).
+    pool: BTreeMap<Hash, PoolEntry>,
 
     /// Blocked transactions waiting for their winner to complete.
     /// Maps: loser_tx_hash -> (loser_tx, winner_tx_hash)
@@ -111,7 +112,7 @@ impl MempoolState {
     /// Create a new mempool state machine.
     pub fn new(topology: Arc<dyn Topology>) -> Self {
         Self {
-            pool: HashMap::new(),
+            pool: BTreeMap::new(),
             blocked_by: HashMap::new(),
             blocked_losers_by_winner: HashMap::new(),
             pending_deferrals: HashMap::new(),
@@ -819,23 +820,19 @@ impl MempoolState {
     ///
     /// The hash-ordering ensures different shards are more likely to pick
     /// the same transactions, reducing cycle formation in cross-shard execution.
+    ///
+    /// Since pool is a BTreeMap sorted by hash, we iterate in order and
+    /// can take early once we have max_count results - no sorting needed.
     pub fn ready_transactions(&self, max_count: usize) -> Vec<Arc<RoutableTransaction>> {
-        // Collect pending transactions that don't conflict with locked nodes
-        // Uses cached locked_nodes_cache for O(1) lookup per node
-        let mut ready: Vec<_> = self
-            .pool
+        // BTreeMap iterates in key (hash) order, so no sorting needed
+        // Filter for pending, non-conflicting transactions, take up to max_count
+        self.pool
             .values()
             .filter(|e| e.status == TransactionStatus::Pending)
             .filter(|e| !self.conflicts_with_locked(&e.tx))
+            .take(max_count)
             .map(|e| Arc::clone(&e.tx))
-            .collect();
-
-        // Sort by hash (ascending) - lower hashes are selected first
-        // This makes different shards more likely to select the same TXs,
-        // reducing the chance of cross-shard cycles
-        ready.sort_by_key(|tx| tx.hash());
-
-        ready.into_iter().take(max_count).collect()
+            .collect()
     }
 
     /// Get lock contention statistics.
