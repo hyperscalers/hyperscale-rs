@@ -61,16 +61,7 @@ impl TransferWorkload {
         rng: &mut R,
     ) -> Option<RoutableTransaction> {
         let shard = ShardGroupId(rng.gen_range(0..accounts.num_shards()));
-        let shard_accounts = accounts.accounts_for_shard(shard)?;
-
-        if shard_accounts.len() < 2 {
-            return None;
-        }
-
-        let (idx1, idx2) = self.select_pair_indices(shard_accounts.len(), rng);
-        let from = &shard_accounts[idx1];
-        let to = &shard_accounts[idx2];
-
+        let (from, to) = accounts.pair_for_shard(shard, rng, self.selection_mode)?;
         self.build_transfer(from, to)
     }
 
@@ -80,77 +71,8 @@ impl TransferWorkload {
         accounts: &AccountPool,
         rng: &mut R,
     ) -> Option<RoutableTransaction> {
-        if accounts.num_shards() < 2 {
-            return None;
-        }
-
-        let shard1 = ShardGroupId(rng.gen_range(0..accounts.num_shards()));
-        let mut shard2 = ShardGroupId(rng.gen_range(0..accounts.num_shards()));
-        while shard2 == shard1 {
-            shard2 = ShardGroupId(rng.gen_range(0..accounts.num_shards()));
-        }
-
-        let accounts1 = accounts.accounts_for_shard(shard1)?;
-        let accounts2 = accounts.accounts_for_shard(shard2)?;
-
-        if accounts1.is_empty() || accounts2.is_empty() {
-            return None;
-        }
-
-        let idx1 = self.select_single_index(accounts1.len(), rng);
-        let idx2 = self.select_single_index(accounts2.len(), rng);
-
-        let from = &accounts1[idx1];
-        let to = &accounts2[idx2];
-
+        let (from, to) = accounts.cross_shard_pair(rng, self.selection_mode)?;
         self.build_transfer(from, to)
-    }
-
-    /// Select a pair of distinct indices.
-    fn select_pair_indices<R: Rng + ?Sized>(
-        &self,
-        num_accounts: usize,
-        rng: &mut R,
-    ) -> (usize, usize) {
-        match self.selection_mode {
-            SelectionMode::Random | SelectionMode::RoundRobin | SelectionMode::NoContention => {
-                // For RoundRobin and NoContention, the AccountPool handles the
-                // stateful selection via atomics. Here we just use random as a fallback
-                // for the rare case where workload does its own selection.
-                let idx1 = rng.gen_range(0..num_accounts);
-                let mut idx2 = rng.gen_range(0..num_accounts);
-                while idx2 == idx1 {
-                    idx2 = rng.gen_range(0..num_accounts);
-                }
-                (idx1, idx2)
-            }
-            SelectionMode::Zipf { exponent } => {
-                let idx1 = self.zipf_index(num_accounts, exponent, rng);
-                let mut idx2 = self.zipf_index(num_accounts, exponent, rng);
-                while idx2 == idx1 {
-                    idx2 = self.zipf_index(num_accounts, exponent, rng);
-                }
-                (idx1, idx2)
-            }
-        }
-    }
-
-    /// Select a single index.
-    fn select_single_index<R: Rng + ?Sized>(&self, num_accounts: usize, rng: &mut R) -> usize {
-        match self.selection_mode {
-            SelectionMode::Random | SelectionMode::RoundRobin | SelectionMode::NoContention => {
-                rng.gen_range(0..num_accounts)
-            }
-            SelectionMode::Zipf { exponent } => self.zipf_index(num_accounts, exponent, rng),
-        }
-    }
-
-    /// Generate a Zipf-distributed index.
-    fn zipf_index<R: Rng + ?Sized>(&self, n: usize, exponent: f64, rng: &mut R) -> usize {
-        let exp = exponent.max(1.0);
-        let u: f64 = rng.gen();
-        let idx = ((n as f64).powf(1.0 - u)).powf(1.0 / exp) as usize;
-        idx.min(n - 1)
     }
 
     /// Build a transfer transaction from one account to another.
@@ -220,9 +142,9 @@ impl TransferWorkload {
             return None;
         }
 
-        let (idx1, idx2) = self.select_pair_indices(shard_accounts.len(), rng);
-        let from = &shard_accounts[idx1];
-        let to = &shard_accounts[idx2];
+        // Use AccountPool's selection for stateful modes (NoContention, RoundRobin)
+        // which use atomic counters to ensure proper distribution/no conflicts.
+        let (from, to) = accounts.pair_for_shard(target_shard, rng, self.selection_mode)?;
 
         self.build_transfer(from, to)
     }
@@ -246,24 +168,14 @@ impl TransferWorkload {
             other_shard = ShardGroupId(rng.gen_range(0..accounts.num_shards()));
         }
 
-        let target_accounts = accounts.accounts_for_shard(target_shard)?;
-        let other_accounts = accounts.accounts_for_shard(other_shard)?;
-
-        if target_accounts.is_empty() || other_accounts.is_empty() {
-            return None;
-        }
-
         // Randomly decide if target shard is sender or receiver
         let target_is_sender = rng.gen_bool(0.5);
 
+        // Use AccountPool's selection for stateful modes (NoContention, RoundRobin)
         let (from, to) = if target_is_sender {
-            let idx1 = self.select_single_index(target_accounts.len(), rng);
-            let idx2 = self.select_single_index(other_accounts.len(), rng);
-            (&target_accounts[idx1], &other_accounts[idx2])
+            accounts.cross_shard_pair_for(target_shard, other_shard, rng, self.selection_mode)?
         } else {
-            let idx1 = self.select_single_index(other_accounts.len(), rng);
-            let idx2 = self.select_single_index(target_accounts.len(), rng);
-            (&other_accounts[idx1], &target_accounts[idx2])
+            accounts.cross_shard_pair_for(other_shard, target_shard, rng, self.selection_mode)?
         };
 
         self.build_transfer(from, to)

@@ -269,7 +269,7 @@ impl AccountPool {
     /// Get a pair of accounts on different shards (for cross-shard transactions).
     pub fn cross_shard_pair(
         &self,
-        rng: &mut impl rand::Rng,
+        rng: &mut (impl rand::Rng + ?Sized),
         mode: SelectionMode,
     ) -> Option<(&FundedAccount, &FundedAccount)> {
         if self.num_shards < 2 {
@@ -282,21 +282,54 @@ impl AccountPool {
             shard2 = ShardGroupId(rng.gen_range(0..self.num_shards));
         }
 
-        let num_accounts1 = self.by_shard.get(&shard1)?.len();
-        let num_accounts2 = self.by_shard.get(&shard2)?.len();
+        self.cross_shard_pair_for(shard1, shard2, rng, mode)
+    }
+
+    /// Get a pair of accounts from two specific shards (for cross-shard transactions).
+    ///
+    /// Returns (from_account, to_account) where from is on `from_shard` and to is on `to_shard`.
+    pub fn cross_shard_pair_for(
+        &self,
+        from_shard: ShardGroupId,
+        to_shard: ShardGroupId,
+        rng: &mut (impl rand::Rng + ?Sized),
+        mode: SelectionMode,
+    ) -> Option<(&FundedAccount, &FundedAccount)> {
+        let num_accounts1 = self.by_shard.get(&from_shard)?.len();
+        let num_accounts2 = self.by_shard.get(&to_shard)?.len();
 
         if num_accounts1 == 0 || num_accounts2 == 0 {
             return None;
         }
 
-        let idx1 = self.select_single_index(shard1, num_accounts1, rng, mode);
-        let idx2 = self.select_single_index(shard2, num_accounts2, rng, mode);
+        let idx1 = self.select_single_index(from_shard, num_accounts1, rng, mode);
+        let idx2 = self.select_single_index(to_shard, num_accounts2, rng, mode);
 
-        // Get references from different shards
-        let accounts1 = self.by_shard.get(&shard1)?;
-        let accounts2 = self.by_shard.get(&shard2)?;
+        let accounts1 = self.by_shard.get(&from_shard)?;
+        let accounts2 = self.by_shard.get(&to_shard)?;
 
         Some((&accounts1[idx1], &accounts2[idx2]))
+    }
+
+    /// Get a pair of accounts on a specific shard.
+    ///
+    /// This properly uses the selection mode's atomic counters for NoContention/RoundRobin.
+    pub fn pair_for_shard(
+        &self,
+        shard: ShardGroupId,
+        rng: &mut (impl rand::Rng + ?Sized),
+        mode: SelectionMode,
+    ) -> Option<(&FundedAccount, &FundedAccount)> {
+        let num_accounts = self.by_shard.get(&shard)?.len();
+
+        if num_accounts < 2 {
+            return None;
+        }
+
+        let (idx1, idx2) = self.select_pair_indices(shard, num_accounts, rng, mode);
+
+        let accounts = self.by_shard.get(&shard)?;
+        Some((&accounts[idx1], &accounts[idx2]))
     }
 
     /// Select a pair of distinct account indices based on selection mode.
@@ -304,7 +337,7 @@ impl AccountPool {
         &self,
         shard: ShardGroupId,
         num_accounts: usize,
-        rng: &mut impl rand::Rng,
+        rng: &mut (impl rand::Rng + ?Sized),
         mode: SelectionMode,
     ) -> (usize, usize) {
         use std::sync::atomic::Ordering;
@@ -356,7 +389,7 @@ impl AccountPool {
         &self,
         shard: ShardGroupId,
         num_accounts: usize,
-        rng: &mut impl rand::Rng,
+        rng: &mut (impl rand::Rng + ?Sized),
         mode: SelectionMode,
     ) -> usize {
         use std::sync::atomic::Ordering;
@@ -393,7 +426,7 @@ impl AccountPool {
     }
 
     /// Generate a Zipf-distributed index.
-    fn zipf_index(&self, n: usize, exponent: f64, rng: &mut impl rand::Rng) -> usize {
+    fn zipf_index(&self, n: usize, exponent: f64, rng: &mut (impl rand::Rng + ?Sized)) -> usize {
         let exp = exponent.max(1.0);
         let u: f64 = rng.gen();
         let idx = ((n as f64).powf(1.0 - u)).powf(1.0 / exp) as usize;
