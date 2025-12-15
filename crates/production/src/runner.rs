@@ -1102,6 +1102,11 @@ impl ProductionRunner {
                     if let Some(ref snapshot) = self.mempool_snapshot {
                         let stats = self.state.mempool().lock_contention_stats();
                         let total = self.state.mempool().len();
+
+                        // Update Prometheus metrics
+                        crate::metrics::set_mempool_size(total);
+                        crate::metrics::set_lock_contention_from_stats(&stats);
+
                         if let Ok(mut snap) = snapshot.try_write() {
                             snap.pending_count = stats.pending_count as usize;
                             snap.committed_count = stats.committed_count as usize;
@@ -1458,8 +1463,24 @@ impl ProductionRunner {
                 }
             }
 
-            Action::EmitTransactionStatus { tx_hash, status } => {
+            Action::EmitTransactionStatus {
+                tx_hash,
+                status,
+                added_at,
+            } => {
                 tracing::debug!(?tx_hash, ?status, "Transaction status update");
+
+                // Record transaction metrics for terminal states
+                if status.is_final() {
+                    // Calculate latency from submission to finalization
+                    let now = self.state.now();
+                    let latency_secs = now.saturating_sub(added_at).as_secs_f64();
+                    // Check if cross-shard by looking at the transaction in mempool
+                    // For simplicity, we use false here - proper cross-shard detection
+                    // would require access to the transaction's shard list
+                    let cross_shard = false;
+                    crate::metrics::record_transaction_finalized(latency_secs, cross_shard);
+                }
 
                 // Update transaction status cache for RPC queries
                 if let Some(ref cache) = self.tx_status_cache {
@@ -1483,6 +1504,11 @@ impl ProductionRunner {
                     view = current_view,
                     "Block committed"
                 );
+
+                // Record block committed metric.
+                // For now, we don't have the proposal timestamp available here,
+                // so we pass 0.0 for latency. The block height gauge is still useful.
+                crate::metrics::record_block_committed(height, 0.0);
 
                 // Update sync manager's committed height - critical for correct sync behavior.
                 self.sync_manager.set_committed_height(height);

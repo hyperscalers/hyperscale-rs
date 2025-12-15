@@ -172,9 +172,14 @@ pub enum Action {
     /// The production runner updates the RPC status cache when processing
     /// this action, allowing clients to query transaction status via the
     /// `GET /api/v1/transactions/{hash}` endpoint.
+    ///
+    /// The `added_at` field tracks when the transaction was first added to the
+    /// mempool, enabling end-to-end latency metrics for finalized transactions.
     EmitTransactionStatus {
         tx_hash: Hash,
         status: TransactionStatus,
+        /// When the transaction was added to the mempool (for latency tracking).
+        added_at: Duration,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

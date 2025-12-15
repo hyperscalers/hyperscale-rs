@@ -43,7 +43,6 @@ impl LockContentionStats {
 struct PoolEntry {
     tx: Arc<RoutableTransaction>,
     status: TransactionStatus,
-    #[allow(dead_code)]
     added_at: Duration,
 }
 
@@ -132,10 +131,11 @@ impl MempoolState {
         let hash = tx.hash();
 
         // Check for duplicate
-        if self.pool.contains_key(&hash) {
+        if let Some(entry) = self.pool.get(&hash) {
             return vec![Action::EmitTransactionStatus {
                 tx_hash: hash,
                 status: TransactionStatus::Pending, // Already exists
+                added_at: entry.added_at,
             }];
         }
 
@@ -160,6 +160,7 @@ impl MempoolState {
         vec![Action::EmitTransactionStatus {
             tx_hash: hash,
             status: TransactionStatus::Pending,
+            added_at: self.now,
         }]
     }
 
@@ -312,12 +313,14 @@ impl MempoolState {
             if let Some(entry) = self.pool.get_mut(&hash) {
                 // Only update if still Pending (avoid overwriting later states during sync)
                 if matches!(entry.status, TransactionStatus::Pending) {
+                    let added_at = entry.added_at;
                     entry.status = TransactionStatus::Committed(height);
                     // Add locks for committed transactions
                     self.add_locked_nodes(tx);
                     actions.push(Action::EmitTransactionStatus {
                         tx_hash: hash,
                         status: TransactionStatus::Committed(height),
+                        added_at,
                     });
                 }
             }
@@ -339,13 +342,15 @@ impl MempoolState {
 
         // 4. Process aborts - mark as aborted with reason and evict
         for abort in &block.aborted {
-            if self.pool.contains_key(&abort.tx_hash) {
+            if let Some(entry) = self.pool.get(&abort.tx_hash) {
+                let added_at = entry.added_at;
                 let status = TransactionStatus::Aborted {
                     reason: abort.reason.clone(),
                 };
                 actions.push(Action::EmitTransactionStatus {
                     tx_hash: abort.tx_hash,
                     status,
+                    added_at,
                 });
                 // Evict from pool and tombstone - terminal state
                 self.evict_terminal(abort.tx_hash);
@@ -427,6 +432,7 @@ impl MempoolState {
                 return vec![Action::EmitTransactionStatus {
                     tx_hash,
                     status: new_status,
+                    added_at: entry.added_at,
                 }];
             }
         } else {
@@ -465,10 +471,12 @@ impl MempoolState {
         let mut actions = Vec::new();
 
         // Mark the certificate's TX as completed with the final decision and evict
-        if self.pool.contains_key(&tx_hash) {
+        if let Some(entry) = self.pool.get(&tx_hash) {
+            let added_at = entry.added_at;
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Completed(decision),
+                added_at,
             });
             // Evict from pool and tombstone - terminal state
             self.evict_terminal(tx_hash);
@@ -499,10 +507,12 @@ impl MempoolState {
                 );
 
                 // Update original's status to Retried and evict
-                if self.pool.contains_key(&loser_hash) {
+                if let Some(entry) = self.pool.get(&loser_hash) {
+                    let added_at = entry.added_at;
                     actions.push(Action::EmitTransactionStatus {
                         tx_hash: loser_hash,
                         status: TransactionStatus::Retried { new_tx: retry_hash },
+                        added_at,
                     });
                     // Evict from pool and tombstone - terminal state
                     self.evict_terminal(loser_hash);
@@ -524,6 +534,7 @@ impl MempoolState {
                     actions.push(Action::EmitTransactionStatus {
                         tx_hash: retry_hash,
                         status: TransactionStatus::Pending,
+                        added_at: self.now,
                     });
 
                     // Gossip the retry to relevant shards
@@ -576,10 +587,12 @@ impl MempoolState {
         );
 
         // Update original's status to Retried and evict
-        if self.pool.contains_key(&loser_hash) {
+        if let Some(entry) = self.pool.get(&loser_hash) {
+            let added_at = entry.added_at;
             actions.push(Action::EmitTransactionStatus {
                 tx_hash: loser_hash,
                 status: TransactionStatus::Retried { new_tx: retry_hash },
+                added_at,
             });
             // Evict from pool and tombstone - terminal state
             self.evict_terminal(loser_hash);
@@ -601,6 +614,7 @@ impl MempoolState {
             actions.push(Action::EmitTransactionStatus {
                 tx_hash: retry_hash,
                 status: TransactionStatus::Pending,
+                added_at: self.now,
             });
 
             // Gossip the retry to relevant shards
@@ -647,10 +661,12 @@ impl MempoolState {
             } else {
                 TransactionDecision::Reject
             };
+            let added_at = entry.added_at;
             entry.status = TransactionStatus::Executed(decision);
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Executed(decision),
+                added_at,
             });
         }
 
@@ -682,10 +698,12 @@ impl MempoolState {
             );
 
             // Update original's status to Retried and evict
-            if self.pool.contains_key(&loser_hash) {
+            if let Some(entry) = self.pool.get(&loser_hash) {
+                let added_at = entry.added_at;
                 actions.push(Action::EmitTransactionStatus {
                     tx_hash: loser_hash,
                     status: TransactionStatus::Retried { new_tx: retry_hash },
+                    added_at,
                 });
                 // Evict from pool and tombstone - terminal state
                 self.evict_terminal(loser_hash);
@@ -707,6 +725,7 @@ impl MempoolState {
                 actions.push(Action::EmitTransactionStatus {
                     tx_hash: retry_hash,
                     status: TransactionStatus::Pending,
+                    added_at: self.now,
                 });
 
                 // Gossip the retry to relevant shards
@@ -721,12 +740,14 @@ impl MempoolState {
     ///
     /// This is a terminal state - the transaction is evicted from mempool.
     pub fn mark_completed(&mut self, tx_hash: &Hash, decision: TransactionDecision) -> Vec<Action> {
-        if self.pool.contains_key(tx_hash) {
+        if let Some(entry) = self.pool.get(tx_hash) {
+            let added_at = entry.added_at;
             // Evict from pool and tombstone - terminal state
             self.evict_terminal(*tx_hash);
             return vec![Action::EmitTransactionStatus {
                 tx_hash: *tx_hash,
                 status: TransactionStatus::Completed(decision),
+                added_at,
             }];
         }
         vec![]
@@ -774,10 +795,12 @@ impl MempoolState {
 
                 // Re-borrow entry after calling helper methods
                 let entry = self.pool.get_mut(tx_hash).unwrap();
+                let added_at = entry.added_at;
                 entry.status = new_status.clone();
                 return vec![Action::EmitTransactionStatus {
                     tx_hash: *tx_hash,
                     status: new_status,
+                    added_at,
                 }];
             }
 
@@ -1248,7 +1271,7 @@ mod tests {
 
         // Should have emitted Retried status for loser
         let retried_action = actions.iter().find(|a| {
-            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Retried { .. } } if *tx_hash == loser_hash)
+            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Retried { .. }, .. } if *tx_hash == loser_hash)
         });
         assert!(
             retried_action.is_some(),
@@ -1363,7 +1386,7 @@ mod tests {
 
         // Should have emitted Aborted status
         let aborted_action = actions.iter().find(|a| {
-            matches!(a, Action::EmitTransactionStatus { tx_hash: h, status: TransactionStatus::Aborted { .. } } if *h == tx_hash)
+            matches!(a, Action::EmitTransactionStatus { tx_hash: h, status: TransactionStatus::Aborted { .. }, .. } if *h == tx_hash)
         });
         assert!(
             aborted_action.is_some(),
@@ -1454,7 +1477,7 @@ mod tests {
 
         // The pending retry should have been processed - we should see retry creation actions
         let retried_action = actions.iter().find(|a| {
-            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Retried { .. } } if *tx_hash == loser_hash)
+            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Retried { .. }, .. } if *tx_hash == loser_hash)
         });
         assert!(
             retried_action.is_some(),
@@ -1528,7 +1551,7 @@ mod tests {
 
         // Retry should be created
         let retried_action = actions.iter().find(|a| {
-            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Retried { .. } } if *tx_hash == loser_hash)
+            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Retried { .. }, .. } if *tx_hash == loser_hash)
         });
         assert!(
             retried_action.is_some(),
@@ -1579,7 +1602,7 @@ mod tests {
 
         // Should have emitted Blocked status
         let blocked_action = actions.iter().find(|a| {
-            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Blocked { .. } } if *tx_hash == loser_hash)
+            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Blocked { .. }, .. } if *tx_hash == loser_hash)
         });
         assert!(
             blocked_action.is_some(),
@@ -1639,7 +1662,7 @@ mod tests {
 
         // Retry should be created for TX_A
         let retried_action = actions.iter().find(|a| {
-            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Retried { .. } } if *tx_hash == tx_a_hash)
+            matches!(a, Action::EmitTransactionStatus { tx_hash, status: TransactionStatus::Retried { .. }, .. } if *tx_hash == tx_a_hash)
         });
         assert!(
             retried_action.is_some(),

@@ -1,0 +1,16 @@
+# Grafana dashboard provisioning
+# Auto-loads dashboards from the dashboards directory
+
+apiVersion: 1
+
+providers:
+  - name: 'Hyperscale'
+    orgId: 1
+    folder: 'Hyperscale'
+    folderUid: 'hyperscale'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

@@ -381,7 +381,9 @@ impl SimNode {
                 self.internal_queue.push_back(event);
             }
 
-            Action::EmitTransactionStatus { tx_hash, status } => {
+            Action::EmitTransactionStatus {
+                tx_hash, status, ..
+            } => {
                 if status.is_final() {
                     self.status_updates.push((tx_hash, status));
                 }

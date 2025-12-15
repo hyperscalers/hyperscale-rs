@@ -28,6 +28,7 @@ DATA_DIR="./cluster-data"
 CLEAN=false
 ACCOUNTS_PER_SHARD=10000    # Spammer accounts per shard
 INITIAL_BALANCE=1000000     # Initial XRD balance per account
+MONITORING=false            # Start Prometheus + Grafana monitoring stack
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -52,8 +53,12 @@ while [[ $# -gt 0 ]]; do
             INITIAL_BALANCE="$2"
             shift 2
             ;;
+        --monitoring)
+            MONITORING=true
+            shift
+            ;;
         --help|-h)
-            echo "Usage: $0 [--shards N] [--validators-per-shard M] [--clean]"
+            echo "Usage: $0 [--shards N] [--validators-per-shard M] [--clean] [--monitoring]"
             echo ""
             echo "Options:"
             echo "  --shards N               Number of shards (default: 2)"
@@ -61,6 +66,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --accounts-per-shard N   Spammer accounts per shard (default: 100)"
             echo "  --initial-balance N      Initial XRD balance per account (default: 1000000)"
             echo "  --clean                  Remove existing data directories"
+            echo "  --monitoring             Start Prometheus + Grafana monitoring stack"
+            echo ""
+            echo "Monitoring:"
+            echo "  When --monitoring is enabled, Prometheus and Grafana are started via Docker."
+            echo "  Prometheus: http://localhost:9090"
+            echo "  Grafana:    http://localhost:3000 (admin/admin)"
             exit 0
             ;;
         *)
@@ -328,4 +339,62 @@ else
     echo ""
     echo "WARNING: Smoke test failed with exit code $SMOKE_TEST_EXIT"
     echo "Check validator logs for details: tail -f $DATA_DIR/validator-*/output.log"
+fi
+
+# Start monitoring stack if requested
+if [ "$MONITORING" = true ]; then
+    echo ""
+    echo "=== Starting Monitoring Stack ==="
+
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    MONITORING_DIR="$SCRIPT_DIR/monitoring"
+
+    # Generate prometheus.yml with correct number of targets
+    echo "Generating Prometheus configuration for $TOTAL_VALIDATORS validators..."
+    PROM_TARGETS=""
+    for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
+        rpc_port=$((BASE_RPC_PORT + i))
+        if [ -n "$PROM_TARGETS" ]; then
+            PROM_TARGETS="$PROM_TARGETS
+          - 'host.docker.internal:$rpc_port'"
+        else
+            PROM_TARGETS="- 'host.docker.internal:$rpc_port'"
+        fi
+    done
+
+    cat > "$MONITORING_DIR/prometheus.yml" << EOF
+# Prometheus configuration for Hyperscale local cluster
+# Auto-generated for $NUM_SHARDS shards x $VALIDATORS_PER_SHARD validators = $TOTAL_VALIDATORS total
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: 'hyperscale'
+    static_configs:
+      - targets:
+          $PROM_TARGETS
+        labels:
+          cluster: 'local'
+    metrics_path: '/metrics'
+    scrape_timeout: 5s
+EOF
+
+    # Check if Docker is available
+    if ! command -v docker &> /dev/null; then
+        echo "WARNING: Docker not found. Cannot start monitoring stack."
+        echo "Install Docker and run manually: cd $MONITORING_DIR && docker-compose up -d"
+    else
+        # Start the monitoring stack
+        echo "Starting Prometheus and Grafana..."
+        (cd "$MONITORING_DIR" && docker-compose up -d 2>&1) | tail -5
+
+        echo ""
+        echo "Monitoring URLs:"
+        echo "  Prometheus: http://localhost:9090"
+        echo "  Grafana:    http://localhost:3000 (admin/admin)"
+        echo ""
+        echo "Stop monitoring: cd $MONITORING_DIR && docker-compose down"
+    fi
 fi

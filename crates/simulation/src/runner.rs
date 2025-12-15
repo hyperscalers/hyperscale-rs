@@ -918,7 +918,9 @@ impl SimulationRunner {
                 debug!(block_hash = ?block.hash(), "Block committed");
             }
 
-            Action::EmitTransactionStatus { tx_hash, status } => {
+            Action::EmitTransactionStatus {
+                tx_hash, status, ..
+            } => {
                 debug!(?tx_hash, ?status, "Transaction status");
                 // Cache the status for test queries
                 self.tx_status_cache.insert((from, tx_hash), status);
