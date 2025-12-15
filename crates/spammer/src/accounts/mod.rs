@@ -132,11 +132,8 @@ pub struct AccountPool {
     num_shards: u64,
 
     /// Round-robin counters per shard.
+    /// Used by both RoundRobin and NoContention selection modes.
     round_robin_counters: HashMap<ShardGroupId, std::sync::atomic::AtomicUsize>,
-
-    /// Global transaction counter for NoContention mode.
-    /// Each transaction reserves 2 account slots to ensure zero conflicts.
-    no_contention_counter: std::sync::atomic::AtomicUsize,
 
     /// Usage tracking: total selections per account index per shard.
     usage_counts: HashMap<ShardGroupId, Vec<std::sync::atomic::AtomicU64>>,
@@ -162,7 +159,6 @@ impl AccountPool {
             by_shard,
             num_shards,
             round_robin_counters,
-            no_contention_counter: AtomicUsize::new(0),
             usage_counts,
         }
     }
@@ -367,10 +363,12 @@ impl AccountPool {
                 (idx1, idx2)
             }
             SelectionMode::NoContention => {
-                // Each call gets a disjoint pair using a GLOBAL counter.
-                // This ensures no conflicts between same-shard and cross-shard transactions.
-                let counter = self.no_contention_counter.fetch_add(1, Ordering::SeqCst);
-                let pair_base = (counter * 2) % num_accounts;
+                // Use per-shard counter to ensure each shard cycles through its own
+                // accounts independently. This provides even distribution across shards
+                // while still avoiding contention within each shard.
+                let counter = self.round_robin_counters.get(&shard).unwrap();
+                let c = counter.fetch_add(1, Ordering::SeqCst);
+                let pair_base = (c * 2) % num_accounts;
                 let idx1 = pair_base;
                 let idx2 = (pair_base + 1) % num_accounts;
                 (idx1, idx2)
@@ -402,9 +400,9 @@ impl AccountPool {
             }
             SelectionMode::Zipf { exponent } => self.zipf_index(num_accounts, exponent, rng),
             SelectionMode::NoContention => {
-                // Use the global counter and reserve a full pair slot (2 indices).
-                let counter = self.no_contention_counter.fetch_add(1, Ordering::SeqCst);
-                (counter * 2) % num_accounts
+                // Use per-shard counter for even distribution within each shard.
+                let counter = self.round_robin_counters.get(&shard).unwrap();
+                counter.fetch_add(1, Ordering::SeqCst) % num_accounts
             }
         };
 
