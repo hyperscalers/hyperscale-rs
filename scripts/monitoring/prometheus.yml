@@ -1,5 +1,9 @@
 # Prometheus configuration for Hyperscale local cluster
-# Auto-generated for 2 shards x 4 validators = 8 total
+# 2 shards x 4 validators = 8 total
+#
+# Shard assignment (auto-generated):
+#   - Shard 0: ports 8080-8083
+#   - Shard 1: ports 8084-8087
 
 global:
   scrape_interval: 5s
@@ -8,16 +12,23 @@ global:
 scrape_configs:
   - job_name: 'hyperscale'
     static_configs:
+      # Shard 0 validators
       - targets:
           - 'host.docker.internal:8080'
           - 'host.docker.internal:8081'
           - 'host.docker.internal:8082'
           - 'host.docker.internal:8083'
+        labels:
+          cluster: 'local'
+          shard: '0'
+      # Shard 1 validators
+      - targets:
           - 'host.docker.internal:8084'
           - 'host.docker.internal:8085'
           - 'host.docker.internal:8086'
           - 'host.docker.internal:8087'
         labels:
           cluster: 'local'
+          shard: '1'
     metrics_path: '/metrics'
     scrape_timeout: 5s

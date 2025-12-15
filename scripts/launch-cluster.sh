@@ -349,22 +349,45 @@ if [ "$MONITORING" = true ]; then
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     MONITORING_DIR="$SCRIPT_DIR/monitoring"
 
-    # Generate prometheus.yml with correct number of targets
-    echo "Generating Prometheus configuration for $TOTAL_VALIDATORS validators..."
-    PROM_TARGETS=""
-    for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
-        rpc_port=$((BASE_RPC_PORT + i))
-        if [ -n "$PROM_TARGETS" ]; then
-            PROM_TARGETS="$PROM_TARGETS
+    # Generate prometheus.yml with correct number of targets and shard labels
+    echo "Generating Prometheus configuration for $TOTAL_VALIDATORS validators across $NUM_SHARDS shards..."
+
+    # Build static configs grouped by shard
+    PROM_STATIC_CONFIGS=""
+    for shard in $(seq 0 $((NUM_SHARDS - 1))); do
+        # Build targets for this shard
+        SHARD_TARGETS=""
+        for v in $(seq 0 $((VALIDATORS_PER_SHARD - 1))); do
+            validator_idx=$((shard * VALIDATORS_PER_SHARD + v))
+            rpc_port=$((BASE_RPC_PORT + validator_idx))
+            if [ -n "$SHARD_TARGETS" ]; then
+                SHARD_TARGETS="$SHARD_TARGETS
           - 'host.docker.internal:$rpc_port'"
-        else
-            PROM_TARGETS="- 'host.docker.internal:$rpc_port'"
-        fi
+            else
+                SHARD_TARGETS="- 'host.docker.internal:$rpc_port'"
+            fi
+        done
+
+        # Add this shard's config block
+        PROM_STATIC_CONFIGS="$PROM_STATIC_CONFIGS
+      # Shard $shard validators
+      - targets:
+          $SHARD_TARGETS
+        labels:
+          cluster: 'local'
+          shard: '$shard'"
     done
 
     cat > "$MONITORING_DIR/prometheus.yml" << EOF
 # Prometheus configuration for Hyperscale local cluster
-# Auto-generated for $NUM_SHARDS shards x $VALIDATORS_PER_SHARD validators = $TOTAL_VALIDATORS total
+# $NUM_SHARDS shards x $VALIDATORS_PER_SHARD validators = $TOTAL_VALIDATORS total
+#
+# Shard assignment (auto-generated):
+$(for shard in $(seq 0 $((NUM_SHARDS - 1))); do
+    first_port=$((BASE_RPC_PORT + shard * VALIDATORS_PER_SHARD))
+    last_port=$((first_port + VALIDATORS_PER_SHARD - 1))
+    echo "#   - Shard $shard: ports $first_port-$last_port"
+done)
 
 global:
   scrape_interval: 5s
@@ -372,11 +395,7 @@ global:
 
 scrape_configs:
   - job_name: 'hyperscale'
-    static_configs:
-      - targets:
-          $PROM_TARGETS
-        labels:
-          cluster: 'local'
+    static_configs:$PROM_STATIC_CONFIGS
     metrics_path: '/metrics'
     scrape_timeout: 5s
 EOF
@@ -393,7 +412,7 @@ EOF
         echo ""
         echo "Monitoring URLs:"
         echo "  Prometheus: http://localhost:9090"
-        echo "  Grafana:    http://localhost:3000 (admin/admin)"
+        echo "  Grafana:    http://localhost:3000/d/hyperscale-cluster/hyperscale-cluster"
         echo ""
         echo "Stop monitoring: cd $MONITORING_DIR && docker-compose down"
     fi

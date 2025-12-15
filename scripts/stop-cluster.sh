@@ -62,8 +62,8 @@ if [ "$STOP_MONITORING" = true ]; then
         # Check if monitoring containers are running
         if docker ps --format '{{.Names}}' | grep -q "hyperscale-prometheus\|hyperscale-grafana"; then
             echo ""
-            echo "Stopping monitoring stack..."
-            (cd "$MONITORING_DIR" && docker-compose down 2>&1) | tail -2
+            echo "Stopping monitoring stack and removing volumes..."
+            (cd "$MONITORING_DIR" && docker-compose down -v 2>&1) | tail -2
             echo "Monitoring stopped."
         fi
     fi

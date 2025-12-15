@@ -48,3 +48,6 @@ cluster-data/
 
 # Modelling
 tla/
+
+# Monitoring (dynamically generated)
+scripts/monitoring/prometheus.yml

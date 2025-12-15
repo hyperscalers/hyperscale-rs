@@ -46,7 +46,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "gridPos": { "h": 4, "w": 3, "x": 0, "y": 1 },
       "id": 1,
       "options": {
         "colorMode": "value",
@@ -87,7 +87,48 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "gridPos": { "h": 4, "w": 3, "x": 3, "y": 1 },
+      "id": 7,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.1.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "count(count by (shard) (up{job=\"hyperscale\"}))",
+          "refId": "A"
+        }
+      ],
+      "title": "Shards",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 6, "y": 1 },
       "id": 2,
       "options": {
         "colorMode": "value",
@@ -109,11 +150,12 @@
           "refId": "A"
         }
       ],
-      "title": "Block Height",
+      "title": "Max Block Height",
       "type": "stat"
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Average block commit rate per shard (not summed across all validators)",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -128,7 +170,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "gridPos": { "h": 4, "w": 3, "x": 9, "y": 1 },
       "id": 3,
       "options": {
         "colorMode": "value",
@@ -146,15 +188,16 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_blocks_committed_total[1m]))",
+          "expr": "avg(avg by (shard) (rate(hyperscale_blocks_committed_total[1m])))",
           "refId": "A"
         }
       ],
-      "title": "Blocks/sec",
+      "title": "Avg Blocks/sec",
       "type": "stat"
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Network-wide unique transactions finalized per second. Cross-shard txns are counted once (divided by number of shards involved).",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -169,7 +212,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "gridPos": { "h": 4, "w": 3, "x": 12, "y": 1 },
       "id": 4,
       "options": {
         "colorMode": "value",
@@ -187,11 +230,11 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_transaction_latency_seconds_count[1m]))",
+          "expr": "sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m]))) + (sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m]))) or vector(0)) / 2",
           "refId": "A"
         }
       ],
-      "title": "Transactions/sec",
+      "title": "Unique TPS",
       "type": "stat"
     },
     {
@@ -212,7 +255,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "gridPos": { "h": 4, "w": 3, "x": 15, "y": 1 },
       "id": 5,
       "options": {
         "colorMode": "value",
@@ -239,6 +282,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Average view changes across all validators in the last 5 minutes",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
@@ -255,7 +299,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "gridPos": { "h": 4, "w": 3, "x": 18, "y": 1 },
       "id": 6,
       "options": {
         "colorMode": "value",
@@ -273,11 +317,55 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_view_changes_total[5m]))",
+          "expr": "avg(increase(hyperscale_view_changes_total[5m]))",
           "refId": "A"
         }
       ],
-      "title": "View Changes/5m",
+      "title": "Avg View Changes/5m",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Total cross-shard transactions currently in flight across the network",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 100 },
+              { "color": "red", "value": 500 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 3, "x": 21, "y": 1 },
+      "id": 8,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.1.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(hyperscale_cross_shard_pending) / count(count by (shard) (up{job=\"hyperscale\"}))",
+          "refId": "A"
+        }
+      ],
+      "title": "Cross-Shard Pending",
       "type": "stat"
     },
     {
@@ -290,6 +378,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Block height by shard (max across validators in each shard)",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -321,22 +410,23 @@
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
       "id": 10,
       "options": {
-        "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true },
         "tooltip": { "mode": "multi", "sort": "none" }
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "hyperscale_block_height",
-          "legendFormat": "{{instance}}",
+          "expr": "max by (shard) (hyperscale_block_height)",
+          "legendFormat": "Shard {{shard}}",
           "refId": "A"
         }
       ],
-      "title": "Block Height by Validator",
+      "title": "Block Height by Shard",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Block commit latency percentiles (aggregated across all validators)",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -395,15 +485,8 @@
       "type": "timeseries"
     },
     {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
-      "id": 102,
-      "panels": [],
-      "title": "Transactions",
-      "type": "row"
-    },
-    {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Average block commit rate per shard (one line per shard)",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -432,7 +515,111 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "id": 12,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "avg by (shard) (rate(hyperscale_blocks_committed_total[1m]))",
+          "legendFormat": "Shard {{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Block Rate by Shard",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "View changes per validator - indicates consensus disruptions",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "id": 13,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "rate(hyperscale_view_changes_total[1m])",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "View Changes by Validator",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "id": 102,
+      "panels": [],
+      "title": "Transactions",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Unique transactions finalized per second. Single-shard txns counted once per shard, cross-shard divided by 2 to avoid double-counting.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
       "id": 20,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -441,24 +628,24 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m]))",
+          "expr": "sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m])))",
           "legendFormat": "Single-shard",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m]))",
-          "legendFormat": "Cross-shard",
+          "expr": "(sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m]))) or vector(0)) / 2",
+          "legendFormat": "Cross-shard (unique)",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_transaction_latency_seconds_count[1m]))",
-          "legendFormat": "Total",
+          "expr": "sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m]))) + (sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m]))) or vector(0)) / 2",
+          "legendFormat": "Total (unique)",
           "refId": "C"
         }
       ],
-      "title": "Transaction Throughput",
+      "title": "Unique Transaction Throughput",
       "type": "timeseries"
     },
     {
@@ -491,7 +678,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
       "id": 21,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -528,53 +715,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": { "type": "linear" },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": { "group": "A", "mode": "none" },
-            "thresholdsStyle": { "mode": "off" }
-          },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
-      "id": 22,
-      "options": {
-        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "none" }
-      },
-      "targets": [
-        {
-          "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "hyperscale_mempool_size",
-          "legendFormat": "{{instance}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Mempool Size",
-      "type": "timeseries"
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Per-shard transaction throughput (avg across validators in each shard)",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -603,33 +744,26 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
-      "id": 23,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "id": 24,
       "options": {
-        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
         "tooltip": { "mode": "multi", "sort": "none" }
       },
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum by (reason) (rate(hyperscale_transactions_rejected_total[1m]))",
-          "legendFormat": "{{reason}}",
+          "expr": "avg by (shard) (rate(hyperscale_transaction_latency_seconds_count[1m]))",
+          "legendFormat": "Shard {{shard}}",
           "refId": "A"
         }
       ],
-      "title": "Transaction Rejections",
+      "title": "Transaction Rate by Shard",
       "type": "timeseries"
     },
     {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
-      "id": 103,
-      "panels": [],
-      "title": "Network",
-      "type": "row"
-    },
-    {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Average mempool size per shard",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -658,7 +792,111 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 32 },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 31 },
+      "id": 22,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "avg by (shard) (hyperscale_mempool_size)",
+          "legendFormat": "Shard {{shard}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Mempool Size by Shard",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Total transaction rejections across the cluster by reason",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 31 },
+      "id": 23,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (reason) (rate(hyperscale_transactions_rejected_total[1m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Transaction Rejections",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
+      "id": 103,
+      "panels": [],
+      "title": "Network",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Average connected peers per validator in each shard",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
       "id": 30,
       "options": {
         "legend": { "calcs": ["mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -667,16 +905,17 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "hyperscale_libp2p_peers_connected",
-          "legendFormat": "{{instance}}",
+          "expr": "avg by (shard) (hyperscale_libp2p_peers_connected)",
+          "legendFormat": "Shard {{shard}}",
           "refId": "A"
         }
       ],
-      "title": "Connected Peers",
+      "title": "Connected Peers by Shard",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Total cluster network bandwidth (sum of all validators)",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -705,7 +944,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 32 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 40 },
       "id": 31,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -715,21 +954,22 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "expr": "sum(rate(hyperscale_libp2p_bandwidth_in_bytes_total[1m]))",
-          "legendFormat": "Inbound",
+          "legendFormat": "Inbound (cluster)",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "expr": "sum(rate(hyperscale_libp2p_bandwidth_out_bytes_total[1m]))",
-          "legendFormat": "Outbound",
+          "legendFormat": "Outbound (cluster)",
           "refId": "B"
         }
       ],
-      "title": "Network Bandwidth",
+      "title": "Cluster Network Bandwidth",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Average message rate per validator (not summed)",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -758,7 +998,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 32 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
       "id": 32,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -767,23 +1007,23 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_network_messages_sent_total[1m]))",
-          "legendFormat": "Sent",
+          "expr": "avg(rate(hyperscale_network_messages_sent_total[1m]))",
+          "legendFormat": "Sent (avg/validator)",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_network_messages_received_total[1m]))",
-          "legendFormat": "Received",
+          "expr": "avg(rate(hyperscale_network_messages_received_total[1m]))",
+          "legendFormat": "Received (avg/validator)",
           "refId": "B"
         }
       ],
-      "title": "Message Rate",
+      "title": "Avg Message Rate per Validator",
       "type": "timeseries"
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
       "id": 104,
       "panels": [],
       "title": "Storage",
@@ -819,7 +1059,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
       "id": 40,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -856,6 +1096,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Average storage write rate per validator (blocks are written by all validators in a shard)",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -884,7 +1125,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
       "id": 41,
       "options": {
         "legend": { "calcs": ["mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -893,29 +1134,29 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_storage_blocks_persisted_total[1m]))",
-          "legendFormat": "Blocks",
+          "expr": "avg(rate(hyperscale_storage_blocks_persisted_total[1m]))",
+          "legendFormat": "Blocks (avg/validator)",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_storage_certificates_persisted_total[1m]))",
-          "legendFormat": "Certificates",
+          "expr": "avg(rate(hyperscale_storage_certificates_persisted_total[1m]))",
+          "legendFormat": "Certificates (avg/validator)",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_storage_votes_persisted_total[1m]))",
-          "legendFormat": "Votes",
+          "expr": "avg(rate(hyperscale_storage_votes_persisted_total[1m]))",
+          "legendFormat": "Votes (avg/validator)",
           "refId": "C"
         }
       ],
-      "title": "Storage Write Rate",
+      "title": "Avg Storage Write Rate per Validator",
       "type": "timeseries"
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
       "id": 105,
       "panels": [],
       "title": "Sync & Fetch",
@@ -923,6 +1164,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Max blocks behind in each shard (0 = fully synced)",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -951,7 +1193,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 50 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 58 },
       "id": 50,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -960,16 +1202,17 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "hyperscale_sync_blocks_behind",
-          "legendFormat": "{{instance}}",
+          "expr": "max by (shard) (hyperscale_sync_blocks_behind)",
+          "legendFormat": "Shard {{shard}}",
           "refId": "A"
         }
       ],
-      "title": "Blocks Behind",
+      "title": "Max Blocks Behind by Shard",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Total fetch operations completed across the cluster",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -998,7 +1241,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 50 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 58 },
       "id": 51,
       "options": {
         "legend": { "calcs": ["mean"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1017,6 +1260,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Total fetch requests in flight across all validators",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -1045,7 +1289,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 50 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 58 },
       "id": 52,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1055,7 +1299,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "expr": "sum(hyperscale_fetch_in_flight)",
-          "legendFormat": "In Flight",
+          "legendFormat": "In Flight (cluster)",
           "refId": "A"
         }
       ],
@@ -1064,7 +1308,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 58 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 66 },
       "id": 106,
       "panels": [],
       "title": "Livelock & Errors",
@@ -1072,6 +1316,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Livelock detection metrics (summed across shards, divided to avoid double-counting)",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -1100,7 +1345,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 59 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 67 },
       "id": 60,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1109,13 +1354,13 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(hyperscale_livelock_deferred_transactions)",
-          "legendFormat": "Deferred",
+          "expr": "sum(hyperscale_livelock_deferred_transactions) / count(count by (shard) (up{job=\"hyperscale\"}))",
+          "legendFormat": "Deferred Txns",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_livelock_cycles_detected_total[1m]))",
+          "expr": "sum(rate(hyperscale_livelock_cycles_detected_total[1m])) / count(count by (shard) (up{job=\"hyperscale\"}))",
           "legendFormat": "Cycles/sec",
           "refId": "B"
         }
@@ -1125,6 +1370,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Average lock contention ratio across all validators",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -1153,7 +1399,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 59 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 67 },
       "id": 61,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1172,6 +1418,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Error rates averaged across validators (not summed)",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -1200,7 +1447,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 59 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 67 },
       "id": 62,
       "options": {
         "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1209,20 +1456,20 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_signature_verification_failures_total[1m]))",
-          "legendFormat": "Sig Failures",
+          "expr": "avg(rate(hyperscale_signature_verification_failures_total[1m]))",
+          "legendFormat": "Sig Failures (avg/validator)",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(rate(hyperscale_invalid_messages_received_total[1m]))",
-          "legendFormat": "Invalid Msgs",
+          "expr": "avg(rate(hyperscale_invalid_messages_received_total[1m]))",
+          "legendFormat": "Invalid Msgs (avg/validator)",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "expr": "sum(rate(hyperscale_sync_peers_banned_total[1m]))",
-          "legendFormat": "Peers Banned",
+          "legendFormat": "Peers Banned (cluster)",
           "refId": "C"
         }
       ],
@@ -1231,7 +1478,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 75 },
       "id": 107,
       "panels": [],
       "title": "Thread Pools",
@@ -1239,6 +1486,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Average thread pool queue depth per validator",
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
@@ -1267,7 +1515,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 68 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 76 },
       "id": 70,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1276,18 +1524,18 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(hyperscale_crypto_pool_queue_depth)",
-          "legendFormat": "Crypto Pool",
+          "expr": "avg(hyperscale_crypto_pool_queue_depth)",
+          "legendFormat": "Crypto Pool (avg/validator)",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(hyperscale_execution_pool_queue_depth)",
-          "legendFormat": "Execution Pool",
+          "expr": "avg(hyperscale_execution_pool_queue_depth)",
+          "legendFormat": "Execution Pool (avg/validator)",
           "refId": "B"
         }
       ],
-      "title": "Thread Pool Queue Depth",
+      "title": "Avg Thread Pool Queue Depth",
       "type": "timeseries"
     },
     {
@@ -1320,7 +1568,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 68 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 76 },
       "id": 71,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
