@@ -11,13 +11,13 @@
 //! This is a complete sync solution - no separate SyncState SubStateMachine needed.
 
 use crate::metrics;
-use crate::network::Libp2pAdapter;
+use crate::network::{compute_peer_id_for_validator, Libp2pAdapter};
 use crate::sync_error::SyncResponseError;
 use hyperscale_core::Event;
-use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, ShardGroupId};
+use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, Topology};
 use libp2p::PeerId;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -126,18 +126,27 @@ pub struct SyncConfig {
     pub base_ban_duration: Duration,
     /// Maximum ban duration (caps the exponential backoff).
     pub max_ban_duration: Duration,
+    /// Desperation mode: if we're this many blocks behind and all peers are in cooldown,
+    /// reset cooldowns to allow retrying. This prevents getting stuck when all peers
+    /// temporarily fail but we urgently need to catch up.
+    pub desperation_threshold_blocks: u64,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
-            max_concurrent_fetches: 4,
+            // Allow up to 16 concurrent fetches for faster catch-up.
+            // With 3 peers (4-validator shard minus self) at 2 requests each,
+            // we could do 6 concurrent, but we allow more headroom for larger shards.
+            max_concurrent_fetches: 16,
             initial_timeout: Duration::from_secs(5),
             max_timeout: Duration::from_secs(30),
             max_retries_per_peer: 3,
             peer_cooldown: Duration::from_secs(60),
             base_ban_duration: Duration::from_secs(600), // 10 minutes
             max_ban_duration: Duration::from_secs(86400), // 24 hours
+            // If 10+ blocks behind and all peers in cooldown, enter desperation mode
+            desperation_threshold_blocks: 10,
         }
     }
 }
@@ -166,6 +175,11 @@ pub struct PeerReputation {
     pub last_success: Option<Instant>,
     /// Time of last failure (for cooldown calculation).
     pub last_failure: Option<Instant>,
+    /// Count of consecutive empty responses (peer doesn't have blocks we need).
+    /// Reset on success. Used to deprioritize peers that are also behind.
+    pub empty_responses: u32,
+    /// Time of last empty response.
+    pub last_empty_response: Option<Instant>,
 }
 
 /// A pending sync fetch request.
@@ -180,6 +194,9 @@ struct PendingFetch {
     started: Instant,
     /// Current retry count.
     retries: u32,
+    /// Peers that have been tried for this height (and returned empty or failed).
+    /// Used to avoid retrying the same peer.
+    tried_peers: HashSet<PeerId>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -248,27 +265,21 @@ pub struct SyncManager {
     network: Arc<Libp2pAdapter>,
     /// Event sender for delivering fetched blocks.
     event_tx: mpsc::Sender<Event>,
-    /// Our local shard - we only sync from peers in the same shard.
-    local_shard: ShardGroupId,
+    /// Network topology - source of truth for committee membership.
+    /// We query this directly for peer selection instead of maintaining a separate map.
+    topology: Arc<dyn Topology>,
     /// Current sync target (if syncing).
     sync_target: Option<(u64, Hash)>,
     /// Heights we need to fetch.
     heights_to_fetch: VecDeque<u64>,
-    /// Heights we've successfully fetched (waiting for state machine to apply).
-    fetched_heights: HashSet<u64>,
-    /// Fetched blocks waiting to be delivered in order.
-    /// Key is height, value is (block, qc).
-    /// Blocks are delivered to BFT in sequential order starting from committed_height + 1.
-    fetched_blocks: BTreeMap<u64, (Block, QuorumCertificate)>,
     /// Currently pending fetch requests.
     pending_fetches: HashMap<u64, PendingFetch>,
+    /// Peers that have been tried for each height (for retry rotation).
+    /// Cleared when sync completes or height is successfully fetched.
+    tried_peers_for_height: HashMap<u64, HashSet<PeerId>>,
     /// Peer reputations for selection and failure tracking.
+    /// Keyed by PeerId, computed from topology on demand.
     peer_reputations: HashMap<PeerId, PeerReputation>,
-    /// Known peers (connected validators) in the same shard.
-    /// Only peers from the local shard are stored here for sync purposes.
-    known_peers: Vec<PeerId>,
-    /// Mapping of peer ID to their shard (for filtering).
-    peer_shards: HashMap<PeerId, ShardGroupId>,
     /// Our current committed height (updated by state machine).
     committed_height: u64,
     /// Channel for receiving results from spawned fetch tasks.
@@ -279,11 +290,15 @@ pub struct SyncManager {
 
 impl SyncManager {
     /// Create a new sync manager.
+    ///
+    /// The topology is used as the source of truth for peer discovery.
+    /// We query it directly for committee members instead of maintaining
+    /// a separate peer map.
     pub fn new(
         config: SyncConfig,
         network: Arc<Libp2pAdapter>,
         event_tx: mpsc::Sender<Event>,
-        local_shard: ShardGroupId,
+        topology: Arc<dyn Topology>,
     ) -> Self {
         // Channel for fetch results - buffer size matches max concurrent fetches
         let (fetch_result_tx, fetch_result_rx) =
@@ -293,77 +308,27 @@ impl SyncManager {
             config,
             network,
             event_tx,
-            local_shard,
+            topology,
             sync_target: None,
             heights_to_fetch: VecDeque::new(),
-            fetched_heights: HashSet::new(),
-            fetched_blocks: BTreeMap::new(),
             pending_fetches: HashMap::new(),
+            tried_peers_for_height: HashMap::new(),
             peer_reputations: HashMap::new(),
-            known_peers: Vec::new(),
-            peer_shards: HashMap::new(),
             committed_height: 0,
             fetch_result_rx,
             fetch_result_tx,
         }
     }
 
-    /// Register a known peer (validator) with their shard assignment.
-    ///
-    /// Only peers from the same shard will be used for sync requests.
-    /// This is critical for multi-shard deployments where blocks from different
-    /// shards have different QC signatures that won't verify cross-shard.
-    pub fn register_peer(&mut self, peer_id: PeerId, peer_shard: ShardGroupId) {
-        // Always track the peer's shard
-        self.peer_shards.insert(peer_id, peer_shard);
-
-        // Only add to known_peers if they're in our shard
-        if peer_shard == self.local_shard && !self.known_peers.contains(&peer_id) {
-            self.known_peers.push(peer_id);
-            self.peer_reputations
-                .insert(peer_id, PeerReputation::default());
-            debug!(?peer_id, shard = ?peer_shard, "Registered sync peer (same shard)");
-        } else if peer_shard != self.local_shard {
-            trace!(
-                ?peer_id,
-                peer_shard = ?peer_shard,
-                local_shard = ?self.local_shard,
-                "Skipping sync peer registration (different shard)"
-            );
-        }
-    }
-
-    /// Remove a peer (disconnected).
-    pub fn remove_peer(&mut self, peer_id: &PeerId) {
-        self.known_peers.retain(|p| p != peer_id);
-        self.peer_reputations.remove(peer_id);
-        self.peer_shards.remove(peer_id);
-        debug!(?peer_id, "Removed sync peer");
-    }
-
-    /// Update known peers from the network's connected peer list.
-    ///
-    /// This should be called periodically to keep the sync manager's peer list
-    /// in sync with actual network connections. Only peers already registered
-    /// with `register_peer` (and in the same shard) will be considered.
-    pub fn update_peers(&mut self, connected_peers: Vec<PeerId>) {
-        // Add new peers that are in our shard
-        for peer_id in &connected_peers {
-            // Only add peers we know are in our shard
-            if let Some(&shard) = self.peer_shards.get(peer_id) {
-                if shard == self.local_shard && !self.known_peers.contains(peer_id) {
-                    self.known_peers.push(*peer_id);
-                    self.peer_reputations
-                        .insert(*peer_id, PeerReputation::default());
-                    debug!(?peer_id, "Added sync peer from network (same shard)");
-                }
-            }
-        }
-
-        // Remove peers that are no longer connected
-        self.known_peers.retain(|p| connected_peers.contains(p));
-        self.peer_reputations
-            .retain(|p, _| connected_peers.contains(p));
+    /// Get the count of same-shard peers available for sync (excluding self).
+    fn sync_peer_count(&self) -> usize {
+        let local_shard = self.topology.local_shard();
+        let local_validator = self.topology.local_validator_id();
+        self.topology
+            .committee_for_shard(local_shard)
+            .iter()
+            .filter(|&&v| v != local_validator)
+            .count()
     }
 
     /// Check if we're currently syncing.
@@ -402,23 +367,32 @@ impl SyncManager {
             current_height: self.committed_height,
             target_height: self.sync_target.map(|(h, _)| h),
             blocks_behind: self.blocks_behind(),
-            sync_peers: self.known_peers.len(),
+            sync_peers: self.sync_peer_count(),
             pending_fetches: self.pending_fetches.len(),
             queued_heights: self.heights_to_fetch.len(),
         }
     }
 
     /// Update the committed height (called when state machine commits a block).
-    ///
-    /// Returns true if there are more blocks ready to deliver (caller should
-    /// call `try_deliver_blocks_sync()` to deliver them).
-    pub fn set_committed_height(&mut self, height: u64) -> bool {
+    pub fn set_committed_height(&mut self, height: u64) {
         self.committed_height = height;
 
         // Remove heights at or below committed from pending lists
         self.heights_to_fetch.retain(|h| *h > height);
-        self.fetched_heights.retain(|h| *h > height);
-        self.fetched_blocks.retain(|h, _| *h > height);
+
+        // When removing pending fetches, decrement in_flight for the associated peers
+        // to prevent the counter from getting stuck
+        let peers_to_decrement: Vec<_> = self
+            .pending_fetches
+            .iter()
+            .filter(|(h, _)| **h <= height)
+            .map(|(_, fetch)| fetch.peer)
+            .collect();
+        for peer in peers_to_decrement {
+            if let Some(rep) = self.peer_reputations.get_mut(&peer) {
+                rep.in_flight = rep.in_flight.saturating_sub(1);
+            }
+        }
         self.pending_fetches.retain(|h, _| *h > height);
 
         // Check if sync is complete
@@ -427,39 +401,6 @@ impl SyncManager {
                 debug!(height, target, "Sync complete");
                 self.sync_target = None;
                 self.heights_to_fetch.clear();
-                self.fetched_blocks.clear();
-                return false;
-            }
-        }
-
-        // Return true if there are more blocks ready to deliver
-        self.fetched_blocks.contains_key(&(height + 1))
-    }
-
-    /// Try to deliver the next block (non-blocking).
-    ///
-    /// Call this after `set_committed_height()` returns true to deliver
-    /// any consecutive blocks that are now ready. Uses `try_send()` which
-    /// is safe to call from within an async runtime.
-    pub fn try_deliver_blocks_sync(&mut self) {
-        let next_height = self.committed_height + 1;
-
-        if let Some((block, qc)) = self.fetched_blocks.remove(&next_height) {
-            debug!(
-                height = next_height,
-                "Delivering synced block to BFT for verification"
-            );
-
-            // Remove from fetched_heights when delivering - if BFT rejects the block,
-            // we need to be able to re-fetch it on the next sync cycle.
-            // The height will be cleaned up from fetched_heights when committed_height
-            // advances past it (in set_committed_height).
-            self.fetched_heights.remove(&next_height);
-
-            // Use try_send (non-blocking) - safe within async runtime
-            let event = Event::SyncBlockReadyToApply { block, qc };
-            if let Err(e) = self.event_tx.try_send(event) {
-                warn!(height = next_height, error = ?e, "Failed to deliver synced block");
             }
         }
     }
@@ -467,6 +408,7 @@ impl SyncManager {
     /// Start syncing to a target height.
     ///
     /// Called when state machine emits `SyncNeeded`.
+    /// Spawns initial batch of fetches immediately rather than deferring to tick().
     pub fn start_sync(&mut self, target_height: u64, target_hash: Hash) {
         // Already syncing to this or higher target?
         if self.sync_target.is_some_and(|(t, _)| t >= target_height) {
@@ -485,19 +427,21 @@ impl SyncManager {
 
         self.sync_target = Some((target_height, target_hash));
 
-        // Queue heights to fetch - add any heights we haven't fetched or queued yet.
-        // Always start from committed_height + 1, not from old_target + 1, because
-        // we need to fill any gaps. The checks for fetched_heights, fetched_blocks,
-        // pending_fetches, and heights_to_fetch prevent duplicate queuing.
-        for height in (self.committed_height + 1)..=target_height {
-            if !self.fetched_heights.contains(&height)
-                && !self.fetched_blocks.contains_key(&height)
-                && !self.pending_fetches.contains_key(&height)
+        // Queue heights to fetch. We don't track "already fetched" heights because
+        // BFT is the source of truth - it will ignore duplicates. This avoids bugs
+        // where SyncManager thinks a block was fetched but BFT lost it (e.g., due to
+        // QC verification failure clearing pending_synced_block_verifications).
+        let first_height = self.committed_height + 1;
+        for height in first_height..=target_height {
+            if !self.pending_fetches.contains_key(&height)
                 && !self.heights_to_fetch.contains(&height)
             {
                 self.heights_to_fetch.push_back(height);
             }
         }
+
+        // Spawn initial batch of fetches immediately (don't wait for tick)
+        self.spawn_pending_fetches();
     }
 
     /// Cancel the current sync operation.
@@ -505,21 +449,18 @@ impl SyncManager {
         debug!("Cancelling sync");
         self.sync_target = None;
         self.heights_to_fetch.clear();
-        self.fetched_blocks.clear();
         self.pending_fetches.clear();
-        // Keep fetched_heights - they might still be useful
     }
 
     /// Tick the sync manager - called periodically to drive fetch progress.
     ///
     /// This should be called regularly (e.g., every 100ms) to:
     /// - Process completed fetch results
-    /// - Start new fetch requests (up to max_concurrent_fetches)
     /// - Check for timed out requests
-    /// - Retry failed requests
+    /// - Spawn more fetches if under the concurrent limit
     ///
-    /// Fetches are spawned as concurrent tasks and results are processed
-    /// via the fetch result channel.
+    /// Note: Initial fetches are spawned immediately in start_sync().
+    /// This tick only handles ongoing progress and retries.
     pub async fn tick(&mut self) {
         // Always process any pending fetch results, even if not syncing
         // (we may have outstanding fetches from before sync was cancelled)
@@ -532,13 +473,21 @@ impl SyncManager {
         // Check for timed out requests
         self.check_timeouts();
 
-        // Spawn new fetches up to the limit (non-blocking)
+        // Spawn more fetches if we're under the limit
+        self.spawn_pending_fetches();
+    }
+
+    /// Spawn pending fetches up to the concurrent limit.
+    ///
+    /// Called both from start_sync() for immediate spawning and from tick()
+    /// for ongoing progress after retries or when slots free up.
+    fn spawn_pending_fetches(&mut self) {
         while self.pending_fetches.len() < self.config.max_concurrent_fetches {
             if let Some(height) = self.heights_to_fetch.pop_front() {
                 if let Some(peer) = self.select_peer() {
                     self.spawn_fetch(height, peer);
                 } else {
-                    // No available peers, put height back
+                    // No available peers, put height back and stop
                     self.heights_to_fetch.push_front(height);
                     break;
                 }
@@ -582,10 +531,9 @@ impl SyncManager {
     fn spawn_fetch(&mut self, height: u64, peer: PeerId) {
         trace!(height, ?peer, "Spawning concurrent sync fetch");
 
-        // Update peer reputation
-        if let Some(rep) = self.peer_reputations.get_mut(&peer) {
-            rep.in_flight += 1;
-        }
+        // Update peer reputation (create entry if needed)
+        let rep = self.peer_reputations.entry(peer).or_default();
+        rep.in_flight += 1;
 
         // Record pending fetch
         self.pending_fetches.insert(
@@ -595,6 +543,7 @@ impl SyncManager {
                 peer,
                 started: Instant::now(),
                 retries: 0,
+                tried_peers: HashSet::new(),
             },
         );
 
@@ -624,8 +573,8 @@ impl SyncManager {
 
     /// Handle a received block response.
     ///
-    /// Validates the block, stores it for ordering, and delivers consecutive
-    /// blocks directly to BFT via `SyncBlockReadyToApply`.
+    /// Validates the block and delivers it immediately to BFT.
+    /// BFT handles ordering and decides when to apply each block.
     pub async fn on_block_received(
         &mut self,
         height: u64,
@@ -633,15 +582,22 @@ impl SyncManager {
         qc: QuorumCertificate,
         from_peer: PeerId,
     ) {
+        // Always decrement in_flight when we receive a response, even if the height
+        // was already handled (e.g., by a timeout). This prevents in_flight from getting
+        // stuck if a timed-out request eventually completes.
+        let rep = self.peer_reputations.entry(from_peer).or_default();
+        rep.in_flight = rep.in_flight.saturating_sub(1);
+
         // Remove from pending
         if let Some(_pending) = self.pending_fetches.remove(&height) {
-            // Mark peer as successful - reset failure count and record success
-            if let Some(rep) = self.peer_reputations.get_mut(&from_peer) {
-                rep.successes += 1;
-                rep.failures = 0; // Reset on success
-                rep.in_flight = rep.in_flight.saturating_sub(1);
-                rep.last_success = Some(Instant::now());
-            }
+            // Clean up tried peers tracking for this height
+            self.tried_peers_for_height.remove(&height);
+
+            // Mark peer as successful - reset failure count and empty_responses
+            rep.successes += 1;
+            rep.failures = 0; // Reset on success
+            rep.empty_responses = 0; // Reset empty response count
+            rep.last_success = Some(Instant::now());
 
             trace!(height, ?from_peer, "Block received for sync");
 
@@ -658,18 +614,18 @@ impl SyncManager {
                 return;
             }
 
-            // Mark as fetched and store for ordering
-            self.fetched_heights.insert(height);
-            self.fetched_blocks.insert(height, (block, qc));
-
-            // Try to deliver consecutive blocks
-            self.try_deliver_blocks().await;
+            // Deliver immediately to BFT - it handles ordering and deduplication
+            debug!(height, "Delivering synced block to BFT for verification");
+            let event = Event::SyncBlockReadyToApply { block, qc };
+            if let Err(e) = self.event_tx.send(event).await {
+                warn!(height, error = ?e, "Failed to deliver synced block");
+            }
         } else {
-            // Unexpected response (maybe from a retry after we already got it)
+            // Request was already handled (likely by timeout) - just log it
             trace!(
                 height,
                 ?from_peer,
-                "Unexpected block response (already handled)"
+                "Late block response (already handled by timeout)"
             );
         }
     }
@@ -702,47 +658,16 @@ impl SyncManager {
         true
     }
 
-    /// Try to deliver consecutive fetched blocks to BFT.
-    ///
-    /// Delivers blocks in order starting from committed_height + 1.
-    /// Blocks are sent via SyncBlockReadyToApply, which BFT will verify
-    /// (QC signatures) and then commit.
-    ///
-    /// We only deliver one block at a time. When BFT commits that block,
-    /// it calls `set_committed_height()`, which updates our committed_height
-    /// and allows the next block to be delivered on the next tick.
-    async fn try_deliver_blocks(&mut self) {
-        let next_height = self.committed_height + 1;
-
-        // Check if we have the next block ready
-        if let Some((block, qc)) = self.fetched_blocks.remove(&next_height) {
-            debug!(
-                height = next_height,
-                "Delivering synced block to BFT for verification"
-            );
-
-            // Remove from fetched_heights when delivering - if BFT rejects the block,
-            // we need to be able to re-fetch it on the next sync cycle.
-            // The height will be cleaned up from fetched_heights when committed_height
-            // advances past it (in set_committed_height).
-            self.fetched_heights.remove(&next_height);
-
-            // Send directly to BFT - bypasses SyncState entirely
-            let event = Event::SyncBlockReadyToApply { block, qc };
-            if let Err(e) = self.event_tx.send(event).await {
-                warn!(height = next_height, error = ?e, "Failed to deliver synced block");
-            }
-
-            // Don't update committed_height here - that happens when BFT
-            // actually commits the block and calls set_committed_height()
-        }
-    }
-
     /// Handle a failed fetch (timeout or error).
     ///
     /// This is for non-malicious failures like timeouts and network errors.
     /// For malicious responses, use `on_sync_response_error()` instead.
     pub fn on_fetch_failed(&mut self, height: u64, peer: PeerId, reason: &str) {
+        // Always decrement in_flight when we receive a failure, even if the height
+        // was already handled. This prevents in_flight from getting stuck.
+        let rep = self.peer_reputations.entry(peer).or_default();
+        rep.in_flight = rep.in_flight.saturating_sub(1);
+
         if let Some(_pending) = self.pending_fetches.remove(&height) {
             warn!(height, ?peer, reason, "Sync fetch failed");
 
@@ -755,55 +680,149 @@ impl SyncManager {
             metrics::record_sync_response_error(error_type);
 
             // Update peer reputation (non-malicious failure)
-            if let Some(rep) = self.peer_reputations.get_mut(&peer) {
-                rep.failures += 1;
-                rep.last_failure = Some(Instant::now());
-                rep.in_flight = rep.in_flight.saturating_sub(1);
-            }
+            rep.failures += 1;
+            rep.last_failure = Some(Instant::now());
 
             // Re-queue the height for retry (with a different peer if possible)
             self.heights_to_fetch.push_back(height);
+        } else {
+            // Request was already handled (likely by timeout) - just log it
+            trace!(
+                height,
+                ?peer,
+                reason,
+                "Late failure for already-handled request"
+            );
         }
     }
 
     /// Select the best peer for a sync request.
     ///
     /// Selection criteria:
-    /// 1. Skip banned peers
-    /// 2. Skip peers in cooldown (too many failures)
-    /// 3. Skip peers with too many in-flight requests
-    /// 4. Prefer peers with fewer in-flight requests
-    /// 5. Prefer peers with fewer failures
+    /// 1. Only consider peers in our shard (from topology)
+    /// 2. Exclude ourselves
+    /// 3. Skip banned peers
+    /// 4. Skip peers in cooldown (too many failures)
+    /// 5. Skip peers with too many in-flight requests
+    /// 6. Prefer peers with fewer in-flight requests
+    /// 7. Prefer peers with fewer failures
+    ///
+    /// If all peers are in cooldown and we're significantly behind (desperation mode),
+    /// cooldowns are reset to allow immediate retries.
     fn select_peer(&mut self) -> Option<PeerId> {
         let now = Instant::now();
 
-        // Filter out banned, cooldown, and overloaded peers
-        let available: Vec<_> = self
-            .known_peers
+        // Try normal peer selection first
+        if let Some(peer) = self.select_peer_inner(now) {
+            return Some(peer);
+        }
+
+        // No peers available - check if we should enter desperation mode
+        let local_shard = self.topology.local_shard();
+        let local_validator = self.topology.local_validator_id();
+        let committee = self.topology.committee_for_shard(local_shard);
+        let same_shard_count = committee.iter().filter(|&&v| v != local_validator).count();
+
+        if same_shard_count == 0 {
+            return None;
+        }
+
+        let in_cooldown_count = self
+            .peer_reputations
+            .values()
+            .filter(|rep| {
+                rep.failures >= self.config.max_retries_per_peer
+                    && rep
+                        .last_failure
+                        .is_some_and(|lf| now.duration_since(lf) < self.config.peer_cooldown)
+            })
+            .count();
+        let banned = self
+            .peer_reputations
+            .values()
+            .filter(|rep| self.is_peer_banned_inner(rep, now))
+            .count();
+        let at_max_inflight = self
+            .peer_reputations
+            .values()
+            .filter(|rep| rep.in_flight >= 2)
+            .count();
+
+        // Check for desperation mode: all peers in cooldown (not banned) and we're far behind
+        let blocks_behind = self.blocks_behind();
+        let all_in_cooldown =
+            in_cooldown_count == same_shard_count && banned == 0 && at_max_inflight == 0;
+
+        if all_in_cooldown && blocks_behind >= self.config.desperation_threshold_blocks {
+            warn!(
+                same_shard_peers = same_shard_count,
+                blocks_behind,
+                "DESPERATION MODE: All peers in cooldown but {} blocks behind - resetting cooldowns",
+                blocks_behind
+            );
+
+            // Reset failure counts and cooldowns for all peers (but not bans)
+            for rep in self.peer_reputations.values_mut() {
+                if rep.banned_until.is_none() {
+                    rep.failures = 0;
+                    rep.last_failure = None;
+                }
+            }
+
+            // Now retry peer selection with reset cooldowns
+            return self.select_peer_inner(now);
+        }
+
+        warn!(
+            same_shard_peers = same_shard_count,
+            in_cooldown = in_cooldown_count,
+            banned,
+            at_max_inflight,
+            "No sync peers available - all peers filtered out"
+        );
+
+        None
+    }
+
+    /// Inner peer selection logic (without desperation mode handling).
+    fn select_peer_inner(&self, now: Instant) -> Option<PeerId> {
+        let local_shard = self.topology.local_shard();
+        let local_validator = self.topology.local_validator_id();
+        let committee = self.topology.committee_for_shard(local_shard);
+
+        // Build list of available peers from committee (excluding self)
+        let available: Vec<_> = committee
             .iter()
-            .filter(|peer| {
-                if let Some(rep) = self.peer_reputations.get(peer) {
+            .filter(|&&v| v != local_validator)
+            .filter_map(|&validator_id| {
+                // Get peer ID from topology
+                let pk = self.topology.public_key(validator_id)?;
+                let peer_id = compute_peer_id_for_validator(&pk);
+
+                // Check reputation filters
+                if let Some(rep) = self.peer_reputations.get(&peer_id) {
                     // Skip banned peers
                     if self.is_peer_banned_inner(rep, now) {
-                        return false;
+                        return None;
                     }
 
                     // Check failure cooldown (for non-banned peers with many failures)
                     if rep.failures >= self.config.max_retries_per_peer {
                         if let Some(last_failure) = rep.last_failure {
                             if now.duration_since(last_failure) < self.config.peer_cooldown {
-                                return false;
+                                return None;
                             }
                         }
                     }
 
                     // Allow up to 2 concurrent requests per peer
-                    rep.in_flight < 2
-                } else {
-                    true
+                    if rep.in_flight >= 2 {
+                        return None;
+                    }
                 }
+
+                Some(peer_id)
             })
-            .cloned()
             .collect();
 
         if available.is_empty() {
@@ -871,14 +890,27 @@ impl SyncManager {
     /// This method categorizes errors as malicious or non-malicious:
     /// - Malicious errors (invalid blocks, bad QCs) result in peer bans
     /// - Non-malicious errors (timeouts, network issues) just increment failure count
+    /// - Empty responses (peer doesn't have the block) are tracked separately
     ///
     /// The height is re-queued for retry with a different peer.
     pub fn on_sync_response_error(&mut self, peer: PeerId, height: u64, error: SyncResponseError) {
         // Record the error metric
         metrics::record_sync_response_error(error.metric_label());
 
-        // Remove from pending (if present)
-        self.pending_fetches.remove(&height);
+        // Get the tried_peers from the pending fetch before removing it
+        let tried_peers = self
+            .pending_fetches
+            .remove(&height)
+            .map(|f| {
+                let mut tried = f.tried_peers;
+                tried.insert(peer); // Add current peer to tried set
+                tried
+            })
+            .unwrap_or_else(|| {
+                let mut tried = HashSet::new();
+                tried.insert(peer);
+                tried
+            });
 
         // Update in-flight count
         if let Some(rep) = self.peer_reputations.get_mut(&peer) {
@@ -888,8 +920,20 @@ impl SyncManager {
         if error.is_malicious() {
             // Ban the peer for malicious behavior
             self.ban_peer(peer, &error);
+        } else if error.is_empty_response() {
+            // Empty response: peer doesn't have the block (probably also behind)
+            // Track this separately from other failures
+            let rep = self.peer_reputations.entry(peer).or_default();
+            rep.empty_responses += 1;
+            rep.last_empty_response = Some(Instant::now());
+            debug!(
+                ?peer,
+                height,
+                empty_responses = rep.empty_responses,
+                "Peer returned empty sync response (doesn't have block)"
+            );
         } else {
-            // Non-malicious: just increment failure count
+            // Non-malicious network error: increment failure count
             if let Some(rep) = self.peer_reputations.get_mut(&peer) {
                 rep.failures += 1;
                 rep.last_failure = Some(Instant::now());
@@ -903,6 +947,15 @@ impl SyncManager {
         }
 
         // Re-queue the height for retry with a different peer
+        // Store the tried_peers so we can avoid them on retry
+        self.queue_height_with_tried_peers(height, tried_peers);
+    }
+
+    /// Queue a height for fetching, tracking which peers have already been tried.
+    fn queue_height_with_tried_peers(&mut self, height: u64, tried_peers: HashSet<PeerId>) {
+        // Store tried peers for this height so spawn_fetch can use them
+        // We use a simple approach: store in a separate map
+        self.tried_peers_for_height.insert(height, tried_peers);
         self.heights_to_fetch.push_back(height);
     }
 
@@ -967,6 +1020,7 @@ impl SyncManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_types::ShardGroupId;
     use libp2p::PeerId;
     use std::time::Duration;
 
@@ -978,10 +1032,10 @@ mod tests {
             config: SyncConfig::default(),
             sync_target: None,
             heights_to_fetch: VecDeque::new(),
-            fetched_heights: HashSet::new(),
             pending_fetches: HashMap::new(),
             peer_reputations: HashMap::new(),
-            known_peers: Vec::new(),
+            peer_shards: HashMap::new(),
+            local_shard: ShardGroupId(0),
             committed_height: 0,
         }
     }
@@ -993,21 +1047,24 @@ mod tests {
         config: SyncConfig,
         sync_target: Option<(u64, Hash)>,
         heights_to_fetch: VecDeque<u64>,
-        #[allow(dead_code)]
-        fetched_heights: HashSet<u64>,
         pending_fetches: HashMap<u64, PendingFetch>,
         peer_reputations: HashMap<PeerId, PeerReputation>,
-        known_peers: Vec<PeerId>,
+        peer_shards: HashMap<PeerId, ShardGroupId>,
+        local_shard: ShardGroupId,
         committed_height: u64,
     }
 
     impl TestSyncManager {
         fn register_peer(&mut self, peer_id: PeerId) {
-            if !self.known_peers.contains(&peer_id) {
-                self.known_peers.push(peer_id);
-                self.peer_reputations
-                    .insert(peer_id, PeerReputation::default());
-            }
+            self.peer_shards.insert(peer_id, self.local_shard);
+            self.peer_reputations.entry(peer_id).or_default();
+        }
+
+        fn sync_peer_count(&self) -> usize {
+            self.peer_shards
+                .iter()
+                .filter(|(_, &shard)| shard == self.local_shard)
+                .count()
         }
 
         fn is_peer_banned(&self, peer: &PeerId) -> bool {
@@ -1048,12 +1105,76 @@ mod tests {
             self.heights_to_fetch.push_back(height);
         }
 
-        fn select_peer(&self) -> Option<PeerId> {
+        fn blocks_behind(&self) -> u64 {
+            self.sync_target
+                .map(|(target, _)| target.saturating_sub(self.committed_height))
+                .unwrap_or(0)
+        }
+
+        fn select_peer(&mut self) -> Option<PeerId> {
             let now = Instant::now();
 
-            let available: Vec<_> = self
-                .known_peers
+            // Try normal selection first
+            if let Some(peer) = self.select_peer_inner(now) {
+                return Some(peer);
+            }
+
+            // Check for desperation mode
+            let same_shard_count = self
+                .peer_shards
                 .iter()
+                .filter(|(_, &shard)| shard == self.local_shard)
+                .count();
+
+            if same_shard_count == 0 {
+                return None;
+            }
+
+            let in_cooldown_count = self
+                .peer_reputations
+                .values()
+                .filter(|rep| {
+                    rep.failures >= self.config.max_retries_per_peer
+                        && rep
+                            .last_failure
+                            .is_some_and(|lf| now.duration_since(lf) < self.config.peer_cooldown)
+                })
+                .count();
+            let banned = self
+                .peer_reputations
+                .values()
+                .filter(|rep| rep.banned_until.is_some_and(|until| now < until))
+                .count();
+            let at_max_inflight = self
+                .peer_reputations
+                .values()
+                .filter(|rep| rep.in_flight >= 2)
+                .count();
+
+            let blocks_behind = self.blocks_behind();
+            let all_in_cooldown =
+                in_cooldown_count == same_shard_count && banned == 0 && at_max_inflight == 0;
+
+            if all_in_cooldown && blocks_behind >= self.config.desperation_threshold_blocks {
+                // Reset cooldowns
+                for rep in self.peer_reputations.values_mut() {
+                    if rep.banned_until.is_none() {
+                        rep.failures = 0;
+                        rep.last_failure = None;
+                    }
+                }
+                return self.select_peer_inner(now);
+            }
+
+            None
+        }
+
+        fn select_peer_inner(&self, now: Instant) -> Option<PeerId> {
+            let available: Vec<_> = self
+                .peer_shards
+                .iter()
+                .filter(|(_, &shard)| shard == self.local_shard)
+                .map(|(peer, _)| peer)
                 .filter(|peer| {
                     if let Some(rep) = self.peer_reputations.get(peer) {
                         // Skip banned peers
@@ -1108,7 +1229,7 @@ mod tests {
                     .sync_target
                     .map(|(target, _)| target.saturating_sub(self.committed_height))
                     .unwrap_or(0),
-                sync_peers: self.known_peers.len(),
+                sync_peers: self.sync_peer_count(),
                 pending_fetches: self.pending_fetches.len(),
                 queued_heights: self.heights_to_fetch.len(),
             }
@@ -1129,7 +1250,7 @@ mod tests {
     #[test]
     fn test_sync_config_defaults() {
         let config = SyncConfig::default();
-        assert_eq!(config.max_concurrent_fetches, 4);
+        assert_eq!(config.max_concurrent_fetches, 16);
         assert_eq!(config.initial_timeout, Duration::from_secs(5));
         assert_eq!(config.max_retries_per_peer, 3);
     }
@@ -1373,7 +1494,7 @@ mod tests {
 
     #[test]
     fn test_select_peer_returns_none_when_no_peers() {
-        let mgr = create_test_sync_manager();
+        let mut mgr = create_test_sync_manager();
         assert!(mgr.select_peer().is_none());
     }
 
@@ -1472,6 +1593,146 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // Desperation mode tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_desperation_mode_resets_cooldowns_when_far_behind() {
+        let mut mgr = create_test_sync_manager();
+        mgr.config.desperation_threshold_blocks = 10;
+
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        mgr.register_peer(peer1);
+        mgr.register_peer(peer2);
+
+        // Put both peers in cooldown
+        for peer in [peer1, peer2] {
+            let rep = mgr.peer_reputations.get_mut(&peer).unwrap();
+            rep.failures = mgr.config.max_retries_per_peer;
+            rep.last_failure = Some(Instant::now());
+        }
+
+        // Without sync target (not behind), should return None
+        assert!(mgr.select_peer().is_none());
+
+        // Start syncing - now we're 20 blocks behind (above threshold)
+        mgr.committed_height = 80;
+        mgr.start_sync(100, Hash::from_bytes(&[1u8; 32]));
+
+        // With desperation mode, should reset cooldowns and return a peer
+        let selected = mgr.select_peer();
+        assert!(selected.is_some());
+
+        // Verify cooldowns were reset
+        for peer in [peer1, peer2] {
+            let rep = mgr.peer_reputations.get(&peer).unwrap();
+            assert_eq!(rep.failures, 0);
+            assert!(rep.last_failure.is_none());
+        }
+    }
+
+    #[test]
+    fn test_desperation_mode_does_not_trigger_when_not_far_behind() {
+        let mut mgr = create_test_sync_manager();
+        mgr.config.desperation_threshold_blocks = 10;
+
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        mgr.register_peer(peer1);
+        mgr.register_peer(peer2);
+
+        // Put both peers in cooldown
+        for peer in [peer1, peer2] {
+            let rep = mgr.peer_reputations.get_mut(&peer).unwrap();
+            rep.failures = mgr.config.max_retries_per_peer;
+            rep.last_failure = Some(Instant::now());
+        }
+
+        // Only 5 blocks behind (below threshold of 10)
+        mgr.committed_height = 95;
+        mgr.start_sync(100, Hash::from_bytes(&[1u8; 32]));
+
+        // Should still return None (not desperate enough)
+        assert!(mgr.select_peer().is_none());
+
+        // Verify cooldowns were NOT reset
+        for peer in [peer1, peer2] {
+            let rep = mgr.peer_reputations.get(&peer).unwrap();
+            assert_eq!(rep.failures, mgr.config.max_retries_per_peer);
+            assert!(rep.last_failure.is_some());
+        }
+    }
+
+    #[test]
+    fn test_desperation_mode_does_not_reset_bans() {
+        let mut mgr = create_test_sync_manager();
+        mgr.config.desperation_threshold_blocks = 10;
+
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        mgr.register_peer(peer1);
+        mgr.register_peer(peer2);
+
+        // Ban peer1 (malicious)
+        let error = SyncResponseError::QcBlockHashMismatch { height: 1 };
+        mgr.ban_peer(peer1, &error);
+
+        // Put peer2 in cooldown
+        let rep2 = mgr.peer_reputations.get_mut(&peer2).unwrap();
+        rep2.failures = mgr.config.max_retries_per_peer;
+        rep2.last_failure = Some(Instant::now());
+
+        // 20 blocks behind
+        mgr.committed_height = 80;
+        mgr.start_sync(100, Hash::from_bytes(&[1u8; 32]));
+
+        // Desperation mode should NOT reset the ban, only the cooldown
+        // Since peer1 is banned and peer2 is in cooldown, but it's not "all in cooldown"
+        // (one is banned), desperation mode shouldn't trigger
+        // Actually, desperation mode only triggers when ALL peers are in cooldown (not banned)
+        // In this case, only peer2 is in cooldown, peer1 is banned, so it won't trigger
+        assert!(mgr.select_peer().is_none());
+
+        // peer1 should still be banned
+        assert!(mgr.is_peer_banned(&peer1));
+    }
+
+    #[test]
+    fn test_desperation_mode_only_resets_cooldowns_not_bans() {
+        let mut mgr = create_test_sync_manager();
+        mgr.config.desperation_threshold_blocks = 10;
+
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        let peer3 = PeerId::random();
+        mgr.register_peer(peer1);
+        mgr.register_peer(peer2);
+        mgr.register_peer(peer3);
+
+        // Put all peers in cooldown
+        for peer in [peer1, peer2, peer3] {
+            let rep = mgr.peer_reputations.get_mut(&peer).unwrap();
+            rep.failures = mgr.config.max_retries_per_peer;
+            rep.last_failure = Some(Instant::now());
+        }
+
+        // 20 blocks behind
+        mgr.committed_height = 80;
+        mgr.start_sync(100, Hash::from_bytes(&[1u8; 32]));
+
+        // Should trigger desperation mode and return a peer
+        let selected = mgr.select_peer();
+        assert!(selected.is_some());
+
+        // All cooldowns should be reset
+        for peer in [peer1, peer2, peer3] {
+            let rep = mgr.peer_reputations.get(&peer).unwrap();
+            assert_eq!(rep.failures, 0, "Cooldown should be reset for {:?}", peer);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // on_sync_response_error tests
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -1489,6 +1750,7 @@ mod tests {
                 peer,
                 started: Instant::now(),
                 retries: 0,
+                tried_peers: HashSet::new(),
             },
         );
 
@@ -1630,6 +1892,7 @@ mod tests {
                 peer,
                 started: Instant::now(),
                 retries: 0,
+                tried_peers: HashSet::new(),
             },
         );
         mgr.pending_fetches.insert(
@@ -1639,6 +1902,7 @@ mod tests {
                 peer,
                 started: Instant::now(),
                 retries: 0,
+                tried_peers: HashSet::new(),
             },
         );
 

@@ -155,6 +155,14 @@ impl SyncResponseError {
         )
     }
 
+    /// Returns true if this is an empty response error.
+    ///
+    /// Empty responses indicate the peer doesn't have the requested block,
+    /// which typically means they are also behind in sync.
+    pub fn is_empty_response(&self) -> bool {
+        matches!(self, Self::EmptyResponse { .. })
+    }
+
     /// Returns the metric label for this error type.
     ///
     /// Labels are designed to be low-cardinality for Prometheus metrics.

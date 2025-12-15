@@ -181,6 +181,13 @@ pub struct BftState {
     /// When we receive a synced block, we must verify its QC's signature before applying.
     pending_synced_block_verifications: HashMap<Hash, PendingSyncedBlockVerification>,
 
+    /// Buffered out-of-order synced blocks waiting for earlier blocks.
+    /// Maps height -> (Block, QC).
+    /// When we receive a synced block for height N but we're still waiting for earlier
+    /// heights, we buffer it here. Once the earlier blocks are processed, we pull from
+    /// this buffer and submit for verification.
+    buffered_synced_blocks: std::collections::BTreeMap<u64, (Block, QuorumCertificate)>,
+
     /// Buffered commits waiting for earlier blocks to commit first.
     /// Maps height -> (block_hash, QC).
     /// When we receive a BlockReadyToCommit for height N but we're still at committed_height < N-1,
@@ -269,6 +276,7 @@ impl BftState {
             pending_vote_verifications: HashMap::new(),
             pending_qc_verifications: HashMap::new(),
             pending_synced_block_verifications: HashMap::new(),
+            buffered_synced_blocks: std::collections::BTreeMap::new(),
             pending_commits: std::collections::BTreeMap::new(),
             pending_commits_awaiting_data: HashMap::new(),
             config,
@@ -1781,6 +1789,12 @@ impl BftState {
     #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
     pub fn on_qc_signature_verified(&mut self, block_hash: Hash, valid: bool) -> Vec<Action> {
         // Check if this is a synced block verification
+        info!(
+            block_hash = ?block_hash,
+            pending_count = self.pending_synced_block_verifications.len(),
+            pending_keys = ?self.pending_synced_block_verifications.keys().collect::<Vec<_>>(),
+            "on_qc_signature_verified: checking pending_synced_block_verifications"
+        );
         if let Some(mut pending_sync) = self.pending_synced_block_verifications.remove(&block_hash)
         {
             if !valid {
@@ -2165,6 +2179,9 @@ impl BftState {
     ///
     /// This is for blocks fetched via sync protocol, not blocks we participated
     /// in consensus for. We verify the QC signature before applying.
+    ///
+    /// Blocks may arrive out of order from concurrent fetches. Out-of-order blocks
+    /// are buffered and processed once earlier blocks complete verification.
     #[instrument(skip(self, block, qc), fields(
         height = block.header.height.0,
         block_hash = ?block.hash()
@@ -2179,37 +2196,7 @@ impl BftState {
             return vec![];
         }
 
-        // Calculate the effective "next expected height" accounting for pending verifications
-        // This allows multiple blocks to be queued for verification simultaneously
-        let highest_pending_height = self
-            .pending_synced_block_verifications
-            .values()
-            .map(|p| p.block.header.height.0)
-            .max()
-            .unwrap_or(self.committed_height);
-        let expected_height = highest_pending_height.max(self.committed_height) + 1;
-
-        // Synced blocks must be sequential (relative to committed or pending)
-        if height != expected_height {
-            // Allow if we already have this block pending
-            if self
-                .pending_synced_block_verifications
-                .contains_key(&block_hash)
-            {
-                trace!(
-                    "Synced block at height {} already pending verification",
-                    height
-                );
-                return vec![];
-            }
-            warn!(
-                "Non-sequential sync: expected height {}, got {}",
-                expected_height, height
-            );
-            return vec![];
-        }
-
-        // Verify QC matches block
+        // Verify QC matches block (do this early, before buffering)
         if qc.block_hash != block_hash {
             warn!(
                 "Synced block QC mismatch: block_hash {:?} != qc.block_hash {:?}",
@@ -2217,6 +2204,68 @@ impl BftState {
             );
             return vec![];
         }
+
+        // Check if we already have this block pending or buffered
+        if self
+            .pending_synced_block_verifications
+            .contains_key(&block_hash)
+        {
+            trace!(
+                "Synced block at height {} already pending verification",
+                height
+            );
+            return vec![];
+        }
+        if self.buffered_synced_blocks.contains_key(&height) {
+            trace!("Synced block at height {} already buffered", height);
+            return vec![];
+        }
+
+        // Calculate what height we need next for sequential application.
+        // We need the lowest height that's not yet pending or buffered.
+        let next_needed = self.committed_height + 1;
+
+        // Check if this block is the next one we need
+        if height == next_needed {
+            // This is exactly what we need - submit for verification immediately
+            return self.submit_synced_block_for_verification(block, qc);
+        }
+
+        // Block is not the next sequential height. Check if we should buffer it
+        // or if we already have what we need and should try draining buffers.
+        if height > next_needed {
+            // Future block - buffer it for later
+            debug!(
+                height,
+                next_needed, "Buffering future synced block for later"
+            );
+            self.buffered_synced_blocks.insert(height, (block, qc));
+
+            // Check if we can drain any buffered blocks starting from next_needed
+            return self.try_drain_buffered_synced_blocks();
+        }
+
+        // height < next_needed but > committed_height - this shouldn't happen
+        // if the checks above are correct, but handle gracefully
+        debug!(
+            height,
+            next_needed,
+            committed = self.committed_height,
+            "Unexpected synced block height - already have or past this"
+        );
+        vec![]
+    }
+
+    /// Submit a synced block for QC signature verification.
+    ///
+    /// Called for in-order blocks or when draining the buffer.
+    fn submit_synced_block_for_verification(
+        &mut self,
+        block: Block,
+        qc: QuorumCertificate,
+    ) -> Vec<Action> {
+        let block_hash = block.hash();
+        let height = block.header.height.0;
 
         // Genesis QC doesn't need signature verification
         if qc.is_genesis() {
@@ -2230,14 +2279,19 @@ impl BftState {
             return vec![];
         };
 
-        debug!(
+        info!(
             height,
             block_hash = ?block_hash,
             signers = qc.signers.count(),
-            "Verifying synced block QC signature"
+            "Submitting synced block for QC verification"
         );
 
         // Store pending verification info
+        info!(
+            height,
+            block_hash = ?block_hash,
+            "Inserting into pending_synced_block_verifications"
+        );
         self.pending_synced_block_verifications.insert(
             block_hash,
             PendingSyncedBlockVerification {
@@ -2258,6 +2312,33 @@ impl BftState {
             block_hash,
             signing_message,
         }]
+    }
+
+    /// Try to drain buffered synced blocks in sequential order.
+    ///
+    /// This is called when a new block is buffered to check if we already have
+    /// the next needed block in the buffer.
+    fn try_drain_buffered_synced_blocks(&mut self) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        // Find the next height we need - accounting for what's already pending verification
+        let highest_pending_height = self
+            .pending_synced_block_verifications
+            .values()
+            .map(|p| p.block.header.height.0)
+            .max()
+            .unwrap_or(self.committed_height);
+
+        let mut next_height = highest_pending_height.max(self.committed_height) + 1;
+
+        // Keep draining as long as we have the next sequential block buffered
+        while let Some((block, qc)) = self.buffered_synced_blocks.remove(&next_height) {
+            debug!(height = next_height, "Draining buffered synced block");
+            actions.extend(self.submit_synced_block_for_verification(block, qc));
+            next_height += 1;
+        }
+
+        actions
     }
 
     /// Apply a synced block after QC verification (or for genesis QC).
@@ -2372,12 +2453,35 @@ impl BftState {
     /// Try to apply all consecutive verified synced blocks.
     ///
     /// Called after a synced block's QC is verified. Applies all verified blocks
-    /// in height order starting from committed_height + 1.
+    /// in height order starting from committed_height + 1, then drains any
+    /// buffered out-of-order blocks that can now be submitted for verification.
     fn try_apply_verified_synced_blocks(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
 
+        // First, apply all consecutive verified blocks
         loop {
             let next_height = self.committed_height + 1;
+
+            // Log state for debugging
+            let verified_heights: Vec<_> = self
+                .pending_synced_block_verifications
+                .values()
+                .filter(|p| p.verified)
+                .map(|p| p.block.header.height.0)
+                .collect();
+            let unverified_heights: Vec<_> = self
+                .pending_synced_block_verifications
+                .values()
+                .filter(|p| !p.verified)
+                .map(|p| p.block.header.height.0)
+                .collect();
+            info!(
+                committed_height = self.committed_height,
+                next_height,
+                verified_heights = ?verified_heights,
+                unverified_heights = ?unverified_heights,
+                "try_apply_verified_synced_blocks: checking"
+            );
 
             // Find a verified block at the next height
             let block_hash = self
@@ -2387,7 +2491,8 @@ impl BftState {
                 .map(|(h, _)| *h);
 
             let Some(hash) = block_hash else {
-                // No verified block at next height - stop
+                // No verified block at next height - stop applying
+                info!(next_height, "No verified block at next height - stopping");
                 break;
             };
 
@@ -2397,6 +2502,26 @@ impl BftState {
                 .remove(&hash)
                 .unwrap();
             actions.extend(self.apply_synced_block(pending.block, pending.qc));
+        }
+
+        // After applying blocks, check if we can drain buffered blocks
+        // Calculate what height we now expect
+        let highest_pending_height = self
+            .pending_synced_block_verifications
+            .values()
+            .map(|p| p.block.header.height.0)
+            .max()
+            .unwrap_or(self.committed_height);
+        let mut expected_height = highest_pending_height.max(self.committed_height) + 1;
+
+        // Drain consecutive buffered blocks and submit them for verification
+        while let Some((block, qc)) = self.buffered_synced_blocks.remove(&expected_height) {
+            debug!(
+                expected_height,
+                "Draining buffered synced block for verification"
+            );
+            actions.extend(self.submit_synced_block_for_verification(block, qc));
+            expected_height += 1;
         }
 
         actions
@@ -3111,6 +3236,10 @@ impl BftState {
         // Remove pending commits awaiting data at or below committed height
         self.pending_commits_awaiting_data
             .retain(|_, (height, _)| *height > committed_height);
+
+        // Remove buffered synced blocks at or below committed height
+        self.buffered_synced_blocks
+            .retain(|height, _| *height > committed_height);
     }
 
     /// Clean up stale incomplete pending blocks.
@@ -3306,6 +3435,7 @@ impl BftState {
     /// - `pending_blocks` (received header, may be waiting for transactions)
     /// - `certified_blocks` (has QC, waiting for commit)
     /// - `pending_synced_block_verifications` (received via sync, verifying QC)
+    /// - `buffered_synced_blocks` (received via sync, waiting for earlier blocks)
     ///
     /// This is used to determine if we need to sync for a block.
     ///
@@ -3346,6 +3476,11 @@ impl BftState {
             return true;
         }
 
+        // In buffered synced blocks (waiting for earlier blocks)
+        if self.buffered_synced_blocks.contains_key(&height) {
+            return true;
+        }
+
         false
     }
 
@@ -3360,6 +3495,7 @@ impl BftState {
     /// - Block is in `pending_blocks` AND is complete (has all data, block constructed)
     /// - Block is in `certified_blocks` (always complete)
     /// - Block is in `pending_synced_block_verifications` (synced blocks are always complete)
+    /// - Block is in `buffered_synced_blocks` (synced blocks are always complete)
     fn has_complete_block_at_height(&self, height: u64) -> bool {
         // Already committed
         if height <= self.committed_height {
@@ -3390,6 +3526,11 @@ impl BftState {
             .values()
             .any(|p| p.block.header.height.0 == height)
         {
+            return true;
+        }
+
+        // In buffered synced blocks (synced blocks are always complete)
+        if self.buffered_synced_blocks.contains_key(&height) {
             return true;
         }
 

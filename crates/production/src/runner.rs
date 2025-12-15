@@ -378,26 +378,13 @@ impl ProductionRunnerBuilder {
         }
 
         // Create sync manager (uses consensus channel for sync events)
-        // Pass local_shard so it only syncs from peers in the same shard
-        let mut sync_manager = SyncManager::new(
+        // The topology is passed directly - SyncManager queries it for committee members
+        let sync_manager = SyncManager::new(
             SyncConfig::default(),
             network.clone(),
             consensus_tx.clone(),
-            local_shard,
+            topology.clone(),
         );
-
-        // Register validators with sync manager, including their shard assignments.
-        // This is critical for multi-shard sync: we must only sync from peers in our shard,
-        // because blocks from different shards have different QC signatures.
-        for shard_id in 0..topology.num_shards() {
-            let shard = ShardGroupId(shard_id);
-            for &validator_id in topology.committee_for_shard(shard).iter() {
-                if let Some(pk) = topology.public_key(validator_id) {
-                    let peer_id = compute_peer_id_for_validator(&pk);
-                    sync_manager.register_peer(peer_id, shard);
-                }
-            }
-        }
 
         // Create fetch manager for transactions and certificates
         let mut fetch_manager = crate::fetch::FetchManager::new(
@@ -1048,10 +1035,6 @@ impl ProductionRunner {
                     let tick_span = span!(Level::TRACE, "sync_tick");
                     let _tick_guard = tick_span.enter();
 
-                    // Update sync manager's peer list from network connections
-                    let connected_peers = self.network.connected_peers().await;
-                    self.sync_manager.update_peers(connected_peers);
-
                     // Tick both managers to process pending fetches
                     self.sync_manager.tick().await;
                     self.fetch_manager.tick().await;
@@ -1502,13 +1485,7 @@ impl ProductionRunner {
                 );
 
                 // Update sync manager's committed height - critical for correct sync behavior.
-                // This also returns true if there are more synced blocks ready to deliver.
-                let has_more_blocks = self.sync_manager.set_committed_height(height);
-
-                // If syncing and we have more blocks ready, deliver the next one
-                if has_more_blocks {
-                    self.sync_manager.try_deliver_blocks_sync();
-                }
+                self.sync_manager.set_committed_height(height);
 
                 // Update RPC status with new block height and view
                 if let Some(ref rpc_status) = self.rpc_status {
