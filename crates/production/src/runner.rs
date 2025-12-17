@@ -1412,6 +1412,7 @@ impl ProductionRunner {
                 let executor = self.executor.clone();
 
                 self.thread_pools.spawn_execution(move || {
+                    let start = std::time::Instant::now();
                     // Execute transactions - RocksDB is internally thread-safe
                     let results = match executor.execute_single_shard(&*storage, &transactions) {
                         Ok(output) => output
@@ -1439,6 +1440,7 @@ impl ProductionRunner {
                                 .collect()
                         }
                     };
+                    crate::metrics::record_execution_latency(start.elapsed().as_secs_f64());
 
                     event_tx
                         .send(Event::TransactionsExecuted {
@@ -1466,6 +1468,7 @@ impl ProductionRunner {
                 let local_shard = self.local_shard;
 
                 self.thread_pools.spawn_execution(move || {
+                    let start = std::time::Instant::now();
                     // Determine which nodes are local to this shard
                     let is_local_node = |node_id: &hyperscale_types::NodeId| -> bool {
                         topology.shard_for_node_id(node_id) == local_shard
@@ -1508,6 +1511,7 @@ impl ProductionRunner {
                             }
                         }
                     };
+                    crate::metrics::record_execution_latency(start.elapsed().as_secs_f64());
 
                     event_tx
                         .send(Event::CrossShardTransactionExecuted { tx_hash, result })

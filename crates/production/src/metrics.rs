@@ -33,6 +33,7 @@ pub struct Metrics {
     pub network_messages_sent: Counter,
     pub network_messages_received: Counter,
     pub signature_verification_latency: Histogram,
+    pub execution_latency: Histogram,
 
     // === Thread Pools ===
     pub crypto_pool_queue_depth: Gauge,
@@ -176,6 +177,13 @@ impl Metrics {
                 "hyperscale_signature_verification_latency_seconds",
                 "Signature verification latency",
                 vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1]
+            )
+            .unwrap(),
+
+            execution_latency: register_histogram!(
+                "hyperscale_execution_latency_seconds",
+                "Transaction execution latency",
+                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
             )
             .unwrap(),
 
@@ -699,6 +707,11 @@ pub fn record_signature_verification_latency(latency_secs: f64) {
     metrics()
         .signature_verification_latency
         .observe(latency_secs);
+}
+
+/// Record execution latency.
+pub fn record_execution_latency(latency_secs: f64) {
+    metrics().execution_latency.observe(latency_secs);
 }
 
 /// Update lock contention metrics.
