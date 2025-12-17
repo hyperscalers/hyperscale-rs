@@ -99,8 +99,8 @@ impl ThreadPoolConfig {
     ///
     /// Uses the following allocation ratios:
     /// - State Machine: 1 core (always)
-    /// - Crypto: 25% of remaining cores (min 1)
     /// - Execution: 50% of remaining cores (min 1)
+    /// - Crypto: 25% of remaining cores (min 1)
     /// - I/O: 25% of remaining cores (min 1)
     ///
     /// On systems with fewer than 4 cores, all pools get 1 thread each.
@@ -119,13 +119,13 @@ impl ThreadPoolConfig {
         // Reserve 1 core for state machine
         let remaining = total_cores.saturating_sub(1).max(3);
 
-        // Allocation ratios: crypto 50%, execution 25%, I/O 25%
+        // Allocation ratios: execution 50%, crypto 25%, I/O 25%
         let (crypto, execution, io) = if remaining <= 3 {
             // Minimum viable: 1 each
             (1, 1, 1)
         } else {
-            let crypto = (remaining * 50 / 100).max(1);
-            let execution = (remaining * 25 / 100).max(1);
+            let execution = (remaining * 50 / 100).max(1);
+            let crypto = (remaining * 25 / 100).max(1);
             let io = remaining
                 .saturating_sub(crypto)
                 .saturating_sub(execution)
@@ -579,16 +579,16 @@ mod tests {
         assert_eq!(config.execution_threads, 1);
         assert_eq!(config.io_threads, 1);
 
-        // 8 cores: 1 state + ~3 crypto + ~1 exec + ~3 io
+        // 8 cores: 1 state + ~1 crypto + ~3 exec + ~3 io
         let config = ThreadPoolConfig::for_core_count(8);
-        assert!(config.crypto_threads >= 3);
-        assert!(config.execution_threads >= 1);
+        assert!(config.crypto_threads >= 1);
+        assert!(config.execution_threads >= 3);
         assert!(config.io_threads >= 1);
 
         // 16 cores: more balanced
         let config = ThreadPoolConfig::for_core_count(16);
-        assert!(config.crypto_threads >= 7);
-        assert!(config.execution_threads >= 3);
+        assert!(config.crypto_threads >= 3);
+        assert!(config.execution_threads >= 7);
         assert!(config.io_threads >= 2);
     }
 
