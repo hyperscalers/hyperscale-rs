@@ -3,12 +3,13 @@
 # Launch a local hyperscale cluster for testing.
 #
 # Usage:
-#   ./scripts/launch-cluster.sh [--shards N] [--validators-per-shard M] [--clean]
+#   ./scripts/launch-cluster.sh [--shards N] [--validators-per-shard M] [--clean] [--log-level LEVEL]
 #
 # Examples:
 #   ./scripts/launch-cluster.sh                    # 2 shards, 4 validators each (default)
 #   ./scripts/launch-cluster.sh --shards 4         # 4 shards, 4 validators each
 #   ./scripts/launch-cluster.sh --clean            # Clean data directories first
+#   ./scripts/launch-cluster.sh --log-level debug  # Enable debug logging
 #
 # This script:
 #   1. Builds the validator binary (if needed)
@@ -29,6 +30,7 @@ CLEAN=false
 ACCOUNTS_PER_SHARD=16000    # Spammer accounts per shard
 INITIAL_BALANCE=1000000     # Initial XRD balance per account
 MONITORING=false            # Start Prometheus + Grafana monitoring stack
+LOG_LEVEL="info"            # Default log level (trace, debug, info, warn, error)
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -57,8 +59,12 @@ while [[ $# -gt 0 ]]; do
             MONITORING=true
             shift
             ;;
+        --log-level)
+            LOG_LEVEL="$2"
+            shift 2
+            ;;
         --help|-h)
-            echo "Usage: $0 [--shards N] [--validators-per-shard M] [--clean] [--monitoring]"
+            echo "Usage: $0 [--shards N] [--validators-per-shard M] [--clean] [--monitoring] [--log-level LEVEL]"
             echo ""
             echo "Options:"
             echo "  --shards N               Number of shards (default: 2)"
@@ -67,6 +73,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --initial-balance N      Initial XRD balance per account (default: 1000000)"
             echo "  --clean                  Remove existing data directories"
             echo "  --monitoring             Start Prometheus + Grafana monitoring stack"
+            echo "  --log-level LEVEL        Log level: trace, debug, info, warn, error (default: info)"
             echo ""
             echo "Monitoring:"
             echo "  When --monitoring is enabled, Prometheus and Grafana are started via Docker."
@@ -97,6 +104,7 @@ echo "Validators per shard: $VALIDATORS_PER_SHARD"
 echo "Total validators: $TOTAL_VALIDATORS"
 echo "Accounts per shard: $ACCOUNTS_PER_SHARD"
 echo "Initial balance: $INITIAL_BALANCE XRD"
+echo "Log level: $LOG_LEVEL"
 echo ""
 
 # Clean up if requested
@@ -268,7 +276,9 @@ for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
 
     echo "  Starting validator $i (shard $shard)..."
 
-    RUST_LOG=warn,hyperscale=info,hyperscale_production=debug,libp2p_gossipsub=info "$VALIDATOR_BIN" --config "$CONFIG_FILE" > "$LOG_FILE" 2>&1 &
+    # Build RUST_LOG based on log level
+    # Always suppress noisy dependencies, but let hyperscale crates use the specified level
+    RUST_LOG="warn,hyperscale=$LOG_LEVEL,hyperscale_production=$LOG_LEVEL,libp2p_gossipsub=warn" "$VALIDATOR_BIN" --config "$CONFIG_FILE" > "$LOG_FILE" 2>&1 &
     PID=$!
     echo "$PID" >> "$PID_FILE"
     echo "    PID: $PID, logs: $LOG_FILE"
