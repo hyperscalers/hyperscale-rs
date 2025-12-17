@@ -67,6 +67,13 @@ pub struct FetchConfig {
     /// Maximum number of hashes to request in a single fetch.
     /// Larger batches are chunked into multiple requests.
     pub max_hashes_per_request: usize,
+
+    /// Number of peers to fetch from immediately in parallel.
+    /// When a fetch request arrives, we spawn requests to this many peers
+    /// simultaneously instead of waiting for the first peer to time out.
+    /// This reduces latency under CPU pressure at the cost of redundant requests.
+    /// Set to 1 to disable proactive parallel fetching.
+    pub proactive_parallel_peers: usize,
 }
 
 impl Default for FetchConfig {
@@ -80,6 +87,9 @@ impl Default for FetchConfig {
             peer_cooldown: Duration::from_secs(10),
             stale_fetch_timeout: Duration::from_secs(30),
             max_hashes_per_request: 100,
+            // Fetch from 2 peers in parallel by default to reduce latency
+            // under CPU pressure. The first response wins; duplicates are ignored.
+            proactive_parallel_peers: 2,
         }
     }
 }
@@ -746,6 +756,7 @@ impl FetchManager {
         let max_hashes = self.config.max_hashes_per_request;
         let max_per_block = self.config.max_concurrent_per_block;
         let peer_cooldown = self.config.peer_cooldown;
+        let proactive_peers = self.config.proactive_parallel_peers;
 
         while self.total_in_flight + to_spawn.len() < self.config.max_total_concurrent {
             let Some(fetch_id) = self.pending_queue.pop_front() else {
@@ -777,10 +788,13 @@ impl FetchManager {
                     state.tried_peers.clone(),
                     state.in_flight.keys().copied().collect::<HashSet<PeerId>>(),
                     state.unfetched_hashes(),
+                    state.in_flight.len(),
                 ))
             };
 
-            let Some((proposer, tried_peers, in_flight_peers, hashes)) = peer_selection_info else {
+            let Some((proposer, tried_peers, in_flight_peers, hashes, current_in_flight)) =
+                peer_selection_info
+            else {
                 continue;
             };
 
@@ -788,14 +802,31 @@ impl FetchManager {
                 continue;
             }
 
-            // Select a peer
-            let peer =
-                self.select_peer_for(proposer, &tried_peers, &in_flight_peers, peer_cooldown);
-            let Some(peer) = peer else {
+            // Determine how many peers to fetch from in parallel.
+            // For new fetches (no in-flight), use proactive_parallel_peers.
+            // For retries (already have in-flight), just add one more peer.
+            let peers_to_add = if current_in_flight == 0 {
+                // New fetch: proactively request from multiple peers
+                proactive_peers.min(max_per_block)
+            } else {
+                // Retry/continuation: add one peer at a time
+                1
+            };
+
+            // Select multiple peers for parallel fetching
+            let selected_peers = self.select_multiple_peers(
+                proposer,
+                &tried_peers,
+                &in_flight_peers,
+                peer_cooldown,
+                peers_to_add,
+            );
+
+            if selected_peers.is_empty() {
                 // No available peers, put back in queue
                 self.pending_queue.push_back(fetch_id);
                 break;
-            };
+            }
 
             // Now get mutable access to update state
             let state = match fetch_id.kind {
@@ -810,21 +841,29 @@ impl FetchManager {
             // Chunk if needed
             let hashes_to_fetch: Vec<Hash> = hashes.into_iter().take(max_hashes).collect();
 
-            // Mark peer as tried
-            state.tried_peers.insert(peer);
+            // Queue spawns for all selected peers
+            for peer in selected_peers {
+                // Mark peer as tried
+                state.tried_peers.insert(peer);
 
-            // Record in-flight request
-            state.in_flight.insert(
-                peer,
-                PendingFetchRequest {
+                // Record in-flight request
+                state.in_flight.insert(
                     peer,
-                    started: Instant::now(),
-                    retries: 0,
-                },
-            );
+                    PendingFetchRequest {
+                        peer,
+                        started: Instant::now(),
+                        retries: 0,
+                    },
+                );
 
-            // Queue for spawning
-            to_spawn.push((fetch_id.block_hash, fetch_id.kind, peer, hashes_to_fetch));
+                // Queue for spawning
+                to_spawn.push((
+                    fetch_id.block_hash,
+                    fetch_id.kind,
+                    peer,
+                    hashes_to_fetch.clone(),
+                ));
+            }
         }
 
         // Now spawn all the fetch tasks
@@ -841,37 +880,51 @@ impl FetchManager {
         }
     }
 
-    /// Select a peer for fetching.
+    /// Select multiple peers for parallel fetching.
     ///
-    /// Strategy:
-    /// 1. Try proposer first (they definitely have the data)
-    /// 2. Fall back to other committee members with good reputation
-    /// 3. Avoid peers in cooldown or with too many in-flight requests
-    fn select_peer_for(
+    /// Returns up to `count` peers, always including the proposer first if available.
+    /// This enables proactive parallel fetching to reduce latency under CPU pressure.
+    fn select_multiple_peers(
         &self,
         proposer: ValidatorId,
         tried_peers: &HashSet<PeerId>,
         in_flight_peers: &HashSet<PeerId>,
         peer_cooldown: Duration,
-    ) -> Option<PeerId> {
+        count: usize,
+    ) -> Vec<PeerId> {
+        let mut selected = Vec::with_capacity(count);
+
         // First, try the proposer if we haven't already
         if let Some(&proposer_peer) = self.committee_peers.get(&proposer) {
             if !tried_peers.contains(&proposer_peer) && !in_flight_peers.contains(&proposer_peer) {
-                if let Some(rep) = self.peer_reputations.get(&proposer_peer) {
-                    if !rep.is_in_cooldown(peer_cooldown) && rep.in_flight < 3 {
-                        return Some(proposer_peer);
-                    }
-                } else {
-                    return Some(proposer_peer);
+                let is_available = self
+                    .peer_reputations
+                    .get(&proposer_peer)
+                    .map(|rep| !rep.is_in_cooldown(peer_cooldown) && rep.in_flight < 3)
+                    .unwrap_or(true);
+
+                if is_available {
+                    selected.push(proposer_peer);
                 }
             }
         }
 
-        // Fall back to other committee members, sorted by reputation
+        if selected.len() >= count {
+            return selected;
+        }
+
+        // Build a set of already-selected peers to avoid duplicates
+        let mut already_selected: HashSet<PeerId> = selected.iter().copied().collect();
+
+        // Collect other committee members, sorted by reputation
         let mut candidates: Vec<_> = self
             .committee_peers
             .iter()
-            .filter(|(_, &peer)| !tried_peers.contains(&peer) && !in_flight_peers.contains(&peer))
+            .filter(|(_, &peer)| {
+                !tried_peers.contains(&peer)
+                    && !in_flight_peers.contains(&peer)
+                    && !already_selected.contains(&peer)
+            })
             .filter_map(|(_, &peer)| {
                 let rep = self.peer_reputations.get(&peer)?;
                 if rep.is_in_cooldown(peer_cooldown) || rep.in_flight >= 3 {
@@ -884,7 +937,17 @@ impl FetchManager {
         // Sort by score (highest first)
         candidates.sort_by(|a, b| b.1.cmp(&a.1));
 
-        candidates.first().map(|(peer, _)| *peer)
+        // Take up to (count - already selected) more peers
+        for (peer, _score) in candidates {
+            if selected.len() >= count {
+                break;
+            }
+            if already_selected.insert(peer) {
+                selected.push(peer);
+            }
+        }
+
+        selected
     }
 
     /// Spawn a fetch task.
@@ -1083,6 +1146,22 @@ mod tests {
         assert_eq!(config.max_concurrent_per_block, 3);
         assert_eq!(config.max_total_concurrent, 12);
         assert_eq!(config.max_retries, 3);
+        // Proactive parallel fetching is enabled by default
+        assert_eq!(config.proactive_parallel_peers, 2);
+    }
+
+    #[test]
+    fn test_fetch_config_proactive_parallel() {
+        // Default enables proactive parallel fetching
+        let default_config = FetchConfig::default();
+        assert_eq!(default_config.proactive_parallel_peers, 2);
+
+        // for_local and for_wan inherit the default
+        let local_config = FetchConfig::for_local();
+        assert_eq!(local_config.proactive_parallel_peers, 2);
+
+        let wan_config = FetchConfig::for_wan();
+        assert_eq!(wan_config.proactive_parallel_peers, 2);
     }
 
     #[test]
