@@ -495,12 +495,16 @@ impl ProductionRunnerBuilder {
             consensus_tx.clone(),
         );
 
-        // Register local committee members with fetch manager
+        // Register local committee members with fetch manager (excluding self)
         // (fetch only happens within shard, so we only need local committee)
-        for &validator_id in topology.committee_for_shard(local_shard).iter() {
-            if let Some(pk) = topology.public_key(validator_id) {
+        for &vid in topology.committee_for_shard(local_shard).iter() {
+            // Don't register self - we can't fetch from ourselves
+            if vid == validator_id {
+                continue;
+            }
+            if let Some(pk) = topology.public_key(vid) {
                 let peer_id = compute_peer_id_for_validator(&pk);
-                fetch_manager.register_committee_member(validator_id, peer_id);
+                fetch_manager.register_committee_member(vid, peer_id);
             }
         }
 
