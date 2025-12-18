@@ -22,15 +22,24 @@ set -e
 
 # Default configuration
 NUM_SHARDS=2
-VALIDATORS_PER_SHARD=4      # Minimum 4 required for BFT (3 validators can't tolerate any delays)
-BASE_PORT=9000              # libp2p port
-BASE_RPC_PORT=8080          # HTTP RPC port
+VALIDATORS_PER_SHARD=4                          # Minimum 4 required for BFT (3 validators can't tolerate any delays)
+BASE_PORT=9000                                  # libp2p port
+TCP_BASE_PORT=30500                             # Base TCP fallback port
+BASE_RPC_PORT=8080                              # HTTP RPC port
 DATA_DIR="./cluster-data"
 CLEAN=false
-ACCOUNTS_PER_SHARD=16000    # Spammer accounts per shard
-INITIAL_BALANCE=1000000     # Initial XRD balance per account
-MONITORING=false            # Start Prometheus + Grafana monitoring stack
-LOG_LEVEL="info"            # Default log level (trace, debug, info, warn, error)
+ACCOUNTS_PER_SHARD=16000                        # Spammer accounts per shard
+INITIAL_BALANCE=1000000                         # Initial XRD balance per account
+MONITORING="${START_MONITORING:-false}"         # Start Prometheus + Grafana monitoring stack
+LOG_LEVEL="info"                                # Default log level (trace, debug, info, warn, error)
+SMOKE_TEST_TIMEOUT="${SMOKE_TEST_TIMEOUT:-60s}" # Smoke test timeout
+SKIP_BUILD="${SKIP_BUILD:-false}"               # Skip building binaries
+NODE_HOSTNAME="${NODE_HOSTNAME:-localhost}"     # Hostname for spammer endpoints
+
+# Define explicit port ranges for Docker and firewall whitelisting
+# let's give a range of 500 ports which should be ok for local testing
+QUIC_PORT_RANGE="${BASE_PORT}-$((BASE_PORT + 500))"
+TCP_PORT_RANGE="${TCP_BASE_PORT}-$((TCP_BASE_PORT + 500))"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -55,6 +64,14 @@ while [[ $# -gt 0 ]]; do
             INITIAL_BALANCE="$2"
             shift 2
             ;;
+        --smoke-timeout)
+            SMOKE_TEST_TIMEOUT="$2"
+            shift 2
+            ;;
+        --node-hostname)
+            NODE_HOSTNAME="$2"
+            shift 2
+            ;;
         --monitoring)
             MONITORING=true
             shift
@@ -63,17 +80,37 @@ while [[ $# -gt 0 ]]; do
             LOG_LEVEL="$2"
             shift 2
             ;;
+        --skip-build)
+            SKIP_BUILD=true
+            shift
+            ;;
+        --start-monitoring)
+            MONITORING=true
+            shift
+            ;;
         --help|-h)
-            echo "Usage: $0 [--shards N] [--validators-per-shard M] [--clean] [--monitoring] [--log-level LEVEL]"
+            echo "Usage: $0 [--shards N] [--validators-per-shard M] [--clean] [--monitoring] [--log-level LEVEL] [--smoke-timeout DURATION] [--node-hostname HOST]"
             echo ""
             echo "Options:"
             echo "  --shards N               Number of shards (default: 2)"
             echo "  --validators-per-shard M Validators per shard (default: 4, minimum: 4)"
             echo "  --accounts-per-shard N   Spammer accounts per shard (default: 100)"
             echo "  --initial-balance N      Initial XRD balance per account (default: 1000000)"
+            echo "  --smoke-timeout DURATION Smoke test timeout (default: 60s)"
+            echo "  --node-hostname HOST     Hostname for spammer endpoints (default: localhost)"
             echo "  --clean                  Remove existing data directories"
             echo "  --monitoring             Start Prometheus + Grafana monitoring stack"
             echo "  --log-level LEVEL        Log level: trace, debug, info, warn, error (default: info)"
+            echo "  --skip-build             Skip building binaries (default: false)"
+            echo "  --start-monitoring       Start Prometheus + Grafana monitoring stack (default: false)"
+            echo ""
+            echo "Environment Variables:"
+            echo "  VALIDATOR_BIN            Path to validator binary (default: ./target/release/hyperscale-validator)"
+            echo "  KEYGEN_BIN               Path to keygen binary (default: ./target/release/hyperscale-keygen)"
+            echo "  SPAMMER_BIN              Path to spammer binary (default: ./target/release/hyperscale-spammer)"
+            echo "  SMOKE_TEST_TIMEOUT       Smoke test timeout (default: 60s)"
+            echo "  NODE_HOSTNAME            Hostname for spammer endpoints (default: localhost)"
+            echo "  SKIP_BUILD               Skip building binaries (default: false)"
             echo ""
             echo "Monitoring:"
             echo "  When --monitoring is enabled, Prometheus and Grafana are started via Docker."
@@ -105,6 +142,12 @@ echo "Total validators: $TOTAL_VALIDATORS"
 echo "Accounts per shard: $ACCOUNTS_PER_SHARD"
 echo "Initial balance: $INITIAL_BALANCE XRD"
 echo "Log level: $LOG_LEVEL"
+echo "Smoke test timeout: $SMOKE_TEST_TIMEOUT"
+echo "Skip build: $SKIP_BUILD"
+echo "Clean data dir: $CLEAN"
+echo "Network Ports:"
+echo "  QUIC Range: $QUIC_PORT_RANGE"
+echo "  TCP Range:  $TCP_PORT_RANGE"
 echo ""
 
 # Clean up if requested
@@ -117,12 +160,16 @@ fi
 mkdir -p "$DATA_DIR"
 
 # Build the validator, keygen, and spammer binaries
-echo "Building binaries..."
-cargo build --release --bin hyperscale-validator --bin hyperscale-keygen --bin hyperscale-spammer 2>&1 | tail -3
+if [ "$SKIP_BUILD" != "true" ]; then
+    echo "Building binaries..."
+    cargo build --release --bin hyperscale-validator --bin hyperscale-keygen --bin hyperscale-spammer 2>&1 | tail -3
+else
+    echo "Skipping build (SKIP_BUILD=true)..."
+fi
 
-VALIDATOR_BIN="./target/release/hyperscale-validator"
-KEYGEN_BIN="./target/release/hyperscale-keygen"
-SPAMMER_BIN="./target/release/hyperscale-spammer"
+VALIDATOR_BIN="${VALIDATOR_BIN:-./target/release/hyperscale-validator}"
+KEYGEN_BIN="${KEYGEN_BIN:-./target/release/hyperscale-keygen}"
+SPAMMER_BIN="${SPAMMER_BIN:-./target/release/hyperscale-spammer}"
 
 if [ ! -f "$VALIDATOR_BIN" ]; then
     echo "ERROR: Validator binary not found at $VALIDATOR_BIN"
@@ -180,7 +227,7 @@ for shard in $(seq 0 $((NUM_SHARDS - 1))); do
         BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS,"
     fi
     # We'll use localhost multiaddr format
-    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/127.0.0.1/udp/$port/quic-v1\""
+    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/127.0.0.1/udp/$port/quic-v1\",\"/ip4/127.0.0.1/tcp/$port\""
 done
 
 # Generate TOML configs for each validator
@@ -225,7 +272,11 @@ key_path = "$KEY_FILE"
 data_dir = "$NODE_DATA_DIR"
 
 [network]
-listen_addr = "/ip4/0.0.0.0/udp/$p2p_port/quic-v1"
+# Use configured port ranges for firewall friendliness
+quic_port_range = "$QUIC_PORT_RANGE"
+tcp_fallback_port_range = "$TCP_PORT_RANGE"
+# listen_addr is ignored when ranges are present, but be safe and keep a valid default
+listen_addr = "/ip4/0.0.0.0/udp/0/quic-v1"
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 request_timeout_ms = 500
 max_message_size = 10485760
@@ -261,7 +312,7 @@ $GENESIS_VALIDATORS
 ${SHARD_GENESIS_BALANCES[$shard]}
 EOF
 
-    echo "  Created config for validator $i (shard $shard, p2p port $p2p_port, rpc port $rpc_port)"
+    echo "  Created config for validator $i (shard $shard, rpc port $rpc_port)"
 done
 
 # Launch validators
@@ -296,14 +347,14 @@ echo "Validator endpoints:"
 for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     shard=$((i / VALIDATORS_PER_SHARD))
     rpc_port=$((BASE_RPC_PORT + i))
-    echo "  Validator $i (shard $shard): http://localhost:$rpc_port"
+    echo "  Validator $i (shard $shard): http://$NODE_HOSTNAME:$rpc_port"
 done
 
 echo ""
 echo "Useful commands:"
-echo "  Check health:  curl http://localhost:$BASE_RPC_PORT/health"
-echo "  Get status:    curl http://localhost:$BASE_RPC_PORT/api/v1/status"
-echo "  View metrics:  curl http://localhost:$BASE_RPC_PORT/metrics"
+echo "  Check health:  curl http://$NODE_HOSTNAME:$BASE_RPC_PORT/health"
+echo "  Get status:    curl http://$NODE_HOSTNAME:$BASE_RPC_PORT/api/v1/status"
+echo "  View metrics:  curl http://$NODE_HOSTNAME:$BASE_RPC_PORT/metrics"
 echo "  View logs:     tail -f $DATA_DIR/validator-0/output.log"
 echo "  Stop cluster:  ./scripts/stop-cluster.sh"
 echo ""
@@ -315,7 +366,7 @@ for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     if [ -n "$SPAMMER_ENDPOINTS" ]; then
         SPAMMER_ENDPOINTS="$SPAMMER_ENDPOINTS,"
     fi
-    SPAMMER_ENDPOINTS="${SPAMMER_ENDPOINTS}http://localhost:$rpc_port"
+    SPAMMER_ENDPOINTS="${SPAMMER_ENDPOINTS}http://$NODE_HOSTNAME:$rpc_port"
 done
 
 echo "Run spammer:"
@@ -323,7 +374,6 @@ echo "  $SPAMMER_BIN run \\"
 echo "    --endpoints $SPAMMER_ENDPOINTS \\"
 echo "    --num-shards $NUM_SHARDS \\"
 echo "    --validators-per-shard $VALIDATORS_PER_SHARD \\"
-echo "    --accounts-per-shard $ACCOUNTS_PER_SHARD \\"
 echo "    --tps 100 \\"
 echo "    --duration 30s"
 echo ""
@@ -335,16 +385,19 @@ echo "=== Running Smoke Test ==="
 echo "Waiting for cluster to stabilize..."
 sleep 3
 
+# Temporarily disable exit-on-error for smoke test
+set +e
 "$SPAMMER_BIN" smoke-test \
     --endpoints "$SPAMMER_ENDPOINTS" \
     --num-shards "$NUM_SHARDS" \
     --validators-per-shard "$VALIDATORS_PER_SHARD" \
     --accounts-per-shard "$ACCOUNTS_PER_SHARD" \
     --wait-ready \
-    --timeout 60s \
+    --timeout "$SMOKE_TEST_TIMEOUT" \
     --poll-interval 100ms
 
 SMOKE_TEST_EXIT=$?
+set -e
 if [ $SMOKE_TEST_EXIT -eq 0 ]; then
     echo ""
     echo "=== Cluster is ready for use ==="
@@ -353,6 +406,24 @@ else
     echo "WARNING: Smoke test failed with exit code $SMOKE_TEST_EXIT"
     echo "Check validator logs for details: tail -f $DATA_DIR/validator-*/output.log"
 fi
+
+# Cleanup function to kill all child processes
+cleanup() {
+    echo ""
+    echo "Stopping cluster..."
+    # Read PIDs from file if available, otherwise kill by pattern might be too aggressive
+    if [ -f "$PID_FILE" ]; then
+        while read -r pid; do
+            if kill -0 "$pid" 2>/dev/null; then
+                kill "$pid"
+            fi
+        done < "$PID_FILE"
+    fi
+    exit 0
+}
+
+# Trap signals for graceful shutdown
+trap cleanup SIGINT SIGTERM
 
 # Start monitoring stack if requested
 if [ "$MONITORING" = true ]; then
@@ -430,3 +501,7 @@ EOF
         echo "Stop monitoring: cd $MONITORING_DIR && docker-compose down"
     fi
 fi
+
+# Keep script running to maintain container life and handle signals
+echo "Cluster is running. Press Ctrl+C to stop."
+wait
