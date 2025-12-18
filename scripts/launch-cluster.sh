@@ -35,6 +35,7 @@ LOG_LEVEL="info"                                # Default log level (trace, debu
 SMOKE_TEST_TIMEOUT="${SMOKE_TEST_TIMEOUT:-60s}" # Smoke test timeout
 SKIP_BUILD="${SKIP_BUILD:-false}"               # Skip building binaries
 NODE_HOSTNAME="${NODE_HOSTNAME:-localhost}"     # Hostname for spammer endpoints
+TCP_FALLBACK_ENABLED="true"                     # Enable TCP fallback transport (default: true)
 
 # Define explicit port ranges for Docker and firewall whitelisting
 # let's give a range of 500 ports which should be ok for local testing
@@ -88,8 +89,12 @@ while [[ $# -gt 0 ]]; do
             MONITORING=true
             shift
             ;;
+        --no-tcp-fallback)
+            TCP_FALLBACK_ENABLED="false"
+            shift
+            ;;
         --help|-h)
-            echo "Usage: $0 [--shards N] [--validators-per-shard M] [--clean] [--monitoring] [--log-level LEVEL] [--smoke-timeout DURATION] [--node-hostname HOST]"
+            echo "Usage: $0 [--shards N] [--validators-per-shard M] [--clean] [--monitoring] [--log-level LEVEL] [--smoke-timeout DURATION] [--node-hostname HOST] [--no-tcp-fallback]"
             echo ""
             echo "Options:"
             echo "  --shards N               Number of shards (default: 2)"
@@ -103,6 +108,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --log-level LEVEL        Log level: trace, debug, info, warn, error (default: info)"
             echo "  --skip-build             Skip building binaries (default: false)"
             echo "  --start-monitoring       Start Prometheus + Grafana monitoring stack (default: false)"
+            echo "  --no-tcp-fallback        Disable TCP fallback transport (QUIC only)"
             echo ""
             echo "Environment Variables:"
             echo "  VALIDATOR_BIN            Path to validator binary (default: ./target/release/hyperscale-validator)"
@@ -145,6 +151,7 @@ echo "Log level: $LOG_LEVEL"
 echo "Smoke test timeout: $SMOKE_TEST_TIMEOUT"
 echo "Skip build: $SKIP_BUILD"
 echo "Clean data dir: $CLEAN"
+echo "TCP fallback: $TCP_FALLBACK_ENABLED"
 echo "Network Ports:"
 echo "  QUIC Range: $QUIC_PORT_RANGE"
 echo "  TCP Range:  $TCP_PORT_RANGE"
@@ -279,6 +286,7 @@ data_dir = "$NODE_DATA_DIR"
 [network]
 # Use specific ports per validator to avoid race conditions during parallel startup
 listen_addr = "/ip4/0.0.0.0/udp/$validator_quic_port/quic-v1"
+tcp_fallback_enabled = $TCP_FALLBACK_ENABLED
 tcp_fallback_port = $validator_tcp_port
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 request_timeout_ms = 500

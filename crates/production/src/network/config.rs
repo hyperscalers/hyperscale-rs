@@ -46,6 +46,19 @@ pub struct Libp2pConfig {
     ///
     /// Default: 60 seconds
     pub idle_connection_timeout: Duration,
+
+    /// Whether to enable TCP fallback transport alongside QUIC.
+    ///
+    /// When enabled, the node will listen on TCP as well as QUIC,
+    /// providing fallback connectivity when UDP is blocked.
+    ///
+    /// Default: true
+    pub tcp_fallback_enabled: bool,
+
+    /// TCP fallback port (only used when tcp_fallback_enabled is true).
+    ///
+    /// Default: None (uses QUIC port + 21500 offset)
+    pub tcp_fallback_port: Option<u16>,
 }
 
 impl Default for Libp2pConfig {
@@ -58,6 +71,8 @@ impl Default for Libp2pConfig {
             max_message_size: 1024 * 1024 * 10, // 10MB
             gossipsub_heartbeat: Duration::from_millis(100),
             idle_connection_timeout: Duration::from_secs(60),
+            tcp_fallback_enabled: true,
+            tcp_fallback_port: None,
         }
     }
 }
@@ -99,6 +114,13 @@ impl Libp2pConfig {
         self
     }
 
+    /// Enable or disable TCP fallback transport.
+    pub fn with_tcp_fallback(mut self, enabled: bool, port: Option<u16>) -> Self {
+        self.tcp_fallback_enabled = enabled;
+        self.tcp_fallback_port = port;
+        self
+    }
+
     /// Create config for local testing with specified port.
     pub fn for_testing(port: u16) -> Self {
         Self {
@@ -110,6 +132,8 @@ impl Libp2pConfig {
             max_message_size: 1024 * 1024, // 1MB
             gossipsub_heartbeat: Duration::from_millis(500),
             idle_connection_timeout: Duration::from_secs(30),
+            tcp_fallback_enabled: true,
+            tcp_fallback_port: None,
         }
     }
 }

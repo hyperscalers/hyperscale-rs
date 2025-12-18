@@ -65,7 +65,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Hyperscale Validator Node
@@ -176,6 +176,10 @@ pub struct NetworkConfig {
     /// TCP fallback port (optional, enables TCP transport alongside QUIC)
     pub tcp_fallback_port: Option<u16>,
 
+    /// Whether TCP fallback is enabled (default: true)
+    #[serde(default = "default_tcp_fallback_enabled")]
+    pub tcp_fallback_enabled: bool,
+
     /// Bootstrap peer addresses
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
@@ -195,6 +199,10 @@ pub struct NetworkConfig {
 
 fn default_listen_addr() -> String {
     "/ip4/0.0.0.0/udp/9000/quic-v1".to_string()
+}
+
+fn default_tcp_fallback_enabled() -> bool {
+    true
 }
 
 fn default_request_timeout_ms() -> u64 {
@@ -793,23 +801,20 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
         .parse()
         .with_context(|| format!("Invalid listen address: {}", config.listen_addr))?;
 
-    let mut listen_addresses = vec![listen_addr.clone()];
+    let listen_addresses = vec![listen_addr.clone()];
 
-    // Add TCP fallback if configured
-    if let Some(port) = config.tcp_fallback_port {
-        let tcp_addr = format!("/ip4/0.0.0.0/tcp/{}", port)
-            .parse::<libp2p::Multiaddr>()
-            .context("Failed to construct TCP multiaddr")?;
-
-        info!("Enabled TCP fallback listener on {}", tcp_addr);
-        listen_addresses.push(tcp_addr);
-    }
-
-    // Filter out our own listen addresses from bootstrap peers to prevent self-dialing
+    // Filter out our own listen addresses from bootstrap peers
+    // Also filter TCP addresses if TCP fallback is disabled
     let bootstrap_peers: Vec<_> = config
         .bootstrap_peers
         .iter()
         .filter_map(|addr| {
+            // Skip TCP addresses if TCP transport is disabled
+            if !config.tcp_fallback_enabled && addr.contains("/tcp/") {
+                trace!("Skipping TCP bootstrap peer (TCP disabled): {}", addr);
+                return None;
+            }
+
             let parsed = addr.parse::<libp2p::Multiaddr>().ok().or_else(|| {
                 warn!("Invalid bootstrap peer address: {}", addr);
                 None
@@ -837,7 +842,8 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
         .with_bootstrap_peers(bootstrap_peers)
         .with_request_timeout(Duration::from_millis(config.request_timeout_ms))
         .with_max_message_size(config.max_message_size)
-        .with_gossipsub_heartbeat(Duration::from_millis(config.gossipsub_heartbeat_ms)))
+        .with_gossipsub_heartbeat(Duration::from_millis(config.gossipsub_heartbeat_ms))
+        .with_tcp_fallback(config.tcp_fallback_enabled, config.tcp_fallback_port))
 }
 
 /// Build RocksDB configuration from TOML config.

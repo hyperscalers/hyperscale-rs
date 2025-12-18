@@ -451,36 +451,66 @@ impl Libp2pAdapter {
             limits,
         };
 
-        // Build swarm
-        let mut swarm = SwarmBuilder::with_existing_identity(keypair)
-            .with_tokio()
-            .with_tcp(
-                libp2p::tcp::Config::default().nodelay(true), // Disable Nagle's algorithm for lower latency
-                libp2p::noise::Config::new,
-                || {
-                    let mut config = libp2p::yamux::Config::default();
-                    // Increase stream limit for TCP fallback to handle burst sync traffic.
-                    // QUIC is preferred but TCP+yamux is used as fallback when UDP is blocked.
-                    config.set_max_num_streams(4096);
-                    config
-                },
-            )
-            .map_err(|e| NetworkError::NetworkError(e.to_string()))?
-            .with_quic()
-            .with_behaviour(|_| behaviour)
-            .map_err(|e| NetworkError::NetworkError(e.to_string()))?
-            .with_swarm_config(|c| {
-                c.with_idle_connection_timeout(config.idle_connection_timeout)
-                    .with_max_negotiating_inbound_streams(100)
-            })
-            .build();
+        // Build swarm with QUIC transport, optionally with TCP fallback
+        let mut swarm = if config.tcp_fallback_enabled {
+            info!("Building swarm with TCP fallback enabled");
+            SwarmBuilder::with_existing_identity(keypair)
+                .with_tokio()
+                .with_tcp(
+                    libp2p::tcp::Config::default().nodelay(true), // Disable Nagle's algorithm for lower latency
+                    libp2p::noise::Config::new,
+                    || {
+                        let mut config = libp2p::yamux::Config::default();
+                        // Increase stream limit for TCP fallback to handle burst sync traffic.
+                        // QUIC is preferred but TCP+yamux is used as fallback when UDP is blocked.
+                        config.set_max_num_streams(4096);
+                        config
+                    },
+                )
+                .map_err(|e| NetworkError::NetworkError(e.to_string()))?
+                .with_quic()
+                .with_behaviour(|_| behaviour)
+                .map_err(|e| NetworkError::NetworkError(e.to_string()))?
+                .with_swarm_config(|c| {
+                    c.with_idle_connection_timeout(config.idle_connection_timeout)
+                        .with_max_negotiating_inbound_streams(100)
+                })
+                .build()
+        } else {
+            info!("Building swarm with QUIC only (TCP fallback disabled)");
+            SwarmBuilder::with_existing_identity(keypair)
+                .with_tokio()
+                .with_quic()
+                .with_behaviour(|_| behaviour)
+                .map_err(|e| NetworkError::NetworkError(e.to_string()))?
+                .with_swarm_config(|c| {
+                    c.with_idle_connection_timeout(config.idle_connection_timeout)
+                        .with_max_negotiating_inbound_streams(100)
+                })
+                .build()
+        };
 
-        // Listen on configured addresses
+        // Listen on configured addresses (QUIC)
         for addr in &config.listen_addresses {
             swarm
                 .listen_on(addr.clone())
                 .map_err(|e| NetworkError::NetworkError(e.to_string()))?;
             info!("Listening on: {}", addr);
+        }
+
+        // Listen on TCP fallback if enabled
+        if config.tcp_fallback_enabled {
+            if let Some(tcp_port) = config.tcp_fallback_port {
+                let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{}", tcp_port)
+                    .parse()
+                    .map_err(|e| {
+                        NetworkError::NetworkError(format!("Invalid TCP address: {}", e))
+                    })?;
+                swarm
+                    .listen_on(tcp_addr.clone())
+                    .map_err(|e| NetworkError::NetworkError(e.to_string()))?;
+                info!("Listening on TCP fallback: {}", tcp_addr);
+            }
         }
 
         // Connect to bootstrap peers
