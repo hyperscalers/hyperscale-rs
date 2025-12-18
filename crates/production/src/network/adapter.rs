@@ -452,7 +452,6 @@ impl Libp2pAdapter {
         };
 
         // Build swarm
-        // Build swarm
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
@@ -460,7 +459,9 @@ impl Libp2pAdapter {
                 libp2p::noise::Config::new,
                 || {
                     let mut config = libp2p::yamux::Config::default();
-                    config.set_max_num_streams(256);
+                    // Increase stream limit for TCP fallback to handle burst sync traffic.
+                    // QUIC is preferred but TCP+yamux is used as fallback when UDP is blocked.
+                    config.set_max_num_streams(4096);
                     config
                 },
             )
