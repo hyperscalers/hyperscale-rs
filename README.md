@@ -48,3 +48,55 @@ cargo run --release --bin hyperscale-sim
 ```bash
 cargo test
 ```
+
+## Running a Local Cluster
+
+For development and testing, you can launch a local cluster using the provided scripts.
+
+### Process-based Cluster
+
+The `launch-cluster.sh` script launches a cluster of validator nodes as background processes on your host machine. This is faster and easier for quick iteration.
+
+```bash
+./scripts/launch-cluster.sh
+```
+
+**Options:**
+- `--shards <N>`: Number of shards (default: 2)
+- `--validators-per-shard <M>`: Validators per shard (default: 4)
+- `--clean`: Clean data directories before starting
+- `--monitoring`: Start Prometheus and Grafana for metrics
+
+### Docker-based Cluster
+
+The `launch-docker-compose.sh` script launches a full cluster inside Docker containers using Docker Compose. This more closely mimics a production environment.
+
+> [!IMPORTANT]
+> **Memory Requirement**: Please ensure your Docker VM/Desktop is configured with at least **8-10GB of RAM**. The validator nodes require significant memory for the high-throughput consensus simulation.
+
+```bash
+./scripts/launch-docker-compose.sh
+```
+
+**Options:**
+- `--build <true|false>`: Whether to build the docker image (default: true). Set to false to use existing image for much faster startup.
+- `--shards <N>`: Number of shards (default: 1)
+- `--validators-per-shard <M>`: Validators per shard (default: 8)
+
+### Running Load Tests (Spammer)
+
+To run load tests against your local cluster, use the `hyperscale-spammer` binary.
+
+> [!IMPORTANT]
+> **Check Ports**: You **MUST** use the ports outputted by the launch script at the end of its execution. These ports may vary depending on the number of validators and sharding configuration.
+
+Example command (adjust ports as needed):
+
+```bash
+./target/release/hyperscale-spammer run \
+  --endpoints "http://localhost:8080,http://localhost:8081" \
+  --num-shards 2 \
+  --validators-per-shard 4 \
+  --tps 100 \
+  --duration 30s
+```
