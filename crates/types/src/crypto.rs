@@ -257,10 +257,17 @@ impl PublicKey {
 
         // Generate random scalars for the linear combination.
         // Using 64 bits of randomness provides 2^-64 probability of false positive.
+        // We seed a fast PRNG (ChaCha) from OsRng once, then generate all scalars from it.
+        // This avoids N system calls to OsRng which can be slow.
+        use rand::SeedableRng;
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut seed);
+        let mut rng = rand::rngs::StdRng::from_seed(seed);
+
         let mut rands = Vec::with_capacity(signatures.len());
         for _ in 0..signatures.len() {
             let mut rand_bytes = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut rand_bytes);
+            rand::RngCore::fill_bytes(&mut rng, &mut rand_bytes);
             let mut scalar = blst::blst_scalar::default();
             unsafe {
                 blst::blst_scalar_from_bendian(&mut scalar, rand_bytes.as_ptr());

@@ -2106,12 +2106,13 @@ impl ProductionRunner {
             // === STATE VOTES (cross-shard execution) ===
             if !pending.state_votes.is_empty() {
                 let start = std::time::Instant::now();
+
                 // Build signing messages for state votes (must match ExecutionState::create_vote)
                 let votes_with_msgs: Vec<(StateVoteBlock, PublicKey, Vec<u8>)> = pending
                     .state_votes
                     .into_iter()
                     .map(|(vote, pk)| {
-                        let mut msg = Vec::new();
+                        let mut msg = Vec::with_capacity(9 + 32 + 32 + 8 + 1); // Pre-allocate exact size
                         msg.extend_from_slice(b"EXEC_VOTE");
                         msg.extend_from_slice(vote.transaction_hash.as_bytes());
                         msg.extend_from_slice(vote.state_root.as_bytes());
@@ -2165,9 +2166,7 @@ impl ProductionRunner {
                 }
 
                 // Process BLS state votes using blst's native batch verification.
-                // This uses random linear combination to verify ALL signatures in ~2 pairings
-                // regardless of whether they have the same or different messages.
-                // For N signatures, this is O(1) crypto instead of O(N).
+                // Uses random linear combination to batch verify different messages efficiently.
                 if !bls_votes.is_empty() {
                     let messages: Vec<&[u8]> =
                         bls_votes.iter().map(|(_, _, m)| m.as_slice()).collect();
@@ -2178,8 +2177,6 @@ impl ProductionRunner {
                     let pubkeys: Vec<PublicKey> =
                         bls_votes.iter().map(|(_, pk, _)| pk.clone()).collect();
 
-                    // Use blst's batch verification with random linear combination.
-                    // This verifies all signatures in ~2 pairings instead of N.
                     let results = PublicKey::batch_verify_bls_different_messages(
                         &messages,
                         &signatures,
