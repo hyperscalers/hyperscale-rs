@@ -2153,15 +2153,68 @@ impl ProductionRunner {
                 }
             }
 
-            // Process BLS block votes individually (different messages)
-            for (vote, pk, msg) in bls_votes {
-                let valid = pk.verify(&msg, &vote.signature);
-                if !valid {
-                    crate::metrics::record_signature_verification_failure();
+            // Process BLS block votes using same-message batch verification.
+            // Votes for the same block (same height, round, block_hash) share the same signing
+            // message, so we can use aggregate signature verification: O(1) pairings instead of O(n).
+            // This is a significant optimization during consensus when multiple validators
+            // vote on the same block.
+            if !bls_votes.is_empty() {
+                use std::collections::HashMap;
+
+                // Group votes by signing message (votes for same block have same message)
+                let mut by_message: HashMap<Vec<u8>, Vec<(BlockVote, PublicKey)>> = HashMap::new();
+                for (vote, pk, msg) in bls_votes {
+                    by_message.entry(msg).or_default().push((vote, pk));
                 }
-                event_tx
-                    .send(Event::VoteSignatureVerified { vote, valid })
-                    .expect("callback channel closed - Loss of this event would cause a deadlock");
+
+                for (message, votes_for_block) in by_message {
+                    if votes_for_block.len() >= 2 {
+                        // Use same-message batch verification (aggregate signatures)
+                        let signatures: Vec<Signature> = votes_for_block
+                            .iter()
+                            .map(|(v, _)| v.signature.clone())
+                            .collect();
+                        let pubkeys: Vec<PublicKey> = votes_for_block
+                            .iter()
+                            .map(|(_, pk)| pk.clone())
+                            .collect();
+
+                        let batch_valid = PublicKey::batch_verify_bls_same_message(
+                            &message,
+                            &signatures,
+                            &pubkeys,
+                        );
+
+                        if batch_valid {
+                            for (vote, _) in votes_for_block {
+                                event_tx
+                                    .send(Event::VoteSignatureVerified { vote, valid: true })
+                                    .expect("callback channel closed");
+                            }
+                        } else {
+                            // Batch failed - fall back to individual verification to find bad ones
+                            for (vote, pk) in votes_for_block {
+                                let valid = pk.verify(&message, &vote.signature);
+                                if !valid {
+                                    crate::metrics::record_signature_verification_failure();
+                                }
+                                event_tx
+                                    .send(Event::VoteSignatureVerified { vote, valid })
+                                    .expect("callback channel closed");
+                            }
+                        }
+                    } else {
+                        // Single vote for this block - verify individually
+                        let (vote, pk) = votes_for_block.into_iter().next().unwrap();
+                        let valid = pk.verify(&message, &vote.signature);
+                        if !valid {
+                            crate::metrics::record_signature_verification_failure();
+                        }
+                        event_tx
+                            .send(Event::VoteSignatureVerified { vote, valid })
+                            .expect("callback channel closed");
+                    }
+                }
             }
 
             crate::metrics::record_signature_verification_latency(
