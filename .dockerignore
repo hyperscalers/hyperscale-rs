@@ -2,3 +2,5 @@ target/
 .git/
 .gitignore
 Dockerfile
+scripts/docker-compose.generated.yml
+scripts/monitoring/

@@ -47,6 +47,6 @@ ENV SKIP_BUILD=true
 ENV NODE_HOSTNAME=localhost
 
 # Expose ports
-EXPOSE 9100-9199 8180-8199
+EXPOSE 9000-9500 8080-8099
 
 ENTRYPOINT ["/usr/local/bin/launch-cluster.sh", "--clean", "--shards", "1", "--validators-per-shard", "7"]
