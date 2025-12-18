@@ -507,6 +507,13 @@ impl ProductionRunnerBuilder {
         // Create executor
         let executor = Arc::new(RadixExecutor::new(network_definition));
 
+        // Create message batcher for execution layer messages
+        // This batches state votes, certificates, and provisions to reduce network overhead
+        let message_batcher = crate::message_batcher::spawn_message_batcher(
+            crate::message_batcher::MessageBatcherConfig::default(),
+            network.clone(),
+        );
+
         Ok(ProductionRunner {
             timer_rx,
             callback_rx,
@@ -544,6 +551,7 @@ impl ProductionRunnerBuilder {
             state_vote_deadline: None,
             pending_cross_shard_executions: PendingCrossShardExecutions::default(),
             cross_shard_execution_deadline: None,
+            message_batcher,
         })
     }
 }
@@ -646,6 +654,9 @@ pub struct ProductionRunner {
     pending_cross_shard_executions: PendingCrossShardExecutions,
     /// Deadline for flushing pending cross-shard executions. None if none pending.
     cross_shard_execution_deadline: Option<tokio::time::Instant>,
+    /// Message batcher for execution layer messages (votes, certificates, provisions).
+    /// Accumulates items and flushes periodically to reduce network overhead.
+    message_batcher: crate::message_batcher::MessageBatcherHandle,
 }
 
 impl ProductionRunner {
@@ -1467,30 +1478,18 @@ impl ProductionRunner {
                 tracing::debug!(msg_type = message.type_name(), "Broadcast globally");
             }
 
-            // Domain-specific execution broadcasts
-            // These use batch wire format but currently send single items.
-            // TODO: Accumulate and flush periodically for batching optimization.
+            // Domain-specific execution broadcasts - queued to message batcher
+            // The batcher accumulates items and flushes periodically to reduce network overhead.
             Action::BroadcastStateVote { shard, vote } => {
-                let batch = hyperscale_messages::StateVoteBatch::single(vote);
-                let message = OutboundMessage::StateVoteBatch(batch);
-                self.network.broadcast_shard(shard, &message).await?;
-                tracing::debug!(?shard, "Broadcast state vote");
+                self.message_batcher.queue_vote(shard, vote);
             }
 
             Action::BroadcastStateCertificate { shard, certificate } => {
-                let mut batch = hyperscale_messages::StateCertificateBatch::single(certificate);
-                batch.trace_context = hyperscale_messages::TraceContext::from_current();
-                let message = OutboundMessage::StateCertificateBatch(batch);
-                self.network.broadcast_shard(shard, &message).await?;
-                tracing::debug!(?shard, "Broadcast state certificate");
+                self.message_batcher.queue_certificate(shard, certificate);
             }
 
             Action::BroadcastStateProvision { shard, provision } => {
-                let mut batch = hyperscale_messages::StateProvisionBatch::single(provision);
-                batch.trace_context = hyperscale_messages::TraceContext::from_current();
-                let message = OutboundMessage::StateProvisionBatch(batch);
-                self.network.broadcast_shard(shard, &message).await?;
-                tracing::debug!(?shard, "Broadcast state provision");
+                self.message_batcher.queue_provision(shard, provision);
             }
 
             // Timers via timer manager

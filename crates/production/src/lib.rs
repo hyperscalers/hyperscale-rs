@@ -71,6 +71,7 @@
 //! ```
 
 mod fetch;
+mod message_batcher;
 pub mod metrics;
 pub mod network;
 pub mod rpc;
@@ -84,6 +85,9 @@ mod timers;
 mod validation_batcher;
 
 pub use fetch::{FetchConfig, FetchKind, FetchManager, FetchStatus};
+pub use message_batcher::{
+    spawn_message_batcher, MessageBatcherConfig, MessageBatcherHandle, MessageBatcherStats,
+};
 pub use sync::{SyncConfig, SyncManager, SyncStatus};
 pub use sync_error::SyncResponseError;
 pub use telemetry::{init_telemetry, TelemetryConfig, TelemetryError, TelemetryGuard};

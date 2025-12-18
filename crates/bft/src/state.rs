@@ -699,7 +699,7 @@ impl BftState {
 
         actions.push(Action::BroadcastToShard {
             shard: self.local_shard(),
-            message: OutboundMessage::BlockHeader(gossip),
+            message: OutboundMessage::BlockHeader(Box::new(gossip)),
         });
 
         // Vote for our own block
@@ -779,7 +779,7 @@ impl BftState {
 
         actions.push(Action::BroadcastToShard {
             shard: self.local_shard(),
-            message: OutboundMessage::BlockHeader(gossip),
+            message: OutboundMessage::BlockHeader(Box::new(gossip)),
         });
 
         // Vote for our own fallback block
@@ -873,7 +873,7 @@ impl BftState {
 
         actions.push(Action::BroadcastToShard {
             shard: self.local_shard(),
-            message: OutboundMessage::BlockHeader(gossip),
+            message: OutboundMessage::BlockHeader(Box::new(gossip)),
         });
 
         // Note: We do NOT create a new vote here - we already voted for this block

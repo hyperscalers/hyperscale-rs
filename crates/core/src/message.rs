@@ -23,7 +23,8 @@ pub enum OutboundMessage {
     // BFT Messages
     // ═══════════════════════════════════════════════════════════════════════
     /// Block header announcement.
-    BlockHeader(BlockHeaderGossip),
+    /// Boxed to reduce enum size variance (BlockHeaderGossip is ~328 bytes).
+    BlockHeader(Box<BlockHeaderGossip>),
 
     /// Vote on a block header.
     BlockVote(BlockVoteGossip),
@@ -120,7 +121,7 @@ impl OutboundMessage {
     pub fn encoded_size(&self) -> (usize, usize) {
         let payload_size = match self {
             OutboundMessage::BlockHeader(gossip) => {
-                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
+                basic_encode(gossip.as_ref()).map(|v| v.len()).unwrap_or(0)
             }
             OutboundMessage::BlockVote(gossip) => {
                 basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
@@ -157,7 +158,7 @@ impl OutboundMessage {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         match self {
             OutboundMessage::BlockHeader(g) => {
-                if let Ok(encoded) = basic_encode(g) {
+                if let Ok(encoded) = basic_encode(g.as_ref()) {
                     encoded.hash(&mut hasher);
                 }
             }

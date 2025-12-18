@@ -246,7 +246,7 @@ mod tests {
             deferred: vec![],
             aborted: vec![],
         };
-        let message = OutboundMessage::BlockHeader(gossip);
+        let message = OutboundMessage::BlockHeader(Box::new(gossip));
 
         // Encode
         let bytes = encode_message(&message).unwrap();
@@ -326,7 +326,7 @@ mod tests {
             deferred: vec![],
             aborted: vec![],
         };
-        let message = OutboundMessage::BlockHeader(gossip);
+        let message = OutboundMessage::BlockHeader(Box::new(gossip));
 
         let topic = topic_for_message(&message, ShardGroupId(5));
         assert_eq!(topic.to_string(), "hyperscale/block.header/shard-5/1.0.0");
