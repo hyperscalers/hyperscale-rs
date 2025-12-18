@@ -1052,8 +1052,8 @@ mod tests {
     #[test]
     fn test_atomic_certificate_persistence() {
         use hyperscale_types::{
-            NodeId, PartitionNumber, ShardExecutionProof, ShardGroupId, Signature,
-            StateCertificate, SubstateWrite, TransactionCertificate, TransactionDecision,
+            NodeId, PartitionNumber, ShardGroupId, Signature, StateCertificate, SubstateWrite,
+            TransactionCertificate, TransactionDecision,
         };
         use std::collections::BTreeMap;
 
@@ -1082,15 +1082,8 @@ mod tests {
             voting_power: 0,
         };
 
-        let shard_proof = ShardExecutionProof {
-            shard_group,
-            read_nodes: vec![],
-            state_writes: writes.clone(),
-            state_certificate: state_cert,
-        };
-
         let mut shard_proofs = BTreeMap::new();
-        shard_proofs.insert(shard_group, shard_proof);
+        shard_proofs.insert(shard_group, state_cert);
 
         let certificate = TransactionCertificate {
             transaction_hash: tx_hash,
@@ -1273,8 +1266,8 @@ mod tests {
     #[test]
     fn test_certificate_idempotency() {
         use hyperscale_types::{
-            NodeId, PartitionNumber, ShardExecutionProof, ShardGroupId, Signature,
-            StateCertificate, SubstateWrite, TransactionCertificate, TransactionDecision,
+            NodeId, PartitionNumber, ShardGroupId, Signature, StateCertificate, SubstateWrite,
+            TransactionCertificate, TransactionDecision,
         };
         use std::collections::BTreeMap;
 
@@ -1302,15 +1295,8 @@ mod tests {
             voting_power: 0,
         };
 
-        let shard_proof = ShardExecutionProof {
-            shard_group,
-            read_nodes: vec![],
-            state_writes: writes.clone(),
-            state_certificate: state_cert,
-        };
-
         let mut shard_proofs = BTreeMap::new();
-        shard_proofs.insert(shard_group, shard_proof);
+        shard_proofs.insert(shard_group, state_cert);
 
         let certificate = TransactionCertificate {
             transaction_hash: tx_hash,

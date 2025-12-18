@@ -1906,7 +1906,7 @@ impl ProductionRunner {
                 let writes: Vec<_> = certificate
                     .shard_proofs
                     .get(&local_shard)
-                    .map(|p| p.state_writes.clone())
+                    .map(|cert| cert.state_writes.clone())
                     .unwrap_or_default();
 
                 // Run on blocking thread since RocksDB write is sync I/O

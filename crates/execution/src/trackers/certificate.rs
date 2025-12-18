@@ -4,8 +4,7 @@
 //! during Phase 5 of the cross-shard 2PC protocol.
 
 use hyperscale_types::{
-    Hash, ShardExecutionProof, ShardGroupId, StateCertificate, TransactionCertificate,
-    TransactionDecision,
+    Hash, ShardGroupId, StateCertificate, TransactionCertificate, TransactionDecision,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -98,10 +97,12 @@ impl CertificateTracker {
 
     /// Create a `TransactionCertificate` from collected certificates.
     ///
+    /// Takes ownership of collected certificates to avoid cloning.
+    ///
     /// Returns `None` if:
     /// - Not all certificates have been collected
     /// - Certificates have mismatched merkle roots (Byzantine behavior)
-    pub fn create_tx_certificate(&self) -> Option<TransactionCertificate> {
+    pub fn create_tx_certificate(&mut self) -> Option<TransactionCertificate> {
         if !self.is_complete() {
             tracing::debug!(
                 tx_hash = ?self.tx_hash,
@@ -129,25 +130,16 @@ impl CertificateTracker {
             "Creating TX certificate - all certificates collected and merkle roots match"
         );
 
-        // Build shard proofs
-        let mut shard_proofs = BTreeMap::new();
-        for (shard_id, state_cert) in &self.certificates {
-            let proof = ShardExecutionProof {
-                shard_group: *shard_id,
-                read_nodes: state_cert.read_nodes.clone(),
-                state_writes: state_cert.state_writes.clone(),
-                state_certificate: state_cert.clone(),
-            };
-            shard_proofs.insert(*shard_id, proof);
-        }
-
-        // Determine decision: ACCEPT if all succeeded, REJECT if any failed
+        // Determine decision first (before moving certificates)
         let all_succeeded = self.certificates.values().all(|c| c.success);
         let decision = if all_succeeded {
             TransactionDecision::Accept
         } else {
             TransactionDecision::Reject
         };
+
+        // Take ownership of certificates directly (no wrapping, no cloning!)
+        let shard_proofs = std::mem::take(&mut self.certificates);
 
         Some(TransactionCertificate {
             transaction_hash: self.tx_hash,

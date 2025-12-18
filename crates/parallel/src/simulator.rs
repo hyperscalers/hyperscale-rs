@@ -546,16 +546,16 @@ impl SimNode {
 
             Action::PersistTransactionCertificate { certificate } => {
                 let local_shard = self.state.shard();
-                if let Some((_, proof)) = certificate
+                if let Some((_, cert)) = certificate
                     .shard_proofs
                     .iter()
                     .find(|(shard, _)| **shard == local_shard)
                 {
                     // Commit to node's local storage
                     self.storage
-                        .commit_certificate_with_writes(&certificate, &proof.state_writes);
+                        .commit_certificate_with_writes(&certificate, &cert.state_writes);
                     // Also commit to the shared cache storage so future executions see the state
-                    cache.commit_writes(local_shard.0, &proof.state_writes);
+                    cache.commit_writes(local_shard.0, &cert.state_writes);
                 } else {
                     self.storage
                         .put_certificate(certificate.transaction_hash, certificate);

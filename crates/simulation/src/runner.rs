@@ -1040,7 +1040,7 @@ impl SimulationRunner {
                 let writes = certificate
                     .shard_proofs
                     .get(&local_shard)
-                    .map(|p| p.state_writes.as_slice())
+                    .map(|cert| cert.state_writes.as_slice())
                     .unwrap_or(&[]);
 
                 // Commit certificate + writes atomically (mirrors production behavior)

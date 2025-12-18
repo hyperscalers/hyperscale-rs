@@ -1567,9 +1567,7 @@ impl ExecutionState {
         );
 
         // Emit verification action for each embedded StateCertificate
-        for (shard_id, proof) in &certificate.shard_proofs {
-            let state_cert = &proof.state_certificate;
-
+        for (shard_id, state_cert) in &certificate.shard_proofs {
             // Get public keys for this shard's committee
             let committee = self.topology.committee_for_shard(*shard_id);
             let public_keys: Vec<PublicKey> = committee
@@ -2138,7 +2136,7 @@ impl ExecutionState {
         let written_nodes: HashSet<NodeId> = certificate
             .shard_proofs
             .values()
-            .flat_map(|proof| proof.state_writes.iter().map(|w| w.node_id))
+            .flat_map(|cert| cert.state_writes.iter().map(|w| w.node_id))
             .collect();
 
         if written_nodes.is_empty() {

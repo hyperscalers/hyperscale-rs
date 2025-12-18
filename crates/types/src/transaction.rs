@@ -994,8 +994,9 @@ pub struct TransactionCertificate {
     /// Final decision: ACCEPT if all shards succeeded, REJECT otherwise.
     pub decision: TransactionDecision,
 
-    /// Execution proofs from all required shards, mapped by shard ID.
-    pub shard_proofs: BTreeMap<ShardGroupId, ShardExecutionProof>,
+    /// State certificates from all participating shards, keyed by shard ID.
+    /// Each certificate contains read_nodes, state_writes, signatures, etc.
+    pub shard_proofs: BTreeMap<ShardGroupId, StateCertificate>,
 }
 
 impl TransactionCertificate {
@@ -1029,8 +1030,8 @@ impl TransactionCertificate {
         self.shard_proofs.keys().copied().collect()
     }
 
-    /// Get proof for a specific shard.
-    pub fn proof_for_shard(&self, shard_id: ShardGroupId) -> Option<&ShardExecutionProof> {
+    /// Get certificate for a specific shard.
+    pub fn certificate_for_shard(&self, shard_id: ShardGroupId) -> Option<&StateCertificate> {
         self.shard_proofs.get(&shard_id)
     }
 
@@ -1038,7 +1039,7 @@ impl TransactionCertificate {
     pub fn all_read_nodes(&self) -> Vec<NodeId> {
         self.shard_proofs
             .values()
-            .flat_map(|proof| proof.read_nodes.iter().cloned())
+            .flat_map(|cert| cert.read_nodes.iter().copied())
             .collect()
     }
 
@@ -1046,22 +1047,20 @@ impl TransactionCertificate {
     pub fn all_state_writes(&self) -> Vec<SubstateWrite> {
         self.shard_proofs
             .values()
-            .flat_map(|proof| proof.state_writes.clone())
+            .flat_map(|cert| cert.state_writes.iter().cloned())
             .collect()
     }
 
     /// Check if all shards succeeded.
     pub fn all_shards_succeeded(&self) -> bool {
-        self.shard_proofs
-            .values()
-            .all(|proof| proof.state_certificate.success)
+        self.shard_proofs.values().all(|cert| cert.success)
     }
 
     /// Get total number of state writes across all shards.
     pub fn total_write_count(&self) -> usize {
         self.shard_proofs
             .values()
-            .map(|proof| proof.state_writes.len())
+            .map(|cert| cert.state_writes.len())
             .sum()
     }
 
@@ -1069,46 +1068,8 @@ impl TransactionCertificate {
     pub fn total_read_count(&self) -> usize {
         self.shard_proofs
             .values()
-            .map(|proof| proof.read_nodes.len())
+            .map(|cert| cert.read_nodes.len())
             .sum()
-    }
-}
-
-/// Proof that a shard executed a transaction and reached consensus.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct ShardExecutionProof {
-    /// Shard group that executed.
-    pub shard_group: ShardGroupId,
-
-    /// Node IDs that were READ during execution.
-    pub read_nodes: Vec<NodeId>,
-
-    /// Substate data that was WRITTEN during execution.
-    pub state_writes: Vec<SubstateWrite>,
-
-    /// State certificate from shard validators (2f+1 quorum proof).
-    pub state_certificate: StateCertificate,
-}
-
-impl ShardExecutionProof {
-    /// Check if execution succeeded for this shard.
-    pub fn is_success(&self) -> bool {
-        self.state_certificate.success
-    }
-
-    /// Check if execution failed for this shard.
-    pub fn is_failure(&self) -> bool {
-        !self.state_certificate.success
-    }
-
-    /// Get number of writes for this shard.
-    pub fn write_count(&self) -> usize {
-        self.state_writes.len()
-    }
-
-    /// Get number of reads for this shard.
-    pub fn read_count(&self) -> usize {
-        self.read_nodes.len()
     }
 }
 
