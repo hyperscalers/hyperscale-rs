@@ -804,6 +804,30 @@ impl SyncManager {
             return self.select_peer_inner(now);
         }
 
+        // Desperation mode for banned peers: if we have banned peers and we're far behind,
+        // lift the bans. Bans are meant to protect against Byzantine peers, but if we're
+        // stuck and can't make progress, we need to try again.
+        if banned > 0 && blocks_behind >= self.config.desperation_threshold_blocks {
+            warn!(
+                same_shard_peers = same_shard_count,
+                blocks_behind,
+                banned,
+                "DESPERATION MODE: {} peers banned but {} blocks behind - lifting bans",
+                banned,
+                blocks_behind
+            );
+
+            // Lift all bans
+            for rep in self.peer_reputations.values_mut() {
+                rep.banned_until = None;
+                rep.failures = 0;
+                rep.last_failure = None;
+            }
+
+            // Now retry peer selection with lifted bans
+            return self.select_peer_inner(now);
+        }
+
         warn!(
             same_shard_peers = same_shard_count,
             in_cooldown = in_cooldown_count,
