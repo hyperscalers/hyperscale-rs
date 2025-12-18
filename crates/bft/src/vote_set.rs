@@ -122,6 +122,11 @@ impl VoteSet {
         self.height.map(|h| h.0)
     }
 
+    /// Get the round number.
+    pub fn round(&self) -> Option<u64> {
+        self.round
+    }
+
     /// Update the vote set with header information.
     ///
     /// This is needed when votes arrive before the header. The vote set

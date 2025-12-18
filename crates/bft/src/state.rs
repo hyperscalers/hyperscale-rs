@@ -3301,10 +3301,19 @@ impl BftState {
             }
         });
 
-        // Clear vote sets for blocks at this height
-        // Note: vote_sets are keyed by block_hash, so we need to check the height
-        self.vote_sets
-            .retain(|_hash, vote_set| vote_set.height().is_none_or(|h| h != height));
+        // Clear vote sets for blocks at this height, but ONLY for rounds less than
+        // the new round. Vote sets at the current or higher rounds may contain valid
+        // votes that can still form a QC.
+        //
+        // This fixes a race condition similar to the one for pending_vote_verifications:
+        // if another validator's fallback block at round N has already accumulated votes
+        // in our vote_sets before we advance to round N, we should preserve those votes.
+        // Note: vote_sets are keyed by block_hash, so we need to check the height and round
+        self.vote_sets.retain(|_hash, vote_set| {
+            // Keep if: different height OR round >= new_round OR round unknown
+            vote_set.height().is_none_or(|h| h != height)
+                || vote_set.round().is_none_or(|r| r >= new_round)
+        });
 
         // Clear pending vote verifications for this height, but ONLY for rounds
         // less than the new round. Votes at the current or higher rounds are still
@@ -5919,6 +5928,165 @@ mod tests {
             state.pending_vote_verifications.len(),
             3,
             "Should have 3 remaining verifications"
+        );
+    }
+
+    #[test]
+    fn test_clear_vote_tracking_preserves_current_round_vote_sets() {
+        // Test that vote sets at the current/higher round are preserved.
+        // This is critical to prevent losing accumulated votes during view changes.
+        use crate::vote_set::VoteSet;
+
+        let (mut state, keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        let height = 5u64;
+
+        // Create block headers at different rounds
+        let header_round1 = BlockHeader {
+            height: BlockHeight(height),
+            parent_hash: Hash::from_bytes(b"parent"),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(2), // (5 + 1) % 4 = 2
+            timestamp: 100_000,
+            round: 1,
+            is_fallback: true,
+        };
+        let block_hash_r1 = header_round1.hash();
+
+        let header_round2 = BlockHeader {
+            height: BlockHeight(height),
+            parent_hash: Hash::from_bytes(b"parent"),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(3), // (5 + 2) % 4 = 3
+            timestamp: 100_001,
+            round: 2,
+            is_fallback: true,
+        };
+        let block_hash_r2 = header_round2.hash();
+
+        let header_round3 = BlockHeader {
+            height: BlockHeight(height),
+            parent_hash: Hash::from_bytes(b"parent"),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(0), // (5 + 3) % 4 = 0
+            timestamp: 100_002,
+            round: 3,
+            is_fallback: true,
+        };
+        let block_hash_r3 = header_round3.hash();
+
+        // Different height - should be preserved
+        let header_height6 = BlockHeader {
+            height: BlockHeight(6),
+            parent_hash: Hash::from_bytes(b"parent"),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(2), // (6 + 0) % 4 = 2
+            timestamp: 100_003,
+            round: 0,
+            is_fallback: false,
+        };
+        let block_hash_h6 = header_height6.hash();
+
+        // Create vote sets with accumulated votes
+        let mut vote_set_r1 = VoteSet::new(Some(header_round1), 4);
+        vote_set_r1.add_vote(
+            BlockVote {
+                block_hash: block_hash_r1,
+                height: BlockHeight(height),
+                round: 1,
+                voter: ValidatorId(0),
+                signature: keys[0].sign(block_hash_r1.as_bytes()),
+                timestamp: 100_000,
+            },
+            0,
+            1,
+        );
+        state.vote_sets.insert(block_hash_r1, vote_set_r1);
+
+        let mut vote_set_r2 = VoteSet::new(Some(header_round2), 4);
+        vote_set_r2.add_vote(
+            BlockVote {
+                block_hash: block_hash_r2,
+                height: BlockHeight(height),
+                round: 2,
+                voter: ValidatorId(1),
+                signature: keys[1].sign(block_hash_r2.as_bytes()),
+                timestamp: 100_001,
+            },
+            1,
+            1,
+        );
+        state.vote_sets.insert(block_hash_r2, vote_set_r2);
+
+        let mut vote_set_r3 = VoteSet::new(Some(header_round3), 4);
+        vote_set_r3.add_vote(
+            BlockVote {
+                block_hash: block_hash_r3,
+                height: BlockHeight(height),
+                round: 3,
+                voter: ValidatorId(2),
+                signature: keys[2].sign(block_hash_r3.as_bytes()),
+                timestamp: 100_002,
+            },
+            2,
+            1,
+        );
+        state.vote_sets.insert(block_hash_r3, vote_set_r3);
+
+        let mut vote_set_h6 = VoteSet::new(Some(header_height6), 4);
+        vote_set_h6.add_vote(
+            BlockVote {
+                block_hash: block_hash_h6,
+                height: BlockHeight(6),
+                round: 0,
+                voter: ValidatorId(3),
+                signature: keys[3].sign(block_hash_h6.as_bytes()),
+                timestamp: 100_003,
+            },
+            3,
+            1,
+        );
+        state.vote_sets.insert(block_hash_h6, vote_set_h6);
+
+        assert_eq!(state.vote_sets.len(), 4);
+
+        // Clear tracking for height 5, advancing to round 2
+        state.clear_vote_tracking_for_height(height, 2);
+
+        // Round 1 vote set should be cleared (round < new_round)
+        assert!(
+            !state.vote_sets.contains_key(&block_hash_r1),
+            "Round 1 vote set should be cleared"
+        );
+
+        // Round 2 vote set should be preserved (round >= new_round)
+        assert!(
+            state.vote_sets.contains_key(&block_hash_r2),
+            "Round 2 vote set should be preserved"
+        );
+        assert_eq!(
+            state.vote_sets.get(&block_hash_r2).unwrap().voting_power(),
+            1,
+            "Round 2 vote set should still have its votes"
+        );
+
+        // Round 3 vote set should be preserved (round >= new_round)
+        assert!(
+            state.vote_sets.contains_key(&block_hash_r3),
+            "Round 3 vote set should be preserved"
+        );
+
+        // Different height vote set should be preserved
+        assert!(
+            state.vote_sets.contains_key(&block_hash_h6),
+            "Different height vote set should be preserved"
+        );
+
+        assert_eq!(
+            state.vote_sets.len(),
+            3,
+            "Should have 3 remaining vote sets"
         );
     }
 
