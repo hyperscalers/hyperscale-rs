@@ -181,6 +181,10 @@ pub struct ExecutionState {
     /// The height is stored to enable cleanup of old entries after finalization.
     verified_state_votes: HashMap<(Hash, ValidatorId), u64>,
 
+    /// Reverse index: tx_hash -> set of validator IDs with verified votes.
+    /// Enables O(k) cleanup instead of O(n) where k = verified votes for this tx.
+    verified_votes_by_tx: HashMap<Hash, HashSet<ValidatorId>>,
+
     // ═══════════════════════════════════════════════════════════════════════
     // Speculative Execution State
     // ═══════════════════════════════════════════════════════════════════════
@@ -292,6 +296,7 @@ impl ExecutionState {
             pending_fetched_cert_verifications: HashMap::new(),
             pending_verifications_by_tx: HashMap::new(),
             verified_state_votes: HashMap::new(),
+            verified_votes_by_tx: HashMap::new(),
             speculative_results: HashMap::new(),
             speculative_in_flight_txs: HashSet::new(),
             speculative_reads_index: HashMap::new(),
@@ -1212,6 +1217,11 @@ impl ExecutionState {
         // (e.g., during gossiping or retries). We use 0 as a placeholder height
         // since cleanup is done by tx_hash in cleanup_transaction().
         self.verified_state_votes.insert((tx_hash, validator_id), 0);
+        // Update reverse index for O(k) cleanup
+        self.verified_votes_by_tx
+            .entry(tx_hash)
+            .or_default()
+            .insert(validator_id);
         tracing::trace!(
             tx_hash = ?tx_hash,
             validator = validator_id.0,
@@ -1682,8 +1692,12 @@ impl ExecutionState {
         &mut self,
         tx_hash: &Hash,
     ) -> Option<Arc<TransactionCertificate>> {
-        // Clean up verified vote cache for this transaction
-        self.verified_state_votes.retain(|(h, _), _| h != tx_hash);
+        // Clean up verified vote cache using reverse index for O(k) instead of O(n)
+        if let Some(validators) = self.verified_votes_by_tx.remove(tx_hash) {
+            for vid in validators {
+                self.verified_state_votes.remove(&(*tx_hash, vid));
+            }
+        }
 
         self.finalized_certificates.remove(tx_hash)
     }
@@ -1800,8 +1814,12 @@ impl ExecutionState {
             }
         }
 
-        // Verified vote cache cleanup (still O(n) but this is less frequent)
-        self.verified_state_votes.retain(|(h, _), _| h != tx_hash);
+        // Verified vote cache cleanup using reverse index for O(k) instead of O(n)
+        if let Some(validators) = self.verified_votes_by_tx.remove(tx_hash) {
+            for vid in validators {
+                self.verified_state_votes.remove(&(*tx_hash, vid));
+            }
+        }
 
         tracing::debug!(
             tx_hash = %tx_hash,
