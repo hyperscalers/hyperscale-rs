@@ -93,20 +93,25 @@ impl ProvisioningTracker {
         for shard in &self.required_shards {
             let provisions = self.provisions_by_shard.get(shard)?;
 
-            // Find majority provision by entries hash
+            // Compute entries_hash once per provision and cache with index
+            let hashed: Vec<_> = provisions
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.entries_hash(), i))
+                .collect();
+
+            // Count occurrences of each hash
             let mut counts: HashMap<Hash, usize> = HashMap::new();
-            for provision in provisions {
-                let entries_hash = provision.entries_hash();
-                *counts.entry(entries_hash).or_default() += 1;
+            for (hash, _) in &hashed {
+                *counts.entry(*hash).or_default() += 1;
             }
 
             let threshold = self.quorum_thresholds.get(shard).copied().unwrap_or(1);
 
-            // Find a provision with quorum
-            for provision in provisions {
-                let entries_hash = provision.entries_hash();
-                if counts.get(&entries_hash).copied().unwrap_or(0) >= threshold {
-                    result.push(provision.clone());
+            // Find a provision with quorum (using cached hash)
+            for (hash, idx) in hashed {
+                if counts.get(&hash).copied().unwrap_or(0) >= threshold {
+                    result.push(provisions[idx].clone());
                     break;
                 }
             }
