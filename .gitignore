@@ -49,5 +49,6 @@ cluster-data/
 # Modelling
 tla/
 
-# Monitoring (dynamically generated)
+# Docker compose and monitoring (dynamically generated)
 scripts/monitoring/prometheus.yml
+scripts/docker-compose.generated.yml
