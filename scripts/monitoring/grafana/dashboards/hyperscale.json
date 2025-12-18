@@ -1706,18 +1706,54 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket[1m])) by (le))",
-          "legendFormat": "p50",
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"vote\"}[1m])) by (le))",
+          "legendFormat": "vote p50",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket[1m])) by (le))",
-          "legendFormat": "p99",
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"vote\"}[1m])) by (le))",
+          "legendFormat": "vote p99",
           "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"qc\"}[1m])) by (le))",
+          "legendFormat": "qc p50",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"qc\"}[1m])) by (le))",
+          "legendFormat": "qc p99",
+          "refId": "D"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"state_vote\"}[1m])) by (le))",
+          "legendFormat": "state_vote p50",
+          "refId": "E"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"state_vote\"}[1m])) by (le))",
+          "legendFormat": "state_vote p99",
+          "refId": "F"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"state_cert\"}[1m])) by (le))",
+          "legendFormat": "state_cert p50",
+          "refId": "G"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"state_cert\"}[1m])) by (le))",
+          "legendFormat": "state_cert p99",
+          "refId": "H"
         }
       ],
-      "title": "Signature Verification Latency",
+      "title": "Signature Verification Latency by Type",
       "type": "timeseries"
     },
     {

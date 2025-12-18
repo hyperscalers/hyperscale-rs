@@ -32,7 +32,7 @@ pub struct Metrics {
     // === Infrastructure ===
     pub network_messages_sent: Counter,
     pub network_messages_received: Counter,
-    pub signature_verification_latency: Histogram,
+    pub signature_verification_latency: HistogramVec,
     pub execution_latency: Histogram,
     pub speculative_execution_latency: Histogram,
 
@@ -181,10 +181,11 @@ impl Metrics {
             )
             .unwrap(),
 
-            signature_verification_latency: register_histogram!(
+            signature_verification_latency: register_histogram_vec!(
                 "hyperscale_signature_verification_latency_seconds",
-                "Signature verification latency",
-                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1]
+                "Signature verification latency by type",
+                &["type"],
+                vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5]
             )
             .unwrap(),
 
@@ -748,10 +749,18 @@ pub fn record_network_message_received() {
     metrics().network_messages_received.inc();
 }
 
-/// Record signature verification latency.
-pub fn record_signature_verification_latency(latency_secs: f64) {
+/// Record signature verification latency by type.
+///
+/// Types:
+/// - "vote": Individual vote signature (BLS or Ed25519)
+/// - "qc": Aggregated QC signature (BLS aggregate)
+/// - "state_vote": State vote signature (execution layer)
+/// - "state_cert": State certificate aggregated signature
+/// - "provision": Provision signature
+pub fn record_signature_verification_latency(sig_type: &str, latency_secs: f64) {
     metrics()
         .signature_verification_latency
+        .with_label_values(&[sig_type])
         .observe(latency_secs);
 }
 

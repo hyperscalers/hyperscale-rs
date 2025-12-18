@@ -1321,6 +1321,7 @@ impl ProductionRunner {
                     // Verify vote signature against domain-separated message
                     let valid = public_key.verify(&signing_message, &vote.signature);
                     crate::metrics::record_signature_verification_latency(
+                        "vote",
                         start.elapsed().as_secs_f64(),
                     );
                     if !valid {
@@ -1346,6 +1347,7 @@ impl ProductionRunner {
 
                     let valid = public_key.verify(&msg, &provision.signature);
                     crate::metrics::record_signature_verification_latency(
+                        "provision",
                         start.elapsed().as_secs_f64(),
                     );
                     if !valid {
@@ -1368,6 +1370,7 @@ impl ProductionRunner {
 
                     let valid = public_key.verify(&msg, &vote.signature);
                     crate::metrics::record_signature_verification_latency(
+                        "state_vote",
                         start.elapsed().as_secs_f64(),
                     );
                     if !valid {
@@ -1414,6 +1417,7 @@ impl ProductionRunner {
                     };
 
                     crate::metrics::record_signature_verification_latency(
+                        "state_cert",
                         start.elapsed().as_secs_f64(),
                     );
                     if !valid {
@@ -1455,6 +1459,7 @@ impl ProductionRunner {
                     };
 
                     crate::metrics::record_signature_verification_latency(
+                        "qc",
                         start.elapsed().as_secs_f64(),
                     );
                     if !valid {
@@ -2031,10 +2036,9 @@ impl ProductionRunner {
         let batch_size = pending.total_count();
 
         self.thread_pools.spawn_crypto(move || {
-            let start = std::time::Instant::now();
-
             // === BLOCK VOTES ===
             if !pending.block_votes.is_empty() {
+                let start = std::time::Instant::now();
                 // Separate by key type for appropriate batch verification
                 let mut ed25519_votes: Vec<(BlockVote, PublicKey, Vec<u8>)> = Vec::new();
                 let mut bls_votes: Vec<(BlockVote, PublicKey, Vec<u8>)> = Vec::new();
@@ -2090,12 +2094,18 @@ impl ProductionRunner {
                         .send(Event::VoteSignatureVerified { vote, valid })
                         .expect("callback channel closed - Loss of this event would cause a deadlock");
                 }
+
+                crate::metrics::record_signature_verification_latency(
+                    "vote",
+                    start.elapsed().as_secs_f64(),
+                );
             }
 
             // Note: View change vote batch verification removed - using HotStuff-2 implicit rounds
 
             // === STATE VOTES (cross-shard execution) ===
             if !pending.state_votes.is_empty() {
+                let start = std::time::Instant::now();
                 // Build signing messages for state votes (must match ExecutionState::create_vote)
                 let votes_with_msgs: Vec<(StateVoteBlock, PublicKey, Vec<u8>)> = pending
                     .state_votes
@@ -2181,16 +2191,16 @@ impl ProductionRunner {
                             .expect("callback channel closed - Loss of this event would cause a deadlock");
                     }
                 }
-            }
 
-            // Record batch metrics
-            let elapsed = start.elapsed().as_secs_f64();
-            crate::metrics::record_signature_verification_latency(elapsed);
+                crate::metrics::record_signature_verification_latency(
+                    "state_vote",
+                    start.elapsed().as_secs_f64(),
+                );
+            }
 
             if batch_size > 1 {
                 tracing::debug!(
                     batch_size,
-                    elapsed_ms = elapsed * 1000.0,
                     "Batch verified signatures"
                 );
             }
