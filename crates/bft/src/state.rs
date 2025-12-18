@@ -1577,6 +1577,20 @@ impl BftState {
         let block_hash = vote.block_hash;
         let is_own_vote = vote.voter == self.validator_id();
 
+        // Early out: skip votes for already-committed heights.
+        // This prevents wasting crypto resources verifying stale votes, which is
+        // critical for avoiding feedback loops under load where crypto backlog
+        // delays QC formation, triggering view changes, which generate more votes.
+        if vote.height.0 <= self.committed_height {
+            trace!(
+                vote_height = vote.height.0,
+                committed_height = self.committed_height,
+                voter = ?vote.voter,
+                "Skipping vote for already-committed height"
+            );
+            return vec![];
+        }
+
         // Validate voter is in committee
         let voter_index = match self.committee_index(vote.voter) {
             Some(idx) => idx,
@@ -3224,6 +3238,21 @@ impl BftState {
         self.vote_sets
             .retain(|_hash, vote_set| vote_set.height().is_none_or(|h| h != height));
 
+        // Clear pending vote verifications for this height.
+        // This prevents the crypto pool from being overwhelmed with stale verifications
+        // after a view change - verifying votes for heights we've moved past is wasted work.
+        let before_pending = self.pending_vote_verifications.len();
+        self.pending_vote_verifications
+            .retain(|_, pending| pending.vote.height.0 != height);
+        let pending_cleared = before_pending - self.pending_vote_verifications.len();
+        if pending_cleared > 0 {
+            debug!(
+                height,
+                pending_cleared,
+                "Cleared pending vote verifications for height during view change"
+            );
+        }
+
         cleared
     }
 
@@ -3260,6 +3289,18 @@ impl BftState {
         // Remove buffered synced blocks at or below committed height
         self.buffered_synced_blocks
             .retain(|height, _| *height > committed_height);
+
+        // Remove pending vote verifications at or below committed height.
+        // Verifying votes for already-committed heights is wasted crypto work.
+        self.pending_vote_verifications
+            .retain(|_, pending| pending.vote.height.0 > committed_height);
+
+        // Remove pending QC verifications for blocks at or below committed height.
+        // We look up the block hash in pending_blocks to get the height - if the block
+        // is no longer in pending_blocks (was just cleaned up above), we remove the
+        // pending verification since we won't need it.
+        self.pending_qc_verifications
+            .retain(|hash, _| self.pending_blocks.contains_key(hash));
     }
 
     /// Clean up stale incomplete pending blocks.
