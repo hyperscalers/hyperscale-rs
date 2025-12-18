@@ -10,6 +10,17 @@ use hyperscale_types::{
 use std::sync::Arc;
 use std::time::Duration;
 
+/// A request to execute a cross-shard transaction with its provisions.
+#[derive(Debug, Clone)]
+pub struct CrossShardExecutionRequest {
+    /// Transaction hash (for correlation).
+    pub tx_hash: Hash,
+    /// The transaction to execute.
+    pub transaction: Arc<RoutableTransaction>,
+    /// State provisions from other shards.
+    pub provisions: Vec<StateProvision>,
+}
+
 /// Actions the state machine wants to perform.
 ///
 /// Actions are **commands** - they describe something to do.
@@ -150,9 +161,9 @@ pub enum Action {
 
     /// Execute a cross-shard transaction with provisioned state.
     ///
-    /// Used after 2PC provisioning completes. The runner executes the transaction
-    /// using the provided provisions and returns the result.
-    /// Returns `Event::CrossShardTransactionExecuted` when complete.
+    /// Used after 2PC provisioning completes. The runner accumulates these actions
+    /// and executes them in parallel batches for efficiency.
+    /// Returns `Event::CrossShardTransactionsExecuted` when the batch completes.
     ExecuteCrossShardTransaction {
         /// Transaction hash (for correlation).
         tx_hash: Hash,

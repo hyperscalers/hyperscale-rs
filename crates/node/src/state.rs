@@ -434,7 +434,7 @@ impl StateMachine for NodeStateMachine {
 
             // Other execution events
             Event::TransactionsExecuted { .. }
-            | Event::CrossShardTransactionExecuted { .. }
+            | Event::CrossShardTransactionsExecuted { .. }
             | Event::StateVoteReceived { .. }
             | Event::StateCertificateReceived { .. }
             | Event::MerkleRootComputed { .. }

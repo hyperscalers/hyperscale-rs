@@ -223,13 +223,11 @@ pub enum Event {
         results: Vec<(Hash, ExecutionResult)>,
     },
 
-    /// Cross-shard transaction execution completed.
+    /// Cross-shard transaction execution completed (batch).
     ///
-    /// Callback from `Action::ExecuteCrossShardTransaction`.
-    CrossShardTransactionExecuted {
-        tx_hash: Hash,
-        result: ExecutionResult,
-    },
+    /// Callback from batched `Action::ExecuteCrossShardTransaction` actions.
+    /// The runner accumulates individual actions and executes them in parallel.
+    CrossShardTransactionsExecuted { results: Vec<ExecutionResult> },
 
     /// Merkle root computation completed.
     MerkleRootComputed { tx_hash: Hash, root: Hash },
@@ -517,7 +515,7 @@ impl Event {
             | Event::QcSignatureVerified { .. }
             | Event::TransactionsExecuted { .. }
             | Event::SpeculativeExecutionComplete { .. }
-            | Event::CrossShardTransactionExecuted { .. }
+            | Event::CrossShardTransactionsExecuted { .. }
             | Event::MerkleRootComputed { .. }
             | Event::StateEntriesFetched { .. }
             | Event::BlockFetched { .. }
@@ -622,7 +620,7 @@ impl Event {
             // Async Callbacks - Execution
             Event::TransactionsExecuted { .. } => "TransactionsExecuted",
             Event::SpeculativeExecutionComplete { .. } => "SpeculativeExecutionComplete",
-            Event::CrossShardTransactionExecuted { .. } => "CrossShardTransactionExecuted",
+            Event::CrossShardTransactionsExecuted { .. } => "CrossShardTransactionsExecuted",
             Event::MerkleRootComputed { .. } => "MerkleRootComputed",
 
             // Storage Callbacks

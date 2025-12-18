@@ -910,6 +910,9 @@ impl SimulationRunner {
                 // NOTE: Execution is READ-ONLY. State writes are collected in the results
                 // and committed later when TransactionCertificate is included in a block
                 // (via PersistTransactionCertificate handler).
+                //
+                // In simulation, we execute immediately and return as a batch of 1.
+                // Production runner batches multiple actions for parallel execution.
                 let storage = &self.node_storage[from as usize];
                 let executor = &self.node_executor[from as usize];
 
@@ -959,10 +962,13 @@ impl SimulationRunner {
                     }
                 };
 
+                // Return as batch event (production runner batches multiple actions)
                 self.schedule_event(
                     from,
                     self.now,
-                    Event::CrossShardTransactionExecuted { tx_hash, result },
+                    Event::CrossShardTransactionsExecuted {
+                        results: vec![result],
+                    },
                 );
             }
 

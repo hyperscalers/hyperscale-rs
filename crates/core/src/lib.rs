@@ -30,7 +30,7 @@ mod event;
 mod message;
 mod traits;
 
-pub use action::{Action, TransactionStatus};
+pub use action::{Action, CrossShardExecutionRequest, TransactionStatus};
 pub use event::{Event, EventPriority};
 pub use message::OutboundMessage;
 pub use traits::{StateMachine, SubStateMachine};

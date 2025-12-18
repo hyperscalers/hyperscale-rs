@@ -514,6 +514,8 @@ impl SimNode {
                 transaction,
                 provisions,
             } => {
+                // Execute single cross-shard transaction, return as batch of 1
+                // (production runner batches multiple actions for parallel execution)
                 let shard_id = self.state.shard().0;
                 let local_shard = self.state.shard();
                 let topology = self.state.topology();
@@ -528,7 +530,9 @@ impl SimNode {
                     is_local_node,
                 );
                 self.internal_queue
-                    .push_back(Event::CrossShardTransactionExecuted { tx_hash, result });
+                    .push_back(Event::CrossShardTransactionsExecuted {
+                        results: vec![result],
+                    });
             }
 
             Action::ComputeMerkleRoot { tx_hash, .. } => {

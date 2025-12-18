@@ -86,6 +86,26 @@ impl PendingStateVotes {
     }
 }
 
+/// Pending cross-shard executions that can be batched.
+///
+/// Accumulates ExecuteCrossShardTransaction actions and executes them in parallel
+/// using rayon's par_iter for better throughput.
+#[derive(Default)]
+struct PendingCrossShardExecutions {
+    /// Cross-shard transactions waiting for execution.
+    requests: Vec<hyperscale_core::CrossShardExecutionRequest>,
+}
+
+impl PendingCrossShardExecutions {
+    fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+
+    fn take(&mut self) -> Vec<hyperscale_core::CrossShardExecutionRequest> {
+        std::mem::take(&mut self.requests)
+    }
+}
+
 /// Handle for shutting down a running ProductionRunner.
 ///
 /// When dropped, signals the runner to exit gracefully.
@@ -522,6 +542,8 @@ impl ProductionRunnerBuilder {
             shutdown_tx: Some(shutdown_tx),
             pending_state_votes: PendingStateVotes::default(),
             state_vote_deadline: None,
+            pending_cross_shard_executions: PendingCrossShardExecutions::default(),
+            cross_shard_execution_deadline: None,
         })
     }
 }
@@ -619,6 +641,11 @@ pub struct ProductionRunner {
     pending_state_votes: PendingStateVotes,
     /// Deadline for flushing pending state votes. None if no votes pending.
     state_vote_deadline: Option<tokio::time::Instant>,
+    /// Pending cross-shard executions accumulated for batch parallel execution.
+    /// Uses a short batching window (5ms) to balance latency vs throughput.
+    pending_cross_shard_executions: PendingCrossShardExecutions,
+    /// Deadline for flushing pending cross-shard executions. None if none pending.
+    cross_shard_execution_deadline: Option<tokio::time::Instant>,
 }
 
 impl ProductionRunner {
@@ -1063,6 +1090,22 @@ impl ProductionRunner {
                                         }
                                         self.pending_state_votes.votes.push((vote, public_key));
                                     }
+                                    Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
+                                        // Accumulate cross-shard executions for batch parallel execution
+                                        if self.pending_cross_shard_executions.is_empty() {
+                                            // Start the 5ms deadline on first cross-shard execution
+                                            self.cross_shard_execution_deadline = Some(
+                                                tokio::time::Instant::now() + Duration::from_millis(5)
+                                            );
+                                        }
+                                        self.pending_cross_shard_executions.requests.push(
+                                            hyperscale_core::CrossShardExecutionRequest {
+                                                tx_hash,
+                                                transaction,
+                                                provisions,
+                                            }
+                                        );
+                                    }
                                     other => {
                                         if let Err(e) = self.process_action(other).await {
                                             tracing::error!(error = ?e, "Error processing action");
@@ -1092,6 +1135,20 @@ impl ProductionRunner {
                                                 );
                                             }
                                             self.pending_state_votes.votes.push((vote, public_key));
+                                        }
+                                        Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
+                                            if self.pending_cross_shard_executions.is_empty() {
+                                                self.cross_shard_execution_deadline = Some(
+                                                    tokio::time::Instant::now() + Duration::from_millis(5)
+                                                );
+                                            }
+                                            self.pending_cross_shard_executions.requests.push(
+                                                hyperscale_core::CrossShardExecutionRequest {
+                                                    tx_hash,
+                                                    transaction,
+                                                    provisions,
+                                                }
+                                            );
                                         }
                                         other => {
                                             if let Err(e) = self.process_action(other).await {
@@ -1130,6 +1187,20 @@ impl ProductionRunner {
                                                             );
                                                         }
                                                         self.pending_state_votes.votes.push((vote, public_key));
+                                                    }
+                                                    Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
+                                                        if self.pending_cross_shard_executions.is_empty() {
+                                                            self.cross_shard_execution_deadline = Some(
+                                                                tokio::time::Instant::now() + Duration::from_millis(5)
+                                                            );
+                                                        }
+                                                        self.pending_cross_shard_executions.requests.push(
+                                                            hyperscale_core::CrossShardExecutionRequest {
+                                                                tx_hash,
+                                                                transaction,
+                                                                provisions,
+                                                            }
+                                                        );
                                                     }
                                                     other => {
                                                         if let Err(e) = self.process_action(other).await {
@@ -1181,6 +1252,28 @@ impl ProductionRunner {
                             "Flushing state vote batch after 20ms window"
                         );
                         self.dispatch_state_vote_verifications(votes);
+                    }
+                }
+
+                // CROSS-SHARD EXECUTION BATCHING: Flush accumulated executions when deadline expires.
+                // Uses a short batching window (5ms) to balance latency vs throughput.
+                // These are executed in parallel using rayon's par_iter.
+                _ = async {
+                    match self.cross_shard_execution_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.cross_shard_execution_deadline.is_some() => {
+                    let requests = self.pending_cross_shard_executions.take();
+                    let batch_size = requests.len();
+                    self.cross_shard_execution_deadline = None;
+
+                    if !requests.is_empty() {
+                        tracing::debug!(
+                            batch_size,
+                            "Flushing cross-shard execution batch after 5ms window"
+                        );
+                        self.dispatch_cross_shard_executions(requests);
                     }
                 }
 
@@ -1696,72 +1789,13 @@ impl ProductionRunner {
                 });
             }
 
-            // Cross-shard transaction execution with provisions
-            // NOTE: Execution is READ-ONLY. State writes are collected in the results
-            // and committed later when TransactionCertificate is included in a block.
-            Action::ExecuteCrossShardTransaction {
-                tx_hash,
-                transaction,
-                provisions,
-            } => {
-                let event_tx = self.callback_tx.clone();
-                let storage = self.storage.clone();
-                let executor = self.executor.clone();
-                let topology = self.topology.clone();
-                let local_shard = self.local_shard;
-
-                self.thread_pools.spawn_execution(move || {
-                    let start = std::time::Instant::now();
-                    // Determine which nodes are local to this shard
-                    let is_local_node = |node_id: &hyperscale_types::NodeId| -> bool {
-                        topology.shard_for_node_id(node_id) == local_shard
-                    };
-
-                    // Execute with provisions - RocksDB is internally thread-safe
-                    let result = match executor.execute_cross_shard(
-                        &*storage,
-                        &[transaction],
-                        &provisions,
-                        is_local_node,
-                    ) {
-                        Ok(output) => {
-                            if let Some(r) = output.results().first() {
-                                hyperscale_types::ExecutionResult {
-                                    transaction_hash: r.tx_hash,
-                                    success: r.success,
-                                    state_root: r.outputs_merkle_root,
-                                    writes: r.state_writes.clone(),
-                                    error: r.error.clone(),
-                                }
-                            } else {
-                                hyperscale_types::ExecutionResult {
-                                    transaction_hash: tx_hash,
-                                    success: false,
-                                    state_root: hyperscale_types::Hash::ZERO,
-                                    writes: vec![],
-                                    error: Some("No execution result".to_string()),
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(?tx_hash, error = %e, "Cross-shard execution failed");
-                            hyperscale_types::ExecutionResult {
-                                transaction_hash: tx_hash,
-                                success: false,
-                                state_root: hyperscale_types::Hash::ZERO,
-                                writes: vec![],
-                                error: Some(format!("{}", e)),
-                            }
-                        }
-                    };
-                    crate::metrics::record_execution_latency(start.elapsed().as_secs_f64());
-
-                    event_tx
-                        .send(Event::CrossShardTransactionExecuted { tx_hash, result })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
+            // Cross-shard transaction execution is handled by the event loop's batching mechanism.
+            // The ExecuteCrossShardTransaction action is accumulated and executed in parallel batches.
+            // See dispatch_cross_shard_executions() for the parallel execution implementation.
+            Action::ExecuteCrossShardTransaction { .. } => {
+                // This should never be reached - the action is intercepted in the event loop
+                // and accumulated for batch execution.
+                tracing::error!("ExecuteCrossShardTransaction reached process_action - should be handled by event loop batching");
             }
 
             // Merkle computation on execution pool (can be parallelized internally)
@@ -2349,6 +2383,100 @@ impl ProductionRunner {
                     "Batch verified state vote signatures (20ms window)"
                 );
             }
+        });
+    }
+
+    /// Dispatch cross-shard executions to the execution thread pool.
+    ///
+    /// Executes all transactions in parallel using rayon's par_iter for maximum throughput.
+    /// Each transaction is executed with its provisioned state from other shards.
+    /// Results are sent back as a single batch event.
+    fn dispatch_cross_shard_executions(
+        &self,
+        requests: Vec<hyperscale_core::CrossShardExecutionRequest>,
+    ) {
+        if requests.is_empty() {
+            return;
+        }
+
+        let event_tx = self.callback_tx.clone();
+        let storage = self.storage.clone();
+        let executor = self.executor.clone();
+        let topology = self.topology.clone();
+        let local_shard = self.local_shard;
+        let thread_pools = self.thread_pools.clone();
+        let batch_size = requests.len();
+
+        self.thread_pools.spawn_execution(move || {
+            let start = std::time::Instant::now();
+
+            // Execute all transactions in parallel using rayon.
+            // Each transaction gets its own storage snapshot for isolated execution.
+            // RocksDB snapshots are thread-safe and support concurrent reads.
+            let results: Vec<hyperscale_types::ExecutionResult> =
+                thread_pools.execution_pool().install(|| {
+                    use rayon::prelude::*;
+                    requests
+                        .par_iter()
+                        .map(|req| {
+                            // Determine which nodes are local to this shard
+                            let is_local_node =
+                                |node_id: &hyperscale_types::NodeId| -> bool {
+                                    topology.shard_for_node_id(node_id) == local_shard
+                                };
+
+                            match executor.execute_cross_shard(
+                                &*storage,
+                                &[req.transaction.clone()],
+                                &req.provisions,
+                                is_local_node,
+                            ) {
+                                Ok(output) => {
+                                    if let Some(r) = output.results().first() {
+                                        hyperscale_types::ExecutionResult {
+                                            transaction_hash: r.tx_hash,
+                                            success: r.success,
+                                            state_root: r.outputs_merkle_root,
+                                            writes: r.state_writes.clone(),
+                                            error: r.error.clone(),
+                                        }
+                                    } else {
+                                        hyperscale_types::ExecutionResult {
+                                            transaction_hash: req.tx_hash,
+                                            success: false,
+                                            state_root: hyperscale_types::Hash::ZERO,
+                                            writes: vec![],
+                                            error: Some("No execution result".to_string()),
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(tx_hash = ?req.tx_hash, error = %e, "Cross-shard execution failed");
+                                    hyperscale_types::ExecutionResult {
+                                        transaction_hash: req.tx_hash,
+                                        success: false,
+                                        state_root: hyperscale_types::Hash::ZERO,
+                                        writes: vec![],
+                                        error: Some(format!("{}", e)),
+                                    }
+                                }
+                            }
+                        })
+                        .collect()
+                });
+
+            crate::metrics::record_execution_latency(start.elapsed().as_secs_f64());
+
+            if batch_size > 1 {
+                tracing::debug!(
+                    batch_size,
+                    "Batch executed cross-shard transactions (5ms window)"
+                );
+            }
+
+            event_tx
+                .send(Event::CrossShardTransactionsExecuted { results })
+                .expect("callback channel closed - Loss of this event would cause a deadlock");
         });
     }
 

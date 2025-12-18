@@ -1002,6 +1002,7 @@ impl ExecutionState {
     /// Execute a cross-shard transaction with provisioned state (Phase 3).
     ///
     /// Emits `Action::ExecuteCrossShardTransaction` to delegate execution to the runner.
+    /// The runner accumulates these actions and executes them in parallel batches.
     /// When execution completes, `on_cross_shard_execution_complete` handles the result.
     fn execute_with_provisions(&mut self, tx: Arc<RoutableTransaction>) -> Vec<Action> {
         let tx_hash = tx.hash();
@@ -1015,7 +1016,7 @@ impl ExecutionState {
             .remove(&tx_hash)
             .unwrap_or_default();
 
-        // Delegate execution to the runner
+        // Delegate execution to the runner (which batches for parallel execution)
         vec![Action::ExecuteCrossShardTransaction {
             tx_hash,
             transaction: tx,
@@ -1055,6 +1056,23 @@ impl ExecutionState {
 
         // Handle our own vote
         actions.extend(self.handle_vote_internal(vote));
+
+        actions
+    }
+
+    /// Handle batch of cross-shard transaction execution completions.
+    ///
+    /// Called when the runner completes `Action::ExecuteCrossShardTransactions`.
+    /// Creates and broadcasts votes for each execution result.
+    pub fn on_cross_shard_executions_complete(
+        &mut self,
+        results: Vec<ExecutionResult>,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        for result in results {
+            actions.extend(self.on_cross_shard_execution_complete(result));
+        }
 
         actions
     }
@@ -2347,8 +2365,8 @@ impl SubStateMachine for ExecutionState {
                 block_hash,
                 results,
             } => Some(self.on_execution_complete(*block_hash, results.clone())),
-            Event::CrossShardTransactionExecuted { result, .. } => {
-                Some(self.on_cross_shard_execution_complete(result.clone()))
+            Event::CrossShardTransactionsExecuted { results } => {
+                Some(self.on_cross_shard_executions_complete(results.clone()))
             }
             Event::StateProvisionReceived { provision } => {
                 Some(self.on_provision(provision.clone()))
