@@ -751,10 +751,12 @@ impl SyncManager {
             .filter(|rep| rep.in_flight >= 2)
             .count();
 
-        // Check for desperation mode: all peers in cooldown (not banned) and we're far behind
+        // Check for desperation mode: all peers blocked (cooldown or max in-flight) and we're far behind
         let blocks_behind = self.blocks_behind();
         let all_in_cooldown =
             in_cooldown_count == same_shard_count && banned == 0 && at_max_inflight == 0;
+        let all_at_max_inflight =
+            at_max_inflight == same_shard_count && banned == 0 && in_cooldown_count == 0;
 
         if all_in_cooldown && blocks_behind >= self.config.desperation_threshold_blocks {
             warn!(
@@ -773,6 +775,32 @@ impl SyncManager {
             }
 
             // Now retry peer selection with reset cooldowns
+            return self.select_peer_inner(now);
+        }
+
+        // Desperation mode for stuck in-flight counters: if all peers are at max in-flight
+        // and we're far behind, reset in-flight counters. This handles cases where spawned
+        // fetch tasks hung or never reported results, leaving in_flight stuck.
+        if all_at_max_inflight && blocks_behind >= self.config.desperation_threshold_blocks {
+            warn!(
+                same_shard_peers = same_shard_count,
+                blocks_behind,
+                at_max_inflight,
+                "DESPERATION MODE: All peers at max in-flight but {} blocks behind - resetting in-flight counters",
+                blocks_behind
+            );
+
+            // Reset in-flight counters for all peers (they're clearly stuck)
+            for rep in self.peer_reputations.values_mut() {
+                if rep.banned_until.is_none() {
+                    rep.in_flight = 0;
+                }
+            }
+
+            // Also clear pending fetches since they're clearly orphaned
+            self.pending_fetches.clear();
+
+            // Now retry peer selection with reset in-flight
             return self.select_peer_inner(now);
         }
 
@@ -1157,6 +1185,8 @@ mod tests {
             let blocks_behind = self.blocks_behind();
             let all_in_cooldown =
                 in_cooldown_count == same_shard_count && banned == 0 && at_max_inflight == 0;
+            let all_at_max_inflight =
+                at_max_inflight == same_shard_count && banned == 0 && in_cooldown_count == 0;
 
             if all_in_cooldown && blocks_behind >= self.config.desperation_threshold_blocks {
                 // Reset cooldowns
@@ -1166,6 +1196,17 @@ mod tests {
                         rep.last_failure = None;
                     }
                 }
+                return self.select_peer_inner(now);
+            }
+
+            // Desperation mode for stuck in-flight counters
+            if all_at_max_inflight && blocks_behind >= self.config.desperation_threshold_blocks {
+                for rep in self.peer_reputations.values_mut() {
+                    if rep.banned_until.is_none() {
+                        rep.in_flight = 0;
+                    }
+                }
+                self.pending_fetches.clear();
                 return self.select_peer_inner(now);
             }
 
@@ -1732,6 +1773,69 @@ mod tests {
         for peer in [peer1, peer2, peer3] {
             let rep = mgr.peer_reputations.get(&peer).unwrap();
             assert_eq!(rep.failures, 0, "Cooldown should be reset for {:?}", peer);
+        }
+    }
+
+    #[test]
+    fn test_desperation_mode_for_stuck_in_flight() {
+        let mut mgr = create_test_sync_manager();
+        mgr.config.desperation_threshold_blocks = 10;
+
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        let peer3 = PeerId::random();
+        mgr.register_peer(peer1);
+        mgr.register_peer(peer2);
+        mgr.register_peer(peer3);
+
+        // Put all peers at max in-flight (simulating stuck counters)
+        for peer in [peer1, peer2, peer3] {
+            let rep = mgr.peer_reputations.get_mut(&peer).unwrap();
+            rep.in_flight = 2; // At max in-flight threshold
+        }
+
+        // 20 blocks behind
+        mgr.committed_height = 80;
+        mgr.start_sync(100, Hash::from_bytes(&[1u8; 32]));
+
+        // Should trigger desperation mode for in-flight and return a peer
+        let selected = mgr.select_peer();
+        assert!(selected.is_some());
+
+        // All in-flight counters should be reset
+        for peer in [peer1, peer2, peer3] {
+            let rep = mgr.peer_reputations.get(&peer).unwrap();
+            assert_eq!(rep.in_flight, 0, "In-flight should be reset for {:?}", peer);
+        }
+    }
+
+    #[test]
+    fn test_desperation_mode_for_in_flight_does_not_trigger_when_not_far_behind() {
+        let mut mgr = create_test_sync_manager();
+        mgr.config.desperation_threshold_blocks = 10;
+
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        mgr.register_peer(peer1);
+        mgr.register_peer(peer2);
+
+        // Put all peers at max in-flight
+        for peer in [peer1, peer2] {
+            let rep = mgr.peer_reputations.get_mut(&peer).unwrap();
+            rep.in_flight = 2;
+        }
+
+        // Only 5 blocks behind (below threshold of 10)
+        mgr.committed_height = 95;
+        mgr.start_sync(100, Hash::from_bytes(&[1u8; 32]));
+
+        // Should still return None (not desperate enough)
+        assert!(mgr.select_peer().is_none());
+
+        // In-flight counters should NOT be reset
+        for peer in [peer1, peer2] {
+            let rep = mgr.peer_reputations.get(&peer).unwrap();
+            assert_eq!(rep.in_flight, 2);
         }
     }
 
