@@ -810,6 +810,7 @@ mod tests {
             committed_certificates: vec![],
             deferred: vec![deferral],
             aborted: vec![],
+            commitment_proofs: std::collections::HashMap::new(),
         };
 
         state.on_block_committed(&block);
@@ -863,6 +864,7 @@ mod tests {
             committed_certificates: vec![std::sync::Arc::new(cert)],
             deferred: vec![],
             aborted: vec![],
+            commitment_proofs: std::collections::HashMap::new(),
         };
 
         state.on_block_committed(&block);

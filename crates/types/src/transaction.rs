@@ -1,9 +1,6 @@
 //! Transaction types for consensus.
 
-use crate::{
-    BlockHeight, CommitmentProof, CycleProof, Hash, NodeId, ShardGroupId, StateCertificate,
-    SubstateWrite,
-};
+use crate::{BlockHeight, CycleProof, Hash, NodeId, ShardGroupId, StateCertificate, SubstateWrite};
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
 use radix_transactions::validation::TransactionValidator;
@@ -29,17 +26,6 @@ pub struct RoutableTransaction {
     /// When a transaction is deferred due to a cross-shard cycle, it is retried
     /// with the same payload but different retry_details, giving it a new hash.
     pub retry_details: Option<RetryDetails>,
-
-    /// Proof that another shard committed this transaction.
-    ///
-    /// Set by the proposer when building blocks. Required when:
-    /// - System is at backpressure limit (1024+ cross-shard TXs in flight)
-    /// - Transaction is cross-shard
-    /// - Transaction is not already being tracked locally
-    ///
-    /// This proof demonstrates that another shard has already committed the
-    /// transaction, making cooperation mandatory regardless of backpressure limits.
-    pub commitment_proof: Option<CommitmentProof>,
 
     /// Cached hash (computed on first access).
     hash: Hash,
@@ -68,7 +54,6 @@ impl Clone for RoutableTransaction {
             declared_reads: self.declared_reads.clone(),
             declared_writes: self.declared_writes.clone(),
             retry_details: self.retry_details.clone(),
-            commitment_proof: self.commitment_proof.clone(),
             hash: self.hash,
             validated: OnceLock::new(), // Don't clone cache - will be recomputed if needed
         }
@@ -83,7 +68,6 @@ impl std::fmt::Debug for RoutableTransaction {
             .field("declared_reads", &self.declared_reads)
             .field("declared_writes", &self.declared_writes)
             .field("retry_details", &self.retry_details)
-            .field("commitment_proof", &self.commitment_proof.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -123,7 +107,6 @@ impl RoutableTransaction {
             declared_reads,
             declared_writes,
             retry_details,
-            commitment_proof: None, // Set later by proposer if needed
             hash,
             validated: OnceLock::new(),
         }
@@ -241,33 +224,6 @@ impl RoutableTransaction {
     pub fn is_retry(&self) -> bool {
         self.retry_details.is_some()
     }
-
-    /// Check if this transaction has a commitment proof attached.
-    pub fn has_commitment_proof(&self) -> bool {
-        self.commitment_proof.is_some()
-    }
-
-    /// Get the commitment proof if present.
-    pub fn commitment_proof(&self) -> Option<&CommitmentProof> {
-        self.commitment_proof.as_ref()
-    }
-
-    /// Attach a commitment proof to this transaction.
-    ///
-    /// Used by the proposer when building blocks to attach proofs for
-    /// cross-shard transactions that have provisions.
-    pub fn set_commitment_proof(&mut self, proof: CommitmentProof) {
-        self.commitment_proof = Some(proof);
-    }
-
-    /// Create a copy of this transaction with a commitment proof attached.
-    ///
-    /// Returns a new transaction with the same hash but with the proof attached.
-    pub fn with_commitment_proof(&self, proof: CommitmentProof) -> Self {
-        let mut clone = self.clone();
-        clone.commitment_proof = Some(proof);
-        clone
-    }
 }
 
 // ============================================================================
@@ -282,7 +238,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(6)?; // 6 fields
+        encoder.write_size(5)?; // 5 fields
 
         // Encode hash as [u8; 32]
         let hash_bytes: [u8; 32] = *self.hash.as_bytes();
@@ -302,9 +258,6 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         // Encode retry_details
         encoder.encode(&self.retry_details)?;
 
-        // Encode commitment_proof
-        encoder.encode(&self.commitment_proof)?;
-
         Ok(())
     }
 }
@@ -319,9 +272,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 6 {
+        if length != 5 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 6,
+                expected: 5,
                 actual: length,
             });
         }
@@ -344,16 +297,12 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         // Decode retry_details
         let retry_details: Option<RetryDetails> = decoder.decode()?;
 
-        // Decode commitment_proof
-        let commitment_proof: Option<CommitmentProof> = decoder.decode()?;
-
         Ok(Self {
             hash,
             transaction,
             declared_reads,
             declared_writes,
             retry_details,
-            commitment_proof,
             validated: OnceLock::new(),
         })
     }

@@ -786,6 +786,7 @@ impl ProductionRunner {
             committed_certificates: vec![],
             deferred: vec![],
             aborted: vec![],
+            commitment_proofs: std::collections::HashMap::new(),
         };
 
         let genesis_hash = genesis_block.hash();

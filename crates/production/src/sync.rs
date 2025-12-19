@@ -2063,6 +2063,7 @@ mod tests {
             committed_certificates: vec![],
             deferred: vec![],
             aborted: vec![],
+            commitment_proofs: std::collections::HashMap::new(),
         }
     }
 

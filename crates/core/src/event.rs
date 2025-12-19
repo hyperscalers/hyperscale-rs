@@ -63,6 +63,8 @@ pub enum Event {
         deferred: Vec<TransactionDefer>,
         /// Aborted transactions in this block.
         aborted: Vec<TransactionAbort>,
+        /// Commitment proofs for priority transaction ordering.
+        commitment_proofs: std::collections::HashMap<Hash, CommitmentProof>,
     },
 
     /// Received a vote on a block header.

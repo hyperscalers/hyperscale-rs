@@ -123,6 +123,7 @@ pub fn decode_message(topic: &str, data: &[u8]) -> Result<DecodedMessage, CodecE
                     cert_hashes: gossip.certificate_hashes,
                     deferred: gossip.deferred,
                     aborted: gossip.aborted,
+                    commitment_proofs: gossip.commitment_proofs,
                 }],
                 trace_context: None,
             })
@@ -223,6 +224,7 @@ mod tests {
     use hyperscale_types::{
         BlockHeader, BlockHeight, BlockVote, Hash, QuorumCertificate, Signature, ValidatorId,
     };
+    use std::collections::HashMap;
 
     fn make_block_header() -> BlockHeader {
         BlockHeader {
@@ -245,6 +247,7 @@ mod tests {
             certificate_hashes: vec![],
             deferred: vec![],
             aborted: vec![],
+            commitment_proofs: HashMap::new(),
         };
         let message = OutboundMessage::BlockHeader(Box::new(gossip));
 
@@ -325,6 +328,7 @@ mod tests {
             certificate_hashes: vec![],
             deferred: vec![],
             aborted: vec![],
+            commitment_proofs: HashMap::new(),
         };
         let message = OutboundMessage::BlockHeader(Box::new(gossip));
 

@@ -403,10 +403,14 @@ impl ProvisionCoordinator {
     ///
     /// Used by backpressure: if true, another shard has committed,
     /// so we must cooperate regardless of limits.
+    ///
+    /// This must be consistent with `build_commitment_proof` - if this returns true,
+    /// then `build_commitment_proof` must return Some. We check that at least one
+    /// shard has a non-empty provisions Vec.
     pub fn has_any_verified_provisions(&self, tx_hash: &Hash) -> bool {
         self.verified_provisions
             .get(tx_hash)
-            .map(|by_shard| !by_shard.is_empty())
+            .map(|by_shard| by_shard.values().any(|provisions| !provisions.is_empty()))
             .unwrap_or(false)
     }
 

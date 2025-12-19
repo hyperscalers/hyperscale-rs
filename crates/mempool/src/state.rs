@@ -1368,6 +1368,7 @@ mod tests {
             committed_certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
+            commitment_proofs: std::collections::HashMap::new(),
         }
     }
 

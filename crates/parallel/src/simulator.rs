@@ -913,6 +913,7 @@ impl ParallelSimulator {
                 committed_certificates: vec![],
                 deferred: vec![],
                 aborted: vec![],
+                commitment_proofs: std::collections::HashMap::new(),
             };
 
             let shard_start = shard_id * self.config.validators_per_shard;
@@ -1052,6 +1053,7 @@ impl ParallelSimulator {
                 committed_certificates: vec![],
                 deferred: vec![],
                 aborted: vec![],
+                commitment_proofs: std::collections::HashMap::new(),
             };
 
             let shard_start = shard_id * self.config.validators_per_shard;

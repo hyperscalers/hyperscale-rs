@@ -399,6 +399,7 @@ impl SimulationRunner {
                 committed_certificates: vec![],
                 deferred: vec![],
                 aborted: vec![],
+                commitment_proofs: std::collections::HashMap::new(),
             };
 
             // Initialize all validators in this shard
@@ -484,6 +485,7 @@ impl SimulationRunner {
                 committed_certificates: vec![],
                 deferred: vec![],
                 aborted: vec![],
+                commitment_proofs: std::collections::HashMap::new(),
             };
 
             // Initialize all validators in this shard
