@@ -862,14 +862,19 @@ impl ProductionRunner {
             // Use biased select for priority ordering:
             // 1. Shutdown (always first)
             // 2. Timers (Critical priority - dedicated channel, never blocked by network)
-            // 3. Callbacks (Internal priority - crypto/execution results that unblock consensus)
-            // 4. Consensus (Network priority - BFT messages from network)
-            // 5. Transaction fetch requests (needed for active consensus)
-            // 6. Certificate fetch requests (needed for active consensus)
-            // 7. Transactions (Client priority - submissions, gossip)
-            // 8. Sync requests (background)
-            // 9. Status events (non-critical)
-            // 10. Ticks (periodic maintenance)
+            // 3. Fetch requests (Critical - unblocks OTHER validators' consensus, quick O(1) lookups)
+            // 4. Callbacks (Internal priority - crypto/execution results that unblock our consensus)
+            // 5. Consensus (Network priority - BFT messages from network)
+            // 6. Transactions (Client priority - submissions, gossip)
+            // 7. Sync requests (background)
+            // 8. Status events (non-critical)
+            // 9. Ticks (periodic maintenance)
+            //
+            // Rationale for fetch > callbacks:
+            // - Fetch handlers are O(1) hashmap lookups, very fast
+            // - Callbacks can trigger complex state machine transitions
+            // - Delayed fetch responses block OTHER validators from voting
+            // - Our callbacks only affect our own progress, not the network
             tokio::select! {
                 biased;
 
@@ -1004,10 +1009,40 @@ impl ProductionRunner {
                     }
                 }
 
-                // HIGHEST PRIORITY: Callback events (Internal priority)
-                // These are results from crypto verification and execution that unblock
-                // in-flight consensus work. Process ALL available callbacks before
-                // checking other channels to ensure consensus makes progress.
+                // CRITICAL PRIORITY: Handle inbound fetch requests from peers
+                // These must be processed quickly to unblock OTHER validators' consensus.
+                // A peer waiting for our certificates/transactions can't vote until we respond.
+                // These are O(1) hashmap lookups - very fast, won't block the loop.
+                Some(request) = self.cert_request_rx.recv() => {
+                    let cert_span = span!(
+                        Level::DEBUG,
+                        "handle_cert_request",
+                        peer = %request.peer,
+                        block_hash = ?request.block_hash,
+                        cert_count = request.cert_hashes.len(),
+                        channel_id = request.channel_id,
+                    );
+                    let _cert_guard = cert_span.enter();
+
+                    self.handle_inbound_certificate_request(request);
+                }
+
+                Some(request) = self.tx_request_rx.recv() => {
+                    let tx_span = span!(
+                        Level::DEBUG,
+                        "handle_tx_request",
+                        peer = %request.peer,
+                        block_hash = ?request.block_hash,
+                        tx_count = request.tx_hashes.len(),
+                        channel_id = request.channel_id,
+                    );
+                    let _tx_guard = tx_span.enter();
+
+                    self.handle_inbound_transaction_request(request);
+                }
+
+                // HIGH PRIORITY: Callback events (crypto/execution results)
+                // These unblock our own in-flight consensus work.
                 //
                 // IMPORTANT: ProvisioningComplete events come through this channel and
                 // produce ExecuteCrossShardTransaction actions. These must be accumulated
@@ -1341,38 +1376,6 @@ impl ProductionRunner {
                     if !self.tx_validation_handle.submit(tx) {
                         tracing::debug!("RPC transaction deduplicated or batcher closed");
                     }
-                }
-
-                // Handle inbound transaction fetch requests from peers
-                // These are needed for active consensus, so process before sync
-                Some(request) = self.tx_request_rx.recv() => {
-                    let tx_span = span!(
-                        Level::DEBUG,
-                        "handle_tx_request",
-                        peer = %request.peer,
-                        block_hash = ?request.block_hash,
-                        tx_count = request.tx_hashes.len(),
-                        channel_id = request.channel_id,
-                    );
-                    let _tx_guard = tx_span.enter();
-
-                    self.handle_inbound_transaction_request(request);
-                }
-
-                // Handle inbound certificate fetch requests from peers
-                // These are needed for active consensus, so process before sync
-                Some(request) = self.cert_request_rx.recv() => {
-                    let cert_span = span!(
-                        Level::DEBUG,
-                        "handle_cert_request",
-                        peer = %request.peer,
-                        block_hash = ?request.block_hash,
-                        cert_count = request.cert_hashes.len(),
-                        channel_id = request.channel_id,
-                    );
-                    let _cert_guard = cert_span.enter();
-
-                    self.handle_inbound_certificate_request(request);
                 }
 
                 // Handle inbound sync requests from peers
