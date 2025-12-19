@@ -1002,47 +1002,44 @@ impl MempoolState {
         let at_soft_limit = self.at_in_flight_limit();
         let at_hard_limit = self.at_in_flight_hard_limit();
 
-        // First group: Cross-shard TXs with verified provisions (priority)
-        // These should be processed since another shard has already committed.
-        // HOWEVER: at the hard limit, even these are delayed to prevent unbounded growth.
-        let with_provisions: Vec<_> = if at_hard_limit {
-            // At hard limit: no TXs at all
-            vec![]
-        } else {
-            self.pool
-                .values()
-                .filter(|e| e.status == TransactionStatus::Pending)
-                .filter(|e| !self.conflicts_with_locked(&e.tx))
-                .filter(|e| e.cross_shard && provisions.has_any_verified_provisions(&e.tx.hash()))
-                .map(|e| Arc::clone(&e.tx))
-                .collect()
-        };
+        // At hard limit: no TXs at all
+        if at_hard_limit {
+            return vec![];
+        }
 
-        // Second group: All other eligible TXs (single-shard + cross-shard without provisions)
-        // These are subject to backpressure at the soft limit.
-        let others: Vec<_> = if at_soft_limit {
-            // At soft limit: only TXs with provisions allowed (first group)
-            vec![]
-        } else {
-            self.pool
-                .values()
-                .filter(|e| e.status == TransactionStatus::Pending)
-                .filter(|e| !self.conflicts_with_locked(&e.tx))
-                .filter(|e| {
-                    // Not in the first group
-                    !(e.cross_shard && provisions.has_any_verified_provisions(&e.tx.hash()))
-                })
-                .map(|e| Arc::clone(&e.tx))
-                .collect()
-        };
+        // Single pass through pool, partitioning into priority and others.
+        // Priority: cross-shard TXs with verified provisions (bypass soft limit)
+        // Others: everything else (subject to soft limit)
+        let mut with_provisions = Vec::new();
+        let mut others = Vec::new();
+
+        for entry in self.pool.values() {
+            // Skip non-pending or conflicting transactions
+            if entry.status != TransactionStatus::Pending {
+                continue;
+            }
+            if self.conflicts_with_locked(&entry.tx) {
+                continue;
+            }
+
+            // Check if this is a priority TX (cross-shard with provisions)
+            let is_priority =
+                entry.cross_shard && provisions.has_any_verified_provisions(&entry.tx.hash());
+
+            if is_priority {
+                with_provisions.push(Arc::clone(&entry.tx));
+            } else if !at_soft_limit {
+                // Only collect non-priority TXs if not at soft limit
+                others.push(Arc::clone(&entry.tx));
+            }
+        }
 
         // Combine: priority TXs first, then others, respecting max_count
         // Both groups are already in hash order (BTreeMap iteration)
-        let mut result = with_provisions;
-        let remaining = max_count.saturating_sub(result.len());
-        result.extend(others.into_iter().take(remaining));
+        let remaining = max_count.saturating_sub(with_provisions.len());
+        with_provisions.extend(others.into_iter().take(remaining));
 
-        result
+        with_provisions
     }
 
     /// Get lock contention statistics.
