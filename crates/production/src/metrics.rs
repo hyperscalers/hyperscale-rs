@@ -102,6 +102,7 @@ pub struct Metrics {
     pub fetch_completed: CounterVec,
     pub fetch_failed: CounterVec,
     pub fetch_items_received: CounterVec,
+    pub fetch_items_sent: CounterVec,
     pub fetch_latency: HistogramVec,
     pub fetch_in_flight: Gauge,
 
@@ -452,6 +453,13 @@ impl Metrics {
             fetch_items_received: register_counter_vec!(
                 "hyperscale_fetch_items_received_total",
                 "Total items (transactions/certificates) received via fetch",
+                &["kind"]
+            )
+            .unwrap(),
+
+            fetch_items_sent: register_counter_vec!(
+                "hyperscale_fetch_items_sent_total",
+                "Total items (transactions/certificates) sent in response to fetch requests",
                 &["kind"]
             )
             .unwrap(),
@@ -916,4 +924,14 @@ pub fn record_fetch_latency(kind: crate::fetch::FetchKind, latency: std::time::D
 /// Update the number of in-flight fetch requests.
 pub fn set_fetch_in_flight(count: usize) {
     metrics().fetch_in_flight.set(count as f64);
+}
+
+/// Record items sent in response to a fetch request.
+///
+/// Called by the fetch handler when responding to inbound fetch requests.
+pub fn record_fetch_response_sent(kind: &str, count: usize) {
+    metrics()
+        .fetch_items_sent
+        .with_label_values(&[kind])
+        .inc_by(count as f64);
 }

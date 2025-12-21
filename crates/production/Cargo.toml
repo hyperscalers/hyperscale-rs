@@ -49,6 +49,9 @@ tokio.workspace = true
 rayon.workspace = true
 parking_lot = "0.12"
 
+# Lock-free concurrent data structures
+dashmap = "5.5"
+
 # OpenTelemetry for distributed tracing
 opentelemetry = "0.31.0"
 opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }

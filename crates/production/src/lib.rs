@@ -71,11 +71,13 @@
 //! ```
 
 mod fetch;
+mod fetch_handler;
 mod message_batcher;
 pub mod metrics;
 pub mod network;
 pub mod rpc;
 mod runner;
+mod shared_state;
 mod storage;
 mod sync;
 pub mod sync_error;
