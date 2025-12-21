@@ -1,6 +1,7 @@
 //! Shared state types for RPC handlers.
 
 use crate::sync::SyncStatus;
+use crate::tx_ingress::TxIngressHandle;
 use hyperscale_core::TransactionStatus;
 use hyperscale_types::{Hash, RoutableTransaction};
 use std::collections::HashMap;
@@ -34,6 +35,11 @@ pub struct RpcState {
     pub tx_status_cache: Arc<RwLock<TransactionStatusCache>>,
     /// Mempool snapshot for querying mempool stats.
     pub mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
+    /// Optional semaphore-based transaction ingress handle.
+    ///
+    /// When set, provides lock-free backpressure for transaction submission.
+    /// Falls back to mempool_snapshot check if not set.
+    pub tx_ingress: Option<TxIngressHandle>,
 }
 
 /// Cached transaction status entry.

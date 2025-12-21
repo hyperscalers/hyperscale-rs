@@ -1,5 +1,9 @@
 //! Production runner implementation.
 
+use crate::action_dispatcher::{
+    spawn_action_dispatcher, ActionDispatcherConfig, ActionDispatcherContext,
+    ActionDispatcherHandle, DispatchableAction,
+};
 use crate::fetch_handler::{spawn_fetch_handler, FetchHandlerConfig, FetchHandlerHandle};
 use crate::network::{
     compute_peer_id_for_validator, InboundSyncRequest, Libp2pAdapter, Libp2pConfig, NetworkError,
@@ -515,6 +519,17 @@ impl ProductionRunnerBuilder {
             cert_request_rx,
         );
 
+        // Spawn action dispatcher task for fire-and-forget network I/O.
+        // Network broadcasts are moved off the event loop to prevent blocking.
+        let action_dispatcher = spawn_action_dispatcher(
+            ActionDispatcherConfig::default(),
+            ActionDispatcherContext {
+                network: network.clone(),
+                message_batcher: message_batcher.clone(),
+            },
+        );
+        let dispatch_tx = action_dispatcher.tx.clone();
+
         Ok(ProductionRunner {
             timer_rx,
             callback_rx,
@@ -553,6 +568,8 @@ impl ProductionRunnerBuilder {
             message_batcher,
             shared_state,
             fetch_handler,
+            dispatch_tx,
+            action_dispatcher,
         })
     }
 }
@@ -653,6 +670,8 @@ pub struct ProductionRunner {
     cross_shard_execution_deadline: Option<tokio::time::Instant>,
     /// Message batcher for execution layer messages (votes, certificates, provisions).
     /// Accumulates items and flushes periodically to reduce network overhead.
+    /// Note: Now primarily used by action dispatcher, kept here for direct access if needed.
+    #[allow(dead_code)]
     message_batcher: crate::message_batcher::MessageBatcherHandle,
     /// Shared read-only state for lock-free fetch responses.
     /// The fetch handler task reads from this without blocking the main event loop.
@@ -661,6 +680,12 @@ pub struct ProductionRunner {
     /// Processes inbound fetch requests from other validators.
     #[allow(dead_code)]
     fetch_handler: FetchHandlerHandle,
+    /// Sender for dispatching fire-and-forget actions to the action dispatcher task.
+    /// Network broadcasts, timer management, and non-critical writes go through this.
+    dispatch_tx: mpsc::Sender<DispatchableAction>,
+    /// Handle for the dedicated action dispatcher task.
+    #[allow(dead_code)]
+    action_dispatcher: ActionDispatcherHandle,
 }
 
 impl ProductionRunner {
@@ -1431,35 +1456,71 @@ impl ProductionRunner {
     #[instrument(skip(self, action), fields(action.type = %action.type_name()))]
     async fn process_action(&mut self, action: Action) -> Result<(), RunnerError> {
         match action {
-            // Network I/O - broadcast via gossipsub topics
+            // Network I/O - dispatch to action dispatcher task (fire-and-forget)
+            // This prevents network latency from blocking the event loop.
             Action::BroadcastToShard { shard, mut message } => {
                 // Inject trace context for cross-shard messages (no-op if feature disabled)
                 message.inject_trace_context();
 
-                self.network.broadcast_shard(shard, &message).await?;
-                tracing::debug!(?shard, msg_type = message.type_name(), "Broadcast to shard");
+                // Dispatch to action dispatcher - non-blocking
+                if let Err(e) = self
+                    .dispatch_tx
+                    .try_send(DispatchableAction::BroadcastToShard { shard, message })
+                {
+                    // Channel full or closed - fall back to direct send (blocking)
+                    tracing::warn!(
+                        "Action dispatch channel full, falling back to blocking broadcast"
+                    );
+                    if let DispatchableAction::BroadcastToShard { shard, message } = e.into_inner()
+                    {
+                        self.network.broadcast_shard(shard, &message).await?;
+                    }
+                }
             }
 
             Action::BroadcastGlobal { mut message } => {
                 // Inject trace context for cross-shard messages (no-op if feature disabled)
                 message.inject_trace_context();
 
-                self.network.broadcast_global(&message).await?;
-                tracing::debug!(msg_type = message.type_name(), "Broadcast globally");
+                // Dispatch to action dispatcher - non-blocking
+                if let Err(e) = self
+                    .dispatch_tx
+                    .try_send(DispatchableAction::BroadcastGlobal { message })
+                {
+                    // Channel full or closed - fall back to direct send (blocking)
+                    tracing::warn!(
+                        "Action dispatch channel full, falling back to blocking broadcast"
+                    );
+                    if let DispatchableAction::BroadcastGlobal { message } = e.into_inner() {
+                        self.network.broadcast_global(&message).await?;
+                    }
+                }
             }
 
-            // Domain-specific execution broadcasts - queued to message batcher
+            // Domain-specific execution broadcasts - dispatch to action dispatcher
             // The batcher accumulates items and flushes periodically to reduce network overhead.
             Action::BroadcastStateVote { shard, vote } => {
-                self.message_batcher.queue_vote(shard, vote);
+                let _ = self
+                    .dispatch_tx
+                    .try_send(DispatchableAction::QueueStateVote { shard, vote });
             }
 
             Action::BroadcastStateCertificate { shard, certificate } => {
-                self.message_batcher.queue_certificate(shard, certificate);
+                let _ = self
+                    .dispatch_tx
+                    .try_send(DispatchableAction::QueueStateCertificate { shard, certificate });
             }
 
             Action::BroadcastStateProvision { shard, provision } => {
-                self.message_batcher.queue_provision(shard, provision);
+                let _ = self
+                    .dispatch_tx
+                    .try_send(DispatchableAction::QueueStateProvision { shard, provision });
+            }
+
+            Action::PublishCertificateForFetch { certificate } => {
+                // Add certificate to SharedReadState for fetch handler.
+                // This enables peers to fetch certificates before block commit.
+                self.shared_state.insert_certificate(Arc::new(certificate));
             }
 
             // Timers via timer manager
@@ -2010,22 +2071,33 @@ impl ProductionRunner {
                 .ok();
             }
 
-            Action::PersistOwnVote {
+            Action::PersistAndBroadcastVote {
                 height,
                 round,
                 block_hash,
+                shard,
+                message,
             } => {
                 // **BFT Safety Critical**: Must persist before broadcasting vote
-                // Prevents equivocation after crash/restart
+                // Prevents equivocation after crash/restart.
+                //
+                // Fire-and-forget pattern with callback:
+                // 1. Spawn blocking task for RocksDB write
+                // 2. After persist completes, dispatch broadcast to action dispatcher
+                // 3. Main event loop continues immediately (no blocking)
                 let storage = self.storage.clone();
+                let dispatch_tx = self.dispatch_tx.clone();
 
-                // Use spawn_blocking since we need sync writes for BFT safety
-                // We await completion to ensure vote is persisted before returning
                 tokio::task::spawn_blocking(move || {
+                    // Persist vote (sync write with WAL)
                     storage.put_own_vote(height.0, round, block_hash);
-                })
-                .await
-                .ok();
+
+                    // After persist completes, send broadcast to action dispatcher
+                    // This ensures persist-before-broadcast ordering without blocking the event loop
+                    let _ = dispatch_tx
+                        .try_send(DispatchableAction::BroadcastToShard { shard, message });
+                });
+                // Note: No .await - we don't block the event loop
             }
 
             // ═══════════════════════════════════════════════════════════════════════

@@ -76,6 +76,14 @@ pub struct Metrics {
     /// Depth of the inbound certificate fetch request channel.
     pub cert_request_channel_depth: Gauge,
 
+    // === Transaction Ingress ===
+    /// Available permits in the transaction ingress semaphore.
+    pub tx_ingress_available_permits: Gauge,
+    /// Total transactions submitted through ingress.
+    pub tx_ingress_submitted: Counter,
+    /// Total transactions rejected due to backpressure.
+    pub tx_ingress_rejected: Counter,
+
     // === Storage ===
     pub rocksdb_read_latency: Histogram,
     pub rocksdb_write_latency: Histogram,
@@ -326,6 +334,25 @@ impl Metrics {
             cert_request_channel_depth: register_gauge!(
                 "hyperscale_cert_request_channel_depth",
                 "Depth of inbound certificate fetch request channel"
+            )
+            .unwrap(),
+
+            // Transaction Ingress
+            tx_ingress_available_permits: register_gauge!(
+                "hyperscale_tx_ingress_available_permits",
+                "Available permits in transaction ingress semaphore"
+            )
+            .unwrap(),
+
+            tx_ingress_submitted: register_counter!(
+                "hyperscale_tx_ingress_submitted_total",
+                "Total transactions submitted through ingress"
+            )
+            .unwrap(),
+
+            tx_ingress_rejected: register_counter!(
+                "hyperscale_tx_ingress_rejected_total",
+                "Total transactions rejected due to backpressure"
             )
             .unwrap(),
 
@@ -627,6 +654,21 @@ pub fn set_channel_depths(depths: &ChannelDepths) {
     m.sync_request_channel_depth.set(depths.sync_request as f64);
     m.tx_request_channel_depth.set(depths.tx_request as f64);
     m.cert_request_channel_depth.set(depths.cert_request as f64);
+}
+
+/// Update transaction ingress metrics.
+pub fn set_tx_ingress_available_permits(count: usize) {
+    metrics().tx_ingress_available_permits.set(count as f64);
+}
+
+/// Record a successful transaction ingress submission.
+pub fn record_tx_ingress_submitted() {
+    metrics().tx_ingress_submitted.inc();
+}
+
+/// Record a rejected transaction due to backpressure.
+pub fn record_tx_ingress_rejected() {
+    metrics().tx_ingress_rejected.inc();
 }
 
 /// Record RocksDB read latency.

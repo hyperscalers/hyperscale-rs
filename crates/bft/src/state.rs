@@ -1646,18 +1646,15 @@ impl BftState {
         // **BFT Safety Critical**: Persist the vote BEFORE broadcasting.
         // If we crash after broadcasting but before persisting, we could vote
         // for a different block at this height after restart (equivocation).
-        // The persist action should be handled synchronously by the runner.
-        let mut actions = vec![
-            Action::PersistOwnVote {
-                height: BlockHeight(height),
-                round,
-                block_hash,
-            },
-            Action::BroadcastToShard {
-                shard: self.local_shard(),
-                message: OutboundMessage::BlockVote(gossip),
-            },
-        ];
+        // Using the combined action allows the runner to optimize the flow
+        // while guaranteeing persist-before-broadcast ordering.
+        let mut actions = vec![Action::PersistAndBroadcastVote {
+            height: BlockHeight(height),
+            round,
+            block_hash,
+            shard: self.local_shard(),
+            message: OutboundMessage::BlockVote(gossip),
+        }];
 
         // Also process our own vote locally
         actions.extend(self.on_block_vote_internal(vote));
@@ -4281,11 +4278,11 @@ mod tests {
         // Now simulate QC signature verified successfully
         let actions = state.on_qc_signature_verified(block_hash, true);
 
-        // Should produce a vote (broadcast)
-        let has_broadcast = actions
+        // Should produce a vote (PersistAndBroadcastVote)
+        let has_vote = actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastToShard { .. }));
-        assert!(has_broadcast, "Should broadcast vote after QC verified");
+            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
+        assert!(has_vote, "Should broadcast vote after QC verified");
     }
 
     #[test]
@@ -4434,11 +4431,11 @@ mod tests {
             .any(|a| matches!(a, Action::VerifyQcSignature { .. }));
         assert!(!has_verify_qc, "Genesis QC should skip verification");
 
-        // Should directly vote (broadcast)
-        let has_broadcast = actions
+        // Should directly vote (PersistAndBroadcastVote)
+        let has_vote = actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastToShard { .. }));
-        assert!(has_broadcast, "Should vote directly for genesis QC block");
+            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
+        assert!(has_vote, "Should vote directly for genesis QC block");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -5791,15 +5788,9 @@ mod tests {
         }
 
         // Should have vote action (we vote for our own fallback)
-        let has_vote = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockVote(_),
-                    ..
-                }
-            )
-        });
+        let has_vote = actions
+            .iter()
+            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
         assert!(has_vote, "Should vote for own fallback block");
     }
 
@@ -5866,15 +5857,9 @@ mod tests {
         }
 
         // Should also have a vote action (we vote for our own fallback block)
-        let has_vote = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockVote(_),
-                    ..
-                }
-            )
-        });
+        let has_vote = actions
+            .iter()
+            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
         assert!(has_vote, "Should create vote for own fallback block");
     }
 
@@ -6480,12 +6465,12 @@ mod tests {
             "Second block with same parent QC should skip verification"
         );
 
-        // Should emit vote-related actions instead (broadcast)
-        let has_broadcast = actions2
+        // Should emit vote-related actions instead (PersistAndBroadcastVote)
+        let has_vote = actions2
             .iter()
-            .any(|a| matches!(a, Action::BroadcastToShard { .. }));
+            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
         assert!(
-            has_broadcast,
+            has_vote,
             "Should proceed directly to voting when QC already verified"
         );
     }

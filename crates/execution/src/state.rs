@@ -1550,6 +1550,14 @@ impl ExecutionState {
                     "TransactionCertificate created successfully"
                 );
 
+                // Publish certificate for fetch requests BEFORE storing locally.
+                // This fixes the chicken-and-egg problem where peers couldn't fetch
+                // certificates until after block commit, but blocks couldn't commit
+                // without the certificates.
+                actions.push(Action::PublishCertificateForFetch {
+                    certificate: tx_cert.clone(),
+                });
+
                 self.finalized_certificates
                     .insert(tx_hash, Arc::new(tx_cert));
 

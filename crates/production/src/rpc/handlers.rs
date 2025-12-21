@@ -137,8 +137,22 @@ pub async fn submit_transaction_handler(
     State(state): State<RpcState>,
     Json(request): Json<SubmitTransactionRequest>,
 ) -> impl IntoResponse {
-    // Check mempool capacity first (backpressure)
-    {
+    // Check backpressure using semaphore (lock-free) if available,
+    // otherwise fall back to mempool snapshot (requires lock)
+    if let Some(ref ingress) = state.tx_ingress {
+        // Lock-free check via semaphore
+        if ingress.is_backpressured() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(SubmitTransactionResponse {
+                    accepted: false,
+                    hash: String::new(),
+                    error: Some("Transaction limit reached. Try again later.".to_string()),
+                }),
+            );
+        }
+    } else {
+        // Legacy path: check mempool capacity (requires lock)
         let snapshot = state.mempool_snapshot.read().await;
         if !snapshot.accepting_rpc_transactions {
             return (
@@ -187,7 +201,35 @@ pub async fn submit_transaction_handler(
     let hash = hex::encode(transaction.hash().as_bytes());
     let tx_arc = Arc::new(transaction);
 
-    // Submit to runner via channel
+    // Try semaphore-based submission if available
+    if let Some(ref ingress) = state.tx_ingress {
+        match ingress.try_submit(Arc::clone(&tx_arc)) {
+            Ok(()) => {
+                // Successfully submitted with permit
+                return (
+                    StatusCode::ACCEPTED,
+                    Json(SubmitTransactionResponse {
+                        accepted: true,
+                        hash,
+                        error: None,
+                    }),
+                );
+            }
+            Err(_rejected_tx) => {
+                // Backpressure active (race between check and submit)
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(SubmitTransactionResponse {
+                        accepted: false,
+                        hash,
+                        error: Some("Transaction limit reached. Try again later.".to_string()),
+                    }),
+                );
+            }
+        }
+    }
+
+    // Legacy path: submit to runner via unbounded channel
     // The runner will:
     // 1. Gossip to all relevant shards (RPC submissions need gossip)
     // 2. Submit to batcher for validation
@@ -378,6 +420,7 @@ mod tests {
             start_time: Instant::now(),
             tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
+            tx_ingress: None, // Tests use legacy path
         }
     }
 

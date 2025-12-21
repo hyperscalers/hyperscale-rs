@@ -70,6 +70,7 @@
 //! let shared_pools = Arc::new(manager);
 //! ```
 
+mod action_dispatcher;
 mod fetch;
 mod fetch_handler;
 mod message_batcher;
@@ -84,6 +85,7 @@ pub mod sync_error;
 pub mod telemetry;
 mod thread_pools;
 mod timers;
+mod tx_ingress;
 mod validation_batcher;
 
 pub use fetch::{FetchConfig, FetchKind, FetchManager, FetchStatus};
@@ -98,6 +100,8 @@ pub use validation_batcher::{
     spawn_tx_validation_batcher, ValidationBatcherConfig, ValidationBatcherHandle,
     ValidationBatcherStats,
 };
+
+pub use tx_ingress::{create_tx_ingress, TxIngressConfig, TxIngressHandle, TxIngressStats};
 
 pub use network::Libp2pConfig;
 pub use runner::{ProductionRunner, RunnerError, ShutdownHandle};

@@ -75,6 +75,12 @@ pub enum Action {
         provision: StateProvision,
     },
 
+    /// Publish a finalized transaction certificate for peer fetch requests.
+    ///
+    /// Emitted when a TransactionCertificate is created (all StateCertificates collected).
+    /// The runner adds it to SharedReadState so peers can fetch it before block commit.
+    PublishCertificateForFetch { certificate: TransactionCertificate },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Timers
     // ═══════════════════════════════════════════════════════════════════════
@@ -283,17 +289,20 @@ pub enum Action {
         qc: QuorumCertificate,
     },
 
-    /// Persist our own vote before broadcasting it.
+    /// Persist a vote and broadcast it as a single atomic action.
     ///
-    /// **BFT Safety Critical**: This MUST be persisted before the vote is sent.
-    /// After a crash/restart, we must remember what we voted for to prevent
-    /// equivocation (voting for a different block at the same height).
-    ///
-    /// Key: (height, round) → block_hash
-    PersistOwnVote {
+    /// **BFT Safety Critical**: The runner MUST persist the vote before broadcasting.
+    /// This action combines `PersistOwnVote` and `BroadcastToShard` into a single
+    /// action, allowing the runner to:
+    /// 1. Start persistence (potentially async with fsync)
+    /// 2. Wait for persistence to complete
+    /// 3. Then broadcast the vote
+    PersistAndBroadcastVote {
         height: BlockHeight,
         round: u64,
         block_hash: Hash,
+        shard: ShardGroupId,
+        message: OutboundMessage,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -496,7 +505,7 @@ impl Action {
                 | Action::BroadcastStateCertificate { .. }
                 | Action::BroadcastStateProvision { .. }
                 | Action::PersistBlock { .. }
-                | Action::PersistOwnVote { .. }
+                | Action::PersistAndBroadcastVote { .. }
                 | Action::PersistTransactionCertificate { .. }
         )
     }
@@ -531,7 +540,7 @@ impl Action {
         matches!(
             self,
             Action::PersistBlock { .. }
-                | Action::PersistOwnVote { .. }
+                | Action::PersistAndBroadcastVote { .. }
                 | Action::PersistTransactionCertificate { .. }
         )
     }
@@ -557,6 +566,7 @@ impl Action {
             Action::BroadcastStateVote { .. } => "BroadcastStateVote",
             Action::BroadcastStateCertificate { .. } => "BroadcastStateCertificate",
             Action::BroadcastStateProvision { .. } => "BroadcastStateProvision",
+            Action::PublishCertificateForFetch { .. } => "PublishCertificateForFetch",
 
             // Timers
             Action::SetTimer { .. } => "SetTimer",
@@ -585,7 +595,7 @@ impl Action {
 
             // Storage - Consensus
             Action::PersistBlock { .. } => "PersistBlock",
-            Action::PersistOwnVote { .. } => "PersistOwnVote",
+            Action::PersistAndBroadcastVote { .. } => "PersistAndBroadcastVote",
 
             // Storage - Execution
             Action::PersistTransactionCertificate { .. } => "PersistTransactionCertificate",
