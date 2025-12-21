@@ -525,7 +525,6 @@ impl ValidatorConfig {
             .with_context(|| format!("Failed to parse config file: {}", path.display()))
     }
 
-
     /// Apply CLI overrides to the configuration.
     fn apply_overrides(&mut self, cli: &Cli) {
         if let Some(ref key_path) = cli.key {
@@ -896,7 +895,10 @@ async fn setup_upnp(config: &NetworkConfig) {
                 }
             }
             Err(e) => {
-                warn!("Could not bind socket to determine local IP for UPnP: {}", e);
+                warn!(
+                    "Could not bind socket to determine local IP for UPnP: {}",
+                    e
+                );
             }
         }
     }

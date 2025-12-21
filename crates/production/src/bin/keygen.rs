@@ -56,7 +56,7 @@ fn main() {
         let seed: [u8; 32] = seed_bytes.try_into().unwrap();
         let keypair = KeyPair::from_seed(KeyType::Bls12381, &seed);
         let public_key = keypair.public_key();
-        
+
         // Derive PeerId
         let libp2p_keypair = derive_libp2p_keypair(&public_key);
         let peer_id = libp2p::PeerId::from_public_key(&libp2p_keypair.public());
