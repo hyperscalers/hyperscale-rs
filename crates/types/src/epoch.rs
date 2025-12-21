@@ -60,8 +60,6 @@ pub enum ValidatorShardState {
     Leaving,
 }
 
-
-
 impl fmt::Display for ValidatorShardState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
