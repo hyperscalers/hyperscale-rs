@@ -13,15 +13,21 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Default: 8 validators (2 shards x 4 validators)
-TOTAL_VALIDATORS=8
+# Default configuration
+NUM_SHARDS=2
+VALIDATORS_PER_SHARD=4
 BASE_RPC_PORT=8080
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --validators)
-            TOTAL_VALIDATORS="$2"
+        --shards)
+            NUM_SHARDS="$2"
+            shift 2
+            ;;
+        --validators-per-shard|--validators)
+            # Support both for compatibility, though --validators usually meant total before
+            VALIDATORS_PER_SHARD="$2"
             shift 2
             ;;
         --base-port)
@@ -29,11 +35,12 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --help|-h)
-            echo "Usage: $0 [--validators N] [--base-port PORT]"
+            echo "Usage: $0 [--shards N] [--validators-per-shard M] [--base-port PORT]"
             echo ""
             echo "Options:"
-            echo "  --validators N   Total number of validators (default: 8)"
-            echo "  --base-port PORT Base RPC port (default: 8080)"
+            echo "  --shards N               Number of shards (default: 2)"
+            echo "  --validators-per-shard M Validators per shard (default: 4)"
+            echo "  --base-port PORT         Base RPC port (default: 8080)"
             echo ""
             echo "Access:"
             echo "  Prometheus: http://localhost:9090"
@@ -47,27 +54,49 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+TOTAL_VALIDATORS=$((NUM_SHARDS * VALIDATORS_PER_SHARD))
+
 echo "=== Starting Monitoring Stack ==="
-echo "Validators: $TOTAL_VALIDATORS"
+echo "Shards: $NUM_SHARDS"
+echo "Validators per shard: $VALIDATORS_PER_SHARD"
+echo "Total Validators: $TOTAL_VALIDATORS"
 echo "Base RPC port: $BASE_RPC_PORT"
 echo ""
 
 # Generate prometheus.yml
 echo "Generating Prometheus configuration..."
-PROM_TARGETS=""
-for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
-    rpc_port=$((BASE_RPC_PORT + i))
-    if [ -n "$PROM_TARGETS" ]; then
-        PROM_TARGETS="$PROM_TARGETS
+
+# Build static configs grouped by shard
+PROM_STATIC_CONFIGS=""
+for shard in $(seq 0 $((NUM_SHARDS - 1))); do
+    # Build targets for this shard
+    SHARD_TARGETS=""
+    for v in $(seq 0 $((VALIDATORS_PER_SHARD - 1))); do
+        validator_idx=$((shard * VALIDATORS_PER_SHARD + v))
+        rpc_port=$((BASE_RPC_PORT + validator_idx))
+        
+        if [ -n "$SHARD_TARGETS" ]; then
+            SHARD_TARGETS="$SHARD_TARGETS
           - 'host.docker.internal:$rpc_port'"
-    else
-        PROM_TARGETS="- 'host.docker.internal:$rpc_port'"
-    fi
+        else
+            SHARD_TARGETS="- 'host.docker.internal:$rpc_port'"
+        fi
+    done
+
+    # Add this shard's config block
+    PROM_STATIC_CONFIGS="$PROM_STATIC_CONFIGS
+      # Shard $shard validators
+      - targets:
+          $SHARD_TARGETS
+        labels:
+          cluster: 'local'
+          shard: '$shard'"
 done
 
 cat > "$SCRIPT_DIR/prometheus.yml" << EOF
 # Prometheus configuration for Hyperscale local cluster
-# Auto-generated for $TOTAL_VALIDATORS validators
+# Auto-generated for $NUM_SHARDS shards x $VALIDATORS_PER_SHARD validators
+# Job name 'hyperscale' matches Grafana dashboard expectations
 
 global:
   scrape_interval: 5s
@@ -75,11 +104,7 @@ global:
 
 scrape_configs:
   - job_name: 'hyperscale'
-    static_configs:
-      - targets:
-          $PROM_TARGETS
-        labels:
-          cluster: 'local'
+    static_configs:$PROM_STATIC_CONFIGS
     metrics_path: '/metrics'
     scrape_timeout: 5s
 EOF

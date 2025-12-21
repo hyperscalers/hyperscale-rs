@@ -22,7 +22,7 @@ DATA_DIR="./bootstrap-data"
 CLEAN=false
 LOG_LEVEL="info"
 SKIP_BUILD="${SKIP_BUILD:-false}"
-TCP_FALLBACK_ENABLED="true"
+TCP_FALLBACK_ENABLED="false"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do

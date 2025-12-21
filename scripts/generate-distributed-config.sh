@@ -61,11 +61,13 @@ echo "Output Directory: $OUT_DIR"
 echo "Clean: $CLEAN"
 echo ""
 
-# Build binaries if needed (keygen is essential)
+# Build binaries if needed (keygen and spammer are essential)
 KEYGEN_BIN="./target/release/hyperscale-keygen"
-if [ ! -f "$KEYGEN_BIN" ]; then
-    echo "Building keygen binary..."
-    cargo build --release --bin hyperscale-keygen 2>&1 | tail -3
+SPAMMER_BIN="./target/release/hyperscale-spammer"
+
+if [ ! -f "$KEYGEN_BIN" ] || [ ! -f "$SPAMMER_BIN" ]; then
+    echo "Building binaries..."
+    cargo build --release --bin hyperscale-keygen --bin hyperscale-spammer 2>&1 | tail -3
 fi
 
 # Clean output dir if requested
@@ -98,7 +100,23 @@ for i in "${!NODE_IPS[@]}"; do
     echo "  Node $i (${NODE_IPS[$i]}): ${PUBLIC_KEYS[$i]:0:16}... PeerID: ${PEER_IDS[$i]}"
 done
 
-# 2. Build Genesis Validator Set
+# 2. Build Genesis Balances for Spammer (using spammer tool)
+# In distributed setup with 1 shard, we generate for shard 0.
+ACCOUNTS_PER_SHARD=16000
+INITIAL_BALANCE=1000000
+
+echo "Generating genesis balances for spammer accounts..."
+declare -a SHARD_GENESIS_BALANCES
+for shard in $(seq 0 $((NUM_SHARDS - 1))); do
+    SHARD_GENESIS_BALANCES[$shard]=$("$SPAMMER_BIN" genesis \
+        --num-shards "$NUM_SHARDS" \
+        --accounts-per-shard "$ACCOUNTS_PER_SHARD" \
+        --balance "$INITIAL_BALANCE" \
+        --shard "$shard")
+    echo "  Shard $shard: $ACCOUNTS_PER_SHARD accounts"
+done
+
+# 3. Build Genesis Validator Set
 GENESIS_VALIDATORS=""
 for i in "${!NODE_IPS[@]}"; do
     if [ -n "$GENESIS_VALIDATORS" ]; then
@@ -112,7 +130,7 @@ public_key = \"${PUBLIC_KEYS[$i]}\"
 voting_power = 1"
 done
 
-# 3. Build Bootstrap Peer List (All nodes point to all other nodes ideally, or at least Node 0)
+# 4. Build Bootstrap Peer List (All nodes point to all other nodes ideally, or at least Node 0)
 # Here we add ALL nodes as bootstrap peers for robustness, using their public IPs.
 BOOTSTRAP_PEERS=""
 for i in "${!NODE_IPS[@]}"; do
@@ -124,10 +142,11 @@ for i in "${!NODE_IPS[@]}"; do
     if [ -n "$BOOTSTRAP_PEERS" ]; then BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS,"; fi
     
     # IMPORTANT: Include Peer ID in the multiaddr to ensure connectivity
-    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/$IP/udp/$BASE_PORT/quic-v1/p2p/$PID\",\"/ip4/$IP/tcp/$TCP_BASE_PORT/p2p/$PID\""
+    # QUIC-only bootstrap peers as requested
+    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/$IP/udp/$BASE_PORT/quic-v1/p2p/$PID\""
 done
 
-# 4. Generate Config Files
+# 5. Generate Config Files
 echo "Generating config files..."
 for i in "${!NODE_IPS[@]}"; do
     NODE_DIR="$OUT_DIR/node-$i"
@@ -145,13 +164,13 @@ for i in "${!NODE_IPS[@]}"; do
 validator_id = $i
 shard = 0
 num_shards = 1
-key_path = "./signing.key"
-data_dir = "./data"
+key_path = "./distributed-cluster-data/node-$i/signing.key"
+data_dir = "./distributed-cluster-data/node-$i/data"
 
 [network]
 # bind to all interfaces
 listen_addr = "/ip4/0.0.0.0/udp/$BASE_PORT/quic-v1"
-tcp_fallback_enabled = true
+tcp_fallback_enabled = false
 tcp_fallback_port = $TCP_BASE_PORT
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 upnp_enabled = false
@@ -171,6 +190,8 @@ listen_addr = "0.0.0.0:$RPC_BASE_PORT"
 enabled = false
 
 $GENESIS_VALIDATORS
+
+${SHARD_GENESIS_BALANCES[0]}
 EOF
     echo "  Generated config for Node $i"
 done
@@ -195,7 +216,7 @@ global:
   evaluation_interval: 5s
 
 scrape_configs:
-  - job_name: 'hyperscale-distributed'
+  - job_name: 'hyperscale'
     scrape_interval: 5s
     static_configs:
       - targets: [$PROM_TARGETS]

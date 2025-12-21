@@ -79,12 +79,13 @@ global:
   evaluation_interval: 5s
 
 scrape_configs:
-  - job_name: 'hyperscale-distributed'
+  - job_name: 'hyperscale'
     scrape_interval: 5s
     static_configs:
       - targets: [$PROM_TARGETS]
         labels:
           cluster: 'distributed'
+          shard: '0'
 EOF
 
 # Check Docker
@@ -97,7 +98,7 @@ DC=$(command -v docker-compose >/dev/null 2>&1 && echo "docker-compose" || echo 
 
 # Start containers
 echo "Starting Prometheus and Grafana..."
-$DC up -d
+$DC up -d --force-recreate
 
 echo ""
 echo "=== Monitoring Stack Started ==="

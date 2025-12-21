@@ -22,8 +22,7 @@ services:
       - '--storage.tsdb.path=/prometheus'
       - '--storage.tsdb.retention.time=7d'
       - '--web.enable-lifecycle'
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+
     restart: unless-stopped
 
   grafana:

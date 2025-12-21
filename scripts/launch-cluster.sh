@@ -21,13 +21,13 @@
 set -e
 
 # Default configuration
-NUM_SHARDS=2
+NUM_SHARDS=2                                    # Number of shards
 VALIDATORS_PER_SHARD=4                          # Minimum 4 required for BFT (3 validators can't tolerate any delays)
 BASE_PORT=9000                                  # libp2p port
 TCP_BASE_PORT=30500                             # Base TCP fallback port
 BASE_RPC_PORT=8080                              # HTTP RPC port
-DATA_DIR="./cluster-data"
-CLEAN=false
+DATA_DIR="./cluster-data"                       # Data directory
+CLEAN=false                                     # Clean data directories first
 ACCOUNTS_PER_SHARD=16000                        # Spammer accounts per shard
 INITIAL_BALANCE=1000000                         # Initial XRD balance per account
 MONITORING="${START_MONITORING:-false}"         # Start Prometheus + Grafana monitoring stack
@@ -35,7 +35,7 @@ LOG_LEVEL="info"                                # Default log level (trace, debu
 SMOKE_TEST_TIMEOUT="${SMOKE_TEST_TIMEOUT:-60s}" # Smoke test timeout
 SKIP_BUILD="${SKIP_BUILD:-false}"               # Skip building binaries
 NODE_HOSTNAME="${NODE_HOSTNAME:-localhost}"     # Hostname for spammer endpoints
-TCP_FALLBACK_ENABLED="true"                     # Enable TCP fallback transport (default: true)
+TCP_FALLBACK_ENABLED="${TCP_FALLBACK_ENABLED:-false}" # Enable TCP fallback transport (default: true)
 
 # Define explicit port ranges for Docker and firewall whitelisting
 # let's give a range of 500 ports which should be ok for local testing
@@ -415,7 +415,7 @@ echo "    --endpoints $SPAMMER_ENDPOINTS \\"
 echo "    --num-shards $NUM_SHARDS \\"
 echo "    --validators-per-shard $VALIDATORS_PER_SHARD \\"
 echo "    --tps 100 \\"
-echo "    --duration 30s"
+echo "    --duration 30s \\"
 echo "    --measure-latency"
 echo ""
 echo "PIDs written to: $PID_FILE"
