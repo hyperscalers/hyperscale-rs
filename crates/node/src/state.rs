@@ -1,7 +1,7 @@
 //! Node state machine.
 
 use hyperscale_bft::{BftConfig, BftState, RecoveredState};
-use hyperscale_core::{Action, Event, StateMachine, SubStateMachine, TimerId};
+use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, SubStateMachine, TimerId};
 use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
@@ -46,8 +46,14 @@ pub struct NodeStateMachine {
     /// Current time.
     now: Duration,
 
-    /// Time of last QC formation (for round timeout detection).
-    last_qc_time: Duration,
+    /// Time of last leader activity (for round timeout detection).
+    /// Reset when we see leader activity (proposal, header receipt, QC, commit).
+    last_leader_activity: Duration,
+
+    /// Last (height, round) for which we reset the leader activity timer on header receipt.
+    /// Prevents a Byzantine leader from spamming headers to delay view changes.
+    /// We only reset once per (height, round) from the leader.
+    last_header_reset: Option<(u64, u64)>,
 }
 
 impl std::fmt::Debug for NodeStateMachine {
@@ -124,7 +130,8 @@ impl NodeStateMachine {
             provisions: ProvisionCoordinator::new(local_shard, topology.clone()),
             livelock: LivelockState::new(local_shard, topology),
             now: Duration::ZERO,
-            last_qc_time: Duration::ZERO,
+            last_leader_activity: Duration::ZERO,
+            last_header_reset: None,
         }
     }
 
@@ -228,7 +235,7 @@ impl NodeStateMachine {
     /// Resets round timeout tracking.
     fn on_block_committed(&mut self, _height: u64) -> Vec<Action> {
         // Reset round advancement timeout - progress was made
-        self.last_qc_time = self.now;
+        self.last_leader_activity = self.now;
 
         // Note: Sync progress tracking is now handled by the runner
         // (production: SyncManager, simulation: runner.sync_targets)
@@ -237,10 +244,21 @@ impl NodeStateMachine {
 
     /// Check if we should advance the round due to timeout.
     ///
-    /// Called from proposal timer to detect if no QC has formed.
+    /// Called from proposal timer to detect leader failure. The timeout resets when:
+    /// - We propose a block (we're the active leader)
+    /// - We receive a block header (leader is active, once per height/round)
+    /// - A QC forms (progress was made)
+    /// - A block commits (progress was made)
+    /// - Sync completes (we caught up)
+    ///
+    /// View changes should only happen when the leader fails to propose,
+    /// not just because vote aggregation is slow.
+    ///
+    /// Note: Header receipt only resets once per (height, round) to prevent
+    /// a Byzantine leader from spamming headers to delay view changes.
     fn should_advance_round(&self) -> bool {
         let timeout = self.bft.config().view_change_timeout;
-        self.now.saturating_sub(self.last_qc_time) >= timeout
+        self.now.saturating_sub(self.last_leader_activity) >= timeout
     }
 
     /// Build commitment proofs for cross-shard transactions.
@@ -285,8 +303,10 @@ impl StateMachine for NodeStateMachine {
                 if self.should_advance_round() {
                     // Reset the timeout so we don't immediately trigger another view change.
                     // Without this, every subsequent timer tick (every 300ms) would trigger
-                    // another view change since last_qc_time would still be stale.
-                    self.last_qc_time = self.now;
+                    // another view change since last_leader_activity would still be stale.
+                    self.last_leader_activity = self.now;
+                    // Clear the header reset tracker since we're changing rounds
+                    self.last_header_reset = None;
 
                     let max_txs = self.bft.config().max_transactions_per_block;
                     let txs = self.mempool.ready_transactions(max_txs, &self.provisions);
@@ -326,13 +346,33 @@ impl StateMachine for NodeStateMachine {
                 );
                 // Get finalized certificates (removed when committed in a block)
                 let certificates = self.execution.get_finalized_certificates();
-                return self.bft.on_proposal_timer(
+                let actions = self.bft.on_proposal_timer(
                     &txs,
                     deferred,
                     aborted,
                     certificates,
                     commitment_proofs,
                 );
+
+                // If we proposed a block, reset the view change timeout.
+                // The leader is doing their job - view changes should only happen
+                // when the leader fails to propose, not just because the QC hasn't
+                // formed yet. This prevents unnecessary view change churn during
+                // idle periods when empty blocks are being proposed.
+                let proposed = actions.iter().any(|a| {
+                    matches!(
+                        a,
+                        Action::BroadcastToShard {
+                            message: OutboundMessage::BlockHeader(_),
+                            ..
+                        }
+                    )
+                });
+                if proposed {
+                    self.last_leader_activity = self.now;
+                }
+
+                return actions;
             }
 
             // BlockHeaderReceived needs mempool for transaction lookup and certificates
@@ -344,6 +384,15 @@ impl StateMachine for NodeStateMachine {
                 aborted,
                 commitment_proofs,
             } => {
+                // Reset the view change timeout - the leader is active.
+                // BUT only reset once per (height, round) to prevent a Byzantine leader
+                // from spamming headers with different hashes to delay view changes.
+                let header_key = (header.height.0, header.round);
+                if self.last_header_reset != Some(header_key) {
+                    self.last_leader_activity = self.now;
+                    self.last_header_reset = Some(header_key);
+                }
+
                 let mempool_txs = self.mempool.transactions_by_hash();
                 let local_certs = self.execution.finalized_certificates_by_hash();
 
@@ -377,7 +426,7 @@ impl StateMachine for NodeStateMachine {
             // Also reset the QC timeout since progress was made
             Event::QuorumCertificateFormed { block_hash, qc } => {
                 // Reset timeout - QC formed means progress
-                self.last_qc_time = self.now;
+                self.last_leader_activity = self.now;
 
                 let max_txs = self.bft.config().max_transactions_per_block;
                 let txs = self.mempool.ready_transactions(max_txs, &self.provisions);
@@ -664,7 +713,7 @@ impl StateMachine for NodeStateMachine {
             Event::SyncComplete { height } => {
                 tracing::info!(height, "Sync complete, resuming normal consensus");
                 // Reset round timeout since we've caught up
-                self.last_qc_time = self.now;
+                self.last_leader_activity = self.now;
             }
 
             Event::ChainMetadataFetched { .. } => {
