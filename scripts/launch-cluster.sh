@@ -289,6 +289,7 @@ listen_addr = "/ip4/0.0.0.0/udp/$validator_quic_port/quic-v1"
 tcp_fallback_enabled = $TCP_FALLBACK_ENABLED
 tcp_fallback_port = $validator_tcp_port
 bootstrap_peers = [$BOOTSTRAP_PEERS]
+upnp_enabled = false
 request_timeout_ms = 500
 max_message_size = 10485760
 gossipsub_heartbeat_ms = 100

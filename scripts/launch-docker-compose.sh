@@ -145,6 +145,7 @@ data_dir = "/home/hyperscalers/data"
 [network]
 listen_addr = "/ip4/0.0.0.0/udp/9000/quic-v1"
 external_addr = "/ip4/$IP/udp/9000/quic-v1"
+upnp_enabled = false
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 tcp_fallback_port_range = "9000-9000"
 [consensus]

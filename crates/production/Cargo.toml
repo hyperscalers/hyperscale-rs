@@ -36,6 +36,9 @@ libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "request-response
 futures = "0.3"
 async-trait = "0.1"
 
+# UPnP
+igd-next = { version = "0.14.3", features = ["aio_tokio"] }
+
 # Serialization
 sbor.workspace = true
 

@@ -61,6 +61,7 @@ use radix_common::network::NetworkDefinition;
 use radix_common::prelude::AddressBech32Decoder;
 use serde::Deserialize;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -98,6 +99,10 @@ struct Cli {
     /// Log level filter (overrides RUST_LOG)
     #[arg(long, default_value = "info")]
     log_level: String,
+
+    /// Disable UPnP port forwarding (overrides config)
+    #[arg(long)]
+    no_upnp: bool,
 }
 
 /// Top-level validator configuration.
@@ -195,6 +200,10 @@ pub struct NetworkConfig {
     /// Gossipsub heartbeat interval in milliseconds
     #[serde(default = "default_gossipsub_heartbeat_ms")]
     pub gossipsub_heartbeat_ms: u64,
+
+    /// Enable UPnP port forwarding
+    #[serde(default = "default_upnp_enabled")]
+    pub upnp_enabled: bool,
 }
 
 fn default_listen_addr() -> String {
@@ -215,6 +224,10 @@ fn default_max_message_size() -> usize {
 
 fn default_gossipsub_heartbeat_ms() -> u64 {
     100
+}
+
+fn default_upnp_enabled() -> bool {
+    true
 }
 
 /// Consensus configuration.
@@ -524,6 +537,7 @@ impl ValidatorConfig {
             .with_context(|| format!("Failed to parse config file: {}", path.display()))
     }
 
+
     /// Apply CLI overrides to the configuration.
     fn apply_overrides(&mut self, cli: &Cli) {
         if let Some(ref key_path) = cli.key {
@@ -540,6 +554,10 @@ impl ValidatorConfig {
 
         if !cli.bootstrap.is_empty() {
             self.network.bootstrap_peers.extend(cli.bootstrap.clone());
+        }
+
+        if cli.no_upnp {
+            self.network.upnp_enabled = false;
         }
     }
 }
@@ -865,6 +883,122 @@ fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
     }
 }
 
+/// Setup UPnP port forwarding.
+async fn setup_upnp(config: &NetworkConfig) {
+    if !config.upnp_enabled {
+        info!("UPnP disabled in configuration");
+        return;
+    }
+
+    info!("Attempting to setup UPnP port forwarding...");
+
+    // Determine local IP address by connecting to a public DNS (no data is sent)
+    // We try multiple reliable DNS servers to ensure robustness
+    let dns_servers = ["8.8.8.8:80", "1.1.1.1:80", "9.9.9.9:80"];
+    let mut local_ip = None;
+
+    for server in dns_servers.iter() {
+        match std::net::UdpSocket::bind("0.0.0.0:0") {
+            Ok(socket) => {
+                if socket.connect(server).is_ok() {
+                    if let Ok(addr) = socket.local_addr() {
+                        local_ip = Some(addr.ip());
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Could not bind socket to determine local IP for UPnP: {}", e);
+            }
+        }
+    }
+
+    let local_ip = match local_ip {
+        Some(ip) => ip,
+        None => {
+            warn!("Could not determine local IP for UPnP: failed to connect to any external DNS server");
+            return;
+        }
+    };
+
+    // Parse listen address to get the port
+    let listen_addr_parsed: libp2p::Multiaddr = match config.listen_addr.parse() {
+        Ok(addr) => addr,
+        Err(e) => {
+            warn!("Failed to parse listen address for UPnP: {}", e);
+            return;
+        }
+    };
+
+    let mut quic_port = None;
+    for protocol in listen_addr_parsed.iter() {
+        if let libp2p::multiaddr::Protocol::Udp(port) = protocol {
+            quic_port = Some(port);
+            break;
+        }
+    }
+
+    // Use igd-next for UPnP
+    match igd_next::aio::tokio::search_gateway(Default::default()).await {
+        Ok(gateway) => {
+            let external_ip = match gateway.get_external_ip().await {
+                Ok(ip) => ip,
+                Err(e) => {
+                    warn!("Failed to get external IP from UPnP gateway: {}", e);
+                    return;
+                }
+            };
+            info!("UPnP Gateway found. External IP: {}", external_ip);
+
+            // Map QUIC port (UDP)
+            if let Some(port) = quic_port {
+                let local_addr = SocketAddr::new(local_ip, port);
+                match gateway
+                    .add_port(
+                        igd_next::PortMappingProtocol::UDP,
+                        port,
+                        local_addr,
+                        60 * 60, // 1 hour lease
+                        "Hyperscale Validator QUIC",
+                    )
+                    .await
+                {
+                    Ok(_) => info!("Successfully mapped QUIC port {} (UDP) via UPnP", port),
+                    Err(e) => warn!("Failed to map QUIC port {} (UDP) via UPnP: {}", port, e),
+                }
+            } else {
+                warn!("Could not determine QUIC port from listen address for UPnP");
+            }
+
+            // Map TCP fallback port
+            if config.tcp_fallback_enabled {
+                if let Some(port) = config.tcp_fallback_port {
+                    let local_addr = SocketAddr::new(local_ip, port);
+                    match gateway
+                        .add_port(
+                            igd_next::PortMappingProtocol::TCP,
+                            port,
+                            local_addr,
+                            60 * 60, // 1 hour lease
+                            "Hyperscale Validator TCP",
+                        )
+                        .await
+                    {
+                        Ok(_) => info!("Successfully mapped TCP fallback port {} via UPnP", port),
+                        Err(e) => warn!("Failed to map TCP fallback port {} via UPnP: {}", port, e),
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                "UPnP gateway not found or accessible: {}. Port forwarding may be required manually.",
+                e
+            );
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -912,6 +1046,9 @@ async fn main() -> Result<()> {
 
     // Ensure data directory exists
     fs::create_dir_all(&config.node.data_dir)?;
+
+    // Setup UPnP
+    setup_upnp(&config.network).await;
 
     // Load or generate keys
     let signing_keypair = load_or_generate_keypair(config.node.key_path.as_ref())?;
