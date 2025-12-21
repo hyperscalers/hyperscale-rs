@@ -29,7 +29,7 @@ use hyperscale_types::{
 use libp2p::identity;
 use sbor::prelude::*;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::{mpsc, oneshot};
@@ -543,6 +543,9 @@ impl ProductionRunnerBuilder {
             status_tx,
             state,
             start_time: Instant::now(),
+            epoch_start_time: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before UNIX epoch"),
             thread_pools,
             timer_manager,
             network,
@@ -618,8 +621,12 @@ pub struct ProductionRunner {
     status_tx: mpsc::Sender<Event>,
     /// The state machine (owned, not shared).
     state: NodeStateMachine,
-    /// Start time for calculating elapsed duration.
+    /// Start time for uptime calculation (node-local, not used for consensus timestamps).
     start_time: Instant,
+    /// Unix epoch time when the node started, for wall-clock time calculation.
+    /// This is used for consensus timestamps to ensure nodes agree on time even if
+    /// they start at different moments.
+    epoch_start_time: Duration,
     /// Thread pool manager for crypto and execution workloads.
     thread_pools: Arc<ThreadPoolManager>,
     /// Timer manager for setting/cancelling timers.
@@ -694,6 +701,18 @@ impl ProductionRunner {
     /// All fields are required - see [`ProductionRunnerBuilder`] for details.
     pub fn builder() -> ProductionRunnerBuilder {
         ProductionRunnerBuilder::new()
+    }
+
+    /// Get wall-clock time as a Duration since UNIX epoch.
+    ///
+    /// This uses the system clock to ensure all nodes agree on timestamps,
+    /// regardless of when they started. This is critical for BFT timestamp
+    /// validation which checks that proposer timestamps are within acceptable
+    /// bounds of the validator's local time.
+    fn wall_clock_time(&self) -> Duration {
+        // Use cached epoch_start_time + elapsed for better monotonicity within a session,
+        // while still being based on wall-clock time across nodes.
+        self.epoch_start_time + self.start_time.elapsed()
     }
 
     /// Get a reference to the thread pool manager.
@@ -1037,7 +1056,7 @@ impl ProductionRunner {
                     let _event_guard = event_span.enter();
 
                     // Update time
-                    let now = self.start_time.elapsed();
+                    let now = self.wall_clock_time();
                     self.state.set_time(now);
 
                     // Process timer event
@@ -1072,7 +1091,7 @@ impl ProductionRunner {
                     let _event_guard = event_span.enter();
 
                     // Update time
-                    let now = self.start_time.elapsed();
+                    let now = self.wall_clock_time();
                     self.state.set_time(now);
 
                     // Dispatch event through unified handler
@@ -1123,7 +1142,7 @@ impl ProductionRunner {
                             let _event_guard = event_span.enter();
 
                             // Update time
-                            let now = self.start_time.elapsed();
+                            let now = self.wall_clock_time();
                             self.state.set_time(now);
 
                             // Process event synchronously (fast)
@@ -1179,7 +1198,7 @@ impl ProductionRunner {
                             // First drain any immediately available events.
                             while let Ok(more_event) = self.consensus_rx.try_recv() {
                                 // Update time for each event
-                                let now = self.start_time.elapsed();
+                                let now = self.wall_clock_time();
                                 self.state.set_time(now);
 
                                 let more_actions = self.state.handle(more_event);
@@ -1220,7 +1239,7 @@ impl ProductionRunner {
                                     match tokio::time::timeout_at(batch_deadline, self.consensus_rx.recv()).await {
                                         Ok(Some(more_event)) => {
                                             // Update time for each event
-                                            let now = self.start_time.elapsed();
+                                            let now = self.wall_clock_time();
                                             self.state.set_time(now);
 
                                             let more_actions = self.state.handle(more_event);
@@ -1349,7 +1368,7 @@ impl ProductionRunner {
                     );
                     let _event_guard = event_span.enter();
 
-                    let now = self.start_time.elapsed();
+                    let now = self.wall_clock_time();
                     self.state.set_time(now);
 
                     let actions = self.state.handle(event);
@@ -1433,7 +1452,7 @@ impl ProductionRunner {
                     let _event_guard = event_span.enter();
 
                     // Update time
-                    let now = self.start_time.elapsed();
+                    let now = self.wall_clock_time();
                     self.state.set_time(now);
 
                     // Process status event (updates mempool state)
