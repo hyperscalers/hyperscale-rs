@@ -258,13 +258,6 @@ pub struct ConsensusConfig {
     /// Higher values reduce wasted work during instability but may reduce hit rate.
     #[serde(default = "default_view_change_cooldown_rounds")]
     pub view_change_cooldown_rounds: u64,
-
-    /// Maximum transactions in the mempool before rejecting RPC submissions.
-    /// When the pool reaches this size, new RPC submissions return 503 Service Unavailable.
-    /// Gossip transactions are still accepted to allow block validation.
-    /// Set to 0 for unlimited (not recommended).
-    #[serde(default = "default_rpc_mempool_limit")]
-    pub rpc_mempool_limit: usize,
 }
 
 impl Default for ConsensusConfig {
@@ -276,7 +269,6 @@ impl Default for ConsensusConfig {
             max_certificates_per_block: default_max_certificates_per_block(),
             speculative_max_txs: default_speculative_max_txs(),
             view_change_cooldown_rounds: default_view_change_cooldown_rounds(),
-            rpc_mempool_limit: default_rpc_mempool_limit(),
         }
     }
 }
@@ -303,10 +295,6 @@ fn default_speculative_max_txs() -> usize {
 
 fn default_view_change_cooldown_rounds() -> u64 {
     3 // Matches hyperscale_execution::DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS
-}
-
-fn default_rpc_mempool_limit() -> usize {
-    hyperscale_mempool::DEFAULT_RPC_MEMPOOL_LIMIT
 }
 
 /// Thread pool configuration.
@@ -1124,8 +1112,7 @@ async fn main() -> Result<()> {
         .tx_status_cache(rpc_tx_status_cache.clone())
         .mempool_snapshot(rpc_mempool_snapshot.clone())
         .speculative_max_txs(config.consensus.speculative_max_txs)
-        .view_change_cooldown_rounds(config.consensus.view_change_cooldown_rounds)
-        .rpc_mempool_limit(config.consensus.rpc_mempool_limit);
+        .view_change_cooldown_rounds(config.consensus.view_change_cooldown_rounds);
 
     // Wire up genesis configuration if XRD balances are specified
     if !config.genesis.xrd_balances.is_empty() {

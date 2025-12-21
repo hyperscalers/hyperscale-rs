@@ -3,11 +3,11 @@
 //! Tracks blocks being assembled from headers + gossiped transactions.
 
 use hyperscale_types::{
-    Block, BlockHeader, Hash, RoutableTransaction, TransactionAbort, TransactionCertificate,
-    TransactionDefer,
+    Block, BlockHeader, CommitmentProof, Hash, RoutableTransaction, TransactionAbort,
+    TransactionCertificate, TransactionDefer,
 };
 use indexmap::IndexMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Tracks a block being assembled from header + gossiped transactions + certificates.
@@ -47,6 +47,10 @@ pub struct PendingBlock {
     /// These don't need to be fetched - they're included directly in the gossip message.
     aborted: Vec<TransactionAbort>,
 
+    /// Commitment proofs for priority transaction ordering.
+    /// Included in block gossip to make blocks self-contained for validation.
+    commitment_proofs: HashMap<Hash, CommitmentProof>,
+
     /// The fully constructed block (None until all transactions/certs received).
     constructed_block: Option<Arc<Block>>,
 }
@@ -77,6 +81,25 @@ impl PendingBlock {
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
     ) -> Self {
+        Self::with_proofs(
+            header,
+            transaction_hashes,
+            certificate_hashes,
+            deferred,
+            aborted,
+            HashMap::new(),
+        )
+    }
+
+    /// Create a new pending block with commitment proofs.
+    pub fn with_proofs(
+        header: BlockHeader,
+        transaction_hashes: Vec<Hash>,
+        certificate_hashes: Vec<Hash>,
+        deferred: Vec<TransactionDefer>,
+        aborted: Vec<TransactionAbort>,
+        commitment_proofs: HashMap<Hash, CommitmentProof>,
+    ) -> Self {
         Self {
             header,
             received_transactions: IndexMap::with_capacity(transaction_hashes.len()),
@@ -85,6 +108,7 @@ impl PendingBlock {
             missing_certificate_hashes: certificate_hashes.into_iter().collect(),
             deferred,
             aborted,
+            commitment_proofs,
             constructed_block: None,
         }
     }
@@ -191,9 +215,10 @@ impl PendingBlock {
             .drain(..)
             .map(|(_, v)| v)
             .collect();
-        // Take deferred and aborted (replace with empty)
+        // Take deferred, aborted, and proofs (replace with empty)
         let deferred = std::mem::take(&mut self.deferred);
         let aborted = std::mem::take(&mut self.aborted);
+        let commitment_proofs = std::mem::take(&mut self.commitment_proofs);
 
         let block = Arc::new(Block {
             header: self.header.clone(),
@@ -201,6 +226,7 @@ impl PendingBlock {
             committed_certificates: certificates,
             deferred,
             aborted,
+            commitment_proofs,
         });
 
         self.constructed_block = Some(Arc::clone(&block));
@@ -252,6 +278,11 @@ impl PendingBlock {
     /// Get reference to aborted transactions.
     pub fn aborted(&self) -> &[TransactionAbort] {
         &self.aborted
+    }
+
+    /// Get reference to commitment proofs.
+    pub fn commitment_proofs(&self) -> &HashMap<Hash, CommitmentProof> {
+        &self.commitment_proofs
     }
 }
 

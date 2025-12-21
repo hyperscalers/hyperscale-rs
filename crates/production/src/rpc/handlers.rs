@@ -146,11 +146,9 @@ pub async fn submit_transaction_handler(
                 Json(SubmitTransactionResponse {
                     accepted: false,
                     hash: String::new(),
-                    error: Some(format!(
-                        "Mempool full ({}/{} transactions). Try again later.",
-                        snapshot.total_count,
-                        snapshot.max_rpc_pool_size.unwrap_or(0)
-                    )),
+                    error: Some(
+                        "Cross-shard transaction limit reached. Try again later.".to_string(),
+                    ),
                 }),
             );
         }

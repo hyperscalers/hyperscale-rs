@@ -97,6 +97,7 @@ fn test_recovered_votes_prevent_equivocation() {
         vec![],
         vec![],
         vec![],
+        HashMap::new(),
         &HashMap::new(),
         &HashMap::new(),
     );

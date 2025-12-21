@@ -453,6 +453,7 @@ impl SyncManager {
         self.sync_target = None;
         self.heights_to_fetch.clear();
         self.pending_fetches.clear();
+        self.tried_peers_for_height.clear();
     }
 
     /// Tick the sync manager - called periodically to drive fetch progress.
@@ -487,7 +488,10 @@ impl SyncManager {
     fn spawn_pending_fetches(&mut self) {
         while self.pending_fetches.len() < self.config.max_concurrent_fetches {
             if let Some(height) = self.heights_to_fetch.pop_front() {
-                if let Some(peer) = self.select_peer() {
+                // Get peers already tried for this height (if any)
+                // Clone to avoid borrow conflict with select_peer_for_height
+                let tried_peers = self.tried_peers_for_height.get(&height).cloned();
+                if let Some(peer) = self.select_peer_for_height(tried_peers.as_ref()) {
                     self.spawn_fetch(height, peer);
                 } else {
                     // No available peers, put height back and stop
@@ -699,24 +703,25 @@ impl SyncManager {
         }
     }
 
-    /// Select the best peer for a sync request.
+    /// Select the best peer for a sync request for a specific height.
     ///
     /// Selection criteria:
     /// 1. Only consider peers in our shard (from topology)
     /// 2. Exclude ourselves
-    /// 3. Skip banned peers
-    /// 4. Skip peers in cooldown (too many failures)
-    /// 5. Skip peers with too many in-flight requests
-    /// 6. Prefer peers with fewer in-flight requests
-    /// 7. Prefer peers with fewer failures
+    /// 3. Skip peers already tried for this height (if provided)
+    /// 4. Skip banned peers
+    /// 5. Skip peers in cooldown (too many failures)
+    /// 6. Skip peers with too many in-flight requests
+    /// 7. Prefer peers with fewer in-flight requests
+    /// 8. Prefer peers with fewer failures
     ///
     /// If all peers are in cooldown and we're significantly behind (desperation mode),
     /// cooldowns are reset to allow immediate retries.
-    fn select_peer(&mut self) -> Option<PeerId> {
+    fn select_peer_for_height(&mut self, tried_peers: Option<&HashSet<PeerId>>) -> Option<PeerId> {
         let now = Instant::now();
 
         // Try normal peer selection first
-        if let Some(peer) = self.select_peer_inner(now) {
+        if let Some(peer) = self.select_peer_inner(now, tried_peers) {
             return Some(peer);
         }
 
@@ -774,8 +779,8 @@ impl SyncManager {
                 }
             }
 
-            // Now retry peer selection with reset cooldowns
-            return self.select_peer_inner(now);
+            // Now retry peer selection with reset cooldowns (ignore tried_peers in desperation)
+            return self.select_peer_inner(now, None);
         }
 
         // Desperation mode for stuck in-flight counters: if all peers are at max in-flight
@@ -800,8 +805,8 @@ impl SyncManager {
             // Also clear pending fetches since they're clearly orphaned
             self.pending_fetches.clear();
 
-            // Now retry peer selection with reset in-flight
-            return self.select_peer_inner(now);
+            // Now retry peer selection with reset in-flight (ignore tried_peers in desperation)
+            return self.select_peer_inner(now, None);
         }
 
         // Desperation mode for banned peers: if we have banned peers and we're far behind,
@@ -824,8 +829,8 @@ impl SyncManager {
                 rep.last_failure = None;
             }
 
-            // Now retry peer selection with lifted bans
-            return self.select_peer_inner(now);
+            // Now retry peer selection with lifted bans (ignore tried_peers in desperation)
+            return self.select_peer_inner(now, None);
         }
 
         warn!(
@@ -840,7 +845,13 @@ impl SyncManager {
     }
 
     /// Inner peer selection logic (without desperation mode handling).
-    fn select_peer_inner(&self, now: Instant) -> Option<PeerId> {
+    ///
+    /// If `tried_peers` is provided, those peers are excluded from selection.
+    fn select_peer_inner(
+        &self,
+        now: Instant,
+        tried_peers: Option<&HashSet<PeerId>>,
+    ) -> Option<PeerId> {
         let local_shard = self.topology.local_shard();
         let local_validator = self.topology.local_validator_id();
         let committee = self.topology.committee_for_shard(local_shard);
@@ -853,6 +864,11 @@ impl SyncManager {
                 // Get peer ID from topology
                 let pk = self.topology.public_key(validator_id)?;
                 let peer_id = compute_peer_id_for_validator(&pk);
+
+                // Skip peers already tried for this height
+                if tried_peers.is_some_and(|tried| tried.contains(&peer_id)) {
+                    return None;
+                }
 
                 // Check reputation filters
                 if let Some(rep) = self.peer_reputations.get(&peer_id) {
@@ -2063,6 +2079,7 @@ mod tests {
             committed_certificates: vec![],
             deferred: vec![],
             aborted: vec![],
+            commitment_proofs: std::collections::HashMap::new(),
         }
     }
 

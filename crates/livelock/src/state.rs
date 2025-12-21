@@ -6,8 +6,8 @@
 use crate::tracker::{CommittedCrossShardTracker, ProvisionTracker, RemoteStateNeeds};
 use hyperscale_core::{Action, Event, SubStateMachine};
 use hyperscale_types::{
-    BlockHeight, DeferReason, Hash, NodeId, RoutableTransaction, ShardGroupId, StateProvision,
-    Topology, TransactionDefer,
+    BlockHeight, CommitmentProof, CycleProof, DeferReason, Hash, NodeId, RoutableTransaction,
+    ShardGroupId, Topology, TransactionDefer,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -65,6 +65,11 @@ pub struct LivelockState {
     /// Added when deferral COMMITS (not when cycle detected).
     deferred_tombstones: HashMap<Hash, Duration>,
 
+    /// Commitment proofs from remote transactions.
+    /// Used to build CycleProof when deferring due to livelock cycle.
+    /// Maps tx_hash -> CommitmentProof
+    commitment_proofs: HashMap<Hash, CommitmentProof>,
+
     /// Deferrals ready to be included in next block proposal.
     /// Kept until they appear in a committed block.
     pending_deferrals: Vec<TransactionDefer>,
@@ -106,6 +111,7 @@ impl LivelockState {
             committed_tracker: CommittedCrossShardTracker::new(),
             provision_tracker: ProvisionTracker::new(),
             deferred_tombstones: HashMap::new(),
+            commitment_proofs: HashMap::new(),
             pending_deferrals: Vec::new(),
             now: Duration::ZERO,
             config,
@@ -178,17 +184,17 @@ impl LivelockState {
     /// # Arguments
     /// * `remote_tx_hash` - The remote transaction's hash
     /// * `source_shard` - The shard that reached quorum
-    /// * `provisions` - The verified provisions that formed the quorum
+    /// * `commitment_proof` - The aggregated proof from the source shard
     pub fn on_provision_quorum_reached(
         &mut self,
         remote_tx_hash: Hash,
         source_shard: ShardGroupId,
-        provisions: &[StateProvision],
+        commitment_proof: &CommitmentProof,
     ) {
         trace!(
             remote_tx = %remote_tx_hash,
             source_shard = source_shard.0,
-            provision_count = provisions.len(),
+            signer_count = commitment_proof.signer_count(),
             "Processing verified quorum for cycle detection"
         );
 
@@ -206,11 +212,12 @@ impl LivelockState {
             return;
         }
 
-        // Collect all nodes from the quorum provisions
-        let remote_tx_nodes: HashSet<NodeId> = provisions
-            .iter()
-            .flat_map(|p| p.entries.iter().map(|e| e.node_id))
-            .collect();
+        // Store the commitment proof for building CycleProof later
+        self.commitment_proofs
+            .insert(remote_tx_hash, commitment_proof.clone());
+
+        // Get nodes from the commitment proof
+        let remote_tx_nodes = commitment_proof.nodes();
 
         // Check for cycle with our local committed TXs
         self.check_for_cycle(remote_tx_hash, source_shard, &remote_tx_nodes);
@@ -312,13 +319,27 @@ impl LivelockState {
             return;
         }
 
+        // Build CycleProof from the stored commitment proof for the winner
+        let proof = self
+            .commitment_proofs
+            .get(&winner_tx)
+            .map(|commitment| CycleProof::new(winner_tx, commitment.clone()));
+
         let deferral = TransactionDefer {
             tx_hash: loser_tx,
             reason: DeferReason::LivelockCycle {
                 winner_tx_hash: winner_tx,
             },
             block_height: BlockHeight(0), // Will be filled in when included in block
+            proof,
         };
+
+        debug!(
+            loser_tx = %loser_tx,
+            winner_tx = %winner_tx,
+            has_proof = deferral.has_proof(),
+            "Queuing deferral with cycle proof"
+        );
 
         self.pending_deferrals.push(deferral);
     }
@@ -456,9 +477,9 @@ impl SubStateMachine for LivelockState {
             Event::ProvisionQuorumReached {
                 tx_hash,
                 source_shard,
-                provisions,
+                commitment_proof,
             } => {
-                self.on_provision_quorum_reached(*tx_hash, *source_shard, provisions);
+                self.on_provision_quorum_reached(*tx_hash, *source_shard, commitment_proof);
                 Some(vec![])
             }
             Event::BlockCommitted { block, .. } => {
@@ -482,7 +503,8 @@ impl SubStateMachine for LivelockState {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        KeyPair, Signature, StaticTopology, ValidatorId, ValidatorInfo, ValidatorSet,
+        KeyPair, PartitionNumber, Signature, SignerBitfield, StateEntry, StaticTopology,
+        ValidatorId, ValidatorInfo, ValidatorSet,
     };
 
     fn make_test_topology(local_shard: ShardGroupId) -> Arc<dyn Topology> {
@@ -510,41 +532,36 @@ mod tests {
         NodeId::from_bytes(&bytes)
     }
 
-    fn make_provision(tx_hash: Hash, source_shard: ShardGroupId) -> StateProvision {
-        use std::sync::Arc;
-        // Create a provision with no entries (no node overlap possible)
-        StateProvision {
-            transaction_hash: tx_hash,
-            target_shard: ShardGroupId(0),
+    fn make_commitment_proof(tx_hash: Hash, source_shard: ShardGroupId) -> CommitmentProof {
+        // Create a commitment proof with no entries (no node overlap possible)
+        CommitmentProof::new(
+            tx_hash,
             source_shard,
-            block_height: BlockHeight(1),
-            entries: Arc::new(vec![]),
-            validator_id: ValidatorId(0),
-            signature: Signature::zero(),
-        }
+            SignerBitfield::new(3),
+            Signature::zero(),
+            BlockHeight(1),
+            vec![],
+        )
     }
 
-    fn make_provision_with_nodes(
+    fn make_commitment_proof_with_nodes(
         tx_hash: Hash,
         source_shard: ShardGroupId,
         node_ids: Vec<NodeId>,
-    ) -> StateProvision {
-        use hyperscale_types::{PartitionNumber, StateEntry};
-        use std::sync::Arc;
-        // Create a provision with specific nodes
+    ) -> CommitmentProof {
+        // Create a commitment proof with specific nodes
         let entries: Vec<_> = node_ids
             .into_iter()
             .map(|node_id| StateEntry::new(node_id, PartitionNumber(0), vec![], None))
             .collect();
-        StateProvision {
-            transaction_hash: tx_hash,
-            target_shard: ShardGroupId(0),
+        CommitmentProof::new(
+            tx_hash,
             source_shard,
-            block_height: BlockHeight(1),
-            entries: Arc::new(entries),
-            validator_id: ValidatorId(0),
-            signature: Signature::zero(),
-        }
+            SignerBitfield::new(3),
+            Signature::zero(),
+            BlockHeight(1),
+            entries,
+        )
     }
 
     fn make_remote_state_needs(
@@ -592,9 +609,9 @@ mod tests {
 
         // Receive quorum of provisions from shard 1 for remote_tx with the SAME conflicting node
         // This simulates shard 1 having committed a TX that also uses the conflicting node
-        let provision =
-            make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
-        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &[provision]);
+        let proof =
+            make_commitment_proof_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
+        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &proof);
 
         // Should have queued a deferral (local_tx loses to remote_tx)
         let deferrals = state.get_pending_deferrals();
@@ -627,9 +644,9 @@ mod tests {
         state.committed_tracker.add(local_tx, needs);
 
         // Receive quorum of provisions from shard 1 for remote_tx with overlapping node
-        let provision =
-            make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
-        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &[provision]);
+        let proof =
+            make_commitment_proof_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
+        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &proof);
 
         // Should NOT have queued a deferral (we win, remote should defer)
         assert!(state.get_pending_deferrals().is_empty());
@@ -656,8 +673,8 @@ mod tests {
         state.committed_tracker.add(local_tx, needs);
 
         // Receive quorum of provisions from shard 1 for remote_tx with DIFFERENT node
-        let provision = make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![remote_node]);
-        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &[provision]);
+        let proof = make_commitment_proof_with_nodes(remote_tx, ShardGroupId(1), vec![remote_node]);
+        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &proof);
 
         // Should NOT have queued a deferral - no node overlap means no real conflict
         assert!(state.get_pending_deferrals().is_empty());
@@ -676,8 +693,8 @@ mod tests {
             .insert(tx, Duration::from_secs(100));
 
         // Receive quorum of provisions for the deferred TX
-        let provision = make_provision(tx, ShardGroupId(1));
-        state.on_provision_quorum_reached(tx, ShardGroupId(1), &[provision]);
+        let proof = make_commitment_proof(tx, ShardGroupId(1));
+        state.on_provision_quorum_reached(tx, ShardGroupId(1), &proof);
 
         // Should not have added to provision tracker (tombstone filtered)
         assert!(!state.provision_tracker.has_provision(tx, ShardGroupId(1)));
@@ -727,18 +744,14 @@ mod tests {
         state.committed_tracker.add(local_tx, needs);
 
         // Receive quorum of provisions - should queue deferral
-        let provision =
-            make_provision_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
-        state.on_provision_quorum_reached(
-            remote_tx,
-            ShardGroupId(1),
-            std::slice::from_ref(&provision),
-        );
+        let proof =
+            make_commitment_proof_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
+        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &proof);
 
         assert_eq!(state.get_pending_deferrals().len(), 1);
 
         // Receive same quorum again - should NOT queue duplicate deferral
-        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &[provision]);
+        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &proof);
 
         assert_eq!(
             state.get_pending_deferrals().len(),
@@ -747,9 +760,9 @@ mod tests {
         );
 
         // Receive quorum from different shard for same cycle - still no duplicate
-        let provision2 =
-            make_provision_with_nodes(remote_tx, ShardGroupId(2), vec![conflicting_node]);
-        state.on_provision_quorum_reached(remote_tx, ShardGroupId(2), &[provision2]);
+        let proof2 =
+            make_commitment_proof_with_nodes(remote_tx, ShardGroupId(2), vec![conflicting_node]);
+        state.on_provision_quorum_reached(remote_tx, ShardGroupId(2), &proof2);
 
         assert_eq!(
             state.get_pending_deferrals().len(),
@@ -780,6 +793,7 @@ mod tests {
                 winner_tx_hash: hash_with_prefix(0x00),
             },
             block_height: BlockHeight(5),
+            proof: None,
         };
 
         let block = hyperscale_types::Block {
@@ -796,6 +810,7 @@ mod tests {
             committed_certificates: vec![],
             deferred: vec![deferral],
             aborted: vec![],
+            commitment_proofs: std::collections::HashMap::new(),
         };
 
         state.on_block_committed(&block);
@@ -849,6 +864,7 @@ mod tests {
             committed_certificates: vec![std::sync::Arc::new(cert)],
             deferred: vec![],
             aborted: vec![],
+            commitment_proofs: std::collections::HashMap::new(),
         };
 
         state.on_block_committed(&block);
@@ -880,8 +896,8 @@ mod tests {
         // Receive quorum from shard 2 (not shard 1) for remote_tx
         // This means remote_tx needs our state, but we don't need shard 2's state
         // so there's no cycle with our local_tx
-        let provision = make_provision_with_nodes(remote_tx, ShardGroupId(2), vec![node2]);
-        state.on_provision_quorum_reached(remote_tx, ShardGroupId(2), &[provision]);
+        let proof = make_commitment_proof_with_nodes(remote_tx, ShardGroupId(2), vec![node2]);
+        state.on_provision_quorum_reached(remote_tx, ShardGroupId(2), &proof);
 
         // Should NOT queue a deferral - no cycle exists
         // Our local_tx needs shard 1, provision is from shard 2

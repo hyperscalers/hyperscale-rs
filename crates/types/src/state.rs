@@ -447,4 +447,76 @@ mod tests {
         assert!(cert.success);
         assert!(cert.signers.is_empty());
     }
+
+    #[test]
+    fn test_state_provision_sbor_roundtrip_preserves_signature() {
+        use crate::{state_provision_message, KeyPair, KeyType};
+        use std::sync::Arc;
+
+        // Create test entries
+        let entries = vec![
+            StateEntry::new(
+                NodeId([1u8; 30]),
+                PartitionNumber(1),
+                vec![1, 2, 3],
+                Some(vec![4, 5, 6]),
+            ),
+            StateEntry::new(NodeId([2u8; 30]), PartitionNumber(2), vec![7, 8, 9], None),
+        ];
+
+        // Create keypair
+        let keypair = KeyPair::from_seed(KeyType::Bls12381, &[42u8; 32]);
+        let public_key = keypair.public_key();
+
+        let tx_hash = Hash::from_bytes(&[1u8; 32]);
+        let target_shard = ShardGroupId(0);
+        let source_shard = ShardGroupId(1);
+        let block_height = BlockHeight(100);
+
+        // Compute signing message
+        let entry_hashes: Vec<Hash> = entries.iter().map(|e| e.hash()).collect();
+        let msg = state_provision_message(
+            &tx_hash,
+            target_shard,
+            source_shard,
+            block_height,
+            &entry_hashes,
+        );
+        let signature = keypair.sign(&msg);
+
+        // Create provision
+        let provision = StateProvision {
+            transaction_hash: tx_hash,
+            target_shard,
+            source_shard,
+            block_height,
+            entries: Arc::new(entries),
+            validator_id: crate::ValidatorId(5),
+            signature,
+        };
+
+        // Verify original
+        let original_msg = provision.signing_message();
+        assert!(
+            public_key.verify(&original_msg, &provision.signature),
+            "Original should verify"
+        );
+
+        // SBOR encode
+        let encoded = sbor::basic_encode(&provision).expect("encode failed");
+
+        // SBOR decode
+        let decoded: StateProvision = sbor::basic_decode(&encoded).expect("decode failed");
+
+        // Verify decoded
+        let decoded_msg = decoded.signing_message();
+        assert_eq!(
+            original_msg, decoded_msg,
+            "Signing messages should match after roundtrip"
+        );
+        assert!(
+            public_key.verify(&decoded_msg, &decoded.signature),
+            "Decoded should verify"
+        );
+    }
 }

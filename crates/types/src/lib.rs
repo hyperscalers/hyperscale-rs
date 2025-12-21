@@ -17,6 +17,7 @@ mod crypto;
 mod hash;
 mod identifiers;
 mod network;
+mod proofs;
 mod signing;
 
 // Consensus types
@@ -37,6 +38,7 @@ pub use epoch::{
 pub use hash::{Hash, HexError};
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
 pub use network::{GlobalMessage, NetworkMessage, Request, ShardMessage};
+pub use proofs::{commitment_proof_message, CommitmentProof, CycleProof, DOMAIN_COMMITMENT_PROOF};
 pub use signing::{
     block_vote_message, exec_vote_message, state_provision_message, DOMAIN_BLOCK_VOTE,
     DOMAIN_EXEC_VOTE, DOMAIN_STATE_PROVISION,

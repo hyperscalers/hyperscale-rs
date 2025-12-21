@@ -14,8 +14,9 @@ use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_engine::RadixExecutor;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
-    Block, Hash as TxHash, KeyPair, KeyType, PublicKey, QuorumCertificate, ShardGroupId,
-    StaticTopology, Topology, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
+    Block, CommitmentProof, Hash as TxHash, KeyPair, KeyType, PublicKey, QuorumCertificate,
+    ShardGroupId, Signature, SignerBitfield, StaticTopology, Topology, TransactionStatus,
+    ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
@@ -398,6 +399,7 @@ impl SimulationRunner {
                 committed_certificates: vec![],
                 deferred: vec![],
                 aborted: vec![],
+                commitment_proofs: std::collections::HashMap::new(),
             };
 
             // Initialize all validators in this shard
@@ -483,6 +485,7 @@ impl SimulationRunner {
                 committed_certificates: vec![],
                 deferred: vec![],
                 aborted: vec![],
+                commitment_proofs: std::collections::HashMap::new(),
             };
 
             // Initialize all validators in this shard
@@ -718,6 +721,49 @@ impl SimulationRunner {
                     from,
                     self.now,
                     Event::ProvisionSignatureVerified { provision, valid },
+                );
+            }
+
+            Action::AggregateCommitmentProof {
+                tx_hash,
+                source_shard,
+                block_height,
+                entries,
+                signatures,
+                signer_indices,
+                committee_size,
+            } => {
+                // Build signer bitfield
+                let mut signers = SignerBitfield::new(committee_size);
+                for idx in &signer_indices {
+                    signers.set(*idx);
+                }
+
+                // Aggregate BLS signatures
+                let aggregated_signature = if signatures.is_empty() {
+                    Signature::zero()
+                } else {
+                    Signature::aggregate_bls(&signatures).unwrap_or_else(|_| Signature::zero())
+                };
+
+                // Build the commitment proof
+                let commitment_proof = CommitmentProof::new(
+                    tx_hash,
+                    source_shard,
+                    signers,
+                    aggregated_signature,
+                    block_height,
+                    entries,
+                );
+
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::CommitmentProofAggregated {
+                        tx_hash,
+                        source_shard,
+                        commitment_proof,
+                    },
                 );
             }
 

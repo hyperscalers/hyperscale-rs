@@ -24,9 +24,10 @@ use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_simulation::{NetworkTrafficAnalyzer, SimStorage, SimulatedNetwork};
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, ExecutionResult, Hash, KeyPair, NodeId, PublicKey,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, StaticTopology, Topology,
-    TransactionDecision, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
+    Block, BlockHeader, BlockHeight, CommitmentProof, ExecutionResult, Hash, KeyPair, NodeId,
+    PublicKey, QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
+    StaticTopology, Topology, TransactionDecision, TransactionStatus, ValidatorId, ValidatorInfo,
+    ValidatorSet,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -445,6 +446,46 @@ impl SimNode {
                 let valid = public_key.verify(&msg, &provision.signature);
                 self.internal_queue
                     .push_back(Event::ProvisionSignatureVerified { provision, valid });
+            }
+
+            Action::AggregateCommitmentProof {
+                tx_hash,
+                source_shard,
+                block_height,
+                entries,
+                signatures,
+                signer_indices,
+                committee_size,
+            } => {
+                // Build signer bitfield
+                let mut signers = SignerBitfield::new(committee_size);
+                for idx in &signer_indices {
+                    signers.set(*idx);
+                }
+
+                // Aggregate BLS signatures
+                let aggregated_signature = if signatures.is_empty() {
+                    Signature::zero()
+                } else {
+                    Signature::aggregate_bls(&signatures).unwrap_or_else(|_| Signature::zero())
+                };
+
+                // Build the commitment proof
+                let commitment_proof = CommitmentProof::new(
+                    tx_hash,
+                    source_shard,
+                    signers,
+                    aggregated_signature,
+                    block_height,
+                    entries,
+                );
+
+                self.internal_queue
+                    .push_back(Event::CommitmentProofAggregated {
+                        tx_hash,
+                        source_shard,
+                        commitment_proof,
+                    });
             }
 
             Action::VerifyStateVoteSignature { vote, public_key } => {
@@ -872,6 +913,7 @@ impl ParallelSimulator {
                 committed_certificates: vec![],
                 deferred: vec![],
                 aborted: vec![],
+                commitment_proofs: std::collections::HashMap::new(),
             };
 
             let shard_start = shard_id * self.config.validators_per_shard;
@@ -1011,6 +1053,7 @@ impl ParallelSimulator {
                 committed_certificates: vec![],
                 deferred: vec![],
                 aborted: vec![],
+                commitment_proofs: std::collections::HashMap::new(),
             };
 
             let shard_start = shard_id * self.config.validators_per_shard;

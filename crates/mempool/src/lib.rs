@@ -15,4 +15,4 @@
 
 mod state;
 
-pub use state::{LockContentionStats, MempoolConfig, MempoolState, DEFAULT_RPC_MEMPOOL_LIMIT};
+pub use state::{LockContentionStats, MempoolConfig, MempoolState};

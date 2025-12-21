@@ -26,8 +26,15 @@ pub struct Metrics {
     pub transactions_finalized: HistogramVec,
     pub mempool_size: Gauge,
 
-    // === Cross-shard ===
-    pub cross_shard_pending: Gauge,
+    // === Backpressure ===
+    /// Number of transactions currently holding state locks (Committed or Executed status).
+    pub in_flight: Gauge,
+    /// Deprecated: alias for in_flight. Use in_flight instead.
+    pub provisions_registered: Gauge,
+    /// Whether backpressure limit is currently active (0 or 1).
+    pub backpressure_active: Gauge,
+    /// Number of TXs with commitment proofs attached in last proposal.
+    pub txs_with_commitment_proof: Gauge,
 
     // === Infrastructure ===
     pub network_messages_sent: Counter,
@@ -165,10 +172,25 @@ impl Metrics {
             )
             .unwrap(),
 
-            // Cross-shard
-            cross_shard_pending: register_gauge!(
-                "hyperscale_cross_shard_pending",
-                "Number of cross-shard transactions in flight"
+            // Backpressure
+            in_flight: register_gauge!(
+                "hyperscale_in_flight",
+                "Number of transactions holding state locks (Committed or Executed)"
+            )
+            .unwrap(),
+            provisions_registered: register_gauge!(
+                "hyperscale_provisions_registered",
+                "Deprecated: same as in_flight"
+            )
+            .unwrap(),
+            backpressure_active: register_gauge!(
+                "hyperscale_backpressure_active",
+                "Whether backpressure limit is currently active (1) or not (0)"
+            )
+            .unwrap(),
+            txs_with_commitment_proof: register_gauge!(
+                "hyperscale_txs_with_commitment_proof",
+                "Number of TXs with commitment proofs in last proposal"
             )
             .unwrap(),
 
@@ -537,9 +559,23 @@ pub fn set_mempool_size(size: usize) {
     metrics().mempool_size.set(size as f64);
 }
 
-/// Update cross-shard pending count.
-pub fn set_cross_shard_pending(count: usize) {
-    metrics().cross_shard_pending.set(count as f64);
+/// Update in-flight transaction count (transactions holding state locks).
+pub fn set_in_flight(count: usize) {
+    metrics().in_flight.set(count as f64);
+    // Also update deprecated metric for backwards compatibility
+    metrics().provisions_registered.set(count as f64);
+}
+
+/// Update backpressure active status.
+pub fn set_backpressure_active(active: bool) {
+    metrics()
+        .backpressure_active
+        .set(if active { 1.0 } else { 0.0 });
+}
+
+/// Update count of TXs with commitment proofs.
+pub fn set_txs_with_commitment_proof(count: usize) {
+    metrics().txs_with_commitment_proof.set(count as f64);
 }
 
 /// Update thread pool queue depths.

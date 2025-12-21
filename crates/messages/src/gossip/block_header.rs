@@ -1,9 +1,11 @@
 //! BlockHeader gossip message.
 
 use hyperscale_types::{
-    BlockHeader, Hash, NetworkMessage, ShardMessage, TransactionAbort, TransactionDefer,
+    BlockHeader, CommitmentProof, Hash, NetworkMessage, ShardMessage, TransactionAbort,
+    TransactionDefer,
 };
 use sbor::prelude::BasicSbor;
+use std::collections::HashMap;
 
 /// Gossips a block proposal (header only, not full block).
 /// Validators construct the full Block locally from header + mempool transactions.
@@ -33,6 +35,13 @@ pub struct BlockHeaderGossip {
     ///
     /// These are transactions that timed out or exceeded retry limits.
     pub aborted: Vec<TransactionAbort>,
+
+    /// Commitment proofs for priority transaction ordering.
+    ///
+    /// Maps transaction hash to its CommitmentProof. Transactions with proofs
+    /// are ordered before transactions without proofs in the block.
+    /// This makes the block self-contained for ordering validation.
+    pub commitment_proofs: HashMap<Hash, CommitmentProof>,
 }
 
 impl BlockHeaderGossip {
@@ -44,6 +53,7 @@ impl BlockHeaderGossip {
             certificate_hashes: vec![],
             deferred: vec![],
             aborted: vec![],
+            commitment_proofs: HashMap::new(),
         }
     }
 
@@ -59,6 +69,7 @@ impl BlockHeaderGossip {
             certificate_hashes,
             deferred: vec![],
             aborted: vec![],
+            commitment_proofs: HashMap::new(),
         }
     }
 
@@ -69,6 +80,7 @@ impl BlockHeaderGossip {
         certificate_hashes: Vec<Hash>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
+        commitment_proofs: HashMap<Hash, CommitmentProof>,
     ) -> Self {
         Self {
             header,
@@ -76,6 +88,7 @@ impl BlockHeaderGossip {
             certificate_hashes,
             deferred,
             aborted,
+            commitment_proofs,
         }
     }
 
@@ -104,6 +117,11 @@ impl BlockHeaderGossip {
         &self.aborted
     }
 
+    /// Get the commitment proofs.
+    pub fn commitment_proofs(&self) -> &HashMap<Hash, CommitmentProof> {
+        &self.commitment_proofs
+    }
+
     /// Consume and return the inner block header.
     pub fn into_header(self) -> BlockHeader {
         self.header
@@ -119,6 +137,7 @@ impl BlockHeaderGossip {
         Vec<Hash>,
         Vec<TransactionDefer>,
         Vec<TransactionAbort>,
+        HashMap<Hash, CommitmentProof>,
     ) {
         (
             self.header,
@@ -126,6 +145,7 @@ impl BlockHeaderGossip {
             self.certificate_hashes,
             self.deferred,
             self.aborted,
+            self.commitment_proofs,
         )
     }
 }

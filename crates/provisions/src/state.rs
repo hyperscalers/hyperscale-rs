@@ -7,7 +7,8 @@
 use crate::ProvisionConfig;
 use hyperscale_core::{Action, Event, SubStateMachine};
 use hyperscale_types::{
-    BlockHeight, Hash, NodeId, ShardGroupId, StateProvision, Topology, ValidatorId,
+    BlockHeight, CommitmentProof, Hash, NodeId, ShardGroupId, Signature, SignerBitfield,
+    StateEntry, StateProvision, Topology, ValidatorId,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -303,21 +304,19 @@ impl ProvisionCoordinator {
                 // Collect the provisions that form the quorum
                 let quorum_provisions = self.collect_shard_quorum_provisions(tx_hash, source_shard);
 
+                // Build aggregation request - runner will do the BLS aggregation
+                let aggregation_action =
+                    self.build_aggregation_action(tx_hash, source_shard, &quorum_provisions);
+
                 debug!(
                     tx_hash = %tx_hash,
                     source_shard = source_shard.0,
                     provision_count = quorum_provisions.len(),
-                    "Shard quorum reached"
+                    "Shard quorum reached - requesting signature aggregation"
                 );
 
-                // Emit event for downstream consumers (livelock, execution)
-                actions.push(Action::EnqueueInternal {
-                    event: Event::ProvisionQuorumReached {
-                        tx_hash,
-                        source_shard,
-                        provisions: quorum_provisions,
-                    },
-                });
+                // Emit action for runner to aggregate signatures
+                actions.push(aggregation_action);
 
                 // Check if ALL required shards have quorum (ready for execution)
                 if self.all_shards_have_quorum(tx_hash) {
@@ -404,10 +403,14 @@ impl ProvisionCoordinator {
     ///
     /// Used by backpressure: if true, another shard has committed,
     /// so we must cooperate regardless of limits.
+    ///
+    /// This must be consistent with `build_commitment_proof` - if this returns true,
+    /// then `build_commitment_proof` must return Some. We check that at least one
+    /// shard has a non-empty provisions Vec.
     pub fn has_any_verified_provisions(&self, tx_hash: &Hash) -> bool {
         self.verified_provisions
             .get(tx_hash)
-            .map(|by_shard| !by_shard.is_empty())
+            .map(|by_shard| by_shard.values().any(|provisions| !provisions.is_empty()))
             .unwrap_or(false)
     }
 
@@ -469,6 +472,60 @@ impl ProvisionCoordinator {
     /// Get the registration for a transaction.
     pub fn get_registration(&self, tx_hash: &Hash) -> Option<&TxRegistration> {
         self.registered_txs.get(tx_hash)
+    }
+
+    /// Build a CommitmentProof for a transaction that has verified provisions.
+    ///
+    /// Returns `None` if:
+    /// - No verified provisions exist for this transaction
+    /// - No provisions from the first source shard
+    ///
+    /// The proof is built from the first source shard that has provisions.
+    /// This is sufficient for backpressure purposes - it proves another shard committed.
+    ///
+    /// Note: Currently uses a placeholder signature since we need BLS aggregation.
+    /// The signature verification is deferred to Phase 5c BFT validation.
+    pub fn build_commitment_proof(&self, tx_hash: &Hash) -> Option<CommitmentProof> {
+        let by_shard = self.verified_provisions.get(tx_hash)?;
+
+        // Get the first shard that has provisions
+        let (source_shard, provisions) = by_shard.iter().next()?;
+
+        if provisions.is_empty() {
+            return None;
+        }
+
+        // Get block height and entries from the first provision
+        // All provisions for the same (tx, shard) should have same entries
+        let first_provision = &provisions[0];
+        let block_height = first_provision.block_height;
+        let entries = Arc::clone(&first_provision.entries);
+
+        // Build signer bitfield from validator IDs
+        let num_validators = self.topology.global_validator_set().len();
+        let mut signers = SignerBitfield::new(num_validators);
+
+        for provision in provisions {
+            // ValidatorId(0) -> index 0, etc.
+            let validator_index = provision.validator_id.0 as usize;
+            if validator_index < num_validators {
+                signers.set(validator_index);
+            }
+        }
+
+        // TODO: Implement actual BLS signature aggregation
+        // For now, we use a placeholder signature. The BFT validation
+        // in Phase 5d will verify individual provision signatures.
+        let aggregated_signature = Signature::zero();
+
+        Some(CommitmentProof::new(
+            *tx_hash,
+            *source_shard,
+            signers,
+            aggregated_signature,
+            block_height,
+            (*entries).clone(),
+        ))
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -563,6 +620,85 @@ impl ProvisionCoordinator {
             .collect()
     }
 
+    /// Handle the callback when commitment proof aggregation completes.
+    ///
+    /// Emits `ProvisionQuorumReached` for downstream consumers (livelock, execution).
+    fn on_commitment_proof_aggregated(
+        &mut self,
+        tx_hash: Hash,
+        source_shard: ShardGroupId,
+        commitment_proof: CommitmentProof,
+    ) -> Vec<Action> {
+        debug!(
+            tx_hash = %tx_hash,
+            source_shard = source_shard.0,
+            signer_count = commitment_proof.signer_count(),
+            "Commitment proof aggregated"
+        );
+
+        // Emit event for downstream consumers (livelock, execution)
+        vec![Action::EnqueueInternal {
+            event: Event::ProvisionQuorumReached {
+                tx_hash,
+                source_shard,
+                commitment_proof,
+            },
+        }]
+    }
+
+    /// Build an aggregation action for the runner to perform BLS signature aggregation.
+    ///
+    /// The runner will aggregate the signatures and return the CommitmentProof
+    /// via the CommitmentProofAggregated event.
+    fn build_aggregation_action(
+        &self,
+        tx_hash: Hash,
+        source_shard: ShardGroupId,
+        provisions: &[StateProvision],
+    ) -> Action {
+        // Get committee size for the source shard to build proper SignerBitfield
+        let committee_size = self.topology.committee_size_for_shard(source_shard);
+
+        // Collect signatures and signer indices
+        let mut signatures = Vec::with_capacity(provisions.len());
+        let mut signer_indices = Vec::with_capacity(provisions.len());
+
+        for provision in provisions {
+            // Get validator's index in the source shard committee
+            if let Some(idx) = self
+                .topology
+                .committee_index_for_shard(source_shard, provision.validator_id)
+            {
+                signer_indices.push(idx);
+                signatures.push(provision.signature.clone());
+            }
+        }
+
+        // Get block height from the first provision (all should be same height)
+        let block_height = provisions
+            .first()
+            .map(|p| p.block_height)
+            .unwrap_or(BlockHeight(0));
+
+        // Deduplicate entries from all provisions
+        // All provisions for the same tx/shard should have identical entries,
+        // but we take from the first provision to be safe.
+        let entries: Vec<StateEntry> = provisions
+            .first()
+            .map(|p| p.entries.as_ref().clone())
+            .unwrap_or_default();
+
+        Action::AggregateCommitmentProof {
+            tx_hash,
+            source_shard,
+            block_height,
+            entries,
+            signatures,
+            signer_indices,
+            committee_size,
+        }
+    }
+
     /// Clean up all state for a transaction.
     fn cleanup_tx(&mut self, tx_hash: &Hash) {
         // Remove registration
@@ -603,6 +739,17 @@ impl SubStateMachine for ProvisionCoordinator {
             Event::ProvisionSignatureVerified { provision, valid } => {
                 Some(self.on_provision_verified(provision.clone(), *valid))
             }
+
+            // Callback from signature aggregation
+            Event::CommitmentProofAggregated {
+                tx_hash,
+                source_shard,
+                commitment_proof,
+            } => Some(self.on_commitment_proof_aggregated(
+                *tx_hash,
+                *source_shard,
+                commitment_proof.clone(),
+            )),
 
             // ═══════════════════════════════════════════════════════════
             // Transaction Registration (from ExecutionState)
@@ -978,6 +1125,71 @@ mod tests {
 
         coordinator.on_tx_registered(tx2, make_registration(vec![ShardGroupId(1)], 1));
         assert_eq!(coordinator.cross_shard_pending_count(), 2);
+    }
+
+    #[test]
+    fn test_build_commitment_proof_returns_none_without_provisions() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        let tx_hash = Hash::from_bytes(b"test_tx");
+        assert!(coordinator.build_commitment_proof(&tx_hash).is_none());
+    }
+
+    #[test]
+    fn test_build_commitment_proof_success() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        let tx_hash = Hash::from_bytes(b"test_tx");
+        let registration = make_registration(vec![ShardGroupId(1)], 2);
+        coordinator.on_tx_registered(tx_hash, registration);
+
+        // Add two verified provisions
+        let provision1 = make_provision(tx_hash, ShardGroupId(1), ValidatorId(3));
+        coordinator.on_provision_received(provision1.clone());
+        coordinator.on_provision_verified(provision1, true);
+
+        let provision2 = make_provision(tx_hash, ShardGroupId(1), ValidatorId(4));
+        coordinator.on_provision_received(provision2.clone());
+        coordinator.on_provision_verified(provision2, true);
+
+        // Build proof
+        let proof = coordinator.build_commitment_proof(&tx_hash);
+        assert!(proof.is_some());
+
+        let proof = proof.unwrap();
+        assert_eq!(proof.tx_hash, tx_hash);
+        assert_eq!(proof.source_shard, ShardGroupId(1));
+        assert_eq!(proof.signer_count(), 2);
+        assert!(proof.signer_indices().contains(&3));
+        assert!(proof.signer_indices().contains(&4));
+    }
+
+    #[test]
+    fn test_build_commitment_proof_includes_entries() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        let tx_hash = Hash::from_bytes(b"test_tx");
+        let registration = make_registration(vec![ShardGroupId(1)], 1);
+        coordinator.on_tx_registered(tx_hash, registration);
+
+        let node1 = make_test_node_id(1);
+        let node2 = make_test_node_id(2);
+        let provision =
+            make_provision_with_nodes(tx_hash, ShardGroupId(1), ValidatorId(3), vec![node1, node2]);
+
+        coordinator.on_provision_received(provision.clone());
+        coordinator.on_provision_verified(provision, true);
+
+        let proof = coordinator.build_commitment_proof(&tx_hash).unwrap();
+
+        // Verify entries are included
+        assert_eq!(proof.entries.len(), 2);
+        let proof_nodes = proof.nodes();
+        assert!(proof_nodes.contains(&node1));
+        assert!(proof_nodes.contains(&node2));
     }
 
     // ═══════════════════════════════════════════════════════════════════════

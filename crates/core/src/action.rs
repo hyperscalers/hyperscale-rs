@@ -4,8 +4,8 @@ use crate::{message::OutboundMessage, Event, TimerId};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, EpochConfig, EpochId, Hash, NodeId, PublicKey,
     QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
-    StateCertificate, StateProvision, StateVoteBlock, TransactionCertificate, ValidatorId,
-    VotePower,
+    StateCertificate, StateEntry, StateProvision, StateVoteBlock, TransactionCertificate,
+    ValidatorId, VotePower,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -119,6 +119,28 @@ pub enum Action {
         provision: StateProvision,
         /// Public key of the sending validator (pre-resolved by state machine).
         public_key: PublicKey,
+    },
+
+    /// Aggregate provisions into a CommitmentProof (cross-shard quorum reached).
+    ///
+    /// Performs BLS signature aggregation which is compute-intensive.
+    /// Delegated to a thread pool in production, instant in simulation.
+    /// Returns `Event::CommitmentProofAggregated` when complete.
+    AggregateCommitmentProof {
+        /// Transaction hash for correlation.
+        tx_hash: Hash,
+        /// Source shard that reached quorum.
+        source_shard: ShardGroupId,
+        /// Block height when provisions were created.
+        block_height: BlockHeight,
+        /// State entries (deduplicated from provisions).
+        entries: Vec<StateEntry>,
+        /// Signatures to aggregate (one per provision).
+        signatures: Vec<Signature>,
+        /// Validator indices in committee (for SignerBitfield).
+        signer_indices: Vec<usize>,
+        /// Committee size (for SignerBitfield capacity).
+        committee_size: usize,
     },
 
     /// Verify a state vote's signature (cross-shard Phase 4).
@@ -485,6 +507,7 @@ impl Action {
             self,
             Action::VerifyVoteSignature { .. }
                 | Action::VerifyProvisionSignature { .. }
+                | Action::AggregateCommitmentProof { .. }
                 | Action::VerifyStateVoteSignature { .. }
                 | Action::VerifyStateCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
@@ -545,6 +568,7 @@ impl Action {
             // Delegated Work - Crypto Verification
             Action::VerifyVoteSignature { .. } => "VerifyVoteSignature",
             Action::VerifyProvisionSignature { .. } => "VerifyProvisionSignature",
+            Action::AggregateCommitmentProof { .. } => "AggregateCommitmentProof",
             Action::VerifyStateVoteSignature { .. } => "VerifyStateVoteSignature",
             Action::VerifyStateCertificateSignature { .. } => "VerifyStateCertificateSignature",
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",

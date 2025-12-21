@@ -242,6 +242,34 @@ impl NodeStateMachine {
         let timeout = self.bft.config().view_change_timeout;
         self.now.saturating_sub(self.last_qc_time) >= timeout
     }
+
+    /// Build commitment proofs for cross-shard transactions.
+    ///
+    /// Returns a HashMap mapping transaction hash to CommitmentProof for all
+    /// cross-shard transactions that have verified provisions. This is included
+    /// in the block to make it self-contained for validation.
+    fn build_commitment_proofs(
+        &self,
+        txs: &[Arc<hyperscale_types::RoutableTransaction>],
+    ) -> std::collections::HashMap<hyperscale_types::Hash, hyperscale_types::CommitmentProof> {
+        let num_shards = self.topology.num_shards();
+        let mut proofs = std::collections::HashMap::new();
+
+        for tx in txs {
+            // Only build proofs for cross-shard transactions
+            if !tx.is_cross_shard(num_shards) {
+                continue;
+            }
+
+            // Check if we have verified provisions for this transaction
+            let tx_hash = tx.hash();
+            if let Some(proof) = self.provisions.build_commitment_proof(&tx_hash) {
+                proofs.insert(tx_hash, proof);
+            }
+        }
+
+        proofs
+    }
 }
 
 impl StateMachine for NodeStateMachine {
@@ -261,7 +289,8 @@ impl StateMachine for NodeStateMachine {
                     self.last_qc_time = self.now;
 
                     let max_txs = self.bft.config().max_transactions_per_block;
-                    let txs = self.mempool.ready_transactions(max_txs);
+                    let txs = self.mempool.ready_transactions(max_txs, &self.provisions);
+                    // Note: commitment_proofs not needed for advance_round - it builds empty fallback blocks
                     let deferred = self.livelock.get_pending_deferrals();
                     let current_height =
                         hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
@@ -283,7 +312,8 @@ impl StateMachine for NodeStateMachine {
 
                 // Normal proposal timer - try to propose if we're the proposer
                 let max_txs = self.bft.config().max_transactions_per_block;
-                let txs = self.mempool.ready_transactions(max_txs);
+                let txs = self.mempool.ready_transactions(max_txs, &self.provisions);
+                let commitment_proofs = self.build_commitment_proofs(&txs);
                 // Get pending deferrals from livelock state
                 let deferred = self.livelock.get_pending_deferrals();
                 // Get timed-out transactions from mempool
@@ -296,9 +326,13 @@ impl StateMachine for NodeStateMachine {
                 );
                 // Get finalized certificates (removed when committed in a block)
                 let certificates = self.execution.get_finalized_certificates();
-                return self
-                    .bft
-                    .on_proposal_timer(&txs, deferred, aborted, certificates);
+                return self.bft.on_proposal_timer(
+                    &txs,
+                    deferred,
+                    aborted,
+                    certificates,
+                    commitment_proofs,
+                );
             }
 
             // BlockHeaderReceived needs mempool for transaction lookup and certificates
@@ -308,6 +342,7 @@ impl StateMachine for NodeStateMachine {
                 cert_hashes,
                 deferred,
                 aborted,
+                commitment_proofs,
             } => {
                 let mempool_txs = self.mempool.transactions_by_hash();
                 let local_certs = self.execution.finalized_certificates_by_hash();
@@ -330,6 +365,7 @@ impl StateMachine for NodeStateMachine {
                     cert_hashes.clone(),
                     deferred.clone(),
                     aborted.clone(),
+                    commitment_proofs.clone(),
                     &mempool_txs,
                     &local_certs,
                 );
@@ -344,7 +380,8 @@ impl StateMachine for NodeStateMachine {
                 self.last_qc_time = self.now;
 
                 let max_txs = self.bft.config().max_transactions_per_block;
-                let txs = self.mempool.ready_transactions(max_txs);
+                let txs = self.mempool.ready_transactions(max_txs, &self.provisions);
+                let commitment_proofs = self.build_commitment_proofs(&txs);
                 let deferred = self.livelock.get_pending_deferrals();
                 let current_height = hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
                 let aborted = self.mempool.get_timed_out_transactions(
@@ -360,6 +397,7 @@ impl StateMachine for NodeStateMachine {
                     deferred,
                     aborted,
                     certificates,
+                    commitment_proofs,
                 );
             }
 
@@ -477,6 +515,14 @@ impl StateMachine for NodeStateMachine {
                 }
             }
 
+            // CommitmentProofAggregated: callback from signature aggregation
+            Event::CommitmentProofAggregated { .. } => {
+                // Route to provision coordinator to emit ProvisionQuorumReached
+                if let Some(actions) = self.provisions.try_handle(&event) {
+                    return actions;
+                }
+            }
+
             // CrossShardTxRegistered: route to coordinator for tracking
             Event::CrossShardTxRegistered { .. } => {
                 if let Some(actions) = self.provisions.try_handle(&event) {
@@ -500,11 +546,14 @@ impl StateMachine for NodeStateMachine {
             Event::ProvisionQuorumReached {
                 tx_hash,
                 source_shard,
-                provisions,
+                commitment_proof,
             } => {
                 // Cycle detection in livelock (may queue a deferral)
-                self.livelock
-                    .on_provision_quorum_reached(*tx_hash, *source_shard, provisions);
+                self.livelock.on_provision_quorum_reached(
+                    *tx_hash,
+                    *source_shard,
+                    commitment_proof,
+                );
 
                 // No actions needed - execution waits for ProvisioningComplete
                 return vec![];

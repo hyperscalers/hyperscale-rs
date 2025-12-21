@@ -205,6 +205,7 @@ impl OutboundMessage {
                 cert_hashes: gossip.certificate_hashes.clone(),
                 deferred: gossip.deferred.clone(),
                 aborted: gossip.aborted.clone(),
+                commitment_proofs: gossip.commitment_proofs.clone(),
             }],
             OutboundMessage::BlockVote(gossip) => vec![Event::BlockVoteReceived {
                 vote: gossip.vote.clone(),

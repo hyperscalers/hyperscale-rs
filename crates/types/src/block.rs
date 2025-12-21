@@ -1,10 +1,11 @@
 //! Block and BlockHeader types for consensus.
 
 use crate::{
-    BlockHeight, Hash, QuorumCertificate, RoutableTransaction, TransactionAbort,
+    BlockHeight, CommitmentProof, Hash, QuorumCertificate, RoutableTransaction, TransactionAbort,
     TransactionCertificate, TransactionDefer, ValidatorId,
 };
 use sbor::prelude::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Block header containing consensus metadata.
@@ -90,6 +91,15 @@ pub struct Block {
     /// used for N-way cycles that cannot be resolved via simple deferral,
     /// or for transactions that explicitly failed during execution.
     pub aborted: Vec<TransactionAbort>,
+
+    /// Commitment proofs for priority transaction ordering.
+    ///
+    /// Maps transaction hash to its CommitmentProof. Transactions with proofs
+    /// are ordered before transactions without proofs in the block.
+    ///
+    /// This makes the block self-contained: validators can verify the ordering
+    /// is correct without needing to have received the same provisions.
+    pub commitment_proofs: HashMap<Hash, CommitmentProof>,
 }
 
 // Manual PartialEq - compare transaction/certificate content, not Arc pointers
@@ -110,6 +120,7 @@ impl PartialEq for Block {
                 .all(|(a, b)| a.as_ref() == b.as_ref())
             && self.deferred == other.deferred
             && self.aborted == other.aborted
+            && self.commitment_proofs == other.commitment_proofs
     }
 }
 
@@ -126,7 +137,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(5)?;
+        encoder.write_size(6)?;
         encoder.encode(&self.header)?;
         // Transactions (manual encoding to unwrap Arc)
         encoder.write_value_kind(sbor::ValueKind::Array)?;
@@ -144,6 +155,18 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         }
         encoder.encode(&self.deferred)?;
         encoder.encode(&self.aborted)?;
+        // Commitment proofs (HashMap<Hash, CommitmentProof>)
+        // Encode as array of (key, value) pairs for determinism
+        encoder.write_value_kind(sbor::ValueKind::Array)?;
+        encoder.write_value_kind(sbor::ValueKind::Tuple)?;
+        encoder.write_size(self.commitment_proofs.len())?;
+        // Sort by hash for deterministic encoding
+        let mut proofs: Vec<_> = self.commitment_proofs.iter().collect();
+        proofs.sort_by_key(|(k, _)| *k);
+        for (tx_hash, proof) in proofs {
+            encoder.encode(tx_hash)?;
+            encoder.encode(proof)?;
+        }
         Ok(())
     }
 }
@@ -156,9 +179,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 5 {
+        if length != 6 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 5,
+                expected: 6,
                 actual: length,
             });
         }
@@ -190,12 +213,24 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let deferred: Vec<TransactionDefer> = decoder.decode()?;
         let aborted: Vec<TransactionAbort> = decoder.decode()?;
 
+        // Commitment proofs (array of (Hash, CommitmentProof) pairs)
+        decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
+        decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
+        let proof_count = decoder.read_size()?;
+        let mut commitment_proofs = HashMap::with_capacity(proof_count);
+        for _ in 0..proof_count {
+            let tx_hash: Hash = decoder.decode()?;
+            let proof: CommitmentProof = decoder.decode()?;
+            commitment_proofs.insert(tx_hash, proof);
+        }
+
         Ok(Self {
             header,
             transactions,
             committed_certificates,
             deferred,
             aborted,
+            commitment_proofs,
         })
     }
 }
@@ -261,7 +296,18 @@ impl Block {
             committed_certificates: vec![],
             deferred: vec![],
             aborted: vec![],
+            commitment_proofs: HashMap::new(),
         }
+    }
+
+    /// Check if a transaction has a commitment proof in this block.
+    pub fn has_commitment_proof(&self, tx_hash: &Hash) -> bool {
+        self.commitment_proofs.contains_key(tx_hash)
+    }
+
+    /// Get the commitment proof for a transaction, if present.
+    pub fn get_commitment_proof(&self, tx_hash: &Hash) -> Option<&CommitmentProof> {
+        self.commitment_proofs.get(tx_hash)
     }
 
     /// Get number of committed certificates in this block.

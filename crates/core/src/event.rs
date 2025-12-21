@@ -1,10 +1,10 @@
 //! Event types for the deterministic state machine.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockVote, EpochConfig, EpochId, ExecutionResult, Hash,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, StateCertificate, StateEntry,
-    StateProvision, StateVoteBlock, TransactionAbort, TransactionCertificate, TransactionDefer,
-    ValidatorId,
+    Block, BlockHeader, BlockHeight, BlockVote, CommitmentProof, EpochConfig, EpochId,
+    ExecutionResult, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, StateCertificate,
+    StateEntry, StateProvision, StateVoteBlock, TransactionAbort, TransactionCertificate,
+    TransactionDefer, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -63,6 +63,8 @@ pub enum Event {
         deferred: Vec<TransactionDefer>,
         /// Aborted transactions in this block.
         aborted: Vec<TransactionAbort>,
+        /// Commitment proofs for priority transaction ordering.
+        commitment_proofs: std::collections::HashMap<Hash, CommitmentProof>,
     },
 
     /// Received a vote on a block header.
@@ -175,6 +177,19 @@ pub enum Event {
         valid: bool,
     },
 
+    /// Commitment proof aggregation completed.
+    ///
+    /// Callback from `Action::AggregateCommitmentProof`.
+    /// Contains the aggregated BLS signature proving quorum commitment.
+    CommitmentProofAggregated {
+        /// Transaction hash for correlation.
+        tx_hash: Hash,
+        /// Source shard that reached quorum.
+        source_shard: ShardGroupId,
+        /// The aggregated commitment proof.
+        commitment_proof: CommitmentProof,
+    },
+
     /// State vote signature verification completed.
     ///
     /// Callback from `Action::VerifyStateVoteSignature`.
@@ -249,8 +264,13 @@ pub enum Event {
         tx_hash: Hash,
         /// The source shard that reached quorum.
         source_shard: ShardGroupId,
-        /// The provisions that formed the quorum (verified signatures).
-        provisions: Vec<StateProvision>,
+        /// Aggregated proof of commitment from the source shard.
+        ///
+        /// Contains the aggregated BLS signature from all validators who provided
+        /// provisions, plus the state entries. This proof enables:
+        /// - Livelock to build CycleProof for deferrals
+        /// - Backpressure bypass for transactions with proof
+        commitment_proof: CommitmentProof,
     },
 
     /// All required shards have reached provision quorum - ready for execution.
@@ -575,6 +595,7 @@ impl Event {
             | Event::TransactionStatusChanged { .. }
             | Event::VoteSignatureVerified { .. }
             | Event::ProvisionSignatureVerified { .. }
+            | Event::CommitmentProofAggregated { .. }
             | Event::StateVoteSignatureVerified { .. }
             | Event::StateCertificateSignatureVerified { .. }
             | Event::QcSignatureVerified { .. }
@@ -683,6 +704,7 @@ impl Event {
             // Async Callbacks - Crypto Verification
             Event::VoteSignatureVerified { .. } => "VoteSignatureVerified",
             Event::ProvisionSignatureVerified { .. } => "ProvisionSignatureVerified",
+            Event::CommitmentProofAggregated { .. } => "CommitmentProofAggregated",
             Event::StateVoteSignatureVerified { .. } => "StateVoteSignatureVerified",
             Event::StateCertificateSignatureVerified { .. } => "StateCertificateSignatureVerified",
             Event::QcSignatureVerified { .. } => "QcSignatureVerified",

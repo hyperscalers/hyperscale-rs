@@ -1,6 +1,6 @@
 //! Transaction types for consensus.
 
-use crate::{BlockHeight, Hash, NodeId, ShardGroupId, StateCertificate, SubstateWrite};
+use crate::{BlockHeight, CycleProof, Hash, NodeId, ShardGroupId, StateCertificate, SubstateWrite};
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
 use radix_transactions::validation::TransactionValidator;
@@ -368,7 +368,7 @@ impl std::fmt::Display for DeferReason {
 /// When a proposer detects that a transaction should be deferred (via cycle
 /// detection during provisioning), they include this in the block. All
 /// validators process it identically, releasing locks and queuing for retry.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransactionDefer {
     /// Hash of the transaction being deferred.
     pub tx_hash: Hash,
@@ -379,15 +379,107 @@ pub struct TransactionDefer {
     /// Block height where this deferral is being committed.
     /// Used for timeout calculations on the retry.
     pub block_height: BlockHeight,
+
+    /// Proof of the cycle that caused this deferral.
+    ///
+    /// Required for block validation. Validators verify this proof to ensure
+    /// the deferral is justified without needing to have seen the same provisions.
+    pub proof: Option<CycleProof>,
+}
+
+// ============================================================================
+// Manual SBOR implementation for TransactionDefer (CycleProof contains Arc)
+// ============================================================================
+
+impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
+    for TransactionDefer
+{
+    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_value_kind(sbor::ValueKind::Tuple)
+    }
+
+    fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_size(4)?;
+        encoder.encode(&self.tx_hash)?;
+        encoder.encode(&self.reason)?;
+        encoder.encode(&self.block_height)?;
+        encoder.encode(&self.proof)?;
+        Ok(())
+    }
+}
+
+impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
+    for TransactionDefer
+{
+    fn decode_body_with_value_kind(
+        decoder: &mut D,
+        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
+    ) -> Result<Self, sbor::DecodeError> {
+        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
+        let length = decoder.read_size()?;
+
+        if length != 4 {
+            return Err(sbor::DecodeError::UnexpectedSize {
+                expected: 4,
+                actual: length,
+            });
+        }
+
+        let tx_hash: Hash = decoder.decode()?;
+        let reason: DeferReason = decoder.decode()?;
+        let block_height: BlockHeight = decoder.decode()?;
+        let proof: Option<CycleProof> = decoder.decode()?;
+
+        Ok(Self {
+            tx_hash,
+            reason,
+            block_height,
+            proof,
+        })
+    }
+}
+
+impl sbor::Categorize<sbor::NoCustomValueKind> for TransactionDefer {
+    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
+        sbor::ValueKind::Tuple
+    }
+}
+
+impl sbor::Describe<sbor::NoCustomTypeKind> for TransactionDefer {
+    const TYPE_ID: sbor::RustTypeId =
+        sbor::RustTypeId::novel_with_code("TransactionDefer", &[], &[]);
+
+    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
+        sbor::TypeData::unnamed(sbor::TypeKind::Any)
+    }
 }
 
 impl TransactionDefer {
-    /// Create a new transaction deferral for a livelock cycle.
+    /// Create a new transaction deferral for a livelock cycle without proof.
+    ///
+    /// The proof should be attached later using `with_proof()` before including
+    /// in a block.
     pub fn livelock_cycle(tx_hash: Hash, winner_tx_hash: Hash, block_height: BlockHeight) -> Self {
         Self {
             tx_hash,
             reason: DeferReason::LivelockCycle { winner_tx_hash },
             block_height,
+            proof: None,
+        }
+    }
+
+    /// Create a new transaction deferral for a livelock cycle with proof.
+    pub fn livelock_cycle_with_proof(
+        tx_hash: Hash,
+        winner_tx_hash: Hash,
+        block_height: BlockHeight,
+        proof: CycleProof,
+    ) -> Self {
+        Self {
+            tx_hash,
+            reason: DeferReason::LivelockCycle { winner_tx_hash },
+            block_height,
+            proof: Some(proof),
         }
     }
 
@@ -396,6 +488,22 @@ impl TransactionDefer {
         match &self.reason {
             DeferReason::LivelockCycle { winner_tx_hash } => Some(winner_tx_hash),
         }
+    }
+
+    /// Check if this deferral has a proof attached.
+    pub fn has_proof(&self) -> bool {
+        self.proof.is_some()
+    }
+
+    /// Get the cycle proof if present.
+    pub fn cycle_proof(&self) -> Option<&CycleProof> {
+        self.proof.as_ref()
+    }
+
+    /// Create a copy of this deferral with a proof attached.
+    pub fn with_proof(mut self, proof: CycleProof) -> Self {
+        self.proof = Some(proof);
+        self
     }
 }
 

@@ -165,15 +165,12 @@ pub struct MempoolSnapshot {
     pub updated_at: Option<Instant>,
     /// Whether the mempool is accepting new RPC transactions.
     ///
-    /// When `false`, the mempool has reached its `max_rpc_pool_size` and
-    /// new RPC submissions should be rejected with a "mempool full" response.
-    /// This provides backpressure to clients.
+    /// When `false`, the cross-shard hard limit has been reached and new RPC
+    /// submissions should be rejected with a backpressure response.
     ///
     /// Defaults to `true` so that transactions can be accepted before the first
     /// snapshot update from the runner.
     pub accepting_rpc_transactions: bool,
-    /// Maximum RPC pool size, if configured.
-    pub max_rpc_pool_size: Option<usize>,
 }
 
 impl Default for MempoolSnapshot {
@@ -186,7 +183,6 @@ impl Default for MempoolSnapshot {
             blocked_count: 0,
             updated_at: None,
             accepting_rpc_transactions: true, // Default to accepting until we know otherwise
-            max_rpc_pool_size: None,
         }
     }
 }

@@ -1181,7 +1181,10 @@ fn test_mempool_to_block_integration() {
     );
 
     // Get ready transactions count
-    let ready_count = node0.mempool().ready_transactions(100).len();
+    let ready_count = node0
+        .mempool()
+        .ready_transactions(100, node0.provisions())
+        .len();
     assert_eq!(ready_count, 3, "Should have 3 ready transactions");
 
     println!("Mempool state before proposals:");

@@ -17,8 +17,9 @@ use hyperscale_types::BlockHeight;
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
-    Block, BlockHeader, BlockVote, Hash, KeyPair, PublicKey, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, Signature, StateVoteBlock, Topology, ValidatorId,
+    Block, BlockHeader, BlockVote, CommitmentProof, Hash, KeyPair, PublicKey, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, Signature, SignerBitfield, StateVoteBlock, Topology,
+    ValidatorId,
 };
 use libp2p::identity;
 use sbor::prelude::*;
@@ -201,8 +202,6 @@ pub struct ProductionRunnerBuilder {
     speculative_max_txs: usize,
     /// Rounds to pause speculation after a view change.
     view_change_cooldown_rounds: u64,
-    /// Maximum transactions in mempool before rejecting RPC submissions.
-    rpc_mempool_limit: Option<usize>,
 }
 
 impl Default for ProductionRunnerBuilder {
@@ -230,7 +229,6 @@ impl ProductionRunnerBuilder {
             network_definition: None,
             speculative_max_txs: 500, // Default, matches hyperscale_execution::DEFAULT_SPECULATIVE_MAX_TXS
             view_change_cooldown_rounds: 3, // Default, matches hyperscale_execution::DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS
-            rpc_mempool_limit: None,        // Use MempoolConfig::default()
         }
     }
 
@@ -303,17 +301,6 @@ impl ProductionRunnerBuilder {
     /// Default: 3
     pub fn view_change_cooldown_rounds(mut self, rounds: u64) -> Self {
         self.view_change_cooldown_rounds = rounds;
-        self
-    }
-
-    /// Set the maximum transactions in mempool before rejecting RPC submissions.
-    ///
-    /// When the pool reaches this size, new RPC submissions return 503 Service Unavailable.
-    /// Gossip transactions are still accepted to allow block validation.
-    /// Set to 0 for unlimited (not recommended).
-    /// Default: 16,384 (4x block size)
-    pub fn rpc_mempool_limit(mut self, limit: usize) -> Self {
-        self.rpc_mempool_limit = if limit == 0 { None } else { Some(limit) };
         self
     }
 
@@ -410,12 +397,6 @@ impl ProductionRunnerBuilder {
         // Load RecoveredState from storage for crash recovery
         let recovered = storage.load_recovered_state();
 
-        // Build mempool config
-        let mempool_config = match self.rpc_mempool_limit {
-            Some(limit) => MempoolConfig::new().with_max_rpc_pool_size(Some(limit)),
-            None => MempoolConfig::default(),
-        };
-
         // NodeIndex is a simulation concept - production uses 0
         let state = NodeStateMachine::with_speculative_config(
             0, // node_index not meaningful in production
@@ -425,7 +406,7 @@ impl ProductionRunnerBuilder {
             recovered,
             self.speculative_max_txs,
             self.view_change_cooldown_rounds,
-            mempool_config,
+            MempoolConfig::default(),
         );
         let timer_manager = TimerManager::new(timer_tx);
 
@@ -805,6 +786,7 @@ impl ProductionRunner {
             committed_certificates: vec![],
             deferred: vec![],
             aborted: vec![],
+            commitment_proofs: std::collections::HashMap::new(),
         };
 
         let genesis_hash = genesis_block.hash();
@@ -880,14 +862,19 @@ impl ProductionRunner {
             // Use biased select for priority ordering:
             // 1. Shutdown (always first)
             // 2. Timers (Critical priority - dedicated channel, never blocked by network)
-            // 3. Callbacks (Internal priority - crypto/execution results that unblock consensus)
-            // 4. Consensus (Network priority - BFT messages from network)
-            // 5. Transaction fetch requests (needed for active consensus)
-            // 6. Certificate fetch requests (needed for active consensus)
-            // 7. Transactions (Client priority - submissions, gossip)
-            // 8. Sync requests (background)
-            // 9. Status events (non-critical)
-            // 10. Ticks (periodic maintenance)
+            // 3. Fetch requests (Critical - unblocks OTHER validators' consensus, quick O(1) lookups)
+            // 4. Callbacks (Internal priority - crypto/execution results that unblock our consensus)
+            // 5. Consensus (Network priority - BFT messages from network)
+            // 6. Transactions (Client priority - submissions, gossip)
+            // 7. Sync requests (background)
+            // 8. Status events (non-critical)
+            // 9. Ticks (periodic maintenance)
+            //
+            // Rationale for fetch > callbacks:
+            // - Fetch handlers are O(1) hashmap lookups, very fast
+            // - Callbacks can trigger complex state machine transitions
+            // - Delayed fetch responses block OTHER validators from voting
+            // - Our callbacks only affect our own progress, not the network
             tokio::select! {
                 biased;
 
@@ -964,17 +951,21 @@ impl ProductionRunner {
 
                     // Update mempool snapshot for RPC queries (non-blocking: skip if contended)
                     if let Some(ref snapshot) = self.mempool_snapshot {
-                        let stats = self.state.mempool().lock_contention_stats();
-                        let total = self.state.mempool().len();
-                        let accepting = self.state.mempool().is_accepting_rpc_transactions();
-                        let max_size = self.state.mempool().max_rpc_pool_size();
+                        let mempool = self.state.mempool();
+                        let stats = mempool.lock_contention_stats();
+                        let total = mempool.len();
+
+                        // RPC back-pressure: reject when hard-limit is reached
+                        let accepting = !mempool.at_in_flight_hard_limit();
 
                         // Update Prometheus metrics
                         crate::metrics::set_mempool_size(total);
                         crate::metrics::set_lock_contention_from_stats(&stats);
-                        crate::metrics::set_cross_shard_pending(
-                            self.state.execution().cross_shard_pending_count(),
-                        );
+
+                        // Backpressure metrics - use mempool's view of in-flight TXs
+                        let in_flight = mempool.in_flight();
+                        crate::metrics::set_in_flight(in_flight);
+                        crate::metrics::set_backpressure_active(mempool.at_in_flight_limit());
 
                         if let Ok(mut snap) = snapshot.try_write() {
                             snap.pending_count = stats.pending_count as usize;
@@ -984,7 +975,6 @@ impl ProductionRunner {
                             snap.total_count = total;
                             snap.updated_at = Some(std::time::Instant::now());
                             snap.accepting_rpc_transactions = accepting;
-                            snap.max_rpc_pool_size = max_size;
                         }
                     }
                 }
@@ -1018,10 +1008,44 @@ impl ProductionRunner {
                     }
                 }
 
-                // HIGHEST PRIORITY: Callback events (Internal priority)
-                // These are results from crypto verification and execution that unblock
-                // in-flight consensus work. Process ALL available callbacks before
-                // checking other channels to ensure consensus makes progress.
+                // CRITICAL PRIORITY: Handle inbound fetch requests from peers
+                // These must be processed quickly to unblock OTHER validators' consensus.
+                // A peer waiting for our certificates/transactions can't vote until we respond.
+                // These are O(1) hashmap lookups - very fast, won't block the loop.
+                Some(request) = self.cert_request_rx.recv() => {
+                    let cert_span = span!(
+                        Level::DEBUG,
+                        "handle_cert_request",
+                        peer = %request.peer,
+                        block_hash = ?request.block_hash,
+                        cert_count = request.cert_hashes.len(),
+                        channel_id = request.channel_id,
+                    );
+                    let _cert_guard = cert_span.enter();
+
+                    self.handle_inbound_certificate_request(request);
+                }
+
+                Some(request) = self.tx_request_rx.recv() => {
+                    let tx_span = span!(
+                        Level::DEBUG,
+                        "handle_tx_request",
+                        peer = %request.peer,
+                        block_hash = ?request.block_hash,
+                        tx_count = request.tx_hashes.len(),
+                        channel_id = request.channel_id,
+                    );
+                    let _tx_guard = tx_span.enter();
+
+                    self.handle_inbound_transaction_request(request);
+                }
+
+                // HIGH PRIORITY: Callback events (crypto/execution results)
+                // These unblock our own in-flight consensus work.
+                //
+                // IMPORTANT: ProvisioningComplete events come through this channel and
+                // produce ExecuteCrossShardTransaction actions. These must be accumulated
+                // for batch parallel execution, not sent directly to process_action().
                 Some(event) = self.callback_rx.recv() => {
                     let event_type = event.type_name();
                     let event_span = span!(
@@ -1040,9 +1064,30 @@ impl ProductionRunner {
                     // Dispatch event through unified handler
                     let actions = self.dispatch_event(event).await;
 
+                    // Process actions, accumulating cross-shard executions for batching
                     for action in actions {
-                        if let Err(e) = self.process_action(action).await {
-                            tracing::error!(error = ?e, "Error processing action from callback");
+                        match action {
+                            Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
+                                // Accumulate cross-shard executions for batch parallel execution
+                                if self.pending_cross_shard_executions.is_empty() {
+                                    // Start the 5ms deadline on first cross-shard execution
+                                    self.cross_shard_execution_deadline = Some(
+                                        tokio::time::Instant::now() + Duration::from_millis(5)
+                                    );
+                                }
+                                self.pending_cross_shard_executions.requests.push(
+                                    hyperscale_core::CrossShardExecutionRequest {
+                                        tx_hash,
+                                        transaction,
+                                        provisions,
+                                    }
+                                );
+                            }
+                            other => {
+                                if let Err(e) = self.process_action(other).await {
+                                    tracing::error!(error = ?e, "Error processing action from callback");
+                                }
+                            }
                         }
                     }
                 }
@@ -1106,22 +1151,8 @@ impl ProductionRunner {
                                         }
                                         self.pending_state_votes.votes.push((vote, public_key));
                                     }
-                                    Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
-                                        // Accumulate cross-shard executions for batch parallel execution
-                                        if self.pending_cross_shard_executions.is_empty() {
-                                            // Start the 5ms deadline on first cross-shard execution
-                                            self.cross_shard_execution_deadline = Some(
-                                                tokio::time::Instant::now() + Duration::from_millis(5)
-                                            );
-                                        }
-                                        self.pending_cross_shard_executions.requests.push(
-                                            hyperscale_core::CrossShardExecutionRequest {
-                                                tx_hash,
-                                                transaction,
-                                                provisions,
-                                            }
-                                        );
-                                    }
+                                    // Note: ExecuteCrossShardTransaction only comes from ProvisioningComplete
+                                    // which routes through the callback channel, not the consensus channel.
                                     other => {
                                         if let Err(e) = self.process_action(other).await {
                                             tracing::error!(error = ?e, "Error processing action");
@@ -1151,20 +1182,6 @@ impl ProductionRunner {
                                                 );
                                             }
                                             self.pending_state_votes.votes.push((vote, public_key));
-                                        }
-                                        Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
-                                            if self.pending_cross_shard_executions.is_empty() {
-                                                self.cross_shard_execution_deadline = Some(
-                                                    tokio::time::Instant::now() + Duration::from_millis(5)
-                                                );
-                                            }
-                                            self.pending_cross_shard_executions.requests.push(
-                                                hyperscale_core::CrossShardExecutionRequest {
-                                                    tx_hash,
-                                                    transaction,
-                                                    provisions,
-                                                }
-                                            );
                                         }
                                         other => {
                                             if let Err(e) = self.process_action(other).await {
@@ -1203,20 +1220,6 @@ impl ProductionRunner {
                                                             );
                                                         }
                                                         self.pending_state_votes.votes.push((vote, public_key));
-                                                    }
-                                                    Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
-                                                        if self.pending_cross_shard_executions.is_empty() {
-                                                            self.cross_shard_execution_deadline = Some(
-                                                                tokio::time::Instant::now() + Duration::from_millis(5)
-                                                            );
-                                                        }
-                                                        self.pending_cross_shard_executions.requests.push(
-                                                            hyperscale_core::CrossShardExecutionRequest {
-                                                                tx_hash,
-                                                                transaction,
-                                                                provisions,
-                                                            }
-                                                        );
                                                     }
                                                     other => {
                                                         if let Err(e) = self.process_action(other).await {
@@ -1374,38 +1377,6 @@ impl ProductionRunner {
                     }
                 }
 
-                // Handle inbound transaction fetch requests from peers
-                // These are needed for active consensus, so process before sync
-                Some(request) = self.tx_request_rx.recv() => {
-                    let tx_span = span!(
-                        Level::DEBUG,
-                        "handle_tx_request",
-                        peer = %request.peer,
-                        block_hash = ?request.block_hash,
-                        tx_count = request.tx_hashes.len(),
-                        channel_id = request.channel_id,
-                    );
-                    let _tx_guard = tx_span.enter();
-
-                    self.handle_inbound_transaction_request(request);
-                }
-
-                // Handle inbound certificate fetch requests from peers
-                // These are needed for active consensus, so process before sync
-                Some(request) = self.cert_request_rx.recv() => {
-                    let cert_span = span!(
-                        Level::DEBUG,
-                        "handle_cert_request",
-                        peer = %request.peer,
-                        block_hash = ?request.block_hash,
-                        cert_count = request.cert_hashes.len(),
-                        channel_id = request.channel_id,
-                    );
-                    let _cert_guard = cert_span.enter();
-
-                    self.handle_inbound_certificate_request(request);
-                }
-
                 // Handle inbound sync requests from peers
                 Some(request) = self.sync_request_rx.recv() => {
                     let sync_span = span!(
@@ -1537,8 +1508,11 @@ impl ProductionRunner {
                 provision,
                 public_key,
             } => {
+                // Use throttled spawn for provisions - this applies backpressure
+                // when the crypto pool is busy, slowing the rate we accept new
+                // provisions rather than rejecting them outright.
                 let event_tx = self.callback_tx.clone();
-                self.thread_pools.spawn_crypto(move || {
+                self.thread_pools.spawn_crypto_throttled(move || {
                     let start = std::time::Instant::now();
                     // Use centralized signing message (must match ExecutionState::sign_provision)
                     let msg = provision.signing_message();
@@ -1553,6 +1527,59 @@ impl ProductionRunner {
                     }
                     event_tx
                         .send(Event::ProvisionSignatureVerified { provision, valid })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
+                });
+            }
+
+            Action::AggregateCommitmentProof {
+                tx_hash,
+                source_shard,
+                block_height,
+                entries,
+                signatures,
+                signer_indices,
+                committee_size,
+            } => {
+                let event_tx = self.callback_tx.clone();
+                self.thread_pools.spawn_crypto(move || {
+                    let start = std::time::Instant::now();
+
+                    // Build signer bitfield
+                    let mut signers = SignerBitfield::new(committee_size);
+                    for idx in &signer_indices {
+                        signers.set(*idx);
+                    }
+
+                    // Aggregate BLS signatures
+                    let aggregated_signature = if signatures.is_empty() {
+                        Signature::zero()
+                    } else {
+                        Signature::aggregate_bls(&signatures).unwrap_or_else(|_| Signature::zero())
+                    };
+
+                    // Build the commitment proof
+                    let commitment_proof = CommitmentProof::new(
+                        tx_hash,
+                        source_shard,
+                        signers,
+                        aggregated_signature,
+                        block_height,
+                        entries,
+                    );
+
+                    crate::metrics::record_signature_verification_latency(
+                        "commitment_proof_aggregation",
+                        start.elapsed().as_secs_f64(),
+                    );
+
+                    event_tx
+                        .send(Event::CommitmentProofAggregated {
+                            tx_hash,
+                            source_shard,
+                            commitment_proof,
+                        })
                         .expect(
                             "callback channel closed - Loss of this event would cause a deadlock",
                         );

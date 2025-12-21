@@ -93,6 +93,7 @@ async fn test_storage_operations() {
         committed_certificates: vec![],
         deferred: vec![],
         aborted: vec![],
+        commitment_proofs: std::collections::HashMap::new(),
     };
 
     let qc = QuorumCertificate::genesis();
