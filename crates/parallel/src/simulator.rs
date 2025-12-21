@@ -405,6 +405,12 @@ impl SimNode {
                     .push((Destination::Shard(shard), Arc::new(message)));
             }
 
+            Action::PublishCertificateForFetch { certificate } => {
+                // Store certificate for later fetch lookups in parallel simulation.
+                self.storage
+                    .put_certificate(certificate.transaction_hash, certificate);
+            }
+
             Action::SetTimer { id, duration } => {
                 // Schedule timer to fire at current_time + duration
                 let fire_time = self.simulated_time + duration;
@@ -630,12 +636,19 @@ impl SimNode {
                 }
             }
 
-            Action::PersistOwnVote {
+            Action::PersistAndBroadcastVote {
                 height,
                 round,
                 block_hash,
+                shard,
+                message,
             } => {
+                // Persist vote first (BFT safety)
                 self.storage.put_own_vote(height.0, round, block_hash);
+
+                // Then broadcast (just like BroadcastToShard)
+                self.outbound_messages
+                    .push((Destination::Shard(shard), Arc::new(message)));
             }
 
             Action::FetchStateEntries { tx_hash, nodes } => {

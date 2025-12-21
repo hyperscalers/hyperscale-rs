@@ -18,11 +18,10 @@
 //! 3. Dispatches a single crypto task that validates all in parallel via rayon
 
 use crate::thread_pools::ThreadPoolManager;
+use dashmap::DashMap;
 use hyperscale_core::Event;
 use hyperscale_engine::TransactionValidation;
 use hyperscale_types::{Hash, RoutableTransaction};
-use parking_lot::RwLock;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -85,44 +84,48 @@ impl ValidationBatcherStats {
     }
 }
 
-/// A cache of recently seen transaction hashes for deduplication.
+/// A lock-free cache of recently seen transaction hashes for deduplication.
 ///
-/// Uses a simple bounded HashSet. When capacity is exceeded, we clear
-/// half the entries (approximate LRU via insertion order isn't tracked,
-/// but random eviction is acceptable for this use case).
+/// Uses DashMap for lock-free concurrent access. When capacity is exceeded,
+/// we evict approximately 10% of entries (random eviction is acceptable for
+/// this deduplication use case).
 struct SeenCache {
-    hashes: HashSet<Hash>,
+    hashes: DashMap<Hash, ()>,
     capacity: usize,
 }
 
 impl SeenCache {
     fn new(capacity: usize) -> Self {
         Self {
-            hashes: HashSet::with_capacity(capacity),
+            hashes: DashMap::with_capacity(capacity),
             capacity,
         }
     }
 
     /// Check if a hash has been seen. Returns true if already seen.
-    fn check_and_insert(&mut self, hash: Hash) -> bool {
-        if self.hashes.contains(&hash) {
+    /// This is lock-free - multiple threads can call concurrently.
+    fn check_and_insert(&self, hash: Hash) -> bool {
+        // Fast path: check if already exists (lock-free read)
+        if self.hashes.contains_key(&hash) {
             return true;
         }
 
-        // Evict half if at capacity
+        // Evict ~10% if at capacity (approximate, non-blocking)
         if self.hashes.len() >= self.capacity {
             let to_remove: Vec<_> = self
                 .hashes
                 .iter()
-                .take(self.capacity / 2)
-                .cloned()
+                .take(self.capacity / 10)
+                .map(|r| *r.key())
                 .collect();
             for h in to_remove {
                 self.hashes.remove(&h);
             }
         }
 
-        self.hashes.insert(hash);
+        // Insert and return false (not seen before)
+        // Note: There's a small race window here, but it's acceptable for dedup
+        self.hashes.insert(hash, ());
         false
     }
 
@@ -137,7 +140,7 @@ impl SeenCache {
 pub struct ValidationBatcherHandle {
     tx: mpsc::UnboundedSender<Arc<RoutableTransaction>>,
     stats: Arc<ValidationBatcherStats>,
-    seen_cache: Arc<RwLock<SeenCache>>,
+    seen_cache: Arc<SeenCache>,
 }
 
 impl ValidationBatcherHandle {
@@ -145,18 +148,17 @@ impl ValidationBatcherHandle {
     ///
     /// Returns `true` if the transaction was submitted for validation,
     /// `false` if it was deduplicated (already seen).
+    ///
+    /// This method is lock-free and can be called concurrently from multiple threads.
     pub fn submit(&self, tx: Arc<RoutableTransaction>) -> bool {
         self.stats.submitted.fetch_add(1, Ordering::Relaxed);
 
-        // Check dedup cache first
+        // Check dedup cache first (lock-free)
         let hash = tx.hash();
-        {
-            let mut cache = self.seen_cache.write();
-            if cache.check_and_insert(hash) {
-                self.stats.deduplicated.fetch_add(1, Ordering::Relaxed);
-                trace!(tx_hash = ?hash, "Deduplicated transaction");
-                return false;
-            }
+        if self.seen_cache.check_and_insert(hash) {
+            self.stats.deduplicated.fetch_add(1, Ordering::Relaxed);
+            trace!(tx_hash = ?hash, "Deduplicated transaction");
+            return false;
         }
 
         // Submit for validation
@@ -175,7 +177,7 @@ impl ValidationBatcherHandle {
 
     /// Get seen cache size (for metrics).
     pub fn seen_cache_size(&self) -> usize {
-        self.seen_cache.read().len()
+        self.seen_cache.len()
     }
 }
 
@@ -307,7 +309,7 @@ pub fn spawn_tx_validation_batcher(
     output_tx: mpsc::UnboundedSender<Event>,
 ) -> ValidationBatcherHandle {
     let stats = Arc::new(ValidationBatcherStats::default());
-    let seen_cache = Arc::new(RwLock::new(SeenCache::new(config.seen_cache_capacity)));
+    let seen_cache = Arc::new(SeenCache::new(config.seen_cache_capacity));
     let (tx, rx) = mpsc::unbounded_channel::<Arc<RoutableTransaction>>();
 
     let handle = ValidationBatcherHandle {
@@ -338,7 +340,7 @@ mod tests {
 
     #[test]
     fn test_seen_cache_dedup() {
-        let mut cache = SeenCache::new(10);
+        let cache = SeenCache::new(10);
         let hash1 = Hash::from_hash_bytes(&[1; 32]);
         let hash2 = Hash::from_hash_bytes(&[2; 32]);
 
@@ -354,7 +356,7 @@ mod tests {
 
     #[test]
     fn test_seen_cache_eviction() {
-        let mut cache = SeenCache::new(10);
+        let cache = SeenCache::new(10);
 
         // Fill the cache
         for i in 0..10 {
@@ -363,12 +365,13 @@ mod tests {
         }
         assert_eq!(cache.len(), 10);
 
-        // Insert one more should trigger eviction
+        // Insert one more should trigger eviction (~10% = 1 entry)
         let hash = Hash::from_hash_bytes(&[100; 32]);
         assert!(!cache.check_and_insert(hash));
 
-        // Should have evicted half
-        assert!(cache.len() <= 6); // 10/2 + 1 new
+        // Should have evicted ~10% (1 entry) then added 1
+        // Result: 10 - 1 + 1 = 10
+        assert!(cache.len() <= 10);
     }
 
     #[test]

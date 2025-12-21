@@ -569,38 +569,55 @@ impl ThreadPoolManager {
         });
     }
 
-    /// Spawn a crypto task with backpressure-based throttling.
+    /// Spawn a crypto task with backpressure-based throttling (non-blocking).
     ///
-    /// When the crypto queue is deep, this introduces a brief pause to slow
-    /// the rate of incoming work. This prevents the caller from overwhelming
-    /// the pool while ensuring no work is rejected.
+    /// When the crypto queue is deep, this returns `false` to signal backpressure
+    /// to the caller. The caller can then decide to retry later or handle the
+    /// backpressure appropriately.
+    ///
+    /// **IMPORTANT**: This method is non-blocking. Previous versions used
+    /// `std::thread::sleep()` which blocked the event loop thread. This version
+    /// returns immediately with a backpressure signal instead.
     ///
     /// Use this for non-critical crypto work like provision verification where
     /// slight delays are acceptable to maintain system stability.
     ///
-    /// Throttling curve:
-    /// - Queue depth 0-50: no delay
-    /// - Queue depth 50-200: linear ramp from 0 to 5ms
-    /// - Queue depth 200+: capped at 5ms
-    pub fn spawn_crypto_throttled<F>(&self, f: F)
+    /// Returns:
+    /// - `true` if the task was spawned
+    /// - `false` if backpressure is active (queue depth > threshold)
+    ///
+    /// Backpressure threshold: queue depth > 100 (half of previous max)
+    pub fn try_spawn_crypto<F>(&self, f: F) -> bool
     where
         F: FnOnce() + Send + 'static,
     {
         let depth = self.crypto_pending.load(Ordering::Relaxed);
 
-        // Throttle based on queue depth to provide backpressure
-        const THROTTLE_START: usize = 50;
-        const THROTTLE_MAX: usize = 200;
-        const MAX_DELAY_MS: u64 = 5;
+        // Backpressure threshold - reject if queue is too deep
+        const BACKPRESSURE_THRESHOLD: usize = 100;
 
-        if depth > THROTTLE_START {
-            let excess = (depth - THROTTLE_START).min(THROTTLE_MAX - THROTTLE_START);
-            let delay_ms = (excess as u64 * MAX_DELAY_MS) / (THROTTLE_MAX - THROTTLE_START) as u64;
-            if delay_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            }
+        if depth > BACKPRESSURE_THRESHOLD {
+            // Signal backpressure - caller should retry later
+            return false;
         }
 
+        self.spawn_crypto(f);
+        true
+    }
+
+    /// Spawn a crypto task, always succeeds (no backpressure).
+    ///
+    /// Use `try_spawn_crypto` for non-critical work that can tolerate backpressure.
+    /// Use this method only when the task MUST be spawned regardless of queue depth.
+    ///
+    /// **Deprecated**: Use `try_spawn_crypto` for new code to enable backpressure.
+    #[deprecated(note = "Use try_spawn_crypto for backpressure support")]
+    pub fn spawn_crypto_throttled<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        // For backwards compatibility, always spawn (no blocking)
+        // New code should use try_spawn_crypto and handle backpressure
         self.spawn_crypto(f);
     }
 

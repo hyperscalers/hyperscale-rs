@@ -650,6 +650,14 @@ impl SimulationRunner {
                 }
             }
 
+            Action::PublishCertificateForFetch { certificate } => {
+                // In simulation, certificate fetches are handled synchronously via
+                // handle_certificate_fetch_needed, so we just store the certificate
+                // in the node's storage for later fetch lookups.
+                let storage = &mut self.node_storage[from as usize];
+                storage.put_certificate(certificate.transaction_hash, certificate);
+            }
+
             Action::SetTimer { id, duration } => {
                 let fire_time = self.now + duration;
                 let event = self.timer_to_event(id.clone());
@@ -1129,10 +1137,12 @@ impl SimulationRunner {
                 // Commit certificate + writes atomically (mirrors production behavior)
                 storage.commit_certificate_with_writes(&certificate, writes);
             }
-            Action::PersistOwnVote {
+            Action::PersistAndBroadcastVote {
                 height,
                 round,
                 block_hash,
+                shard,
+                message,
             } => {
                 // **BFT Safety Critical**: Store our vote before broadcasting.
                 // This ensures we remember what we voted for after a restart.
@@ -1145,6 +1155,10 @@ impl SimulationRunner {
                     block_hash = ?block_hash,
                     "Persisted own vote"
                 );
+
+                // Now broadcast the vote (simulated immediately after persist)
+                let broadcast_action = Action::BroadcastToShard { shard, message };
+                self.process_action(from, broadcast_action);
             }
             // Storage reads - immediately return callback events in simulation
             // In production, these would be async operations
