@@ -113,10 +113,6 @@ impl Default for SyncStatus {
 pub struct SyncConfig {
     /// Maximum number of concurrent fetch requests.
     pub max_concurrent_fetches: usize,
-    /// Initial timeout for sync requests.
-    pub initial_timeout: Duration,
-    /// Maximum timeout for sync requests (after exponential backoff).
-    pub max_timeout: Duration,
     /// Maximum retries per block before giving up on a peer.
     pub max_retries_per_peer: u32,
     /// Cooldown period before retrying a failed peer.
@@ -139,8 +135,6 @@ impl Default for SyncConfig {
             // With 3 peers (4-validator shard minus self) at 2 requests each,
             // we could do 6 concurrent, but we allow more headroom for larger shards.
             max_concurrent_fetches: 16,
-            initial_timeout: Duration::from_millis(500),
-            max_timeout: Duration::from_secs(5),
             max_retries_per_peer: 3,
             // Short cooldown to allow quick recovery from transient failures.
             // The desperation mode will reset cooldowns if we fall too far behind.
@@ -473,9 +467,6 @@ impl SyncManager {
         if self.sync_target.is_none() {
             return;
         }
-
-        // Check for timed out requests
-        self.check_timeouts();
 
         // Spawn more fetches if we're under the limit
         self.spawn_pending_fetches();
@@ -1069,23 +1060,6 @@ impl SyncManager {
             }
         }
     }
-
-    /// Check for timed out requests.
-    fn check_timeouts(&mut self) {
-        let now = Instant::now();
-        let timeout = self.config.initial_timeout;
-
-        let timed_out: Vec<_> = self
-            .pending_fetches
-            .iter()
-            .filter(|(_, fetch)| now.duration_since(fetch.started) > timeout)
-            .map(|(h, f)| (*h, f.peer))
-            .collect();
-
-        for (height, peer) in timed_out {
-            self.on_fetch_failed(height, peer, "timeout");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1335,7 +1309,6 @@ mod tests {
     fn test_sync_config_defaults() {
         let config = SyncConfig::default();
         assert_eq!(config.max_concurrent_fetches, 16);
-        assert_eq!(config.initial_timeout, Duration::from_millis(500));
         assert_eq!(config.max_retries_per_peer, 3);
     }
 
