@@ -79,8 +79,9 @@ pub struct FetchConfig {
 impl Default for FetchConfig {
     fn default() -> Self {
         Self {
-            max_concurrent_per_block: 3,
-            max_total_concurrent: 12,
+            // Increased to allow parallel chunked fetching across more peers
+            max_concurrent_per_block: 8,
+            max_total_concurrent: 32,
             initial_timeout: Duration::from_millis(500),
             max_timeout: Duration::from_secs(5),
             max_retries: 3,
@@ -89,10 +90,11 @@ impl Default for FetchConfig {
             // hammering a truly unavailable peer.
             peer_cooldown: Duration::from_secs(3),
             stale_fetch_timeout: Duration::from_secs(30),
-            max_hashes_per_request: 100,
-            // Fetch from 2 peers in parallel by default to reduce latency
-            // under CPU pressure. The first response wins; duplicates are ignored.
-            proactive_parallel_peers: 2,
+            // Smaller chunks for better parallelization across peers
+            max_hashes_per_request: 50,
+            // Fetch from 4 peers in parallel by default to enable chunked
+            // parallel fetching for large requests (e.g., 335 certs across 4 peers)
+            proactive_parallel_peers: 4,
         }
     }
 }
@@ -616,6 +618,23 @@ impl FetchManager {
             info!(?block_hash, "Transaction fetch complete");
             self.tx_fetches.remove(&block_hash);
             metrics::record_fetch_completed(FetchKind::Transaction);
+        } else if state.in_flight.is_empty() && !state.missing_hashes.is_empty() {
+            // Partial response - some txs were not returned by the peer.
+            // Re-queue to fetch remaining from other peers.
+            info!(
+                ?block_hash,
+                remaining = state.missing_hashes.len(),
+                "Partial transaction response, re-queuing for remaining"
+            );
+            // Clear tried_peers to allow retrying with all peers for the remaining hashes.
+            // Don't reset total_retries - we track retries per fetch attempt, not per hash.
+            // But we do reset it partially since we made progress (received some data).
+            state.tried_peers.clear();
+            state.total_retries = state.total_retries.saturating_sub(1);
+            self.pending_queue.push_back(FetchId {
+                block_hash,
+                kind: FetchKind::Transaction,
+            });
         }
     }
 
@@ -678,6 +697,23 @@ impl FetchManager {
             info!(?block_hash, "Certificate fetch complete");
             self.cert_fetches.remove(&block_hash);
             metrics::record_fetch_completed(FetchKind::Certificate);
+        } else if state.in_flight.is_empty() && !state.missing_hashes.is_empty() {
+            // Partial response - some certs were not returned by the peer.
+            // Re-queue to fetch remaining from other peers.
+            info!(
+                ?block_hash,
+                remaining = state.missing_hashes.len(),
+                "Partial certificate response, re-queuing for remaining"
+            );
+            // Clear tried_peers to allow retrying with all peers for the remaining hashes.
+            // Don't reset total_retries - we track retries per fetch attempt, not per hash.
+            // But we do reset it partially since we made progress (received some data).
+            state.tried_peers.clear();
+            state.total_retries = state.total_retries.saturating_sub(1);
+            self.pending_queue.push_back(FetchId {
+                block_hash,
+                kind: FetchKind::Certificate,
+            });
         }
     }
 
@@ -709,51 +745,69 @@ impl FetchManager {
 
         // Mark in-flight request as complete
         state.in_flight.remove(&peer);
-        state.total_retries += 1;
 
         warn!(
             ?block_hash,
             ?kind,
             ?peer,
             error,
-            retries = state.total_retries,
+            in_flight_remaining = state.in_flight.len(),
             "Fetch request failed"
         );
 
         metrics::record_fetch_failed(kind);
 
-        // Check if we should give up
-        if state.total_retries >= self.config.max_retries {
-            warn!(?block_hash, ?kind, "Giving up on fetch after max retries");
-            match kind {
-                FetchKind::Transaction => {
-                    self.tx_fetches.remove(&block_hash);
-                    // Notify BFT that transaction fetch permanently failed
-                    // so it can remove the pending block and allow sync.
-                    // CRITICAL: Must use .send().await to ensure delivery - dropping
-                    // this event would leave the block stuck forever.
-                    let event = Event::TransactionFetchFailed { block_hash };
-                    if let Err(e) = self.event_tx.send(event).await {
-                        warn!(?block_hash, error = ?e, "Failed to send TransactionFetchFailed event");
-                    }
-                }
-                FetchKind::Certificate => {
-                    self.cert_fetches.remove(&block_hash);
-                    // Notify BFT that certificate fetch permanently failed
-                    // so it can remove the pending block and allow sync.
-                    // CRITICAL: Must use .send().await to ensure delivery - dropping
-                    // this event would leave the block stuck forever.
-                    let event = Event::CertificateFetchFailed { block_hash };
-                    if let Err(e) = self.event_tx.send(event).await {
-                        warn!(?block_hash, error = ?e, "Failed to send CertificateFetchFailed event");
-                    }
-                }
-            }
+        // Only increment retry counter when ALL in-flight requests have completed.
+        // This prevents parallel requests from exhausting retries prematurely.
+        // We count a "retry round" as one full attempt across all peers.
+        if !state.in_flight.is_empty() {
+            // Other requests still in flight - wait for them
             return;
         }
 
-        // Re-queue for retry with a different peer
-        self.pending_queue.push_back(FetchId { block_hash, kind });
+        // All in-flight requests have completed (either succeeded or failed).
+        // If we still have missing hashes, increment retry counter and re-queue.
+        if !state.missing_hashes.is_empty() {
+            state.total_retries += 1;
+
+            // Check if we should give up
+            if state.total_retries >= self.config.max_retries {
+                warn!(
+                    ?block_hash,
+                    ?kind,
+                    retries = state.total_retries,
+                    "Giving up on fetch after max retries"
+                );
+                match kind {
+                    FetchKind::Transaction => {
+                        self.tx_fetches.remove(&block_hash);
+                        let event = Event::TransactionFetchFailed { block_hash };
+                        if let Err(e) = self.event_tx.send(event).await {
+                            warn!(?block_hash, error = ?e, "Failed to send TransactionFetchFailed event");
+                        }
+                    }
+                    FetchKind::Certificate => {
+                        self.cert_fetches.remove(&block_hash);
+                        let event = Event::CertificateFetchFailed { block_hash };
+                        if let Err(e) = self.event_tx.send(event).await {
+                            warn!(?block_hash, error = ?e, "Failed to send CertificateFetchFailed event");
+                        }
+                    }
+                }
+                return;
+            }
+
+            // Re-queue for retry with fresh peers
+            info!(
+                ?block_hash,
+                ?kind,
+                retries = state.total_retries,
+                remaining = state.missing_hashes.len(),
+                "Re-queuing fetch after round failure"
+            );
+            state.tried_peers.clear();
+            self.pending_queue.push_back(FetchId { block_hash, kind });
+        }
     }
 
     /// Process the pending queue and spawn new fetch tasks.
@@ -845,31 +899,39 @@ impl FetchManager {
                 continue;
             };
 
-            // Chunk if needed
-            let hashes_to_fetch: Vec<Hash> = hashes.into_iter().take(max_hashes).collect();
+            // Chunk the hashes and distribute across peers for parallel fetching.
+            // Each peer gets a different chunk to maximize throughput.
+            let chunks: Vec<Vec<Hash>> = hashes.chunks(max_hashes).map(|c| c.to_vec()).collect();
 
-            // Queue spawns for all selected peers
-            for peer in selected_peers {
+            // Distribute chunks across selected peers (round-robin if more chunks than peers)
+            for (i, peer) in selected_peers.iter().enumerate() {
+                // Each peer gets chunks at positions: i, i+num_peers, i+2*num_peers, ...
+                let peer_chunks: Vec<Hash> = chunks
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| j % selected_peers.len() == i)
+                    .flat_map(|(_, chunk)| chunk.iter().copied())
+                    .collect();
+
+                if peer_chunks.is_empty() {
+                    continue;
+                }
+
                 // Mark peer as tried
-                state.tried_peers.insert(peer);
+                state.tried_peers.insert(*peer);
 
                 // Record in-flight request
                 state.in_flight.insert(
-                    peer,
+                    *peer,
                     PendingFetchRequest {
-                        peer,
+                        peer: *peer,
                         started: Instant::now(),
                         retries: 0,
                     },
                 );
 
                 // Queue for spawning
-                to_spawn.push((
-                    fetch_id.block_hash,
-                    fetch_id.kind,
-                    peer,
-                    hashes_to_fetch.clone(),
-                ));
+                to_spawn.push((fetch_id.block_hash, fetch_id.kind, *peer, peer_chunks));
             }
         }
 
@@ -1150,25 +1212,26 @@ mod tests {
     #[test]
     fn test_fetch_config_defaults() {
         let config = FetchConfig::default();
-        assert_eq!(config.max_concurrent_per_block, 3);
-        assert_eq!(config.max_total_concurrent, 12);
+        assert_eq!(config.max_concurrent_per_block, 8);
+        assert_eq!(config.max_total_concurrent, 32);
         assert_eq!(config.max_retries, 3);
-        // Proactive parallel fetching is enabled by default
-        assert_eq!(config.proactive_parallel_peers, 2);
+        // Proactive parallel fetching with 4 peers for chunked distribution
+        assert_eq!(config.proactive_parallel_peers, 4);
+        assert_eq!(config.max_hashes_per_request, 50);
     }
 
     #[test]
     fn test_fetch_config_proactive_parallel() {
-        // Default enables proactive parallel fetching
+        // Default enables proactive parallel fetching with 4 peers
         let default_config = FetchConfig::default();
-        assert_eq!(default_config.proactive_parallel_peers, 2);
+        assert_eq!(default_config.proactive_parallel_peers, 4);
 
         // for_local and for_wan inherit the default
         let local_config = FetchConfig::for_local();
-        assert_eq!(local_config.proactive_parallel_peers, 2);
+        assert_eq!(local_config.proactive_parallel_peers, 4);
 
         let wan_config = FetchConfig::for_wan();
-        assert_eq!(wan_config.proactive_parallel_peers, 2);
+        assert_eq!(wan_config.proactive_parallel_peers, 4);
     }
 
     #[test]
