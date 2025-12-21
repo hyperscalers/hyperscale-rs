@@ -252,10 +252,13 @@ jobs:
             fi
           else
             # Push event
-            if [[ "$COMMIT_MSG" == "Merge pull request"* ]] || [[ "$COMMIT_MSG" == "Merge branch"* ]]; then
-              echo "Merge commit detected, skipping."
-              exit 0
-            fi
+
+            # commenting this out for now, otherwise PRs from forks get no notifications
+            
+            # if [[ "$COMMIT_MSG" == "Merge pull request"* ]] || [[ "$COMMIT_MSG" == "Merge branch"* ]]; then
+            #   echo "Merge commit detected, skipping."
+            #   exit 0
+            # fi
             
             # fetch detailed stats and file count for the commit
             STATS_JSON=$(gh api "repos/${{ github.repository }}/commits/$COMMIT_SHA" \
