@@ -6,7 +6,6 @@ use hyperscale_types::{
     Block, BlockHeader, CommitmentProof, Hash, RoutableTransaction, TransactionAbort,
     TransactionCertificate, TransactionDefer,
 };
-use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -25,16 +24,22 @@ pub struct PendingBlock {
     /// Block header (received first).
     header: BlockHeader,
 
+    /// Original transaction order from the gossip message.
+    /// This is the canonical order the proposer intended, which must be preserved
+    /// when constructing the block (priority TXs first, then others, both in hash order).
+    original_tx_order: Vec<Hash>,
+
+    /// Original certificate order from the gossip message.
+    original_cert_order: Vec<Hash>,
+
     /// Map of transaction hash -> Arc<RoutableTransaction> (for received transactions).
-    /// Uses IndexMap for deterministic iteration order (insertion order) when constructing blocks.
-    received_transactions: IndexMap<Hash, Arc<RoutableTransaction>>,
+    received_transactions: HashMap<Hash, Arc<RoutableTransaction>>,
 
     /// Set of transaction hashes we're still waiting for (HashSet for O(1) lookup).
     missing_transaction_hashes: HashSet<Hash>,
 
     /// Map of transaction hash -> Arc<TransactionCertificate> (for received certificates).
-    /// Uses IndexMap for deterministic iteration order (insertion order) when constructing blocks.
-    received_certificates: IndexMap<Hash, Arc<TransactionCertificate>>,
+    received_certificates: HashMap<Hash, Arc<TransactionCertificate>>,
 
     /// Set of certificate hashes we're still waiting for (HashSet for O(1) lookup).
     missing_certificate_hashes: HashSet<Hash>,
@@ -102,9 +107,11 @@ impl PendingBlock {
     ) -> Self {
         Self {
             header,
-            received_transactions: IndexMap::with_capacity(transaction_hashes.len()),
+            original_tx_order: transaction_hashes.clone(),
+            original_cert_order: certificate_hashes.clone(),
+            received_transactions: HashMap::with_capacity(transaction_hashes.len()),
             missing_transaction_hashes: transaction_hashes.into_iter().collect(),
-            received_certificates: IndexMap::with_capacity(certificate_hashes.len()),
+            received_certificates: HashMap::with_capacity(certificate_hashes.len()),
             missing_certificate_hashes: certificate_hashes.into_iter().collect(),
             deferred,
             aborted,
@@ -203,18 +210,23 @@ impl PendingBlock {
             return Ok(Arc::clone(block));
         }
 
-        // Build the block from header + full transaction objects + certificates
-        // Use drain(..) to take ownership of data instead of cloning
+        // Build transactions in the ORIGINAL order from the gossip message.
+        // This is critical: the proposer ordered them with priority TXs first,
+        // then others, both groups in hash order. We must preserve that order
+        // regardless of the order transactions were received from the network.
         let transactions: Vec<Arc<RoutableTransaction>> = self
-            .received_transactions
-            .drain(..)
-            .map(|(_, v)| v)
+            .original_tx_order
+            .iter()
+            .filter_map(|hash| self.received_transactions.remove(hash))
             .collect();
+
+        // Build certificates in the original order from the gossip message.
         let certificates: Vec<Arc<TransactionCertificate>> = self
-            .received_certificates
-            .drain(..)
-            .map(|(_, v)| v)
+            .original_cert_order
+            .iter()
+            .filter_map(|hash| self.received_certificates.remove(hash))
             .collect();
+
         // Take deferred, aborted, and proofs (replace with empty)
         let deferred = std::mem::take(&mut self.deferred);
         let aborted = std::mem::take(&mut self.aborted);
@@ -248,26 +260,18 @@ impl PendingBlock {
         self.header.hash()
     }
 
-    /// Get all transaction hashes (both received and missing).
+    /// Get all transaction hashes in the original order.
     ///
     /// Used for re-broadcasting block headers after view change.
     pub fn all_transaction_hashes(&self) -> Vec<Hash> {
-        self.received_transactions
-            .keys()
-            .copied()
-            .chain(self.missing_transaction_hashes.iter().copied())
-            .collect()
+        self.original_tx_order.clone()
     }
 
-    /// Get all certificate hashes (both received and missing).
+    /// Get all certificate hashes in the original order.
     ///
     /// Used for re-broadcasting block headers after view change.
     pub fn all_certificate_hashes(&self) -> Vec<Hash> {
-        self.received_certificates
-            .keys()
-            .copied()
-            .chain(self.missing_certificate_hashes.iter().copied())
-            .collect()
+        self.original_cert_order.clone()
     }
 
     /// Get reference to deferred transactions.
