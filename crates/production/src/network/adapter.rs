@@ -473,7 +473,13 @@ impl Libp2pAdapter {
                         e
                     ))
                 })?
-                .with_quic()
+                .with_quic_config(|mut quic_config| {
+                    // Increase QUIC stream limit to match TCP yamux config (4096).
+                    // Default is 256 which causes "max sub-streams reached" errors
+                    // during burst sync traffic when catching up.
+                    quic_config.max_concurrent_stream_limit = 4096;
+                    quic_config
+                })
                 .with_behaviour(|_| behaviour)
                 .map_err(|e| {
                     NetworkError::NetworkError(format!(
@@ -490,7 +496,13 @@ impl Libp2pAdapter {
             info!("Building swarm with QUIC only (TCP fallback disabled)");
             SwarmBuilder::with_existing_identity(keypair)
                 .with_tokio()
-                .with_quic()
+                .with_quic_config(|mut quic_config| {
+                    // Increase QUIC stream limit to match TCP yamux config (4096).
+                    // Default is 256 which causes "max sub-streams reached" errors
+                    // during burst sync traffic when catching up.
+                    quic_config.max_concurrent_stream_limit = 4096;
+                    quic_config
+                })
                 .with_behaviour(|_| behaviour)
                 .map_err(|e| {
                     NetworkError::NetworkError(format!(
