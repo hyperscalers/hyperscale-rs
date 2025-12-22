@@ -2033,7 +2033,20 @@ impl ProductionRunner {
                 crate::metrics::record_block_committed(height, 0.0);
 
                 // Update sync manager's committed height - critical for correct sync behavior.
-                self.sync_manager.set_committed_height(height);
+                // If sync completes, notify the state machine so it can resume view changes.
+                if let Some(sync_height) = self.sync_manager.set_committed_height(height) {
+                    tracing::info!(
+                        sync_height,
+                        committed_height = height,
+                        "Sync completed, sending SyncComplete event to resume consensus"
+                    );
+                    let sync_complete_event = Event::SyncComplete {
+                        height: sync_height,
+                    };
+                    // SyncComplete handler just clears the syncing flag and resets timeout,
+                    // it doesn't return any actions that need processing.
+                    let _ = self.state.handle(sync_complete_event);
+                }
 
                 // Update RPC status with new block height and view
                 if let Some(ref rpc_status) = self.rpc_status {

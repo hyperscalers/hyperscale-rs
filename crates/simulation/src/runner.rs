@@ -1115,8 +1115,15 @@ impl SimulationRunner {
                         // Still need to sync more blocks - retry fetching
                         self.handle_sync_needed(from, sync_target);
                     } else {
-                        // Sync complete
+                        // Sync complete - notify state machine so it can resume view changes
                         self.sync_targets.remove(&from);
+                        let sync_complete_event = Event::SyncComplete {
+                            height: sync_target,
+                        };
+                        let actions = self.nodes[from as usize].handle(sync_complete_event);
+                        for action in actions {
+                            self.process_action(from, action);
+                        }
                     }
                 }
             }
@@ -1303,6 +1310,14 @@ impl SimulationRunner {
         // Check if sync is complete
         if committed_height >= effective_target {
             self.sync_targets.remove(&node);
+            // Notify state machine so it can resume view changes
+            let sync_complete_event = Event::SyncComplete {
+                height: effective_target,
+            };
+            let actions = self.nodes[node as usize].handle(sync_complete_event);
+            for action in actions {
+                self.process_action(node, action);
+            }
             return;
         }
 

@@ -1245,6 +1245,30 @@ impl ParallelSimulator {
             }
         }
 
+        // Step 7: Check if any syncing nodes have reached their target
+        // This handles the case where blocks were committed during this step
+        let completed_syncs: Vec<(u32, u64)> = self
+            .sync_targets
+            .iter()
+            .filter_map(|(&node_idx, &target)| {
+                let committed = self.nodes[node_idx as usize].state.bft().committed_height();
+                if committed >= target {
+                    Some((node_idx, target))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (node_idx, target) in completed_syncs {
+            self.sync_targets.remove(&node_idx);
+            // Send SyncComplete event to the node
+            let event = Event::SyncComplete { height: target };
+            self.nodes[node_idx as usize]
+                .internal_queue
+                .push_back(event);
+        }
+
         events_processed
     }
 
@@ -1323,6 +1347,13 @@ impl ParallelSimulator {
         // Check if sync is complete
         if committed_height >= effective_target {
             self.sync_targets.remove(&requester);
+            // Send SyncComplete event to the node so it can resume view changes
+            let event = Event::SyncComplete {
+                height: effective_target,
+            };
+            self.nodes[requester as usize]
+                .internal_queue
+                .push_back(event);
             return;
         }
 

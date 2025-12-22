@@ -371,7 +371,10 @@ impl SyncManager {
     }
 
     /// Update the committed height (called when state machine commits a block).
-    pub fn set_committed_height(&mut self, height: u64) {
+    ///
+    /// Returns `Some(target_height)` if this commit completed a sync operation,
+    /// allowing the caller to send a `SyncComplete` event to the state machine.
+    pub fn set_committed_height(&mut self, height: u64) -> Option<u64> {
         self.committed_height = height;
 
         // Remove heights at or below committed from pending lists
@@ -395,11 +398,17 @@ impl SyncManager {
         // Check if sync is complete
         if let Some((target, _)) = self.sync_target {
             if height >= target {
-                debug!(height, target, "Sync complete");
+                info!(
+                    height,
+                    target, "Sync complete - returning to normal consensus"
+                );
                 self.sync_target = None;
                 self.heights_to_fetch.clear();
+                return Some(target);
             }
         }
+
+        None
     }
 
     /// Start syncing to a target height.
