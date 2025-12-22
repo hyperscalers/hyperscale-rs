@@ -177,27 +177,44 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
+          - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             name: linux-amd64
           - target: aarch64-apple-darwin
             os: macos-14
             name: macos-arm64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: windows-amd64
     steps:
+      - name: Enable Long Paths (Windows)
+        if: matrix.os == 'windows-latest'
+        run: git config --system core.longpaths true
+
       - uses: actions/checkout@v4
 
-      - name: Install musl-tools
-        if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get install -y musl-tools
+      - name: Install LLVM and Clang (Windows)
+        if: matrix.os == 'windows-latest'
+        run: choco install llvm -y
+
+      - name: Install Protoc (Windows)
+        if: matrix.os == 'windows-latest'
+        run: choco install protoc -y
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      - name: Set LIBCLANG_PATH (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $GITHUB_ENV
+
       - uses: swatinem/rust-cache@v2
 
       - name: Build Binaries
+        shell: bash
         run: |
           cargo build --release --target ${{ matrix.target }} \
             --bin hyperscale-validator \
@@ -205,9 +222,16 @@ jobs:
             --bin hyperscale-spammer
 
       - name: Archive Binaries
+        shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          zip hyperscale-${{ matrix.name }}.zip hyperscale-validator hyperscale-keygen hyperscale-spammer
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            EXT=".exe"
+            7z a -tzip hyperscale-${{ matrix.name }}.zip hyperscale-validator$EXT hyperscale-keygen$EXT hyperscale-spammer$EXT
+          else
+            EXT=""
+            zip hyperscale-${{ matrix.name }}.zip hyperscale-validator$EXT hyperscale-keygen$EXT hyperscale-spammer$EXT
+          fi
           mv hyperscale-${{ matrix.name }}.zip ../../../
 
       - name: Upload Release Asset
