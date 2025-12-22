@@ -103,18 +103,30 @@ impl RocksDbStorage {
     }
 
     /// Internal: iterate over a key range.
-    fn iter_range(&self, start: &[u8], end: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
-            start,
-            rocksdb::Direction::Forward,
-        ));
+    fn iter_range<'a>(
+        &'a self,
+        start: &[u8],
+        end: &[u8],
+    ) -> impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + 'a {
+        let mut iter = self.db.raw_iterator();
+        iter.seek(start);
+        let end = end.to_vec();
 
-        iter.take_while(|item| match item {
-            Ok((key, _)) => key.as_ref() < end,
-            Err(_) => false,
+        std::iter::from_fn(move || {
+            if iter.valid() {
+                let key = iter.key()?;
+                if key < end.as_slice() {
+                    let k: Box<[u8]> = Box::from(key);
+                    let v: Box<[u8]> = Box::from(iter.value()?);
+                    iter.next();
+                    Some((k, v))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         })
-        .filter_map(|item| item.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
-        .collect()
     }
 }
 
@@ -154,7 +166,7 @@ impl SubstateDatabase for RocksDbStorage {
         Box::new(items.into_iter().filter_map(move |(full_key, value)| {
             if full_key.len() > prefix_len {
                 let sort_key_bytes = full_key[prefix_len..].to_vec();
-                Some((DbSortKey(sort_key_bytes), value))
+                Some((DbSortKey(sort_key_bytes), value.into_vec()))
             } else {
                 None
             }
@@ -201,8 +213,18 @@ impl RocksDbStorage {
                         let prefix = keys::partition_prefix(&partition_key);
                         let end = keys::next_prefix(&prefix);
 
-                        for (key, _) in self.iter_range(&prefix, &end) {
-                            batch.delete(&key);
+                        let mut iter = self.db.raw_iterator();
+                        iter.seek(&prefix);
+                        while iter.valid() {
+                            if let Some(key) = iter.key() {
+                                if key >= end.as_slice() {
+                                    break;
+                                }
+                                batch.delete(key);
+                                iter.next();
+                            } else {
+                                break;
+                            }
                         }
 
                         // Insert new values
@@ -270,7 +292,7 @@ impl SubstateStore for RocksDbStorage {
             if full_key.len() > prefix_len {
                 let partition_num = full_key[prefix_len];
                 let sort_key_bytes = full_key[prefix_len + 1..].to_vec();
-                Some((partition_num, DbSortKey(sort_key_bytes), value))
+                Some((partition_num, DbSortKey(sort_key_bytes), value.into_vec()))
             } else {
                 None
             }
@@ -314,24 +336,29 @@ impl SubstateDatabase for RocksDbSnapshot {
         };
         let end = keys::next_prefix(&prefix);
 
-        // Collect into Vec to avoid lifetime issues with RocksDB iterators
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
-            &start,
-            rocksdb::Direction::Forward,
-        ));
+        let mut iter = self.db.raw_iterator();
+        iter.seek(&start);
 
-        let items: Vec<_> = iter
-            .take_while(|item| match item {
-                Ok((key, _)) => key.as_ref() < end.as_slice(),
-                Err(_) => false,
-            })
-            .filter_map(|item| item.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
-            .collect();
+        let raw_iter = std::iter::from_fn(move || {
+            if iter.valid() {
+                let key = iter.key()?;
+                if key < end.as_slice() {
+                    let k: Box<[u8]> = Box::from(key);
+                    let v: Box<[u8]> = Box::from(iter.value()?);
+                    iter.next();
+                    Some((k, v))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
 
-        Box::new(items.into_iter().filter_map(move |(full_key, value)| {
+        Box::new(raw_iter.filter_map(move |(full_key, value)| {
             if full_key.len() > prefix_len {
                 let sort_key_bytes = full_key[prefix_len..].to_vec();
-                Some((DbSortKey(sort_key_bytes), value))
+                Some((DbSortKey(sort_key_bytes), value.into_vec()))
             } else {
                 None
             }
