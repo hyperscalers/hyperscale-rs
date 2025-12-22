@@ -319,8 +319,20 @@ impl StateMachine for NodeStateMachine {
                     // Clear the header reset tracker since we're changing rounds
                     self.last_header_reset = None;
 
+                    // Account for pipelining: count txs/certs in ALL pending blocks
+                    let (pending_txs, pending_certs) = self.bft.pending_block_tx_cert_counts();
+
+                    // Get certificates we're about to propose
+                    let certificates = self.execution.get_finalized_certificates();
+                    let new_certs = certificates.len();
+
                     let max_txs = self.bft.config().max_transactions_per_block;
-                    let txs = self.mempool.ready_transactions(max_txs, &self.provisions);
+                    let txs = self.mempool.ready_transactions_with_pending_commits(
+                        max_txs,
+                        &self.provisions,
+                        pending_txs,               // txs in uncommitted pipeline blocks
+                        pending_certs + new_certs, // certs in pipeline + certs we're proposing
+                    );
                     // Note: commitment_proofs not needed for advance_round - it builds empty fallback blocks
                     let deferred = self.livelock.get_pending_deferrals();
                     let current_height =
@@ -330,7 +342,6 @@ impl StateMachine for NodeStateMachine {
                         30, // execution_timeout_blocks
                         3,  // max_retries
                     );
-                    let certificates = self.execution.get_finalized_certificates();
 
                     // Notify execution of view change to pause speculation temporarily
                     self.execution.on_view_change(current_height.0);
@@ -342,8 +353,22 @@ impl StateMachine for NodeStateMachine {
                 }
 
                 // Normal proposal timer - try to propose if we're the proposer
+                //
+                // Account for pipelining: multiple blocks can be proposed before any commit.
+                // We must count txs/certs in ALL pending blocks to avoid exceeding in-flight limits.
+                let (pending_txs, pending_certs) = self.bft.pending_block_tx_cert_counts();
+
+                // Get certificates we're about to propose - these also reduce in-flight
+                let certificates = self.execution.get_finalized_certificates();
+                let new_certs = certificates.len();
+
                 let max_txs = self.bft.config().max_transactions_per_block;
-                let txs = self.mempool.ready_transactions(max_txs, &self.provisions);
+                let txs = self.mempool.ready_transactions_with_pending_commits(
+                    max_txs,
+                    &self.provisions,
+                    pending_txs,               // txs in uncommitted pipeline blocks
+                    pending_certs + new_certs, // certs in pipeline + certs we're proposing
+                );
                 let commitment_proofs = self.build_commitment_proofs(&txs);
                 // Get pending deferrals from livelock state
                 let deferred = self.livelock.get_pending_deferrals();
@@ -355,8 +380,6 @@ impl StateMachine for NodeStateMachine {
                     30, // execution_timeout_blocks
                     3,  // max_retries
                 );
-                // Get finalized certificates (removed when committed in a block)
-                let certificates = self.execution.get_finalized_certificates();
                 let actions = self.bft.on_proposal_timer(
                     &txs,
                     deferred,
@@ -404,64 +427,60 @@ impl StateMachine for NodeStateMachine {
                     self.last_header_reset = Some(header_key);
                 }
 
-                // Validate in-flight limits to prevent malicious/buggy proposers from
-                // overwhelming the system. The rules mirror ready_transactions():
-                //
-                // 1. Transactions WITH commitment proofs can exceed soft limit (up to hard limit)
-                //    - These are cross-shard TXs committed on other shards waiting on us
-                // 2. Transactions WITHOUT proofs must respect soft limit
-                // 3. Nothing can exceed hard limit
-                //
-                // In-flight count is deterministic across all honest validators because:
-                // - A TX becomes in-flight when committed in a block (same blocks everywhere)
-                // - A TX stops being in-flight when its certificate is committed (same blocks)
-                //
-                // The block being validated also contains certificates that REDUCE in-flight,
-                // so we account for those as well.
-                let current_in_flight = self.mempool.in_flight();
-                let certs_in_block = cert_hashes.len();
-                let effective_in_flight = current_in_flight.saturating_sub(certs_in_block);
+                // Validate in-flight limits only for the next block after committed height.
+                // For blocks further ahead, skip validation - validators at different heights
+                // have different in_flight() counts, causing split votes and view changes.
+                let committed_height = self.bft.committed_height();
+                let is_next_block = header.height.0 == committed_height + 1;
 
-                let config = self.mempool.config();
-                let soft_limit = config.max_in_flight;
-                let hard_limit = config.max_in_flight_hard_limit;
+                if is_next_block {
+                    let current_in_flight = self.mempool.in_flight();
+                    let certs_in_block = cert_hashes.len();
+                    let config = self.mempool.config();
+                    let soft_limit = config.max_in_flight;
+                    let hard_limit = config.max_in_flight_hard_limit;
 
-                // Count transactions with and without commitment proofs
-                let with_proofs = tx_hashes
-                    .iter()
-                    .filter(|h| commitment_proofs.contains_key(h))
-                    .count();
-                let without_proofs = tx_hashes.len() - with_proofs;
+                    let with_proofs = tx_hashes
+                        .iter()
+                        .filter(|h| commitment_proofs.contains_key(h))
+                        .count();
+                    let without_proofs = tx_hashes.len() - with_proofs;
 
-                // Hard limit check: effective_in_flight + new txs
-                if effective_in_flight + tx_hashes.len() > hard_limit {
-                    tracing::warn!(
-                        current_in_flight = current_in_flight,
-                        certs_in_block = certs_in_block,
-                        effective_in_flight = effective_in_flight,
-                        proposed_tx_count = tx_hashes.len(),
-                        hard_limit = hard_limit,
-                        block_hash = ?header.hash(),
-                        height = header.height.0,
-                        "Rejecting block that would exceed in-flight hard limit"
-                    );
-                    return vec![];
-                }
+                    let new_in_flight = current_in_flight
+                        .saturating_add(tx_hashes.len())
+                        .saturating_sub(certs_in_block);
 
-                // Soft limit check: transactions without proofs
-                // If we're at/above soft limit, only transactions with proofs should be included
-                if effective_in_flight >= soft_limit && without_proofs > 0 {
-                    tracing::warn!(
-                        current_in_flight = current_in_flight,
-                        effective_in_flight = effective_in_flight,
-                        soft_limit = soft_limit,
-                        txs_without_proofs = without_proofs,
-                        txs_with_proofs = with_proofs,
-                        block_hash = ?header.hash(),
-                        height = header.height.0,
-                        "Rejecting block with non-priority transactions while at soft limit"
-                    );
-                    return vec![];
+                    // Reject if exceeding hard limit AND making things worse.
+                    // Allow blocks that don't increase in-flight (prevents deadlock).
+                    let would_exceed = new_in_flight > hard_limit;
+                    let would_increase = new_in_flight > current_in_flight;
+
+                    if would_exceed && would_increase {
+                        tracing::warn!(
+                            current_in_flight,
+                            certs_in_block,
+                            proposed_tx_count = tx_hashes.len(),
+                            new_in_flight,
+                            hard_limit,
+                            block_hash = ?header.hash(),
+                            height = header.height.0,
+                            "Rejecting block that would exceed in-flight hard limit"
+                        );
+                        return vec![];
+                    }
+
+                    // Soft limit: only allow TXs with proofs when at limit
+                    if current_in_flight >= soft_limit && without_proofs > 0 {
+                        tracing::warn!(
+                            current_in_flight,
+                            soft_limit,
+                            txs_without_proofs = without_proofs,
+                            block_hash = ?header.hash(),
+                            height = header.height.0,
+                            "Rejecting block with non-priority transactions while at soft limit"
+                        );
+                        return vec![];
+                    }
                 }
 
                 let mempool_txs = self.mempool.transactions_by_hash();

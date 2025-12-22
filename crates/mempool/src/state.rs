@@ -1033,6 +1033,14 @@ impl MempoolState {
             return vec![];
         }
 
+        // Cap max_count to stay within hard limit
+        // We can add at most (hard_limit - effective_in_flight) transactions
+        let room_to_hard_limit = self
+            .config
+            .max_in_flight_hard_limit
+            .saturating_sub(effective_in_flight);
+        let max_count = max_count.min(room_to_hard_limit);
+
         // Single pass through pool, partitioning into priority and others.
         // Priority: cross-shard TXs with verified provisions (bypass soft limit)
         // Others: everything else (subject to soft limit)
@@ -1062,6 +1070,8 @@ impl MempoolState {
 
         // Combine: priority TXs first, then others, respecting max_count
         // Both groups are already in hash order (BTreeMap iteration)
+        // Priority TXs bypass soft limit but must still respect hard limit (max_count)
+        with_provisions.truncate(max_count);
         let remaining = max_count.saturating_sub(with_provisions.len());
         with_provisions.extend(others.into_iter().take(remaining));
 

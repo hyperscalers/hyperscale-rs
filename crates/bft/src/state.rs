@@ -2076,6 +2076,29 @@ impl BftState {
         self.pending_commit_counts(qc).0
     }
 
+    /// Count transactions and certificates in ALL pending blocks above committed height.
+    ///
+    /// This accounts for pipelining in chained BFT: multiple blocks can be proposed
+    /// before the first one commits. Each pending block's transactions will increase
+    /// in-flight when they commit, and each pending block's certificates will decrease
+    /// in-flight.
+    ///
+    /// Returns (total_tx_count, total_cert_count) across all pending blocks.
+    pub fn pending_block_tx_cert_counts(&self) -> (usize, usize) {
+        let mut total_txs = 0;
+        let mut total_certs = 0;
+
+        for pending in self.pending_blocks.values() {
+            // Use original_tx_order/original_cert_order which are available even
+            // before the block is fully constructed (waiting for tx/cert data).
+            // These give us the counts from the block header.
+            total_txs += pending.all_transaction_hashes().len();
+            total_certs += pending.all_certificate_hashes().len();
+        }
+
+        (total_txs, total_certs)
+    }
+
     /// Handle QC formation.
     ///
     /// When a QC forms, we:
