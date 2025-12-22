@@ -12,9 +12,13 @@ use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
 use super::topic::Topic;
 use crate::metrics;
 use crate::validation_batcher::ValidationBatcherHandle;
+use futures::future::Either;
 use futures::StreamExt;
 use hyperscale_core::{Event, OutboundMessage};
 use hyperscale_types::{PublicKey, ShardGroupId, ValidatorId};
+use libp2p::core::muxing::StreamMuxerBox;
+use libp2p::core::transport::{OrTransport, Transport};
+use libp2p::core::upgrade::Version;
 use libp2p::{
     gossipsub, identity, kad,
     request_response::{self, ProtocolSupport, ResponseChannel},
@@ -31,10 +35,6 @@ use tracing::Instrument;
 use tracing::{debug, info, trace, warn};
 #[cfg(feature = "trace-propagation")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use libp2p::core::transport::{Transport, OrTransport};
-use libp2p::core::upgrade::Version;
-use libp2p::core::muxing::StreamMuxerBox;
-use futures::future::Either;
 
 /// Domain separator for deriving libp2p identity from validator public key.
 const LIBP2P_IDENTITY_DOMAIN: &[u8] = b"hyperscale-libp2p-identity-v1:";
@@ -458,36 +458,38 @@ impl Libp2pAdapter {
         // Build swarm with QUIC transport, optionally with TCP fallback
         let mut swarm = if config.tcp_fallback_enabled {
             info!("Building swarm with QUIC (primary) + TCP (fallback)");
-            
+
             // QUIC configuration
             let mut quic_config = libp2p::quic::Config::new(&keypair);
             quic_config.max_concurrent_stream_limit = 4096;
-            
+
             let quic_transport = libp2p::quic::tokio::Transport::new(quic_config)
                 .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
 
             // TCP configuration with Noise + Yamux
-            let tcp_transport = libp2p::tcp::tokio::Transport::new(
-                libp2p::tcp::Config::default().nodelay(true)
-            )
-            .upgrade(Version::V1)
-            .authenticate(libp2p::noise::Config::new(&keypair).map_err(|e| NetworkError::NetworkError(e.to_string()))?)
-            .multiplex({
-                let mut config = libp2p::yamux::Config::default();
-                config.set_max_num_streams(4096);
-                // allowing deprecated because replacement (connection-level limits) is not available libp2p 0.56
-                #[allow(deprecated)]
-                {
-                    config.set_max_buffer_size(16 * 1024 * 1024);
-                    config.set_receive_window_size(16 * 1024 * 1024);
-                }
-                config
-            })
-            .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
+            let tcp_transport =
+                libp2p::tcp::tokio::Transport::new(libp2p::tcp::Config::default().nodelay(true))
+                    .upgrade(Version::V1)
+                    .authenticate(
+                        libp2p::noise::Config::new(&keypair)
+                            .map_err(|e| NetworkError::NetworkError(e.to_string()))?,
+                    )
+                    .multiplex({
+                        let mut config = libp2p::yamux::Config::default();
+                        config.set_max_num_streams(4096);
+                        // allowing deprecated because replacement (connection-level limits) is not available libp2p 0.56
+                        #[allow(deprecated)]
+                        {
+                            config.set_max_buffer_size(16 * 1024 * 1024);
+                            config.set_receive_window_size(16 * 1024 * 1024);
+                        }
+                        config
+                    })
+                    .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
 
             // Prioritize QUIC by putting it first (Left side of OrTransport)
-            let transport = OrTransport::new(quic_transport, tcp_transport)
-                .map(|either, _| match either {
+            let transport =
+                OrTransport::new(quic_transport, tcp_transport).map(|either, _| match either {
                     Either::Left((peer_id, muxer)) => (peer_id, muxer),
                     Either::Right((peer_id, muxer)) => (peer_id, muxer),
                 });
