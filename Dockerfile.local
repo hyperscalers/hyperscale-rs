@@ -1,12 +1,6 @@
-# syntax=docker/dockerfile:1
-
-FROM --platform=$BUILDPLATFORM rust:latest AS builder
-
-# import cross-compilation helpers
-COPY --from=tonistiigi/xx:master / /
+FROM rust:latest AS builder
 
 WORKDIR /usr/src/app
-ARG TARGETPLATFORM
 
 # install dependencies
 RUN apt-get update && apt-get install -y \
@@ -16,25 +10,20 @@ RUN apt-get update && apt-get install -y \
     protobuf-compiler \
     git \
     build-essential \
-    && xx-apt-get install -y \
-    gcc \
-    g++ \
     libssl-dev \
     libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . .
 
-ENV PKG_CONFIG_ALLOW_CROSS=1
-
-# build with xx-cargo to cross compile (github runners are linux/amd64, but we may want to build for arm64)
+# build with cargo (native)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/src/app/target \
-    xx-cargo build --release --target-dir ./target && \
+    cargo build --release --target-dir ./target && \
     mkdir -p /out && \
-    cp target/$(xx-cargo --print-target-triple)/release/hyperscale-validator /out/ && \
-    cp target/$(xx-cargo --print-target-triple)/release/hyperscale-keygen /out/ && \
-    cp target/$(xx-cargo --print-target-triple)/release/hyperscale-spammer /out/
+    cp target/release/hyperscale-validator /out/ && \
+    cp target/release/hyperscale-keygen /out/ && \
+    cp target/release/hyperscale-spammer /out/
 
 FROM ubuntu:24.04
 
@@ -72,4 +61,4 @@ ENV NODE_HOSTNAME=localhost
 EXPOSE 9000-9500 8080-8099
 
 # NOTE: use --net=host for docker run! otherwise the nodes will be isolated from each other
-ENTRYPOINT ["tail", "-f", "/dev/null"]
+ENTRYPOINT ["/usr/local/bin/launch-cluster.sh", "--clean", "--shards", "1", "--validators-per-shard", "4"]
