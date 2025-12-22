@@ -1539,18 +1539,27 @@ impl BftState {
     ///
     /// # Ordering Rules
     ///
-    /// Transactions must be ordered as follows:
-    /// 1. **Priority group first**: Cross-shard TXs with CommitmentProof (in hash order)
-    /// 2. **Others second**: All other TXs (in hash order)
+    /// Transactions must be ordered in three priority tiers:
+    /// 1. **Retries first**: Retry transactions (have `retry_details`), sorted by hash
+    /// 2. **With proofs second**: Non-retry TXs with CommitmentProof, sorted by hash
+    /// 3. **Others third**: All other TXs, sorted by hash
     ///
-    /// Within each group, transactions must be sorted by hash (ascending).
-    /// This deterministic ordering:
-    /// - Reduces cross-shard conflicts (all shards pick same TXs)
-    /// - Prioritizes TXs that other shards are waiting on
-    /// - Is verifiable by all validators without local state
+    /// Within each tier, transactions must be sorted by hash (ascending).
     ///
-    /// The commitment proofs are stored in the block's `commitment_proofs` field,
-    /// making the block self-contained for validation.
+    /// # Why This Ordering
+    ///
+    /// - **Retries** have highest priority because they represent deferred transactions
+    ///   that have already been through one execution cycle. Fast inclusion prevents
+    ///   stalls and livelock cascades.
+    /// - **CommitmentProof TXs** have high priority because other shards are waiting
+    ///   on us to process them.
+    /// - **Others** are fresh transactions with no urgency.
+    ///
+    /// # Proof Verification
+    ///
+    /// Both priority tiers are verifiable from block contents:
+    /// - `RetryDetails` is embedded in the transaction itself
+    /// - `CommitmentProof` is stored in `block.commitment_proofs`
     fn validate_transaction_ordering(&self, block: &Block) -> Result<(), String> {
         let txs = &block.transactions;
 
@@ -1558,59 +1567,100 @@ impl BftState {
             return Ok(());
         }
 
-        // Split into priority (with proof in block) and others (without proof)
+        // Split into three tiers based on priority
+        let mut retries: Vec<Hash> = Vec::new();
         let mut with_proof: Vec<Hash> = Vec::new();
-        let mut without_proof: Vec<Hash> = Vec::new();
+        let mut others: Vec<Hash> = Vec::new();
 
         for tx in txs.iter() {
             let tx_hash = tx.hash();
-            if block.has_commitment_proof(&tx_hash) {
+            if tx.is_retry() {
+                retries.push(tx_hash);
+            } else if block.has_commitment_proof(&tx_hash) {
                 with_proof.push(tx_hash);
             } else {
-                without_proof.push(tx_hash);
+                others.push(tx_hash);
             }
         }
 
-        // Verify priority group is sorted by hash
+        // Verify each tier is sorted by hash
+        for window in retries.windows(2) {
+            if window[0] >= window[1] {
+                return Err(format!(
+                    "Retry transactions not in hash order: {} should be < {}",
+                    window[0], window[1]
+                ));
+            }
+        }
+
         for window in with_proof.windows(2) {
             if window[0] >= window[1] {
                 return Err(format!(
-                    "Priority transactions not in hash order: {} should be < {}",
+                    "CommitmentProof transactions not in hash order: {} should be < {}",
                     window[0], window[1]
                 ));
             }
         }
 
-        // Verify others group is sorted by hash
-        for window in without_proof.windows(2) {
+        for window in others.windows(2) {
             if window[0] >= window[1] {
                 return Err(format!(
-                    "Non-priority transactions not in hash order: {} should be < {}",
+                    "Other transactions not in hash order: {} should be < {}",
                     window[0], window[1]
                 ));
             }
         }
 
-        // Verify priority group comes before others group
-        // (all TXs with proof must have lower index than all TXs without proof)
-        if !with_proof.is_empty() && !without_proof.is_empty() {
-            // Find the last TX with proof and first TX without proof
-            let mut last_proof_idx = 0;
-            let mut first_no_proof_idx = txs.len();
+        // Verify tier ordering: retries < with_proof < others
+        // Track the last index seen in each tier and first index of next tier
+        let mut last_retry_idx: Option<usize> = None;
+        let mut first_proof_idx: Option<usize> = None;
+        let mut last_proof_idx: Option<usize> = None;
+        let mut first_other_idx: Option<usize> = None;
 
-            for (i, tx) in txs.iter().enumerate() {
-                let tx_hash = tx.hash();
-                if block.has_commitment_proof(&tx_hash) {
-                    last_proof_idx = i;
-                } else if first_no_proof_idx == txs.len() {
-                    first_no_proof_idx = i;
+        for (i, tx) in txs.iter().enumerate() {
+            let tx_hash = tx.hash();
+            if tx.is_retry() {
+                last_retry_idx = Some(i);
+            } else if block.has_commitment_proof(&tx_hash) {
+                if first_proof_idx.is_none() {
+                    first_proof_idx = Some(i);
                 }
+                last_proof_idx = Some(i);
+            } else if first_other_idx.is_none() {
+                first_other_idx = Some(i);
             }
+        }
 
-            if last_proof_idx > first_no_proof_idx {
+        // Check: all retries must come before all with_proof
+        if let (Some(last_retry), Some(first_proof)) = (last_retry_idx, first_proof_idx) {
+            if last_retry > first_proof {
                 return Err(format!(
-                    "Priority transactions must come before non-priority: found proof TX at index {} after non-proof TX at index {}",
-                    last_proof_idx, first_no_proof_idx
+                    "Retry transactions must come before CommitmentProof transactions: \
+                     found retry at index {} after proof TX at index {}",
+                    last_retry, first_proof
+                ));
+            }
+        }
+
+        // Check: all retries must come before all others
+        if let (Some(last_retry), Some(first_other)) = (last_retry_idx, first_other_idx) {
+            if last_retry > first_other {
+                return Err(format!(
+                    "Retry transactions must come before other transactions: \
+                     found retry at index {} after other TX at index {}",
+                    last_retry, first_other
+                ));
+            }
+        }
+
+        // Check: all with_proof must come before all others
+        if let (Some(last_proof), Some(first_other)) = (last_proof_idx, first_other_idx) {
+            if last_proof > first_other {
+                return Err(format!(
+                    "CommitmentProof transactions must come before other transactions: \
+                     found proof TX at index {} after other TX at index {}",
+                    last_proof, first_other
                 ));
             }
         }
@@ -6686,6 +6736,14 @@ mod tests {
         Arc::new(test_utils::test_transaction(seed))
     }
 
+    /// Create a retry transaction for testing.
+    fn make_retry_tx(seed: u8) -> Arc<hyperscale_types::RoutableTransaction> {
+        use hyperscale_types::test_utils;
+        let original = test_utils::test_transaction(seed);
+        let winner_hash = Hash::from_bytes(&[seed.wrapping_add(100); 32]);
+        Arc::new(original.create_retry(winner_hash, BlockHeight(1)))
+    }
+
     /// Sort transactions by hash for test setup
     fn sort_txs_by_hash(txs: &mut [Arc<hyperscale_types::RoutableTransaction>]) {
         txs.sort_by_key(|tx| tx.hash());
@@ -6794,7 +6852,7 @@ mod tests {
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
-            .contains("Priority transactions not in hash order"));
+            .contains("CommitmentProof transactions not in hash order"));
     }
 
     #[test]
@@ -6815,7 +6873,7 @@ mod tests {
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
-            .contains("Priority transactions must come before non-priority"));
+            .contains("CommitmentProof transactions must come before other transactions"));
     }
 
     #[test]
@@ -6838,6 +6896,115 @@ mod tests {
 
         let block = make_test_block_with_proofs(5, txs, proofs);
         assert!(state.validate_transaction_ordering(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_retries_first() {
+        let state = make_test_state();
+
+        // Create retry TXs, proof TXs, and regular TXs
+        let retry1 = make_retry_tx(10);
+        let retry2 = make_retry_tx(20);
+        let (proof_tx, proof) = make_test_tx_with_proof(30, true);
+        let regular = make_test_tx(40, false);
+
+        // Sort each tier by hash
+        let mut retries = vec![retry1.clone(), retry2.clone()];
+        sort_txs_by_hash(&mut retries);
+
+        let mut proofs_vec = vec![proof_tx.clone()];
+        sort_txs_by_hash(&mut proofs_vec);
+
+        let mut others = vec![regular.clone()];
+        sort_txs_by_hash(&mut others);
+
+        // Combine in correct order: retries, then proofs, then others
+        let mut txs = Vec::new();
+        txs.extend(retries);
+        txs.extend(proofs_vec);
+        txs.extend(others);
+
+        let mut proofs_map = HashMap::new();
+        proofs_map.insert(proof_tx.hash(), proof.unwrap());
+
+        let block = make_test_block_with_proofs(5, txs, proofs_map);
+        assert!(state.validate_transaction_ordering(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_invalid_retry_after_proof() {
+        let state = make_test_state();
+
+        // Create a retry and a proof TX
+        let retry = make_retry_tx(10);
+        let (proof_tx, proof) = make_test_tx_with_proof(30, true);
+
+        // Invalid order: proof TX before retry
+        let txs = vec![proof_tx.clone(), retry.clone()];
+
+        let mut proofs_map = HashMap::new();
+        proofs_map.insert(proof_tx.hash(), proof.unwrap());
+
+        let block = make_test_block_with_proofs(5, txs, proofs_map);
+        let result = state.validate_transaction_ordering(&block);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Retry transactions must come before"),
+            "Should detect retry after proof TX"
+        );
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_invalid_retry_after_other() {
+        let state = make_test_state();
+
+        // Create a retry and a regular TX
+        let retry = make_retry_tx(10);
+        let regular = make_test_tx(30, false);
+
+        // Invalid order: regular TX before retry
+        let txs = vec![regular.clone(), retry.clone()];
+
+        let block = make_test_block_with_transactions(5, txs);
+        let result = state.validate_transaction_ordering(&block);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Retry transactions must come before"),
+            "Should detect retry after regular TX"
+        );
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_retries_only() {
+        let state = make_test_state();
+
+        // All retries - valid as long as sorted
+        let mut txs = vec![make_retry_tx(10), make_retry_tx(20), make_retry_tx(30)];
+        sort_txs_by_hash(&mut txs);
+
+        let block = make_test_block_with_transactions(5, txs);
+        assert!(state.validate_transaction_ordering(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_retries_unsorted() {
+        let state = make_test_state();
+
+        // Retries not sorted by hash
+        let mut txs = vec![make_retry_tx(10), make_retry_tx(20), make_retry_tx(30)];
+        sort_txs_by_hash(&mut txs);
+        txs.reverse(); // Make invalid
+
+        let block = make_test_block_with_transactions(5, txs);
+        let result = state.validate_transaction_ordering(&block);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Retry transactions not in hash order"));
     }
 
     #[test]
