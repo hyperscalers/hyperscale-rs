@@ -177,7 +177,7 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             name: linux-amd64
           - target: aarch64-apple-darwin
@@ -185,6 +185,10 @@ jobs:
             name: macos-arm64
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install musl-tools
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get install -y musl-tools
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
