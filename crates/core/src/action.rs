@@ -288,6 +288,9 @@ pub enum Action {
         added_at: Duration,
         /// Whether this is a cross-shard transaction (for metrics labeling).
         cross_shard: bool,
+        /// Whether this transaction was submitted locally (via RPC) vs received via gossip/fetch.
+        /// Only locally-submitted transactions should contribute to latency metrics.
+        submitted_locally: bool,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

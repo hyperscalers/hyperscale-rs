@@ -94,6 +94,9 @@ struct PoolEntry {
     added_at: Duration,
     /// Whether this is a cross-shard transaction (cached at insertion time).
     cross_shard: bool,
+    /// Whether this transaction was submitted locally (via RPC) vs received via gossip/fetch.
+    /// Only locally-submitted transactions should contribute to latency metrics.
+    submitted_locally: bool,
 }
 
 /// Mempool state machine.
@@ -203,6 +206,7 @@ impl MempoolState {
                 status: TransactionStatus::Pending, // Already exists
                 added_at: entry.added_at,
                 cross_shard: entry.cross_shard,
+                submitted_locally: entry.submitted_locally,
             }];
         }
 
@@ -220,6 +224,7 @@ impl MempoolState {
                 status: TransactionStatus::Pending,
                 added_at: self.now,
                 cross_shard,
+                submitted_locally: true, // Submitted via RPC
             },
         );
         tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
@@ -231,6 +236,7 @@ impl MempoolState {
             status: TransactionStatus::Pending,
             added_at: self.now,
             cross_shard,
+            submitted_locally: true,
         }]
     }
 
@@ -258,6 +264,7 @@ impl MempoolState {
                 status: TransactionStatus::Pending,
                 added_at: self.now,
                 cross_shard,
+                submitted_locally: false, // Received via gossip
             },
         );
         tracing::debug!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
@@ -373,6 +380,7 @@ impl MempoolState {
                         status: TransactionStatus::Pending, // Will be updated by execution
                         added_at: self.now,
                         cross_shard,
+                        submitted_locally: false, // Fetched for block processing
                     },
                 );
                 tracing::debug!(
@@ -411,6 +419,7 @@ impl MempoolState {
                 if matches!(entry.status, TransactionStatus::Pending) {
                     let added_at = entry.added_at;
                     let cross_shard = entry.cross_shard;
+                    let submitted_locally = entry.submitted_locally;
                     entry.status = TransactionStatus::Committed(height);
                     // Add locks for committed transactions
                     self.add_locked_nodes(tx);
@@ -419,6 +428,7 @@ impl MempoolState {
                         status: TransactionStatus::Committed(height),
                         added_at,
                         cross_shard,
+                        submitted_locally,
                     });
                 }
             }
@@ -443,6 +453,7 @@ impl MempoolState {
             if let Some(entry) = self.pool.get(&abort.tx_hash) {
                 let added_at = entry.added_at;
                 let cross_shard = entry.cross_shard;
+                let submitted_locally = entry.submitted_locally;
                 let status = TransactionStatus::Aborted {
                     reason: abort.reason.clone(),
                 };
@@ -451,6 +462,7 @@ impl MempoolState {
                     status,
                     added_at,
                     cross_shard,
+                    submitted_locally,
                 });
                 // Evict from pool and tombstone - terminal state
                 self.evict_terminal(abort.tx_hash);
@@ -535,6 +547,7 @@ impl MempoolState {
                     status: new_status,
                     added_at: entry.added_at,
                     cross_shard,
+                    submitted_locally: entry.submitted_locally,
                 }];
             }
         } else {
@@ -576,11 +589,13 @@ impl MempoolState {
         if let Some(entry) = self.pool.get(&tx_hash) {
             let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
+            let submitted_locally = entry.submitted_locally;
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Completed(decision),
                 added_at,
                 cross_shard,
+                submitted_locally,
             });
             // Evict from pool and tombstone - terminal state
             self.evict_terminal(tx_hash);
@@ -614,11 +629,13 @@ impl MempoolState {
                 if let Some(entry) = self.pool.get(&loser_hash) {
                     let added_at = entry.added_at;
                     let cross_shard = entry.cross_shard;
+                    let submitted_locally = entry.submitted_locally;
                     actions.push(Action::EmitTransactionStatus {
                         tx_hash: loser_hash,
                         status: TransactionStatus::Retried { new_tx: retry_hash },
                         added_at,
                         cross_shard,
+                        submitted_locally,
                     });
                     // Evict from pool and tombstone - terminal state
                     self.evict_terminal(loser_hash);
@@ -635,6 +652,7 @@ impl MempoolState {
                             status: TransactionStatus::Pending,
                             added_at: self.now,
                             cross_shard,
+                            submitted_locally: false, // System-generated retry
                         },
                     );
 
@@ -644,6 +662,7 @@ impl MempoolState {
                         status: TransactionStatus::Pending,
                         added_at: self.now,
                         cross_shard,
+                        submitted_locally: false,
                     });
 
                     // Gossip the retry to relevant shards
@@ -699,11 +718,13 @@ impl MempoolState {
         if let Some(entry) = self.pool.get(&loser_hash) {
             let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
+            let submitted_locally = entry.submitted_locally;
             actions.push(Action::EmitTransactionStatus {
                 tx_hash: loser_hash,
                 status: TransactionStatus::Retried { new_tx: retry_hash },
                 added_at,
                 cross_shard,
+                submitted_locally,
             });
             // Evict from pool and tombstone - terminal state
             self.evict_terminal(loser_hash);
@@ -720,6 +741,7 @@ impl MempoolState {
                     status: TransactionStatus::Pending,
                     added_at: self.now,
                     cross_shard,
+                    submitted_locally: false, // System-generated retry
                 },
             );
 
@@ -729,6 +751,7 @@ impl MempoolState {
                 status: TransactionStatus::Pending,
                 added_at: self.now,
                 cross_shard,
+                submitted_locally: false,
             });
 
             // Gossip the retry to relevant shards
@@ -777,12 +800,14 @@ impl MempoolState {
             };
             let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
+            let submitted_locally = entry.submitted_locally;
             entry.status = TransactionStatus::Executed(decision);
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Executed(decision),
                 added_at,
                 cross_shard,
+                submitted_locally,
             });
         }
 
@@ -817,11 +842,13 @@ impl MempoolState {
             if let Some(entry) = self.pool.get(&loser_hash) {
                 let added_at = entry.added_at;
                 let cross_shard = entry.cross_shard;
+                let submitted_locally = entry.submitted_locally;
                 actions.push(Action::EmitTransactionStatus {
                     tx_hash: loser_hash,
                     status: TransactionStatus::Retried { new_tx: retry_hash },
                     added_at,
                     cross_shard,
+                    submitted_locally,
                 });
                 // Evict from pool and tombstone - terminal state
                 self.evict_terminal(loser_hash);
@@ -838,6 +865,7 @@ impl MempoolState {
                         status: TransactionStatus::Pending,
                         added_at: self.now,
                         cross_shard,
+                        submitted_locally: false, // System-generated retry
                     },
                 );
 
@@ -847,6 +875,7 @@ impl MempoolState {
                     status: TransactionStatus::Pending,
                     added_at: self.now,
                     cross_shard,
+                    submitted_locally: false,
                 });
 
                 // Gossip the retry to relevant shards
@@ -864,6 +893,7 @@ impl MempoolState {
         if let Some(entry) = self.pool.get(tx_hash) {
             let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
+            let submitted_locally = entry.submitted_locally;
             // Evict from pool and tombstone - terminal state
             self.evict_terminal(*tx_hash);
             return vec![Action::EmitTransactionStatus {
@@ -871,6 +901,7 @@ impl MempoolState {
                 status: TransactionStatus::Completed(decision),
                 added_at,
                 cross_shard,
+                submitted_locally,
             }];
         }
         vec![]
@@ -920,12 +951,14 @@ impl MempoolState {
                 // Re-borrow entry after calling helper methods
                 let entry = self.pool.get_mut(tx_hash).unwrap();
                 let added_at = entry.added_at;
+                let submitted_locally = entry.submitted_locally;
                 entry.status = new_status.clone();
                 return vec![Action::EmitTransactionStatus {
                     tx_hash: *tx_hash,
                     status: new_status,
                     added_at,
                     cross_shard,
+                    submitted_locally,
                 }];
             }
 

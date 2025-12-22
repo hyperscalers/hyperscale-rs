@@ -566,6 +566,7 @@ impl ProductionRunnerBuilder {
             fetch_handler,
             dispatch_tx,
             action_dispatcher,
+            rpc_submitted_txs: std::collections::HashSet::new(),
         })
     }
 }
@@ -684,6 +685,10 @@ pub struct ProductionRunner {
     /// Handle for the dedicated action dispatcher task.
     #[allow(dead_code)]
     action_dispatcher: ActionDispatcherHandle,
+    /// Set of transaction hashes that were submitted via RPC (locally).
+    /// Used to track which transactions should contribute to latency metrics.
+    /// Transactions are added when received via RPC, removed when finalized.
+    rpc_submitted_txs: std::collections::HashSet<hyperscale_types::Hash>,
 }
 
 impl ProductionRunner {
@@ -1379,14 +1384,18 @@ impl ProductionRunner {
                 // These need to be gossiped to all relevant shards BEFORE validation,
                 // unlike gossip-received transactions which are already gossiped.
                 Some(tx) = self.rpc_tx_rx.recv() => {
+                    let tx_hash = tx.hash();
                     let tx_span = span!(
                         Level::DEBUG,
                         "handle_rpc_tx",
-                        tx_hash = ?tx.hash(),
+                        tx_hash = ?tx_hash,
                         node = self.state.node_index(),
                         shard = ?self.state.shard(),
                     );
                     let _tx_guard = tx_span.enter();
+
+                    // Track this as an RPC-submitted transaction for latency metrics
+                    self.rpc_submitted_txs.insert(tx_hash);
 
                     // Step 1: Gossip to all relevant shards FIRST
                     // This ensures other validators see the transaction even if we fail later
@@ -2059,15 +2068,28 @@ impl ProductionRunner {
                 status,
                 added_at,
                 cross_shard,
+                submitted_locally: _,
             } => {
                 tracing::debug!(?tx_hash, ?status, cross_shard, "Transaction status update");
 
-                // Record transaction metrics for terminal states
+                // Record transaction metrics for terminal states, but only for transactions
+                // that were submitted via RPC to THIS node. This avoids polluting latency
+                // metrics with transactions received via gossip/sync which would have
+                // artificially high latencies on lagging nodes.
+                //
+                // Note: We use rpc_submitted_txs instead of the submitted_locally field
+                // because the field tracks mempool insertion, not RPC origin. In production,
+                // RPC transactions go through gossip before reaching the mempool, so
+                // submitted_locally would always be false.
                 if status.is_final() {
-                    // Calculate latency from submission to finalization
-                    let now = self.state.now();
-                    let latency_secs = now.saturating_sub(added_at).as_secs_f64();
-                    crate::metrics::record_transaction_finalized(latency_secs, cross_shard);
+                    // Check if this was an RPC-submitted transaction
+                    let was_rpc_submitted = self.rpc_submitted_txs.remove(&tx_hash);
+                    if was_rpc_submitted {
+                        // Calculate latency from submission to finalization
+                        let now = self.state.now();
+                        let latency_secs = now.saturating_sub(added_at).as_secs_f64();
+                        crate::metrics::record_transaction_finalized(latency_secs, cross_shard);
+                    }
                 }
 
                 // Update transaction status cache for RPC queries
