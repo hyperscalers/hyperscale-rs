@@ -22,7 +22,7 @@ use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     Block, BlockHeader, BlockMetadata, BlockVote, CommitmentProof, Hash, KeyPair, PublicKey,
     QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
-    StateVoteBlock, Topology, TransactionCertificate, ValidatorId,
+    StateProvision, StateVoteBlock, Topology, TransactionCertificate, ValidatorId,
 };
 use libp2p::identity;
 use sbor::prelude::*;
@@ -107,6 +107,27 @@ impl PendingCrossShardExecutions {
 
     fn take(&mut self) -> Vec<hyperscale_core::CrossShardExecutionRequest> {
         std::mem::take(&mut self.requests)
+    }
+}
+
+/// Pending provision verifications with batching window.
+///
+/// Provisions are cross-shard state data that must be verified before execution.
+/// Similar to state votes, we batch them with a 10ms window to enable batch
+/// signature verification (2-8x faster than individual verification).
+#[derive(Default)]
+struct PendingProvisions {
+    /// Provisions waiting for verification.
+    provisions: Vec<(StateProvision, PublicKey)>,
+}
+
+impl PendingProvisions {
+    fn is_empty(&self) -> bool {
+        self.provisions.is_empty()
+    }
+
+    fn take(&mut self) -> Vec<(StateProvision, PublicKey)> {
+        std::mem::take(&mut self.provisions)
     }
 }
 
@@ -576,6 +597,8 @@ impl ProductionRunnerBuilder {
             state_vote_deadline: None,
             pending_cross_shard_executions: PendingCrossShardExecutions::default(),
             cross_shard_execution_deadline: None,
+            pending_provisions: PendingProvisions::default(),
+            provision_deadline: None,
             message_batcher,
             fetch_handler,
             dispatch_tx,
@@ -684,6 +707,12 @@ pub struct ProductionRunner {
     pending_cross_shard_executions: PendingCrossShardExecutions,
     /// Deadline for flushing pending cross-shard executions. None if none pending.
     cross_shard_execution_deadline: Option<tokio::time::Instant>,
+    /// Pending provisions accumulated for batch signature verification.
+    /// Uses a 10ms batching window - shorter than state votes (20ms) since provisions
+    /// block cross-shard execution, but longer than block votes (5ms).
+    pending_provisions: PendingProvisions,
+    /// Deadline for flushing pending provisions. None if none pending.
+    provision_deadline: Option<tokio::time::Instant>,
     /// Message batcher for execution layer messages (votes, certificates, provisions).
     /// Accumulates items and flushes periodically to reduce network overhead.
     /// Note: Now primarily used by action dispatcher, kept here for direct access if needed.
@@ -1321,6 +1350,15 @@ impl ProductionRunner {
                                         }
                                         self.pending_state_votes.votes.push((vote, public_key));
                                     }
+                                    Action::VerifyProvisionSignature { provision, public_key } => {
+                                        // Add to accumulated provisions with 10ms batching window
+                                        if self.pending_provisions.is_empty() {
+                                            self.provision_deadline = Some(
+                                                tokio::time::Instant::now() + Duration::from_millis(10)
+                                            );
+                                        }
+                                        self.pending_provisions.provisions.push((provision, public_key));
+                                    }
                                     // Note: ExecuteCrossShardTransaction only comes from ProvisioningComplete
                                     // which routes through the callback channel, not the consensus channel.
                                     other => {
@@ -1352,6 +1390,14 @@ impl ProductionRunner {
                                                 );
                                             }
                                             self.pending_state_votes.votes.push((vote, public_key));
+                                        }
+                                        Action::VerifyProvisionSignature { provision, public_key } => {
+                                            if self.pending_provisions.is_empty() {
+                                                self.provision_deadline = Some(
+                                                    tokio::time::Instant::now() + Duration::from_millis(10)
+                                                );
+                                            }
+                                            self.pending_provisions.provisions.push((provision, public_key));
                                         }
                                         other => {
                                             if let Err(e) = self.process_action(other).await {
@@ -1393,6 +1439,14 @@ impl ProductionRunner {
                                                             );
                                                         }
                                                         self.pending_state_votes.votes.push((vote, public_key));
+                                                    }
+                                                    Action::VerifyProvisionSignature { provision, public_key } => {
+                                                        if self.pending_provisions.is_empty() {
+                                                            self.provision_deadline = Some(
+                                                                tokio::time::Instant::now() + Duration::from_millis(10)
+                                                            );
+                                                        }
+                                                        self.pending_provisions.provisions.push((provision, public_key));
                                                     }
                                                     other => {
                                                         if let Err(e) = self.process_action(other).await {
@@ -1466,6 +1520,28 @@ impl ProductionRunner {
                             "Flushing cross-shard execution batch after 5ms window"
                         );
                         self.dispatch_cross_shard_executions(requests);
+                    }
+                }
+
+                // PROVISION BATCHING: Flush accumulated provisions when deadline expires.
+                // Uses a 10ms batching window - shorter than state votes (20ms) since provisions
+                // block cross-shard execution, but longer than block votes (5ms).
+                _ = async {
+                    match self.provision_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.provision_deadline.is_some() => {
+                    let provisions = self.pending_provisions.take();
+                    let batch_size = provisions.len();
+                    self.provision_deadline = None;
+
+                    if !provisions.is_empty() {
+                        tracing::debug!(
+                            batch_size,
+                            "Flushing provision batch after 10ms window"
+                        );
+                        self.dispatch_provision_verifications(provisions);
                     }
                 }
 
@@ -1717,29 +1793,16 @@ impl ProductionRunner {
                 provision,
                 public_key,
             } => {
-                // Spawn provision verification - always succeeds (provisions are critical).
-                // We use spawn_crypto directly since provisions should not be dropped.
-                // Backpressure is handled at the transaction submission layer instead.
-                let event_tx = self.callback_tx.clone();
-                self.thread_pools.spawn_crypto(move || {
-                    let start = std::time::Instant::now();
-                    // Use centralized signing message (must match ExecutionState::sign_provision)
-                    let msg = provision.signing_message();
-
-                    let valid = public_key.verify(&msg, &provision.signature);
-                    crate::metrics::record_signature_verification_latency(
-                        "provision",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        crate::metrics::record_signature_verification_failure();
-                    }
-                    event_tx
-                        .send(Event::ProvisionSignatureVerified { provision, valid })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
+                // NOTE: Provisions should normally be batched via the event loop's
+                // pending_provisions accumulator. This fallback handles any provisions
+                // that come through process_action (e.g., from callback channel events).
+                if self.pending_provisions.is_empty() {
+                    self.provision_deadline =
+                        Some(tokio::time::Instant::now() + Duration::from_millis(10));
+                }
+                self.pending_provisions
+                    .provisions
+                    .push((provision, public_key));
             }
 
             Action::AggregateCommitmentProof {
@@ -2786,6 +2849,137 @@ impl ProductionRunner {
                 tracing::debug!(
                     batch_size,
                     "Batch verified state vote signatures (20ms window)"
+                );
+            }
+        });
+    }
+
+    /// Dispatch provision verifications to the crypto thread pool.
+    ///
+    /// Provisions are cross-shard state data that must be verified before execution.
+    /// Uses a 10ms batching window - shorter than state votes (20ms) since provisions
+    /// block cross-shard execution, but longer than block votes (5ms).
+    ///
+    /// Results are sent back as individual events to maintain compatibility
+    /// with the state machine's expectations.
+    fn dispatch_provision_verifications(&self, provisions: Vec<(StateProvision, PublicKey)>) {
+        if provisions.is_empty() {
+            return;
+        }
+
+        let event_tx = self.callback_tx.clone();
+        let batch_size = provisions.len();
+
+        self.thread_pools.spawn_crypto(move || {
+            let start = std::time::Instant::now();
+
+            // Build signing messages for provisions (must match ExecutionState::sign_provision)
+            let provisions_with_msgs: Vec<(StateProvision, PublicKey, Vec<u8>)> = provisions
+                .into_iter()
+                .map(|(provision, pk)| {
+                    let msg = provision.signing_message();
+                    (provision, pk, msg)
+                })
+                .collect();
+
+            let mut ed25519_provisions: Vec<(StateProvision, PublicKey, Vec<u8>)> = Vec::new();
+            let mut bls_provisions: Vec<(StateProvision, PublicKey, Vec<u8>)> = Vec::new();
+
+            for (provision, pk, msg) in provisions_with_msgs {
+                match &pk {
+                    PublicKey::Ed25519(_) => ed25519_provisions.push((provision, pk, msg)),
+                    PublicKey::Bls12381(_) => bls_provisions.push((provision, pk, msg)),
+                }
+            }
+
+            // Process Ed25519 provisions using batch verification
+            if !ed25519_provisions.is_empty() {
+                let messages: Vec<&[u8]> = ed25519_provisions
+                    .iter()
+                    .map(|(_, _, m)| m.as_slice())
+                    .collect();
+                let signatures: Vec<Signature> = ed25519_provisions
+                    .iter()
+                    .map(|(p, _, _)| p.signature.clone())
+                    .collect();
+                let pubkeys: Vec<PublicKey> = ed25519_provisions
+                    .iter()
+                    .map(|(_, pk, _)| pk.clone())
+                    .collect();
+
+                let batch_valid =
+                    PublicKey::batch_verify_ed25519(&messages, &signatures, &pubkeys);
+
+                if batch_valid {
+                    for (provision, _, _) in ed25519_provisions {
+                        event_tx
+                            .send(Event::ProvisionSignatureVerified {
+                                provision,
+                                valid: true,
+                            })
+                            .expect(
+                                "callback channel closed - Loss of this event would cause a deadlock",
+                            );
+                    }
+                } else {
+                    // Batch failed - fall back to individual verification
+                    for (provision, pk, msg) in ed25519_provisions {
+                        let valid = pk.verify(&msg, &provision.signature);
+                        if !valid {
+                            crate::metrics::record_signature_verification_failure();
+                        }
+                        event_tx
+                            .send(Event::ProvisionSignatureVerified { provision, valid })
+                            .expect(
+                                "callback channel closed - Loss of this event would cause a deadlock",
+                            );
+                    }
+                }
+            }
+
+            // Process BLS provisions using blst's native batch verification.
+            // Uses random linear combination to batch verify different messages efficiently.
+            if !bls_provisions.is_empty() {
+                let messages: Vec<&[u8]> = bls_provisions
+                    .iter()
+                    .map(|(_, _, m)| m.as_slice())
+                    .collect();
+                let signatures: Vec<Signature> = bls_provisions
+                    .iter()
+                    .map(|(p, _, _)| p.signature.clone())
+                    .collect();
+                let pubkeys: Vec<PublicKey> = bls_provisions
+                    .iter()
+                    .map(|(_, pk, _)| pk.clone())
+                    .collect();
+
+                let results = PublicKey::batch_verify_bls_different_messages(
+                    &messages,
+                    &signatures,
+                    &pubkeys,
+                );
+
+                for ((provision, _, _), valid) in bls_provisions.into_iter().zip(results) {
+                    if !valid {
+                        crate::metrics::record_signature_verification_failure();
+                    }
+                    event_tx
+                        .send(Event::ProvisionSignatureVerified { provision, valid })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
+                }
+            }
+
+            crate::metrics::record_signature_verification_latency(
+                "provision",
+                start.elapsed().as_secs_f64(),
+            );
+
+            if batch_size > 1 {
+                tracing::debug!(
+                    batch_size,
+                    "Batch verified provision signatures (10ms window)"
                 );
             }
         });
