@@ -143,6 +143,28 @@ pub enum Action {
         committee_size: usize,
     },
 
+    /// Aggregate state votes into a StateCertificate (vote quorum reached).
+    ///
+    /// Performs BLS signature aggregation which is compute-intensive.
+    /// Delegated to a thread pool in production, instant in simulation.
+    /// Returns `Event::StateCertificateAggregated` when complete.
+    AggregateStateCertificate {
+        /// Transaction hash for correlation.
+        tx_hash: Hash,
+        /// Shard group that executed.
+        shard: ShardGroupId,
+        /// Merkle root of the execution outputs.
+        merkle_root: Hash,
+        /// Votes to aggregate (with quorum).
+        votes: Vec<StateVoteBlock>,
+        /// Read nodes (for certificate).
+        read_nodes: Vec<NodeId>,
+        /// Total voting power of the votes.
+        voting_power: VotePower,
+        /// Committee size (for SignerBitfield capacity).
+        committee_size: usize,
+    },
+
     /// Verify a state vote's signature (cross-shard Phase 4).
     ///
     /// Delegated to a thread pool in production, instant in simulation.
@@ -511,6 +533,7 @@ impl Action {
             Action::VerifyVoteSignature { .. }
                 | Action::VerifyProvisionSignature { .. }
                 | Action::AggregateCommitmentProof { .. }
+                | Action::AggregateStateCertificate { .. }
                 | Action::VerifyStateVoteSignature { .. }
                 | Action::VerifyStateCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
@@ -572,6 +595,7 @@ impl Action {
             Action::VerifyVoteSignature { .. } => "VerifyVoteSignature",
             Action::VerifyProvisionSignature { .. } => "VerifyProvisionSignature",
             Action::AggregateCommitmentProof { .. } => "AggregateCommitmentProof",
+            Action::AggregateStateCertificate { .. } => "AggregateStateCertificate",
             Action::VerifyStateVoteSignature { .. } => "VerifyStateVoteSignature",
             Action::VerifyStateCertificateSignature { .. } => "VerifyStateCertificateSignature",
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",

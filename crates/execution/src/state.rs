@@ -32,8 +32,8 @@
 use hyperscale_core::{Action, Event, SubStateMachine};
 use hyperscale_types::{
     BlockHeight, ExecutionResult, Hash, KeyPair, NodeId, PublicKey, RoutableTransaction,
-    ShardGroupId, Signature, SignerBitfield, StateCertificate, StateEntry, StateProvision,
-    StateVoteBlock, Topology, TransactionCertificate, TransactionDecision, ValidatorId,
+    ShardGroupId, Signature, StateCertificate, StateEntry, StateProvision, StateVoteBlock,
+    Topology, TransactionCertificate, TransactionDecision, ValidatorId, VotePower,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -42,8 +42,8 @@ use std::time::Duration;
 use tracing::{debug, instrument};
 
 use crate::pending::{
-    PendingCertificateVerification, PendingFetchedCertificateVerification,
-    PendingProvisionBroadcast, PendingStateVoteVerification,
+    PendingCertificateAggregation, PendingCertificateVerification,
+    PendingFetchedCertificateVerification, PendingProvisionBroadcast, PendingStateVoteVerification,
 };
 use crate::trackers::{CertificateTracker, VoteTracker};
 
@@ -135,6 +135,10 @@ pub struct ExecutionState {
     /// State certificates from vote aggregation (local shard's certificate).
     /// Maps tx_hash -> StateCertificate
     state_certificates: HashMap<Hash, StateCertificate>,
+
+    /// Pending certificate aggregations waiting for BLS aggregation callback.
+    /// Maps tx_hash -> PendingCertificateAggregation
+    pending_cert_aggregations: HashMap<Hash, PendingCertificateAggregation>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Cross-shard state (Phase 5: Finalization)
@@ -291,6 +295,7 @@ impl ExecutionState {
             pending_provision_fetches: HashMap::new(),
             vote_trackers: HashMap::new(),
             state_certificates: HashMap::new(),
+            pending_cert_aggregations: HashMap::new(),
             certificate_trackers: HashMap::new(),
             early_provisioning_complete: HashMap::new(),
             early_votes: HashMap::new(),
@@ -361,11 +366,6 @@ impl ExecutionState {
     /// Get quorum threshold.
     fn quorum_threshold(&self) -> u64 {
         self.topology.local_quorum_threshold()
-    }
-
-    /// Get committee index for a validator.
-    fn committee_index(&self, validator_id: ValidatorId) -> Option<usize> {
-        self.topology.local_committee_index(validator_id)
     }
 
     /// Check if a transaction is single-shard.
@@ -1195,91 +1195,83 @@ impl ExecutionState {
                 merkle_root = ?merkle_root,
                 votes = votes.len(),
                 power = total_power,
-                "Vote quorum reached"
+                "Vote quorum reached - delegating BLS aggregation"
             );
 
-            // Create state certificate
-            let certificate =
-                self.create_state_certificate(tx_hash, merkle_root, &votes, read_nodes);
+            // Store pending aggregation state for callback
+            self.pending_cert_aggregations.insert(
+                tx_hash,
+                PendingCertificateAggregation {
+                    participating_shards,
+                },
+            );
 
-            // Store certificate
-            self.state_certificates.insert(tx_hash, certificate.clone());
+            // Delegate BLS signature aggregation to crypto pool
+            let committee_size = self.committee().len();
+            actions.push(Action::AggregateStateCertificate {
+                tx_hash,
+                shard: local_shard,
+                merkle_root,
+                votes,
+                read_nodes,
+                voting_power: VotePower(total_power),
+                committee_size,
+            });
 
-            // Broadcast certificate to all participating shards (runner handles batching)
-            for target_shard in participating_shards {
-                actions.push(Action::BroadcastStateCertificate {
-                    shard: target_shard,
-                    certificate: certificate.clone(),
-                });
-            }
-
-            // Handle our own certificate
-            actions.extend(self.handle_certificate_internal(certificate));
-
-            // Remove vote tracker
+            // Remove vote tracker (we've extracted what we need)
             self.vote_trackers.remove(&tx_hash);
         }
 
         actions
     }
 
-    /// Create a state certificate from votes.
-    fn create_state_certificate(
-        &self,
+    /// Handle state certificate aggregation completed.
+    ///
+    /// Callback from `Action::AggregateStateCertificate`. The crypto pool has
+    /// finished BLS signature aggregation and produced the certificate.
+    #[instrument(skip(self, certificate), fields(
+        tx_hash = ?tx_hash,
+        shard = certificate.shard_group_id.0,
+        success = certificate.success
+    ))]
+    fn on_state_certificate_aggregated(
+        &mut self,
         tx_hash: Hash,
-        merkle_root: Hash,
-        votes: &[StateVoteBlock],
-        read_nodes: Vec<NodeId>,
-    ) -> StateCertificate {
-        let shard = self.local_shard();
+        certificate: StateCertificate,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
 
-        // Deduplicate votes by validator to avoid aggregating the same signature multiple times
-        let mut seen_validators = std::collections::HashSet::new();
-        let unique_votes: Vec<_> = votes
-            .iter()
-            .filter(|vote| seen_validators.insert(vote.validator))
-            .collect();
-
-        // Aggregate BLS signatures from unique votes only
-        let bls_signatures: Vec<Signature> = unique_votes
-            .iter()
-            .filter_map(|vote| match &vote.signature {
-                Signature::Bls12381(_) => Some(vote.signature.clone()),
-                _ => None,
-            })
-            .collect();
-
-        let aggregated_signature = if !bls_signatures.is_empty() {
-            Signature::aggregate_bls(&bls_signatures).unwrap_or_else(|_| Signature::zero())
-        } else {
-            Signature::zero()
+        // Get pending aggregation state
+        let Some(pending) = self.pending_cert_aggregations.remove(&tx_hash) else {
+            tracing::warn!(
+                tx_hash = ?tx_hash,
+                "Received certificate aggregation callback but no pending aggregation found"
+            );
+            return actions;
         };
 
-        // Create signer bitfield
-        let committee_size = self.committee().len();
-        let mut signers = SignerBitfield::new(committee_size);
-        let mut total_power = 0u64;
+        tracing::debug!(
+            tx_hash = ?tx_hash,
+            shard = certificate.shard_group_id.0,
+            participating_shards = pending.participating_shards.len(),
+            "State certificate aggregation complete"
+        );
 
-        for vote in unique_votes {
-            if let Some(index) = self.committee_index(vote.validator) {
-                signers.set(index);
-                total_power += self.voting_power(vote.validator);
-            }
+        // Store certificate
+        self.state_certificates.insert(tx_hash, certificate.clone());
+
+        // Broadcast certificate to all participating shards (runner handles batching)
+        for target_shard in pending.participating_shards {
+            actions.push(Action::BroadcastStateCertificate {
+                shard: target_shard,
+                certificate: certificate.clone(),
+            });
         }
 
-        let success = votes.first().map(|v| v.success).unwrap_or(false);
+        // Handle our own certificate
+        actions.extend(self.handle_certificate_internal(certificate));
 
-        StateCertificate {
-            transaction_hash: tx_hash,
-            shard_group_id: shard,
-            read_nodes,
-            state_writes: vec![], // Would be populated from execution
-            outputs_merkle_root: merkle_root,
-            success,
-            aggregated_signature,
-            signers,
-            voting_power: total_power,
-        }
+        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2325,6 +2317,11 @@ impl SubStateMachine for ExecutionState {
                 block_hash,
                 results,
             } => Some(self.on_speculative_execution_complete(*block_hash, results.clone())),
+            // BLS aggregation callback
+            Event::StateCertificateAggregated {
+                tx_hash,
+                certificate,
+            } => Some(self.on_state_certificate_aggregated(*tx_hash, certificate.clone())),
             _ => None,
         }
     }

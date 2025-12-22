@@ -1667,6 +1667,85 @@ impl ProductionRunner {
                 });
             }
 
+            Action::AggregateStateCertificate {
+                tx_hash,
+                shard,
+                merkle_root,
+                votes,
+                read_nodes,
+                voting_power,
+                committee_size,
+            } => {
+                let event_tx = self.callback_tx.clone();
+                self.thread_pools.spawn_crypto(move || {
+                    let start = std::time::Instant::now();
+
+                    // Deduplicate votes by validator to avoid aggregating the same signature multiple times
+                    let mut seen_validators = std::collections::HashSet::new();
+                    let unique_votes: Vec<_> = votes
+                        .iter()
+                        .filter(|vote| seen_validators.insert(vote.validator))
+                        .collect();
+
+                    // Aggregate BLS signatures from unique votes only
+                    let bls_signatures: Vec<_> = unique_votes
+                        .iter()
+                        .filter_map(|vote| match &vote.signature {
+                            hyperscale_types::Signature::Bls12381(_) => {
+                                Some(vote.signature.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect();
+
+                    let aggregated_signature = if !bls_signatures.is_empty() {
+                        Signature::aggregate_bls(&bls_signatures)
+                            .unwrap_or_else(|_| Signature::zero())
+                    } else {
+                        Signature::zero()
+                    };
+
+                    // Create signer bitfield
+                    let mut signers = SignerBitfield::new(committee_size);
+
+                    for vote in &unique_votes {
+                        // Use validator ID as index (assumes validators are numbered 0..N)
+                        let idx = vote.validator.0 as usize;
+                        if idx < committee_size {
+                            signers.set(idx);
+                        }
+                    }
+
+                    let success = votes.first().map(|v| v.success).unwrap_or(false);
+
+                    let certificate = hyperscale_types::StateCertificate {
+                        transaction_hash: tx_hash,
+                        shard_group_id: shard,
+                        read_nodes,
+                        state_writes: vec![],
+                        outputs_merkle_root: merkle_root,
+                        success,
+                        aggregated_signature,
+                        signers,
+                        voting_power: voting_power.0,
+                    };
+
+                    crate::metrics::record_signature_verification_latency(
+                        "state_cert_aggregation",
+                        start.elapsed().as_secs_f64(),
+                    );
+
+                    event_tx
+                        .send(Event::StateCertificateAggregated {
+                            tx_hash,
+                            certificate,
+                        })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
+                });
+            }
+
             Action::VerifyStateVoteSignature { vote, public_key } => {
                 let event_tx = self.callback_tx.clone();
                 self.thread_pools.spawn_crypto(move || {

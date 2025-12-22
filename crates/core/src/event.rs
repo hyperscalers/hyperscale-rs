@@ -190,6 +190,17 @@ pub enum Event {
         commitment_proof: CommitmentProof,
     },
 
+    /// State certificate aggregation completed.
+    ///
+    /// Callback from `Action::AggregateStateCertificate`.
+    /// Contains the aggregated BLS signature proving vote quorum.
+    StateCertificateAggregated {
+        /// Transaction hash for correlation.
+        tx_hash: Hash,
+        /// The aggregated state certificate.
+        certificate: StateCertificate,
+    },
+
     /// State vote signature verification completed.
     ///
     /// Callback from `Action::VerifyStateVoteSignature`.
@@ -657,6 +668,9 @@ impl Event {
             Event::CertificateReceived { .. } => EventPriority::Network,
             Event::CertificateFetchFailed { .. } => EventPriority::Internal,
             Event::FetchedCertificateVerified { .. } => EventPriority::Internal,
+
+            // BLS aggregation callbacks
+            Event::StateCertificateAggregated { .. } => EventPriority::Internal,
         }
     }
 
@@ -757,6 +771,9 @@ impl Event {
             Event::CertificateReceived { .. } => "CertificateReceived",
             Event::CertificateFetchFailed { .. } => "CertificateFetchFailed",
             Event::FetchedCertificateVerified { .. } => "FetchedCertificateVerified",
+
+            // BLS aggregation callbacks
+            Event::StateCertificateAggregated { .. } => "StateCertificateAggregated",
         }
     }
 }

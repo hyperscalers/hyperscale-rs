@@ -634,6 +634,7 @@ impl StateMachine for NodeStateMachine {
             | Event::MerkleRootComputed { .. }
             | Event::StateVoteSignatureVerified { .. }
             | Event::StateCertificateSignatureVerified { .. }
+            | Event::StateCertificateAggregated { .. }
             | Event::SpeculativeExecutionComplete { .. } => {
                 if let Some(actions) = self.execution.try_handle(&event) {
                     return actions;

@@ -15,8 +15,8 @@ use hyperscale_engine::RadixExecutor;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     Block, CommitmentProof, Hash as TxHash, KeyPair, KeyType, PublicKey, QuorumCertificate,
-    ShardGroupId, Signature, SignerBitfield, StaticTopology, Topology, TransactionStatus,
-    ValidatorId, ValidatorInfo, ValidatorSet,
+    ShardGroupId, Signature, SignerBitfield, StateCertificate, StaticTopology, Topology,
+    TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
@@ -763,6 +763,70 @@ impl SimulationRunner {
                         tx_hash,
                         source_shard,
                         commitment_proof,
+                    },
+                );
+            }
+
+            Action::AggregateStateCertificate {
+                tx_hash,
+                shard,
+                merkle_root,
+                votes,
+                read_nodes,
+                voting_power,
+                committee_size,
+            } => {
+                // Deduplicate votes by validator
+                let mut seen_validators = std::collections::HashSet::new();
+                let unique_votes: Vec<_> = votes
+                    .iter()
+                    .filter(|vote| seen_validators.insert(vote.validator))
+                    .collect();
+
+                // Aggregate BLS signatures
+                let bls_signatures: Vec<_> = unique_votes
+                    .iter()
+                    .filter_map(|vote| match &vote.signature {
+                        Signature::Bls12381(_) => Some(vote.signature.clone()),
+                        _ => None,
+                    })
+                    .collect();
+
+                let aggregated_signature = if !bls_signatures.is_empty() {
+                    Signature::aggregate_bls(&bls_signatures).unwrap_or_else(|_| Signature::zero())
+                } else {
+                    Signature::zero()
+                };
+
+                // Create signer bitfield
+                let mut signers = SignerBitfield::new(committee_size);
+                for vote in &unique_votes {
+                    let idx = vote.validator.0 as usize;
+                    if idx < committee_size {
+                        signers.set(idx);
+                    }
+                }
+
+                let success = votes.first().map(|v| v.success).unwrap_or(false);
+
+                let certificate = StateCertificate {
+                    transaction_hash: tx_hash,
+                    shard_group_id: shard,
+                    read_nodes,
+                    state_writes: vec![],
+                    outputs_merkle_root: merkle_root,
+                    success,
+                    aggregated_signature,
+                    signers,
+                    voting_power: voting_power.0,
+                };
+
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::StateCertificateAggregated {
+                        tx_hash,
+                        certificate,
                     },
                 );
             }

@@ -69,3 +69,14 @@ pub struct PendingFetchedCertificateVerification {
     /// Whether any shard verification has failed.
     pub has_failed: bool,
 }
+
+/// Tracks a pending state certificate BLS aggregation.
+///
+/// When vote quorum is reached, we delegate BLS signature aggregation to
+/// the crypto pool. This struct stores the state needed to continue
+/// processing when aggregation completes.
+#[derive(Debug, Clone)]
+pub struct PendingCertificateAggregation {
+    /// Shards to broadcast the certificate to.
+    pub participating_shards: Vec<ShardGroupId>,
+}
