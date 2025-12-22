@@ -808,6 +808,16 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
 
     let listen_addresses = vec![listen_addr.clone()];
 
+    // Calculate default TCP fallback port if enabled but not specified (UDP port + 21500)
+    let tcp_fallback_port = if config.tcp_fallback_enabled && config.tcp_fallback_port.is_none() {
+        listen_addr.iter().find_map(|p| match p {
+            libp2p::multiaddr::Protocol::Udp(port) => Some(port + 21500),
+            _ => None,
+        })
+    } else {
+        config.tcp_fallback_port
+    };
+
     // Filter out our own listen addresses from bootstrap peers
     // Also filter TCP addresses if TCP fallback is disabled
     let bootstrap_peers: Vec<_> = config
@@ -848,7 +858,7 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
         .with_request_timeout(Duration::from_millis(config.request_timeout_ms))
         .with_max_message_size(config.max_message_size)
         .with_gossipsub_heartbeat(Duration::from_millis(config.gossipsub_heartbeat_ms))
-        .with_tcp_fallback(config.tcp_fallback_enabled, config.tcp_fallback_port))
+        .with_tcp_fallback(config.tcp_fallback_enabled, tcp_fallback_port))
 }
 
 /// Build RocksDB configuration from TOML config.
