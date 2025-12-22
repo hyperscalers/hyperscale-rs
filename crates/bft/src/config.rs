@@ -67,7 +67,7 @@ impl Default for BftConfig {
             max_timestamp_delay_ms: 30_000,
             max_timestamp_rush_ms: 2_000,
             transaction_fetch_timeout: Duration::from_millis(50),
-            certificate_fetch_timeout: Duration::from_millis(100),
+            certificate_fetch_timeout: Duration::from_millis(500),
             stale_pending_block_timeout: Duration::from_secs(30),
             cleanup_interval: Duration::from_secs(1),
             pipeline_backpressure_limit: 12,
