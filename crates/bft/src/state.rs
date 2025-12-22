@@ -361,6 +361,16 @@ impl BftState {
         self.topology.should_propose(height, round)
     }
 
+    /// Check if pipeline backpressure should prevent proposing.
+    ///
+    /// Returns true if the gap between QC height and committed height exceeds the limit.
+    /// This prevents runaway pipelining where QC advances faster than commits can follow,
+    /// which can cause slower validators to fall behind and eventually lose quorum.
+    fn pipeline_backpressure(&self) -> bool {
+        let qc_height = self.latest_qc.as_ref().map(|qc| qc.height.0).unwrap_or(0);
+        qc_height > self.committed_height + self.config.pipeline_backpressure_limit
+    }
+
     /// Get committee index for a validator.
     fn committee_index(&self, validator_id: ValidatorId) -> Option<usize> {
         self.topology.local_committee_index(validator_id)
@@ -534,6 +544,22 @@ impl BftState {
                 validator = ?self.validator_id(),
                 expected = ?self.proposer_for(next_height, round),
                 "Not the proposer for this height/round"
+            );
+            return actions;
+        }
+
+        // Check pipeline backpressure - if QC is too far ahead of commits, wait.
+        // This prevents runaway pipelining that can cause slower validators to fall
+        // behind and eventually lose quorum.
+        if self.pipeline_backpressure() {
+            let qc_height = self.latest_qc.as_ref().map(|qc| qc.height.0).unwrap_or(0);
+            info!(
+                validator = ?self.validator_id(),
+                qc_height = qc_height,
+                committed_height = self.committed_height,
+                gap = qc_height.saturating_sub(self.committed_height),
+                limit = self.config.pipeline_backpressure_limit,
+                "Pipeline backpressure - skipping proposal to let commits catch up"
             );
             return actions;
         }
@@ -6774,5 +6800,125 @@ mod tests {
 
         let block = make_test_block_with_proofs(5, txs, proofs);
         assert!(state.validate_transaction_ordering(&block).is_ok());
+    }
+
+    #[test]
+    fn test_pipeline_backpressure_no_qc() {
+        let state = make_test_state();
+
+        // No QC yet, committed_height = 0 -> no backpressure
+        assert!(!state.pipeline_backpressure());
+    }
+
+    #[test]
+    fn test_pipeline_backpressure_within_limit() {
+        let mut state = make_test_state();
+
+        // Set committed height to 5
+        state.committed_height = 5;
+
+        // Set QC at height 10 (gap of 5, within default limit of 12)
+        state.latest_qc = Some(QuorumCertificate {
+            block_hash: Hash::from_bytes(b"test"),
+            height: BlockHeight(10),
+            parent_block_hash: Hash::from_bytes(b"parent"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 0,
+        });
+
+        // Gap is 5, limit is 12 -> no backpressure
+        assert!(!state.pipeline_backpressure());
+    }
+
+    #[test]
+    fn test_pipeline_backpressure_at_limit() {
+        let mut state = make_test_state();
+
+        // Set committed height to 5
+        state.committed_height = 5;
+
+        // Set QC at height 17 (gap of exactly 12, at the limit)
+        state.latest_qc = Some(QuorumCertificate {
+            block_hash: Hash::from_bytes(b"test"),
+            height: BlockHeight(17),
+            parent_block_hash: Hash::from_bytes(b"parent"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 0,
+        });
+
+        // Gap is 12, limit is 12 -> no backpressure (limit is exclusive: qc > committed + limit)
+        assert!(!state.pipeline_backpressure());
+    }
+
+    #[test]
+    fn test_pipeline_backpressure_exceeds_limit() {
+        let mut state = make_test_state();
+
+        // Set committed height to 5
+        state.committed_height = 5;
+
+        // Set QC at height 18 (gap of 13, exceeds default limit of 12)
+        state.latest_qc = Some(QuorumCertificate {
+            block_hash: Hash::from_bytes(b"test"),
+            height: BlockHeight(18),
+            parent_block_hash: Hash::from_bytes(b"parent"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 0,
+        });
+
+        // Gap is 13, limit is 12 -> BACKPRESSURE
+        assert!(state.pipeline_backpressure());
+    }
+
+    #[test]
+    fn test_pipeline_backpressure_configurable_limit() {
+        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+
+        // Create config with smaller limit
+        let mut config = BftConfig::default();
+        config.pipeline_backpressure_limit = 5;
+
+        let mut state = BftState::new(
+            0,
+            keys[0].clone(),
+            topology,
+            config,
+            RecoveredState::default(),
+        );
+
+        state.committed_height = 10;
+        state.latest_qc = Some(QuorumCertificate {
+            block_hash: Hash::from_bytes(b"test"),
+            height: BlockHeight(16), // Gap of 6, exceeds limit of 5
+            parent_block_hash: Hash::from_bytes(b"parent"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 0,
+        });
+
+        // Gap is 6, limit is 5 -> BACKPRESSURE
+        assert!(state.pipeline_backpressure());
     }
 }
