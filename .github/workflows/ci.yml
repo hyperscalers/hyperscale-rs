@@ -172,6 +172,8 @@ jobs:
     name: Release Binaries
     runs-on: ${{ matrix.os }}
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     strategy:
       matrix:
         include:
