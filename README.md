@@ -197,3 +197,15 @@ If you encounter "path too long" errors during `cargo build` on Windows (often d
     git config --system core.longpaths true
     ```
 
+### Windows: "Can't find clang.dll" or "libclang.dll"
+
+If you see errors about missing `clang.dll` or `libclang.dll` during build (usually from `rocksdb` or `bindgen`), you need to set the `LIBCLANG_PATH` environment variable.
+
+1.  Ensure LLVM is installed (`choco install llvm`).
+2.  Ensure protobuf is installed (`choco install protobuf`).
+3.  Set the environment variable to your LLVM `bin` directory:
+    ```powershell
+    $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+    ```
+    (Or add it permanently to your System Environment Variables).
+
