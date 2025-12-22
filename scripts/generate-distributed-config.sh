@@ -47,8 +47,12 @@ while [[ $# -gt 0 ]]; do
             NODES_PER_HOST="$2"
             shift 2
             ;;
+        --shards|--num-shards)
+            NUM_SHARDS="$2"
+            shift 2
+            ;;
         --help|-h)
-            echo "Usage: $0 --hosts \"IP1,IP2...\" [--nodes-per-host N] [--out-dir DIR] [--clean]"
+            echo "Usage: $0 --hosts \"IP1,IP2...\" [--nodes-per-host N] [--shards N] [--out-dir DIR] [--clean]"
             exit 0
             ;;
         *)
@@ -68,9 +72,18 @@ IFS=',' read -r -a HOST_IPS <<< "$HOSTS"
 NUM_HOSTS=${#HOST_IPS[@]}
 TOTAL_NODES=$((NUM_HOSTS * NODES_PER_HOST))
 
+if (( TOTAL_NODES % NUM_SHARDS != 0 )); then
+    echo "ERROR: Total nodes ($TOTAL_NODES) must be divisible by number of shards ($NUM_SHARDS)"
+    exit 1
+fi
+
+NODES_PER_SHARD=$((TOTAL_NODES / NUM_SHARDS))
+
 echo "=== Generating Distributed Cluster Config ==="
 echo "Hosts: ${HOST_IPS[*]}"
 echo "Nodes per Host: $NODES_PER_HOST"
+echo "Shards: $NUM_SHARDS"
+echo "Nodes per Shard: $NODES_PER_SHARD"
 echo "Total Nodes (Validators): $TOTAL_NODES"
 echo "Output Directory: $OUT_DIR"
 echo "Clean: $CLEAN"
@@ -160,7 +173,7 @@ for id in $(seq 0 $((TOTAL_NODES - 1))); do
     fi
     GENESIS_VALIDATORS="$GENESIS_VALIDATORS[[genesis.validators]]
 id = $id
-shard = 0
+shard = $((id / NODES_PER_SHARD))
 public_key = \"${PUBLIC_KEYS[$id]}\"
 voting_power = 1"
 done
@@ -172,9 +185,13 @@ for id in $(seq 0 $((TOTAL_NODES - 1))); do
     PID="${PEER_IDS[$id]}"
     PORT="${NODE_P2P_PORTS[$id]}"
     
+    # Calculate local node index to determine port offset
+    v=$((id % NODES_PER_HOST))
+    TCP_PORT=$((TCP_BASE_PORT + v))
+    
     if [ -n "$BOOTSTRAP_PEERS" ]; then BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS,"; fi
     
-    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/$IP/udp/$PORT/quic-v1/p2p/$PID\""
+    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/$IP/udp/$PORT/quic-v1/p2p/$PID\",\"/ip4/$IP/tcp/$TCP_PORT/p2p/$PID\""
 done
 
 # 5. Generate Config Files
@@ -208,8 +225,8 @@ for i in "${!HOST_IPS[@]}"; do
 
 [node]
 validator_id = $NODE_ID
-shard = 0
-num_shards = 1
+shard = $((NODE_ID / NODES_PER_SHARD))
+num_shards = $NUM_SHARDS
 key_path = "./distributed-cluster-data/host-$i/node-$v/signing.key"
 data_dir = "./distributed-cluster-data/host-$i/node-$v/data"
 
@@ -220,9 +237,9 @@ tcp_fallback_enabled = false
 tcp_fallback_port = $TCP_PORT
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 upnp_enabled = false
-request_timeout_ms = 500
+request_timeout_ms = 30000
 max_message_size = 10485760
-gossipsub_heartbeat_ms = 100
+gossipsub_heartbeat_ms = 1000
 
 [consensus]
 proposal_interval_ms = 300
@@ -259,7 +276,7 @@ scrape_configs:
       - targets: [$PROM_TARGETS]
         labels:
           cluster: 'distributed'
-          shard: '0'
+          shard: '$((NODE_ID / NODES_PER_SHARD))'
 EOF
 
 echo "=== Generation Complete ==="
@@ -278,3 +295,27 @@ for i in "${!HOST_IPS[@]}"; do
         echo "       ./hyperscale-validator --config distributed-cluster-data/host-$i/node-$v/config.toml &"
     done
 done
+
+# 7. Print Spammer Command
+echo ""
+echo "------------------------------------------------------------------"
+echo "To run the spammer manually:"
+
+# Construct endpoints string
+ENDPOINTS=""
+for i in "${!HOST_IPS[@]}"; do
+    IP="${HOST_IPS[$i]}"
+    for v in $(seq 0 $((NODES_PER_HOST - 1))); do
+        RPC_PORT=$((RPC_BASE_PORT + v))
+        if [ -n "$ENDPOINTS" ]; then ENDPOINTS="$ENDPOINTS,"; fi
+        ENDPOINTS="${ENDPOINTS}http://$IP:$RPC_PORT"
+    done
+done
+
+echo "./target/release/hyperscale-spammer run \\"
+echo "    --endpoints \"$ENDPOINTS\" \\"
+echo "    --num-shards \"$NUM_SHARDS\" \\"
+echo "    --validators-per-shard \"$NODES_PER_SHARD\" \\"
+echo "    --tps 150 \\"
+echo "    --duration 60s --cross-shard-ratio 0 --measure-latency"
+echo "------------------------------------------------------------------"
