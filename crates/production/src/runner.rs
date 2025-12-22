@@ -966,6 +966,7 @@ impl ProductionRunner {
                     crate::metrics::set_pool_queue_depths(
                         self.thread_pools.consensus_crypto_queue_depth(),
                         self.thread_pools.crypto_queue_depth(),
+                        self.thread_pools.tx_validation_queue_depth(),
                         self.thread_pools.execution_queue_depth(),
                     );
 

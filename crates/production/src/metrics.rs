@@ -54,8 +54,11 @@ pub struct Metrics {
     /// Queue depth of the consensus crypto pool (block votes, QC verification).
     /// This pool is liveness-critical and should remain near zero under load.
     pub consensus_crypto_pool_queue_depth: Gauge,
-    /// Queue depth of the general crypto pool (provisions, state votes, tx validation).
+    /// Queue depth of the general crypto pool (provisions, state votes).
     pub crypto_pool_queue_depth: Gauge,
+    /// Queue depth of the tx validation pool (transaction signature verification).
+    /// Isolated from general crypto to prevent tx floods from blocking execution progress.
+    pub tx_validation_pool_queue_depth: Gauge,
     pub execution_pool_queue_depth: Gauge,
 
     // === Event Channel Depths ===
@@ -279,6 +282,12 @@ impl Metrics {
             crypto_pool_queue_depth: register_gauge!(
                 "hyperscale_crypto_pool_queue_depth",
                 "Number of pending tasks in general crypto pool (provisions, state votes)"
+            )
+            .unwrap(),
+
+            tx_validation_pool_queue_depth: register_gauge!(
+                "hyperscale_tx_validation_pool_queue_depth",
+                "Number of pending tasks in tx validation pool (transaction signature verification)"
             )
             .unwrap(),
 
@@ -614,11 +623,17 @@ pub fn set_txs_with_commitment_proof(count: usize) {
 }
 
 /// Update thread pool queue depths.
-pub fn set_pool_queue_depths(consensus_crypto: usize, crypto: usize, execution: usize) {
+pub fn set_pool_queue_depths(
+    consensus_crypto: usize,
+    crypto: usize,
+    tx_validation: usize,
+    execution: usize,
+) {
     let m = metrics();
     m.consensus_crypto_pool_queue_depth
         .set(consensus_crypto as f64);
     m.crypto_pool_queue_depth.set(crypto as f64);
+    m.tx_validation_pool_queue_depth.set(tx_validation as f64);
     m.execution_pool_queue_depth.set(execution as f64);
 }
 

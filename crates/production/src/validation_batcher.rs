@@ -265,8 +265,8 @@ impl ValidationBatcher {
 
         debug!(batch_size, "Dispatching transaction validation batch");
 
-        self.thread_pools.spawn_crypto(move || {
-            // Use rayon to validate in parallel across all crypto threads
+        self.thread_pools.spawn_tx_validation(move || {
+            // Use rayon to validate in parallel across all tx validation threads
             use rayon::prelude::*;
 
             let results: Vec<_> = batch

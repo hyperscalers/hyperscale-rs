@@ -1990,6 +1990,12 @@
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "avg(hyperscale_tx_validation_pool_queue_depth)",
+          "legendFormat": "TX Validation Pool (avg/validator)",
+          "refId": "D"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
           "expr": "avg(hyperscale_execution_pool_queue_depth)",
           "legendFormat": "Execution Pool (avg/validator)",
           "refId": "B"
