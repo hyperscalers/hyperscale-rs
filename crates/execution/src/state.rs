@@ -1550,11 +1550,9 @@ impl ExecutionState {
                     "TransactionCertificate created successfully"
                 );
 
-                // Publish certificate for fetch requests BEFORE storing locally.
-                // This fixes the chicken-and-egg problem where peers couldn't fetch
-                // certificates until after block commit, but blocks couldn't commit
-                // without the certificates.
-                actions.push(Action::PublishCertificateForFetch {
+                // Eagerly persist certificate so peers can fetch it before block commit.
+                // This is idempotent - storing twice (here and in put_block_denormalized) is safe.
+                actions.push(Action::PersistTransactionCertificate {
                     certificate: tx_cert.clone(),
                 });
 

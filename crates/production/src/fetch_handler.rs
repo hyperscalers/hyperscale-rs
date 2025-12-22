@@ -2,13 +2,16 @@
 //!
 //! This module provides a high-performance task for handling inbound fetch requests
 //! (transactions and certificates) from other validators. It runs independently from
-//! the main event loop, using lock-free reads from `SharedReadState`.
+//! the main event loop, reading directly from RocksDB storage.
 //!
-//! # Performance Benefits
+//! # Storage-Backed Design
 //!
-//! - **No Event Loop Blocking**: Fetch requests don't compete with consensus events
-//! - **Lock-Free Reads**: DashMap provides O(1) concurrent lookups
-//! - **Predictable Latency**: P99 fetch response time drops from 50-500ms to <10ms
+//! Unlike the previous SharedReadState approach (which was an in-memory cache that
+//! could evict data), this handler reads directly from RocksDB. This ensures:
+//!
+//! - **Reliable Sync**: Committed data is always available for peers to fetch
+//! - **No Cache Eviction**: Historical data remains accessible indefinitely
+//! - **RocksDB Block Cache**: Hot data is still served from memory via RocksDB's cache
 //!
 //! # Architecture
 //!
@@ -18,15 +21,15 @@
 //! │ Peer Request ├───────────────────────►│ cert_request_rx.recv()      │
 //! │ (inbound)    │                        │ tx_request_rx.recv()        │
 //! └──────────────┘                        │                             │
-//!                                         │ shared_state.get_*()        │
-//!                                         │ (lock-free DashMap read)    │
+//!                                         │ storage.get_*_batch()       │
+//!                                         │ (RocksDB read, block cache) │
 //!                                         │                             │
 //!                                         │ network.send_*_response()   │
 //!                                         └─────────────────────────────┘
 //! ```
 
 use crate::network::{InboundCertificateRequest, InboundTransactionRequest, Libp2pAdapter};
-use crate::shared_state::SharedReadState;
+use crate::storage::RocksDbStorage;
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -73,13 +76,13 @@ impl FetchHandlerHandle {
 /// Spawn the dedicated fetch handler task.
 ///
 /// This task runs independently from the main event loop, handling all
-/// inbound fetch requests (transactions and certificates) using lock-free
-/// reads from the shared state.
+/// inbound fetch requests (transactions and certificates) by reading
+/// directly from RocksDB storage.
 ///
 /// # Arguments
 ///
 /// * `config` - Configuration for the fetch handler
-/// * `shared_state` - Lock-free shared state for reading transactions/certificates
+/// * `storage` - RocksDB storage for reading transactions/certificates
 /// * `network` - Network adapter for sending responses
 /// * `tx_request_rx` - Channel for inbound transaction fetch requests
 /// * `cert_request_rx` - Channel for inbound certificate fetch requests
@@ -89,20 +92,13 @@ impl FetchHandlerHandle {
 /// A handle that can be used to monitor the task.
 pub fn spawn_fetch_handler(
     config: FetchHandlerConfig,
-    shared_state: SharedReadState,
+    storage: Arc<RocksDbStorage>,
     network: Arc<Libp2pAdapter>,
     tx_request_rx: mpsc::Receiver<InboundTransactionRequest>,
     cert_request_rx: mpsc::Receiver<InboundCertificateRequest>,
 ) -> FetchHandlerHandle {
     let join_handle = tokio::spawn(async move {
-        run_fetch_handler(
-            config,
-            shared_state,
-            network,
-            tx_request_rx,
-            cert_request_rx,
-        )
-        .await;
+        run_fetch_handler(config, storage, network, tx_request_rx, cert_request_rx).await;
     });
 
     FetchHandlerHandle { join_handle }
@@ -113,12 +109,12 @@ pub fn spawn_fetch_handler(
 /// Processes inbound fetch requests until all channels close.
 async fn run_fetch_handler(
     config: FetchHandlerConfig,
-    shared_state: SharedReadState,
+    storage: Arc<RocksDbStorage>,
     network: Arc<Libp2pAdapter>,
     mut tx_request_rx: mpsc::Receiver<InboundTransactionRequest>,
     mut cert_request_rx: mpsc::Receiver<InboundCertificateRequest>,
 ) {
-    tracing::info!("Fetch handler task started");
+    tracing::info!("Fetch handler task started (storage-backed)");
 
     loop {
         tokio::select! {
@@ -126,21 +122,21 @@ async fn run_fetch_handler(
 
             // Handle certificate fetch requests (usually more latency-sensitive)
             Some(request) = cert_request_rx.recv() => {
-                handle_certificate_request(&config, &shared_state, &network, request);
+                handle_certificate_request(&config, &storage, &network, request);
 
                 // Drain any additional pending requests
                 while let Ok(request) = cert_request_rx.try_recv() {
-                    handle_certificate_request(&config, &shared_state, &network, request);
+                    handle_certificate_request(&config, &storage, &network, request);
                 }
             }
 
             // Handle transaction fetch requests
             Some(request) = tx_request_rx.recv() => {
-                handle_transaction_request(&config, &shared_state, &network, request);
+                handle_transaction_request(&config, &storage, &network, request);
 
                 // Drain any additional pending requests
                 while let Ok(request) = tx_request_rx.try_recv() {
-                    handle_transaction_request(&config, &shared_state, &network, request);
+                    handle_transaction_request(&config, &storage, &network, request);
                 }
             }
 
@@ -155,11 +151,11 @@ async fn run_fetch_handler(
 
 /// Handle an inbound transaction fetch request.
 ///
-/// Looks up requested transactions from the shared state (lock-free)
-/// and sends them back via the network adapter.
+/// Reads requested transactions directly from RocksDB storage.
+/// Hot data is served from RocksDB's block cache for performance.
 fn handle_transaction_request(
     config: &FetchHandlerConfig,
-    shared_state: &SharedReadState,
+    storage: &RocksDbStorage,
     network: &Arc<Libp2pAdapter>,
     request: InboundTransactionRequest,
 ) {
@@ -181,8 +177,12 @@ fn handle_transaction_request(
         &request.tx_hashes
     };
 
-    // Lock-free lookups from shared state
-    let found_transactions = shared_state.get_transactions(hashes_to_fetch);
+    // Read directly from RocksDB storage (block cache handles hot data)
+    let found_transactions: Vec<Arc<_>> = storage
+        .get_transactions_batch(hashes_to_fetch)
+        .into_iter()
+        .map(Arc::new)
+        .collect();
     let found_count = found_transactions.len();
 
     debug!(
@@ -218,11 +218,11 @@ fn handle_transaction_request(
 
 /// Handle an inbound certificate fetch request.
 ///
-/// Looks up requested certificates from the shared state (lock-free)
-/// and sends them back via the network adapter.
+/// Reads requested certificates directly from RocksDB storage.
+/// Hot data is served from RocksDB's block cache for performance.
 fn handle_certificate_request(
     config: &FetchHandlerConfig,
-    shared_state: &SharedReadState,
+    storage: &RocksDbStorage,
     network: &Arc<Libp2pAdapter>,
     request: InboundCertificateRequest,
 ) {
@@ -244,12 +244,8 @@ fn handle_certificate_request(
         &request.cert_hashes
     };
 
-    // Lock-free lookups from shared state
-    let found_certificates: Vec<_> = shared_state
-        .get_certificates(hashes_to_fetch)
-        .into_iter()
-        .map(|arc_cert| (*arc_cert).clone())
-        .collect();
+    // Read directly from RocksDB storage (block cache handles hot data)
+    let found_certificates = storage.get_certificates_batch(hashes_to_fetch);
     let found_count = found_certificates.len();
 
     debug!(

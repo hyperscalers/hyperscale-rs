@@ -75,12 +75,6 @@ pub enum Action {
         provision: StateProvision,
     },
 
-    /// Publish a finalized transaction certificate for peer fetch requests.
-    ///
-    /// Emitted when a TransactionCertificate is created (all StateCertificates collected).
-    /// The runner adds it to SharedReadState so peers can fetch it before block commit.
-    PublishCertificateForFetch { certificate: TransactionCertificate },
-
     // ═══════════════════════════════════════════════════════════════════════
     // Timers
     // ═══════════════════════════════════════════════════════════════════════
@@ -566,7 +560,6 @@ impl Action {
             Action::BroadcastStateVote { .. } => "BroadcastStateVote",
             Action::BroadcastStateCertificate { .. } => "BroadcastStateCertificate",
             Action::BroadcastStateProvision { .. } => "BroadcastStateProvision",
-            Action::PublishCertificateForFetch { .. } => "PublishCertificateForFetch",
 
             // Timers
             Action::SetTimer { .. } => "SetTimer",

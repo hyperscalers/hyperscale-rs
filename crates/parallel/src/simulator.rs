@@ -405,12 +405,6 @@ impl SimNode {
                     .push((Destination::Shard(shard), Arc::new(message)));
             }
 
-            Action::PublishCertificateForFetch { certificate } => {
-                // Store certificate for later fetch lookups in parallel simulation.
-                self.storage
-                    .put_certificate(certificate.transaction_hash, certificate);
-            }
-
             Action::SetTimer { id, duration } => {
                 // Schedule timer to fire at current_time + duration
                 let fire_time = self.simulated_time + duration;

@@ -9,7 +9,6 @@ use crate::network::{
     compute_peer_id_for_validator, InboundSyncRequest, Libp2pAdapter, Libp2pConfig, NetworkError,
 };
 use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
-use crate::shared_state::SharedReadState;
 use crate::storage::RocksDbStorage;
 use crate::sync::{SyncConfig, SyncManager};
 use crate::thread_pools::ThreadPoolManager;
@@ -504,16 +503,13 @@ impl ProductionRunnerBuilder {
             network.clone(),
         );
 
-        // Create shared read-only state for lock-free fetch responses.
-        // The fetch handler task reads from this without blocking the main event loop.
-        let shared_state = SharedReadState::default();
-
         // Spawn dedicated fetch handler task.
-        // This handles all inbound fetch requests (transactions/certificates) using
-        // lock-free reads from shared_state, achieving P99 < 10ms response times.
+        // This handles all inbound fetch requests (transactions/certificates) by
+        // reading directly from RocksDB storage. Hot data is served from RocksDB's
+        // block cache for performance.
         let fetch_handler = spawn_fetch_handler(
             FetchHandlerConfig::default(),
-            shared_state.clone(),
+            storage.clone(),
             network.clone(),
             tx_request_rx,
             cert_request_rx,
@@ -569,7 +565,6 @@ impl ProductionRunnerBuilder {
             pending_cross_shard_executions: PendingCrossShardExecutions::default(),
             cross_shard_execution_deadline: None,
             message_batcher,
-            shared_state,
             fetch_handler,
             dispatch_tx,
             action_dispatcher,
@@ -680,9 +675,6 @@ pub struct ProductionRunner {
     /// Note: Now primarily used by action dispatcher, kept here for direct access if needed.
     #[allow(dead_code)]
     message_batcher: crate::message_batcher::MessageBatcherHandle,
-    /// Shared read-only state for lock-free fetch responses.
-    /// The fetch handler task reads from this without blocking the main event loop.
-    shared_state: SharedReadState,
     /// Handle for the dedicated fetch handler task.
     /// Processes inbound fetch requests from other validators.
     #[allow(dead_code)]
@@ -1353,9 +1345,13 @@ impl ProductionRunner {
                             }
                         }
 
-                        // Add transaction to SharedReadState for fetch handler
-                        // This enables lock-free lookups by the dedicated fetch handler task
-                        self.shared_state.insert_transaction(Arc::clone(tx));
+                        // Eagerly store transaction in RocksDB so peers can fetch it
+                        // before block commit. This is idempotent - storing twice is safe.
+                        let storage = self.storage.clone();
+                        let tx_clone = Arc::clone(tx);
+                        tokio::spawn(async move {
+                            storage.put_transaction(&tx_clone);
+                        });
                     }
 
                     let event_type = event.type_name();
@@ -1534,12 +1530,6 @@ impl ProductionRunner {
                 let _ = self
                     .dispatch_tx
                     .try_send(DispatchableAction::QueueStateProvision { shard, provision });
-            }
-
-            Action::PublishCertificateForFetch { certificate } => {
-                // Add certificate to SharedReadState for fetch handler.
-                // This enables peers to fetch certificates before block commit.
-                self.shared_state.insert_certificate(Arc::new(certificate));
             }
 
             // Timers via timer manager
@@ -2065,10 +2055,14 @@ impl ProductionRunner {
             Action::PersistBlock { block, qc } => {
                 // Fire-and-forget block persistence - not latency critical
                 // RocksDB is internally thread-safe, no lock needed
+                //
+                // Uses denormalized storage: block metadata stored separately from
+                // transactions and certificates. This eliminates duplication and
+                // enables storage-backed fetch requests.
                 let storage = self.storage.clone();
                 let height = block.height();
                 tokio::spawn(async move {
-                    storage.put_block(height, &block, &qc);
+                    storage.put_block_denormalized(&block, &qc);
                     // Update chain metadata
                     storage.set_chain_metadata(height, None, None);
                     // Prune old votes - we no longer need votes at or below committed height
@@ -2077,11 +2071,6 @@ impl ProductionRunner {
             }
 
             Action::PersistTransactionCertificate { certificate } => {
-                // Add certificate to SharedReadState for fetch handler
-                // This enables lock-free lookups by the dedicated fetch handler task
-                self.shared_state
-                    .insert_certificate(Arc::new(certificate.clone()));
-
                 // Commit certificate + state writes atomically
                 // This is durability-critical: we await completion
                 let storage = self.storage.clone();
@@ -2676,8 +2665,8 @@ impl ProductionRunner {
 
     /// Handle an inbound sync request from a peer.
     ///
-    /// Looks up the requested block from storage and sends the response
-    /// back via the network adapter.
+    /// Looks up the requested block from denormalized storage (reconstructing from
+    /// block metadata + transactions + certificates) and sends the response.
     fn handle_inbound_sync_request(&self, request: InboundSyncRequest) {
         let height = BlockHeight(request.height);
         let channel_id = request.channel_id;
@@ -2689,8 +2678,8 @@ impl ProductionRunner {
             "Handling inbound sync request"
         );
 
-        // Look up block from storage - RocksDB is internally thread-safe
-        let response = if let Some((block, qc)) = self.storage.get_block(height) {
+        // Look up block from denormalized storage - reconstructs from 3 CFs
+        let response = if let Some((block, qc)) = self.storage.get_block_denormalized(height) {
             // Encode the response as SBOR: (Some(block), Some(qc))
             match sbor::basic_encode(&(Some(&block), Some(&qc))) {
                 Ok(data) => data,
@@ -2718,9 +2707,8 @@ impl ProductionRunner {
     }
 
     // NOTE: handle_inbound_transaction_request and handle_inbound_certificate_request
-    // have been removed. These are now handled by the dedicated fetch handler task
-    // in fetch_handler.rs, which reads from SharedReadState for lock-free access.
-    // This achieves P99 < 10ms fetch response times.
+    // are now handled by the dedicated fetch handler task in fetch_handler.rs,
+    // which reads directly from RocksDB storage for reliable access to historical data.
 
     /// Dispatch an event to the state machine.
     ///

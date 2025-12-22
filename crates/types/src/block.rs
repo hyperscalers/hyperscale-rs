@@ -366,6 +366,79 @@ impl Block {
     }
 }
 
+// ============================================================================
+// BlockMetadata - Denormalized storage format
+// ============================================================================
+
+/// Denormalized block metadata for efficient storage.
+///
+/// Unlike `Block`, this stores only hashes for transactions and certificates,
+/// which are stored separately in their own column families. This eliminates
+/// duplication and enables direct lookups.
+///
+/// # Storage Layout
+///
+/// - `"blocks"` CF: `BlockMetadata` (this struct) keyed by height
+/// - `"transactions"` CF: `RoutableTransaction` keyed by tx_hash
+/// - `"certificates"` CF: `TransactionCertificate` keyed by tx_hash
+///
+/// To reconstruct a full `Block`, fetch the metadata, then batch-fetch
+/// transactions and certificates using the stored hashes.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct BlockMetadata {
+    /// Block header (contains height, parent hash, proposer, etc.)
+    pub header: BlockHeader,
+
+    /// Transaction hashes in block order.
+    /// Actual transactions stored in "transactions" CF.
+    pub tx_hashes: Vec<Hash>,
+
+    /// Certificate hashes in block order.
+    /// Actual certificates stored in "certificates" CF.
+    pub cert_hashes: Vec<Hash>,
+
+    /// Deferred transactions (small, stored inline).
+    pub deferred: Vec<TransactionDefer>,
+
+    /// Aborted transactions (small, stored inline).
+    pub aborted: Vec<TransactionAbort>,
+
+    /// Commitment proofs for priority ordering (stored inline).
+    pub commitment_proofs: HashMap<Hash, CommitmentProof>,
+
+    /// Quorum certificate that commits this block.
+    pub qc: QuorumCertificate,
+}
+
+impl BlockMetadata {
+    /// Create metadata from a full block and QC.
+    pub fn from_block(block: &Block, qc: QuorumCertificate) -> Self {
+        Self {
+            header: block.header.clone(),
+            tx_hashes: block.transactions.iter().map(|tx| tx.hash()).collect(),
+            cert_hashes: block
+                .committed_certificates
+                .iter()
+                .map(|c| c.transaction_hash)
+                .collect(),
+            deferred: block.deferred.clone(),
+            aborted: block.aborted.clone(),
+            commitment_proofs: block.commitment_proofs.clone(),
+            qc,
+        }
+    }
+
+    /// Get block height.
+    pub fn height(&self) -> BlockHeight {
+        self.header.height
+    }
+
+    /// Compute hash of this block (hashes the header).
+    pub fn hash(&self) -> Hash {
+        self.header.hash()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

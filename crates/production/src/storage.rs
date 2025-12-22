@@ -343,7 +343,10 @@ impl SubstateDatabase for RocksDbSnapshot {
 // Block storage
 // ═══════════════════════════════════════════════════════════════════════
 
-use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, TransactionCertificate};
+use hyperscale_types::{
+    Block, BlockHeight, BlockMetadata, Hash, QuorumCertificate, RoutableTransaction,
+    TransactionCertificate,
+};
 
 impl RocksDbStorage {
     /// Store a committed block with its quorum certificate.
@@ -436,6 +439,204 @@ impl RocksDbStorage {
             })
         })
         .collect()
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Transaction storage (denormalized)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Store a transaction by hash.
+    ///
+    /// This is idempotent - storing the same transaction twice is safe.
+    /// Used by `put_block_denormalized` to store transactions separately from block metadata.
+    pub fn put_transaction(&self, tx: &RoutableTransaction) {
+        let cf = match self.db.cf_handle("transactions") {
+            Some(cf) => cf,
+            None => {
+                tracing::error!("transactions column family not found");
+                return;
+            }
+        };
+
+        let hash = tx.hash();
+        let value = match sbor::basic_encode(tx) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!("Failed to encode transaction: {:?}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = self.db.put_cf(cf, hash.as_bytes(), value) {
+            tracing::error!("Failed to store transaction: {}", e);
+        }
+    }
+
+    /// Get a transaction by hash.
+    pub fn get_transaction(&self, hash: &Hash) -> Option<RoutableTransaction> {
+        let start = Instant::now();
+        let cf = self.db.cf_handle("transactions")?;
+
+        let result = self
+            .db
+            .get_cf(cf, hash.as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|v| sbor::basic_decode(&v).ok());
+
+        metrics::record_rocksdb_read(start.elapsed().as_secs_f64());
+        result
+    }
+
+    /// Get multiple transactions by hash (batch read).
+    ///
+    /// Uses RocksDB's `multi_get_cf` for efficient batch retrieval.
+    /// Returns only transactions that were found (missing hashes are skipped).
+    pub fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {
+        if hashes.is_empty() {
+            return vec![];
+        }
+
+        let start = Instant::now();
+        let cf = match self.db.cf_handle("transactions") {
+            Some(cf) => cf,
+            None => return vec![],
+        };
+
+        let keys: Vec<_> = hashes.iter().map(|h| (cf, h.as_bytes().to_vec())).collect();
+        let results = self.db.multi_get_cf(keys);
+
+        let txs: Vec<_> = results
+            .into_iter()
+            .filter_map(|r| r.ok().flatten())
+            .filter_map(|v| sbor::basic_decode(&v).ok())
+            .collect();
+
+        let elapsed = start.elapsed().as_secs_f64();
+        metrics::record_rocksdb_read(elapsed);
+        metrics::record_storage_operation("get_transactions_batch", elapsed);
+
+        txs
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Denormalized block storage
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Store a committed block with denormalized storage.
+    ///
+    /// Atomically writes:
+    /// - Block metadata (header + hashes) to "blocks" CF
+    /// - Each transaction to "transactions" CF
+    /// - Each certificate to "certificates" CF
+    ///
+    /// This eliminates duplication: transactions and certificates are stored once
+    /// by hash, and the block metadata references them.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the block cannot be persisted. This is intentional: committed blocks
+    /// are essential for crash recovery.
+    pub fn put_block_denormalized(&self, block: &Block, qc: &QuorumCertificate) {
+        let start = Instant::now();
+        let mut batch = rocksdb::WriteBatch::default();
+
+        let blocks_cf = self
+            .db
+            .cf_handle("blocks")
+            .expect("blocks column family must exist");
+        let txs_cf = self
+            .db
+            .cf_handle("transactions")
+            .expect("transactions column family must exist");
+        let certs_cf = self
+            .db
+            .cf_handle("certificates")
+            .expect("certificates column family must exist");
+
+        // 1. Store block metadata (header + hashes only)
+        let metadata = BlockMetadata::from_block(block, qc.clone());
+        let height_key = block.header.height.0.to_be_bytes();
+        let metadata_value =
+            sbor::basic_encode(&metadata).expect("block metadata encoding must succeed");
+        batch.put_cf(blocks_cf, height_key, metadata_value);
+
+        // 2. Store transactions (deduplicated - RocksDB overwrites are idempotent)
+        for tx in &block.transactions {
+            let tx_hash = tx.hash();
+            let tx_value =
+                sbor::basic_encode(tx.as_ref()).expect("transaction encoding must succeed");
+            batch.put_cf(txs_cf, tx_hash.as_bytes(), tx_value);
+        }
+
+        // 3. Store certificates (deduplicated)
+        for cert in &block.committed_certificates {
+            let cert_value =
+                sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
+            batch.put_cf(certs_cf, cert.transaction_hash.as_bytes(), cert_value);
+        }
+
+        // Atomic write
+        self.db
+            .write(batch)
+            .expect("block persistence failed - cannot maintain chain state");
+
+        let elapsed = start.elapsed().as_secs_f64();
+        metrics::record_rocksdb_write(elapsed);
+        metrics::record_storage_operation("put_block_denormalized", elapsed);
+        metrics::record_block_persisted();
+    }
+
+    /// Get a committed block by height (reconstructs from denormalized storage).
+    ///
+    /// Fetches block metadata, then batch-fetches transactions and certificates
+    /// using the stored hashes to reconstruct the full block.
+    pub fn get_block_denormalized(
+        &self,
+        height: BlockHeight,
+    ) -> Option<(Block, QuorumCertificate)> {
+        let start = Instant::now();
+
+        // 1. Get block metadata
+        let blocks_cf = self.db.cf_handle("blocks")?;
+        let key = height.0.to_be_bytes();
+
+        let metadata: BlockMetadata = self
+            .db
+            .get_cf(blocks_cf, key)
+            .ok()
+            .flatten()
+            .and_then(|v| sbor::basic_decode(&v).ok())?;
+
+        // 2. Batch-fetch transactions
+        let transactions: Vec<Arc<RoutableTransaction>> = self
+            .get_transactions_batch(&metadata.tx_hashes)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+
+        // 3. Batch-fetch certificates
+        let certificates: Vec<Arc<TransactionCertificate>> = self
+            .get_certificates_batch(&metadata.cert_hashes)
+            .into_iter()
+            .map(Arc::new)
+            .collect();
+
+        // 4. Reconstruct block
+        let block = Block {
+            header: metadata.header,
+            transactions,
+            committed_certificates: certificates,
+            deferred: metadata.deferred,
+            aborted: metadata.aborted,
+            commitment_proofs: metadata.commitment_proofs,
+        };
+
+        let elapsed = start.elapsed().as_secs_f64();
+        metrics::record_rocksdb_read(elapsed);
+        metrics::record_storage_operation("get_block_denormalized", elapsed);
+
+        Some((block, metadata.qc))
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -543,6 +744,37 @@ impl RocksDbStorage {
             Ok(Some(value)) => sbor::basic_decode(&value).ok(),
             _ => None,
         }
+    }
+
+    /// Get multiple certificates by hash (batch read).
+    ///
+    /// Uses RocksDB's `multi_get_cf` for efficient batch retrieval.
+    /// Returns only certificates that were found (missing hashes are skipped).
+    pub fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate> {
+        if hashes.is_empty() {
+            return vec![];
+        }
+
+        let start = Instant::now();
+        let cf = match self.db.cf_handle("certificates") {
+            Some(cf) => cf,
+            None => return vec![],
+        };
+
+        let keys: Vec<_> = hashes.iter().map(|h| (cf, h.as_bytes().to_vec())).collect();
+        let results = self.db.multi_get_cf(keys);
+
+        let certs: Vec<_> = results
+            .into_iter()
+            .filter_map(|r| r.ok().flatten())
+            .filter_map(|v| sbor::basic_decode(&v).ok())
+            .collect();
+
+        let elapsed = start.elapsed().as_secs_f64();
+        metrics::record_rocksdb_read(elapsed);
+        metrics::record_storage_operation("get_certificates_batch", elapsed);
+
+        certs
     }
 
     /// Atomically commit a certificate and its state writes.

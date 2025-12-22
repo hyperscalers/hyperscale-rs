@@ -650,14 +650,6 @@ impl SimulationRunner {
                 }
             }
 
-            Action::PublishCertificateForFetch { certificate } => {
-                // In simulation, certificate fetches are handled synchronously via
-                // handle_certificate_fetch_needed, so we just store the certificate
-                // in the node's storage for later fetch lookups.
-                let storage = &mut self.node_storage[from as usize];
-                storage.put_certificate(certificate.transaction_hash, certificate);
-            }
-
             Action::SetTimer { id, duration } => {
                 let fire_time = self.now + duration;
                 let event = self.timer_to_event(id.clone());
