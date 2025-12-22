@@ -618,6 +618,10 @@ impl RocksDbStorage {
     ///
     /// Fetches block metadata, then batch-fetches transactions and certificates
     /// using the stored hashes to reconstruct the full block.
+    ///
+    /// Returns `None` if the block metadata is not found, or if any referenced
+    /// transactions or certificates are missing. This ensures sync responses
+    /// always contain complete, self-contained blocks.
     pub fn get_block_denormalized(
         &self,
         height: BlockHeight,
@@ -635,19 +639,33 @@ impl RocksDbStorage {
             .flatten()
             .and_then(|v| sbor::basic_decode(&v).ok())?;
 
-        // 2. Batch-fetch transactions
-        let transactions: Vec<Arc<RoutableTransaction>> = self
-            .get_transactions_batch(&metadata.tx_hashes)
-            .into_iter()
-            .map(Arc::new)
-            .collect();
+        // 2. Batch-fetch transactions (preserving order)
+        let transactions = self.get_transactions_batch_ordered(&metadata.tx_hashes);
 
-        // 3. Batch-fetch certificates
-        let certificates: Vec<Arc<TransactionCertificate>> = self
-            .get_certificates_batch(&metadata.cert_hashes)
-            .into_iter()
-            .map(Arc::new)
-            .collect();
+        // Verify we got ALL transactions - return None if any are missing
+        if transactions.len() != metadata.tx_hashes.len() {
+            tracing::warn!(
+                height = height.0,
+                expected = metadata.tx_hashes.len(),
+                found = transactions.len(),
+                "Block has missing transactions - cannot serve sync request"
+            );
+            return None;
+        }
+
+        // 3. Batch-fetch certificates (preserving order)
+        let certificates = self.get_certificates_batch_ordered(&metadata.cert_hashes);
+
+        // Verify we got ALL certificates - return None if any are missing
+        if certificates.len() != metadata.cert_hashes.len() {
+            tracing::warn!(
+                height = height.0,
+                expected = metadata.cert_hashes.len(),
+                found = certificates.len(),
+                "Block has missing certificates - cannot serve sync request"
+            );
+            return None;
+        }
 
         // 4. Reconstruct block
         let block = Block {
@@ -664,6 +682,90 @@ impl RocksDbStorage {
         metrics::record_storage_operation("get_block_denormalized", elapsed);
 
         Some((block, metadata.qc))
+    }
+
+    /// Get multiple transactions by hash, preserving order.
+    ///
+    /// Unlike `get_transactions_batch`, this returns results in the same order
+    /// as the input hashes, with missing entries causing the result to be shorter.
+    /// Callers should check that the result length matches the input length.
+    fn get_transactions_batch_ordered(&self, hashes: &[Hash]) -> Vec<Arc<RoutableTransaction>> {
+        if hashes.is_empty() {
+            return vec![];
+        }
+
+        let cf = match self.db.cf_handle("transactions") {
+            Some(cf) => cf,
+            None => return vec![],
+        };
+
+        let keys: Vec<_> = hashes.iter().map(|h| (cf, h.as_bytes().to_vec())).collect();
+        let results = self.db.multi_get_cf(keys);
+
+        // Process results in order, collecting only successful decodes
+        results
+            .into_iter()
+            .zip(hashes.iter())
+            .filter_map(|(result, hash)| match result {
+                Ok(Some(bytes)) => match sbor::basic_decode::<RoutableTransaction>(&bytes) {
+                    Ok(tx) => Some(Arc::new(tx)),
+                    Err(e) => {
+                        tracing::warn!(?hash, error = ?e, "Failed to decode transaction");
+                        None
+                    }
+                },
+                Ok(None) => {
+                    tracing::trace!(?hash, "Transaction not found in storage");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(?hash, error = ?e, "RocksDB error fetching transaction");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get multiple certificates by hash, preserving order.
+    ///
+    /// Unlike `get_certificates_batch`, this returns results in the same order
+    /// as the input hashes, with missing entries causing the result to be shorter.
+    /// Callers should check that the result length matches the input length.
+    fn get_certificates_batch_ordered(&self, hashes: &[Hash]) -> Vec<Arc<TransactionCertificate>> {
+        if hashes.is_empty() {
+            return vec![];
+        }
+
+        let cf = match self.db.cf_handle("certificates") {
+            Some(cf) => cf,
+            None => return vec![],
+        };
+
+        let keys: Vec<_> = hashes.iter().map(|h| (cf, h.as_bytes().to_vec())).collect();
+        let results = self.db.multi_get_cf(keys);
+
+        // Process results in order, collecting only successful decodes
+        results
+            .into_iter()
+            .zip(hashes.iter())
+            .filter_map(|(result, hash)| match result {
+                Ok(Some(bytes)) => match sbor::basic_decode::<TransactionCertificate>(&bytes) {
+                    Ok(cert) => Some(Arc::new(cert)),
+                    Err(e) => {
+                        tracing::warn!(?hash, error = ?e, "Failed to decode certificate");
+                        None
+                    }
+                },
+                Ok(None) => {
+                    tracing::trace!(?hash, "Certificate not found in storage");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(?hash, error = ?e, "RocksDB error fetching certificate");
+                    None
+                }
+            })
+            .collect()
     }
 
     // ═══════════════════════════════════════════════════════════════════════
