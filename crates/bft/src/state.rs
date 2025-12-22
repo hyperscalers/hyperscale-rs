@@ -2207,6 +2207,47 @@ impl BftState {
 
         let mut actions = vec![];
 
+        // Persist the certified block immediately so it's available for sync.
+        // In HotStuff-2, block N gets certified (QC formed) before it's committed
+        // (which happens when block N+1 gets certified). If we only persist on commit,
+        // there's a window where the QC exists but the block isn't in storage,
+        // causing sync failures when other validators try to fetch it.
+        //
+        // TODO: This creates duplicate persistence - blocks are persisted here on QC
+        // formation AND again on commit (in on_block_ready_to_commit). RocksDB handles
+        // this efficiently (idempotent overwrite), but we should consider either:
+        // (a) tracking persisted blocks to skip duplicates, or
+        // (b) removing PersistBlock from the commit path for non-synced blocks.
+        let block = if let Some(pending) = self.pending_blocks.get(&block_hash) {
+            pending.block().map(|b| (*b).clone())
+        } else if let Some((block, _)) = self.certified_blocks.get(&block_hash) {
+            Some(block.clone())
+        } else {
+            None
+        };
+
+        if let Some(block) = block {
+            debug!(
+                validator = ?self.validator_id(),
+                height = height,
+                block_hash = ?block_hash,
+                "Persisting certified block for sync availability"
+            );
+            actions.push(Action::PersistBlock {
+                block,
+                qc: qc.clone(),
+            });
+        } else {
+            // Block not yet complete - this can happen if we're still fetching
+            // transactions/certificates. The block will be persisted when it commits.
+            debug!(
+                validator = ?self.validator_id(),
+                height = height,
+                block_hash = ?block_hash,
+                "Cannot persist certified block - not yet complete"
+            );
+        }
+
         // Two-chain commit rule: when we have QC for block N,
         // we can commit block N-1 (the parent)
         if qc.has_committable_block() {
