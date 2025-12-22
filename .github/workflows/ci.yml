@@ -168,6 +168,111 @@ jobs:
           done
           cosign sign --yes ${images}
 
+  release-binaries:
+    name: Release Binaries
+    runs-on: ${{ matrix.os }}
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: linux-amd64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            name: macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl-tools
+        if: startsWith(matrix.os, 'ubuntu')
+        run: sudo apt-get install -y musl-tools
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Build Binaries
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            --bin hyperscale-validator \
+            --bin hyperscale-keygen \
+            --bin hyperscale-spammer
+
+      - name: Archive Binaries
+        run: |
+          cd target/${{ matrix.target }}/release
+          zip hyperscale-${{ matrix.name }}.zip hyperscale-validator hyperscale-keygen hyperscale-spammer
+          mv hyperscale-${{ matrix.name }}.zip ../../../
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v1
+        with:
+          files: hyperscale-${{ matrix.name }}.zip
+
+  notify-release:
+    runs-on: ubuntu-latest
+    needs: release-binaries
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Send Release Notification
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_AUTHOR: ${{ github.event.head_commit.author.name }}
+          COMMIT_TIMESTAMP: ${{ github.event.head_commit.timestamp }}
+        run: |
+          escape_html() {
+            local s="$1"
+            s="${s//&/&amp;}"
+            s="${s//</&lt;}"
+            s="${s//>/&gt;}"
+            s="${s//\"/&quot;}"
+            echo "$s"
+          }
+
+          get_gh_name() {
+            local login="$1"
+            gh api "users/$login" --jq '.name // .login' 2>/dev/null || echo "$login"
+          }
+
+          # Get tagger/author info
+          # If it's a pushing of a tag, the 'sender' or head commit author is relevant
+          AUTHOR_LOGIN="${{ github.event.sender.login }}"
+          FRIENDLY_NAME=$(get_gh_name "$AUTHOR_LOGIN")
+          SAFE_FRIENDLY_NAME=$(escape_html "$FRIENDLY_NAME")
+          SAFE_TAG_NAME=$(escape_html "$TAG_NAME")
+          
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/$TAG_NAME"
+
+          TEXT="📦 <b>New Release:</b> $SAFE_TAG_NAME"
+          TEXT+=$'\n'
+          TEXT+=$'\n'"<b>Author:</b> $SAFE_FRIENDLY_NAME"
+          TEXT+=$'\n'"<b>Date:</b> $COMMIT_TIMESTAMP"
+          TEXT+=$'\n'
+          TEXT+=$'\n'"<a href=\"$RELEASE_URL\">View on GitHub</a>"
+
+          jq -n \
+            --arg chat_id "$CHANNEL_ID" \
+            --arg text "$TEXT" \
+            '{"chat_id": $chat_id, "text": $text, "parse_mode": "HTML", "disable_web_page_preview": true}' > payload.json
+          
+          curl -s -X POST "https://api.telegram.org/bot$TELEGRAM_TOKEN/sendMessage" \
+            -H 'Content-Type: application/json' \
+            -d @payload.json
+
   notify:
     runs-on: ubuntu-latest
     # permission for gh api

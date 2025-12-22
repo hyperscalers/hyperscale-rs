@@ -31,6 +31,18 @@ Rust implementation of Hyperscale consensus protocol.
 | `hyperscale-production` | Production runner: libp2p networking, RocksDB storage, thread pools |
 | `hyperscale-spammer` | Transaction spammer CLI and library for load testing |
 
+## Installation
+
+### Binaries
+Pre-built binaries for Linux (x86_64) and macOS (ARM64) are available on the [Releases page](https://github.com/flightofthefox/hyperscale-rs/releases).
+
+### Docker Image
+You can pull the latest Docker image from the GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/flightofthefox/hyperscale-rs:latest
+```
+
 ## Prerequisites
 
 ### 1. Install Rust
