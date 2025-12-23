@@ -298,7 +298,7 @@ tcp_fallback_enabled = $TCP_FALLBACK_ENABLED
 tcp_fallback_port = $validator_tcp_port
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 upnp_enabled = false
-request_timeout_ms = 500
+request_timeout_ms = 10000
 max_message_size = 10485760
 gossipsub_heartbeat_ms = 100
 
