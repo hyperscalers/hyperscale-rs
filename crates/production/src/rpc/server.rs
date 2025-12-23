@@ -3,6 +3,7 @@
 use super::routes::create_router;
 use super::state::{MempoolSnapshot, NodeStatusState, RpcState, TransactionStatusCache};
 use crate::sync::SyncStatus;
+use arc_swap::ArcSwap;
 use hyperscale_types::RoutableTransaction;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,7 +46,7 @@ pub struct RpcServerHandle {
     /// Ready flag to set when node is ready.
     ready_flag: Arc<AtomicBool>,
     /// Sync status provider for updates.
-    sync_status: Arc<RwLock<SyncStatus>>,
+    sync_status: Arc<ArcSwap<SyncStatus>>,
     /// Node status provider for updates.
     node_status: Arc<RwLock<NodeStatusState>>,
     /// Transaction status cache for updates.
@@ -61,7 +62,7 @@ impl RpcServerHandle {
     }
 
     /// Get a reference to the sync status for updates.
-    pub fn sync_status(&self) -> &Arc<RwLock<SyncStatus>> {
+    pub fn sync_status(&self) -> &Arc<ArcSwap<SyncStatus>> {
         &self.sync_status
     }
 
@@ -110,7 +111,7 @@ impl RpcServer {
     ) -> Self {
         let state = RpcState {
             ready: Arc::new(AtomicBool::new(false)),
-            sync_status: Arc::new(RwLock::new(SyncStatus::default())),
+            sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
             node_status: Arc::new(RwLock::new(NodeStatusState::default())),
             tx_submission_tx,
             start_time: Instant::now(),
@@ -129,7 +130,7 @@ impl RpcServer {
     pub fn with_state(
         config: RpcServerConfig,
         ready: Arc<AtomicBool>,
-        sync_status: Arc<RwLock<SyncStatus>>,
+        sync_status: Arc<ArcSwap<SyncStatus>>,
         node_status: Arc<RwLock<NodeStatusState>>,
         tx_submission_tx: mpsc::UnboundedSender<Arc<RoutableTransaction>>,
         tx_status_cache: Arc<RwLock<TransactionStatusCache>>,

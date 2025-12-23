@@ -1095,12 +1095,16 @@ async fn main() -> Result<()> {
 
     // Create shared RPC state objects that will be used by both runner and RPC server.
     // These are created first so they can be wired into both components.
+    use arc_swap::ArcSwap;
     use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
     use std::sync::atomic::AtomicBool;
     use tokio::sync::RwLock;
 
     let rpc_ready = Arc::new(AtomicBool::new(false));
-    let rpc_sync_status = Arc::new(RwLock::new(hyperscale_production::SyncStatus::default()));
+    // Use ArcSwap for lock-free reads of sync status from HTTP handlers
+    let rpc_sync_status = Arc::new(ArcSwap::new(Arc::new(
+        hyperscale_production::SyncStatus::default(),
+    )));
     let rpc_node_status = Arc::new(RwLock::new(NodeStatusState {
         validator_id: config.node.validator_id,
         shard: config.node.shard,

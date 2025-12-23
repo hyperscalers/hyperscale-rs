@@ -37,6 +37,7 @@ fn api_v1_routes() -> Router<RpcState> {
 mod tests {
     use super::*;
     use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
+    use arc_swap::ArcSwap;
     use axum::{body::Body, http::Request};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -48,7 +49,7 @@ mod tests {
         let (tx_submission_tx, _rx) = mpsc::unbounded_channel();
         RpcState {
             ready: Arc::new(AtomicBool::new(true)),
-            sync_status: Arc::new(RwLock::new(crate::sync::SyncStatus::default())),
+            sync_status: Arc::new(ArcSwap::new(Arc::new(crate::sync::SyncStatus::default()))),
             node_status: Arc::new(RwLock::new(NodeStatusState {
                 validator_id: 1,
                 shard: 0,

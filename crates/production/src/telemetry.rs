@@ -5,6 +5,7 @@
 //! state machine determinism.
 
 use crate::sync::SyncStatus;
+use arc_swap::ArcSwap;
 use axum::{response::IntoResponse, routing::get, Router};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
@@ -19,15 +20,11 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::RwLock;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry};
 
 /// Provider for sync status, used by the telemetry HTTP server.
-///
-/// This is wrapped in `Arc<RwLock<>>` and updated by the runner,
-/// then read by the HTTP handler.
-pub type SyncStatusProvider = Arc<RwLock<SyncStatus>>;
+pub type SyncStatusProvider = Arc<ArcSwap<SyncStatus>>;
 
 #[derive(Debug, Error)]
 pub enum TelemetryError {
@@ -142,7 +139,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
     // Start Prometheus metrics endpoint if enabled
     let (prometheus_handle, ready_flag, sync_status) = if config.prometheus_enabled {
         let ready_flag = Arc::new(AtomicBool::new(false));
-        let sync_status = Arc::new(RwLock::new(SyncStatus::default()));
+        let sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus::default())));
         let handle = start_metrics_server(
             config.prometheus_port,
             ready_flag.clone(),
@@ -340,8 +337,8 @@ async fn ready_handler(ready_flag: Arc<AtomicBool>) -> impl axum::response::Into
 ///
 /// Returns the current sync status as JSON.
 async fn sync_status_handler(sync_status: SyncStatusProvider) -> impl axum::response::IntoResponse {
-    let status = sync_status.read().await.clone();
-    axum::Json(status)
+    let status = sync_status.load();
+    axum::Json((**status).clone())
 }
 
 /// Response for health endpoint.
@@ -524,7 +521,7 @@ mod tests {
     async fn test_sync_status_endpoint() {
         use crate::sync::{SyncStateKind, SyncStatus};
 
-        let sync_status = Arc::new(RwLock::new(SyncStatus {
+        let sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus {
             state: SyncStateKind::Syncing,
             current_height: 100,
             target_height: Some(200),
@@ -532,7 +529,7 @@ mod tests {
             sync_peers: 3,
             pending_fetches: 2,
             queued_heights: 98,
-        }));
+        })));
 
         let status_clone = sync_status.clone();
         let app = Router::new().route(

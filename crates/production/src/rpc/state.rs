@@ -2,6 +2,7 @@
 
 use crate::sync::SyncStatus;
 use crate::tx_ingress::TxIngressHandle;
+use arc_swap::ArcSwap;
 use hyperscale_core::TransactionStatus;
 use hyperscale_types::{Hash, RoutableTransaction};
 use std::collections::HashMap;
@@ -16,7 +17,7 @@ pub struct RpcState {
     /// Ready flag for readiness probe.
     pub ready: Arc<AtomicBool>,
     /// Sync status provider.
-    pub sync_status: Arc<RwLock<SyncStatus>>,
+    pub sync_status: Arc<ArcSwap<SyncStatus>>,
     /// Node status provider.
     pub node_status: Arc<RwLock<NodeStatusState>>,
     /// Channel to submit transactions to the runner.

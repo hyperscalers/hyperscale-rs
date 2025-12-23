@@ -49,8 +49,9 @@ tokio.workspace = true
 rayon.workspace = true
 parking_lot = "0.12"
 
-# Lock-free concurrent data structures (used by validation_batcher)
-dashmap = "5.5"
+# Lock-free concurrent data structures
+arc-swap = "1.8.0"
+dashmap = "6.1.0"
 
 # OpenTelemetry for distributed tracing
 opentelemetry = "0.31.0"
