@@ -1,0 +1,18 @@
+#!/bin/sh
+
+echo "Running cargo fmt..."
+cargo fmt -- --check
+if [ $? -ne 0 ]; then
+    echo "Cargo fmt failed. Please run 'cargo fmt' manually."
+    exit 1
+fi
+
+echo "Running cargo clippy..."
+cargo clippy -- -D warnings
+if [ $? -ne 0 ]; then
+    echo "Cargo clippy failed. Please fix the warnings."
+    exit 1
+fi
+
+echo "Pre-commit checks passed."
+exit 0
