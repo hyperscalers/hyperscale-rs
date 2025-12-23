@@ -231,6 +231,10 @@ pub struct BftState {
     /// Current time (set by runner before each handle call).
     now: Duration,
 
+    /// Timestamp of the last block proposal we made.
+    /// Used for rate limiting block production via min_block_interval.
+    last_proposal_time: Duration,
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Statistics
     // ═══════════════════════════════════════════════════════════════════════════
@@ -307,6 +311,7 @@ impl BftState {
             pending_commits_awaiting_data: HashMap::new(),
             config,
             now: Duration::ZERO,
+            last_proposal_time: Duration::ZERO,
             view_changes: 0,
         }
     }
@@ -728,6 +733,9 @@ impl BftState {
             commitment_proofs,
         );
 
+        // Track proposal time for rate limiting
+        self.last_proposal_time = self.now;
+
         actions.push(Action::BroadcastToShard {
             shard: self.local_shard(),
             message: OutboundMessage::BlockHeader(Box::new(gossip)),
@@ -808,6 +816,9 @@ impl BftState {
 
         // Create gossip message (fallback blocks have no transactions, deferrals, or aborts)
         let gossip = hyperscale_messages::BlockHeaderGossip::new(header, vec![]);
+
+        // Track proposal time for rate limiting
+        self.last_proposal_time = self.now;
 
         actions.push(Action::BroadcastToShard {
             shard: self.local_shard(),
@@ -2275,6 +2286,10 @@ impl BftState {
         // just waste resources on signature verification and storage. If there's
         // nothing to include, the regular proposal timer will fire and propagate
         // the QC then.
+        //
+        // Rate limiting: Even with content, we respect min_block_interval to prevent
+        // burst behavior under high load. If we proposed too recently, let the
+        // regular proposal timer handle it.
         let next_height = height + 1;
         let round = self.view;
 
@@ -2283,7 +2298,10 @@ impl BftState {
             || !aborted.is_empty()
             || !certificates.is_empty();
 
-        if has_content && self.should_propose(next_height, round) {
+        let time_since_last_proposal = self.now.saturating_sub(self.last_proposal_time);
+        let rate_limited = time_since_last_proposal < self.config.min_block_interval;
+
+        if has_content && self.should_propose(next_height, round) && !rate_limited {
             debug!(
                 validator = ?self.validator_id(),
                 next_height = next_height,
@@ -2299,6 +2317,14 @@ impl BftState {
                 certificates,
                 commitment_proofs,
             ));
+        } else if has_content && self.should_propose(next_height, round) && rate_limited {
+            trace!(
+                validator = ?self.validator_id(),
+                next_height = next_height,
+                time_since_last_ms = time_since_last_proposal.as_millis(),
+                min_interval_ms = self.config.min_block_interval.as_millis(),
+                "Rate limiting immediate proposal after QC - waiting for proposal timer"
+            );
         }
 
         actions
@@ -7168,5 +7194,345 @@ mod tests {
 
         // Gap is 6, limit is 5 -> BACKPRESSURE
         assert!(state.pipeline_backpressure());
+    }
+
+    #[test]
+    fn test_min_block_interval_rate_limits_immediate_proposal() {
+        // When a QC forms with content but we proposed too recently,
+        // the immediate proposal should be rate-limited.
+        use hyperscale_types::{DeferReason, TransactionDefer};
+
+        let mut state = make_test_state();
+
+        // Set current time and simulate that we just proposed
+        state.set_time(Duration::from_millis(1000));
+        state.last_proposal_time = Duration::from_millis(950); // 50ms ago
+
+        // min_block_interval is 150ms by default, so we're within the rate limit window
+
+        // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 1000,
+        };
+
+        // Create a deferral so there's content to propose
+        let deferral = TransactionDefer {
+            tx_hash: Hash::from_bytes(b"deferred_tx"),
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: Hash::from_bytes(b"winner_tx"),
+            },
+            block_height: BlockHeight(0),
+            proof: None,
+        };
+
+        let actions = state.on_qc_formed(
+            qc.block_hash,
+            qc,
+            &[],            // empty mempool
+            vec![deferral], // has content
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        // Should NOT contain a BlockHeader broadcast (rate limited)
+        let has_block_header = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+
+        assert!(
+            !has_block_header,
+            "Should NOT propose immediately when rate limited (proposed 50ms ago, limit is 150ms)"
+        );
+    }
+
+    #[test]
+    fn test_min_block_interval_allows_proposal_after_interval() {
+        // When enough time has passed since the last proposal,
+        // immediate proposals should be allowed.
+        use hyperscale_types::{DeferReason, TransactionDefer};
+
+        let mut state = make_test_state();
+
+        // Set current time and simulate that we proposed long enough ago
+        state.set_time(Duration::from_millis(1000));
+        state.last_proposal_time = Duration::from_millis(800); // 200ms ago
+
+        // min_block_interval is 150ms by default, so 200ms > 150ms - should be allowed
+
+        // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 1000,
+        };
+
+        // Create a deferral so there's content to propose
+        let deferral = TransactionDefer {
+            tx_hash: Hash::from_bytes(b"deferred_tx"),
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: Hash::from_bytes(b"winner_tx"),
+            },
+            block_height: BlockHeight(0),
+            proof: None,
+        };
+
+        let actions = state.on_qc_formed(
+            qc.block_hash,
+            qc,
+            &[],            // empty mempool
+            vec![deferral], // has content
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        // Should contain a BlockHeader broadcast (enough time passed)
+        let has_block_header = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+
+        assert!(
+            has_block_header,
+            "Should propose after rate limit interval has passed (200ms > 150ms)"
+        );
+    }
+
+    #[test]
+    fn test_min_block_interval_configurable() {
+        // Test that the min_block_interval config is respected.
+        use hyperscale_types::{DeferReason, TransactionDefer};
+
+        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+
+        // Create config with longer min_block_interval
+        let config = BftConfig {
+            min_block_interval: Duration::from_millis(500),
+            ..BftConfig::default()
+        };
+
+        let mut state = BftState::new(
+            0,
+            keys[0].clone(),
+            topology,
+            config,
+            RecoveredState::default(),
+        );
+
+        // Set current time and simulate that we proposed 200ms ago
+        state.set_time(Duration::from_millis(1000));
+        state.last_proposal_time = Duration::from_millis(800); // 200ms ago
+
+        // With min_block_interval of 500ms, 200ms is not enough - should be rate limited
+
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 1000,
+        };
+
+        let deferral = TransactionDefer {
+            tx_hash: Hash::from_bytes(b"deferred_tx"),
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: Hash::from_bytes(b"winner_tx"),
+            },
+            block_height: BlockHeight(0),
+            proof: None,
+        };
+
+        let actions = state.on_qc_formed(
+            qc.block_hash,
+            qc,
+            &[],
+            vec![deferral],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        let has_block_header = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+
+        assert!(
+            !has_block_header,
+            "Should be rate limited with custom 500ms interval (only 200ms passed)"
+        );
+    }
+
+    #[test]
+    fn test_min_block_interval_zero_disables_rate_limiting() {
+        // Test that setting min_block_interval to zero disables rate limiting.
+        use hyperscale_types::{DeferReason, TransactionDefer};
+
+        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+
+        // Create config with zero min_block_interval (disabled)
+        let config = BftConfig {
+            min_block_interval: Duration::ZERO,
+            ..BftConfig::default()
+        };
+
+        let mut state = BftState::new(
+            0,
+            keys[0].clone(),
+            topology,
+            config,
+            RecoveredState::default(),
+        );
+
+        // Propose just now (0ms ago) - normally would be rate limited
+        state.set_time(Duration::from_millis(1000));
+        state.last_proposal_time = Duration::from_millis(1000);
+
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 1000,
+        };
+
+        let deferral = TransactionDefer {
+            tx_hash: Hash::from_bytes(b"deferred_tx"),
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: Hash::from_bytes(b"winner_tx"),
+            },
+            block_height: BlockHeight(0),
+            proof: None,
+        };
+
+        let actions = state.on_qc_formed(
+            qc.block_hash,
+            qc,
+            &[],
+            vec![deferral],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        let has_block_header = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+
+        assert!(
+            has_block_header,
+            "Should allow immediate proposal when min_block_interval is zero"
+        );
+    }
+
+    #[test]
+    fn test_proposal_timer_updates_last_proposal_time() {
+        // Verify that on_proposal_timer updates last_proposal_time when a proposal is made.
+        let mut state = make_test_state();
+        state.set_time(Duration::from_millis(5000));
+
+        // Ensure last_proposal_time starts at zero
+        assert_eq!(state.last_proposal_time, Duration::ZERO);
+
+        // Proposer rotation is (height + round) % committee_size.
+        // With 4 validators, validator 0 proposes for height 0, 4, 8, etc.
+        // Since committed_height=0, next height is 1, and (1+0)%4=1, so validator 1 proposes.
+        // We need to set up a QC so that the next height is 4 (validator 0's turn).
+        state.latest_qc = Some(QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 5000,
+        });
+
+        // Now next_height = 4, (4+0)%4=0, so validator 0 proposes
+        let actions = state.on_proposal_timer(&[], vec![], vec![], vec![], HashMap::new());
+
+        // Check that a proposal was made
+        let proposed = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+
+        assert!(proposed, "Validator 0 should propose for height 4");
+
+        // Verify last_proposal_time was updated
+        assert_eq!(
+            state.last_proposal_time,
+            Duration::from_millis(5000),
+            "last_proposal_time should be updated to current time"
+        );
     }
 }
