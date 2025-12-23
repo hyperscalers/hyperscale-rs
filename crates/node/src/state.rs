@@ -416,7 +416,16 @@ impl StateMachine for NodeStateMachine {
                         }
                     )
                 });
+
                 if proposed {
+                    self.last_leader_activity = self.now;
+                }
+
+                // Also reset timeout if we're the proposer and backpressure is active -
+                // we're intentionally skipping proposals to let commits catch up.
+                // Only do this when WE are the proposer; if someone else is the proposer
+                // and backpressure is active, they might have actually failed.
+                if self.bft.is_current_proposer() && self.bft.is_pipeline_backpressure_active() {
                     self.last_leader_activity = self.now;
                 }
 

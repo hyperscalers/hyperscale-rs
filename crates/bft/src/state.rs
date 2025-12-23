@@ -4038,6 +4038,24 @@ impl BftState {
         }
     }
 
+    /// Check if pipeline backpressure is active.
+    ///
+    /// Returns true when QC height is too far ahead of committed height,
+    /// meaning proposals are being skipped to let commits catch up.
+    pub fn is_pipeline_backpressure_active(&self) -> bool {
+        self.pipeline_backpressure()
+    }
+
+    /// Check if we are the proposer for the current height and round.
+    pub fn is_current_proposer(&self) -> bool {
+        let next_height = self
+            .latest_qc
+            .as_ref()
+            .map(|qc| qc.height.0 + 1)
+            .unwrap_or(self.committed_height + 1);
+        self.should_propose(next_height, self.view)
+    }
+
     /// Get the BFT configuration.
     pub fn config(&self) -> &BftConfig {
         &self.config
