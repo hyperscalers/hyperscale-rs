@@ -91,6 +91,7 @@ pub use network::Libp2pConfig;
 pub use runner::{ProductionRunner, RunnerError};
 pub use storage::{CompressionType, RocksDbConfig, RocksDbStorage, StorageError};
 pub use sync::SyncStatus;
+pub use sync_error::SyncResponseError;
 pub use telemetry::{init_telemetry, TelemetryConfig};
 pub use thread_pools::{ThreadPoolConfig, ThreadPoolManager};
 pub use validation_batcher::{

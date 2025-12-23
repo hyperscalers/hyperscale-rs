@@ -189,6 +189,9 @@ impl SubstateDatabase for RocksDbStorage {
 impl RocksDbStorage {
     /// Commit database updates using a shared reference.
     ///
+    /// Returns an error if the write fails. Callers must handle the error appropriately -
+    /// for critical state updates, this typically means crashing to prevent data divergence.
+    ///
     /// # Safety
     /// This is safe because RocksDB's `DB::write()` only requires `&self` internally.
     /// The `CommittableSubstateDatabase` trait requires `&mut self` but RocksDB doesn't
@@ -197,7 +200,7 @@ impl RocksDbStorage {
         node_count = updates.node_updates.len(),
         latency_us = tracing::field::Empty,
     ))]
-    pub fn commit(&self, updates: &DatabaseUpdates) {
+    pub fn commit(&self, updates: &DatabaseUpdates) -> Result<(), StorageError> {
         let start = Instant::now();
         let mut batch = WriteBatch::default();
         let mut put_count = 0u64;
@@ -260,9 +263,10 @@ impl RocksDbStorage {
         }
 
         // Write batch atomically - RocksDB handles internal synchronization
-        if let Err(e) = self.db.write(batch) {
-            tracing::error!("Failed to commit updates: {}", e);
-        }
+        self.db
+            .write(batch)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
         let elapsed = start.elapsed();
         metrics::record_rocksdb_write(elapsed.as_secs_f64());
 
@@ -270,6 +274,8 @@ impl RocksDbStorage {
         let span = tracing::Span::current();
         span.record("latency_us", elapsed.as_micros() as u64);
         tracing::debug!(put_count, delete_count, "commit complete");
+
+        Ok(())
     }
 
     /// Get a mutable reference for APIs that require `&mut self`.
@@ -291,7 +297,9 @@ impl RocksDbStorage {
 impl CommittableSubstateDatabase for RocksDbStorage {
     fn commit(&mut self, updates: &DatabaseUpdates) {
         // Delegate to the shared version - RocksDB doesn't need &mut
+        // Panic on error since the trait doesn't support Result and this is safety-critical
         RocksDbStorage::commit(self, updates)
+            .expect("Storage commit failed - cannot maintain consistent state")
     }
 }
 
@@ -1405,7 +1413,7 @@ mod tests {
                 .collect(),
             },
         );
-        storage.commit(&updates);
+        storage.commit(&updates).unwrap();
 
         // Now we can read it
         let value = storage.get_raw_substate_by_db_key(&partition_key, &sort_key);
@@ -1440,7 +1448,7 @@ mod tests {
                 .collect(),
             },
         );
-        storage.commit(&updates);
+        storage.commit(&updates).unwrap();
 
         // Take snapshot
         let snapshot = storage.snapshot();
