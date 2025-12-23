@@ -14,7 +14,7 @@ use crate::metrics;
 use crate::validation_batcher::ValidationBatcherHandle;
 use dashmap::DashMap;
 use futures::future::Either;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use hyperscale_core::{Event, OutboundMessage};
 use hyperscale_types::{PublicKey, ShardGroupId, ValidatorId};
 use libp2p::core::muxing::StreamMuxerBox;
@@ -178,6 +178,25 @@ enum SwarmCommand {
     /// Send a response to a certificate request (by channel ID).
     SendCertificateResponse { channel_id: u64, response: Vec<u8> },
 }
+
+/// A pending response channel with its creation time for timeout cleanup.
+struct PendingResponseChannel {
+    channel: ResponseChannel<Vec<u8>>,
+    created_at: std::time::Instant,
+}
+
+/// Interval for periodic maintenance tasks in the event loop.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Timeout for pending response channels (after which they are cleaned up).
+/// This should be slightly longer than the request_timeout to allow for processing.
+const RESPONSE_CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Delay before attempting to reconnect to a disconnected validator.
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+/// Interval for periodic Kademlia refresh to discover new peers.
+const KADEMLIA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Network errors.
 #[derive(Debug, thiserror::Error)]
@@ -432,8 +451,11 @@ impl Libp2pAdapter {
         // Set to server mode so we can serve routing information to peers
         kademlia.set_mode(Some(kad::Mode::Server));
 
-        // Set up request-response protocol
-        let req_resp_config = request_response::Config::default();
+        // Set up request-response protocol with configured timeout.
+        // This timeout is the ultimate backstop for request-response operations.
+        // Higher-level timeouts (sync, fetch) should be shorter to enable retries.
+        let req_resp_config =
+            request_response::Config::default().with_request_timeout(config.request_timeout);
         let protocols = std::iter::once((
             StreamProtocol::new("/hyperscale/sync/1.0.0"),
             ProtocolSupport::Full,
@@ -466,6 +488,10 @@ impl Libp2pAdapter {
             // QUIC configuration
             let mut quic_config = libp2p::quic::Config::new(&keypair);
             quic_config.max_concurrent_stream_limit = 4096;
+            // Enable QUIC keep-alive to detect dead connections early.
+            // Sends PING frames at this interval to keep connections alive and detect failures.
+            // Set to half of idle_connection_timeout to ensure we ping before connection is closed.
+            quic_config.keep_alive_interval = config.idle_connection_timeout / 2;
 
             let quic_transport = libp2p::quic::tokio::Transport::new(quic_config)
                 .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
@@ -523,6 +549,8 @@ impl Libp2pAdapter {
                     // Default is 256 which causes "max sub-streams reached" errors
                     // during burst sync traffic when catching up.
                     quic_config.max_concurrent_stream_limit = 4096;
+                    // Enable QUIC keep-alive to detect dead connections early.
+                    quic_config.keep_alive_interval = config.idle_connection_timeout / 2;
                     quic_config
                 })
                 .with_behaviour(|_| behaviour)
@@ -580,9 +608,15 @@ impl Libp2pAdapter {
         let peer_validators = Arc::new(DashMap::new());
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let (command_tx, command_rx) = mpsc::unbounded_channel();
-        let (sync_request_tx, sync_request_rx) = mpsc::unbounded_channel(); // Unbounded to avoid blocking network event loop
-        let (tx_request_tx, tx_request_rx) = mpsc::unbounded_channel(); // Unbounded to avoid blocking network event loop
-        let (cert_request_tx, cert_request_rx) = mpsc::unbounded_channel(); // Unbounded to avoid blocking network event loop
+        // Inbound request channels are unbounded to avoid blocking the network event loop.
+        // Protection against unbounded growth:
+        // 1. Rate limiter limits requests per peer (validators get higher limit)
+        // 2. Response channel timeout cleanup prevents leaked channels
+        // 3. Peer reputation tracking penalizes misbehaving peers
+        // If memory growth is observed, consider bounded channels with try_send + drop.
+        let (sync_request_tx, sync_request_rx) = mpsc::unbounded_channel();
+        let (tx_request_tx, tx_request_rx) = mpsc::unbounded_channel();
+        let (cert_request_tx, cert_request_rx) = mpsc::unbounded_channel();
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
         let adapter = Arc::new(Self {
@@ -604,20 +638,52 @@ impl Libp2pAdapter {
         // Spawn event loop (takes ownership of swarm)
         // Use default rate limit config for now
         let rate_limit_config = RateLimitConfig::default();
-        tokio::spawn(Self::event_loop(
-            swarm,
-            command_rx,
-            consensus_tx,
-            peer_validators,
-            shutdown_rx,
-            sync_request_tx,
-            tx_request_tx,
-            cert_request_tx,
-            rate_limit_config,
-            cached_peer_count,
-            shard,
-            tx_validation_handle,
-        ));
+
+        // Spawn with panic catching - network loop panics are critical but shouldn't
+        // crash the entire node. The process supervisor (systemd/k8s) should restart.
+        tokio::spawn(async move {
+            let result = std::panic::AssertUnwindSafe(Self::event_loop(
+                swarm,
+                command_rx,
+                consensus_tx,
+                peer_validators,
+                shutdown_rx,
+                sync_request_tx,
+                tx_request_tx,
+                cert_request_tx,
+                rate_limit_config,
+                cached_peer_count,
+                shard,
+                tx_validation_handle,
+            ))
+            .catch_unwind()
+            .await;
+
+            match result {
+                Ok(()) => {
+                    info!("Network event loop exited normally");
+                }
+                Err(panic_info) => {
+                    // Extract panic message if possible
+                    let panic_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "Unknown panic".to_string()
+                    };
+
+                    // Log critical error - this should trigger alerts
+                    tracing::error!(
+                        panic = %panic_msg,
+                        "CRITICAL: Network event loop panicked! Networking is down. Node restart required."
+                    );
+
+                    // Record metric for alerting
+                    metrics::record_network_event_loop_panic();
+                }
+            }
+        });
 
         Ok((adapter, sync_request_rx, tx_request_rx, cert_request_rx))
     }
@@ -916,7 +982,8 @@ impl Libp2pAdapter {
         > = HashMap::new();
 
         // Track pending response channels (inbound) - keyed by channel_id
-        let mut pending_response_channels: HashMap<u64, ResponseChannel<Vec<u8>>> = HashMap::new();
+        // Uses PendingResponseChannel to track creation time for timeout cleanup
+        let mut pending_response_channels: HashMap<u64, PendingResponseChannel> = HashMap::new();
         let mut next_channel_id: u64 = 0;
 
         // Rate limiter for inbound sync requests
@@ -925,12 +992,110 @@ impl Libp2pAdapter {
         // Track whether we've bootstrapped Kademlia (do it once after first connection)
         let mut kademlia_bootstrapped = false;
 
+        // Maintenance timer for periodic tasks (cleanup, reconnection, Kademlia refresh)
+        let mut maintenance_interval = tokio::time::interval(MAINTENANCE_INTERVAL);
+        maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Track last Kademlia refresh time
+        let mut last_kademlia_refresh = std::time::Instant::now();
+
+        // Track validators that need reconnection (peer_id -> scheduled_reconnect_time)
+        let mut pending_reconnects: HashMap<Libp2pPeerId, std::time::Instant> = HashMap::new();
+
+        // Track known validator addresses for reconnection
+        // (peer_id -> last known address)
+        let mut validator_addresses: HashMap<Libp2pPeerId, Multiaddr> = HashMap::new();
+
         loop {
             tokio::select! {
                 // Handle shutdown signal
                 _ = shutdown_rx.recv() => {
                     info!("Shutting down libp2p network event loop");
                     break;
+                }
+
+                // Periodic maintenance tasks
+                _ = maintenance_interval.tick() => {
+                    let now = std::time::Instant::now();
+
+                    // 1. Clean up timed-out pending response channels
+                    let before_count = pending_response_channels.len();
+                    pending_response_channels.retain(|channel_id, pending| {
+                        let expired = now.duration_since(pending.created_at) > RESPONSE_CHANNEL_TIMEOUT;
+                        if expired {
+                            warn!(
+                                channel_id,
+                                age_secs = now.duration_since(pending.created_at).as_secs(),
+                                "Cleaning up timed-out response channel"
+                            );
+                        }
+                        !expired
+                    });
+                    let cleaned = before_count - pending_response_channels.len();
+                    if cleaned > 0 {
+                        info!(cleaned, remaining = pending_response_channels.len(), "Cleaned up timed-out response channels");
+                    }
+
+                    // 2. Record metrics for pending response channels
+                    metrics::record_pending_response_channels(pending_response_channels.len());
+
+                    // 3. Process pending reconnections
+                    let reconnects_due: Vec<_> = pending_reconnects
+                        .iter()
+                        .filter(|(_, scheduled)| now >= **scheduled)
+                        .map(|(peer, _)| *peer)
+                        .collect();
+
+                    for peer in reconnects_due {
+                        pending_reconnects.remove(&peer);
+
+                        // Only reconnect if this is a known validator and we're not already connected
+                        if peer_validators.contains_key(&peer) && !swarm.is_connected(&peer) {
+                            if let Some(addr) = validator_addresses.get(&peer) {
+                                info!(
+                                    peer = %peer,
+                                    addr = %addr,
+                                    "Attempting to reconnect to validator"
+                                );
+                                if let Err(e) = swarm.dial(addr.clone()) {
+                                    warn!(
+                                        peer = %peer,
+                                        error = ?e,
+                                        "Failed to dial validator for reconnection"
+                                    );
+                                    // Schedule another reconnect attempt
+                                    pending_reconnects.insert(peer, now + RECONNECT_DELAY * 2);
+                                }
+                            } else {
+                                // No known address, try to find via Kademlia
+                                debug!(peer = %peer, "No known address for validator, relying on Kademlia discovery");
+                            }
+                        }
+                    }
+
+                    // 4. Periodic Kademlia refresh for peer discovery
+                    if kademlia_bootstrapped && now.duration_since(last_kademlia_refresh) > KADEMLIA_REFRESH_INTERVAL {
+                        // Trigger a random walk to discover new peers
+                        let random_peer = Libp2pPeerId::random();
+                        swarm.behaviour_mut().kademlia.get_closest_peers(random_peer);
+                        last_kademlia_refresh = now;
+                        debug!("Triggered Kademlia refresh for peer discovery");
+                    }
+
+                    // 5. Check connection health - ensure we're connected to validators
+                    let connected_count = swarm.connected_peers().count();
+                    let validator_count = peer_validators.len();
+                    if connected_count < validator_count / 2 {
+                        warn!(
+                            connected = connected_count,
+                            total_validators = validator_count,
+                            "Low peer connectivity - connected to less than half of validators"
+                        );
+                        // Trigger Kademlia bootstrap to find more peers
+                        if kademlia_bootstrapped {
+                            let _ = swarm.behaviour_mut().kademlia.bootstrap();
+                        }
+                    }
                 }
 
                 // Handle commands from adapter methods
@@ -965,6 +1130,13 @@ impl Libp2pAdapter {
                             "Added peer to Kademlia routing table"
                         );
 
+                        // Track validator addresses for reconnection
+                        if peer_validators.contains_key(peer_id) {
+                            validator_addresses.insert(*peer_id, addr);
+                            // Clear any pending reconnect since we're now connected
+                            pending_reconnects.remove(peer_id);
+                        }
+
                         // Bootstrap Kademlia after first connection to start peer discovery
                         if !kademlia_bootstrapped {
                             if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
@@ -973,6 +1145,21 @@ impl Libp2pAdapter {
                                 info!("Kademlia bootstrap initiated for peer discovery");
                                 kademlia_bootstrapped = true;
                             }
+                        }
+                    }
+
+                    // Handle connection closed - schedule reconnection for validators
+                    if let SwarmEvent::ConnectionClosed { peer_id, num_established, .. } = &event {
+                        // Only schedule reconnect if this was the last connection to this peer
+                        // and the peer is a known validator
+                        if *num_established == 0 && peer_validators.contains_key(peer_id) {
+                            let reconnect_time = std::time::Instant::now() + RECONNECT_DELAY;
+                            info!(
+                                peer = %peer_id,
+                                reconnect_in_secs = RECONNECT_DELAY.as_secs(),
+                                "Validator disconnected, scheduling reconnection"
+                            );
+                            pending_reconnects.insert(*peer_id, reconnect_time);
                         }
                     }
 
@@ -1036,7 +1223,7 @@ impl Libp2pAdapter {
             request_response::OutboundRequestId,
             tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
         >,
-        pending_response_channels: &mut HashMap<u64, ResponseChannel<Vec<u8>>>,
+        pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
     ) {
         match cmd {
             SwarmCommand::Subscribe { topic } => {
@@ -1106,11 +1293,11 @@ impl Libp2pAdapter {
                 channel_id,
                 response,
             } => {
-                if let Some(channel) = pending_response_channels.remove(&channel_id) {
+                if let Some(pending) = pending_response_channels.remove(&channel_id) {
                     if let Err(e) = swarm
                         .behaviour_mut()
                         .request_response
-                        .send_response(channel, response)
+                        .send_response(pending.channel, response)
                     {
                         warn!("Failed to send block response: {:?}", e);
                     }
@@ -1142,11 +1329,11 @@ impl Libp2pAdapter {
                 channel_id,
                 response,
             } => {
-                if let Some(channel) = pending_response_channels.remove(&channel_id) {
+                if let Some(pending) = pending_response_channels.remove(&channel_id) {
                     if let Err(e) = swarm
                         .behaviour_mut()
                         .request_response
-                        .send_response(channel, response)
+                        .send_response(pending.channel, response)
                     {
                         warn!("Failed to send transaction response: {:?}", e);
                     }
@@ -1178,11 +1365,11 @@ impl Libp2pAdapter {
                 channel_id,
                 response,
             } => {
-                if let Some(channel) = pending_response_channels.remove(&channel_id) {
+                if let Some(pending) = pending_response_channels.remove(&channel_id) {
                     if let Err(e) = swarm
                         .behaviour_mut()
                         .request_response
-                        .send_response(channel, response)
+                        .send_response(pending.channel, response)
                     {
                         warn!("Failed to send certificate response: {:?}", e);
                     }
@@ -1203,7 +1390,7 @@ impl Libp2pAdapter {
             request_response::OutboundRequestId,
             tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
         >,
-        pending_response_channels: &mut HashMap<u64, ResponseChannel<Vec<u8>>>,
+        pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
         next_channel_id: &mut u64,
         sync_request_tx: &mpsc::UnboundedSender<InboundSyncRequest>,
         tx_request_tx: &mpsc::UnboundedSender<InboundTransactionRequest>,
@@ -1396,6 +1583,7 @@ impl Libp2pAdapter {
                         is_validator = is_validator,
                         "Rate limited request from peer"
                     );
+                    metrics::record_request_rate_limited(is_validator);
                     // Drop the request by not processing it
                     // The channel will be dropped, which signals failure to the requester
                     return;
@@ -1408,10 +1596,16 @@ impl Libp2pAdapter {
                     // Block sync request
                     let height = u64::from_le_bytes(request[..8].try_into().unwrap());
 
-                    // Allocate a channel ID and store the response channel
+                    // Allocate a channel ID and store the response channel with timestamp
                     let channel_id = *next_channel_id;
                     *next_channel_id = next_channel_id.wrapping_add(1);
-                    pending_response_channels.insert(channel_id, channel);
+                    pending_response_channels.insert(
+                        channel_id,
+                        PendingResponseChannel {
+                            channel,
+                            created_at: std::time::Instant::now(),
+                        },
+                    );
 
                     debug!(
                         peer = %peer,
@@ -1457,7 +1651,13 @@ impl Libp2pAdapter {
                                 // Transaction fetch request
                                 let channel_id = *next_channel_id;
                                 *next_channel_id = next_channel_id.wrapping_add(1);
-                                pending_response_channels.insert(channel_id, channel);
+                                pending_response_channels.insert(
+                                    channel_id,
+                                    PendingResponseChannel {
+                                        channel,
+                                        created_at: std::time::Instant::now(),
+                                    },
+                                );
 
                                 debug!(
                                     peer = %peer,
@@ -1493,7 +1693,13 @@ impl Libp2pAdapter {
                                 // Certificate fetch request
                                 let channel_id = *next_channel_id;
                                 *next_channel_id = next_channel_id.wrapping_add(1);
-                                pending_response_channels.insert(channel_id, channel);
+                                pending_response_channels.insert(
+                                    channel_id,
+                                    PendingResponseChannel {
+                                        channel,
+                                        created_at: std::time::Instant::now(),
+                                    },
+                                );
 
                                 debug!(
                                     peer = %peer,
@@ -1591,7 +1797,7 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let config = Libp2pConfig::default();
-        assert_eq!(config.request_timeout, Duration::from_secs(1));
+        assert_eq!(config.request_timeout, Duration::from_secs(10));
         assert!(!config.listen_addresses.is_empty());
     }
 }

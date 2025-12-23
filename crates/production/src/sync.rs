@@ -127,6 +127,11 @@ pub struct SyncConfig {
     /// reset cooldowns to allow retrying. This prevents getting stuck when all peers
     /// temporarily fail but we urgently need to catch up.
     pub desperation_threshold_blocks: u64,
+    /// Timeout for individual fetch requests. If a fetch doesn't complete within this
+    /// duration, it's marked as failed and retried with a different peer.
+    pub fetch_timeout: Duration,
+    /// Timeout for backfill operations (fetching missing txs/certs after metadata-only response).
+    pub backfill_timeout: Duration,
 }
 
 impl Default for SyncConfig {
@@ -145,6 +150,16 @@ impl Default for SyncConfig {
             // If 3+ blocks behind and all peers in cooldown, enter desperation mode.
             // Low threshold ensures we don't get stuck due to transient network issues.
             desperation_threshold_blocks: 3,
+            // 5 second timeout for individual sync fetch requests.
+            // This is ~1.5x view_change_timeout (3s), giving enough time for network
+            // RTT + block serialization while ensuring fast peer failover.
+            // Sync is catch-up mode - we're already behind and need fast recovery.
+            // With 150-300ms block times, 5s delay = 15-30 blocks of additional lag.
+            fetch_timeout: Duration::from_secs(5),
+            // 30 second timeout for backfill operations (fetching txs/certs after
+            // metadata-only response). Aligned with BFT's stale_pending_block_timeout
+            // so backfill gives up around the same time BFT would remove the block anyway.
+            backfill_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -498,12 +513,65 @@ impl SyncManager {
         // (we may have outstanding fetches from before sync was cancelled)
         self.process_fetch_results().await;
 
+        // Check for timed out fetch requests and re-queue them
+        self.check_fetch_timeouts();
+
         if self.sync_target.is_none() {
             return;
         }
 
         // Spawn more fetches if we're under the limit
         self.spawn_pending_fetches();
+    }
+
+    /// Check for fetch requests that have timed out and re-queue them.
+    ///
+    /// This prevents stuck requests from blocking sync progress indefinitely.
+    /// Timed-out requests are treated as failures and the height is re-queued
+    /// for retry with a different peer.
+    fn check_fetch_timeouts(&mut self) {
+        let now = Instant::now();
+        let timeout = self.config.fetch_timeout;
+
+        // Find all timed-out requests
+        let timed_out: Vec<_> = self
+            .pending_fetches
+            .iter()
+            .filter(|(_, fetch)| now.duration_since(fetch.started) > timeout)
+            .map(|(&height, fetch)| (height, fetch.peer))
+            .collect();
+
+        // Process each timed-out request
+        for (height, peer) in timed_out {
+            warn!(
+                height,
+                ?peer,
+                timeout_secs = timeout.as_secs(),
+                "Sync fetch timed out"
+            );
+
+            // Record metric
+            metrics::record_sync_response_error("timeout");
+
+            // Remove from pending and update peer reputation
+            if let Some(fetch) = self.pending_fetches.remove(&height) {
+                if let Some(rep) = self.peer_reputations.get_mut(&peer) {
+                    rep.in_flight = rep.in_flight.saturating_sub(1);
+                    rep.failures += 1;
+                    rep.last_failure = Some(now);
+                }
+
+                // Track tried peers for this height
+                let mut tried = fetch.tried_peers;
+                tried.insert(peer);
+                self.tried_peers_for_height.insert(height, tried);
+            }
+
+            // Re-queue the height for retry
+            if !self.heights_to_fetch.contains(&height) {
+                self.heights_to_fetch.push_back(height);
+            }
+        }
     }
 
     /// Spawn pending fetches up to the concurrent limit.
@@ -1363,12 +1431,17 @@ impl SyncManager {
             self.try_complete_backfill(height);
         }
 
-        // Clean up old backfills that have timed out (5 minutes)
-        let timeout = Duration::from_secs(300);
+        // Clean up old backfills that have timed out
+        let timeout = self.config.backfill_timeout;
         let now = Instant::now();
         self.pending_backfills.retain(|height, backfill| {
             if now.duration_since(backfill.started) > timeout {
-                warn!(height, "Backfill timed out after 5 minutes");
+                warn!(
+                    height,
+                    timeout_secs = timeout.as_secs(),
+                    "Backfill timed out"
+                );
+                metrics::record_sync_response_error("backfill_timeout");
                 false
             } else {
                 true
@@ -1618,6 +1691,54 @@ mod tests {
             for h in (self.committed_height + 1)..=target_height {
                 self.heights_to_fetch.push_back(h);
             }
+        }
+
+        /// Check for fetch requests that have timed out and re-queue them.
+        fn check_fetch_timeouts(&mut self) -> Vec<u64> {
+            let now = Instant::now();
+            let timeout = self.config.fetch_timeout;
+
+            let timed_out: Vec<_> = self
+                .pending_fetches
+                .iter()
+                .filter(|(_, fetch)| now.duration_since(fetch.started) > timeout)
+                .map(|(&height, fetch)| (height, fetch.peer))
+                .collect();
+
+            let mut timed_out_heights = Vec::new();
+            for (height, peer) in timed_out {
+                timed_out_heights.push(height);
+
+                if let Some(_fetch) = self.pending_fetches.remove(&height) {
+                    if let Some(rep) = self.peer_reputations.get_mut(&peer) {
+                        rep.in_flight = rep.in_flight.saturating_sub(1);
+                        rep.failures += 1;
+                        rep.last_failure = Some(now);
+                    }
+                }
+
+                if !self.heights_to_fetch.contains(&height) {
+                    self.heights_to_fetch.push_back(height);
+                }
+            }
+
+            timed_out_heights
+        }
+
+        /// Add a pending fetch for testing.
+        fn add_pending_fetch(&mut self, height: u64, peer: PeerId, started: Instant) {
+            self.pending_fetches.insert(
+                height,
+                PendingFetch {
+                    height,
+                    peer,
+                    started,
+                    retries: 0,
+                    tried_peers: HashSet::new(),
+                },
+            );
+            let rep = self.peer_reputations.entry(peer).or_default();
+            rep.in_flight += 1;
         }
     }
 
@@ -2465,5 +2586,103 @@ mod tests {
             result,
             Err(SyncResponseError::StateMismatch { .. })
         ));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Fetch Timeout Tests
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_check_fetch_timeouts_no_timeouts() {
+        let mut manager = create_test_sync_manager();
+        let peer = PeerId::random();
+        manager.register_peer(peer);
+
+        // Add a recent fetch (not timed out)
+        manager.add_pending_fetch(100, peer, Instant::now());
+
+        // Should not time out
+        let timed_out = manager.check_fetch_timeouts();
+        assert!(timed_out.is_empty());
+        assert_eq!(manager.pending_fetches.len(), 1);
+    }
+
+    #[test]
+    fn test_check_fetch_timeouts_removes_stale_fetches() {
+        let mut manager = create_test_sync_manager();
+        manager.config.fetch_timeout = Duration::from_millis(10);
+        let peer = PeerId::random();
+        manager.register_peer(peer);
+
+        // Add an old fetch (before timeout)
+        let old_time = Instant::now() - Duration::from_secs(60);
+        manager.add_pending_fetch(100, peer, old_time);
+
+        // Should time out
+        let timed_out = manager.check_fetch_timeouts();
+        assert_eq!(timed_out, vec![100]);
+        assert!(manager.pending_fetches.is_empty());
+
+        // Height should be re-queued
+        assert!(manager.heights_to_fetch.contains(&100));
+    }
+
+    #[test]
+    fn test_check_fetch_timeouts_updates_peer_reputation() {
+        let mut manager = create_test_sync_manager();
+        manager.config.fetch_timeout = Duration::from_millis(10);
+        let peer = PeerId::random();
+        manager.register_peer(peer);
+
+        // Verify initial state
+        assert_eq!(manager.peer_reputations.get(&peer).unwrap().in_flight, 0);
+        assert_eq!(manager.peer_reputations.get(&peer).unwrap().failures, 0);
+
+        // Add an old fetch
+        let old_time = Instant::now() - Duration::from_secs(60);
+        manager.add_pending_fetch(100, peer, old_time);
+        assert_eq!(manager.peer_reputations.get(&peer).unwrap().in_flight, 1);
+
+        // Time out should update reputation
+        manager.check_fetch_timeouts();
+
+        let rep = manager.peer_reputations.get(&peer).unwrap();
+        assert_eq!(rep.in_flight, 0); // Decremented
+        assert_eq!(rep.failures, 1); // Incremented
+        assert!(rep.last_failure.is_some()); // Set
+    }
+
+    #[test]
+    fn test_check_fetch_timeouts_multiple_fetches() {
+        let mut manager = create_test_sync_manager();
+        manager.config.fetch_timeout = Duration::from_millis(10);
+        let peer1 = PeerId::random();
+        let peer2 = PeerId::random();
+        manager.register_peer(peer1);
+        manager.register_peer(peer2);
+
+        // Add two old fetches to different peers
+        let old_time = Instant::now() - Duration::from_secs(60);
+        manager.add_pending_fetch(100, peer1, old_time);
+        manager.add_pending_fetch(101, peer2, old_time);
+
+        // Add one recent fetch
+        manager.add_pending_fetch(102, peer1, Instant::now());
+
+        // Only old fetches should time out
+        let mut timed_out = manager.check_fetch_timeouts();
+        timed_out.sort();
+        assert_eq!(timed_out, vec![100, 101]);
+
+        // One fetch remains
+        assert_eq!(manager.pending_fetches.len(), 1);
+        assert!(manager.pending_fetches.contains_key(&102));
+    }
+
+    #[test]
+    fn test_sync_config_has_fetch_timeout() {
+        let config = SyncConfig::default();
+        assert_eq!(config.fetch_timeout, Duration::from_secs(5));
+        assert_eq!(config.backfill_timeout, Duration::from_secs(30));
     }
 }
