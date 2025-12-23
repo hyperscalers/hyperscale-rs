@@ -148,30 +148,21 @@ pub struct ExecutionState {
     certificate_trackers: HashMap<Hash, CertificateTracker>,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Early arrivals (before tracking starts) - bounded to prevent memory exhaustion
+    // Early arrivals (before tracking starts)
     // ═══════════════════════════════════════════════════════════════════════
     /// ProvisioningComplete events that arrived before the block was committed.
     /// This can happen when provisions reach quorum before we've seen the block.
-    /// Maps tx_hash -> provisions
-    /// Bounded to `max_early_arrivals` entries.
+    /// Maps tx_hash -> provisions.
+    /// Unbounded: eviction would cause unrecoverable transaction loss, and memory
+    /// cost is trivial (provisions are small, buffer drains on block commit).
     early_provisioning_complete: HashMap<Hash, Vec<StateProvision>>,
 
     /// Votes that arrived before tracking started.
     /// Uses HashSet for O(1) deduplication instead of O(n) Vec::contains.
-    /// Bounded to `max_early_arrivals` entries.
     early_votes: HashMap<Hash, HashSet<StateVoteBlock>>,
 
     /// Certificates that arrived before tracking started.
-    /// Bounded to `max_early_arrivals` entries.
     early_certificates: HashMap<Hash, Vec<StateCertificate>>,
-
-    /// Maximum number of transactions to buffer in each early arrival map.
-    /// When exceeded, oldest entries are evicted to prevent memory exhaustion.
-    /// Default: 1000 transactions.
-    max_early_arrivals: usize,
-
-    /// Counter for early arrival evictions (for metrics/debugging).
-    early_arrival_evictions: u64,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Pending signature verifications
@@ -270,11 +261,6 @@ pub const DEFAULT_SPECULATIVE_MAX_TXS: usize = 500;
 
 /// Default number of rounds to pause speculation after a view change.
 pub const DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS: u64 = 3;
-
-/// Default maximum early arrivals per buffer type.
-/// Prevents unbounded memory growth from early votes/certificates/provisions.
-pub const DEFAULT_MAX_EARLY_ARRIVALS: usize = 1000;
-
 impl ExecutionState {
     /// Create a new execution state machine with default settings.
     pub fn new(topology: Arc<dyn Topology>, signing_key: KeyPair) -> Self {
@@ -334,8 +320,6 @@ impl ExecutionState {
             speculative_late_hit_count: 0,
             speculative_cache_miss_count: 0,
             speculative_invalidated_count: 0,
-            max_early_arrivals: DEFAULT_MAX_EARLY_ARRIVALS,
-            early_arrival_evictions: 0,
         }
     }
 
@@ -346,43 +330,6 @@ impl ExecutionState {
     /// Get the local validator ID.
     fn validator_id(&self) -> ValidatorId {
         self.topology.local_validator_id()
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Early Arrival Buffer Management
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Enforce the early arrival buffer limit by evicting oldest entries if needed.
-    /// Returns true if eviction occurred.
-    fn enforce_early_arrival_limit<V>(&mut self, buffer: &mut HashMap<Hash, V>) -> bool {
-        if buffer.len() < self.max_early_arrivals {
-            return false;
-        }
-
-        // Evict oldest entries (arbitrary since HashMap doesn't preserve order)
-        // In practice, we just remove any entry to make room
-        let keys_to_remove: Vec<_> = buffer
-            .keys()
-            .take(buffer.len() - self.max_early_arrivals + 1)
-            .copied()
-            .collect();
-
-        for key in keys_to_remove {
-            buffer.remove(&key);
-            self.early_arrival_evictions += 1;
-            tracing::warn!(
-                tx_hash = ?key,
-                total_evictions = self.early_arrival_evictions,
-                "Evicted early arrival entry due to buffer limit"
-            );
-        }
-
-        true
-    }
-
-    /// Get the total number of early arrival evictions (for metrics).
-    pub fn early_arrival_eviction_count(&self) -> u64 {
-        self.early_arrival_evictions
     }
 
     /// Get the local shard.
@@ -966,11 +913,9 @@ impl ExecutionState {
                 shard = local_shard.0,
                 "Provisioning complete before block committed, buffering"
             );
-            // Enforce buffer limit before inserting
-            let mut buffer = std::mem::take(&mut self.early_provisioning_complete);
-            self.enforce_early_arrival_limit(&mut buffer);
-            buffer.insert(tx_hash, provisions);
-            self.early_provisioning_complete = buffer;
+            // No buffer limit - eviction causes unrecoverable transaction loss
+            // Memory cost is trivial (provisions are small, buffer drains on block commit)
+            self.early_provisioning_complete.insert(tx_hash, provisions);
             return vec![];
         };
 
@@ -1093,11 +1038,8 @@ impl ExecutionState {
                 return vec![];
             }
             // Buffer for later (HashSet provides O(1) deduplication)
-            // Enforce buffer limit before inserting
-            let mut buffer = std::mem::take(&mut self.early_votes);
-            self.enforce_early_arrival_limit(&mut buffer);
-            buffer.entry(tx_hash).or_default().insert(vote);
-            self.early_votes = buffer;
+            // No buffer limit - eviction causes unrecoverable transaction loss
+            self.early_votes.entry(tx_hash).or_default().insert(vote);
             return vec![];
         }
 
@@ -1360,11 +1302,11 @@ impl ExecutionState {
                 return vec![];
             }
             // Buffer for later
-            // Enforce buffer limit before inserting
-            let mut buffer = std::mem::take(&mut self.early_certificates);
-            self.enforce_early_arrival_limit(&mut buffer);
-            buffer.entry(tx_hash).or_default().push(cert);
-            self.early_certificates = buffer;
+            // No buffer limit - eviction causes unrecoverable transaction loss
+            self.early_certificates
+                .entry(tx_hash)
+                .or_default()
+                .push(cert);
             return vec![];
         }
 
