@@ -31,6 +31,7 @@ CLEAN=false                                     # Clean data directories first
 ACCOUNTS_PER_SHARD=16000                        # Spammer accounts per shard
 INITIAL_BALANCE=1000000                         # Initial XRD balance per account
 MONITORING="${START_MONITORING:-false}"         # Start Prometheus + Grafana monitoring stack
+TRACING="${TRACING:-false}"                     # Enable distributed tracing with Jaeger
 LOG_LEVEL="info"                                # Default log level (trace, debug, info, warn, error)
 SMOKE_TEST_TIMEOUT="${SMOKE_TEST_TIMEOUT:-60s}" # Smoke test timeout
 SKIP_BUILD="${SKIP_BUILD:-false}"               # Skip building binaries
@@ -89,6 +90,10 @@ while [[ $# -gt 0 ]]; do
             MONITORING=true
             shift
             ;;
+        --tracing)
+            TRACING=true
+            shift
+            ;;
         --no-tcp-fallback)
             TCP_FALLBACK_ENABLED="false"
             shift
@@ -105,6 +110,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --node-hostname HOST     Hostname for spammer endpoints (default: localhost)"
             echo "  --clean                  Remove existing data directories"
             echo "  --monitoring             Start Prometheus + Grafana monitoring stack"
+            echo "  --tracing                Enable distributed tracing with Jaeger (exports to localhost:4317)"
             echo "  --log-level LEVEL        Log level: trace, debug, info, warn, error (default: info)"
             echo "  --skip-build             Skip building binaries (default: false)"
             echo "  --start-monitoring       Start Prometheus + Grafana monitoring stack (default: false)"
@@ -152,6 +158,7 @@ echo "Smoke test timeout: $SMOKE_TEST_TIMEOUT"
 echo "Skip build: $SKIP_BUILD"
 echo "Clean data dir: $CLEAN"
 echo "TCP fallback: $TCP_FALLBACK_ENABLED"
+echo "Tracing: $TRACING"
 echo "Network Ports:"
 echo "  QUIC Range: $QUIC_PORT_RANGE"
 echo "  TCP Range:  $TCP_PORT_RANGE"
@@ -318,7 +325,9 @@ enabled = true
 listen_addr = "0.0.0.0:$rpc_port"
 
 [telemetry]
-enabled = false
+enabled = $TRACING
+otlp_endpoint = "http://localhost:4317"
+service_name = "hyperscale-validator"
 
 $GENESIS_VALIDATORS
 
@@ -462,12 +471,12 @@ cleanup() {
     fi
 
     # Stop monitoring stack if it was started
-    if [ "$MONITORING" = true ]; then
+    if [ "$MONITORING" = true ] || [ "$TRACING" = true ]; then
         SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
         MONITORING_DIR="$SCRIPT_DIR/monitoring"
 
         if command -v docker &> /dev/null; then
-            if docker ps --format '{{.Names}}' | grep -q "hyperscale-prometheus\|hyperscale-grafana"; then
+            if docker ps --format '{{.Names}}' | grep -q "hyperscale-prometheus\|hyperscale-grafana\|hyperscale-jaeger"; then
                 echo ""
                 echo "Stopping monitoring stack and removing volumes..."
                 (cd "$MONITORING_DIR" && docker-compose down -v 2>&1) | tail -2
@@ -482,7 +491,7 @@ cleanup() {
 trap cleanup SIGINT SIGTERM
 
 # Start monitoring stack if requested
-if [ "$MONITORING" = true ]; then
+if [ "$MONITORING" = true ] || [ "$TRACING" = true ]; then
     echo ""
     echo "=== Starting Monitoring Stack ==="
 
@@ -542,13 +551,23 @@ EOF
         echo "Install Docker and run manually: cd $MONITORING_DIR && $DC up -d"
     else
         # Start the monitoring stack
-        echo "Starting Prometheus and Grafana..."
+        if [ "$MONITORING" = true ]; then
+            echo "Starting Prometheus, Grafana, and Jaeger..."
+        else
+            echo "Starting Jaeger for distributed tracing..."
+        fi
         (cd "$MONITORING_DIR" && $DC up -d 2>&1) | tail -5
 
         echo ""
         echo "Monitoring URLs:"
-        echo "  Prometheus: http://localhost:9090"
-        echo "  Grafana:    http://localhost:3000/d/hyperscale-cluster/hyperscale-cluster"
+        if [ "$MONITORING" = true ]; then
+            echo "  Prometheus: http://localhost:9090"
+            echo "  Grafana:    http://localhost:3000/d/hyperscale-cluster/hyperscale-cluster"
+        fi
+        if [ "$TRACING" = true ]; then
+            echo "  Traces:     http://localhost:3000/explore (Grafana - better UI, select Jaeger datasource)"
+            echo "  Jaeger:     http://localhost:16686 (legacy UI)"
+        fi
         echo ""
         echo "Stop monitoring: cd $MONITORING_DIR && $DC down"
     fi

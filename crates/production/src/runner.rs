@@ -31,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{instrument, span, Level, Span};
+use tracing::{span, Level};
 
 /// Errors from the production runner.
 #[derive(Debug, Error)]
@@ -1091,21 +1091,11 @@ impl ProductionRunner {
                 // by network floods. This is critical for liveness - if timers stop firing,
                 // the validator cannot make progress.
                 Some(event) = self.timer_rx.recv() => {
-                    let event_type = event.type_name();
-                    let event_span = span!(
-                        Level::INFO,
-                        "handle_timer",
-                        event.type = %event_type,
-                        node = self.state.node_index(),
-                        shard = ?self.state.shard(),
-                    );
-                    let _event_guard = event_span.enter();
-
                     // Update time
                     let now = self.wall_clock_time();
                     self.state.set_time(now);
 
-                    // Process timer event
+                    // Process timer event (span created by state.handle())
                     let actions = self.dispatch_event(event).await;
 
                     for action in actions {
@@ -1126,21 +1116,11 @@ impl ProductionRunner {
                 // produce ExecuteCrossShardTransaction actions. These must be accumulated
                 // for batch parallel execution, not sent directly to process_action().
                 Some(event) = self.callback_rx.recv() => {
-                    let event_type = event.type_name();
-                    let event_span = span!(
-                        Level::DEBUG,
-                        "handle_callback",
-                        event.type = %event_type,
-                        node = self.state.node_index(),
-                        shard = ?self.state.shard(),
-                    );
-                    let _event_guard = event_span.enter();
-
                     // Update time
                     let now = self.wall_clock_time();
                     self.state.set_time(now);
 
-                    // Dispatch event through unified handler
+                    // Dispatch event through unified handler (span created by state.handle())
                     let actions = self.dispatch_event(event).await;
 
                     // Process actions, accumulating cross-shard executions for batching
@@ -1175,18 +1155,6 @@ impl ProductionRunner {
                 event = self.consensus_rx.recv() => {
                     match event {
                         Some(event) => {
-                            // Create span for event handling
-                            let event_type = event.type_name();
-                            let event_span = span!(
-                                Level::INFO,
-                                "handle_event",
-                                event.type = %event_type,
-                                node = self.state.node_index(),
-                                shard = ?self.state.shard(),
-                                otel.kind = "INTERNAL",
-                            );
-                            let _event_guard = event_span.enter();
-
                             // Update time
                             let now = self.wall_clock_time();
                             self.state.set_time(now);
@@ -1311,25 +1279,10 @@ impl ProductionRunner {
                                 continue;
                             }
 
-                            // Process event synchronously (fast)
+                            // Process event synchronously (span created by state.handle())
                             // Note: Runner I/O requests (StartSync, FetchTransactions, FetchCertificates)
                             // are now Actions emitted by the state machine and handled in process_action().
-                            let actions = {
-                                let sm_span = span!(Level::DEBUG, "state_machine.handle");
-                                let _sm_guard = sm_span.enter();
-                                self.state.handle(event)
-                            };
-
-                            // Record action count
-                            Span::current().record("actions.count", actions.len());
-
-                            if !actions.is_empty() {
-                                tracing::debug!(
-                                    event_type = %event_type,
-                                    num_actions = actions.len(),
-                                    "Event produced actions"
-                                );
-                            }
+                            let actions = self.state.handle(event);
 
                             // Collect block vote verifications for batching (5ms window).
                             // State votes are accumulated separately with a longer window (20ms).
@@ -1575,19 +1528,10 @@ impl ProductionRunner {
                         });
                     }
 
-                    let event_type = event.type_name();
-                    let event_span = span!(
-                        Level::DEBUG,
-                        "handle_validated_tx",
-                        event.type = %event_type,
-                        node = self.state.node_index(),
-                        shard = ?self.state.shard(),
-                    );
-                    let _event_guard = event_span.enter();
-
                     let now = self.wall_clock_time();
                     self.state.set_time(now);
 
+                    // Span created by state.handle()
                     let actions = self.state.handle(event);
 
                     for action in actions {
@@ -1679,19 +1623,11 @@ impl ProductionRunner {
                 // Transaction status updates (non-consensus-critical)
                 // These update mempool status for RPC queries but don't affect consensus
                 Some(event) = self.status_rx.recv() => {
-                    let event_type = event.type_name();
-                    let event_span = span!(
-                        Level::DEBUG,
-                        "handle_status_event",
-                        event.type = %event_type,
-                    );
-                    let _event_guard = event_span.enter();
-
                     // Update time
                     let now = self.wall_clock_time();
                     self.state.set_time(now);
 
-                    // Process status event (updates mempool state)
+                    // Process status event (span created by state.handle())
                     let actions = self.state.handle(event);
 
                     for action in actions {
@@ -1708,7 +1644,6 @@ impl ProductionRunner {
     }
 
     /// Process an action.
-    #[instrument(skip(self, action), fields(action.type = %action.type_name()))]
     async fn process_action(&mut self, action: Action) -> Result<(), RunnerError> {
         match action {
             // Network I/O - dispatch to action dispatcher task (fire-and-forget)

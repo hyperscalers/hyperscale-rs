@@ -977,6 +977,7 @@ impl ExecutionState {
     ///
     /// Called when the runner completes `Action::ExecuteCrossShardTransactions`.
     /// Creates and broadcasts votes for each execution result.
+    #[instrument(skip(self, results), fields(result_count = results.len()))]
     pub fn on_cross_shard_executions_complete(
         &mut self,
         results: Vec<ExecutionResult>,
@@ -1521,6 +1522,10 @@ impl ExecutionState {
     }
 
     /// Internal certificate handling (assumes tracking is active).
+    #[instrument(level = "debug", skip(self, cert), fields(
+        tx_hash = %cert.transaction_hash,
+        cert_shard = cert.shard_group_id.0,
+    ))]
     fn handle_certificate_internal(&mut self, cert: StateCertificate) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = cert.transaction_hash;
@@ -1880,6 +1885,7 @@ impl ExecutionState {
     ///
     /// This is called when the runner completes a `FetchStateEntries` action
     /// and returns the state entries for cross-shard provisioning.
+    #[instrument(skip(self, entries), fields(tx_hash = ?tx_hash, entry_count = entries.len()))]
     pub fn on_state_entries_fetched(
         &mut self,
         tx_hash: Hash,
@@ -1949,6 +1955,7 @@ impl ExecutionState {
     ///
     /// Speculation will be paused for a few rounds to avoid wasted work,
     /// since blocks proposed during instability may not commit.
+    #[instrument(skip(self), fields(height = height))]
     pub fn on_view_change(&mut self, height: u64) {
         tracing::debug!(
             height,
@@ -2047,6 +2054,7 @@ impl ExecutionState {
     /// Caches the results for use when the block commits. If the block has already
     /// committed and is waiting for this speculation, the result is processed
     /// immediately via the normal execution path.
+    #[instrument(skip(self, results), fields(block_hash = ?block_hash, result_count = results.len()))]
     pub fn on_speculative_execution_complete(
         &mut self,
         block_hash: Hash,

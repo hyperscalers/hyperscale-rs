@@ -31,6 +31,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
+use tracing::instrument;
 
 /// Errors from thread pool configuration.
 #[derive(Debug, Error)]
@@ -598,6 +599,9 @@ impl ThreadPoolManager {
     ///
     /// Returns immediately; the task runs asynchronously.
     /// Queue depth is tracked for metrics.
+    #[instrument(level = "debug", skip_all, fields(
+        queue_depth = self.consensus_crypto_pending.load(Ordering::Relaxed),
+    ))]
     pub fn spawn_consensus_crypto<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
@@ -708,6 +712,9 @@ impl ThreadPoolManager {
     ///
     /// Returns immediately; the task runs asynchronously.
     /// Queue depth is tracked for metrics.
+    #[instrument(level = "debug", skip_all, fields(
+        queue_depth = self.execution_pending.load(Ordering::Relaxed),
+    ))]
     pub fn spawn_execution<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,

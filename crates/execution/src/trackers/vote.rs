@@ -5,6 +5,7 @@
 
 use hyperscale_types::{Hash, NodeId, ShardGroupId, StateVoteBlock};
 use std::collections::BTreeMap;
+use tracing::instrument;
 
 /// Tracks votes for a cross-shard transaction.
 ///
@@ -68,6 +69,12 @@ impl VoteTracker {
     }
 
     /// Add a vote and its voting power.
+    #[instrument(level = "debug", skip(self, vote), fields(
+        tx_hash = %self.tx_hash,
+        validator = vote.validator.0,
+        power = power,
+        quorum = self.quorum,
+    ))]
     pub fn add_vote(&mut self, vote: StateVoteBlock, power: u64) {
         let state_root = vote.state_root;
         self.votes_by_root.entry(state_root).or_default().push(vote);

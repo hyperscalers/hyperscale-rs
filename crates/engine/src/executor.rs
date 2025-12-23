@@ -46,6 +46,8 @@ use radix_engine::vm::DefaultVmModules;
 use radix_transactions::validation::TransactionValidator;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
+use tracing::{instrument, Level};
 
 /// Shared executor caches to avoid rebuilding on clone.
 ///
@@ -144,11 +146,16 @@ impl RadixExecutor {
     /// **IMPORTANT**: This method does NOT commit state changes. The writes
     /// are returned in the `ExecutionOutput` and should be committed later
     /// when the `TransactionCertificate` is included in a committed block.
+    #[instrument(level = Level::DEBUG, skip_all, fields(
+        tx_count = transactions.len(),
+        latency_us = tracing::field::Empty,
+    ))]
     pub fn execute_single_shard<S: SubstateStore>(
         &self,
         storage: &S,
         transactions: &[Arc<RoutableTransaction>],
     ) -> Result<ExecutionOutput, ExecutionError> {
+        let start = Instant::now();
         let mut results = Vec::with_capacity(transactions.len());
 
         for tx in transactions {
@@ -156,6 +163,7 @@ impl RadixExecutor {
             results.push(result);
         }
 
+        tracing::Span::current().record("latency_us", start.elapsed().as_micros() as u64);
         Ok(ExecutionOutput::new(results))
     }
 
@@ -169,6 +177,11 @@ impl RadixExecutor {
     ///
     /// Note: The `is_local_node` parameter is kept for future use when we
     /// need to filter writes in the result, but commits are now deferred.
+    #[instrument(level = Level::DEBUG, skip_all, fields(
+        tx_count = transactions.len(),
+        provision_count = provisions.len(),
+        latency_us = tracing::field::Empty,
+    ))]
     pub fn execute_cross_shard<S: SubstateStore>(
         &self,
         storage: &S,
@@ -176,6 +189,7 @@ impl RadixExecutor {
         provisions: &[StateProvision],
         _is_local_node: impl Fn(&NodeId) -> bool,
     ) -> Result<ExecutionOutput, ExecutionError> {
+        let start = Instant::now();
         // Pre-index provisions by transaction hash for O(1) lookup per transaction
         // instead of O(N*M) where N=transactions, M=provisions
         let mut provisions_by_tx: HashMap<Hash, Vec<&StateProvision>> =
@@ -231,6 +245,7 @@ impl RadixExecutor {
             results.push(result);
         }
 
+        tracing::Span::current().record("latency_us", start.elapsed().as_micros() as u64);
         Ok(ExecutionOutput::new(results))
     }
 

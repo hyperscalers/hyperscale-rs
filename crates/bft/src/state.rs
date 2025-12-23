@@ -450,6 +450,7 @@ impl BftState {
     /// Handle chain metadata fetched from storage (recovery).
     ///
     /// Called when the runner completes `Action::FetchChainMetadata`.
+    #[instrument(skip(self, qc), fields(height = height.0, has_hash = hash.is_some(), has_qc = qc.is_some()))]
     pub fn on_chain_metadata_fetched(
         &mut self,
         height: BlockHeight,
@@ -3079,6 +3080,7 @@ impl BftState {
     ///
     /// If the pending block is still incomplete, emit TransactionNeeded
     /// so the runner can request the missing transactions from a peer.
+    #[instrument(skip(self), fields(block_hash = ?block_hash))]
     pub fn on_transaction_fetch_timer(&mut self, block_hash: Hash) -> Vec<Action> {
         let Some(pending) = self.pending_blocks.get(&block_hash) else {
             // Block no longer pending (completed or removed)
@@ -3117,6 +3119,7 @@ impl BftState {
     ///
     /// Adds the fetched transactions to the pending block and triggers
     /// voting if the block is now complete.
+    #[instrument(skip(self, transactions), fields(block_hash = ?block_hash, tx_count = transactions.len()))]
     pub fn on_transaction_fetch_received(
         &mut self,
         block_hash: Hash,
@@ -3235,6 +3238,7 @@ impl BftState {
     ///
     /// If the pending block is still missing certificates, emit CertificateNeeded
     /// so the runner can request them from a peer.
+    #[instrument(skip(self), fields(block_hash = ?block_hash))]
     pub fn on_certificate_fetch_timer(&mut self, block_hash: Hash) -> Vec<Action> {
         let Some(pending) = self.pending_blocks.get(&block_hash) else {
             // Block no longer pending (completed or removed)
@@ -3276,6 +3280,7 @@ impl BftState {
     ///
     /// Note: Certificates should be verified by the caller before passing here.
     /// This method assumes the certificates have been validated.
+    #[instrument(skip(self, certificates), fields(block_hash = ?block_hash, cert_count = certificates.len()))]
     pub fn on_certificate_fetch_received(
         &mut self,
         block_hash: Hash,
@@ -3402,6 +3407,7 @@ impl BftState {
     /// - Should proposers persist block data before broadcasting?
     /// - How do we handle the case where the proposer is the only one with the data
     ///   and they crash/disappear?
+    #[instrument(skip(self), fields(block_hash = ?block_hash))]
     pub fn on_fetch_failed(&mut self, block_hash: Hash) -> Vec<Action> {
         // Check if this block has a QC - if so, we MUST get the data eventually
         let has_qc = self.certified_blocks.contains_key(&block_hash)

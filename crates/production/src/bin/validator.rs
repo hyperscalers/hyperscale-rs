@@ -1003,27 +1003,13 @@ async fn setup_upnp(config: &NetworkConfig) {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level)),
-        )
-        .init();
-
-    info!("Hyperscale Validator starting...");
-
-    // Load configuration
+    // Load configuration first (before logging init) to check if telemetry is enabled
     let mut config = ValidatorConfig::load(&cli.config)?;
     config.apply_overrides(&cli);
 
-    info!(
-        validator_id = config.node.validator_id,
-        shard = config.node.shard,
-        num_shards = config.node.num_shards,
-        "Node configuration loaded"
-    );
-
-    // Initialize telemetry if enabled
+    // Initialize telemetry/logging
+    // If telemetry is enabled, init_telemetry sets up the global subscriber with OTLP export.
+    // Otherwise, use basic fmt subscriber.
     let _telemetry_guard = if config.telemetry.enabled {
         let telemetry_config = TelemetryConfig {
             service_name: config.telemetry.service_name.clone(),
@@ -1041,8 +1027,24 @@ async fn main() -> Result<()> {
         };
         Some(init_telemetry(&telemetry_config)?)
     } else {
+        // Basic logging without OTLP export
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&cli.log_level)),
+            )
+            .init();
         None
     };
+
+    info!("Hyperscale Validator starting...");
+
+    info!(
+        validator_id = config.node.validator_id,
+        shard = config.node.shard,
+        num_shards = config.node.num_shards,
+        "Node configuration loaded"
+    );
 
     // Ensure data directory exists
     fs::create_dir_all(&config.node.data_dir)?;

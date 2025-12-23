@@ -6,9 +6,28 @@
 #
 # Access:
 #   Prometheus: http://localhost:9090
-#   Grafana:    http://localhost:3000 (admin/admin)
+#   Grafana:    http://localhost:3000 (admin/admin) - USE THIS FOR TRACES!
+#   Jaeger UI:  http://localhost:16686 (legacy, limited)
+#
+# For tracing, use Grafana's Explore view (much better UI than Jaeger's):
+#   1. Go to http://localhost:3000/explore
+#   2. Select "Jaeger" datasource
+#   3. Use the query builder or TraceQL-like syntax
 
 services:
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: hyperscale-jaeger
+    ports:
+      - "16686:16686"  # Jaeger UI (legacy)
+      - "4317:4317"    # OTLP gRPC receiver
+      - "4318:4318"    # OTLP HTTP receiver
+      - "16685:16685"  # Jaeger gRPC query (for Grafana)
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - MEMORY_MAX_TRACES=10000000
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:v2.47.0
     container_name: hyperscale-prometheus

@@ -9,6 +9,7 @@ use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_types::{Block, BlockHeight, KeyPair, ShardGroupId, Topology};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::instrument;
 
 /// Index type for simulation-only node routing.
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
@@ -201,6 +202,7 @@ impl NodeStateMachine {
     }
 
     /// Handle cleanup timer.
+    #[instrument(skip(self))]
     fn on_cleanup_timer(&mut self) -> Vec<Action> {
         // Reschedule the cleanup timer
         let mut actions = vec![Action::SetTimer {
@@ -244,6 +246,7 @@ impl NodeStateMachine {
     /// Handle block committed event.
     ///
     /// Resets round timeout tracking.
+    #[instrument(skip(self), fields(height = _height))]
     fn on_block_committed(&mut self, _height: u64) -> Vec<Action> {
         // Reset round advancement timeout - progress was made
         self.last_leader_activity = self.now;
@@ -307,6 +310,12 @@ impl NodeStateMachine {
 }
 
 impl StateMachine for NodeStateMachine {
+    #[instrument(skip(self), fields(
+        node = self.node_index,
+        shard = self.topology.local_shard().0,
+        event = %event.type_name(),
+        height = self.bft.committed_height(),
+    ))]
     fn handle(&mut self, event: Event) -> Vec<Action> {
         // Route event to appropriate sub-state machine
         match &event {

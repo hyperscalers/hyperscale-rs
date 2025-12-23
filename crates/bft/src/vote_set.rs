@@ -4,6 +4,7 @@ use hyperscale_types::{
     BlockHeader, BlockHeight, BlockVote, Hash, QuorumCertificate, Signature, SignerBitfield,
     VotePower,
 };
+use tracing::instrument;
 
 /// Votes for a specific block.
 #[derive(Debug, Clone)]
@@ -78,6 +79,13 @@ impl VoteSet {
     /// The `stake_weight` is the validator's voting power from their stake.
     ///
     /// Returns true if vote was added, false if validator already voted.
+    #[instrument(level = "debug", skip(self, vote), fields(
+        block_hash = ?self.block_hash,
+        height = ?self.height.map(|h| h.0),
+        voter = vote.voter.0,
+        power_before = self.voting_power,
+        stake_weight = stake_weight,
+    ))]
     pub fn add_vote(&mut self, vote: BlockVote, committee_index: usize, stake_weight: u64) -> bool {
         // Check if validator already voted (using committee index)
         if self.signers.is_set(committee_index) {

@@ -1,5 +1,5 @@
 # Grafana datasource provisioning
-# Auto-configures Prometheus as the default datasource
+# Auto-configures Prometheus and Jaeger datasources
 
 apiVersion: 1
 
@@ -10,3 +10,18 @@ datasources:
     url: http://prometheus:9090
     isDefault: true
     editable: false
+
+  # Jaeger for distributed tracing
+  # Use Grafana Explore (http://localhost:3000/explore) for a much better UI than Jaeger's native UI
+  - name: Jaeger
+    type: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    editable: false
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: ''
+      tracesToMetrics:
+        datasourceUid: 'Prometheus'
+      nodeGraph:
+        enabled: true

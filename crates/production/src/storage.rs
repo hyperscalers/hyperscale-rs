@@ -17,6 +17,7 @@ use std::cell::UnsafeCell;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+use tracing::{instrument, Level};
 
 /// RocksDB-based storage for production use.
 ///
@@ -131,6 +132,10 @@ impl RocksDbStorage {
 }
 
 impl SubstateDatabase for RocksDbStorage {
+    #[instrument(level = Level::DEBUG, skip_all, fields(
+        found = tracing::field::Empty,
+        latency_us = tracing::field::Empty,
+    ))]
     fn get_raw_substate_by_db_key(
         &self,
         partition_key: &DbPartitionKey,
@@ -139,7 +144,14 @@ impl SubstateDatabase for RocksDbStorage {
         let start = Instant::now();
         let key = keys::to_storage_key(partition_key, sort_key);
         let result = self.db.get(&key).ok().flatten();
-        metrics::record_rocksdb_read(start.elapsed().as_secs_f64());
+        let elapsed = start.elapsed();
+        metrics::record_rocksdb_read(elapsed.as_secs_f64());
+
+        // Record span fields
+        let span = tracing::Span::current();
+        span.record("found", result.is_some());
+        span.record("latency_us", elapsed.as_micros() as u64);
+
         result
     }
 
@@ -181,9 +193,15 @@ impl RocksDbStorage {
     /// This is safe because RocksDB's `DB::write()` only requires `&self` internally.
     /// The `CommittableSubstateDatabase` trait requires `&mut self` but RocksDB doesn't
     /// actually need exclusive access - it handles synchronization internally.
+    #[instrument(level = Level::DEBUG, skip_all, fields(
+        node_count = updates.node_updates.len(),
+        latency_us = tracing::field::Empty,
+    ))]
     pub fn commit(&self, updates: &DatabaseUpdates) {
         let start = Instant::now();
         let mut batch = WriteBatch::default();
+        let mut put_count = 0u64;
+        let mut delete_count = 0u64;
 
         for (node_key, node_updates) in &updates.node_updates {
             for (partition_num, partition_updates) in &node_updates.partition_updates {
@@ -199,9 +217,11 @@ impl RocksDbStorage {
                             match update {
                                 DatabaseUpdate::Set(value) => {
                                     batch.put(&key, value);
+                                    put_count += 1;
                                 }
                                 DatabaseUpdate::Delete => {
                                     batch.delete(&key);
+                                    delete_count += 1;
                                 }
                             }
                         }
@@ -221,6 +241,7 @@ impl RocksDbStorage {
                                     break;
                                 }
                                 batch.delete(key);
+                                delete_count += 1;
                                 iter.next();
                             } else {
                                 break;
@@ -231,6 +252,7 @@ impl RocksDbStorage {
                         for (sort_key, value) in new_substate_values {
                             let key = keys::to_storage_key(&partition_key, sort_key);
                             batch.put(&key, value);
+                            put_count += 1;
                         }
                     }
                 }
@@ -241,7 +263,13 @@ impl RocksDbStorage {
         if let Err(e) = self.db.write(batch) {
             tracing::error!("Failed to commit updates: {}", e);
         }
-        metrics::record_rocksdb_write(start.elapsed().as_secs_f64());
+        let elapsed = start.elapsed();
+        metrics::record_rocksdb_write(elapsed.as_secs_f64());
+
+        // Record span fields
+        let span = tracing::Span::current();
+        span.record("latency_us", elapsed.as_micros() as u64);
+        tracing::debug!(put_count, delete_count, "commit complete");
     }
 
     /// Get a mutable reference for APIs that require `&mut self`.
@@ -1037,6 +1065,12 @@ impl RocksDbStorage {
     ///
     /// * `certificate` - The transaction certificate to store
     /// * `writes` - The state writes from the certificate's shard_proofs for the local shard
+    #[instrument(level = Level::DEBUG, skip_all, fields(
+        tx_hash = %certificate.transaction_hash,
+        write_count = writes.len(),
+        latency_us = tracing::field::Empty,
+        otel.kind = "INTERNAL",
+    ))]
     pub fn commit_certificate_with_writes(
         &self,
         certificate: &TransactionCertificate,
@@ -1099,11 +1133,14 @@ impl RocksDbStorage {
             "BFT SAFETY CRITICAL: certificate commit failed - node state would diverge from network",
         );
 
-        let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_rocksdb_write(elapsed);
-        metrics::record_storage_operation("commit_cert_writes", elapsed);
+        let elapsed = start.elapsed();
+        metrics::record_rocksdb_write(elapsed.as_secs_f64());
+        metrics::record_storage_operation("commit_cert_writes", elapsed.as_secs_f64());
         metrics::record_storage_batch_size(write_count);
         metrics::record_certificate_persisted();
+
+        // Record span fields
+        tracing::Span::current().record("latency_us", elapsed.as_micros() as u64);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1126,6 +1163,10 @@ impl RocksDbStorage {
     ///
     /// Key: height (u64 big-endian)
     /// Value: (block_hash, round) SBOR-encoded
+    #[instrument(level = Level::DEBUG, skip(self), fields(
+        latency_us = tracing::field::Empty,
+        otel.kind = "INTERNAL",
+    ))]
     pub fn put_own_vote(&self, height: u64, round: u64, block_hash: Hash) {
         let start = Instant::now();
         let cf = self
@@ -1145,10 +1186,13 @@ impl RocksDbStorage {
             .put_cf_opt(cf, key, value, &write_opts)
             .expect("BFT SAFETY CRITICAL: vote persistence failed - cannot continue safely");
 
-        let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_rocksdb_write(elapsed);
-        metrics::record_storage_operation("put_vote", elapsed);
+        let elapsed = start.elapsed();
+        metrics::record_rocksdb_write(elapsed.as_secs_f64());
+        metrics::record_storage_operation("put_vote", elapsed.as_secs_f64());
         metrics::record_vote_persisted();
+
+        // Record span fields
+        tracing::Span::current().record("latency_us", elapsed.as_micros() as u64);
     }
 
     /// Get our own vote for a height (if any).
