@@ -46,6 +46,21 @@ pub enum RunnerError {
     NetworkError(#[from] NetworkError),
 }
 
+/// Maximum batch sizes for time-windowed operations.
+/// These limits cap p99 latency by preventing unbounded batch growth under load.
+/// Values are tuned to balance throughput (larger batches = better amortization)
+/// against latency (smaller batches = faster completion).
+mod batch_limits {
+    /// Block votes: consensus-critical, lighter preprocessing. 128 matches ValidationBatcher.
+    pub const MAX_BLOCK_VOTES: usize = 128;
+    /// State votes: same crypto pattern as block votes, 20ms window needs tighter cap.
+    pub const MAX_STATE_VOTES: usize = 64;
+    /// State certs: parallel key aggregation benefits from ~core-count batches.
+    pub const MAX_STATE_CERTS: usize = 64;
+    /// Cross-shard execution: heavy per-item work, memory pressure from provisions.
+    pub const MAX_CROSS_SHARD_EXECUTIONS: usize = 32;
+}
+
 /// Pending block vote verifications that can be batched.
 ///
 /// Collects verification actions and processes them together using
@@ -66,6 +81,10 @@ impl PendingBlockVotes {
 
     fn len(&self) -> usize {
         self.votes.len()
+    }
+
+    fn is_full(&self) -> bool {
+        self.votes.len() >= batch_limits::MAX_BLOCK_VOTES
     }
 }
 
@@ -88,6 +107,10 @@ impl PendingStateVotes {
     fn take(&mut self) -> Vec<(StateVoteBlock, PublicKey)> {
         std::mem::take(&mut self.votes)
     }
+
+    fn is_full(&self) -> bool {
+        self.votes.len() >= batch_limits::MAX_STATE_VOTES
+    }
 }
 
 /// Pending cross-shard executions that can be batched.
@@ -107,6 +130,10 @@ impl PendingCrossShardExecutions {
 
     fn take(&mut self) -> Vec<hyperscale_core::CrossShardExecutionRequest> {
         std::mem::take(&mut self.requests)
+    }
+
+    fn is_full(&self) -> bool {
+        self.requests.len() >= batch_limits::MAX_CROSS_SHARD_EXECUTIONS
     }
 }
 
@@ -129,6 +156,10 @@ impl PendingStateCerts {
 
     fn take(&mut self) -> Vec<(hyperscale_types::StateCertificate, Vec<PublicKey>)> {
         std::mem::take(&mut self.certs)
+    }
+
+    fn is_full(&self) -> bool {
+        self.certs.len() >= batch_limits::MAX_STATE_CERTS
     }
 }
 
@@ -1141,6 +1172,12 @@ impl ProductionRunner {
                                         provisions,
                                     }
                                 );
+                                // Flush early if batch is full to cap p99 latency
+                                if self.pending_cross_shard_executions.is_full() {
+                                    let requests = self.pending_cross_shard_executions.take();
+                                    self.cross_shard_execution_deadline = None;
+                                    self.dispatch_cross_shard_executions(requests);
+                                }
                             }
                             other => {
                                 if let Err(e) = self.process_action(other).await {
@@ -1302,6 +1339,12 @@ impl ProductionRunner {
                                             );
                                         }
                                         self.pending_state_votes.votes.push((vote, public_key));
+                                        // Flush early if batch is full to cap p99 latency
+                                        if self.pending_state_votes.is_full() {
+                                            let votes = self.pending_state_votes.take();
+                                            self.state_vote_deadline = None;
+                                            self.dispatch_state_vote_verifications(votes);
+                                        }
                                     }
                                     Action::VerifyStateCertificateSignature { certificate, public_keys } => {
                                         // Add to accumulated state certs with 15ms batching window
@@ -1311,6 +1354,12 @@ impl ProductionRunner {
                                             );
                                         }
                                         self.pending_state_certs.certs.push((certificate, public_keys));
+                                        // Flush early if batch is full to cap p99 latency
+                                        if self.pending_state_certs.is_full() {
+                                            let certs = self.pending_state_certs.take();
+                                            self.state_cert_deadline = None;
+                                            self.dispatch_state_cert_verifications(certs);
+                                        }
                                     }
                                     // Note: ExecuteCrossShardTransaction only comes from ProvisioningComplete
                                     // which routes through the callback channel, not the consensus channel.
@@ -1343,6 +1392,11 @@ impl ProductionRunner {
                                                 );
                                             }
                                             self.pending_state_votes.votes.push((vote, public_key));
+                                            if self.pending_state_votes.is_full() {
+                                                let votes = self.pending_state_votes.take();
+                                                self.state_vote_deadline = None;
+                                                self.dispatch_state_vote_verifications(votes);
+                                            }
                                         }
                                         Action::VerifyStateCertificateSignature { certificate, public_keys } => {
                                             if self.pending_state_certs.is_empty() {
@@ -1351,6 +1405,11 @@ impl ProductionRunner {
                                                 );
                                             }
                                             self.pending_state_certs.certs.push((certificate, public_keys));
+                                            if self.pending_state_certs.is_full() {
+                                                let certs = self.pending_state_certs.take();
+                                                self.state_cert_deadline = None;
+                                                self.dispatch_state_cert_verifications(certs);
+                                            }
                                         }
                                         other => {
                                             if let Err(e) = self.process_action(other).await {
@@ -1392,6 +1451,11 @@ impl ProductionRunner {
                                                             );
                                                         }
                                                         self.pending_state_votes.votes.push((vote, public_key));
+                                                        if self.pending_state_votes.is_full() {
+                                                            let votes = self.pending_state_votes.take();
+                                                            self.state_vote_deadline = None;
+                                                            self.dispatch_state_vote_verifications(votes);
+                                                        }
                                                     }
                                                     Action::VerifyStateCertificateSignature { certificate, public_keys } => {
                                                         if self.pending_state_certs.is_empty() {
@@ -1400,6 +1464,11 @@ impl ProductionRunner {
                                                             );
                                                         }
                                                         self.pending_state_certs.certs.push((certificate, public_keys));
+                                                        if self.pending_state_certs.is_full() {
+                                                            let certs = self.pending_state_certs.take();
+                                                            self.state_cert_deadline = None;
+                                                            self.dispatch_state_cert_verifications(certs);
+                                                        }
                                                     }
                                                     other => {
                                                         if let Err(e) = self.process_action(other).await {
@@ -1407,6 +1476,11 @@ impl ProductionRunner {
                                                         }
                                                     }
                                                 }
+                                            }
+
+                                            // Break early if block votes batch is full
+                                            if pending_block_votes.is_full() {
+                                                break;
                                             }
                                         }
                                         Ok(None) => {
@@ -2017,6 +2091,12 @@ impl ProductionRunner {
                 self.pending_state_certs
                     .certs
                     .push((certificate, public_keys));
+                // Flush early if batch is full to cap p99 latency
+                if self.pending_state_certs.is_full() {
+                    let certs = self.pending_state_certs.take();
+                    self.state_cert_deadline = None;
+                    self.dispatch_state_cert_verifications(certs);
+                }
             }
 
             Action::VerifyQcSignature {
