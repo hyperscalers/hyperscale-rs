@@ -944,7 +944,8 @@ impl ExecutionState {
     /// Creates and broadcasts a vote based on the execution result.
     #[instrument(skip(self, result), fields(
         tx_hash = ?result.transaction_hash,
-        success = result.success
+        success = result.success,
+        sign_us = tracing::field::Empty,
     ))]
     pub fn on_cross_shard_execution_complete(&mut self, result: ExecutionResult) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -958,8 +959,10 @@ impl ExecutionState {
             "Cross-shard execution complete, creating vote"
         );
 
-        // Create vote from execution result
+        // Create vote from execution result (includes BLS signing)
+        let sign_start = std::time::Instant::now();
         let vote = self.create_vote(tx_hash, result.state_root, result.success);
+        tracing::Span::current().record("sign_us", sign_start.elapsed().as_micros() as u64);
 
         // Broadcast vote to local shard (runner handles batching)
         actions.push(Action::BroadcastStateVote {
@@ -1885,7 +1888,11 @@ impl ExecutionState {
     ///
     /// This is called when the runner completes a `FetchStateEntries` action
     /// and returns the state entries for cross-shard provisioning.
-    #[instrument(skip(self, entries), fields(tx_hash = ?tx_hash, entry_count = entries.len()))]
+    #[instrument(skip(self, entries), fields(
+        tx_hash = ?tx_hash,
+        entry_count = entries.len(),
+        sign_us = tracing::field::Empty,
+    ))]
     pub fn on_state_entries_fetched(
         &mut self,
         tx_hash: Hash,
@@ -1913,8 +1920,21 @@ impl ExecutionState {
         // This avoids cloning the potentially large Vec<StateEntry> for each broadcast.
         let entries = Arc::new(entries);
 
+        // Track total signing time for all provisions
+        let mut total_sign_us = 0u64;
+
         // Create and broadcast provisions to each target shard
         for target_shard in pending.target_shards {
+            let sign_start = std::time::Instant::now();
+            let signature = self.sign_provision(
+                &tx_hash,
+                target_shard,
+                local_shard,
+                pending.block_height,
+                &entries,
+            );
+            total_sign_us += sign_start.elapsed().as_micros() as u64;
+
             let provision = StateProvision {
                 transaction_hash: tx_hash,
                 target_shard,
@@ -1922,13 +1942,7 @@ impl ExecutionState {
                 block_height: pending.block_height,
                 entries: Arc::clone(&entries),
                 validator_id: self.validator_id(),
-                signature: self.sign_provision(
-                    &tx_hash,
-                    target_shard,
-                    local_shard,
-                    pending.block_height,
-                    &entries,
-                ),
+                signature,
             };
 
             actions.push(Action::BroadcastStateProvision {
@@ -1944,6 +1958,7 @@ impl ExecutionState {
             );
         }
 
+        tracing::Span::current().record("sign_us", total_sign_us);
         actions
     }
 

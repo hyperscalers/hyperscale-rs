@@ -1681,6 +1681,11 @@ impl BftState {
     }
 
     /// Create a vote for a block.
+    #[tracing::instrument(level = "debug", skip(self), fields(
+        height = height,
+        round = round,
+        sign_us = tracing::field::Empty,
+    ))]
     fn create_vote(&mut self, block_hash: Hash, height: u64, round: u64) -> Vec<Action> {
         // Record that we voted for this block at this height
         // This is the core safety invariant: once we vote for a block at a height,
@@ -1690,7 +1695,9 @@ impl BftState {
         // Create signature with domain separation (prevents cross-shard replay)
         let signing_message =
             Self::block_vote_message(self.shard_group, height, round, &block_hash);
+        let sign_start = std::time::Instant::now();
         let signature = self.signing_key.sign(&signing_message);
+        tracing::Span::current().record("sign_us", sign_start.elapsed().as_micros() as u64);
         let timestamp = self.now.as_millis() as u64;
 
         let vote = BlockVote {
