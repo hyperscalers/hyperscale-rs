@@ -160,6 +160,51 @@ impl VoteSet {
         self.parent_block_hash.is_some()
     }
 
+    /// Extract data needed to build a QC asynchronously.
+    ///
+    /// This marks the vote set as "QC building in progress" and returns all data
+    /// needed by the runner to perform BLS signature aggregation off the main thread.
+    ///
+    /// Returns None if:
+    /// - No votes collected
+    /// - QC already built or being built
+    /// - Missing height or parent_block_hash
+    pub fn prepare_qc_build(
+        &mut self,
+    ) -> Option<(
+        BlockHeight,
+        u64,
+        Hash,
+        Vec<(usize, BlockVote)>,
+        SignerBitfield,
+        u64,
+        u128,
+    )> {
+        if self.votes.is_empty() || self.qc_built {
+            return None;
+        }
+
+        let height = self.height?;
+        let round = self.round.unwrap_or(0);
+        let parent_block_hash = self.parent_block_hash?;
+
+        // Sort votes by committee index for deterministic aggregation
+        self.votes.sort_by_key(|(idx, _)| *idx);
+
+        // Mark as built to prevent duplicate building
+        self.qc_built = true;
+
+        Some((
+            height,
+            round,
+            parent_block_hash,
+            self.votes.clone(),
+            self.signers.clone(),
+            self.voting_power,
+            self.timestamp_weight_sum,
+        ))
+    }
+
     /// Build a Quorum Certificate from collected votes.
     ///
     /// Two-chain rule (HotStuff-2): when creating a QC for block N,

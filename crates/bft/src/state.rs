@@ -1088,18 +1088,30 @@ impl BftState {
                     block_hash = ?block_hash,
                     height = height,
                     voting_power = vote_set.voting_power(),
-                    "Header arrived, quorum already reached - forming QC"
+                    "Header arrived, quorum already reached - building QC"
                 );
 
-                match vote_set.build_qc(block_hash) {
-                    Ok(qc) => {
-                        actions.push(Action::EnqueueInternal {
-                            event: Event::QuorumCertificateFormed { block_hash, qc },
-                        });
-                    }
-                    Err(e) => {
-                        warn!("Failed to build QC after header arrival: {}", e);
-                    }
+                // Extract data for async QC building (BLS aggregation is expensive)
+                if let Some((
+                    height,
+                    round,
+                    parent_block_hash,
+                    votes,
+                    signers,
+                    voting_power,
+                    timestamp_weight_sum,
+                )) = vote_set.prepare_qc_build()
+                {
+                    actions.push(Action::BuildQuorumCertificate {
+                        block_hash,
+                        height,
+                        round,
+                        parent_block_hash,
+                        votes,
+                        signers,
+                        voting_power: VotePower(voting_power),
+                        timestamp_weight_sum,
+                    });
                 }
             }
         }
@@ -1993,23 +2005,62 @@ impl BftState {
                 block_hash = ?block_hash,
                 height = height,
                 voting_power = vote_set.voting_power(),
-                "Quorum reached, forming QC"
+                "Quorum reached, building QC"
             );
 
-            // Build QC
-            match vote_set.build_qc(block_hash) {
-                Ok(qc) => {
-                    return vec![Action::EnqueueInternal {
-                        event: Event::QuorumCertificateFormed { block_hash, qc },
-                    }];
-                }
-                Err(e) => {
-                    warn!("Failed to build QC: {}", e);
-                }
+            // Extract data for async QC building (BLS aggregation is expensive)
+            if let Some((
+                height,
+                round,
+                parent_block_hash,
+                votes,
+                signers,
+                voting_power,
+                timestamp_weight_sum,
+            )) = vote_set.prepare_qc_build()
+            {
+                return vec![Action::BuildQuorumCertificate {
+                    block_hash,
+                    height,
+                    round,
+                    parent_block_hash,
+                    votes,
+                    signers,
+                    voting_power: VotePower(voting_power),
+                    timestamp_weight_sum,
+                }];
             }
         }
 
         vec![]
+    }
+
+    /// Handle QC building completion.
+    ///
+    /// Called when the runner completes `Action::BuildQuorumCertificate`.
+    /// The QC is formed by aggregating BLS signatures from collected votes.
+    #[instrument(skip(self, qc), fields(block_hash = ?block_hash, success = qc.is_some()))]
+    pub fn on_qc_built(&mut self, block_hash: Hash, qc: Option<QuorumCertificate>) -> Vec<Action> {
+        match qc {
+            Some(qc) => {
+                info!(
+                    block_hash = ?block_hash,
+                    height = qc.height.0,
+                    voting_power = qc.voting_power.0,
+                    "QC built successfully"
+                );
+                vec![Action::EnqueueInternal {
+                    event: Event::QuorumCertificateFormed { block_hash, qc },
+                }]
+            }
+            None => {
+                warn!(
+                    block_hash = ?block_hash,
+                    "Failed to build QC - signature aggregation failed"
+                );
+                vec![]
+            }
+        }
     }
 
     /// Handle QC signature verification result.
@@ -4172,6 +4223,9 @@ impl SubStateMachine for BftState {
             }
             Event::QcSignatureVerified { block_hash, valid } => {
                 Some(self.on_qc_signature_verified(*block_hash, *valid))
+            }
+            Event::QuorumCertificateBuilt { block_hash, qc } => {
+                Some(self.on_qc_built(*block_hash, qc.clone()))
             }
             Event::ChainMetadataFetched { height, hash, qc } => {
                 Some(self.on_chain_metadata_fetched(*height, *hash, qc.clone()))

@@ -233,6 +233,17 @@ pub enum Event {
         valid: bool,
     },
 
+    /// Quorum Certificate building completed.
+    ///
+    /// Callback from `Action::BuildQuorumCertificate`.
+    /// The QC is built by aggregating BLS signatures from collected votes.
+    QuorumCertificateBuilt {
+        /// Block hash the QC is for.
+        block_hash: Hash,
+        /// The built QC, or None if aggregation failed.
+        qc: Option<QuorumCertificate>,
+    },
+
     /// Single-shard transaction execution completed.
     TransactionsExecuted {
         block_hash: Hash,
@@ -637,6 +648,7 @@ impl Event {
             | Event::StateVoteSignatureVerified { .. }
             | Event::StateCertificateSignatureVerified { .. }
             | Event::QcSignatureVerified { .. }
+            | Event::QuorumCertificateBuilt { .. }
             | Event::TransactionsExecuted { .. }
             | Event::SpeculativeExecutionComplete { .. }
             | Event::CrossShardTransactionsExecuted { .. }
@@ -756,6 +768,7 @@ impl Event {
             Event::StateVoteSignatureVerified { .. } => "StateVoteSignatureVerified",
             Event::StateCertificateSignatureVerified { .. } => "StateCertificateSignatureVerified",
             Event::QcSignatureVerified { .. } => "QcSignatureVerified",
+            Event::QuorumCertificateBuilt { .. } => "QuorumCertificateBuilt",
 
             // Async Callbacks - Execution
             Event::TransactionsExecuted { .. } => "TransactionsExecuted",

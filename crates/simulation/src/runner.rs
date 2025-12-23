@@ -1012,6 +1012,55 @@ impl SimulationRunner {
                 );
             }
 
+            // QC building (BLS signature aggregation) - runs synchronously in simulation
+            Action::BuildQuorumCertificate {
+                block_hash,
+                height,
+                round,
+                parent_block_hash,
+                votes,
+                signers,
+                voting_power,
+                timestamp_weight_sum,
+            } => {
+                // Extract signatures in sorted order (votes are pre-sorted by committee index)
+                let signatures: Vec<Signature> =
+                    votes.iter().map(|(_, v)| v.signature.clone()).collect();
+
+                // Aggregate BLS signatures
+                let qc = match Signature::aggregate_bls(&signatures) {
+                    Ok(aggregated_signature) => {
+                        // Compute stake-weighted timestamp
+                        let weighted_timestamp_ms = if voting_power.0 == 0 {
+                            0
+                        } else {
+                            (timestamp_weight_sum / voting_power.0 as u128) as u64
+                        };
+
+                        Some(QuorumCertificate {
+                            block_hash,
+                            height,
+                            parent_block_hash,
+                            round,
+                            aggregated_signature,
+                            signers,
+                            voting_power,
+                            weighted_timestamp_ms,
+                        })
+                    }
+                    Err(e) => {
+                        warn!(node = from, ?block_hash, error = %e, "Failed to aggregate BLS signatures for QC");
+                        None
+                    }
+                };
+
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::QuorumCertificateBuilt { block_hash, qc },
+                );
+            }
+
             // Note: View change verification actions removed - using HotStuff-2 implicit rounds
             Action::ExecuteTransactions {
                 block_hash,

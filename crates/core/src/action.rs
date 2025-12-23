@@ -200,6 +200,31 @@ pub enum Action {
         signing_message: Vec<u8>,
     },
 
+    /// Build a Quorum Certificate by aggregating BLS signatures from collected votes.
+    ///
+    /// Performs BLS signature aggregation which is compute-intensive (~100ms for large committees).
+    /// Delegated to a thread pool in production, instant in simulation.
+    /// Returns `Event::QuorumCertificateBuilt` when complete.
+    BuildQuorumCertificate {
+        /// Block hash the QC is for.
+        block_hash: Hash,
+        /// Block height.
+        height: BlockHeight,
+        /// Round number.
+        round: u64,
+        /// Parent block hash (from the block's header).
+        parent_block_hash: Hash,
+        /// Votes to aggregate, sorted by committee index.
+        /// Each tuple is (committee_index, vote).
+        votes: Vec<(usize, BlockVote)>,
+        /// Bitfield tracking which validators have voted.
+        signers: SignerBitfield,
+        /// Total voting power accumulated.
+        voting_power: VotePower,
+        /// Weighted timestamp sum for calculating stake-weighted timestamp.
+        timestamp_weight_sum: u128,
+    },
+
     /// Execute a batch of single-shard transactions.
     ///
     /// Delegated to the engine thread pool in production, instant in simulation.
@@ -531,6 +556,7 @@ impl Action {
                 | Action::VerifyStateVoteSignature { .. }
                 | Action::VerifyStateCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
+                | Action::BuildQuorumCertificate { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
@@ -592,6 +618,7 @@ impl Action {
             Action::VerifyStateVoteSignature { .. } => "VerifyStateVoteSignature",
             Action::VerifyStateCertificateSignature { .. } => "VerifyStateCertificateSignature",
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
+            Action::BuildQuorumCertificate { .. } => "BuildQuorumCertificate",
 
             // Delegated Work - Execution
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",

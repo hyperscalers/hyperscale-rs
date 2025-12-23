@@ -571,7 +571,8 @@ impl StateMachine for NodeStateMachine {
             Event::BlockVoteReceived { .. }
             | Event::BlockReadyToCommit { .. }
             | Event::VoteSignatureVerified { .. }
-            | Event::QcSignatureVerified { .. } => {
+            | Event::QcSignatureVerified { .. }
+            | Event::QuorumCertificateBuilt { .. } => {
                 if let Some(actions) = self.bft.try_handle(&event) {
                     return actions;
                 }
