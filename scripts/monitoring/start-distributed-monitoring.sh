@@ -96,7 +96,15 @@ DC=$(command -v docker-compose >/dev/null 2>&1 && echo "docker-compose" || echo 
 
 # Start containers
 echo "Starting Prometheus and Grafana..."
-$DC up -d --force-recreate
+
+# MacOS and Linux need different settings
+COMPOSE_FLAGS=""
+if [[ "$(uname -s)" == "Linux" ]]; then
+    echo "Detected Linux: Adding extra_hosts configuration..."
+    COMPOSE_FLAGS="-f docker-compose.yml -f docker-compose.linux.yml"
+fi
+
+$DC $COMPOSE_FLAGS up -d --force-recreate
 
 echo ""
 echo "=== Monitoring Stack Started ==="

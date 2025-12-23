@@ -117,7 +117,15 @@ fi
 
 # Start containers
 echo "Starting Prometheus and Grafana..."
-docker-compose up -d
+
+# MacOS and Linux need different settings
+COMPOSE_FLAGS=""
+if [[ "$(uname -s)" == "Linux" ]]; then
+    echo "Detected Linux: Adding extra_hosts configuration..."
+    COMPOSE_FLAGS="-f docker-compose.yml -f docker-compose.linux.yml"
+fi
+
+docker-compose $COMPOSE_FLAGS up -d
 
 echo ""
 echo "=== Monitoring Stack Started ==="
