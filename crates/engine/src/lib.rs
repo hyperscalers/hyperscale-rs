@@ -54,10 +54,10 @@ mod result;
 mod storage;
 mod validation;
 
-pub use execution::substate_writes_to_database_updates;
+pub use execution::{substate_writes_to_database_updates, ProvisionedSnapshot};
 pub use executor::RadixExecutor;
 pub use genesis::GenesisConfig;
-pub use storage::{keys, SubstateStore};
+pub use storage::{keys, SubstateStore, RADIX_PREFIX};
 pub use validation::TransactionValidation;
 
 // Re-export commonly needed Radix types for storage implementations

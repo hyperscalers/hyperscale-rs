@@ -1721,7 +1721,8 @@ impl ExecutionState {
     /// Handle state entries fetched from storage.
     ///
     /// This is called when the runner completes a `FetchStateEntries` action
-    /// and returns the state entries for cross-shard provisioning.
+    /// and returns the state entries (with pre-computed storage keys) for
+    /// cross-shard provisioning.
     #[instrument(skip(self, entries), fields(
         tx_hash = ?tx_hash,
         entry_count = entries.len(),

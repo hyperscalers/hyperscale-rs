@@ -31,8 +31,7 @@
 
 use crate::error::ExecutionError;
 use crate::execution::{
-    compute_merkle_root, extract_substate_writes, is_commit_success, PreparedProvisions,
-    ProvisionedExecutionContext,
+    compute_merkle_root, extract_substate_writes, is_commit_success, ProvisionedSnapshot,
 };
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
@@ -44,7 +43,6 @@ use radix_common::network::NetworkDefinition;
 use radix_engine::transaction::{execute_transaction, ExecutionConfig, TransactionReceipt};
 use radix_engine::vm::DefaultVmModules;
 use radix_transactions::validation::TransactionValidator;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{instrument, Level};
@@ -170,13 +168,17 @@ impl RadixExecutor {
     /// Execute cross-shard transactions with provisions (READ-ONLY).
     ///
     /// Layers provisions on top of local storage and executes transactions.
+    /// Provisions contain pre-computed storage keys from other shards.
     ///
     /// **IMPORTANT**: This method does NOT commit state changes. The writes
     /// are returned in the `ExecutionOutput` and should be committed later
     /// when the `TransactionCertificate` is included in a committed block.
     ///
-    /// Note: The `is_local_node` parameter is kept for future use when we
-    /// need to filter writes in the result, but commits are now deferred.
+    /// # Performance
+    ///
+    /// Uses `ProvisionedSnapshot` with pre-computed storage keys for O(log n)
+    /// lookups. The sending shard computes storage keys once via
+    /// `fetch_db_state_entries()`, avoiding expensive hash computations here.
     #[instrument(level = Level::DEBUG, skip_all, fields(
         tx_count = transactions.len(),
         provision_count = provisions.len(),
@@ -190,50 +192,34 @@ impl RadixExecutor {
         _is_local_node: impl Fn(&NodeId) -> bool,
     ) -> Result<ExecutionOutput, ExecutionError> {
         let start = Instant::now();
-        // Pre-index provisions by transaction hash for O(1) lookup per transaction
-        // instead of O(N*M) where N=transactions, M=provisions
-        let mut provisions_by_tx: HashMap<Hash, Vec<&StateProvision>> =
-            HashMap::with_capacity(transactions.len());
-        for provision in provisions {
-            provisions_by_tx
-                .entry(provision.transaction_hash)
-                .or_default()
-                .push(provision);
-        }
 
         let mut results = Vec::with_capacity(transactions.len());
 
         // Take a snapshot for isolated execution
         let snapshot = storage.snapshot();
 
+        // Collect all DbStateEntries from provisions
+        // Provisions now contain pre-computed storage keys (StateEntry)
+        let all_entries: Vec<&StateEntry> =
+            provisions.iter().flat_map(|p| p.entries.iter()).collect();
+
+        // Create provisioned snapshot with pre-computed storage keys
+        // This is O(n log n) to build the BTreeMap, then O(log n) per lookup
+        let entries_slice: Vec<StateEntry> = all_entries.iter().map(|e| (*e).clone()).collect();
+        let provisioned = ProvisionedSnapshot::new(&snapshot, &entries_slice);
+
         for tx in transactions {
-            // Get provisions for this transaction
-            let tx_provisions = provisions_by_tx.get(&tx.hash());
-
-            // Pre-process provisions into DatabaseUpdates (computes DB keys once)
-            let prepared = if let Some(provs) = tx_provisions {
-                PreparedProvisions::from_provisions(provs)
-            } else {
-                PreparedProvisions::default()
-            };
-
-            // Create execution context with pre-computed provisions
-            let context = ProvisionedExecutionContext::with_prepared_provisions(
-                &snapshot,
-                &self.network,
-                prepared,
-            );
-
             // Execute using cached VM modules and config
             let validated = tx
                 .get_or_validate(&self.caches.validator)
                 .ok_or_else(|| ExecutionError::Preparation("Validation failed".to_string()))?;
             let executable = validated.clone().create_executable();
-            let receipt = context.execute_with_cache(
+            let receipt = provisioned.execute(
                 &executable,
                 &self.caches.vm_modules,
                 &self.caches.exec_config,
-            )?;
+            );
+
             // Use cross-shard result which filters writes to declared_writes
             // so all shards compute the same merkle root
             let result =
@@ -344,24 +330,41 @@ impl RadixExecutor {
 
     /// Fetch state entries for the given nodes from storage.
     ///
-    /// Used by provisioning to collect state for other shards.
+    /// Returns `StateEntry` with pre-computed storage keys. This is efficient
+    /// for cross-shard provisioning because:
+    /// 1. Storage keys are computed once at the source shard
+    /// 2. Receiving shard can use them directly for database lookups
+    /// 3. No SpreadPrefixKeyMapper calls needed at execution time
     pub fn fetch_state_entries<S: SubstateStore>(
         &self,
         storage: &S,
         nodes: &[NodeId],
     ) -> Vec<StateEntry> {
+        use crate::storage::RADIX_PREFIX;
+        use radix_substate_store_interface::db_key_mapper::{
+            DatabaseKeyMapper, SpreadPrefixKeyMapper,
+        };
+
         let mut entries = Vec::new();
 
         for node in nodes {
+            // Compute the db_node_key once per node (expensive hash computation)
+            let radix_node_id = radix_common::types::NodeId(node.0);
+            let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
+
             let substates: Vec<_> = storage.list_substates_for_node(node).collect();
 
             for (partition_num, db_sort_key, value) in substates {
-                entries.push(StateEntry::new(
-                    *node,
-                    PartitionNumber(partition_num),
-                    db_sort_key.0,
-                    Some(value),
-                ));
+                // Build full storage key
+                let mut storage_key = Vec::with_capacity(
+                    RADIX_PREFIX.len() + db_node_key.len() + 1 + db_sort_key.0.len(),
+                );
+                storage_key.extend_from_slice(RADIX_PREFIX);
+                storage_key.extend_from_slice(&db_node_key);
+                storage_key.push(partition_num);
+                storage_key.extend_from_slice(&db_sort_key.0);
+
+                entries.push(StateEntry::new(storage_key, Some(value)));
             }
         }
 

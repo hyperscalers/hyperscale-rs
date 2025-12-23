@@ -581,7 +581,7 @@ impl ProvisionCoordinator {
             .map(|provisions| {
                 provisions
                     .iter()
-                    .flat_map(|p| p.entries.iter().map(|e| e.node_id))
+                    .flat_map(|p| p.entries.iter().filter_map(|e| e.node_id()))
                     .collect()
             })
             .unwrap_or_default()
@@ -825,10 +825,7 @@ impl SubStateMachine for ProvisionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{
-        KeyPair, PartitionNumber, Signature, StateEntry, StaticTopology, ValidatorInfo,
-        ValidatorSet,
-    };
+    use hyperscale_types::{KeyPair, Signature, StaticTopology, ValidatorInfo, ValidatorSet};
 
     fn make_test_topology(local_shard: ShardGroupId) -> Arc<dyn Topology> {
         // Create a simple topology with 3 validators per shard (2 shards)
@@ -872,7 +869,7 @@ mod tests {
     ) -> StateProvision {
         let entries: Vec<_> = node_ids
             .into_iter()
-            .map(|node_id| StateEntry::new(node_id, PartitionNumber(0), vec![], None))
+            .map(|node_id| StateEntry::test_entry(node_id, 0, vec![], None))
             .collect();
         StateProvision {
             transaction_hash: tx_hash,

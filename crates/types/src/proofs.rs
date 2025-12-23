@@ -56,8 +56,8 @@ pub struct CommitmentProof {
     /// Block height at which the tx was committed on the source shard.
     pub block_height: BlockHeight,
 
-    /// The state entries (deduplicated, single copy).
-    /// Needed for cycle detection (node overlap checking).
+    /// The state entries with pre-computed storage keys.
+    /// Needed for cycle detection (node overlap checking via StateEntry::node_id()).
     /// Wrapped in Arc for efficient sharing.
     pub entries: Arc<Vec<StateEntry>>,
 }
@@ -175,7 +175,7 @@ impl CommitmentProof {
     ///
     /// Used by livelock for cycle detection (node overlap checking).
     pub fn nodes(&self) -> HashSet<NodeId> {
-        self.entries.iter().map(|e| e.node_id).collect()
+        self.entries.iter().filter_map(|e| e.node_id()).collect()
     }
 
     /// Get the number of signers in this proof.
@@ -343,15 +343,20 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for CycleProof {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PartitionNumber;
 
+    /// Create a test StateEntry with a valid storage key format.
+    ///
+    /// Storage key format: RADIX_PREFIX (6) + hash_prefix (20) + node_id (30) + partition (1) + sort_key
     fn test_entry(seed: u8) -> StateEntry {
-        StateEntry {
-            node_id: NodeId([seed; 30]),
-            partition: PartitionNumber(0),
-            sort_key: vec![seed],
-            value: Some(vec![seed, seed + 1]),
-        }
+        // Build a valid storage key
+        let mut storage_key = Vec::with_capacity(6 + 20 + 30 + 1 + 1);
+        storage_key.extend_from_slice(b"radix:"); // RADIX_PREFIX (6 bytes)
+        storage_key.extend_from_slice(&[0u8; 20]); // hash prefix (20 bytes)
+        storage_key.extend_from_slice(&[seed; 30]); // node_id (30 bytes)
+        storage_key.push(0); // partition
+        storage_key.push(seed); // sort_key
+
+        StateEntry::new(storage_key, Some(vec![seed, seed + 1]))
     }
 
     #[test]

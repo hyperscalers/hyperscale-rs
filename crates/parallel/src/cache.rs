@@ -5,10 +5,11 @@
 //! shared. This dramatically improves simulation performance at scale.
 
 use dashmap::DashMap;
-use hyperscale_engine::{CommittableSubstateDatabase, RadixExecutor};
+use hyperscale_engine::{CommittableSubstateDatabase, RadixExecutor, RADIX_PREFIX};
 use hyperscale_simulation::SimStorage;
-use hyperscale_types::{Hash, NodeId, PublicKey, RoutableTransaction, Signature};
+use hyperscale_types::{Hash, NodeId, PublicKey, RoutableTransaction, Signature, StateEntry};
 use radix_common::network::NetworkDefinition;
+use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 use std::sync::{Arc, Mutex};
 use tracing::warn;
 
@@ -129,12 +130,9 @@ impl SimulationCache {
     /// Fetch state entries from a shard's reference storage.
     ///
     /// This is used for cross-shard provisioning - fetching state that needs
-    /// to be sent to other shards.
-    pub fn fetch_state_entries(
-        &self,
-        shard_id: u64,
-        nodes: &[NodeId],
-    ) -> Vec<hyperscale_types::StateEntry> {
+    /// to be sent to other shards. Returns `StateEntry` with pre-computed
+    /// storage keys for efficient cross-shard execution.
+    pub fn fetch_state_entries(&self, shard_id: u64, nodes: &[NodeId]) -> Vec<StateEntry> {
         use hyperscale_engine::SubstateStore;
 
         let storage_ref = match self.shard_storage.get(&shard_id) {
@@ -153,22 +151,28 @@ impl SimulationCache {
             }
         };
 
-        nodes
-            .iter()
-            .flat_map(|node_id| {
-                storage
-                    .list_substates_for_node(node_id)
-                    .map(
-                        |(partition, sort_key, value)| hyperscale_types::StateEntry {
-                            node_id: *node_id,
-                            partition: hyperscale_types::PartitionNumber(partition),
-                            sort_key: sort_key.0,
-                            value: Some(value),
-                        },
-                    )
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+        let mut entries = Vec::new();
+
+        for node_id in nodes {
+            // Compute the db_node_key once per node (expensive hash computation)
+            let radix_node_id = radix_common::types::NodeId(node_id.0);
+            let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
+
+            for (partition_num, db_sort_key, value) in storage.list_substates_for_node(node_id) {
+                // Build full storage key
+                let mut storage_key = Vec::with_capacity(
+                    RADIX_PREFIX.len() + db_node_key.len() + 1 + db_sort_key.0.len(),
+                );
+                storage_key.extend_from_slice(RADIX_PREFIX);
+                storage_key.extend_from_slice(&db_node_key);
+                storage_key.push(partition_num);
+                storage_key.extend_from_slice(&db_sort_key.0);
+
+                entries.push(StateEntry::new(storage_key, Some(value)));
+            }
+        }
+
+        entries
     }
 
     /// Compute a cache key from verification inputs.

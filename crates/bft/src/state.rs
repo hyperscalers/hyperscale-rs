@@ -6856,7 +6856,7 @@ mod tests {
         Arc<hyperscale_types::RoutableTransaction>,
         Option<CommitmentProof>,
     ) {
-        use hyperscale_types::{test_utils, PartitionNumber, ShardGroupId};
+        use hyperscale_types::{test_utils, ShardGroupId, StateEntry};
 
         let tx = test_utils::test_transaction(seed);
         let tx_arc = Arc::new(tx);
@@ -6869,12 +6869,7 @@ mod tests {
                 SignerBitfield::new(4),
                 Signature::zero(),
                 BlockHeight(1),
-                vec![hyperscale_types::StateEntry::new(
-                    node,
-                    PartitionNumber(0),
-                    vec![],
-                    None,
-                )],
+                vec![StateEntry::test_entry(node, 0, vec![], None)],
             ))
         } else {
             None

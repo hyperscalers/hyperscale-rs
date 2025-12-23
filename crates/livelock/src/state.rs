@@ -503,8 +503,8 @@ impl SubStateMachine for LivelockState {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        KeyPair, PartitionNumber, Signature, SignerBitfield, StateEntry, StaticTopology,
-        ValidatorId, ValidatorInfo, ValidatorSet,
+        KeyPair, Signature, SignerBitfield, StateEntry, StaticTopology, ValidatorId, ValidatorInfo,
+        ValidatorSet,
     };
 
     fn make_test_topology(local_shard: ShardGroupId) -> Arc<dyn Topology> {
@@ -552,7 +552,7 @@ mod tests {
         // Create a commitment proof with specific nodes
         let entries: Vec<_> = node_ids
             .into_iter()
-            .map(|node_id| StateEntry::new(node_id, PartitionNumber(0), vec![], None))
+            .map(|node_id| StateEntry::test_entry(node_id, 0, vec![], None))
             .collect();
         CommitmentProof::new(
             tx_hash,
