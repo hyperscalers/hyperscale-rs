@@ -32,7 +32,7 @@ hyperscale-messages.workspace = true
 rocksdb = "0.24"
 
 # Networking - libp2p with QUIC transport
-libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "request-response", "quic", "tcp", "noise", "yamux", "tokio", "macros"] }
+libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "request-response", "quic", "tcp", "noise", "yamux", "tokio", "macros", "identify"] }
 futures = "0.3"
 async-trait = "0.1"
 

@@ -123,6 +123,7 @@ data_dir = "$NODE_DATA_DIR"
 listen_addr = "/ip4/0.0.0.0/udp/$BASE_PORT/quic-v1"
 tcp_fallback_enabled = $TCP_FALLBACK_ENABLED
 tcp_fallback_port = $TCP_BASE_PORT
+version_interop_mode = "relaxed"
 bootstrap_peers = []
 upnp_enabled = true
 request_timeout_ms = 10000

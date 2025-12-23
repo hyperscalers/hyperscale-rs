@@ -59,6 +59,56 @@ pub struct Libp2pConfig {
     ///
     /// Default: None (uses QUIC port + 21500 offset)
     pub tcp_fallback_port: Option<u16>,
+
+    /// Version interoperability mode.
+    ///
+    /// Default: Strict
+    pub version_interop_mode: VersionInteroperabilityMode,
+}
+
+/// Mode for version interoperability checks.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum VersionInteroperabilityMode {
+    /// Versions must match exactly.
+    #[default]
+    Strict,
+    /// Major and minor versions must match (e.g. 1.3.0 compatible with 1.3.1).
+    Relaxed,
+    /// No version check.
+    Off,
+}
+
+impl VersionInteroperabilityMode {
+    /// Check if two versions are compatible according to this mode.
+    pub fn check(&self, local_version: &str, remote_version: &str) -> bool {
+        match self {
+            VersionInteroperabilityMode::Off => true,
+            VersionInteroperabilityMode::Strict => local_version == remote_version,
+            VersionInteroperabilityMode::Relaxed => {
+                // Check if major/minor versions match (e.g., 1.3.x)
+                let local_parts: Vec<&str> = local_version.split('.').collect();
+                let remote_parts: Vec<&str> = remote_version.split('.').collect();
+
+                if local_parts.len() >= 2 && remote_parts.len() >= 2 {
+                    local_parts[0] == remote_parts[0] && local_parts[1] == remote_parts[1]
+                } else {
+                    // If version format doesn't match expected X.Y.Z, fallback to exact match
+                    local_version == remote_version
+                }
+            }
+        }
+    }
 }
 
 impl Default for Libp2pConfig {
@@ -77,6 +127,7 @@ impl Default for Libp2pConfig {
             idle_connection_timeout: Duration::from_secs(60),
             tcp_fallback_enabled: true,
             tcp_fallback_port: None,
+            version_interop_mode: VersionInteroperabilityMode::Relaxed,
         }
     }
 }
@@ -138,7 +189,14 @@ impl Libp2pConfig {
             idle_connection_timeout: Duration::from_secs(30),
             tcp_fallback_enabled: true,
             tcp_fallback_port: None,
+            version_interop_mode: VersionInteroperabilityMode::Relaxed,
         }
+    }
+
+    /// Set the version interoperability mode.
+    pub fn with_version_interop_mode(mut self, mode: VersionInteroperabilityMode) -> Self {
+        self.version_interop_mode = mode;
+        self
     }
 }
 
@@ -176,5 +234,27 @@ mod tests {
             "/ip4/127.0.0.1/udp/9000/quic-v1"
         );
         assert_eq!(config.request_timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_version_compatibility() {
+        // Strict mode
+        assert!(VersionInteroperabilityMode::Strict.check("1.0.0", "1.0.0"));
+        assert!(!VersionInteroperabilityMode::Strict.check("1.0.0", "1.0.1"));
+        assert!(!VersionInteroperabilityMode::Strict.check("1.0.0", "1.1.0"));
+
+        // Relaxed mode
+        assert!(VersionInteroperabilityMode::Relaxed.check("1.3.0", "1.3.1"));
+        assert!(VersionInteroperabilityMode::Relaxed.check("1.3.0", "1.3.0.1"));
+        assert!(VersionInteroperabilityMode::Relaxed.check("1.3.5", "1.3.0"));
+        assert!(!VersionInteroperabilityMode::Relaxed.check("1.3.0", "1.4.0"));
+        assert!(!VersionInteroperabilityMode::Relaxed.check("1.3.0", "2.3.0"));
+        // Fallback for non-semver
+        assert!(VersionInteroperabilityMode::Relaxed.check("localdev", "localdev"));
+        assert!(!VersionInteroperabilityMode::Relaxed.check("localdev", "other"));
+
+        // Off mode
+        assert!(VersionInteroperabilityMode::Off.check("1.0.0", "2.0.0"));
+        assert!(VersionInteroperabilityMode::Off.check("anything", "everything"));
     }
 }

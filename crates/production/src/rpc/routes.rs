@@ -36,7 +36,9 @@ fn api_v1_routes() -> Router<RpcState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
+    use crate::rpc::{
+        MempoolSnapshot, NodeStatusResponse, NodeStatusState, TransactionStatusCache,
+    };
     use arc_swap::ArcSwap;
     use axum::{body::Body, http::Request};
     use std::sync::atomic::AtomicBool;
@@ -98,6 +100,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let status: NodeStatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.version, "localdev");
     }
 
     #[tokio::test]

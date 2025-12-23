@@ -8,8 +8,8 @@
 #![allow(dead_code)]
 
 use prometheus::{
-    register_counter, register_counter_vec, register_gauge, register_histogram,
-    register_histogram_vec, Counter, CounterVec, Gauge, Histogram, HistogramVec,
+    register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
+    register_histogram_vec, Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec,
 };
 use std::sync::OnceLock;
 
@@ -25,6 +25,8 @@ pub struct Metrics {
     pub round: Gauge,
     /// Total number of view changes (round advances due to timeout).
     pub view_changes: Gauge,
+    /// Build information with version label.
+    pub build_info: GaugeVec,
 
     // === Transactions ===
     pub transactions_finalized: HistogramVec,
@@ -165,7 +167,18 @@ impl Metrics {
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
         ];
 
+        let build_info = register_gauge_vec!(
+            "hyperscale_build_info",
+            "Node build information",
+            &["version"]
+        )
+        .unwrap();
+
+        let version = option_env!("HYPERSCALE_VERSION").unwrap_or("localdev");
+        build_info.with_label_values(&[version]).set(1.0);
+
         Self {
+            build_info,
             // Consensus
             blocks_committed: register_counter!(
                 "hyperscale_blocks_committed_total",

@@ -7,6 +7,7 @@ COPY --from=tonistiigi/xx:master / /
 
 WORKDIR /usr/src/app
 ARG TARGETPLATFORM
+ARG HYPERSCALE_VERSION=localdev
 
 # install dependencies
 RUN apt-get update && apt-get install -y \
@@ -30,7 +31,7 @@ ENV PKG_CONFIG_ALLOW_CROSS=1
 # build with xx-cargo to cross compile (github runners are linux/amd64, but we may want to build for arm64)
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/src/app/target \
-    xx-cargo build --release --target-dir ./target && \
+    HYPERSCALE_VERSION=${HYPERSCALE_VERSION} xx-cargo build --release --target-dir ./target && \
     mkdir -p /out && \
     cp target/$(xx-cargo --print-target-triple)/release/hyperscale-validator /out/ && \
     cp target/$(xx-cargo --print-target-triple)/release/hyperscale-keygen /out/ && \

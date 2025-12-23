@@ -47,7 +47,9 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use hyperscale_bft::BftConfig;
-use hyperscale_production::network::{derive_libp2p_keypair, Libp2pConfig};
+use hyperscale_production::network::{
+    derive_libp2p_keypair, Libp2pConfig, VersionInteroperabilityMode,
+};
 use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
 use hyperscale_production::{
     init_telemetry, ProductionRunner, RocksDbConfig, RocksDbStorage, TelemetryConfig,
@@ -103,6 +105,10 @@ struct Cli {
     /// Disable UPnP port forwarding (overrides config)
     #[arg(long)]
     no_upnp: bool,
+
+    /// Version interoperability mode (strict, relaxed, off)
+    #[arg(long)]
+    version_interop_mode: Option<VersionInteroperabilityMode>,
 }
 
 /// Top-level validator configuration.
@@ -202,8 +208,12 @@ pub struct NetworkConfig {
     pub gossipsub_heartbeat_ms: u64,
 
     /// Enable UPnP port forwarding
+    /// Enable UPnP port forwarding
     #[serde(default = "default_upnp_enabled")]
     pub upnp_enabled: bool,
+
+    /// Version interoperability mode
+    pub version_interop_mode: Option<VersionInteroperabilityMode>,
 }
 
 fn default_listen_addr() -> String {
@@ -546,6 +556,10 @@ impl ValidatorConfig {
         if cli.no_upnp {
             self.network.upnp_enabled = false;
         }
+
+        if let Some(mode) = cli.version_interop_mode {
+            self.network.version_interop_mode = Some(mode);
+        }
     }
 }
 
@@ -858,7 +872,13 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
         .with_request_timeout(Duration::from_millis(config.request_timeout_ms))
         .with_max_message_size(config.max_message_size)
         .with_gossipsub_heartbeat(Duration::from_millis(config.gossipsub_heartbeat_ms))
-        .with_tcp_fallback(config.tcp_fallback_enabled, tcp_fallback_port))
+        .with_gossipsub_heartbeat(Duration::from_millis(config.gossipsub_heartbeat_ms))
+        .with_tcp_fallback(config.tcp_fallback_enabled, tcp_fallback_port)
+        .with_version_interop_mode(
+            config
+                .version_interop_mode
+                .unwrap_or(VersionInteroperabilityMode::Strict),
+        ))
 }
 
 /// Build RocksDB configuration from TOML config.

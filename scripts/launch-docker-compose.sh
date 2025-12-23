@@ -154,6 +154,7 @@ listen_addr = "/ip4/0.0.0.0/udp/9000/quic-v1"
 external_addr = "/ip4/$IP/udp/9000/quic-v1"
 upnp_enabled = false
 bootstrap_peers = [$BOOTSTRAP_PEERS]
+version_interop_mode = "relaxed"
 tcp_fallback_port_range = "9000-9000"
 [consensus]
 proposal_interval_ms = 300

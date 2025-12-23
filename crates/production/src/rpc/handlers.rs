@@ -91,7 +91,9 @@ pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse 
         view: node_status.view,
         connected_peers: node_status.connected_peers,
         uptime_secs: uptime,
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: option_env!("HYPERSCALE_VERSION")
+            .unwrap_or("localdev")
+            .to_string(),
         mempool: MempoolStatusResponse {
             pending_count: mempool_snapshot.pending_count,
             committed_count: mempool_snapshot.committed_count,

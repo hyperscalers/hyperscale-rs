@@ -11,6 +11,7 @@ use super::config::Libp2pConfig;
 use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
 use super::topic::Topic;
 use crate::metrics;
+use crate::network::config::VersionInteroperabilityMode;
 use crate::validation_batcher::ValidationBatcherHandle;
 use dashmap::DashMap;
 use futures::future::Either;
@@ -21,7 +22,7 @@ use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::{OrTransport, Transport};
 use libp2p::core::upgrade::Version;
 use libp2p::{
-    gossipsub, identity, kad,
+    gossipsub, identify, identity, kad,
     request_response::{self, ProtocolSupport, ResponseChannel},
     swarm::{NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId as Libp2pPeerId, StreamProtocol, Swarm, SwarmBuilder,
@@ -319,6 +320,9 @@ struct Behaviour {
     /// Request-response for sync block fetching.
     request_response: request_response::Behaviour<HyperscaleCodec>,
 
+    /// Identify protocol for peer versioning.
+    identify: identify::Behaviour,
+
     /// Connection limits to prevent storms.
     limits: libp2p::connection_limits::Behaviour,
 }
@@ -473,11 +477,22 @@ impl Libp2pAdapter {
                 .with_max_established_per_peer(Some(2)),
         );
 
+        // Configure Identify protocol
+        let identify_config =
+            identify::Config::new("/hyperscale/1.0.0".to_string(), keypair.public())
+                .with_agent_version(
+                    option_env!("HYPERSCALE_VERSION")
+                        .unwrap_or("localdev")
+                        .to_string(),
+                );
+        let identify = identify::Behaviour::new(identify_config);
+
         // Create behaviour
         let behaviour = Behaviour {
             gossipsub,
             kademlia,
             request_response,
+            identify,
             limits,
         };
 
@@ -655,6 +670,7 @@ impl Libp2pAdapter {
                 cached_peer_count,
                 shard,
                 tx_validation_handle,
+                config.version_interop_mode,
             ))
             .catch_unwind()
             .await;
@@ -974,6 +990,7 @@ impl Libp2pAdapter {
         cached_peer_count: Arc<AtomicUsize>,
         local_shard: ShardGroupId,
         tx_validation_handle: ValidationBatcherHandle,
+        version_interop_mode: VersionInteroperabilityMode,
     ) {
         // Track pending sync requests (outbound)
         let mut pending_requests: HashMap<
@@ -1113,6 +1130,23 @@ impl Libp2pAdapter {
 
                 // Handle swarm events
                 event = swarm.select_next_some() => {
+                    // Check version compatibility for Identify events
+                    if let SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) = &event {
+                        let local_version = option_env!("HYPERSCALE_VERSION").unwrap_or("localdev");
+                        if !version_interop_mode.check(local_version, &info.agent_version) {
+                            warn!(
+                                peer = %peer_id,
+                                local_version = %local_version,
+                                remote_version = %info.agent_version,
+                                mode = ?version_interop_mode,
+                                "Peer version incompatible, disconnecting"
+                            );
+                            if swarm.disconnect_peer_id(*peer_id).is_err() {
+                                debug!(peer = %peer_id, "Failed to disconnect incompatible peer");
+                            }
+                        }
+                    }
+
                     // Check if this is a connection event that changes peer count
                     let is_connection_event = matches!(
                         &event,
@@ -1735,6 +1769,21 @@ impl Libp2pAdapter {
                 } else {
                     warn!(peer = %peer, len = request.len(), "Invalid request (too short)");
                 }
+            }
+
+            // Handle Identify events
+            SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
+                peer_id,
+                info,
+                ..
+            })) => {
+                info!(
+                    peer = %peer_id,
+                    agent_version = %info.agent_version,
+                    protocol_version = %info.protocol_version,
+                    protocols = ?info.protocols,
+                    "Identified peer"
+                );
             }
 
             // Connection events

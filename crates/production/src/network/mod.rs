@@ -57,6 +57,6 @@ pub use adapter::{
     compute_peer_id_for_validator, derive_libp2p_keypair, InboundCertificateRequest,
     InboundSyncRequest, InboundTransactionRequest, Libp2pAdapter, NetworkError,
 };
-pub use config::Libp2pConfig;
+pub use config::{Libp2pConfig, VersionInteroperabilityMode};
 pub use rate_limiter::{RateLimitConfig, SyncRateLimiter};
 pub use topic::{ProtocolVersion, Topic};

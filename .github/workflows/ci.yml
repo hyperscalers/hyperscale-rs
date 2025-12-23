@@ -58,6 +58,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Calculate Version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+          else
+            echo "VERSION=main-$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          fi
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3.0.0
 
@@ -83,6 +92,8 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
+          build-args: |
+            HYPERSCALE_VERSION=${{ env.VERSION }}
           labels: ${{ steps.meta.outputs.labels }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha
@@ -215,6 +226,8 @@ jobs:
 
       - name: Build Binaries
         shell: bash
+        env:
+          HYPERSCALE_VERSION: ${{ github.ref_name }}
         run: |
           cargo build --release --target ${{ matrix.target }} \
             --bin hyperscale-validator \

@@ -235,6 +235,7 @@ data_dir = "./distributed-cluster-data/host-$i/node-$v/data"
 listen_addr = "/ip4/0.0.0.0/udp/$P2P_PORT/quic-v1"
 tcp_fallback_enabled = false
 tcp_fallback_port = $TCP_PORT
+version_interop_mode = "relaxed"
 bootstrap_peers = [$BOOTSTRAP_PEERS]
 upnp_enabled = false
 request_timeout_ms = 30000
