@@ -3418,86 +3418,96 @@ impl ProductionRunner {
     /// Looks up the requested block from denormalized storage (reconstructing from
     /// block metadata + transactions + certificates) and sends the response.
     ///
+    /// The storage read is performed on a blocking thread pool to avoid blocking
+    /// the main event loop. RocksDB reads for large blocks can take several ms.
+    ///
     /// Response format: `(Option<Block>, Option<QC>, Option<BlockMetadata>)`
     /// - `(Some(block), Some(qc), None)` = complete block with all data
     /// - `(None, None, Some(metadata))` = metadata only (txs/certs must be fetched)
     /// - `(None, None, None)` = block not found at this height
     fn handle_inbound_sync_request(&self, request: InboundSyncRequest) {
-        use crate::storage::SyncBlockData;
+        let storage = self.storage.clone();
+        let network = self.network.clone();
 
-        let height = BlockHeight(request.height);
-        let channel_id = request.channel_id;
+        // Spawn on blocking thread pool to avoid blocking the main event loop.
+        // RocksDB reads are synchronous I/O that can take ms for large blocks.
+        tokio::task::spawn_blocking(move || {
+            use crate::storage::SyncBlockData;
 
-        tracing::debug!(
-            peer = %request.peer,
-            height = request.height,
-            channel_id = channel_id,
-            "Handling inbound sync request"
-        );
+            let height = BlockHeight(request.height);
+            let channel_id = request.channel_id;
 
-        // Look up block from storage - returns Complete, MetadataOnly, or None
-        let response = match self.storage.get_block_for_sync(height) {
-            Some(SyncBlockData::Complete(block, qc)) => {
-                // Full block available - encode as (Some(block), Some(qc), None)
-                match sbor::basic_encode(&(Some(&block), Some(&qc), None::<BlockMetadata>)) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        tracing::warn!(height = request.height, error = ?e, "Failed to encode block response");
-                        sbor::basic_encode(&(
-                            None::<Block>,
-                            None::<QuorumCertificate>,
-                            None::<BlockMetadata>,
-                        ))
-                        .unwrap_or_default()
-                    }
-                }
-            }
-            Some(SyncBlockData::MetadataOnly(metadata)) => {
-                // Metadata only - encode as (None, None, Some(metadata))
-                tracing::debug!(
-                    height = request.height,
-                    tx_count = metadata.tx_hashes.len(),
-                    cert_count = metadata.cert_hashes.len(),
-                    "Returning metadata-only sync response"
-                );
-                match sbor::basic_encode(&(
-                    None::<Block>,
-                    None::<QuorumCertificate>,
-                    Some(&metadata),
-                )) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        tracing::warn!(height = request.height, error = ?e, "Failed to encode metadata response");
-                        sbor::basic_encode(&(
-                            None::<Block>,
-                            None::<QuorumCertificate>,
-                            None::<BlockMetadata>,
-                        ))
-                        .unwrap_or_default()
-                    }
-                }
-            }
-            None => {
-                tracing::trace!(height = request.height, "Block not found for sync request");
-                // Not found - encode as (None, None, None)
-                sbor::basic_encode(&(
-                    None::<Block>,
-                    None::<QuorumCertificate>,
-                    None::<BlockMetadata>,
-                ))
-                .unwrap_or_default()
-            }
-        };
-
-        // Send response via network adapter
-        if let Err(e) = self.network.send_block_response(channel_id, response) {
-            tracing::warn!(
+            tracing::debug!(
+                peer = %request.peer,
                 height = request.height,
                 channel_id = channel_id,
-                error = ?e,
-                "Failed to send block response"
+                "Handling inbound sync request"
             );
-        }
+
+            // Look up block from storage - returns Complete, MetadataOnly, or None
+            let response = match storage.get_block_for_sync(height) {
+                Some(SyncBlockData::Complete(block, qc)) => {
+                    // Full block available - encode as (Some(block), Some(qc), None)
+                    match sbor::basic_encode(&(Some(&block), Some(&qc), None::<BlockMetadata>)) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::warn!(height = request.height, error = ?e, "Failed to encode block response");
+                            sbor::basic_encode(&(
+                                None::<Block>,
+                                None::<QuorumCertificate>,
+                                None::<BlockMetadata>,
+                            ))
+                            .unwrap_or_default()
+                        }
+                    }
+                }
+                Some(SyncBlockData::MetadataOnly(metadata)) => {
+                    // Metadata only - encode as (None, None, Some(metadata))
+                    tracing::debug!(
+                        height = request.height,
+                        tx_count = metadata.tx_hashes.len(),
+                        cert_count = metadata.cert_hashes.len(),
+                        "Returning metadata-only sync response"
+                    );
+                    match sbor::basic_encode(&(
+                        None::<Block>,
+                        None::<QuorumCertificate>,
+                        Some(&metadata),
+                    )) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::warn!(height = request.height, error = ?e, "Failed to encode metadata response");
+                            sbor::basic_encode(&(
+                                None::<Block>,
+                                None::<QuorumCertificate>,
+                                None::<BlockMetadata>,
+                            ))
+                            .unwrap_or_default()
+                        }
+                    }
+                }
+                None => {
+                    tracing::trace!(height = request.height, "Block not found for sync request");
+                    // Not found - encode as (None, None, None)
+                    sbor::basic_encode(&(
+                        None::<Block>,
+                        None::<QuorumCertificate>,
+                        None::<BlockMetadata>,
+                    ))
+                    .unwrap_or_default()
+                }
+            };
+
+            // Send response via network adapter
+            if let Err(e) = network.send_block_response(channel_id, response) {
+                tracing::warn!(
+                    height = request.height,
+                    channel_id = channel_id,
+                    error = ?e,
+                    "Failed to send block response"
+                );
+            }
+        });
     }
 
     // NOTE: handle_inbound_transaction_request and handle_inbound_certificate_request
