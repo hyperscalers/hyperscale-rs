@@ -219,7 +219,7 @@ impl RadixExecutor {
 
             // Create execution context with pre-computed provisions
             let context = ProvisionedExecutionContext::with_prepared_provisions(
-                snapshot.as_ref(),
+                &snapshot,
                 &self.network,
                 prepared,
             );
@@ -270,7 +270,7 @@ impl RadixExecutor {
 
         // Use cached vm_modules and exec_config
         let receipt = execute_transaction(
-            snapshot.as_ref(),
+            &snapshot,
             &self.caches.vm_modules,
             &self.caches.exec_config,
             &executable,

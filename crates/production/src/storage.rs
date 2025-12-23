@@ -11,7 +11,7 @@ use hyperscale_engine::{
     DbSubstateValue, PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::NodeId;
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, Snapshot, WriteBatch, DB};
 use sbor::prelude::*;
 use std::cell::UnsafeCell;
 use std::path::Path;
@@ -304,14 +304,15 @@ impl CommittableSubstateDatabase for RocksDbStorage {
 }
 
 impl SubstateStore for RocksDbStorage {
-    type Snapshot = RocksDbSnapshot;
+    type Snapshot<'a> = RocksDbSnapshot<'a>;
 
-    fn snapshot(&self) -> Arc<Self::Snapshot> {
-        // Note: Currently uses the DB directly for snapshot reads.
-        // In the future, this could be optimized with RocksDB's native snapshot feature.
-        Arc::new(RocksDbSnapshot {
-            db: self.db.clone(),
-        })
+    fn snapshot(&self) -> Self::Snapshot<'_> {
+        // Use RocksDB's native snapshot feature for point-in-time isolation.
+        // The snapshot provides a consistent view of the database at the time
+        // of creation, immune to concurrent writes.
+        RocksDbSnapshot {
+            snapshot: self.db.snapshot(),
+        }
     }
 
     fn list_substates_for_node(
@@ -338,20 +339,21 @@ impl SubstateStore for RocksDbStorage {
 
 /// RocksDB snapshot for consistent reads.
 ///
-/// Note: Currently uses the DB directly. In the future, this could be
-/// optimized to use RocksDB's native snapshot feature.
-pub struct RocksDbSnapshot {
-    db: Arc<DB>,
+/// Uses RocksDB's native snapshot feature to provide point-in-time isolation.
+/// Any writes that occur after the snapshot is created are invisible to reads
+/// through this snapshot.
+pub struct RocksDbSnapshot<'a> {
+    snapshot: Snapshot<'a>,
 }
 
-impl SubstateDatabase for RocksDbSnapshot {
+impl SubstateDatabase for RocksDbSnapshot<'_> {
     fn get_raw_substate_by_db_key(
         &self,
         partition_key: &DbPartitionKey,
         sort_key: &DbSortKey,
     ) -> Option<DbSubstateValue> {
         let key = keys::to_storage_key(partition_key, sort_key);
-        self.db.get(&key).ok().flatten()
+        self.snapshot.get(&key).ok().flatten()
     }
 
     fn list_raw_values_from_db_key(
@@ -372,7 +374,7 @@ impl SubstateDatabase for RocksDbSnapshot {
         };
         let end = keys::next_prefix(&prefix);
 
-        let mut iter = self.db.raw_iterator();
+        let mut iter = self.snapshot.raw_iterator();
         iter.seek(&start);
 
         let raw_iter = std::iter::from_fn(move || {
