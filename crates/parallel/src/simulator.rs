@@ -1560,7 +1560,6 @@ impl ParallelSimulator {
         match dest {
             Destination::Shard(shard) => self.shard_members.get(shard).cloned().unwrap_or_default(),
             Destination::Global => (0..self.nodes.len() as u32).collect(),
-            Destination::Validator(validator) => vec![validator.0 as u32],
         }
     }
 

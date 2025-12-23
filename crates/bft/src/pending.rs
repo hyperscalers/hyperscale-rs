@@ -134,13 +134,6 @@ impl PendingBlock {
         }
     }
 
-    /// Add a received transaction (wraps in Arc).
-    ///
-    /// Returns true if this transaction was needed, false if duplicate or not in this block.
-    pub fn add_transaction(&mut self, tx: RoutableTransaction) -> bool {
-        self.add_transaction_arc(Arc::new(tx))
-    }
-
     /// Add a received certificate.
     ///
     /// Returns true if this certificate was needed, false if duplicate or not in this block.
@@ -161,6 +154,7 @@ impl PendingBlock {
     }
 
     /// Check if all transactions have been received (certificates may still be pending).
+    #[cfg(test)]
     pub fn has_all_transactions(&self) -> bool {
         self.missing_transaction_hashes.is_empty()
     }
@@ -253,11 +247,6 @@ impl PendingBlock {
     /// Get the block header.
     pub fn header(&self) -> &BlockHeader {
         &self.header
-    }
-
-    /// Get the block hash.
-    pub fn hash(&self) -> Hash {
-        self.header.hash()
     }
 
     /// Get all transaction hashes in the original order.

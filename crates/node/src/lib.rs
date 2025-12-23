@@ -5,5 +5,4 @@
 
 mod state;
 
-pub use state::NodeIndex;
 pub use state::NodeStateMachine;

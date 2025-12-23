@@ -23,9 +23,6 @@ pub trait NetworkMessage: Send + Sync + Sized + BasicEncode + BasicDecode {
     }
 }
 
-/// Marker trait for messages that are broadcast globally.
-pub trait GlobalMessage: NetworkMessage {}
-
 /// Marker trait for messages that are shard-specific.
 pub trait ShardMessage: NetworkMessage {}
 

@@ -100,11 +100,13 @@ impl CommittedCrossShardTracker {
     }
 
     /// Check if a transaction is being tracked.
+    #[cfg(test)]
     pub fn contains(&self, tx_hash: &Hash) -> bool {
         self.tx_needs.contains_key(tx_hash)
     }
 
     /// Get the shards a transaction needs provisions from.
+    #[cfg(test)]
     pub fn shards_for_tx(&self, tx_hash: &Hash) -> Option<&BTreeSet<ShardGroupId>> {
         self.tx_needs.get(tx_hash).map(|n| &n.shards)
     }
@@ -114,7 +116,8 @@ impl CommittedCrossShardTracker {
         self.tx_needs.len()
     }
 
-    /// Check if the tracker is empty.
+    /// Check if the tracker is empty (clippy: len_without_is_empty).
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.tx_needs.is_empty()
     }
@@ -156,6 +159,7 @@ impl ProvisionTracker {
     ///
     /// Returns the set of transactions that have received provisions from
     /// the given source shard. Used for cycle detection.
+    #[cfg(test)]
     pub fn txs_with_provision_from(&self, source_shard: ShardGroupId) -> Vec<Hash> {
         self.seen
             .iter()
@@ -172,6 +176,7 @@ impl ProvisionTracker {
     }
 
     /// Check if we've seen any provision for a transaction from a specific shard.
+    #[cfg(test)]
     pub fn has_provision(&self, tx_hash: Hash, source_shard: ShardGroupId) -> bool {
         self.seen.contains(&(tx_hash, source_shard))
     }
@@ -181,7 +186,8 @@ impl ProvisionTracker {
         self.seen.len()
     }
 
-    /// Check if the tracker is empty.
+    /// Check if the tracker is empty (clippy: len_without_is_empty).
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.seen.is_empty()
     }

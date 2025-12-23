@@ -406,11 +406,13 @@ impl LivelockAnalyzer {
     }
 
     /// Get the number of incomplete transactions.
+    #[allow(dead_code)]
     pub fn incomplete_count(&self) -> usize {
         self.stuck_transactions.len()
     }
 
     /// Check if there are any incomplete transactions.
+    #[allow(dead_code)]
     pub fn has_incomplete(&self) -> bool {
         !self.stuck_transactions.is_empty()
     }

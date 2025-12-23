@@ -10,6 +10,4 @@ pub use gossip::{
     BlockHeaderGossip, BlockVoteGossip, StateCertificateBatch, StateProvisionBatch, StateVoteBatch,
     TransactionCertificateGossip, TransactionGossip,
 };
-pub use request::{GetBlockRequest, SyncCompleteAnnouncement};
-pub use response::GetBlockResponse;
 pub use trace_context::TraceContext;

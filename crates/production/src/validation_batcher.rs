@@ -42,6 +42,7 @@ pub struct ValidationBatcherConfig {
     pub seen_cache_capacity: usize,
 
     /// How often to clean expired entries from seen cache (default: 60s).
+    #[allow(dead_code)]
     pub seen_cache_cleanup_interval: Duration,
 }
 

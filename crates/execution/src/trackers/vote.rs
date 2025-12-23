@@ -53,11 +53,6 @@ impl VoteTracker {
         }
     }
 
-    /// Get the transaction hash this tracker is for.
-    pub fn tx_hash(&self) -> Hash {
-        self.tx_hash
-    }
-
     /// Get the participating shards.
     pub fn participating_shards(&self) -> &[ShardGroupId] {
         &self.participating_shards
@@ -95,6 +90,7 @@ impl VoteTracker {
     }
 
     /// Get votes for a specific merkle root (reference).
+    #[cfg(test)]
     pub fn votes_for_root(&self, merkle_root: &Hash) -> &[StateVoteBlock] {
         self.votes_by_root
             .get(merkle_root)
@@ -105,16 +101,6 @@ impl VoteTracker {
     /// Take votes for a specific merkle root (ownership transfer, avoids clone).
     pub fn take_votes_for_root(&mut self, merkle_root: &Hash) -> Vec<StateVoteBlock> {
         self.votes_by_root.remove(merkle_root).unwrap_or_default()
-    }
-
-    /// Get the quorum needed for this tracker.
-    pub fn quorum_needed(&self) -> u64 {
-        self.quorum
-    }
-
-    /// Get total voting power accumulated so far.
-    pub fn total_power(&self) -> u64 {
-        self.power_by_root.values().sum()
     }
 }
 

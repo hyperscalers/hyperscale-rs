@@ -2,6 +2,10 @@
 //!
 //! Metrics are domain-specific rather than generic event counters.
 //! Use traces for event-level granularity during investigations.
+//!
+//! Note: Some metrics functions are not yet hooked up but are intentionally
+//! kept for future integration. The dead_code allow is intentional here.
+#![allow(dead_code)]
 
 use prometheus::{
     register_counter, register_counter_vec, register_gauge, register_histogram,

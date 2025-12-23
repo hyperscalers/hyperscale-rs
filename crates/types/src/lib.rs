@@ -30,15 +30,15 @@ mod topology;
 mod transaction;
 mod validator;
 
-pub use crypto::{AggregateError, KeyPair, KeyType, PublicKey, Signature};
+pub use crypto::{KeyPair, KeyType, PublicKey, Signature};
 pub use epoch::{
     EpochConfig, EpochId, GlobalConsensusConfig, GlobalValidatorInfo, ShardCommitteeConfig,
     ShardHashRange, ValidatorRating, ValidatorShardState, DEFAULT_EPOCH_LENGTH,
 };
-pub use hash::{Hash, HexError};
+pub use hash::Hash;
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
-pub use network::{GlobalMessage, NetworkMessage, Request, ShardMessage};
-pub use proofs::{commitment_proof_message, CommitmentProof, CycleProof, DOMAIN_COMMITMENT_PROOF};
+pub use network::{NetworkMessage, Request, ShardMessage};
+pub use proofs::{commitment_proof_message, CommitmentProof, CycleProof};
 pub use signing::{
     block_vote_message, exec_vote_message, state_provision_message, DOMAIN_BLOCK_VOTE,
     DOMAIN_EXEC_VOTE, DOMAIN_STATE_PROVISION,
@@ -59,9 +59,6 @@ pub use transaction::{
     TransactionDefer, TransactionError, TransactionStatus, TransactionStatusParseError,
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
-
-// Re-export Radix transaction types for convenience
-pub use radix_transactions::model::UserTransaction;
 
 /// Block vote for BFT consensus.
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
@@ -102,23 +99,16 @@ impl BlockVote {
     }
 }
 
-/// Helper functions.
-pub mod helpers {
-    use super::Hash;
-
-    /// Create a zero hash (all bytes 0x00).
-    pub fn zero_hash() -> Hash {
-        Hash::ZERO
-    }
-}
-
 /// Test utilities.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils {
     use super::*;
     use radix_common::crypto::{Ed25519PublicKey, Ed25519Signature, PublicKey as RadixPublicKey};
     use radix_common::prelude::Epoch;
-    use radix_transactions::model::*;
+    use radix_transactions::model::{
+        BlobsV1, InstructionsV1, IntentSignaturesV1, IntentV1, MessageV1, NotarizedTransactionV1,
+        NotarySignatureV1, SignatureV1, SignedIntentV1, TransactionHeaderV1, UserTransaction,
+    };
 
     /// Create a test NodeId from a seed byte.
     pub fn test_node(seed: u8) -> NodeId {

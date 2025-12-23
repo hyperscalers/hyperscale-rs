@@ -8,8 +8,7 @@
 //! in the `hyperscale-provisions` crate.
 
 use hyperscale_types::{
-    BlockHeight, Hash, NodeId, RoutableTransaction, ShardGroupId, StateCertificate, StateVoteBlock,
-    TransactionCertificate,
+    BlockHeight, Hash, ShardGroupId, StateCertificate, StateVoteBlock, TransactionCertificate,
 };
 use std::collections::HashSet;
 
@@ -18,16 +17,11 @@ use std::collections::HashSet;
 /// When starting cross-shard execution, we need to fetch state entries from
 /// storage before we can broadcast provisions to target shards.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct PendingProvisionBroadcast {
-    /// The transaction we're provisioning for.
-    pub transaction: RoutableTransaction,
     /// Block height when the transaction was committed.
     pub block_height: BlockHeight,
     /// Target shards to broadcast to.
     pub target_shards: Vec<ShardGroupId>,
-    /// Nodes we own that need to be provisioned.
-    pub owned_nodes: Vec<NodeId>,
 }
 
 /// Tracks a pending state vote signature verification.
@@ -46,10 +40,13 @@ pub struct PendingStateVoteVerification {
 ///
 /// When we receive a state certificate from another shard, we delegate
 /// aggregated signature verification to the runner before accepting it.
+///
+/// The certificate field is kept for debugging/diagnostics even though
+/// the verification result provides the certificate.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PendingCertificateVerification {
-    /// The certificate awaiting verification.
+    /// The certificate awaiting verification (stored for diagnostics).
+    #[allow(dead_code)]
     pub certificate: StateCertificate,
 }
 

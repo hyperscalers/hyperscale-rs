@@ -39,11 +39,6 @@ impl CertificateTracker {
         }
     }
 
-    /// Get the transaction hash this tracker is for.
-    pub fn tx_hash(&self) -> Hash {
-        self.tx_hash
-    }
-
     /// Get the number of certificates collected.
     pub fn certificate_count(&self) -> usize {
         self.certificates.len()

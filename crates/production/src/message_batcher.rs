@@ -65,6 +65,7 @@ pub struct MessageBatcherConfig {
 
     /// Whether batching is enabled (default: true).
     /// When disabled, messages are sent immediately without batching.
+    #[allow(dead_code)]
     pub enabled: bool,
 
     /// Maximum retry attempts for failed broadcasts (default: 5).
@@ -121,6 +122,7 @@ pub struct MessageBatcherStats {
 
 impl MessageBatcherStats {
     /// Get average items per batch.
+    #[cfg(test)]
     pub fn avg_batch_size(&self) -> f64 {
         let batches = self.batches_sent.load(Ordering::Relaxed);
         let items = self.items_sent.load(Ordering::Relaxed);
@@ -150,8 +152,10 @@ pub enum BatcherCommand {
         item: Box<BatchableItem>,
     },
     /// Flush all pending batches immediately.
+    #[allow(dead_code)]
     Flush,
     /// Shutdown the batcher.
+    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -160,6 +164,7 @@ pub enum BatcherCommand {
 pub struct MessageBatcherHandle {
     tx: mpsc::UnboundedSender<BatcherCommand>,
     stats: Arc<MessageBatcherStats>,
+    #[allow(dead_code)]
     config: MessageBatcherConfig,
 }
 
@@ -192,21 +197,25 @@ impl MessageBatcherHandle {
     }
 
     /// Force flush all pending batches.
+    #[allow(dead_code)]
     pub fn flush(&self) {
         let _ = self.tx.send(BatcherCommand::Flush);
     }
 
     /// Shutdown the batcher.
+    #[allow(dead_code)]
     pub fn shutdown(&self) {
         let _ = self.tx.send(BatcherCommand::Shutdown);
     }
 
     /// Get current statistics.
+    #[allow(dead_code)]
     pub fn stats(&self) -> &MessageBatcherStats {
         &self.stats
     }
 
     /// Check if batching is enabled.
+    #[allow(dead_code)]
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
     }

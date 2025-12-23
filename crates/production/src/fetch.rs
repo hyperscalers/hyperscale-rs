@@ -102,6 +102,7 @@ impl Default for FetchConfig {
 
 impl FetchConfig {
     /// Create config optimized for low-latency local networks.
+    #[cfg(test)]
     pub fn for_local() -> Self {
         Self {
             initial_timeout: Duration::from_millis(100),
@@ -112,6 +113,7 @@ impl FetchConfig {
     }
 
     /// Create config for high-latency WANs.
+    #[cfg(test)]
     pub fn for_wan() -> Self {
         Self {
             initial_timeout: Duration::from_secs(2),
@@ -501,6 +503,7 @@ impl FetchManager {
     }
 
     /// Cancel a fetch for a block (e.g., block completed via gossip).
+    #[allow(dead_code)]
     pub fn cancel_fetch(&mut self, block_hash: Hash, kind: FetchKind) {
         let removed = match kind {
             FetchKind::Transaction => self.tx_fetches.remove(&block_hash).is_some(),

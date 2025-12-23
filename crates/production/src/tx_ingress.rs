@@ -45,6 +45,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 
 /// Configuration for the transaction ingress system.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TxIngressConfig {
     /// Maximum number of concurrent in-flight transactions.
@@ -115,6 +116,7 @@ pub struct PermittedTransaction {
     pub tx: Arc<RoutableTransaction>,
     /// Permit that is released when this is dropped.
     /// Kept as `Option` to allow explicit release if needed.
+    #[allow(dead_code)]
     permit: Option<IngressPermit>,
 }
 
@@ -123,6 +125,7 @@ impl PermittedTransaction {
     ///
     /// After calling this, dropping the `PermittedTransaction` will not release the permit.
     /// The caller is responsible for holding/dropping the permit appropriately.
+    #[allow(dead_code)]
     pub fn take_permit(&mut self) -> Option<IngressPermit> {
         self.permit.take()
     }
@@ -219,6 +222,7 @@ impl TxIngressHandle {
 /// The runner uses this to receive transactions. When the transaction is
 /// processed, the permit is automatically released when the `PermittedTransaction`
 /// is dropped.
+#[allow(dead_code)]
 pub struct TxIngressReceiver {
     rx: mpsc::Receiver<PermittedTransaction>,
 }
@@ -227,16 +231,19 @@ impl TxIngressReceiver {
     /// Receive the next permitted transaction.
     ///
     /// Returns `None` if the channel is closed.
+    #[allow(dead_code)]
     pub async fn recv(&mut self) -> Option<PermittedTransaction> {
         self.rx.recv().await
     }
 
     /// Try to receive without blocking.
+    #[allow(dead_code)]
     pub fn try_recv(&mut self) -> Result<PermittedTransaction, mpsc::error::TryRecvError> {
         self.rx.try_recv()
     }
 
     /// Get the number of buffered transactions.
+    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         // Note: mpsc::Receiver doesn't expose len(), but we can check capacity usage
         // For now, return 0 as a placeholder
@@ -247,6 +254,7 @@ impl TxIngressReceiver {
 /// Create a transaction ingress system.
 ///
 /// Returns a handle for submitting transactions and a receiver for processing them.
+#[allow(dead_code)]
 pub fn create_tx_ingress(config: TxIngressConfig) -> (TxIngressHandle, TxIngressReceiver) {
     let semaphore = Arc::new(Semaphore::new(config.max_in_flight));
     let (tx, rx) = mpsc::channel(config.channel_capacity);

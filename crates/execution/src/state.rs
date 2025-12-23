@@ -767,10 +767,8 @@ impl ExecutionState {
         self.pending_provision_fetches.insert(
             tx_hash,
             PendingProvisionBroadcast {
-                transaction: tx.clone(),
                 block_height,
                 target_shards,
-                owned_nodes: owned_nodes.clone(),
             },
         );
 

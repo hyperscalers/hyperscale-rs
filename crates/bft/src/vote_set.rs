@@ -1,9 +1,8 @@
 //! Vote set for collecting block votes.
 
-use hyperscale_types::{
-    BlockHeader, BlockHeight, BlockVote, Hash, QuorumCertificate, Signature, SignerBitfield,
-    VotePower,
-};
+#[cfg(test)]
+use hyperscale_types::QuorumCertificate;
+use hyperscale_types::{BlockHeader, BlockHeight, BlockVote, Hash, SignerBitfield, VotePower};
 use tracing::instrument;
 
 /// Data needed to build a QC asynchronously.
@@ -166,11 +165,6 @@ impl VoteSet {
         }
     }
 
-    /// Check if the vote set has header information.
-    pub fn has_header(&self) -> bool {
-        self.parent_block_hash.is_some()
-    }
-
     /// Extract data needed to build a QC asynchronously.
     ///
     /// This marks the vote set as "QC building in progress" and returns all data
@@ -216,7 +210,10 @@ impl VoteSet {
     /// # Errors
     ///
     /// Returns error if called before reaching quorum or with no votes.
+    #[cfg(test)]
     pub fn build_qc(&mut self, block_hash: Hash) -> Result<QuorumCertificate, String> {
+        use hyperscale_types::Signature;
+
         if self.votes.is_empty() {
             return Err("cannot build QC with no votes".to_string());
         }

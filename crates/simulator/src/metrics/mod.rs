@@ -83,6 +83,7 @@ impl MetricsCollector {
     }
 
     /// Record multiple submissions.
+    #[allow(dead_code)]
     pub fn record_submissions(&mut self, count: u64) {
         self.submissions += count;
     }
