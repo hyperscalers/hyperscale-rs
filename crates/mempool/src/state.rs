@@ -21,14 +21,14 @@ const TRANSACTION_RETENTION_BLOCKS: u64 = 100;
 /// When at this limit, new transactions without provisions are delayed.
 /// Cross-shard TXs WITH provisions (committed on another shard) can still be proposed,
 /// ensuring we don't block transactions that other shards are waiting on.
-pub const DEFAULT_IN_FLIGHT_LIMIT: usize = 256;
+pub const DEFAULT_IN_FLIGHT_LIMIT: usize = 512;
 
 /// Default hard limit on transactions in-flight.
 ///
 /// This is an absolute cap on transactions holding state locks. When at this limit,
 /// NO new transactions are proposed (even cross-shard TXs with provisions). This prevents
 /// unbounded growth and controls execution/crypto verification pressure.
-pub const DEFAULT_IN_FLIGHT_HARD_LIMIT: usize = 512;
+pub const DEFAULT_IN_FLIGHT_HARD_LIMIT: usize = 1024;
 
 /// Mempool configuration.
 #[derive(Debug, Clone)]
