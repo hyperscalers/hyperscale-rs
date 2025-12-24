@@ -31,6 +31,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
+use tracing::instrument;
 
 /// Errors from thread pool configuration.
 #[derive(Debug, Error)]
@@ -58,9 +59,14 @@ pub struct ThreadPoolConfig {
     /// for consensus liveness - block vote verification delays cause view changes.
     pub consensus_crypto_threads: usize,
 
-    /// Number of threads for general crypto operations (provisions, state votes, tx validation).
+    /// Number of threads for general crypto operations (provisions, state votes).
     /// These are CPU-bound but not consensus-critical. They can queue without affecting liveness.
     pub crypto_threads: usize,
+
+    /// Number of threads for transaction signature validation.
+    /// This is a dedicated pool to prevent transaction floods from blocking
+    /// provision/state vote verification which are needed for execution progress.
+    pub tx_validation_threads: usize,
 
     /// Number of threads for transaction execution.
     /// These run the Radix Engine and are CPU/memory intensive.
@@ -106,11 +112,12 @@ impl ThreadPoolConfig {
     /// Uses the following allocation ratios:
     /// - State Machine: 1 core (always)
     /// - Consensus Crypto: 2 threads (dedicated for block votes/QC - liveness critical)
+    /// - TX Validation: 2 threads (dedicated for transaction signature verification)
     /// - Execution: 40% of remaining cores (min 1)
     /// - General Crypto: 30% of remaining cores (min 1)
     /// - I/O: 30% of remaining cores (min 1)
     ///
-    /// On systems with fewer than 4 cores, all pools get 1 thread each.
+    /// On systems with fewer than 5 cores, all pools get 1 thread each.
     pub fn auto() -> Self {
         let available = std::thread::available_parallelism()
             .map(NonZeroUsize::get)
@@ -124,31 +131,35 @@ impl ThreadPoolConfig {
     /// Useful for testing or when you want to limit resource usage.
     pub fn for_core_count(total_cores: usize) -> Self {
         // Reserve 1 core for state machine
-        let remaining = total_cores.saturating_sub(1).max(4);
+        let remaining = total_cores.saturating_sub(1).max(5);
 
-        // Allocation: consensus_crypto gets dedicated threads, rest split among others
+        // Allocation: consensus_crypto and tx_validation get dedicated threads, rest split among others
         // Consensus crypto is critical for liveness - even under heavy load, block votes
         // must be verified quickly to form QCs within the view_change_timeout (3s default)
-        let (consensus_crypto, crypto, execution, io) = if remaining <= 4 {
-            // Minimum viable: 1 each, consensus_crypto always gets at least 1
-            (1, 1, 1, 1)
+        // TX validation is separate to prevent transaction floods from blocking execution-layer crypto
+        let (consensus_crypto, tx_validation, crypto, execution, io) = if remaining <= 5 {
+            // Minimum viable: 1 each
+            (1, 1, 1, 1, 1)
         } else {
             // Consensus crypto: fixed 2 threads (enough for ~1000 votes/sec)
+            // TX validation: fixed 2 threads (enough for transaction flood isolation)
             let consensus_crypto = 2;
-            let after_consensus = remaining.saturating_sub(consensus_crypto);
+            let tx_validation = 2;
+            let after_dedicated = remaining.saturating_sub(consensus_crypto + tx_validation);
             // Remaining split: execution 40%, crypto 30%, I/O 30%
-            let execution = (after_consensus * 40 / 100).max(1);
-            let crypto = (after_consensus * 30 / 100).max(1);
-            let io = after_consensus
+            let execution = (after_dedicated * 40 / 100).max(1);
+            let crypto = (after_dedicated * 30 / 100).max(1);
+            let io = after_dedicated
                 .saturating_sub(crypto)
                 .saturating_sub(execution)
                 .max(1);
-            (consensus_crypto, crypto, execution, io)
+            (consensus_crypto, tx_validation, crypto, execution, io)
         };
 
         Self {
             consensus_crypto_threads: consensus_crypto,
             crypto_threads: crypto,
+            tx_validation_threads: tx_validation,
             execution_threads: execution,
             io_threads: io,
             pin_cores: false,
@@ -171,6 +182,7 @@ impl ThreadPoolConfig {
         Self {
             consensus_crypto_threads: 1,
             crypto_threads: 1,
+            tx_validation_threads: 1,
             execution_threads: 1,
             io_threads: 1,
             pin_cores: false,
@@ -187,6 +199,7 @@ impl ThreadPoolConfig {
     pub fn total_threads(&self) -> usize {
         self.consensus_crypto_threads
             + self.crypto_threads
+            + self.tx_validation_threads
             + self.execution_threads
             + self.io_threads
     }
@@ -201,6 +214,11 @@ impl ThreadPoolConfig {
         if self.crypto_threads == 0 {
             return Err(ThreadPoolError::InvalidConfig(
                 "crypto_threads must be at least 1".to_string(),
+            ));
+        }
+        if self.tx_validation_threads == 0 {
+            return Err(ThreadPoolError::InvalidConfig(
+                "tx_validation_threads must be at least 1".to_string(),
             ));
         }
         if self.execution_threads == 0 {
@@ -223,6 +241,7 @@ impl ThreadPoolConfig {
             let total_needed = 1
                 + self.consensus_crypto_threads
                 + self.crypto_threads
+                + self.tx_validation_threads
                 + self.execution_threads
                 + self.io_threads;
             if total_needed > available {
@@ -261,6 +280,12 @@ impl ThreadPoolConfigBuilder {
     /// Set the number of general crypto verification threads (provisions, state votes).
     pub fn crypto_threads(mut self, count: usize) -> Self {
         self.config.crypto_threads = count;
+        self
+    }
+
+    /// Set the number of transaction validation threads.
+    pub fn tx_validation_threads(mut self, count: usize) -> Self {
+        self.config.tx_validation_threads = count;
         self
     }
 
@@ -344,13 +369,17 @@ impl Default for ThreadPoolConfigBuilder {
 ///
 /// Creates and owns:
 /// - A rayon thread pool for consensus-critical crypto (block votes, QC verification)
-/// - A rayon thread pool for general crypto operations (provisions, state votes, tx validation)
+/// - A rayon thread pool for general crypto operations (provisions, state votes)
+/// - A rayon thread pool for transaction signature validation (isolated from other crypto)
 /// - A rayon thread pool for execution operations (Radix Engine)
 /// - Configuration for tokio runtime (actual runtime created by caller)
 ///
 /// The separation of consensus crypto from general crypto is critical for liveness:
 /// under high load, provision and state vote verification can queue up, but block vote
 /// verification must remain responsive to form QCs within the view_change_timeout.
+///
+/// Transaction validation is further isolated to prevent transaction floods from
+/// blocking provision/state vote verification which are needed for execution progress.
 pub struct ThreadPoolManager {
     /// Configuration used to create the pools.
     config: ThreadPoolConfig,
@@ -359,8 +388,12 @@ pub struct ThreadPoolManager {
     /// This pool is kept small and dedicated to ensure liveness under load.
     consensus_crypto_pool: rayon::ThreadPool,
 
-    /// Rayon pool for general crypto operations (provisions, state votes, tx validation).
+    /// Rayon pool for general crypto operations (provisions, state votes).
     crypto_pool: rayon::ThreadPool,
+
+    /// Rayon pool for transaction signature validation.
+    /// Isolated from general crypto to prevent tx floods from blocking execution progress.
+    tx_validation_pool: rayon::ThreadPool,
 
     /// Rayon pool for execution operations (Radix Engine).
     execution_pool: rayon::ThreadPool,
@@ -370,6 +403,9 @@ pub struct ThreadPoolManager {
 
     /// Queue depth tracking for general crypto pool (for metrics).
     crypto_pending: Arc<AtomicUsize>,
+
+    /// Queue depth tracking for tx validation pool (for metrics).
+    tx_validation_pending: Arc<AtomicUsize>,
 
     /// Queue depth tracking for execution pool (for metrics).
     execution_pending: Arc<AtomicUsize>,
@@ -382,11 +418,13 @@ impl ThreadPoolManager {
 
         let consensus_crypto_pool = Self::build_consensus_crypto_pool(&config)?;
         let crypto_pool = Self::build_crypto_pool(&config)?;
+        let tx_validation_pool = Self::build_tx_validation_pool(&config)?;
         let execution_pool = Self::build_execution_pool(&config)?;
 
         tracing::info!(
             consensus_crypto_threads = config.consensus_crypto_threads,
             crypto_threads = config.crypto_threads,
+            tx_validation_threads = config.tx_validation_threads,
             execution_threads = config.execution_threads,
             io_threads = config.io_threads,
             pin_cores = config.pin_cores,
@@ -397,9 +435,11 @@ impl ThreadPoolManager {
             config,
             consensus_crypto_pool,
             crypto_pool,
+            tx_validation_pool,
             execution_pool,
             consensus_crypto_pending: Arc::new(AtomicUsize::new(0)),
             crypto_pending: Arc::new(AtomicUsize::new(0)),
+            tx_validation_pending: Arc::new(AtomicUsize::new(0)),
             execution_pending: Arc::new(AtomicUsize::new(0)),
         })
     }
@@ -427,7 +467,7 @@ impl ThreadPoolManager {
             .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
     }
 
-    /// Build the general crypto pool (provisions, state votes, tx validation).
+    /// Build the general crypto pool (provisions, state votes).
     fn build_crypto_pool(config: &ThreadPoolConfig) -> Result<rayon::ThreadPool, ThreadPoolError> {
         let mut builder = rayon::ThreadPoolBuilder::new()
             .num_threads(config.crypto_threads)
@@ -448,6 +488,23 @@ impl ThreadPoolManager {
                 }
             });
         }
+
+        builder
+            .build()
+            .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
+    }
+
+    /// Build the transaction validation pool (isolated from general crypto).
+    fn build_tx_validation_pool(
+        config: &ThreadPoolConfig,
+    ) -> Result<rayon::ThreadPool, ThreadPoolError> {
+        let builder = rayon::ThreadPoolBuilder::new()
+            .num_threads(config.tx_validation_threads)
+            .stack_size(config.crypto_stack_size) // Same stack size as crypto
+            .thread_name(|i| format!("tx-val-{}", i));
+
+        // Note: No core pinning for tx validation - let OS schedule freely
+        // This pool handles bursty workloads and benefits from flexibility
 
         builder
             .build()
@@ -490,6 +547,11 @@ impl ThreadPoolManager {
     /// Get a reference to the general crypto thread pool.
     pub fn crypto_pool(&self) -> &rayon::ThreadPool {
         &self.crypto_pool
+    }
+
+    /// Get a reference to the transaction validation thread pool.
+    pub fn tx_validation_pool(&self) -> &rayon::ThreadPool {
+        &self.tx_validation_pool
     }
 
     /// Get a reference to the execution thread pool.
@@ -537,6 +599,9 @@ impl ThreadPoolManager {
     ///
     /// Returns immediately; the task runs asynchronously.
     /// Queue depth is tracked for metrics.
+    #[instrument(level = "debug", skip_all, fields(
+        queue_depth = self.consensus_crypto_pending.load(Ordering::Relaxed),
+    ))]
     pub fn spawn_consensus_crypto<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
@@ -552,8 +617,10 @@ impl ThreadPoolManager {
 
     /// Spawn a general crypto verification task on the crypto pool.
     ///
-    /// Use this for provisions, state votes, and transaction validation - these are
-    /// not consensus-critical and can queue without affecting liveness.
+    /// Use this for provisions and state votes - these are not consensus-critical
+    /// and can queue without affecting liveness.
+    ///
+    /// Note: Transaction validation should use `spawn_tx_validation` instead.
     ///
     /// Returns immediately; the task runs asynchronously.
     /// Queue depth is tracked for metrics.
@@ -564,6 +631,26 @@ impl ThreadPoolManager {
         self.crypto_pending.fetch_add(1, Ordering::Relaxed);
         let pending = self.crypto_pending.clone();
         self.crypto_pool.spawn(move || {
+            f();
+            pending.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+
+    /// Spawn a transaction validation task on the dedicated tx validation pool.
+    ///
+    /// Use this for transaction signature verification. This pool is isolated from
+    /// the general crypto pool to prevent transaction floods from blocking
+    /// provision/state vote verification which are needed for execution progress.
+    ///
+    /// Returns immediately; the task runs asynchronously.
+    /// Queue depth is tracked for metrics.
+    pub fn spawn_tx_validation<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.tx_validation_pending.fetch_add(1, Ordering::Relaxed);
+        let pending = self.tx_validation_pending.clone();
+        self.tx_validation_pool.spawn(move || {
             f();
             pending.fetch_sub(1, Ordering::Relaxed);
         });
@@ -625,6 +712,9 @@ impl ThreadPoolManager {
     ///
     /// Returns immediately; the task runs asynchronously.
     /// Queue depth is tracked for metrics.
+    #[instrument(level = "debug", skip_all, fields(
+        queue_depth = self.execution_pending.load(Ordering::Relaxed),
+    ))]
     pub fn spawn_execution<F>(&self, f: F)
     where
         F: FnOnce() + Send + 'static,
@@ -645,6 +735,11 @@ impl ThreadPoolManager {
     /// Get current general crypto pool queue depth (for metrics).
     pub fn crypto_queue_depth(&self) -> usize {
         self.crypto_pending.load(Ordering::Relaxed)
+    }
+
+    /// Get current tx validation pool queue depth (for metrics).
+    pub fn tx_validation_queue_depth(&self) -> usize {
+        self.tx_validation_pending.load(Ordering::Relaxed)
     }
 
     /// Get current execution pool queue depth (for metrics).
@@ -723,6 +818,7 @@ mod tests {
         let config = ThreadPoolConfig::auto();
         assert!(config.consensus_crypto_threads >= 1);
         assert!(config.crypto_threads >= 1);
+        assert!(config.tx_validation_threads >= 1);
         assert!(config.execution_threads >= 1);
         assert!(config.io_threads >= 1);
         config.validate().unwrap();
@@ -730,27 +826,30 @@ mod tests {
 
     #[test]
     fn test_for_core_count() {
-        // 4 cores: 1 state + 1 consensus_crypto + 1 crypto + 1 exec + 1 io (minimum viable)
-        let config = ThreadPoolConfig::for_core_count(4);
+        // 5 cores: 1 state + 1 each for all pools (minimum viable)
+        let config = ThreadPoolConfig::for_core_count(5);
         assert_eq!(config.consensus_crypto_threads, 1);
         assert_eq!(config.crypto_threads, 1);
+        assert_eq!(config.tx_validation_threads, 1);
         assert_eq!(config.execution_threads, 1);
         assert_eq!(config.io_threads, 1);
 
-        // 8 cores: 1 state + 2 consensus_crypto + rest split
-        let config = ThreadPoolConfig::for_core_count(8);
+        // 10 cores: 1 state + 2 consensus_crypto + 2 tx_validation + rest split
+        let config = ThreadPoolConfig::for_core_count(10);
         assert!(config.consensus_crypto_threads >= 1);
         assert!(config.crypto_threads >= 1);
+        assert!(config.tx_validation_threads >= 1);
         assert!(config.execution_threads >= 1);
         assert!(config.io_threads >= 1);
 
-        // 16 cores: more balanced with dedicated consensus crypto
-        // 15 remaining after state machine, 13 after consensus crypto (2)
-        // execution 40% = 5, crypto 30% = 3, io = 5
+        // 16 cores: more balanced with dedicated consensus crypto and tx validation
+        // 15 remaining after state machine, 11 after consensus crypto (2) and tx_validation (2)
+        // execution 40% = 4, crypto 30% = 3, io = 4
         let config = ThreadPoolConfig::for_core_count(16);
         assert_eq!(config.consensus_crypto_threads, 2); // Fixed 2 threads for consensus crypto
-        assert!(config.crypto_threads >= 3);
-        assert!(config.execution_threads >= 4);
+        assert_eq!(config.tx_validation_threads, 2); // Fixed 2 threads for tx validation
+        assert!(config.crypto_threads >= 2);
+        assert!(config.execution_threads >= 3);
         assert!(config.io_threads >= 2);
     }
 
@@ -759,6 +858,7 @@ mod tests {
         let config = ThreadPoolConfig::minimal();
         assert_eq!(config.consensus_crypto_threads, 1);
         assert_eq!(config.crypto_threads, 1);
+        assert_eq!(config.tx_validation_threads, 1);
         assert_eq!(config.execution_threads, 1);
         assert_eq!(config.io_threads, 1);
         config.validate().unwrap();
@@ -829,6 +929,7 @@ mod tests {
 
         let consensus_crypto_counter = Arc::new(AtomicUsize::new(0));
         let crypto_counter = Arc::new(AtomicUsize::new(0));
+        let tx_validation_counter = Arc::new(AtomicUsize::new(0));
         let exec_counter = Arc::new(AtomicUsize::new(0));
 
         // Spawn on consensus crypto pool
@@ -843,6 +944,12 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
+        // Spawn on tx validation pool
+        let counter = tx_validation_counter.clone();
+        manager.spawn_tx_validation(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+
         // Spawn on execution pool
         let counter = exec_counter.clone();
         manager.spawn_execution(move || {
@@ -854,6 +961,7 @@ mod tests {
 
         assert_eq!(consensus_crypto_counter.load(Ordering::SeqCst), 1);
         assert_eq!(crypto_counter.load(Ordering::SeqCst), 1);
+        assert_eq!(tx_validation_counter.load(Ordering::SeqCst), 1);
         assert_eq!(exec_counter.load(Ordering::SeqCst), 1);
     }
 
@@ -862,10 +970,11 @@ mod tests {
         let config = ThreadPoolConfig::builder()
             .consensus_crypto_threads(2)
             .crypto_threads(4)
+            .tx_validation_threads(3)
             .execution_threads(6)
             .io_threads(2)
             .build_unchecked();
 
-        assert_eq!(config.total_threads(), 14); // 2 + 4 + 6 + 2
+        assert_eq!(config.total_threads(), 17); // 2 + 4 + 3 + 6 + 2
     }
 }

@@ -17,7 +17,7 @@
 use hyperscale_core::{Event, OutboundMessage};
 use hyperscale_messages::gossip::{
     BlockHeaderGossip, BlockVoteGossip, StateCertificateBatch, StateProvisionBatch, StateVoteBatch,
-    TransactionGossip,
+    TransactionCertificateGossip, TransactionGossip,
 };
 use hyperscale_messages::TraceContext;
 use hyperscale_types::ShardGroupId;
@@ -64,6 +64,8 @@ pub fn encode_message(message: &OutboundMessage) -> Result<Vec<u8>, CodecError> 
             OutboundMessage::StateCertificateBatch(batch) => {
                 sbor::basic_encode(batch).map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?
             }
+            OutboundMessage::TransactionCertificateGossip(gossip) => sbor::basic_encode(gossip)
+                .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
             OutboundMessage::TransactionGossip(gossip) => sbor::basic_encode(gossip.as_ref())
                 .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
         };
@@ -200,6 +202,16 @@ pub fn decode_message(topic: &str, data: &[u8]) -> Result<DecodedMessage, CodecE
                 trace_context: trace_ctx,
             })
         }
+        "transaction.certificate" => {
+            let gossip: TransactionCertificateGossip = sbor::basic_decode(payload)
+                .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
+            Ok(DecodedMessage {
+                events: vec![Event::TransactionCertificateReceived {
+                    certificate: gossip.into_certificate(),
+                }],
+                trace_context: None,
+            })
+        }
         _ => Err(CodecError::UnknownTopic(topic.to_string())),
     }
 }
@@ -214,6 +226,7 @@ pub fn topic_for_message(message: &OutboundMessage, shard: ShardGroupId) -> crat
         OutboundMessage::StateProvisionBatch(_) => Topic::state_provision_batch(shard),
         OutboundMessage::StateVoteBatch(_) => Topic::state_vote_batch(shard),
         OutboundMessage::StateCertificateBatch(_) => Topic::state_certificate_batch(shard),
+        OutboundMessage::TransactionCertificateGossip(_) => Topic::transaction_certificate(shard),
         OutboundMessage::TransactionGossip(_) => Topic::transaction_gossip(shard),
     }
 }

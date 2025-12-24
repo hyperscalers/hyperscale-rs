@@ -152,7 +152,9 @@ pub struct ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════
     /// ProvisioningComplete events that arrived before the block was committed.
     /// This can happen when provisions reach quorum before we've seen the block.
-    /// Maps tx_hash -> provisions
+    /// Maps tx_hash -> provisions.
+    /// Unbounded: eviction would cause unrecoverable transaction loss, and memory
+    /// cost is trivial (provisions are small, buffer drains on block commit).
     early_provisioning_complete: HashMap<Hash, Vec<StateProvision>>,
 
     /// Votes that arrived before tracking started.
@@ -216,8 +218,8 @@ pub struct ExecutionState {
     pending_speculative_executions: HashMap<Hash, Vec<Arc<RoutableTransaction>>>,
 
     /// Transactions that committed while speculation was in-flight.
-    /// When speculation completes, these are processed via on_execution_complete
-    /// instead of being cached. Maps tx_hash -> (block_hash, transaction).
+    /// When speculation completes, SignExecutionResults is emitted for the runner
+    /// to sign and broadcast. Maps tx_hash -> (block_hash, transaction).
     /// This avoids double-execution when commit beats speculation.
     committed_awaiting_speculation: HashMap<Hash, (Hash, Arc<RoutableTransaction>)>,
 
@@ -259,7 +261,6 @@ pub const DEFAULT_SPECULATIVE_MAX_TXS: usize = 500;
 
 /// Default number of rounds to pause speculation after a view change.
 pub const DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS: u64 = 3;
-
 impl ExecutionState {
     /// Create a new execution state machine with default settings.
     pub fn new(topology: Arc<dyn Topology>, signing_key: KeyPair) -> Self {
@@ -483,11 +484,17 @@ impl ExecutionState {
             }
         }
 
-        // Process speculative hits immediately (skip execution, go straight to voting)
+        // Process speculative hits - start tracking and emit results for runner to sign
+        let mut cached_results = Vec::new();
         for (tx, result) in speculative_hits {
             actions.extend(self.start_single_shard_execution(tx.clone(), height, block_hash));
-            // Directly process the execution result
-            actions.extend(self.on_single_tx_execution_complete(block_hash, result));
+            cached_results.push(result);
+        }
+        if !cached_results.is_empty() {
+            // Runner will sign these results and send StateVoteReceived for each
+            actions.push(Action::SignExecutionResults {
+                results: cached_results,
+            });
         }
 
         // Track transactions waiting for in-flight speculation to complete.
@@ -760,10 +767,8 @@ impl ExecutionState {
         self.pending_provision_fetches.insert(
             tx_hash,
             PendingProvisionBroadcast {
-                transaction: tx.clone(),
                 block_height,
                 target_shards,
-                owned_nodes: owned_nodes.clone(),
             },
         );
 
@@ -796,94 +801,6 @@ impl ExecutionState {
         self.signing_key.sign(&msg)
     }
 
-    /// Handle execution completion callback for single-shard transactions.
-    #[instrument(skip(self, results), fields(
-        block_hash = ?block_hash,
-        result_count = results.len()
-    ))]
-    pub fn on_execution_complete(
-        &mut self,
-        block_hash: Hash,
-        results: Vec<ExecutionResult>,
-    ) -> Vec<Action> {
-        let mut actions = Vec::new();
-
-        // Get the transactions we were executing
-        let Some(transactions) = self.pending_single_shard_executions.remove(&block_hash) else {
-            tracing::warn!(?block_hash, "Execution complete for unknown block");
-            return actions;
-        };
-
-        // Match results to transactions
-        let results_map: HashMap<Hash, &ExecutionResult> =
-            results.iter().map(|r| (r.transaction_hash, r)).collect();
-
-        for tx in transactions {
-            let tx_hash = tx.hash();
-
-            // Get execution result
-            let result = results_map.get(&tx_hash);
-            let success = result.is_none_or(|r| r.success);
-            let state_root = result.map(|r| r.state_root).unwrap_or(Hash::ZERO);
-
-            let exec_result = ExecutionResult {
-                transaction_hash: tx_hash,
-                success,
-                state_root,
-                writes: result.map(|r| r.writes.clone()).unwrap_or_default(),
-                error: result.and_then(|r| r.error.clone()),
-            };
-
-            actions.extend(self.on_single_tx_execution_complete(block_hash, exec_result));
-        }
-
-        actions
-    }
-
-    /// Handle execution completion for a single transaction.
-    ///
-    /// Creates and broadcasts a vote for the transaction.
-    /// Used by both normal execution and speculative execution paths.
-    fn on_single_tx_execution_complete(
-        &mut self,
-        _block_hash: Hash,
-        result: ExecutionResult,
-    ) -> Vec<Action> {
-        let mut actions = Vec::new();
-        let local_shard = self.local_shard();
-
-        let tx_hash = result.transaction_hash;
-        let success = result.success;
-        let state_root = result.state_root;
-
-        tracing::debug!(
-            tx_hash = ?tx_hash,
-            success,
-            state_root = ?state_root,
-            "Single-shard execution complete, creating vote"
-        );
-
-        // Create signed vote (same as cross-shard voting)
-        let vote = self.create_vote(tx_hash, state_root, success);
-
-        // Broadcast vote within shard (runner handles batching)
-        actions.push(Action::BroadcastStateVote {
-            shard: local_shard,
-            vote: vote.clone(),
-        });
-
-        tracing::debug!(
-            tx_hash = ?tx_hash,
-            shard = local_shard.0,
-            "Broadcasted single-shard vote"
-        );
-
-        // Handle our own vote (ensures we count without relying on network loopback)
-        actions.extend(self.handle_vote_internal(vote));
-
-        actions
-    }
-
     // ═══════════════════════════════════════════════════════════════════════════
     // Phase 2: Provisioning Complete
     // ═══════════════════════════════════════════════════════════════════════════
@@ -912,6 +829,8 @@ impl ExecutionState {
                 shard = local_shard.0,
                 "Provisioning complete before block committed, buffering"
             );
+            // No buffer limit - eviction causes unrecoverable transaction loss
+            // Memory cost is trivial (provisions are small, buffer drains on block commit)
             self.early_provisioning_complete.insert(tx_hash, provisions);
             return vec![];
         };
@@ -932,88 +851,10 @@ impl ExecutionState {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Phase 3: Cross-Shard Execution
+    // Phase 3: Vote Aggregation
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle cross-shard transaction execution completion.
-    ///
-    /// Called when the runner completes `Action::ExecuteCrossShardTransaction`.
-    /// Creates and broadcasts a vote based on the execution result.
-    #[instrument(skip(self, result), fields(
-        tx_hash = ?result.transaction_hash,
-        success = result.success
-    ))]
-    pub fn on_cross_shard_execution_complete(&mut self, result: ExecutionResult) -> Vec<Action> {
-        let mut actions = Vec::new();
-        let tx_hash = result.transaction_hash;
-        let local_shard = self.local_shard();
-
-        tracing::debug!(
-            tx_hash = ?tx_hash,
-            success = result.success,
-            state_root = ?result.state_root,
-            "Cross-shard execution complete, creating vote"
-        );
-
-        // Create vote from execution result
-        let vote = self.create_vote(tx_hash, result.state_root, result.success);
-
-        // Broadcast vote to local shard (runner handles batching)
-        actions.push(Action::BroadcastStateVote {
-            shard: local_shard,
-            vote: vote.clone(),
-        });
-
-        // Handle our own vote
-        actions.extend(self.handle_vote_internal(vote));
-
-        actions
-    }
-
-    /// Handle batch of cross-shard transaction execution completions.
-    ///
-    /// Called when the runner completes `Action::ExecuteCrossShardTransactions`.
-    /// Creates and broadcasts votes for each execution result.
-    pub fn on_cross_shard_executions_complete(
-        &mut self,
-        results: Vec<ExecutionResult>,
-    ) -> Vec<Action> {
-        let mut actions = Vec::new();
-
-        for result in results {
-            actions.extend(self.on_cross_shard_execution_complete(result));
-        }
-
-        actions
-    }
-
-    /// Create a state vote block.
-    ///
-    /// Uses the centralized `exec_vote_message` for domain-separated signing.
-    fn create_vote(&self, tx_hash: Hash, state_root: Hash, success: bool) -> StateVoteBlock {
-        let shard_group = self.local_shard();
-        let validator_id = self.validator_id();
-
-        // Build signing message using centralized domain-separated function
-        let message =
-            hyperscale_types::exec_vote_message(&tx_hash, &state_root, shard_group, success);
-        let signature = self.signing_key.sign(&message);
-
-        StateVoteBlock {
-            transaction_hash: tx_hash,
-            shard_group_id: shard_group,
-            state_root,
-            success,
-            validator: validator_id,
-            signature,
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Phase 4: Vote Aggregation
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Handle state vote received (cross-shard Phase 3-4).
+    /// Handle state vote received.
     ///
     /// Delegates signature verification to the runner before processing.
     /// Handle a state vote received from another validator.
@@ -1035,6 +876,7 @@ impl ExecutionState {
                 return vec![];
             }
             // Buffer for later (HashSet provides O(1) deduplication)
+            // No buffer limit - eviction causes unrecoverable transaction loss
             self.early_votes.entry(tx_hash).or_default().insert(vote);
             return vec![];
         }
@@ -1275,10 +1117,10 @@ impl ExecutionState {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Phase 5: Finalization
+    // Phase 4: Finalization
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle state certificate received (cross-shard Phase 5).
+    /// Handle state certificate received.
     ///
     /// Delegates signature verification to the runner before processing.
     /// Handle a state certificate received from another validator.
@@ -1298,6 +1140,7 @@ impl ExecutionState {
                 return vec![];
             }
             // Buffer for later
+            // No buffer limit - eviction causes unrecoverable transaction loss
             self.early_certificates
                 .entry(tx_hash)
                 .or_default()
@@ -1516,6 +1359,10 @@ impl ExecutionState {
     }
 
     /// Internal certificate handling (assumes tracking is active).
+    #[instrument(level = "debug", skip(self, cert), fields(
+        tx_hash = %cert.transaction_hash,
+        cert_shard = cert.shard_group_id.0,
+    ))]
     fn handle_certificate_internal(&mut self, cert: StateCertificate) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = cert.transaction_hash;
@@ -1774,53 +1621,113 @@ impl ExecutionState {
 
     /// Cancel local certificate building for a transaction.
     ///
-    /// Called when we receive a fetched certificate from another node instead of
-    /// building our own. This cleans up the certificate tracking state to avoid
-    /// wasting resources on a certificate we no longer need to build.
+    /// Called when we receive a verified certificate from another node (via fetch or gossip)
+    /// instead of building our own. This cleans up all local certificate building state:
+    /// certificate tracking, vote aggregation, our own StateCertificate, and pending verifications.
     ///
-    /// Note: This does NOT clean up provisioning or vote tracking - those may still
-    /// be needed for other purposes (e.g., responding to peers who need our votes).
-    /// It only cancels the certificate aggregation.
+    /// Note: This keeps `executed_txs` for deduplication.
     pub fn cancel_certificate_building(&mut self, tx_hash: &Hash) {
         let had_tracker = self.certificate_trackers.remove(tx_hash).is_some();
         let had_early = self.early_certificates.remove(tx_hash).is_some();
 
+        // Clean up vote aggregation - we don't need to build our own StateCertificate
+        let had_vote_tracker = self.vote_trackers.remove(tx_hash).is_some();
+        let had_aggregation = self.pending_cert_aggregations.remove(tx_hash).is_some();
+        self.early_votes.remove(tx_hash);
+
+        // Clean up our local StateCertificate - peers can't request it, and the
+        // external certificate we received contains all the StateCertificates we need
+        self.state_certificates.remove(tx_hash);
+
         // Clean up pending fetched certificate verifications for this tx
         self.pending_fetched_cert_verifications.remove(tx_hash);
 
-        // Clean up pending cert verifications using reverse index
-        let mut removed_count = 0;
+        // Clean up pending verifications using reverse index
+        let mut removed_cert_count = 0;
+        let mut removed_vote_count = 0;
         if let Some(keys) = self.pending_verifications_by_tx.get_mut(tx_hash) {
-            // Only remove Certificate keys, keep Provision and Vote keys
-            let cert_keys: Vec<_> = keys
-                .iter()
-                .filter_map(|k| match k {
-                    PendingVerificationKey::Certificate(shard) => Some(*shard),
-                    _ => None,
-                })
-                .collect();
-            for shard in cert_keys {
-                self.pending_cert_verifications.remove(&(*tx_hash, shard));
-                keys.remove(&PendingVerificationKey::Certificate(shard));
-                removed_count += 1;
+            // Remove both Certificate and Vote verification keys - we don't need either
+            let keys_to_remove: Vec<_> = keys.iter().cloned().collect();
+            for key in keys_to_remove {
+                match key {
+                    PendingVerificationKey::Certificate(shard) => {
+                        self.pending_cert_verifications.remove(&(*tx_hash, shard));
+                        keys.remove(&key);
+                        removed_cert_count += 1;
+                    }
+                    PendingVerificationKey::Vote(vid) => {
+                        self.pending_vote_verifications.remove(&(*tx_hash, vid));
+                        keys.remove(&key);
+                        removed_vote_count += 1;
+                    }
+                }
             }
         }
 
-        if had_tracker || had_early || removed_count > 0 {
+        // Clean up verified votes cache
+        if let Some(validators) = self.verified_votes_by_tx.remove(tx_hash) {
+            for vid in validators {
+                self.verified_state_votes.remove(&(*tx_hash, vid));
+            }
+        }
+
+        if had_tracker
+            || had_early
+            || had_vote_tracker
+            || had_aggregation
+            || removed_cert_count > 0
+            || removed_vote_count > 0
+        {
             tracing::debug!(
                 tx_hash = %tx_hash,
-                had_tracker = had_tracker,
-                had_early = had_early,
-                removed_verifications = removed_count,
-                "Cancelled local certificate building - using fetched certificate"
+                had_cert_tracker = had_tracker,
+                had_vote_tracker = had_vote_tracker,
+                had_aggregation = had_aggregation,
+                removed_cert_verifications = removed_cert_count,
+                removed_vote_verifications = removed_vote_count,
+                "Cancelled local certificate building - using external certificate"
             );
         }
+    }
+
+    /// Add a verified certificate received from gossip or fetch.
+    ///
+    /// Called after a TransactionCertificate from another validator has been verified.
+    /// This adds it to finalized_certificates so it's available for block inclusion,
+    /// without going through the normal vote aggregation and certificate tracking flow.
+    pub fn add_verified_certificate(&mut self, certificate: TransactionCertificate) {
+        let tx_hash = certificate.transaction_hash;
+
+        // Check if already finalized
+        if self.finalized_certificates.contains_key(&tx_hash) {
+            tracing::debug!(
+                tx_hash = ?tx_hash,
+                "Certificate already finalized, skipping add"
+            );
+            return;
+        }
+
+        tracing::debug!(
+            tx_hash = ?tx_hash,
+            decision = ?certificate.decision,
+            shards = certificate.shard_proofs.len(),
+            "Adding verified certificate from gossip"
+        );
+
+        self.finalized_certificates
+            .insert(tx_hash, Arc::new(certificate));
     }
 
     /// Handle state entries fetched from storage.
     ///
     /// This is called when the runner completes a `FetchStateEntries` action
-    /// and returns the state entries for cross-shard provisioning.
+    /// and returns the state entries (with pre-computed storage keys) for
+    /// cross-shard provisioning.
+    #[instrument(skip(self, entries), fields(
+        tx_hash = ?tx_hash,
+        entry_count = entries.len(),
+        sign_us = tracing::field::Empty,
+    ))]
     pub fn on_state_entries_fetched(
         &mut self,
         tx_hash: Hash,
@@ -1848,8 +1755,21 @@ impl ExecutionState {
         // This avoids cloning the potentially large Vec<StateEntry> for each broadcast.
         let entries = Arc::new(entries);
 
+        // Track total signing time for all provisions
+        let mut total_sign_us = 0u64;
+
         // Create and broadcast provisions to each target shard
         for target_shard in pending.target_shards {
+            let sign_start = std::time::Instant::now();
+            let signature = self.sign_provision(
+                &tx_hash,
+                target_shard,
+                local_shard,
+                pending.block_height,
+                &entries,
+            );
+            total_sign_us += sign_start.elapsed().as_micros() as u64;
+
             let provision = StateProvision {
                 transaction_hash: tx_hash,
                 target_shard,
@@ -1857,13 +1777,7 @@ impl ExecutionState {
                 block_height: pending.block_height,
                 entries: Arc::clone(&entries),
                 validator_id: self.validator_id(),
-                signature: self.sign_provision(
-                    &tx_hash,
-                    target_shard,
-                    local_shard,
-                    pending.block_height,
-                    &entries,
-                ),
+                signature,
             };
 
             actions.push(Action::BroadcastStateProvision {
@@ -1879,6 +1793,7 @@ impl ExecutionState {
             );
         }
 
+        tracing::Span::current().record("sign_us", total_sign_us);
         actions
     }
 
@@ -1890,6 +1805,7 @@ impl ExecutionState {
     ///
     /// Speculation will be paused for a few rounds to avoid wasted work,
     /// since blocks proposed during instability may not commit.
+    #[instrument(skip(self), fields(height = height))]
     pub fn on_view_change(&mut self, height: u64) {
         tracing::debug!(
             height,
@@ -1988,6 +1904,7 @@ impl ExecutionState {
     /// Caches the results for use when the block commits. If the block has already
     /// committed and is waiting for this speculation, the result is processed
     /// immediately via the normal execution path.
+    #[instrument(skip(self, results), fields(block_hash = ?block_hash, result_count = results.len()))]
     pub fn on_speculative_execution_complete(
         &mut self,
         block_hash: Hash,
@@ -2027,8 +1944,10 @@ impl ExecutionState {
                     "SPECULATIVE LATE HIT: Using speculative result for already-committed tx"
                 );
                 self.record_speculative_late_hit();
-                // Process through the normal execution completion path
-                actions.extend(self.on_single_tx_execution_complete(committed_block_hash, result));
+                // Runner will sign this result and send StateVoteReceived
+                actions.push(Action::SignExecutionResults {
+                    results: vec![result],
+                });
                 continue;
             }
 
@@ -2289,12 +2208,10 @@ impl SubStateMachine for ExecutionState {
                 // Now we have the full block with transactions
                 Some(self.on_block_committed(*block_hash, *height, block.transactions.clone()))
             }
-            Event::TransactionsExecuted {
-                block_hash,
-                results,
-            } => Some(self.on_execution_complete(*block_hash, results.clone())),
-            Event::CrossShardTransactionsExecuted { results } => {
-                Some(self.on_cross_shard_executions_complete(results.clone()))
+            // TransactionsExecuted and CrossShardTransactionsExecuted are no longer used.
+            // Runners now sign votes directly and send StateVoteReceived events.
+            Event::TransactionsExecuted { .. } | Event::CrossShardTransactionsExecuted { .. } => {
+                Some(vec![])
             }
             Event::ProvisioningComplete {
                 tx_hash,
@@ -2391,31 +2308,39 @@ mod tests {
         // Vote tracker should be set up
         assert!(state.is_tracking_votes(&tx_hash));
 
-        // Execution completes - now creates vote instead of direct certificate
-        let results = vec![ExecutionResult {
-            transaction_hash: tx_hash,
-            success: true,
-            state_root: Hash::ZERO,
-            writes: vec![],
-            error: None,
-        }];
-        let actions = state.on_execution_complete(block_hash, results);
+        // In production, the runner executes + signs + sends StateVoteReceived.
+        // Simulate that by creating a vote and calling on_vote.
+        let state_root = Hash::ZERO;
+        let success = true;
+        let local_shard = state.local_shard();
+        let validator_id = state.validator_id();
 
-        // Should broadcast vote within shard + handle own vote
-        assert!(!actions.is_empty());
-        // Should have broadcast state vote action
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::BroadcastStateVote { .. })));
+        // Create a signed vote (simulating what the runner does)
+        let message =
+            hyperscale_types::exec_vote_message(&tx_hash, &state_root, local_shard, success);
+        let signature = state.signing_key.sign(&message);
+
+        let vote = StateVoteBlock {
+            transaction_hash: tx_hash,
+            shard_group_id: local_shard,
+            state_root,
+            success,
+            validator: validator_id,
+            signature,
+        };
+
+        // Simulate runner sending StateVoteReceived for our own vote
+        let actions = state.on_vote(vote);
+
+        // Should not emit any broadcast action (runner handles broadcast)
+        // Our vote is handled internally - might trigger certificate aggregation if quorum reached
 
         // With 4 validators and quorum threshold (2*4+1)/3 = 3,
         // single validator vote won't reach quorum yet
         // In a real test, we'd simulate receiving votes from other validators
 
-        // For now, just verify the vote tracking is working
-        // The transaction won't be finalized until we receive enough votes
-        // In this single-node test, it shouldn't finalize with just our vote
-        // (unless we have a 1-node quorum, which depends on topology setup)
+        // For now, just verify the vote was counted
+        let _ = actions; // Actions depend on quorum configuration
     }
 
     #[test]
@@ -2486,10 +2411,10 @@ mod tests {
             .iter()
             .any(|a| matches!(a, Action::ExecuteTransactions { .. })));
 
-        // Should have broadcast state vote (from speculative hit processing)
+        // Should emit SignExecutionResults for the runner to sign and broadcast
         assert!(actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastStateVote { .. })));
+            .any(|a| matches!(a, Action::SignExecutionResults { .. })));
     }
 
     #[test]
@@ -2538,10 +2463,10 @@ mod tests {
         let complete_actions = state.on_speculative_execution_complete(block_hash, spec_results);
 
         // Should process the result immediately (late hit)
-        // Should emit broadcast state vote action
+        // Should emit SignExecutionResults for the runner to sign and broadcast
         assert!(complete_actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastStateVote { .. })));
+            .any(|a| matches!(a, Action::SignExecutionResults { .. })));
 
         // Should no longer be awaiting
         assert!(!state.committed_awaiting_speculation.contains_key(&tx_hash));

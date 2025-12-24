@@ -31,6 +31,18 @@ Rust implementation of Hyperscale consensus protocol.
 | `hyperscale-production` | Production runner: libp2p networking, RocksDB storage, thread pools |
 | `hyperscale-spammer` | Transaction spammer CLI and library for load testing |
 
+## Installation
+
+### Binaries
+Pre-built binaries for Linux (x86_64) and macOS (ARM64) are available on the [Releases page](https://github.com/flightofthefox/hyperscale-rs/releases).
+
+### Docker Image
+You can pull the latest Docker image from the GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/flightofthefox/hyperscale-rs:latest
+```
+
 ## Prerequisites
 
 ### 1. Install Rust
@@ -166,3 +178,34 @@ Example command (adjust ports as needed):
   --tps 100 \
   --duration 30s
 ```
+
+
+## Troubleshooting
+
+### Windows: "Path too long" Error
+
+If you encounter "path too long" errors during `cargo build` on Windows (often due to deep dependency trees), you need to enable Long Paths in Windows.
+
+1.  Open **PowerShell** as Administrator.
+2.  Run the following command to enable long paths in the registry:
+    ```powershell
+    New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force
+    ```
+3.  Restart your computer (or sign out and back in).
+4.  Run this git command to ensure git uses long paths:
+    ```bash
+    git config --system core.longpaths true
+    ```
+
+### Windows: "Can't find clang.dll" or "libclang.dll"
+
+If you see errors about missing `clang.dll` or `libclang.dll` during build (usually from `rocksdb` or `bindgen`), you need to set the `LIBCLANG_PATH` environment variable.
+
+1.  Ensure LLVM is installed (`choco install llvm`).
+2.  Ensure protobuf is installed (`choco install protobuf`).
+3.  Set the environment variable to your LLVM `bin` directory:
+    ```powershell
+    $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
+    ```
+    (Or add it permanently to your System Environment Variables).
+

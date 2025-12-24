@@ -231,6 +231,10 @@ pub struct BftState {
     /// Current time (set by runner before each handle call).
     now: Duration,
 
+    /// Timestamp of the last block proposal we made.
+    /// Used for rate limiting block production via min_block_interval.
+    last_proposal_time: Duration,
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Statistics
     // ═══════════════════════════════════════════════════════════════════════════
@@ -307,6 +311,7 @@ impl BftState {
             pending_commits_awaiting_data: HashMap::new(),
             config,
             now: Duration::ZERO,
+            last_proposal_time: Duration::ZERO,
             view_changes: 0,
         }
     }
@@ -359,6 +364,16 @@ impl BftState {
     /// Check if we should propose.
     fn should_propose(&self, height: u64, round: u64) -> bool {
         self.topology.should_propose(height, round)
+    }
+
+    /// Check if pipeline backpressure should prevent proposing.
+    ///
+    /// Returns true if the gap between QC height and committed height exceeds the limit.
+    /// This prevents runaway pipelining where QC advances faster than commits can follow,
+    /// which can cause slower validators to fall behind and eventually lose quorum.
+    fn pipeline_backpressure(&self) -> bool {
+        let qc_height = self.latest_qc.as_ref().map(|qc| qc.height.0).unwrap_or(0);
+        qc_height > self.committed_height + self.config.pipeline_backpressure_limit
     }
 
     /// Get committee index for a validator.
@@ -435,6 +450,7 @@ impl BftState {
     /// Handle chain metadata fetched from storage (recovery).
     ///
     /// Called when the runner completes `Action::FetchChainMetadata`.
+    #[instrument(skip(self, qc), fields(height = height.0, has_hash = hash.is_some(), has_qc = qc.is_some()))]
     pub fn on_chain_metadata_fetched(
         &mut self,
         height: BlockHeight,
@@ -534,6 +550,22 @@ impl BftState {
                 validator = ?self.validator_id(),
                 expected = ?self.proposer_for(next_height, round),
                 "Not the proposer for this height/round"
+            );
+            return actions;
+        }
+
+        // Check pipeline backpressure - if QC is too far ahead of commits, wait.
+        // This prevents runaway pipelining that can cause slower validators to fall
+        // behind and eventually lose quorum.
+        if self.pipeline_backpressure() {
+            let qc_height = self.latest_qc.as_ref().map(|qc| qc.height.0).unwrap_or(0);
+            info!(
+                validator = ?self.validator_id(),
+                qc_height = qc_height,
+                committed_height = self.committed_height,
+                gap = qc_height.saturating_sub(self.committed_height),
+                limit = self.config.pipeline_backpressure_limit,
+                "Pipeline backpressure - skipping proposal to let commits catch up"
             );
             return actions;
         }
@@ -702,6 +734,9 @@ impl BftState {
             commitment_proofs,
         );
 
+        // Track proposal time for rate limiting
+        self.last_proposal_time = self.now;
+
         actions.push(Action::BroadcastToShard {
             shard: self.local_shard(),
             message: OutboundMessage::BlockHeader(Box::new(gossip)),
@@ -782,6 +817,9 @@ impl BftState {
 
         // Create gossip message (fallback blocks have no transactions, deferrals, or aborts)
         let gossip = hyperscale_messages::BlockHeaderGossip::new(header, vec![]);
+
+        // Track proposal time for rate limiting
+        self.last_proposal_time = self.now;
 
         actions.push(Action::BroadcastToShard {
             shard: self.local_shard(),
@@ -1050,18 +1088,30 @@ impl BftState {
                     block_hash = ?block_hash,
                     height = height,
                     voting_power = vote_set.voting_power(),
-                    "Header arrived, quorum already reached - forming QC"
+                    "Header arrived, quorum already reached - building QC"
                 );
 
-                match vote_set.build_qc(block_hash) {
-                    Ok(qc) => {
-                        actions.push(Action::EnqueueInternal {
-                            event: Event::QuorumCertificateFormed { block_hash, qc },
-                        });
-                    }
-                    Err(e) => {
-                        warn!("Failed to build QC after header arrival: {}", e);
-                    }
+                // Extract data for async QC building (BLS aggregation is expensive)
+                if let Some((
+                    height,
+                    round,
+                    parent_block_hash,
+                    votes,
+                    signers,
+                    voting_power,
+                    timestamp_weight_sum,
+                )) = vote_set.prepare_qc_build()
+                {
+                    actions.push(Action::BuildQuorumCertificate {
+                        block_hash,
+                        height,
+                        round,
+                        parent_block_hash,
+                        votes,
+                        signers,
+                        voting_power: VotePower(voting_power),
+                        timestamp_weight_sum,
+                    });
                 }
             }
         }
@@ -1092,42 +1142,24 @@ impl BftState {
             return actions;
         }
 
-        // Block not complete yet - request missing data immediately
-        // The runner handles retries; BFT just requests what it needs
+        // Block not complete yet - don't fetch immediately!
+        // Wait for the configured timeout to give gossip/local creation a chance.
+        // The cleanup timer calls check_pending_block_fetches() periodically to
+        // emit fetch requests for blocks that have been waiting long enough.
+        //
+        // This reduces unnecessary network traffic:
+        // - Transactions often arrive via gossip before we need to fetch
+        // - Certificates can be created locally from state certificates
         if let Some(pending) = self.pending_blocks.get(&block_hash) {
-            let proposer = pending.header().proposer;
-
-            // Request missing transactions
-            let missing_txs = pending.missing_transactions();
-            if !missing_txs.is_empty() {
-                debug!(
-                    validator = ?self.validator_id(),
-                    block_hash = ?block_hash,
-                    missing_tx_count = missing_txs.len(),
-                    "Requesting missing transactions for incomplete block"
-                );
-                actions.push(Action::FetchTransactions {
-                    block_hash,
-                    proposer,
-                    tx_hashes: missing_txs,
-                });
-            }
-
-            // Request missing certificates
-            let missing_certs = pending.missing_certificates();
-            if !missing_certs.is_empty() {
-                debug!(
-                    validator = ?self.validator_id(),
-                    block_hash = ?block_hash,
-                    missing_cert_count = missing_certs.len(),
-                    "Requesting missing certificates for incomplete block"
-                );
-                actions.push(Action::FetchCertificates {
-                    block_hash,
-                    proposer,
-                    cert_hashes: missing_certs,
-                });
-            }
+            debug!(
+                validator = ?self.validator_id(),
+                block_hash = ?block_hash,
+                missing_txs = pending.missing_transaction_count(),
+                missing_certs = pending.missing_certificate_count(),
+                tx_timeout_ms = self.config.transaction_fetch_timeout.as_millis(),
+                cert_timeout_ms = self.config.certificate_fetch_timeout.as_millis(),
+                "Block incomplete, will fetch after timeout if still missing"
+            );
         }
 
         actions
@@ -1531,18 +1563,27 @@ impl BftState {
     ///
     /// # Ordering Rules
     ///
-    /// Transactions must be ordered as follows:
-    /// 1. **Priority group first**: Cross-shard TXs with CommitmentProof (in hash order)
-    /// 2. **Others second**: All other TXs (in hash order)
+    /// Transactions must be ordered in three priority tiers:
+    /// 1. **Retries first**: Retry transactions (have `retry_details`), sorted by hash
+    /// 2. **With proofs second**: Non-retry TXs with CommitmentProof, sorted by hash
+    /// 3. **Others third**: All other TXs, sorted by hash
     ///
-    /// Within each group, transactions must be sorted by hash (ascending).
-    /// This deterministic ordering:
-    /// - Reduces cross-shard conflicts (all shards pick same TXs)
-    /// - Prioritizes TXs that other shards are waiting on
-    /// - Is verifiable by all validators without local state
+    /// Within each tier, transactions must be sorted by hash (ascending).
     ///
-    /// The commitment proofs are stored in the block's `commitment_proofs` field,
-    /// making the block self-contained for validation.
+    /// # Why This Ordering
+    ///
+    /// - **Retries** have highest priority because they represent deferred transactions
+    ///   that have already been through one execution cycle. Fast inclusion prevents
+    ///   stalls and livelock cascades.
+    /// - **CommitmentProof TXs** have high priority because other shards are waiting
+    ///   on us to process them.
+    /// - **Others** are fresh transactions with no urgency.
+    ///
+    /// # Proof Verification
+    ///
+    /// Both priority tiers are verifiable from block contents:
+    /// - `RetryDetails` is embedded in the transaction itself
+    /// - `CommitmentProof` is stored in `block.commitment_proofs`
     fn validate_transaction_ordering(&self, block: &Block) -> Result<(), String> {
         let txs = &block.transactions;
 
@@ -1550,59 +1591,100 @@ impl BftState {
             return Ok(());
         }
 
-        // Split into priority (with proof in block) and others (without proof)
+        // Split into three tiers based on priority
+        let mut retries: Vec<Hash> = Vec::new();
         let mut with_proof: Vec<Hash> = Vec::new();
-        let mut without_proof: Vec<Hash> = Vec::new();
+        let mut others: Vec<Hash> = Vec::new();
 
         for tx in txs.iter() {
             let tx_hash = tx.hash();
-            if block.has_commitment_proof(&tx_hash) {
+            if tx.is_retry() {
+                retries.push(tx_hash);
+            } else if block.has_commitment_proof(&tx_hash) {
                 with_proof.push(tx_hash);
             } else {
-                without_proof.push(tx_hash);
+                others.push(tx_hash);
             }
         }
 
-        // Verify priority group is sorted by hash
+        // Verify each tier is sorted by hash
+        for window in retries.windows(2) {
+            if window[0] >= window[1] {
+                return Err(format!(
+                    "Retry transactions not in hash order: {} should be < {}",
+                    window[0], window[1]
+                ));
+            }
+        }
+
         for window in with_proof.windows(2) {
             if window[0] >= window[1] {
                 return Err(format!(
-                    "Priority transactions not in hash order: {} should be < {}",
+                    "CommitmentProof transactions not in hash order: {} should be < {}",
                     window[0], window[1]
                 ));
             }
         }
 
-        // Verify others group is sorted by hash
-        for window in without_proof.windows(2) {
+        for window in others.windows(2) {
             if window[0] >= window[1] {
                 return Err(format!(
-                    "Non-priority transactions not in hash order: {} should be < {}",
+                    "Other transactions not in hash order: {} should be < {}",
                     window[0], window[1]
                 ));
             }
         }
 
-        // Verify priority group comes before others group
-        // (all TXs with proof must have lower index than all TXs without proof)
-        if !with_proof.is_empty() && !without_proof.is_empty() {
-            // Find the last TX with proof and first TX without proof
-            let mut last_proof_idx = 0;
-            let mut first_no_proof_idx = txs.len();
+        // Verify tier ordering: retries < with_proof < others
+        // Track the last index seen in each tier and first index of next tier
+        let mut last_retry_idx: Option<usize> = None;
+        let mut first_proof_idx: Option<usize> = None;
+        let mut last_proof_idx: Option<usize> = None;
+        let mut first_other_idx: Option<usize> = None;
 
-            for (i, tx) in txs.iter().enumerate() {
-                let tx_hash = tx.hash();
-                if block.has_commitment_proof(&tx_hash) {
-                    last_proof_idx = i;
-                } else if first_no_proof_idx == txs.len() {
-                    first_no_proof_idx = i;
+        for (i, tx) in txs.iter().enumerate() {
+            let tx_hash = tx.hash();
+            if tx.is_retry() {
+                last_retry_idx = Some(i);
+            } else if block.has_commitment_proof(&tx_hash) {
+                if first_proof_idx.is_none() {
+                    first_proof_idx = Some(i);
                 }
+                last_proof_idx = Some(i);
+            } else if first_other_idx.is_none() {
+                first_other_idx = Some(i);
             }
+        }
 
-            if last_proof_idx > first_no_proof_idx {
+        // Check: all retries must come before all with_proof
+        if let (Some(last_retry), Some(first_proof)) = (last_retry_idx, first_proof_idx) {
+            if last_retry > first_proof {
                 return Err(format!(
-                    "Priority transactions must come before non-priority: found proof TX at index {} after non-proof TX at index {}",
-                    last_proof_idx, first_no_proof_idx
+                    "Retry transactions must come before CommitmentProof transactions: \
+                     found retry at index {} after proof TX at index {}",
+                    last_retry, first_proof
+                ));
+            }
+        }
+
+        // Check: all retries must come before all others
+        if let (Some(last_retry), Some(first_other)) = (last_retry_idx, first_other_idx) {
+            if last_retry > first_other {
+                return Err(format!(
+                    "Retry transactions must come before other transactions: \
+                     found retry at index {} after other TX at index {}",
+                    last_retry, first_other
+                ));
+            }
+        }
+
+        // Check: all with_proof must come before all others
+        if let (Some(last_proof), Some(first_other)) = (last_proof_idx, first_other_idx) {
+            if last_proof > first_other {
+                return Err(format!(
+                    "CommitmentProof transactions must come before other transactions: \
+                     found proof TX at index {} after other TX at index {}",
+                    last_proof, first_other
                 ));
             }
         }
@@ -1611,6 +1693,11 @@ impl BftState {
     }
 
     /// Create a vote for a block.
+    #[tracing::instrument(level = "debug", skip(self), fields(
+        height = height,
+        round = round,
+        sign_us = tracing::field::Empty,
+    ))]
     fn create_vote(&mut self, block_hash: Hash, height: u64, round: u64) -> Vec<Action> {
         // Record that we voted for this block at this height
         // This is the core safety invariant: once we vote for a block at a height,
@@ -1620,7 +1707,9 @@ impl BftState {
         // Create signature with domain separation (prevents cross-shard replay)
         let signing_message =
             Self::block_vote_message(self.shard_group, height, round, &block_hash);
+        let sign_start = std::time::Instant::now();
         let signature = self.signing_key.sign(&signing_message);
+        tracing::Span::current().record("sign_us", sign_start.elapsed().as_micros() as u64);
         let timestamp = self.now.as_millis() as u64;
 
         let vote = BlockVote {
@@ -1916,23 +2005,62 @@ impl BftState {
                 block_hash = ?block_hash,
                 height = height,
                 voting_power = vote_set.voting_power(),
-                "Quorum reached, forming QC"
+                "Quorum reached, building QC"
             );
 
-            // Build QC
-            match vote_set.build_qc(block_hash) {
-                Ok(qc) => {
-                    return vec![Action::EnqueueInternal {
-                        event: Event::QuorumCertificateFormed { block_hash, qc },
-                    }];
-                }
-                Err(e) => {
-                    warn!("Failed to build QC: {}", e);
-                }
+            // Extract data for async QC building (BLS aggregation is expensive)
+            if let Some((
+                height,
+                round,
+                parent_block_hash,
+                votes,
+                signers,
+                voting_power,
+                timestamp_weight_sum,
+            )) = vote_set.prepare_qc_build()
+            {
+                return vec![Action::BuildQuorumCertificate {
+                    block_hash,
+                    height,
+                    round,
+                    parent_block_hash,
+                    votes,
+                    signers,
+                    voting_power: VotePower(voting_power),
+                    timestamp_weight_sum,
+                }];
             }
         }
 
         vec![]
+    }
+
+    /// Handle QC building completion.
+    ///
+    /// Called when the runner completes `Action::BuildQuorumCertificate`.
+    /// The QC is formed by aggregating BLS signatures from collected votes.
+    #[instrument(skip(self, qc), fields(block_hash = ?block_hash, success = qc.is_some()))]
+    pub fn on_qc_built(&mut self, block_hash: Hash, qc: Option<QuorumCertificate>) -> Vec<Action> {
+        match qc {
+            Some(qc) => {
+                info!(
+                    block_hash = ?block_hash,
+                    height = qc.height.0,
+                    voting_power = qc.voting_power.0,
+                    "QC built successfully"
+                );
+                vec![Action::EnqueueInternal {
+                    event: Event::QuorumCertificateFormed { block_hash, qc },
+                }]
+            }
+            None => {
+                warn!(
+                    block_hash = ?block_hash,
+                    "Failed to build QC - signature aggregation failed"
+                );
+                vec![]
+            }
+        }
     }
 
     /// Handle QC signature verification result.
@@ -2026,6 +2154,79 @@ impl BftState {
     // QC and Commit Logic
     // ═══════════════════════════════════════════════════════════════════════════
 
+    /// Count transactions and certificates in the block that would be committed by a QC.
+    ///
+    /// This is used by the mempool to account for "about to be committed" transactions
+    /// when calculating in-flight limits. When a QC forms, the 2-chain commit rule
+    /// may commit a parent block, but that commit event won't be processed until after
+    /// transaction selection. This method allows the caller to preemptively count:
+    /// - Transactions that will INCREASE in-flight (new commits)
+    /// - Certificates that will DECREASE in-flight (completed transactions)
+    ///
+    /// Returns (tx_count, cert_count). Both are 0 if the QC won't trigger a commit
+    /// or the block data isn't available.
+    pub fn pending_commit_counts(&self, qc: &QuorumCertificate) -> (usize, usize) {
+        if !qc.has_committable_block() {
+            return (0, 0);
+        }
+
+        let Some(committable_hash) = qc.committable_hash() else {
+            return (0, 0);
+        };
+        let Some(committable_height) = qc.committable_height() else {
+            return (0, 0);
+        };
+
+        // Only count if we haven't already committed this height
+        if committable_height.0 <= self.committed_height {
+            return (0, 0);
+        }
+
+        // Look up the block to count transactions and certificates
+        if let Some(pending) = self.pending_blocks.get(&committable_hash) {
+            if let Some(block) = pending.block() {
+                (block.transactions.len(), block.committed_certificates.len())
+            } else {
+                (0, 0)
+            }
+        } else if let Some((block, _)) = self.certified_blocks.get(&committable_hash) {
+            (block.transactions.len(), block.committed_certificates.len())
+        } else {
+            (0, 0)
+        }
+    }
+
+    /// Count transactions in the block that would be committed by a QC.
+    ///
+    /// Convenience method - returns only the transaction count.
+    /// Use `pending_commit_counts` if you also need certificate count.
+    pub fn pending_commit_tx_count(&self, qc: &QuorumCertificate) -> usize {
+        self.pending_commit_counts(qc).0
+    }
+
+    /// Count transactions and certificates in ALL pending blocks above committed height.
+    ///
+    /// This accounts for pipelining in chained BFT: multiple blocks can be proposed
+    /// before the first one commits. Each pending block's transactions will increase
+    /// in-flight when they commit, and each pending block's certificates will decrease
+    /// in-flight.
+    ///
+    /// Returns (total_tx_count, total_cert_count) across all pending blocks.
+    pub fn pending_block_tx_cert_counts(&self) -> (usize, usize) {
+        let mut total_txs = 0;
+        let mut total_certs = 0;
+
+        for pending in self.pending_blocks.values() {
+            // Use original_tx_order/original_cert_order which are available even
+            // before the block is fully constructed (waiting for tx/cert data).
+            // These give us the counts from the block header.
+            total_txs += pending.all_transaction_hashes().len();
+            total_certs += pending.all_certificate_hashes().len();
+        }
+
+        (total_txs, total_certs)
+    }
+
     /// Handle QC formation.
     ///
     /// When a QC forms, we:
@@ -2076,6 +2277,47 @@ impl BftState {
 
         let mut actions = vec![];
 
+        // Persist the certified block immediately so it's available for sync.
+        // In HotStuff-2, block N gets certified (QC formed) before it's committed
+        // (which happens when block N+1 gets certified). If we only persist on commit,
+        // there's a window where the QC exists but the block isn't in storage,
+        // causing sync failures when other validators try to fetch it.
+        //
+        // TODO: This creates duplicate persistence - blocks are persisted here on QC
+        // formation AND again on commit (in on_block_ready_to_commit). RocksDB handles
+        // this efficiently (idempotent overwrite), but we should consider either:
+        // (a) tracking persisted blocks to skip duplicates, or
+        // (b) removing PersistBlock from the commit path for non-synced blocks.
+        let block = if let Some(pending) = self.pending_blocks.get(&block_hash) {
+            pending.block().map(|b| (*b).clone())
+        } else if let Some((block, _)) = self.certified_blocks.get(&block_hash) {
+            Some(block.clone())
+        } else {
+            None
+        };
+
+        if let Some(block) = block {
+            debug!(
+                validator = ?self.validator_id(),
+                height = height,
+                block_hash = ?block_hash,
+                "Persisting certified block for sync availability"
+            );
+            actions.push(Action::PersistBlock {
+                block,
+                qc: qc.clone(),
+            });
+        } else {
+            // Block not yet complete - this can happen if we're still fetching
+            // transactions/certificates. The block will be persisted when it commits.
+            debug!(
+                validator = ?self.validator_id(),
+                height = height,
+                block_hash = ?block_hash,
+                "Cannot persist certified block - not yet complete"
+            );
+        }
+
         // Two-chain commit rule: when we have QC for block N,
         // we can commit block N-1 (the parent)
         if qc.has_committable_block() {
@@ -2103,6 +2345,10 @@ impl BftState {
         // just waste resources on signature verification and storage. If there's
         // nothing to include, the regular proposal timer will fire and propagate
         // the QC then.
+        //
+        // Rate limiting: Even with content, we respect min_block_interval to prevent
+        // burst behavior under high load. If we proposed too recently, let the
+        // regular proposal timer handle it.
         let next_height = height + 1;
         let round = self.view;
 
@@ -2111,7 +2357,10 @@ impl BftState {
             || !aborted.is_empty()
             || !certificates.is_empty();
 
-        if has_content && self.should_propose(next_height, round) {
+        let time_since_last_proposal = self.now.saturating_sub(self.last_proposal_time);
+        let rate_limited = time_since_last_proposal < self.config.min_block_interval;
+
+        if has_content && self.should_propose(next_height, round) && !rate_limited {
             debug!(
                 validator = ?self.validator_id(),
                 next_height = next_height,
@@ -2127,6 +2376,14 @@ impl BftState {
                 certificates,
                 commitment_proofs,
             ));
+        } else if has_content && self.should_propose(next_height, round) && rate_limited {
+            trace!(
+                validator = ?self.validator_id(),
+                next_height = next_height,
+                time_since_last_ms = time_since_last_proposal.as_millis(),
+                min_interval_ms = self.config.min_block_interval.as_millis(),
+                "Rate limiting immediate proposal after QC - waiting for proposal timer"
+            );
         }
 
         actions
@@ -2881,6 +3138,7 @@ impl BftState {
     ///
     /// If the pending block is still incomplete, emit TransactionNeeded
     /// so the runner can request the missing transactions from a peer.
+    #[instrument(skip(self), fields(block_hash = ?block_hash))]
     pub fn on_transaction_fetch_timer(&mut self, block_hash: Hash) -> Vec<Action> {
         let Some(pending) = self.pending_blocks.get(&block_hash) else {
             // Block no longer pending (completed or removed)
@@ -2919,6 +3177,7 @@ impl BftState {
     ///
     /// Adds the fetched transactions to the pending block and triggers
     /// voting if the block is now complete.
+    #[instrument(skip(self, transactions), fields(block_hash = ?block_hash, tx_count = transactions.len()))]
     pub fn on_transaction_fetch_received(
         &mut self,
         block_hash: Hash,
@@ -3037,6 +3296,7 @@ impl BftState {
     ///
     /// If the pending block is still missing certificates, emit CertificateNeeded
     /// so the runner can request them from a peer.
+    #[instrument(skip(self), fields(block_hash = ?block_hash))]
     pub fn on_certificate_fetch_timer(&mut self, block_hash: Hash) -> Vec<Action> {
         let Some(pending) = self.pending_blocks.get(&block_hash) else {
             // Block no longer pending (completed or removed)
@@ -3078,6 +3338,7 @@ impl BftState {
     ///
     /// Note: Certificates should be verified by the caller before passing here.
     /// This method assumes the certificates have been validated.
+    #[instrument(skip(self, certificates), fields(block_hash = ?block_hash, cert_count = certificates.len()))]
     pub fn on_certificate_fetch_received(
         &mut self,
         block_hash: Hash,
@@ -3204,6 +3465,7 @@ impl BftState {
     /// - Should proposers persist block data before broadcasting?
     /// - How do we handle the case where the proposer is the only one with the data
     ///   and they crash/disappear?
+    #[instrument(skip(self), fields(block_hash = ?block_hash))]
     pub fn on_fetch_failed(&mut self, block_hash: Hash) -> Vec<Action> {
         // Check if this block has a QC - if so, we MUST get the data eventually
         let has_qc = self.certified_blocks.contains_key(&block_hash)
@@ -3254,37 +3516,25 @@ impl BftState {
             }
         }
 
-        // No QC for this block - safe to give up and let sync handle it
-        if let Some(pending) = self.pending_blocks.remove(&block_hash) {
+        // No QC for this block yet - don't remove it, just stop actively fetching.
+        // The block might still complete via:
+        // 1. StateCertificate gossip → local TransactionCertificate creation
+        // 2. Later fetches triggered by cleanup timer
+        // 3. Certificates arriving from other sources
+        //
+        // The stale_pending_block_timeout will clean up truly dead blocks later.
+        if let Some(pending) = self.pending_blocks.get(&block_hash) {
             let height = pending.header().height.0;
-            warn!(
+            debug!(
                 validator = ?self.validator_id(),
                 block_hash = ?block_hash,
                 height = height,
                 missing_txs = pending.missing_transaction_count(),
                 missing_certs = pending.missing_certificate_count(),
-                "Removing pending block due to permanent fetch failure"
-            );
-            self.pending_block_created_at.remove(&block_hash);
-        }
-
-        // Also clean up any buffered commit that was waiting for this block's data.
-        // Without this, the entry would stay in pending_commits_awaiting_data forever
-        // since the block will never complete.
-        if self
-            .pending_commits_awaiting_data
-            .remove(&block_hash)
-            .is_some()
-        {
-            debug!(
-                validator = ?self.validator_id(),
-                block_hash = ?block_hash,
-                "Removed buffered commit awaiting data for failed fetch"
+                "Fetch failed but keeping pending block - may complete via gossip/local creation"
             );
         }
 
-        // Sync will be triggered by check_sync_health() when it detects we can't
-        // make progress (next block to commit is missing or incomplete)
         vec![]
     }
 
@@ -3534,6 +3784,74 @@ impl BftState {
             .retain(|_, height| *height > committed_height.saturating_sub(2));
     }
 
+    /// Check pending blocks and emit fetch requests for those that have been
+    /// waiting longer than the configured timeout.
+    ///
+    /// This is called periodically by the cleanup timer. Instead of fetching
+    /// immediately when a block header arrives, we give gossip and local
+    /// certificate creation time to fill in the missing data first.
+    ///
+    /// - `transaction_fetch_timeout`: How long to wait before fetching missing txs
+    /// - `certificate_fetch_timeout`: How long to wait before fetching missing certs
+    pub fn check_pending_block_fetches(&self) -> Vec<Action> {
+        let now = self.now;
+        let tx_timeout = self.config.transaction_fetch_timeout;
+        let cert_timeout = self.config.certificate_fetch_timeout;
+        let mut actions = Vec::new();
+
+        for (block_hash, pending) in &self.pending_blocks {
+            // Skip complete blocks
+            if pending.is_complete() {
+                continue;
+            }
+
+            let Some(&created_at) = self.pending_block_created_at.get(block_hash) else {
+                continue;
+            };
+
+            let age = now.saturating_sub(created_at);
+            let proposer = pending.header().proposer;
+
+            // Check if we should fetch missing transactions
+            let missing_txs = pending.missing_transactions();
+            if !missing_txs.is_empty() && age >= tx_timeout {
+                debug!(
+                    validator = ?self.validator_id(),
+                    block_hash = ?block_hash,
+                    missing_tx_count = missing_txs.len(),
+                    age_ms = age.as_millis(),
+                    timeout_ms = tx_timeout.as_millis(),
+                    "Fetch timeout reached, requesting missing transactions"
+                );
+                actions.push(Action::FetchTransactions {
+                    block_hash: *block_hash,
+                    proposer,
+                    tx_hashes: missing_txs,
+                });
+            }
+
+            // Check if we should fetch missing certificates
+            let missing_certs = pending.missing_certificates();
+            if !missing_certs.is_empty() && age >= cert_timeout {
+                debug!(
+                    validator = ?self.validator_id(),
+                    block_hash = ?block_hash,
+                    missing_cert_count = missing_certs.len(),
+                    age_ms = age.as_millis(),
+                    timeout_ms = cert_timeout.as_millis(),
+                    "Fetch timeout reached, requesting missing certificates"
+                );
+                actions.push(Action::FetchCertificates {
+                    block_hash: *block_hash,
+                    proposer,
+                    cert_hashes: missing_certs,
+                });
+            }
+        }
+
+        actions
+    }
+
     /// Clean up stale incomplete pending blocks.
     ///
     /// Removes pending blocks that:
@@ -3718,6 +4036,24 @@ impl BftState {
             current_round: self.view,
             committed_height: self.committed_height,
         }
+    }
+
+    /// Check if pipeline backpressure is active.
+    ///
+    /// Returns true when QC height is too far ahead of committed height,
+    /// meaning proposals are being skipped to let commits catch up.
+    pub fn is_pipeline_backpressure_active(&self) -> bool {
+        self.pipeline_backpressure()
+    }
+
+    /// Check if we are the proposer for the current height and round.
+    pub fn is_current_proposer(&self) -> bool {
+        let next_height = self
+            .latest_qc
+            .as_ref()
+            .map(|qc| qc.height.0 + 1)
+            .unwrap_or(self.committed_height + 1);
+        self.should_propose(next_height, self.view)
     }
 
     /// Get the BFT configuration.
@@ -3905,6 +4241,9 @@ impl SubStateMachine for BftState {
             }
             Event::QcSignatureVerified { block_hash, valid } => {
                 Some(self.on_qc_signature_verified(*block_hash, *valid))
+            }
+            Event::QuorumCertificateBuilt { block_hash, qc } => {
+                Some(self.on_qc_built(*block_hash, qc.clone()))
             }
             Event::ChainMetadataFetched { height, hash, qc } => {
                 Some(self.on_chain_metadata_fetched(*height, *hash, qc.clone()))
@@ -6517,7 +6856,7 @@ mod tests {
         Arc<hyperscale_types::RoutableTransaction>,
         Option<CommitmentProof>,
     ) {
-        use hyperscale_types::{test_utils, PartitionNumber, ShardGroupId};
+        use hyperscale_types::{test_utils, ShardGroupId, StateEntry};
 
         let tx = test_utils::test_transaction(seed);
         let tx_arc = Arc::new(tx);
@@ -6530,12 +6869,7 @@ mod tests {
                 SignerBitfield::new(4),
                 Signature::zero(),
                 BlockHeight(1),
-                vec![hyperscale_types::StateEntry::new(
-                    node,
-                    PartitionNumber(0),
-                    vec![],
-                    None,
-                )],
+                vec![StateEntry::test_entry(node, 0, vec![], None)],
             ))
         } else {
             None
@@ -6547,6 +6881,14 @@ mod tests {
     fn make_test_tx(seed: u8, _with_proof: bool) -> Arc<hyperscale_types::RoutableTransaction> {
         use hyperscale_types::test_utils;
         Arc::new(test_utils::test_transaction(seed))
+    }
+
+    /// Create a retry transaction for testing.
+    fn make_retry_tx(seed: u8) -> Arc<hyperscale_types::RoutableTransaction> {
+        use hyperscale_types::test_utils;
+        let original = test_utils::test_transaction(seed);
+        let winner_hash = Hash::from_bytes(&[seed.wrapping_add(100); 32]);
+        Arc::new(original.create_retry(winner_hash, BlockHeight(1)))
     }
 
     /// Sort transactions by hash for test setup
@@ -6657,7 +6999,7 @@ mod tests {
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
-            .contains("Priority transactions not in hash order"));
+            .contains("CommitmentProof transactions not in hash order"));
     }
 
     #[test]
@@ -6678,7 +7020,7 @@ mod tests {
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
-            .contains("Priority transactions must come before non-priority"));
+            .contains("CommitmentProof transactions must come before other transactions"));
     }
 
     #[test]
@@ -6701,5 +7043,576 @@ mod tests {
 
         let block = make_test_block_with_proofs(5, txs, proofs);
         assert!(state.validate_transaction_ordering(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_retries_first() {
+        let state = make_test_state();
+
+        // Create retry TXs, proof TXs, and regular TXs
+        let retry1 = make_retry_tx(10);
+        let retry2 = make_retry_tx(20);
+        let (proof_tx, proof) = make_test_tx_with_proof(30, true);
+        let regular = make_test_tx(40, false);
+
+        // Sort each tier by hash
+        let mut retries = vec![retry1.clone(), retry2.clone()];
+        sort_txs_by_hash(&mut retries);
+
+        let mut proofs_vec = vec![proof_tx.clone()];
+        sort_txs_by_hash(&mut proofs_vec);
+
+        let mut others = vec![regular.clone()];
+        sort_txs_by_hash(&mut others);
+
+        // Combine in correct order: retries, then proofs, then others
+        let mut txs = Vec::new();
+        txs.extend(retries);
+        txs.extend(proofs_vec);
+        txs.extend(others);
+
+        let mut proofs_map = HashMap::new();
+        proofs_map.insert(proof_tx.hash(), proof.unwrap());
+
+        let block = make_test_block_with_proofs(5, txs, proofs_map);
+        assert!(state.validate_transaction_ordering(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_invalid_retry_after_proof() {
+        let state = make_test_state();
+
+        // Create a retry and a proof TX
+        let retry = make_retry_tx(10);
+        let (proof_tx, proof) = make_test_tx_with_proof(30, true);
+
+        // Invalid order: proof TX before retry
+        let txs = vec![proof_tx.clone(), retry.clone()];
+
+        let mut proofs_map = HashMap::new();
+        proofs_map.insert(proof_tx.hash(), proof.unwrap());
+
+        let block = make_test_block_with_proofs(5, txs, proofs_map);
+        let result = state.validate_transaction_ordering(&block);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Retry transactions must come before"),
+            "Should detect retry after proof TX"
+        );
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_invalid_retry_after_other() {
+        let state = make_test_state();
+
+        // Create a retry and a regular TX
+        let retry = make_retry_tx(10);
+        let regular = make_test_tx(30, false);
+
+        // Invalid order: regular TX before retry
+        let txs = vec![regular.clone(), retry.clone()];
+
+        let block = make_test_block_with_transactions(5, txs);
+        let result = state.validate_transaction_ordering(&block);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Retry transactions must come before"),
+            "Should detect retry after regular TX"
+        );
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_retries_only() {
+        let state = make_test_state();
+
+        // All retries - valid as long as sorted
+        let mut txs = vec![make_retry_tx(10), make_retry_tx(20), make_retry_tx(30)];
+        sort_txs_by_hash(&mut txs);
+
+        let block = make_test_block_with_transactions(5, txs);
+        assert!(state.validate_transaction_ordering(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_transaction_ordering_retries_unsorted() {
+        let state = make_test_state();
+
+        // Retries not sorted by hash
+        let mut txs = vec![make_retry_tx(10), make_retry_tx(20), make_retry_tx(30)];
+        sort_txs_by_hash(&mut txs);
+        txs.reverse(); // Make invalid
+
+        let block = make_test_block_with_transactions(5, txs);
+        let result = state.validate_transaction_ordering(&block);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Retry transactions not in hash order"));
+    }
+
+    #[test]
+    fn test_pipeline_backpressure_no_qc() {
+        let state = make_test_state();
+
+        // No QC yet, committed_height = 0 -> no backpressure
+        assert!(!state.pipeline_backpressure());
+    }
+
+    #[test]
+    fn test_pipeline_backpressure_within_limit() {
+        let mut state = make_test_state();
+
+        // Set committed height to 5
+        state.committed_height = 5;
+
+        // Set QC at height 10 (gap of 5, within default limit of 12)
+        state.latest_qc = Some(QuorumCertificate {
+            block_hash: Hash::from_bytes(b"test"),
+            height: BlockHeight(10),
+            parent_block_hash: Hash::from_bytes(b"parent"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 0,
+        });
+
+        // Gap is 5, limit is 12 -> no backpressure
+        assert!(!state.pipeline_backpressure());
+    }
+
+    #[test]
+    fn test_pipeline_backpressure_at_limit() {
+        let mut state = make_test_state();
+
+        // Set committed height to 5
+        state.committed_height = 5;
+
+        // Set QC at height 17 (gap of exactly 12, at the limit)
+        state.latest_qc = Some(QuorumCertificate {
+            block_hash: Hash::from_bytes(b"test"),
+            height: BlockHeight(17),
+            parent_block_hash: Hash::from_bytes(b"parent"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 0,
+        });
+
+        // Gap is 12, limit is 12 -> no backpressure (limit is exclusive: qc > committed + limit)
+        assert!(!state.pipeline_backpressure());
+    }
+
+    #[test]
+    fn test_pipeline_backpressure_exceeds_limit() {
+        let mut state = make_test_state();
+
+        // Set committed height to 5
+        state.committed_height = 5;
+
+        // Set QC at height 18 (gap of 13, exceeds default limit of 12)
+        state.latest_qc = Some(QuorumCertificate {
+            block_hash: Hash::from_bytes(b"test"),
+            height: BlockHeight(18),
+            parent_block_hash: Hash::from_bytes(b"parent"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 0,
+        });
+
+        // Gap is 13, limit is 12 -> BACKPRESSURE
+        assert!(state.pipeline_backpressure());
+    }
+
+    #[test]
+    fn test_pipeline_backpressure_configurable_limit() {
+        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+
+        // Create config with smaller limit
+        let config = BftConfig {
+            pipeline_backpressure_limit: 5,
+            ..BftConfig::default()
+        };
+
+        let mut state = BftState::new(
+            0,
+            keys[0].clone(),
+            topology,
+            config,
+            RecoveredState::default(),
+        );
+
+        state.committed_height = 10;
+        state.latest_qc = Some(QuorumCertificate {
+            block_hash: Hash::from_bytes(b"test"),
+            height: BlockHeight(16), // Gap of 6, exceeds limit of 5
+            parent_block_hash: Hash::from_bytes(b"parent"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 0,
+        });
+
+        // Gap is 6, limit is 5 -> BACKPRESSURE
+        assert!(state.pipeline_backpressure());
+    }
+
+    #[test]
+    fn test_min_block_interval_rate_limits_immediate_proposal() {
+        // When a QC forms with content but we proposed too recently,
+        // the immediate proposal should be rate-limited.
+        use hyperscale_types::{DeferReason, TransactionDefer};
+
+        let mut state = make_test_state();
+
+        // Set current time and simulate that we just proposed
+        state.set_time(Duration::from_millis(1000));
+        state.last_proposal_time = Duration::from_millis(950); // 50ms ago
+
+        // min_block_interval is 150ms by default, so we're within the rate limit window
+
+        // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 1000,
+        };
+
+        // Create a deferral so there's content to propose
+        let deferral = TransactionDefer {
+            tx_hash: Hash::from_bytes(b"deferred_tx"),
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: Hash::from_bytes(b"winner_tx"),
+            },
+            block_height: BlockHeight(0),
+            proof: None,
+        };
+
+        let actions = state.on_qc_formed(
+            qc.block_hash,
+            qc,
+            &[],            // empty mempool
+            vec![deferral], // has content
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        // Should NOT contain a BlockHeader broadcast (rate limited)
+        let has_block_header = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+
+        assert!(
+            !has_block_header,
+            "Should NOT propose immediately when rate limited (proposed 50ms ago, limit is 150ms)"
+        );
+    }
+
+    #[test]
+    fn test_min_block_interval_allows_proposal_after_interval() {
+        // When enough time has passed since the last proposal,
+        // immediate proposals should be allowed.
+        use hyperscale_types::{DeferReason, TransactionDefer};
+
+        let mut state = make_test_state();
+
+        // Set current time and simulate that we proposed long enough ago
+        state.set_time(Duration::from_millis(1000));
+        state.last_proposal_time = Duration::from_millis(800); // 200ms ago
+
+        // min_block_interval is 150ms by default, so 200ms > 150ms - should be allowed
+
+        // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 1000,
+        };
+
+        // Create a deferral so there's content to propose
+        let deferral = TransactionDefer {
+            tx_hash: Hash::from_bytes(b"deferred_tx"),
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: Hash::from_bytes(b"winner_tx"),
+            },
+            block_height: BlockHeight(0),
+            proof: None,
+        };
+
+        let actions = state.on_qc_formed(
+            qc.block_hash,
+            qc,
+            &[],            // empty mempool
+            vec![deferral], // has content
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        // Should contain a BlockHeader broadcast (enough time passed)
+        let has_block_header = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+
+        assert!(
+            has_block_header,
+            "Should propose after rate limit interval has passed (200ms > 150ms)"
+        );
+    }
+
+    #[test]
+    fn test_min_block_interval_configurable() {
+        // Test that the min_block_interval config is respected.
+        use hyperscale_types::{DeferReason, TransactionDefer};
+
+        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+
+        // Create config with longer min_block_interval
+        let config = BftConfig {
+            min_block_interval: Duration::from_millis(500),
+            ..BftConfig::default()
+        };
+
+        let mut state = BftState::new(
+            0,
+            keys[0].clone(),
+            topology,
+            config,
+            RecoveredState::default(),
+        );
+
+        // Set current time and simulate that we proposed 200ms ago
+        state.set_time(Duration::from_millis(1000));
+        state.last_proposal_time = Duration::from_millis(800); // 200ms ago
+
+        // With min_block_interval of 500ms, 200ms is not enough - should be rate limited
+
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 1000,
+        };
+
+        let deferral = TransactionDefer {
+            tx_hash: Hash::from_bytes(b"deferred_tx"),
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: Hash::from_bytes(b"winner_tx"),
+            },
+            block_height: BlockHeight(0),
+            proof: None,
+        };
+
+        let actions = state.on_qc_formed(
+            qc.block_hash,
+            qc,
+            &[],
+            vec![deferral],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        let has_block_header = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+
+        assert!(
+            !has_block_header,
+            "Should be rate limited with custom 500ms interval (only 200ms passed)"
+        );
+    }
+
+    #[test]
+    fn test_min_block_interval_zero_disables_rate_limiting() {
+        // Test that setting min_block_interval to zero disables rate limiting.
+        use hyperscale_types::{DeferReason, TransactionDefer};
+
+        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+
+        // Create config with zero min_block_interval (disabled)
+        let config = BftConfig {
+            min_block_interval: Duration::ZERO,
+            ..BftConfig::default()
+        };
+
+        let mut state = BftState::new(
+            0,
+            keys[0].clone(),
+            topology,
+            config,
+            RecoveredState::default(),
+        );
+
+        // Propose just now (0ms ago) - normally would be rate limited
+        state.set_time(Duration::from_millis(1000));
+        state.last_proposal_time = Duration::from_millis(1000);
+
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 1000,
+        };
+
+        let deferral = TransactionDefer {
+            tx_hash: Hash::from_bytes(b"deferred_tx"),
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: Hash::from_bytes(b"winner_tx"),
+            },
+            block_height: BlockHeight(0),
+            proof: None,
+        };
+
+        let actions = state.on_qc_formed(
+            qc.block_hash,
+            qc,
+            &[],
+            vec![deferral],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        let has_block_header = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+
+        assert!(
+            has_block_header,
+            "Should allow immediate proposal when min_block_interval is zero"
+        );
+    }
+
+    #[test]
+    fn test_proposal_timer_updates_last_proposal_time() {
+        // Verify that on_proposal_timer updates last_proposal_time when a proposal is made.
+        let mut state = make_test_state();
+        state.set_time(Duration::from_millis(5000));
+
+        // Ensure last_proposal_time starts at zero
+        assert_eq!(state.last_proposal_time, Duration::ZERO);
+
+        // Proposer rotation is (height + round) % committee_size.
+        // With 4 validators, validator 0 proposes for height 0, 4, 8, etc.
+        // Since committed_height=0, next height is 1, and (1+0)%4=1, so validator 1 proposes.
+        // We need to set up a QC so that the next height is 4 (validator 0's turn).
+        state.latest_qc = Some(QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 5000,
+        });
+
+        // Now next_height = 4, (4+0)%4=0, so validator 0 proposes
+        let actions = state.on_proposal_timer(&[], vec![], vec![], vec![], HashMap::new());
+
+        // Check that a proposal was made
+        let proposed = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+
+        assert!(proposed, "Validator 0 should propose for height 4");
+
+        // Verify last_proposal_time was updated
+        assert_eq!(
+            state.last_proposal_time,
+            Duration::from_millis(5000),
+            "last_proposal_time should be updated to current time"
+        );
     }
 }

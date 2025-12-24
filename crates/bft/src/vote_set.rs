@@ -1,9 +1,20 @@
 //! Vote set for collecting block votes.
 
-use hyperscale_types::{
-    BlockHeader, BlockHeight, BlockVote, Hash, QuorumCertificate, Signature, SignerBitfield,
-    VotePower,
-};
+#[cfg(test)]
+use hyperscale_types::QuorumCertificate;
+use hyperscale_types::{BlockHeader, BlockHeight, BlockVote, Hash, SignerBitfield, VotePower};
+use tracing::instrument;
+
+/// Data needed to build a QC asynchronously.
+type QcBuildData = (
+    BlockHeight,
+    u64,
+    Hash,
+    Vec<(usize, BlockVote)>,
+    SignerBitfield,
+    u64,
+    u128,
+);
 
 /// Votes for a specific block.
 #[derive(Debug, Clone)]
@@ -78,6 +89,13 @@ impl VoteSet {
     /// The `stake_weight` is the validator's voting power from their stake.
     ///
     /// Returns true if vote was added, false if validator already voted.
+    #[instrument(level = "debug", skip(self, vote), fields(
+        block_hash = ?self.block_hash,
+        height = ?self.height.map(|h| h.0),
+        voter = vote.voter.0,
+        power_before = self.voting_power,
+        stake_weight = stake_weight,
+    ))]
     pub fn add_vote(&mut self, vote: BlockVote, committee_index: usize, stake_weight: u64) -> bool {
         // Check if validator already voted (using committee index)
         if self.signers.is_set(committee_index) {
@@ -147,9 +165,39 @@ impl VoteSet {
         }
     }
 
-    /// Check if the vote set has header information.
-    pub fn has_header(&self) -> bool {
-        self.parent_block_hash.is_some()
+    /// Extract data needed to build a QC asynchronously.
+    ///
+    /// This marks the vote set as "QC building in progress" and returns all data
+    /// needed by the runner to perform BLS signature aggregation off the main thread.
+    ///
+    /// Returns None if:
+    /// - No votes collected
+    /// - QC already built or being built
+    /// - Missing height or parent_block_hash
+    pub fn prepare_qc_build(&mut self) -> Option<QcBuildData> {
+        if self.votes.is_empty() || self.qc_built {
+            return None;
+        }
+
+        let height = self.height?;
+        let round = self.round.unwrap_or(0);
+        let parent_block_hash = self.parent_block_hash?;
+
+        // Sort votes by committee index for deterministic aggregation
+        self.votes.sort_by_key(|(idx, _)| *idx);
+
+        // Mark as built to prevent duplicate building
+        self.qc_built = true;
+
+        Some((
+            height,
+            round,
+            parent_block_hash,
+            self.votes.clone(),
+            self.signers.clone(),
+            self.voting_power,
+            self.timestamp_weight_sum,
+        ))
     }
 
     /// Build a Quorum Certificate from collected votes.
@@ -162,7 +210,10 @@ impl VoteSet {
     /// # Errors
     ///
     /// Returns error if called before reaching quorum or with no votes.
+    #[cfg(test)]
     pub fn build_qc(&mut self, block_hash: Hash) -> Result<QuorumCertificate, String> {
+        use hyperscale_types::Signature;
+
         if self.votes.is_empty() {
             return Err("cannot build QC with no votes".to_string());
         }

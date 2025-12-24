@@ -7,59 +7,6 @@ use crate::{
 use sbor::prelude::*;
 use std::sync::Arc;
 
-/// A state entry (key-value pair from the state tree).
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct StateEntry {
-    /// The node (address) this entry belongs to.
-    pub node_id: NodeId,
-
-    /// Partition within the node.
-    pub partition: PartitionNumber,
-
-    /// Raw DbSortKey bytes for the substate.
-    pub sort_key: Vec<u8>,
-
-    /// SBOR-encoded substate value (None if doesn't exist).
-    pub value: Option<Vec<u8>>,
-}
-
-impl StateEntry {
-    /// Create a new state entry.
-    pub fn new(
-        node_id: NodeId,
-        partition: PartitionNumber,
-        sort_key: Vec<u8>,
-        value: Option<Vec<u8>>,
-    ) -> Self {
-        Self {
-            node_id,
-            partition,
-            sort_key,
-            value,
-        }
-    }
-
-    /// Compute hash of this state entry.
-    pub fn hash(&self) -> Hash {
-        let mut data = Vec::new();
-        data.extend_from_slice(&self.node_id.0);
-        data.push(self.partition.0);
-        data.extend_from_slice(&self.sort_key);
-
-        match &self.value {
-            Some(value_bytes) => {
-                let value_hash = Hash::from_bytes(value_bytes);
-                data.extend_from_slice(value_hash.as_bytes());
-            }
-            None => {
-                data.extend_from_slice(&[0u8; 32]); // ZERO hash
-            }
-        }
-
-        Hash::from_bytes(&data)
-    }
-}
-
 /// A write to a substate.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct SubstateWrite {
@@ -93,11 +40,109 @@ impl SubstateWrite {
     }
 }
 
+// ============================================================================
+// State entry types with pre-computed storage keys
+// ============================================================================
+
+/// A state entry with pre-computed storage key for fast engine lookup.
+///
+/// This type stores the pre-computed storage key that can be used directly for
+/// database lookups without any key transformation at the receiving shard.
+///
+/// The storage key format is: `RADIX_PREFIX + db_node_key + partition_num + sort_key`
+/// where `db_node_key` is the SpreadPrefixKeyMapper hash (expensive to compute).
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct StateEntry {
+    /// Pre-computed full storage key (ready for direct DB lookup).
+    /// Format: RADIX_PREFIX (6 bytes) + db_node_key (50 bytes) + partition (1 byte) + sort_key
+    pub storage_key: Vec<u8>,
+
+    /// SBOR-encoded substate value (None if deleted/doesn't exist).
+    pub value: Option<Vec<u8>>,
+}
+
+/// RADIX_PREFIX length (b"radix:" = 6 bytes)
+const RADIX_PREFIX_LEN: usize = 6;
+
+/// Hash prefix length in db_node_key (SpreadPrefixKeyMapper adds 20-byte hash)
+const HASH_PREFIX_LEN: usize = 20;
+
+impl StateEntry {
+    /// Create a new DB state entry with pre-computed storage key.
+    pub fn new(storage_key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
+        Self { storage_key, value }
+    }
+
+    /// Extract the NodeId from the storage key.
+    ///
+    /// The storage key format is:
+    /// - RADIX_PREFIX (6 bytes)
+    /// - db_node_key (50 bytes: 20-byte hash prefix + 30-byte node_id)
+    /// - partition_num (1 byte)
+    /// - sort_key (variable)
+    ///
+    /// The NodeId is at bytes [26..56] (after RADIX_PREFIX and hash prefix).
+    pub fn node_id(&self) -> Option<NodeId> {
+        let start = RADIX_PREFIX_LEN + HASH_PREFIX_LEN;
+        let end = start + 30;
+        if self.storage_key.len() >= end {
+            let mut id = [0u8; 30];
+            id.copy_from_slice(&self.storage_key[start..end]);
+            Some(NodeId(id))
+        } else {
+            None
+        }
+    }
+
+    /// Compute hash of this entry for signing/verification.
+    pub fn hash(&self) -> Hash {
+        let mut data = Vec::with_capacity(self.storage_key.len() + 32);
+        data.extend_from_slice(&self.storage_key);
+
+        match &self.value {
+            Some(value_bytes) => {
+                let value_hash = Hash::from_bytes(value_bytes);
+                data.extend_from_slice(value_hash.as_bytes());
+            }
+            None => {
+                data.extend_from_slice(&[0u8; 32]); // ZERO hash for deletion
+            }
+        }
+
+        Hash::from_bytes(&data)
+    }
+
+    /// Create a test entry from a node ID (for testing only).
+    ///
+    /// Creates a storage key in the correct format so that `node_id()` can extract
+    /// the node ID. Uses a dummy hash prefix (zeros) since tests don't need real
+    /// SpreadPrefixKeyMapper hashes.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn test_entry(
+        node_id: NodeId,
+        partition: u8,
+        sort_key: Vec<u8>,
+        value: Option<Vec<u8>>,
+    ) -> Self {
+        // Format: RADIX_PREFIX (6) + hash_prefix (20) + node_id (30) + partition (1) + sort_key
+        let mut storage_key = Vec::with_capacity(6 + 20 + 30 + 1 + sort_key.len());
+        storage_key.extend_from_slice(b"radix:"); // RADIX_PREFIX
+        storage_key.extend_from_slice(&[0u8; 20]); // Dummy hash prefix
+        storage_key.extend_from_slice(&node_id.0); // Node ID
+        storage_key.push(partition); // Partition number
+        storage_key.extend_from_slice(&sort_key); // Sort key
+        Self { storage_key, value }
+    }
+}
+
 /// State provision from a source shard to a target shard.
 ///
+/// Contains pre-computed storage keys (`StateEntry`) for efficient execution.
+/// The sending shard computes storage keys once, so the receiving shard can
+/// use them directly without expensive hash computations.
+///
 /// The `entries` field uses `Arc<Vec<StateEntry>>` for efficient sharing when
-/// broadcasting the same provision data to multiple target shards (avoiding
-/// expensive clones of potentially large state entry vectors).
+/// broadcasting the same provision data to multiple target shards.
 #[derive(Debug, Clone)]
 pub struct StateProvision {
     /// Hash of the transaction this provision is for.
@@ -112,7 +157,7 @@ pub struct StateProvision {
     /// Block height when this provision was created.
     pub block_height: BlockHeight,
 
-    /// The state entries being provided.
+    /// The state entries with pre-computed storage keys.
     /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
     pub entries: Arc<Vec<StateEntry>>,
 
@@ -422,13 +467,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_state_entry_hash() {
-        let entry = StateEntry {
-            node_id: NodeId([1u8; 30]),
-            partition: PartitionNumber(0),
-            sort_key: b"key".to_vec(),
-            value: Some(b"value".to_vec()),
-        };
+    fn test_db_state_entry_hash() {
+        let entry = StateEntry::test_entry(
+            NodeId([1u8; 30]),
+            0,
+            b"key".to_vec(),
+            Some(b"value".to_vec()),
+        );
 
         let hash1 = entry.hash();
         let hash2 = entry.hash();
@@ -453,15 +498,10 @@ mod tests {
         use crate::{state_provision_message, KeyPair, KeyType};
         use std::sync::Arc;
 
-        // Create test entries
+        // Create test entries using StateEntry::test_entry
         let entries = vec![
-            StateEntry::new(
-                NodeId([1u8; 30]),
-                PartitionNumber(1),
-                vec![1, 2, 3],
-                Some(vec![4, 5, 6]),
-            ),
-            StateEntry::new(NodeId([2u8; 30]), PartitionNumber(2), vec![7, 8, 9], None),
+            StateEntry::test_entry(NodeId([1u8; 30]), 1, vec![1, 2, 3], Some(vec![4, 5, 6])),
+            StateEntry::test_entry(NodeId([2u8; 30]), 2, vec![7, 8, 9], None),
         ];
 
         // Create keypair

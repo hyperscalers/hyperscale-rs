@@ -9,6 +9,7 @@ use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_types::{Block, BlockHeight, KeyPair, ShardGroupId, Topology};
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::instrument;
 
 /// Index type for simulation-only node routing.
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
@@ -201,6 +202,7 @@ impl NodeStateMachine {
     }
 
     /// Handle cleanup timer.
+    #[instrument(skip(self))]
     fn on_cleanup_timer(&mut self) -> Vec<Action> {
         // Reschedule the cleanup timer
         let mut actions = vec![Action::SetTimer {
@@ -210,6 +212,11 @@ impl NodeStateMachine {
 
         // Clean up expired tombstones in livelock state
         self.livelock.cleanup();
+
+        // Check pending blocks that need fetch requests.
+        // We delay fetching to give gossip and local certificate creation
+        // time to fill in missing data first.
+        actions.extend(self.bft.check_pending_block_fetches());
 
         // Clean up stale incomplete pending blocks in BFT state.
         // This prevents nodes from getting stuck when transaction/certificate
@@ -239,6 +246,7 @@ impl NodeStateMachine {
     /// Handle block committed event.
     ///
     /// Resets round timeout tracking.
+    #[instrument(skip(self), fields(height = _height))]
     fn on_block_committed(&mut self, _height: u64) -> Vec<Action> {
         // Reset round advancement timeout - progress was made
         self.last_leader_activity = self.now;
@@ -302,6 +310,12 @@ impl NodeStateMachine {
 }
 
 impl StateMachine for NodeStateMachine {
+    #[instrument(skip(self), fields(
+        node = self.node_index,
+        shard = self.topology.local_shard().0,
+        event = %event.type_name(),
+        height = self.bft.committed_height(),
+    ))]
     fn handle(&mut self, event: Event) -> Vec<Action> {
         // Route event to appropriate sub-state machine
         match &event {
@@ -319,8 +333,20 @@ impl StateMachine for NodeStateMachine {
                     // Clear the header reset tracker since we're changing rounds
                     self.last_header_reset = None;
 
+                    // Account for pipelining: count txs/certs in ALL pending blocks
+                    let (pending_txs, pending_certs) = self.bft.pending_block_tx_cert_counts();
+
+                    // Get certificates we're about to propose
+                    let certificates = self.execution.get_finalized_certificates();
+                    let new_certs = certificates.len();
+
                     let max_txs = self.bft.config().max_transactions_per_block;
-                    let txs = self.mempool.ready_transactions(max_txs, &self.provisions);
+                    let txs = self.mempool.ready_transactions_with_pending_commits(
+                        max_txs,
+                        &self.provisions,
+                        pending_txs,               // txs in uncommitted pipeline blocks
+                        pending_certs + new_certs, // certs in pipeline + certs we're proposing
+                    );
                     // Note: commitment_proofs not needed for advance_round - it builds empty fallback blocks
                     let deferred = self.livelock.get_pending_deferrals();
                     let current_height =
@@ -330,7 +356,6 @@ impl StateMachine for NodeStateMachine {
                         30, // execution_timeout_blocks
                         3,  // max_retries
                     );
-                    let certificates = self.execution.get_finalized_certificates();
 
                     // Notify execution of view change to pause speculation temporarily
                     self.execution.on_view_change(current_height.0);
@@ -342,8 +367,22 @@ impl StateMachine for NodeStateMachine {
                 }
 
                 // Normal proposal timer - try to propose if we're the proposer
+                //
+                // Account for pipelining: multiple blocks can be proposed before any commit.
+                // We must count txs/certs in ALL pending blocks to avoid exceeding in-flight limits.
+                let (pending_txs, pending_certs) = self.bft.pending_block_tx_cert_counts();
+
+                // Get certificates we're about to propose - these also reduce in-flight
+                let certificates = self.execution.get_finalized_certificates();
+                let new_certs = certificates.len();
+
                 let max_txs = self.bft.config().max_transactions_per_block;
-                let txs = self.mempool.ready_transactions(max_txs, &self.provisions);
+                let txs = self.mempool.ready_transactions_with_pending_commits(
+                    max_txs,
+                    &self.provisions,
+                    pending_txs,               // txs in uncommitted pipeline blocks
+                    pending_certs + new_certs, // certs in pipeline + certs we're proposing
+                );
                 let commitment_proofs = self.build_commitment_proofs(&txs);
                 // Get pending deferrals from livelock state
                 let deferred = self.livelock.get_pending_deferrals();
@@ -355,8 +394,6 @@ impl StateMachine for NodeStateMachine {
                     30, // execution_timeout_blocks
                     3,  // max_retries
                 );
-                // Get finalized certificates (removed when committed in a block)
-                let certificates = self.execution.get_finalized_certificates();
                 let actions = self.bft.on_proposal_timer(
                     &txs,
                     deferred,
@@ -379,7 +416,16 @@ impl StateMachine for NodeStateMachine {
                         }
                     )
                 });
+
                 if proposed {
+                    self.last_leader_activity = self.now;
+                }
+
+                // Also reset timeout if we're the proposer and backpressure is active -
+                // we're intentionally skipping proposals to let commits catch up.
+                // Only do this when WE are the proposer; if someone else is the proposer
+                // and backpressure is active, they might have actually failed.
+                if self.bft.is_current_proposer() && self.bft.is_pipeline_backpressure_active() {
                     self.last_leader_activity = self.now;
                 }
 
@@ -402,6 +448,62 @@ impl StateMachine for NodeStateMachine {
                 if self.last_header_reset != Some(header_key) {
                     self.last_leader_activity = self.now;
                     self.last_header_reset = Some(header_key);
+                }
+
+                // Validate in-flight limits only for the next block after committed height.
+                // For blocks further ahead, skip validation - validators at different heights
+                // have different in_flight() counts, causing split votes and view changes.
+                let committed_height = self.bft.committed_height();
+                let is_next_block = header.height.0 == committed_height + 1;
+
+                if is_next_block {
+                    let current_in_flight = self.mempool.in_flight();
+                    let certs_in_block = cert_hashes.len();
+                    let config = self.mempool.config();
+                    let soft_limit = config.max_in_flight;
+                    let hard_limit = config.max_in_flight_hard_limit;
+
+                    let with_proofs = tx_hashes
+                        .iter()
+                        .filter(|h| commitment_proofs.contains_key(h))
+                        .count();
+                    let without_proofs = tx_hashes.len() - with_proofs;
+
+                    let new_in_flight = current_in_flight
+                        .saturating_add(tx_hashes.len())
+                        .saturating_sub(certs_in_block);
+
+                    // Reject if exceeding hard limit AND making things worse.
+                    // Allow blocks that don't increase in-flight (prevents deadlock).
+                    let would_exceed = new_in_flight > hard_limit;
+                    let would_increase = new_in_flight > current_in_flight;
+
+                    if would_exceed && would_increase {
+                        tracing::warn!(
+                            current_in_flight,
+                            certs_in_block,
+                            proposed_tx_count = tx_hashes.len(),
+                            new_in_flight,
+                            hard_limit,
+                            block_hash = ?header.hash(),
+                            height = header.height.0,
+                            "Rejecting block that would exceed in-flight hard limit"
+                        );
+                        return vec![];
+                    }
+
+                    // Soft limit: only allow TXs with proofs when at limit
+                    if current_in_flight >= soft_limit && without_proofs > 0 {
+                        tracing::warn!(
+                            current_in_flight,
+                            soft_limit,
+                            txs_without_proofs = without_proofs,
+                            block_hash = ?header.hash(),
+                            height = header.height.0,
+                            "Rejecting block with non-priority transactions while at soft limit"
+                        );
+                        return vec![];
+                    }
                 }
 
                 let mempool_txs = self.mempool.transactions_by_hash();
@@ -439,8 +541,21 @@ impl StateMachine for NodeStateMachine {
                 // Reset timeout - QC formed means progress
                 self.last_leader_activity = self.now;
 
+                // Count transactions and certificates in the block that will be committed.
+                // This is critical for respecting in-flight limits: the BlockCommitted
+                // event won't be processed until after we select transactions, so we
+                // need to preemptively account for:
+                // - Transactions that will INCREASE in-flight (new commits)
+                // - Certificates that will DECREASE in-flight (completed transactions)
+                let (pending_tx_count, pending_cert_count) = self.bft.pending_commit_counts(qc);
+
                 let max_txs = self.bft.config().max_transactions_per_block;
-                let txs = self.mempool.ready_transactions(max_txs, &self.provisions);
+                let txs = self.mempool.ready_transactions_with_pending_commits(
+                    max_txs,
+                    &self.provisions,
+                    pending_tx_count,
+                    pending_cert_count,
+                );
                 let commitment_proofs = self.build_commitment_proofs(&txs);
                 let deferred = self.livelock.get_pending_deferrals();
                 let current_height = hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
@@ -465,7 +580,8 @@ impl StateMachine for NodeStateMachine {
             Event::BlockVoteReceived { .. }
             | Event::BlockReadyToCommit { .. }
             | Event::VoteSignatureVerified { .. }
-            | Event::QcSignatureVerified { .. } => {
+            | Event::QcSignatureVerified { .. }
+            | Event::QuorumCertificateBuilt { .. } => {
                 if let Some(actions) = self.bft.try_handle(&event) {
                     return actions;
                 }
@@ -568,16 +684,9 @@ impl StateMachine for NodeStateMachine {
                 }
             }
 
-            Event::ProvisionSignatureVerified { .. } => {
-                // Route ONLY to provision coordinator
-                if let Some(actions) = self.provisions.try_handle(&event) {
-                    return actions;
-                }
-            }
-
-            // CommitmentProofAggregated: callback from signature aggregation
-            Event::CommitmentProofAggregated { .. } => {
-                // Route to provision coordinator to emit ProvisionQuorumReached
+            // ProvisionsVerifiedAndAggregated: callback from batch verification + aggregation
+            Event::ProvisionsVerifiedAndAggregated { .. } => {
+                // Route to provision coordinator to handle verified provisions and quorum
                 if let Some(actions) = self.provisions.try_handle(&event) {
                     return actions;
                 }
@@ -923,6 +1032,39 @@ impl StateMachine for NodeStateMachine {
 
             Event::CertificateFetchFailed { block_hash } => {
                 return self.bft.on_fetch_failed(*block_hash);
+            }
+
+            // TransactionCertificateReceived is handled directly by the production runner
+            // (verified and persisted to storage without going through the state machine).
+            // In simulation, we handle it in the simulator's runner, not here.
+            Event::TransactionCertificateReceived { .. } => {
+                // No action needed - runner handles verification and persistence
+                return vec![];
+            }
+
+            // GossipedCertificateVerified - a gossiped certificate has been verified and persisted.
+            // Cancel local certificate building and add to finalized certificates.
+            Event::GossipedCertificateVerified { certificate } => {
+                let tx_hash = certificate.transaction_hash;
+
+                // Cancel any ongoing local certificate building
+                self.execution.cancel_certificate_building(&tx_hash);
+
+                // Add to finalized certificates if not already present
+                self.execution.add_verified_certificate(certificate.clone());
+
+                // Notify mempool that transaction is finalized
+                return vec![Action::EnqueueInternal {
+                    event: Event::TransactionExecuted {
+                        tx_hash,
+                        accepted: certificate.is_accepted(),
+                    },
+                }];
+            }
+
+            // GossipedCertificateSignatureVerified is handled by the runner, not here
+            Event::GossipedCertificateSignatureVerified { .. } => {
+                return vec![];
             }
         }
 

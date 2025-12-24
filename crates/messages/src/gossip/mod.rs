@@ -9,5 +9,7 @@ mod transaction;
 
 pub use block_header::BlockHeaderGossip;
 pub use block_vote::BlockVoteGossip;
-pub use state::{StateCertificateBatch, StateProvisionBatch, StateVoteBatch};
+pub use state::{
+    StateCertificateBatch, StateProvisionBatch, StateVoteBatch, TransactionCertificateGossip,
+};
 pub use transaction::TransactionGossip;

@@ -10,13 +10,12 @@
 //! - [`runner`]: Spammer orchestrator
 //! - [`genesis`]: Genesis balance generation for cluster setup
 //! - [`config`]: Configuration types
-//! - [`latency`]: Latency tracking for measuring transaction completion times
 
 pub mod accounts;
 pub mod client;
 pub mod config;
 pub mod genesis;
-pub mod latency;
+mod latency;
 pub mod runner;
 pub mod workloads;
 
@@ -25,6 +24,5 @@ pub use accounts::{
 };
 pub use client::RpcClient;
 pub use config::SpammerConfig;
-pub use latency::{LatencyReport, LatencyTracker};
-pub use runner::{Spammer, SpammerReport, SpammerStats};
+pub use runner::Spammer;
 pub use workloads::{TransferWorkload, WorkloadGenerator};

@@ -167,30 +167,6 @@ impl GenesisBuilder {
         self
     }
 
-    /// Set the faucet supply.
-    pub fn with_faucet_supply(mut self, supply: Decimal) -> Self {
-        self.config.faucet_supply = supply;
-        self
-    }
-
-    /// Disable the faucet.
-    pub fn without_faucet(mut self) -> Self {
-        self.config.faucet_supply = Decimal::ZERO;
-        self
-    }
-
-    /// Add validators.
-    pub fn with_validators(mut self, validators: Vec<GenesisValidator>) -> Self {
-        self.config.validators = validators;
-        self
-    }
-
-    /// Add XRD balances.
-    pub fn with_xrd_balances(mut self, balances: Vec<(ComponentAddress, Decimal)>) -> Self {
-        self.config.xrd_balances = balances;
-        self
-    }
-
     /// Execute genesis on the provided database.
     pub fn build<S>(self, store: &mut S) -> Result<GenesisReceipts, GenesisError>
     where

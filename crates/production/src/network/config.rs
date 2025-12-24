@@ -67,7 +67,11 @@ impl Default for Libp2pConfig {
             // Use QUIC by default with random port
             listen_addresses: vec!["/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap()],
             bootstrap_peers: vec![],
-            request_timeout: Duration::from_millis(1000),
+            // 10 second timeout for request-response operations.
+            // This must be >= SyncConfig::fetch_timeout (5s) and FetchConfig::max_timeout (5s)
+            // to ensure those higher-level timeouts are effective. The libp2p timeout is the
+            // ultimate backstop - if it's shorter, sync/fetch timeouts become ineffective.
+            request_timeout: Duration::from_secs(10),
             max_message_size: 1024 * 1024 * 10, // 10MB
             gossipsub_heartbeat: Duration::from_millis(100),
             idle_connection_timeout: Duration::from_secs(60),
@@ -145,7 +149,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Libp2pConfig::default();
-        assert_eq!(config.request_timeout, Duration::from_secs(1));
+        assert_eq!(config.request_timeout, Duration::from_secs(10));
         assert_eq!(config.max_message_size, 1024 * 1024 * 10); // 10MB
         assert_eq!(config.gossipsub_heartbeat, Duration::from_millis(100));
         assert!(!config.listen_addresses.is_empty());

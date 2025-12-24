@@ -686,8 +686,9 @@ fn test_resolves_livelocks_in_under_x_seconds() {
         iteration += 1;
 
         // Use the status cache for reliable status checks (survives eviction)
+        // TX A was submitted to node 0 (shard 0), TX B to node 3 (shard 1)
         let status_a = runner.tx_status(0, &hash_a).cloned();
-        let status_b = runner.tx_status(0, &hash_b).cloned();
+        let status_b = runner.tx_status(3, &hash_b).cloned();
 
         // Log status changes for TX A
         if status_a != last_status_a {
@@ -755,8 +756,9 @@ fn test_resolves_livelocks_in_under_x_seconds() {
     let resolution_time = runner.now() - resolution_start;
 
     // Get final statuses from cache (reliable even after eviction)
+    // TX A was submitted to node 0, TX B to node 3
     let final_status_a = runner.tx_status(0, &hash_a);
-    let final_status_b = runner.tx_status(0, &hash_b);
+    let final_status_b = runner.tx_status(3, &hash_b);
     let final_retry_status = retry_hash.and_then(|h| runner.tx_status(0, &h));
 
     println!("\n=== Results ===");

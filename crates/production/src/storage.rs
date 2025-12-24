@@ -11,12 +11,13 @@ use hyperscale_engine::{
     DbSubstateValue, PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::NodeId;
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, WriteBatch, DB};
+use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, Snapshot, WriteBatch, DB};
 use sbor::prelude::*;
 use std::cell::UnsafeCell;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
+use tracing::{instrument, Level};
 
 /// RocksDB-based storage for production use.
 ///
@@ -131,6 +132,10 @@ impl RocksDbStorage {
 }
 
 impl SubstateDatabase for RocksDbStorage {
+    #[instrument(level = Level::DEBUG, skip_all, fields(
+        found = tracing::field::Empty,
+        latency_us = tracing::field::Empty,
+    ))]
     fn get_raw_substate_by_db_key(
         &self,
         partition_key: &DbPartitionKey,
@@ -139,7 +144,14 @@ impl SubstateDatabase for RocksDbStorage {
         let start = Instant::now();
         let key = keys::to_storage_key(partition_key, sort_key);
         let result = self.db.get(&key).ok().flatten();
-        metrics::record_rocksdb_read(start.elapsed().as_secs_f64());
+        let elapsed = start.elapsed();
+        metrics::record_rocksdb_read(elapsed.as_secs_f64());
+
+        // Record span fields
+        let span = tracing::Span::current();
+        span.record("found", result.is_some());
+        span.record("latency_us", elapsed.as_micros() as u64);
+
         result
     }
 
@@ -177,13 +189,22 @@ impl SubstateDatabase for RocksDbStorage {
 impl RocksDbStorage {
     /// Commit database updates using a shared reference.
     ///
+    /// Returns an error if the write fails. Callers must handle the error appropriately -
+    /// for critical state updates, this typically means crashing to prevent data divergence.
+    ///
     /// # Safety
     /// This is safe because RocksDB's `DB::write()` only requires `&self` internally.
     /// The `CommittableSubstateDatabase` trait requires `&mut self` but RocksDB doesn't
     /// actually need exclusive access - it handles synchronization internally.
-    pub fn commit(&self, updates: &DatabaseUpdates) {
+    #[instrument(level = Level::DEBUG, skip_all, fields(
+        node_count = updates.node_updates.len(),
+        latency_us = tracing::field::Empty,
+    ))]
+    pub fn commit(&self, updates: &DatabaseUpdates) -> Result<(), StorageError> {
         let start = Instant::now();
         let mut batch = WriteBatch::default();
+        let mut put_count = 0u64;
+        let mut delete_count = 0u64;
 
         for (node_key, node_updates) in &updates.node_updates {
             for (partition_num, partition_updates) in &node_updates.partition_updates {
@@ -199,9 +220,11 @@ impl RocksDbStorage {
                             match update {
                                 DatabaseUpdate::Set(value) => {
                                     batch.put(&key, value);
+                                    put_count += 1;
                                 }
                                 DatabaseUpdate::Delete => {
                                     batch.delete(&key);
+                                    delete_count += 1;
                                 }
                             }
                         }
@@ -221,6 +244,7 @@ impl RocksDbStorage {
                                     break;
                                 }
                                 batch.delete(key);
+                                delete_count += 1;
                                 iter.next();
                             } else {
                                 break;
@@ -231,6 +255,7 @@ impl RocksDbStorage {
                         for (sort_key, value) in new_substate_values {
                             let key = keys::to_storage_key(&partition_key, sort_key);
                             batch.put(&key, value);
+                            put_count += 1;
                         }
                     }
                 }
@@ -238,10 +263,19 @@ impl RocksDbStorage {
         }
 
         // Write batch atomically - RocksDB handles internal synchronization
-        if let Err(e) = self.db.write(batch) {
-            tracing::error!("Failed to commit updates: {}", e);
-        }
-        metrics::record_rocksdb_write(start.elapsed().as_secs_f64());
+        self.db
+            .write(batch)
+            .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
+
+        let elapsed = start.elapsed();
+        metrics::record_rocksdb_write(elapsed.as_secs_f64());
+
+        // Record span fields
+        let span = tracing::Span::current();
+        span.record("latency_us", elapsed.as_micros() as u64);
+        tracing::debug!(put_count, delete_count, "commit complete");
+
+        Ok(())
     }
 
     /// Get a mutable reference for APIs that require `&mut self`.
@@ -263,19 +297,22 @@ impl RocksDbStorage {
 impl CommittableSubstateDatabase for RocksDbStorage {
     fn commit(&mut self, updates: &DatabaseUpdates) {
         // Delegate to the shared version - RocksDB doesn't need &mut
+        // Panic on error since the trait doesn't support Result and this is safety-critical
         RocksDbStorage::commit(self, updates)
+            .expect("Storage commit failed - cannot maintain consistent state")
     }
 }
 
 impl SubstateStore for RocksDbStorage {
-    type Snapshot = RocksDbSnapshot;
+    type Snapshot<'a> = RocksDbSnapshot<'a>;
 
-    fn snapshot(&self) -> Arc<Self::Snapshot> {
-        // Note: Currently uses the DB directly for snapshot reads.
-        // In the future, this could be optimized with RocksDB's native snapshot feature.
-        Arc::new(RocksDbSnapshot {
-            db: self.db.clone(),
-        })
+    fn snapshot(&self) -> Self::Snapshot<'_> {
+        // Use RocksDB's native snapshot feature for point-in-time isolation.
+        // The snapshot provides a consistent view of the database at the time
+        // of creation, immune to concurrent writes.
+        RocksDbSnapshot {
+            snapshot: self.db.snapshot(),
+        }
     }
 
     fn list_substates_for_node(
@@ -302,20 +339,21 @@ impl SubstateStore for RocksDbStorage {
 
 /// RocksDB snapshot for consistent reads.
 ///
-/// Note: Currently uses the DB directly. In the future, this could be
-/// optimized to use RocksDB's native snapshot feature.
-pub struct RocksDbSnapshot {
-    db: Arc<DB>,
+/// Uses RocksDB's native snapshot feature to provide point-in-time isolation.
+/// Any writes that occur after the snapshot is created are invisible to reads
+/// through this snapshot.
+pub struct RocksDbSnapshot<'a> {
+    snapshot: Snapshot<'a>,
 }
 
-impl SubstateDatabase for RocksDbSnapshot {
+impl SubstateDatabase for RocksDbSnapshot<'_> {
     fn get_raw_substate_by_db_key(
         &self,
         partition_key: &DbPartitionKey,
         sort_key: &DbSortKey,
     ) -> Option<DbSubstateValue> {
         let key = keys::to_storage_key(partition_key, sort_key);
-        self.db.get(&key).ok().flatten()
+        self.snapshot.get(&key).ok().flatten()
     }
 
     fn list_raw_values_from_db_key(
@@ -336,7 +374,7 @@ impl SubstateDatabase for RocksDbSnapshot {
         };
         let end = keys::next_prefix(&prefix);
 
-        let mut iter = self.db.raw_iterator();
+        let mut iter = self.snapshot.raw_iterator();
         iter.seek(&start);
 
         let raw_iter = std::iter::from_fn(move || {
@@ -1037,6 +1075,12 @@ impl RocksDbStorage {
     ///
     /// * `certificate` - The transaction certificate to store
     /// * `writes` - The state writes from the certificate's shard_proofs for the local shard
+    #[instrument(level = Level::DEBUG, skip_all, fields(
+        tx_hash = %certificate.transaction_hash,
+        write_count = writes.len(),
+        latency_us = tracing::field::Empty,
+        otel.kind = "INTERNAL",
+    ))]
     pub fn commit_certificate_with_writes(
         &self,
         certificate: &TransactionCertificate,
@@ -1099,11 +1143,14 @@ impl RocksDbStorage {
             "BFT SAFETY CRITICAL: certificate commit failed - node state would diverge from network",
         );
 
-        let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_rocksdb_write(elapsed);
-        metrics::record_storage_operation("commit_cert_writes", elapsed);
+        let elapsed = start.elapsed();
+        metrics::record_rocksdb_write(elapsed.as_secs_f64());
+        metrics::record_storage_operation("commit_cert_writes", elapsed.as_secs_f64());
         metrics::record_storage_batch_size(write_count);
         metrics::record_certificate_persisted();
+
+        // Record span fields
+        tracing::Span::current().record("latency_us", elapsed.as_micros() as u64);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1126,6 +1173,10 @@ impl RocksDbStorage {
     ///
     /// Key: height (u64 big-endian)
     /// Value: (block_hash, round) SBOR-encoded
+    #[instrument(level = Level::DEBUG, skip(self), fields(
+        latency_us = tracing::field::Empty,
+        otel.kind = "INTERNAL",
+    ))]
     pub fn put_own_vote(&self, height: u64, round: u64, block_hash: Hash) {
         let start = Instant::now();
         let cf = self
@@ -1145,10 +1196,13 @@ impl RocksDbStorage {
             .put_cf_opt(cf, key, value, &write_opts)
             .expect("BFT SAFETY CRITICAL: vote persistence failed - cannot continue safely");
 
-        let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_rocksdb_write(elapsed);
-        metrics::record_storage_operation("put_vote", elapsed);
+        let elapsed = start.elapsed();
+        metrics::record_rocksdb_write(elapsed.as_secs_f64());
+        metrics::record_storage_operation("put_vote", elapsed.as_secs_f64());
         metrics::record_vote_persisted();
+
+        // Record span fields
+        tracing::Span::current().record("latency_us", elapsed.as_micros() as u64);
     }
 
     /// Get our own vote for a height (if any).
@@ -1361,7 +1415,7 @@ mod tests {
                 .collect(),
             },
         );
-        storage.commit(&updates);
+        storage.commit(&updates).unwrap();
 
         // Now we can read it
         let value = storage.get_raw_substate_by_db_key(&partition_key, &sort_key);
@@ -1396,7 +1450,7 @@ mod tests {
                 .collect(),
             },
         );
-        storage.commit(&updates);
+        storage.commit(&updates).unwrap();
 
         // Take snapshot
         let snapshot = storage.snapshot();

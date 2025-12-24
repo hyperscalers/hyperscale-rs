@@ -102,6 +102,7 @@ impl Default for FetchConfig {
 
 impl FetchConfig {
     /// Create config optimized for low-latency local networks.
+    #[cfg(test)]
     pub fn for_local() -> Self {
         Self {
             initial_timeout: Duration::from_millis(100),
@@ -112,6 +113,7 @@ impl FetchConfig {
     }
 
     /// Create config for high-latency WANs.
+    #[cfg(test)]
     pub fn for_wan() -> Self {
         Self {
             initial_timeout: Duration::from_secs(2),
@@ -501,6 +503,7 @@ impl FetchManager {
     }
 
     /// Cancel a fetch for a block (e.g., block completed via gossip).
+    #[allow(dead_code)]
     pub fn cancel_fetch(&mut self, block_hash: Hash, kind: FetchKind) {
         let removed = match kind {
             FetchKind::Transaction => self.tx_fetches.remove(&block_hash).is_some(),
@@ -636,6 +639,7 @@ impl FetchManager {
             };
             if let Err(e) = self.event_tx.send(event).await {
                 warn!(?block_hash, error = ?e, "Failed to deliver transactions to BFT");
+                metrics::record_fetch_event_send_failed("TransactionReceived");
             }
         }
 
@@ -734,6 +738,7 @@ impl FetchManager {
             };
             if let Err(e) = self.event_tx.send(event).await {
                 warn!(?block_hash, error = ?e, "Failed to deliver certificates to BFT");
+                metrics::record_fetch_event_send_failed("CertificateReceived");
             }
         }
 
@@ -829,6 +834,7 @@ impl FetchManager {
                         let event = Event::TransactionFetchFailed { block_hash };
                         if let Err(e) = self.event_tx.send(event).await {
                             warn!(?block_hash, error = ?e, "Failed to send TransactionFetchFailed event");
+                            metrics::record_fetch_event_send_failed("TransactionFetchFailed");
                         }
                     }
                     FetchKind::Certificate => {
@@ -836,6 +842,7 @@ impl FetchManager {
                         let event = Event::CertificateFetchFailed { block_hash };
                         if let Err(e) = self.event_tx.send(event).await {
                             warn!(?block_hash, error = ?e, "Failed to send CertificateFetchFailed event");
+                            metrics::record_fetch_event_send_failed("CertificateFetchFailed");
                         }
                     }
                 }
@@ -1208,6 +1215,7 @@ impl FetchManager {
         }
 
         for (block_hash, peer) in timed_out {
+            metrics::record_fetch_timeout(FetchKind::Transaction);
             self.handle_fetch_failed(block_hash, FetchKind::Transaction, peer, "timeout")
                 .await;
         }
@@ -1223,6 +1231,7 @@ impl FetchManager {
         }
 
         for (block_hash, peer) in timed_out {
+            metrics::record_fetch_timeout(FetchKind::Certificate);
             self.handle_fetch_failed(block_hash, FetchKind::Certificate, peer, "timeout")
                 .await;
         }
@@ -1252,10 +1261,12 @@ impl FetchManager {
                     age_secs = state.created.elapsed().as_secs(),
                     "Cleaning up stale transaction fetch - notifying BFT"
                 );
+                metrics::record_fetch_stale_cleanup(FetchKind::Transaction);
                 // Notify BFT so it can handle the failure (e.g., remove pending block)
                 let event = Event::TransactionFetchFailed { block_hash: hash };
                 if let Err(e) = self.event_tx.send(event).await {
                     warn!(?hash, error = ?e, "Failed to send TransactionFetchFailed for stale fetch");
+                    metrics::record_fetch_event_send_failed("TransactionFetchFailed");
                 }
             }
         }
@@ -1277,10 +1288,12 @@ impl FetchManager {
                     age_secs = state.created.elapsed().as_secs(),
                     "Cleaning up stale certificate fetch - notifying BFT"
                 );
+                metrics::record_fetch_stale_cleanup(FetchKind::Certificate);
                 // Notify BFT so it can handle the failure
                 let event = Event::CertificateFetchFailed { block_hash: hash };
                 if let Err(e) = self.event_tx.send(event).await {
                     warn!(?hash, error = ?e, "Failed to send CertificateFetchFailed for stale fetch");
+                    metrics::record_fetch_event_send_failed("CertificateFetchFailed");
                 }
             }
         }

@@ -49,13 +49,14 @@ tokio.workspace = true
 rayon.workspace = true
 parking_lot = "0.12"
 
-# Lock-free concurrent data structures (used by validation_batcher)
-dashmap = "5.5"
+# Lock-free concurrent data structures
+arc-swap = "1.8.0"
+dashmap = "6.1.0"
 
 # OpenTelemetry for distributed tracing
 opentelemetry = "0.31.0"
 opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic"] }
+opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic", "reqwest-rustls"] }
 opentelemetry-semantic-conventions = "0.31.0"
 
 # Tracing integration (version matched to opentelemetry 0.31.0)

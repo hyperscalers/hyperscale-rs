@@ -3,7 +3,7 @@
 use crate::Event;
 use hyperscale_messages::{
     BlockHeaderGossip, BlockVoteGossip, StateCertificateBatch, StateProvisionBatch, StateVoteBatch,
-    TraceContext, TransactionGossip,
+    TraceContext, TransactionCertificateGossip, TransactionGossip,
 };
 use sbor::prelude::*;
 use std::hash::{Hash, Hasher};
@@ -41,6 +41,11 @@ pub enum OutboundMessage {
     /// Batched certificates proving execution quorum.
     StateCertificateBatch(StateCertificateBatch),
 
+    /// Finalized transaction certificate gossip for same-shard peers.
+    /// Gossiped when certificates are finalized so peers have them before block inclusion.
+    /// Uses individual gossip (not batched) for better deduplication by gossipsub.
+    TransactionCertificateGossip(TransactionCertificateGossip),
+
     // ═══════════════════════════════════════════════════════════════════════
     // Mempool Messages
     // ═══════════════════════════════════════════════════════════════════════
@@ -57,6 +62,7 @@ impl OutboundMessage {
             OutboundMessage::StateProvisionBatch(_) => "StateProvisionBatch",
             OutboundMessage::StateVoteBatch(_) => "StateVoteBatch",
             OutboundMessage::StateCertificateBatch(_) => "StateCertificateBatch",
+            OutboundMessage::TransactionCertificateGossip(_) => "TransactionCertificateGossip",
             OutboundMessage::TransactionGossip(_) => "TransactionGossip",
         }
     }
@@ -76,6 +82,7 @@ impl OutboundMessage {
             OutboundMessage::StateProvisionBatch(_)
                 | OutboundMessage::StateVoteBatch(_)
                 | OutboundMessage::StateCertificateBatch(_)
+                | OutboundMessage::TransactionCertificateGossip(_)
         )
     }
 
@@ -107,10 +114,11 @@ impl OutboundMessage {
             OutboundMessage::TransactionGossip(gossip) => {
                 gossip.trace_context = ctx;
             }
-            // BFT consensus and state vote messages don't carry trace context
+            // BFT consensus, state vote, and transaction certificate messages don't carry trace context
             OutboundMessage::BlockHeader(_)
             | OutboundMessage::BlockVote(_)
-            | OutboundMessage::StateVoteBatch(_) => {}
+            | OutboundMessage::StateVoteBatch(_)
+            | OutboundMessage::TransactionCertificateGossip(_) => {}
         }
     }
 
@@ -134,6 +142,9 @@ impl OutboundMessage {
             }
             OutboundMessage::StateCertificateBatch(batch) => {
                 basic_encode(batch).map(|v| v.len()).unwrap_or(0)
+            }
+            OutboundMessage::TransactionCertificateGossip(gossip) => {
+                basic_encode(gossip).map(|v| v.len()).unwrap_or(0)
             }
             OutboundMessage::TransactionGossip(gossip) => {
                 basic_encode(gossip.as_ref()).map(|v| v.len()).unwrap_or(0)
@@ -182,6 +193,11 @@ impl OutboundMessage {
                     encoded.hash(&mut hasher);
                 }
             }
+            OutboundMessage::TransactionCertificateGossip(gossip) => {
+                if let Ok(encoded) = basic_encode(gossip) {
+                    encoded.hash(&mut hasher);
+                }
+            }
             OutboundMessage::TransactionGossip(g) => {
                 if let Ok(encoded) = basic_encode(g.as_ref()) {
                     encoded.hash(&mut hasher);
@@ -227,6 +243,11 @@ impl OutboundMessage {
                 .iter()
                 .map(|cert| Event::StateCertificateReceived { cert: cert.clone() })
                 .collect(),
+            OutboundMessage::TransactionCertificateGossip(gossip) => {
+                vec![Event::TransactionCertificateReceived {
+                    certificate: gossip.certificate.clone(),
+                }]
+            }
             OutboundMessage::TransactionGossip(gossip) => vec![Event::TransactionGossipReceived {
                 tx: Arc::clone(&gossip.transaction),
             }],

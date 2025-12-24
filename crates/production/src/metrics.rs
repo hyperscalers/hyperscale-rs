@@ -2,6 +2,10 @@
 //!
 //! Metrics are domain-specific rather than generic event counters.
 //! Use traces for event-level granularity during investigations.
+//!
+//! Note: Some metrics functions are not yet hooked up but are intentionally
+//! kept for future integration. The dead_code allow is intentional here.
+#![allow(dead_code)]
 
 use prometheus::{
     register_counter, register_counter_vec, register_gauge, register_histogram,
@@ -54,8 +58,11 @@ pub struct Metrics {
     /// Queue depth of the consensus crypto pool (block votes, QC verification).
     /// This pool is liveness-critical and should remain near zero under load.
     pub consensus_crypto_pool_queue_depth: Gauge,
-    /// Queue depth of the general crypto pool (provisions, state votes, tx validation).
+    /// Queue depth of the general crypto pool (provisions, state votes).
     pub crypto_pool_queue_depth: Gauge,
+    /// Queue depth of the tx validation pool (transaction signature verification).
+    /// Isolated from general crypto to prevent tx floods from blocking execution progress.
+    pub tx_validation_pool_queue_depth: Gauge,
     pub execution_pool_queue_depth: Gauge,
 
     // === Event Channel Depths ===
@@ -97,6 +104,9 @@ pub struct Metrics {
     pub libp2p_peers_connected: Gauge,
     pub libp2p_bandwidth_in_bytes: Counter,
     pub libp2p_bandwidth_out_bytes: Counter,
+    pub libp2p_pending_response_channels: Gauge,
+    pub libp2p_event_loop_panics: Counter,
+    pub libp2p_requests_rate_limited: CounterVec,
 
     // === Sync ===
     pub sync_blocks_behind: Gauge,
@@ -109,6 +119,9 @@ pub struct Metrics {
     pub fetch_started: CounterVec,
     pub fetch_completed: CounterVec,
     pub fetch_failed: CounterVec,
+    pub fetch_timeouts: CounterVec,
+    pub fetch_stale_cleanups: CounterVec,
+    pub fetch_event_send_failed: CounterVec,
     pub fetch_items_received: CounterVec,
     pub fetch_items_sent: CounterVec,
     pub fetch_latency: HistogramVec,
@@ -127,6 +140,22 @@ pub struct Metrics {
     pub signature_verification_failures: Counter,
     pub invalid_messages_received: Counter,
     pub transactions_rejected: CounterVec,
+
+    // === Cross-Shard Message Delivery ===
+    /// Failures to dispatch cross-shard messages (channel closed).
+    pub dispatch_failures: CounterVec,
+    /// Cross-shard message batches that failed initial broadcast (queued for retry).
+    pub broadcast_failures: Counter,
+    /// Cross-shard message batches successfully delivered after retry.
+    pub broadcast_retry_successes: Counter,
+    /// Cross-shard message batches dropped after max retries.
+    pub broadcast_messages_dropped: Counter,
+    /// Current size of the broadcast retry queue.
+    pub broadcast_retry_queue_size: Gauge,
+    /// Gossipsub publish failures by topic.
+    pub gossipsub_publish_failures: CounterVec,
+    /// Early arrival buffer evictions.
+    pub early_arrival_evictions: Counter,
 }
 
 impl Metrics {
@@ -282,6 +311,12 @@ impl Metrics {
             )
             .unwrap(),
 
+            tx_validation_pool_queue_depth: register_gauge!(
+                "hyperscale_tx_validation_pool_queue_depth",
+                "Number of pending tasks in tx validation pool (transaction signature verification)"
+            )
+            .unwrap(),
+
             execution_pool_queue_depth: register_gauge!(
                 "hyperscale_execution_pool_queue_depth",
                 "Number of pending tasks in execution pool"
@@ -423,6 +458,25 @@ impl Metrics {
             )
             .unwrap(),
 
+            libp2p_pending_response_channels: register_gauge!(
+                "hyperscale_libp2p_pending_response_channels",
+                "Number of pending response channels (potential memory leak if growing)"
+            )
+            .unwrap(),
+
+            libp2p_event_loop_panics: register_counter!(
+                "hyperscale_libp2p_event_loop_panics_total",
+                "Network event loop panics (critical - requires node restart)"
+            )
+            .unwrap(),
+
+            libp2p_requests_rate_limited: register_counter_vec!(
+                "hyperscale_libp2p_requests_rate_limited_total",
+                "Inbound requests dropped due to rate limiting",
+                &["peer_type"] // "validator" or "unknown"
+            )
+            .unwrap(),
+
             // Sync
             sync_blocks_behind: register_gauge!(
                 "hyperscale_sync_blocks_behind",
@@ -474,6 +528,27 @@ impl Metrics {
                 "hyperscale_fetch_failed_total",
                 "Total fetch operations failed",
                 &["kind"]
+            )
+            .unwrap(),
+
+            fetch_timeouts: register_counter_vec!(
+                "hyperscale_fetch_timeouts_total",
+                "Fetch operations that timed out (subset of failed)",
+                &["kind"]
+            )
+            .unwrap(),
+
+            fetch_stale_cleanups: register_counter_vec!(
+                "hyperscale_fetch_stale_cleanups_total",
+                "Fetch operations cleaned up as stale (exceeded stale_fetch_timeout)",
+                &["kind"]
+            )
+            .unwrap(),
+
+            fetch_event_send_failed: register_counter_vec!(
+                "hyperscale_fetch_event_send_failed_total",
+                "Failed to send fetch result event to BFT (critical)",
+                &["event_type"]
             )
             .unwrap(),
 
@@ -556,6 +631,51 @@ impl Metrics {
                 &["reason"]
             )
             .unwrap(),
+
+            // Cross-Shard Message Delivery
+            dispatch_failures: register_counter_vec!(
+                "hyperscale_dispatch_failures_total",
+                "Failures to dispatch cross-shard messages (channel closed)",
+                &["message_type"]
+            )
+            .unwrap(),
+
+            broadcast_failures: register_counter!(
+                "hyperscale_broadcast_failures_total",
+                "Cross-shard message batches that failed initial broadcast"
+            )
+            .unwrap(),
+
+            broadcast_retry_successes: register_counter!(
+                "hyperscale_broadcast_retry_successes_total",
+                "Cross-shard message batches successfully delivered after retry"
+            )
+            .unwrap(),
+
+            broadcast_messages_dropped: register_counter!(
+                "hyperscale_broadcast_messages_dropped_total",
+                "Cross-shard message batches dropped after max retries (CRITICAL)"
+            )
+            .unwrap(),
+
+            broadcast_retry_queue_size: register_gauge!(
+                "hyperscale_broadcast_retry_queue_size",
+                "Current size of the broadcast retry queue"
+            )
+            .unwrap(),
+
+            gossipsub_publish_failures: register_counter_vec!(
+                "hyperscale_gossipsub_publish_failures_total",
+                "Gossipsub publish failures by topic type",
+                &["topic_type"]
+            )
+            .unwrap(),
+
+            early_arrival_evictions: register_counter!(
+                "hyperscale_early_arrival_evictions_total",
+                "Early arrival buffer entries evicted due to size limit"
+            )
+            .unwrap(),
         }
     }
 }
@@ -614,11 +734,17 @@ pub fn set_txs_with_commitment_proof(count: usize) {
 }
 
 /// Update thread pool queue depths.
-pub fn set_pool_queue_depths(consensus_crypto: usize, crypto: usize, execution: usize) {
+pub fn set_pool_queue_depths(
+    consensus_crypto: usize,
+    crypto: usize,
+    tx_validation: usize,
+    execution: usize,
+) {
     let m = metrics();
     m.consensus_crypto_pool_queue_depth
         .set(consensus_crypto as f64);
     m.crypto_pool_queue_depth.set(crypto as f64);
+    m.tx_validation_pool_queue_depth.set(tx_validation as f64);
     m.execution_pool_queue_depth.set(execution as f64);
 }
 
@@ -732,6 +858,26 @@ pub fn record_libp2p_bandwidth(bytes_in: u64, bytes_out: u64) {
     m.libp2p_bandwidth_out_bytes.inc_by(bytes_out as f64);
 }
 
+/// Record number of pending response channels (for leak detection).
+pub fn record_pending_response_channels(count: usize) {
+    metrics().libp2p_pending_response_channels.set(count as f64);
+}
+
+/// Record a rate-limited request.
+/// `is_validator` indicates whether the peer was a known validator.
+pub fn record_request_rate_limited(is_validator: bool) {
+    let peer_type = if is_validator { "validator" } else { "unknown" };
+    metrics()
+        .libp2p_requests_rate_limited
+        .with_label_values(&[peer_type])
+        .inc();
+}
+
+/// Record a network event loop panic (critical error).
+pub fn record_network_event_loop_panic() {
+    metrics().libp2p_event_loop_panics.inc();
+}
+
 /// Update sync status.
 pub fn set_sync_status(blocks_behind: u64, in_progress: bool) {
     let m = metrics();
@@ -753,7 +899,8 @@ pub fn record_sync_block_downloaded() {
 /// - `"peer_mismatch"` - response from unexpected peer
 /// - `"request_id_mismatch"` - wrong request ID
 /// - `"state_mismatch"` - block doesn't extend current state
-/// - `"timeout"` - request timed out
+/// - `"timeout"` - sync fetch request timed out
+/// - `"backfill_timeout"` - backfill request timed out (transactions/certs for metadata-only block)
 /// - `"network_error"` - network-level failure
 /// - `"empty_response"` - peer doesn't have the block (may have pruned it)
 ///
@@ -956,6 +1103,31 @@ pub fn record_fetch_failed(kind: crate::fetch::FetchKind) {
         .inc();
 }
 
+/// Record a fetch operation timeout (also counts as failed).
+pub fn record_fetch_timeout(kind: crate::fetch::FetchKind) {
+    metrics()
+        .fetch_timeouts
+        .with_label_values(&[kind.as_str()])
+        .inc();
+}
+
+/// Record a stale fetch cleanup (fetch exceeded stale_fetch_timeout).
+pub fn record_fetch_stale_cleanup(kind: crate::fetch::FetchKind) {
+    metrics()
+        .fetch_stale_cleanups
+        .with_label_values(&[kind.as_str()])
+        .inc();
+}
+
+/// Record a failed attempt to send fetch result event to BFT.
+/// This is a critical error - the data was fetched but BFT won't receive it.
+pub fn record_fetch_event_send_failed(event_type: &str) {
+    metrics()
+        .fetch_event_send_failed
+        .with_label_values(&[event_type])
+        .inc();
+}
+
 /// Record items received via fetch.
 pub fn record_fetch_items_received(kind: crate::fetch::FetchKind, count: usize) {
     metrics()
@@ -985,4 +1157,53 @@ pub fn record_fetch_response_sent(kind: &str, count: usize) {
         .fetch_items_sent
         .with_label_values(&[kind])
         .inc_by(count as f64);
+}
+
+// === Cross-Shard Message Delivery Metrics ===
+
+/// Increment dispatch failure counter for cross-shard messages.
+///
+/// Called when the action dispatcher channel is closed (critical failure).
+pub fn increment_dispatch_failures(message_type: &str) {
+    metrics()
+        .dispatch_failures
+        .with_label_values(&[message_type])
+        .inc();
+}
+
+/// Record a broadcast failure (queued for retry).
+pub fn record_broadcast_failure() {
+    metrics().broadcast_failures.inc();
+}
+
+/// Record a successful retry of a broadcast.
+pub fn record_broadcast_retry_success() {
+    metrics().broadcast_retry_successes.inc();
+}
+
+/// Record a message batch dropped after max retries.
+pub fn record_broadcast_message_dropped() {
+    metrics().broadcast_messages_dropped.inc();
+}
+
+/// Update the current retry queue size.
+pub fn set_broadcast_retry_queue_size(size: usize) {
+    metrics().broadcast_retry_queue_size.set(size as f64);
+}
+
+/// Record a gossipsub publish failure.
+///
+/// Extracts the topic type from the full topic string for better grouping.
+pub fn record_gossipsub_publish_failure(topic: &str) {
+    // Extract topic type from full topic string (e.g., "/hyperscale/shard/0/votes" -> "votes")
+    let topic_type = topic.rsplit('/').next().unwrap_or("unknown");
+    metrics()
+        .gossipsub_publish_failures
+        .with_label_values(&[topic_type])
+        .inc();
+}
+
+/// Record an early arrival buffer eviction.
+pub fn record_early_arrival_eviction() {
+    metrics().early_arrival_evictions.inc();
 }

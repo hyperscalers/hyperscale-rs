@@ -1,8 +1,7 @@
 //! Production runner implementation.
 
 use crate::action_dispatcher::{
-    spawn_action_dispatcher, ActionDispatcherConfig, ActionDispatcherContext,
-    ActionDispatcherHandle, DispatchableAction,
+    spawn_action_dispatcher, ActionDispatcherContext, ActionDispatcherHandle, DispatchableAction,
 };
 use crate::fetch_handler::{spawn_fetch_handler, FetchHandlerConfig, FetchHandlerHandle};
 use crate::network::{
@@ -23,7 +22,7 @@ use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     Block, BlockHeader, BlockMetadata, BlockVote, CommitmentProof, Hash, KeyPair, PublicKey,
     QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
-    StateVoteBlock, Topology, ValidatorId,
+    StateVoteBlock, Topology, TransactionCertificate, ValidatorId,
 };
 use libp2p::identity;
 use sbor::prelude::*;
@@ -32,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{instrument, span, Level, Span};
+use tracing::{span, Level};
 
 /// Errors from the production runner.
 #[derive(Debug, Error)]
@@ -45,6 +44,21 @@ pub enum RunnerError {
     SendError(String),
     #[error("Network error: {0}")]
     NetworkError(#[from] NetworkError),
+}
+
+/// Maximum batch sizes for time-windowed operations.
+/// These limits cap p99 latency by preventing unbounded batch growth under load.
+/// Values are tuned to balance throughput (larger batches = better amortization)
+/// against latency (smaller batches = faster completion).
+mod batch_limits {
+    /// Block votes: consensus-critical, lighter preprocessing. 128 matches ValidationBatcher.
+    pub const MAX_BLOCK_VOTES: usize = 128;
+    /// State votes: same crypto pattern as block votes, 20ms window needs tighter cap.
+    pub const MAX_STATE_VOTES: usize = 64;
+    /// State certs: parallel key aggregation benefits from ~core-count batches.
+    pub const MAX_STATE_CERTS: usize = 64;
+    /// Cross-shard execution: heavy per-item work, memory pressure from provisions.
+    pub const MAX_CROSS_SHARD_EXECUTIONS: usize = 32;
 }
 
 /// Pending block vote verifications that can be batched.
@@ -68,6 +82,10 @@ impl PendingBlockVotes {
     fn len(&self) -> usize {
         self.votes.len()
     }
+
+    fn is_full(&self) -> bool {
+        self.votes.len() >= batch_limits::MAX_BLOCK_VOTES
+    }
 }
 
 /// Pending state vote verifications with a longer batching window.
@@ -89,6 +107,10 @@ impl PendingStateVotes {
     fn take(&mut self) -> Vec<(StateVoteBlock, PublicKey)> {
         std::mem::take(&mut self.votes)
     }
+
+    fn is_full(&self) -> bool {
+        self.votes.len() >= batch_limits::MAX_STATE_VOTES
+    }
 }
 
 /// Pending cross-shard executions that can be batched.
@@ -109,6 +131,50 @@ impl PendingCrossShardExecutions {
     fn take(&mut self) -> Vec<hyperscale_core::CrossShardExecutionRequest> {
         std::mem::take(&mut self.requests)
     }
+
+    fn is_full(&self) -> bool {
+        self.requests.len() >= batch_limits::MAX_CROSS_SHARD_EXECUTIONS
+    }
+}
+
+/// Pending state certificate verifications with batching window.
+///
+/// State certificates have aggregated BLS signatures that are expensive to verify
+/// (~1.5ms each). By batching them with a 15ms window, we can use BLS batch
+/// verification which is ~40% faster than individual verification.
+#[derive(Default)]
+struct PendingStateCerts {
+    /// State certificates waiting for verification.
+    /// Each entry contains: (certificate, public_keys for the shard)
+    certs: Vec<(hyperscale_types::StateCertificate, Vec<PublicKey>)>,
+}
+
+impl PendingStateCerts {
+    fn is_empty(&self) -> bool {
+        self.certs.is_empty()
+    }
+
+    fn take(&mut self) -> Vec<(hyperscale_types::StateCertificate, Vec<PublicKey>)> {
+        std::mem::take(&mut self.certs)
+    }
+
+    fn is_full(&self) -> bool {
+        self.certs.len() >= batch_limits::MAX_STATE_CERTS
+    }
+}
+
+/// Pending verification of a gossiped TransactionCertificate.
+///
+/// When we receive a TransactionCertificate via gossip, we verify each embedded
+/// StateCertificate's BLS signature before persisting. This tracks the verification
+/// progress for a single certificate.
+struct PendingGossipCertVerification {
+    /// The certificate being verified.
+    certificate: TransactionCertificate,
+    /// Shards still awaiting verification callback.
+    pending_shards: std::collections::HashSet<ShardGroupId>,
+    /// Whether any verification has failed.
+    failed: bool,
 }
 
 /// Handle for shutting down a running ProductionRunner.
@@ -401,6 +467,9 @@ impl ProductionRunnerBuilder {
         // Load RecoveredState from storage for crash recovery
         let recovered = storage.load_recovered_state();
 
+        // Clone signing key for runner's state vote signing (state machine also needs it)
+        let runner_signing_key = signing_key.clone();
+
         // NodeIndex is a simulation concept - production uses 0
         let state = NodeStateMachine::with_speculative_config(
             0, // node_index not meaningful in production
@@ -519,13 +588,10 @@ impl ProductionRunnerBuilder {
 
         // Spawn action dispatcher task for fire-and-forget network I/O.
         // Network broadcasts are moved off the event loop to prevent blocking.
-        let action_dispatcher = spawn_action_dispatcher(
-            ActionDispatcherConfig::default(),
-            ActionDispatcherContext {
-                network: network.clone(),
-                message_batcher: message_batcher.clone(),
-            },
-        );
+        let action_dispatcher = spawn_action_dispatcher(ActionDispatcherContext {
+            network: network.clone(),
+            message_batcher: message_batcher.clone(),
+        });
         let dispatch_tx = action_dispatcher.tx.clone();
 
         Ok(ProductionRunner {
@@ -566,10 +632,15 @@ impl ProductionRunnerBuilder {
             state_vote_deadline: None,
             pending_cross_shard_executions: PendingCrossShardExecutions::default(),
             cross_shard_execution_deadline: None,
+            pending_state_certs: PendingStateCerts::default(),
+            state_cert_deadline: None,
+            signing_key: runner_signing_key,
             message_batcher,
             fetch_handler,
             dispatch_tx,
             action_dispatcher,
+            rpc_submitted_txs: std::collections::HashSet::new(),
+            pending_gossip_cert_verifications: std::collections::HashMap::new(),
         })
     }
 }
@@ -657,7 +728,7 @@ pub struct ProductionRunner {
     /// Optional genesis configuration for initial state.
     genesis_config: Option<hyperscale_engine::GenesisConfig>,
     /// Inbound sync request channel (from network adapter).
-    sync_request_rx: mpsc::Receiver<InboundSyncRequest>,
+    sync_request_rx: mpsc::UnboundedReceiver<InboundSyncRequest>,
     /// Shutdown signal receiver.
     shutdown_rx: oneshot::Receiver<()>,
     /// Shutdown handle sender (stored to return to caller).
@@ -672,6 +743,13 @@ pub struct ProductionRunner {
     pending_cross_shard_executions: PendingCrossShardExecutions,
     /// Deadline for flushing pending cross-shard executions. None if none pending.
     cross_shard_execution_deadline: Option<tokio::time::Instant>,
+    /// Pending state certificates accumulated for batch signature verification.
+    /// Uses a 15ms batching window - state certs are the highest volume crypto operation.
+    pending_state_certs: PendingStateCerts,
+    /// Deadline for flushing pending state certificates. None if none pending.
+    state_cert_deadline: Option<tokio::time::Instant>,
+    /// Signing key for state vote signing (cloned from state machine).
+    signing_key: KeyPair,
     /// Message batcher for execution layer messages (votes, certificates, provisions).
     /// Accumulates items and flushes periodically to reduce network overhead.
     /// Note: Now primarily used by action dispatcher, kept here for direct access if needed.
@@ -683,10 +761,20 @@ pub struct ProductionRunner {
     fetch_handler: FetchHandlerHandle,
     /// Sender for dispatching fire-and-forget actions to the action dispatcher task.
     /// Network broadcasts, timer management, and non-critical writes go through this.
-    dispatch_tx: mpsc::Sender<DispatchableAction>,
+    /// Unbounded to prevent dropping critical consensus messages under load.
+    dispatch_tx: mpsc::UnboundedSender<DispatchableAction>,
     /// Handle for the dedicated action dispatcher task.
     #[allow(dead_code)]
     action_dispatcher: ActionDispatcherHandle,
+    /// Set of transaction hashes that were submitted via RPC (locally).
+    /// Used to track which transactions should contribute to latency metrics.
+    /// Transactions are added when received via RPC, removed when finalized.
+    rpc_submitted_txs: std::collections::HashSet<hyperscale_types::Hash>,
+    /// Pending verifications for gossiped TransactionCertificates.
+    /// Maps tx_hash -> verification state. When all shards verified, certificate is
+    /// persisted and GossipedCertificateVerified event sent to state machine.
+    pending_gossip_cert_verifications:
+        std::collections::HashMap<Hash, PendingGossipCertVerification>,
 }
 
 impl ProductionRunner {
@@ -944,6 +1032,7 @@ impl ProductionRunner {
                     crate::metrics::set_pool_queue_depths(
                         self.thread_pools.consensus_crypto_queue_depth(),
                         self.thread_pools.crypto_queue_depth(),
+                        self.thread_pools.tx_validation_queue_depth(),
                         self.thread_pools.execution_queue_depth(),
                     );
 
@@ -1039,21 +1128,11 @@ impl ProductionRunner {
                 // by network floods. This is critical for liveness - if timers stop firing,
                 // the validator cannot make progress.
                 Some(event) = self.timer_rx.recv() => {
-                    let event_type = event.type_name();
-                    let event_span = span!(
-                        Level::INFO,
-                        "handle_timer",
-                        event.type = %event_type,
-                        node = self.state.node_index(),
-                        shard = ?self.state.shard(),
-                    );
-                    let _event_guard = event_span.enter();
-
                     // Update time
                     let now = self.wall_clock_time();
                     self.state.set_time(now);
 
-                    // Process timer event
+                    // Process timer event (span created by state.handle())
                     let actions = self.dispatch_event(event).await;
 
                     for action in actions {
@@ -1074,24 +1153,14 @@ impl ProductionRunner {
                 // produce ExecuteCrossShardTransaction actions. These must be accumulated
                 // for batch parallel execution, not sent directly to process_action().
                 Some(event) = self.callback_rx.recv() => {
-                    let event_type = event.type_name();
-                    let event_span = span!(
-                        Level::DEBUG,
-                        "handle_callback",
-                        event.type = %event_type,
-                        node = self.state.node_index(),
-                        shard = ?self.state.shard(),
-                    );
-                    let _event_guard = event_span.enter();
-
                     // Update time
                     let now = self.wall_clock_time();
                     self.state.set_time(now);
 
-                    // Dispatch event through unified handler
+                    // Dispatch event through unified handler (span created by state.handle())
                     let actions = self.dispatch_event(event).await;
 
-                    // Process actions, accumulating cross-shard executions for batching
+                    // Process actions, accumulating cross-shard executions and vote signings for batching
                     for action in actions {
                         match action {
                             Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
@@ -1109,6 +1178,12 @@ impl ProductionRunner {
                                         provisions,
                                     }
                                 );
+                                // Flush early if batch is full to cap p99 latency
+                                if self.pending_cross_shard_executions.is_full() {
+                                    let requests = self.pending_cross_shard_executions.take();
+                                    self.cross_shard_execution_deadline = None;
+                                    self.dispatch_cross_shard_executions(requests);
+                                }
                             }
                             other => {
                                 if let Err(e) = self.process_action(other).await {
@@ -1123,41 +1198,134 @@ impl ProductionRunner {
                 event = self.consensus_rx.recv() => {
                     match event {
                         Some(event) => {
-                            // Create span for event handling
-                            let event_type = event.type_name();
-                            let event_span = span!(
-                                Level::INFO,
-                                "handle_event",
-                                event.type = %event_type,
-                                node = self.state.node_index(),
-                                shard = ?self.state.shard(),
-                                otel.kind = "INTERNAL",
-                            );
-                            let _event_guard = event_span.enter();
-
                             // Update time
                             let now = self.wall_clock_time();
                             self.state.set_time(now);
 
-                            // Process event synchronously (fast)
+                            // Handle TransactionCertificateReceived - verify before persisting.
+                            // This is a certificate gossiped from another validator. We verify all
+                            // embedded StateCertificate BLS signatures before persisting to prevent
+                            // malicious peers from filling our storage with invalid certificates.
+                            if let Event::TransactionCertificateReceived { certificate } = &event {
+                                let tx_hash = certificate.transaction_hash;
+
+                                // Skip if already verified or in storage
+                                if self.pending_gossip_cert_verifications.contains_key(&tx_hash) {
+                                    continue;
+                                }
+                                if self.storage.get_certificate(&tx_hash).is_some() {
+                                    continue;
+                                }
+
+                                // Collect shards that need verification
+                                let pending_shards: std::collections::HashSet<ShardGroupId> =
+                                    certificate.shard_proofs.keys().copied().collect();
+
+                                if pending_shards.is_empty() {
+                                    // Empty certificate (no shard proofs) - persist directly
+                                    // This shouldn't happen in practice but handle it gracefully
+                                    self.persist_and_notify_gossiped_certificate(certificate.clone());
+                                    continue;
+                                }
+
+                                // Track pending verification
+                                self.pending_gossip_cert_verifications.insert(
+                                    tx_hash,
+                                    PendingGossipCertVerification {
+                                        certificate: certificate.clone(),
+                                        pending_shards: pending_shards.clone(),
+                                        failed: false,
+                                    },
+                                );
+
+                                // Spawn verification for each StateCertificate on crypto pool
+                                for (shard_id, state_cert) in &certificate.shard_proofs {
+                                    let committee = self.topology.committee_for_shard(*shard_id);
+                                    let public_keys: Vec<PublicKey> = committee
+                                        .iter()
+                                        .filter_map(|&vid| self.topology.public_key(vid))
+                                        .collect();
+
+                                    if public_keys.len() != committee.len() {
+                                        tracing::warn!(
+                                            tx_hash = ?tx_hash,
+                                            shard = shard_id.0,
+                                            "Could not resolve all public keys for gossiped certificate"
+                                        );
+                                        // Mark as failed
+                                        if let Some(pending) =
+                                            self.pending_gossip_cert_verifications.get_mut(&tx_hash)
+                                        {
+                                            pending.failed = true;
+                                            pending.pending_shards.remove(shard_id);
+                                        }
+                                        continue;
+                                    }
+
+                                    let cert = state_cert.clone();
+                                    let shard = *shard_id;
+                                    let callback_tx = self.callback_tx.clone();
+
+                                    self.thread_pools.spawn_crypto(move || {
+                                        let valid =
+                                            verify_state_certificate_signature(&cert, &public_keys);
+                                        let _ = callback_tx.send(
+                                            Event::GossipedCertificateSignatureVerified {
+                                                tx_hash,
+                                                shard,
+                                                valid,
+                                            },
+                                        );
+                                    });
+                                }
+
+                                // Don't dispatch to state machine yet - wait for verification
+                                continue;
+                            }
+
+                            // Handle GossipedCertificateSignatureVerified callbacks
+                            if let Event::GossipedCertificateSignatureVerified {
+                                tx_hash,
+                                shard,
+                                valid,
+                            } = &event
+                            {
+                                if let Some(pending) =
+                                    self.pending_gossip_cert_verifications.get_mut(tx_hash)
+                                {
+                                    if !valid {
+                                        pending.failed = true;
+                                        tracing::warn!(
+                                            tx_hash = ?tx_hash,
+                                            shard = shard.0,
+                                            "Gossiped certificate signature verification failed"
+                                        );
+                                    }
+                                    pending.pending_shards.remove(shard);
+
+                                    // Check if all shards verified
+                                    if pending.pending_shards.is_empty() {
+                                        let pending = self
+                                            .pending_gossip_cert_verifications
+                                            .remove(tx_hash)
+                                            .unwrap();
+
+                                        if !pending.failed {
+                                            // All verified - persist and notify state machine
+                                            self.persist_and_notify_gossiped_certificate(
+                                                pending.certificate,
+                                            );
+                                        }
+                                        // If failed, just drop - don't persist invalid certificate
+                                    }
+                                }
+                                continue;
+                            }
+
+                            // Process event synchronously (span created by state.handle())
                             // Note: Runner I/O requests (StartSync, FetchTransactions, FetchCertificates)
                             // are now Actions emitted by the state machine and handled in process_action().
-                            let actions = {
-                                let sm_span = span!(Level::DEBUG, "state_machine.handle");
-                                let _sm_guard = sm_span.enter();
-                                self.state.handle(event)
-                            };
-
-                            // Record action count
-                            Span::current().record("actions.count", actions.len());
-
-                            if !actions.is_empty() {
-                                tracing::debug!(
-                                    event_type = %event_type,
-                                    num_actions = actions.len(),
-                                    "Event produced actions"
-                                );
-                            }
+                            let actions = self.state.handle(event);
 
                             // Collect block vote verifications for batching (5ms window).
                             // State votes are accumulated separately with a longer window (20ms).
@@ -1177,6 +1345,27 @@ impl ProductionRunner {
                                             );
                                         }
                                         self.pending_state_votes.votes.push((vote, public_key));
+                                        // Flush early if batch is full to cap p99 latency
+                                        if self.pending_state_votes.is_full() {
+                                            let votes = self.pending_state_votes.take();
+                                            self.state_vote_deadline = None;
+                                            self.dispatch_state_vote_verifications(votes);
+                                        }
+                                    }
+                                    Action::VerifyStateCertificateSignature { certificate, public_keys } => {
+                                        // Add to accumulated state certs with 15ms batching window
+                                        if self.pending_state_certs.is_empty() {
+                                            self.state_cert_deadline = Some(
+                                                tokio::time::Instant::now() + Duration::from_millis(15)
+                                            );
+                                        }
+                                        self.pending_state_certs.certs.push((certificate, public_keys));
+                                        // Flush early if batch is full to cap p99 latency
+                                        if self.pending_state_certs.is_full() {
+                                            let certs = self.pending_state_certs.take();
+                                            self.state_cert_deadline = None;
+                                            self.dispatch_state_cert_verifications(certs);
+                                        }
                                     }
                                     // Note: ExecuteCrossShardTransaction only comes from ProvisioningComplete
                                     // which routes through the callback channel, not the consensus channel.
@@ -1209,6 +1398,24 @@ impl ProductionRunner {
                                                 );
                                             }
                                             self.pending_state_votes.votes.push((vote, public_key));
+                                            if self.pending_state_votes.is_full() {
+                                                let votes = self.pending_state_votes.take();
+                                                self.state_vote_deadline = None;
+                                                self.dispatch_state_vote_verifications(votes);
+                                            }
+                                        }
+                                        Action::VerifyStateCertificateSignature { certificate, public_keys } => {
+                                            if self.pending_state_certs.is_empty() {
+                                                self.state_cert_deadline = Some(
+                                                    tokio::time::Instant::now() + Duration::from_millis(15)
+                                                );
+                                            }
+                                            self.pending_state_certs.certs.push((certificate, public_keys));
+                                            if self.pending_state_certs.is_full() {
+                                                let certs = self.pending_state_certs.take();
+                                                self.state_cert_deadline = None;
+                                                self.dispatch_state_cert_verifications(certs);
+                                            }
                                         }
                                         other => {
                                             if let Err(e) = self.process_action(other).await {
@@ -1250,6 +1457,24 @@ impl ProductionRunner {
                                                             );
                                                         }
                                                         self.pending_state_votes.votes.push((vote, public_key));
+                                                        if self.pending_state_votes.is_full() {
+                                                            let votes = self.pending_state_votes.take();
+                                                            self.state_vote_deadline = None;
+                                                            self.dispatch_state_vote_verifications(votes);
+                                                        }
+                                                    }
+                                                    Action::VerifyStateCertificateSignature { certificate, public_keys } => {
+                                                        if self.pending_state_certs.is_empty() {
+                                                            self.state_cert_deadline = Some(
+                                                                tokio::time::Instant::now() + Duration::from_millis(15)
+                                                            );
+                                                        }
+                                                        self.pending_state_certs.certs.push((certificate, public_keys));
+                                                        if self.pending_state_certs.is_full() {
+                                                            let certs = self.pending_state_certs.take();
+                                                            self.state_cert_deadline = None;
+                                                            self.dispatch_state_cert_verifications(certs);
+                                                        }
                                                     }
                                                     other => {
                                                         if let Err(e) = self.process_action(other).await {
@@ -1257,6 +1482,11 @@ impl ProductionRunner {
                                                         }
                                                     }
                                                 }
+                                            }
+
+                                            // Break early if block votes batch is full
+                                            if pending_block_votes.is_full() {
+                                                break;
                                             }
                                         }
                                         Ok(None) => {
@@ -1326,6 +1556,28 @@ impl ProductionRunner {
                     }
                 }
 
+                // STATE CERTIFICATE BATCHING: Flush accumulated state certs when deadline expires.
+                // Uses a 15ms batching window - state certs are the highest volume crypto operation
+                // and benefit significantly from batch BLS verification (~40% faster).
+                _ = async {
+                    match self.state_cert_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.state_cert_deadline.is_some() => {
+                    let certs = self.pending_state_certs.take();
+                    let batch_size = certs.len();
+                    self.state_cert_deadline = None;
+
+                    if !certs.is_empty() {
+                        tracing::debug!(
+                            batch_size,
+                            "Flushing state cert batch after 15ms window"
+                        );
+                        self.dispatch_state_cert_verifications(certs);
+                    }
+                }
+
                 // Handle validated transactions from batcher (unbounded channel)
                 // These are transactions that passed crypto validation in the batcher.
                 // Process before direct submissions since they've already been validated.
@@ -1356,19 +1608,10 @@ impl ProductionRunner {
                         });
                     }
 
-                    let event_type = event.type_name();
-                    let event_span = span!(
-                        Level::DEBUG,
-                        "handle_validated_tx",
-                        event.type = %event_type,
-                        node = self.state.node_index(),
-                        shard = ?self.state.shard(),
-                    );
-                    let _event_guard = event_span.enter();
-
                     let now = self.wall_clock_time();
                     self.state.set_time(now);
 
+                    // Span created by state.handle()
                     let actions = self.state.handle(event);
 
                     for action in actions {
@@ -1382,14 +1625,18 @@ impl ProductionRunner {
                 // These need to be gossiped to all relevant shards BEFORE validation,
                 // unlike gossip-received transactions which are already gossiped.
                 Some(tx) = self.rpc_tx_rx.recv() => {
+                    let tx_hash = tx.hash();
                     let tx_span = span!(
                         Level::DEBUG,
                         "handle_rpc_tx",
-                        tx_hash = ?tx.hash(),
+                        tx_hash = ?tx_hash,
                         node = self.state.node_index(),
                         shard = ?self.state.shard(),
                     );
                     let _tx_guard = tx_span.enter();
+
+                    // Track this as an RPC-submitted transaction for latency metrics
+                    self.rpc_submitted_txs.insert(tx_hash);
 
                     // Step 1: Gossip to all relevant shards FIRST
                     // This ensures other validators see the transaction even if we fail later
@@ -1456,19 +1703,11 @@ impl ProductionRunner {
                 // Transaction status updates (non-consensus-critical)
                 // These update mempool status for RPC queries but don't affect consensus
                 Some(event) = self.status_rx.recv() => {
-                    let event_type = event.type_name();
-                    let event_span = span!(
-                        Level::DEBUG,
-                        "handle_status_event",
-                        event.type = %event_type,
-                    );
-                    let _event_guard = event_span.enter();
-
                     // Update time
                     let now = self.wall_clock_time();
                     self.state.set_time(now);
 
-                    // Process status event (updates mempool state)
+                    // Process status event (span created by state.handle())
                     let actions = self.state.handle(event);
 
                     for action in actions {
@@ -1485,7 +1724,6 @@ impl ProductionRunner {
     }
 
     /// Process an action.
-    #[instrument(skip(self, action), fields(action.type = %action.type_name()))]
     async fn process_action(&mut self, action: Action) -> Result<(), RunnerError> {
         match action {
             // Network I/O - dispatch to action dispatcher task (fire-and-forget)
@@ -1494,59 +1732,77 @@ impl ProductionRunner {
                 // Inject trace context for cross-shard messages (no-op if feature disabled)
                 message.inject_trace_context();
 
-                // Dispatch to action dispatcher - non-blocking
-                if let Err(e) = self
+                // Dispatch to action dispatcher (unbounded channel - never blocks or drops)
+                let _ = self
                     .dispatch_tx
-                    .try_send(DispatchableAction::BroadcastToShard { shard, message })
-                {
-                    // Channel full or closed - fall back to direct send (blocking)
-                    tracing::warn!(
-                        "Action dispatch channel full, falling back to blocking broadcast"
-                    );
-                    if let DispatchableAction::BroadcastToShard { shard, message } = e.into_inner()
-                    {
-                        self.network.broadcast_shard(shard, &message).await?;
-                    }
-                }
+                    .send(DispatchableAction::BroadcastToShard { shard, message });
             }
 
             Action::BroadcastGlobal { mut message } => {
                 // Inject trace context for cross-shard messages (no-op if feature disabled)
                 message.inject_trace_context();
 
-                // Dispatch to action dispatcher - non-blocking
-                if let Err(e) = self
+                // Dispatch to action dispatcher (unbounded channel - never blocks or drops)
+                let _ = self
                     .dispatch_tx
-                    .try_send(DispatchableAction::BroadcastGlobal { message })
-                {
-                    // Channel full or closed - fall back to direct send (blocking)
-                    tracing::warn!(
-                        "Action dispatch channel full, falling back to blocking broadcast"
-                    );
-                    if let DispatchableAction::BroadcastGlobal { message } = e.into_inner() {
-                        self.network.broadcast_global(&message).await?;
-                    }
-                }
+                    .send(DispatchableAction::BroadcastGlobal { message });
             }
 
             // Domain-specific execution broadcasts - dispatch to action dispatcher
             // The batcher accumulates items and flushes periodically to reduce network overhead.
+            // These are critical cross-shard messages - log errors if dispatch fails.
             Action::BroadcastStateVote { shard, vote } => {
-                let _ = self
+                if self
                     .dispatch_tx
-                    .try_send(DispatchableAction::QueueStateVote { shard, vote });
+                    .send(DispatchableAction::QueueStateVote {
+                        shard,
+                        vote: vote.clone(),
+                    })
+                    .is_err()
+                {
+                    tracing::error!(
+                        shard = shard.0,
+                        tx_hash = ?vote.transaction_hash,
+                        "CRITICAL: Failed to dispatch state vote - dispatcher channel closed"
+                    );
+                    crate::metrics::increment_dispatch_failures("state_vote");
+                }
             }
 
             Action::BroadcastStateCertificate { shard, certificate } => {
-                let _ = self
+                if self
                     .dispatch_tx
-                    .try_send(DispatchableAction::QueueStateCertificate { shard, certificate });
+                    .send(DispatchableAction::QueueStateCertificate {
+                        shard,
+                        certificate: certificate.clone(),
+                    })
+                    .is_err()
+                {
+                    tracing::error!(
+                        shard = shard.0,
+                        tx_hash = ?certificate.transaction_hash,
+                        "CRITICAL: Failed to dispatch state certificate - dispatcher channel closed"
+                    );
+                    crate::metrics::increment_dispatch_failures("state_certificate");
+                }
             }
 
             Action::BroadcastStateProvision { shard, provision } => {
-                let _ = self
+                if self
                     .dispatch_tx
-                    .try_send(DispatchableAction::QueueStateProvision { shard, provision });
+                    .send(DispatchableAction::QueueStateProvision {
+                        shard,
+                        provision: provision.clone(),
+                    })
+                    .is_err()
+                {
+                    tracing::error!(
+                        shard = shard.0,
+                        tx_hash = ?provision.transaction_hash,
+                        "CRITICAL: Failed to dispatch state provision - dispatcher channel closed"
+                    );
+                    crate::metrics::increment_dispatch_failures("state_provision");
+                }
             }
 
             // Timers via timer manager
@@ -1585,80 +1841,136 @@ impl ProductionRunner {
                 });
             }
 
-            Action::VerifyProvisionSignature {
-                provision,
-                public_key,
-            } => {
-                // Spawn provision verification - always succeeds (provisions are critical).
-                // We use spawn_crypto directly since provisions should not be dropped.
-                // Backpressure is handled at the transaction submission layer instead.
-                let event_tx = self.callback_tx.clone();
-                self.thread_pools.spawn_crypto(move || {
-                    let start = std::time::Instant::now();
-                    // Use centralized signing message (must match ExecutionState::sign_provision)
-                    let msg = provision.signing_message();
-
-                    let valid = public_key.verify(&msg, &provision.signature);
-                    crate::metrics::record_signature_verification_latency(
-                        "provision",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        crate::metrics::record_signature_verification_failure();
-                    }
-                    event_tx
-                        .send(Event::ProvisionSignatureVerified { provision, valid })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
-            }
-
-            Action::AggregateCommitmentProof {
+            Action::VerifyAndAggregateProvisions {
                 tx_hash,
                 source_shard,
                 block_height,
                 entries,
-                signatures,
-                signer_indices,
+                provisions,
+                public_keys,
                 committee_size,
             } => {
                 let event_tx = self.callback_tx.clone();
+                let topology = self.topology.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
 
-                    // Build signer bitfield
-                    let mut signers = SignerBitfield::new(committee_size);
-                    for idx in &signer_indices {
-                        signers.set(*idx);
-                    }
+                    // All provisions for the same (tx, source_shard) sign the SAME message.
+                    // This enables an optimized verification path:
+                    // 1. Aggregate all signatures into one
+                    // 2. Aggregate all public keys into one
+                    // 3. Single pairing check: e(agg_sig, G2) == e(agg_pk, H(msg))
+                    //
+                    // This is O(1) pairings instead of O(N), a massive speedup.
+                    // We only fall back to individual verification if the aggregate fails
+                    // (indicating a Byzantine validator submitted a bad signature).
 
-                    // Aggregate BLS signatures
-                    let aggregated_signature = if signatures.is_empty() {
-                        Signature::zero()
-                    } else {
-                        Signature::aggregate_bls(&signatures).unwrap_or_else(|_| Signature::zero())
-                    };
+                    let signatures: Vec<Signature> =
+                        provisions.iter().map(|p| p.signature.clone()).collect();
 
-                    // Build the commitment proof
-                    let commitment_proof = CommitmentProof::new(
-                        tx_hash,
-                        source_shard,
-                        signers,
-                        aggregated_signature,
-                        block_height,
-                        entries,
+                    // Happy path: try aggregate verification first (single pairing)
+                    let message = provisions
+                        .first()
+                        .map(|p| p.signing_message())
+                        .unwrap_or_default();
+
+                    let all_valid = PublicKey::batch_verify_bls_same_message(
+                        &message,
+                        &signatures,
+                        &public_keys,
                     );
 
+                    let (verified_provisions, commitment_proof) = if all_valid {
+                        // Fast path: all signatures valid, build proof directly
+                        let mut signers = SignerBitfield::new(committee_size);
+                        for provision in &provisions {
+                            if let Some(idx) = topology
+                                .committee_index_for_shard(source_shard, provision.validator_id)
+                            {
+                                signers.set(idx);
+                            }
+                        }
+
+                        let aggregated_signature = Signature::aggregate_bls(&signatures)
+                            .unwrap_or_else(|_| Signature::zero());
+
+                        let proof = CommitmentProof::new(
+                            tx_hash,
+                            source_shard,
+                            signers,
+                            aggregated_signature,
+                            block_height,
+                            entries,
+                        );
+
+                        (provisions.clone(), Some(proof))
+                    } else {
+                        // Slow path: aggregate verification failed, find valid signatures
+                        // This only happens with Byzantine behavior (rare)
+                        tracing::warn!(
+                            tx_hash = %tx_hash,
+                            source_shard = source_shard.0,
+                            provision_count = provisions.len(),
+                            "Aggregate provision verification failed, falling back to individual"
+                        );
+
+                        let mut verified = Vec::new();
+                        let mut valid_sigs = Vec::new();
+                        let mut signer_indices = Vec::new();
+
+                        for (provision, pk) in provisions.iter().zip(public_keys.iter()) {
+                            if pk.verify(&message, &provision.signature) {
+                                verified.push(provision.clone());
+                                valid_sigs.push(provision.signature.clone());
+                                if let Some(idx) = topology
+                                    .committee_index_for_shard(source_shard, provision.validator_id)
+                                {
+                                    signer_indices.push(idx);
+                                }
+                            } else {
+                                crate::metrics::record_signature_verification_failure();
+                                tracing::warn!(
+                                    tx_hash = %tx_hash,
+                                    validator = provision.validator_id.0,
+                                    "Invalid provision signature"
+                                );
+                            }
+                        }
+
+                        let proof = if !valid_sigs.is_empty() {
+                            let mut signers = SignerBitfield::new(committee_size);
+                            for idx in &signer_indices {
+                                signers.set(*idx);
+                            }
+
+                            let aggregated_signature = Signature::aggregate_bls(&valid_sigs)
+                                .unwrap_or_else(|_| Signature::zero());
+
+                            Some(CommitmentProof::new(
+                                tx_hash,
+                                source_shard,
+                                signers,
+                                aggregated_signature,
+                                block_height,
+                                entries,
+                            ))
+                        } else {
+                            None
+                        };
+
+                        (verified, proof)
+                    };
+
                     crate::metrics::record_signature_verification_latency(
-                        "commitment_proof_aggregation",
+                        "provision_batch_verify_aggregate",
                         start.elapsed().as_secs_f64(),
                     );
 
                     event_tx
-                        .send(Event::CommitmentProofAggregated {
+                        .send(Event::ProvisionsVerifiedAndAggregated {
                             tx_hash,
                             source_shard,
+                            verified_provisions,
                             commitment_proof,
                         })
                         .expect(
@@ -1677,6 +1989,7 @@ impl ProductionRunner {
                 committee_size,
             } => {
                 let event_tx = self.callback_tx.clone();
+                let topology = self.topology.clone();
                 self.thread_pools.spawn_crypto(move || {
                     let start = std::time::Instant::now();
 
@@ -1706,12 +2019,13 @@ impl ProductionRunner {
                     };
 
                     // Create signer bitfield
+                    // Use topology to get correct committee index for the shard.
+                    // Validator IDs are global but committee indices are per-shard.
                     let mut signers = SignerBitfield::new(committee_size);
 
                     for vote in &unique_votes {
-                        // Use validator ID as index (assumes validators are numbered 0..N)
-                        let idx = vote.validator.0 as usize;
-                        if idx < committee_size {
+                        if let Some(idx) = topology.committee_index_for_shard(shard, vote.validator)
+                        {
                             signers.set(idx);
                         }
                     }
@@ -1773,44 +2087,22 @@ impl ProductionRunner {
                 certificate,
                 public_keys,
             } => {
-                let event_tx = self.callback_tx.clone();
-                self.thread_pools.spawn_crypto(move || {
-                    let start = std::time::Instant::now();
-                    // Use centralized signing message - StateCertificates aggregate signatures
-                    // from StateVoteBlocks, so they use the same EXEC_VOTE domain tag.
-                    let msg = certificate.signing_message();
-
-                    // Get signer keys based on bitfield
-                    let signer_keys: Vec<_> = public_keys
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| certificate.signers.is_set(*i))
-                        .map(|(_, pk)| pk.clone())
-                        .collect();
-
-                    let valid = if signer_keys.is_empty() {
-                        // No signers - valid only if zero signature (single-shard case)
-                        certificate.aggregated_signature == hyperscale_types::Signature::zero()
-                    } else {
-                        // Verify aggregated BLS signature
-                        match hyperscale_types::PublicKey::aggregate_bls(&signer_keys) {
-                            Ok(aggregated_pk) => {
-                                aggregated_pk.verify(&msg, &certificate.aggregated_signature)
-                            }
-                            Err(_) => false,
-                        }
-                    };
-
-                    crate::metrics::record_signature_verification_latency(
-                        "state_cert",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        crate::metrics::record_signature_verification_failure();
-                    }
-                    let _ = event_tx
-                        .send(Event::StateCertificateSignatureVerified { certificate, valid });
-                });
+                // NOTE: State certs should normally be batched via the event loop's
+                // pending_state_certs accumulator. This fallback handles any certs
+                // that come through process_action (e.g., from callback channel events).
+                if self.pending_state_certs.is_empty() {
+                    self.state_cert_deadline =
+                        Some(tokio::time::Instant::now() + Duration::from_millis(15));
+                }
+                self.pending_state_certs
+                    .certs
+                    .push((certificate, public_keys));
+                // Flush early if batch is full to cap p99 latency
+                if self.pending_state_certs.is_full() {
+                    let certs = self.pending_state_certs.take();
+                    self.state_cert_deadline = None;
+                    self.dispatch_state_cert_verifications(certs);
+                }
             }
 
             Action::VerifyQcSignature {
@@ -1859,20 +2151,86 @@ impl ProductionRunner {
                 });
             }
 
+            // QC building (BLS signature aggregation) on CONSENSUS crypto pool (liveness-critical)
+            Action::BuildQuorumCertificate {
+                block_hash,
+                height,
+                round,
+                parent_block_hash,
+                votes,
+                signers,
+                voting_power,
+                timestamp_weight_sum,
+            } => {
+                let event_tx = self.callback_tx.clone();
+                // QC building is liveness-critical - use dedicated consensus crypto pool
+                self.thread_pools.spawn_consensus_crypto(move || {
+                    let start = std::time::Instant::now();
+
+                    // Extract signatures in sorted order (votes are pre-sorted by committee index)
+                    let signatures: Vec<Signature> =
+                        votes.iter().map(|(_, v)| v.signature.clone()).collect();
+
+                    // Aggregate BLS signatures
+                    let qc = match Signature::aggregate_bls(&signatures) {
+                        Ok(aggregated_signature) => {
+                            // Compute stake-weighted timestamp
+                            let weighted_timestamp_ms = if voting_power.0 == 0 {
+                                0
+                            } else {
+                                (timestamp_weight_sum / voting_power.0 as u128) as u64
+                            };
+
+                            Some(QuorumCertificate {
+                                block_hash,
+                                height,
+                                parent_block_hash,
+                                round,
+                                aggregated_signature,
+                                signers,
+                                voting_power,
+                                weighted_timestamp_ms,
+                            })
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to aggregate BLS signatures for QC: {}", e);
+                            None
+                        }
+                    };
+
+                    crate::metrics::record_signature_verification_latency(
+                        "qc_build",
+                        start.elapsed().as_secs_f64(),
+                    );
+
+                    event_tx
+                        .send(Event::QuorumCertificateBuilt { block_hash, qc })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
+                });
+            }
+
             // Note: View change verification actions removed - using HotStuff-2 implicit rounds
 
             // Transaction execution on dedicated execution thread pool
             // NOTE: Execution is READ-ONLY. State writes are collected in the results
             // and committed later when TransactionCertificate is included in a block.
+            // After execution, signs votes and broadcasts + sends to state machine directly,
+            // avoiding a round-trip through the state machine for signing.
             Action::ExecuteTransactions {
-                block_hash,
+                block_hash: _,
                 transactions,
                 state_root: _,
             } => {
                 let event_tx = self.callback_tx.clone();
+                let dispatch_tx = self.dispatch_tx.clone();
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
                 let thread_pools = self.thread_pools.clone();
+                let signing_key = self.signing_key.clone();
+                let local_shard = self.local_shard;
+                let validator_id = self.topology.local_validator_id();
 
                 self.thread_pools.spawn_execution(move || {
                     let start = std::time::Instant::now();
@@ -1921,14 +2279,41 @@ impl ProductionRunner {
                         });
                     crate::metrics::record_execution_latency(start.elapsed().as_secs_f64());
 
-                    event_tx
-                        .send(Event::TransactionsExecuted {
-                            block_hash,
-                            results,
-                        })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
+                    // Sign votes for each execution result. The runner handles:
+                    // 1. Signing (done here)
+                    // 2. Broadcasting (via dispatch_tx)
+                    // 3. Local handling (via StateVoteReceived to state machine)
+                    for result in results {
+                        let message = hyperscale_types::exec_vote_message(
+                            &result.transaction_hash,
+                            &result.state_root,
+                            local_shard,
+                            result.success,
                         );
+                        let signature = signing_key.sign(&message);
+
+                        let vote = StateVoteBlock {
+                            transaction_hash: result.transaction_hash,
+                            shard_group_id: local_shard,
+                            state_root: result.state_root,
+                            success: result.success,
+                            validator: validator_id,
+                            signature,
+                        };
+
+                        // Broadcast to shard peers via message batcher
+                        let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
+                            shard: local_shard,
+                            vote: vote.clone(),
+                        });
+
+                        // Send to state machine for local handling (skips verification for own votes)
+                        event_tx
+                            .send(Event::StateVoteReceived { vote })
+                            .expect(
+                                "callback channel closed - Loss of this event would cause a deadlock",
+                            );
+                    }
                 });
             }
 
@@ -2017,6 +2402,48 @@ impl ProductionRunner {
                 tracing::error!("ExecuteCrossShardTransaction reached process_action - should be handled by event loop batching");
             }
 
+            // Sign already-executed results (e.g., speculative execution cache hits).
+            // Signs votes and broadcasts + sends StateVoteReceived for local handling.
+            Action::SignExecutionResults { results } => {
+                let event_tx = self.callback_tx.clone();
+                let dispatch_tx = self.dispatch_tx.clone();
+                let signing_key = self.signing_key.clone();
+                let local_shard = self.local_shard;
+                let validator_id = self.topology.local_validator_id();
+
+                self.thread_pools.spawn_execution(move || {
+                    for result in results {
+                        let message = hyperscale_types::exec_vote_message(
+                            &result.transaction_hash,
+                            &result.state_root,
+                            local_shard,
+                            result.success,
+                        );
+                        let signature = signing_key.sign(&message);
+
+                        let vote = StateVoteBlock {
+                            transaction_hash: result.transaction_hash,
+                            shard_group_id: local_shard,
+                            state_root: result.state_root,
+                            success: result.success,
+                            validator: validator_id,
+                            signature,
+                        };
+
+                        // Broadcast to shard peers via message batcher
+                        let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
+                            shard: local_shard,
+                            vote: vote.clone(),
+                        });
+
+                        // Send to state machine for local handling
+                        event_tx
+                            .send(Event::StateVoteReceived { vote })
+                            .expect("callback channel closed");
+                    }
+                });
+            }
+
             // Merkle computation on execution pool (can be parallelized internally)
             // Note: This action is currently not emitted by any state machine.
             Action::ComputeMerkleRoot { tx_hash, writes } => {
@@ -2079,15 +2506,28 @@ impl ProductionRunner {
                 status,
                 added_at,
                 cross_shard,
+                submitted_locally: _,
             } => {
                 tracing::debug!(?tx_hash, ?status, cross_shard, "Transaction status update");
 
-                // Record transaction metrics for terminal states
+                // Record transaction metrics for terminal states, but only for transactions
+                // that were submitted via RPC to THIS node. This avoids polluting latency
+                // metrics with transactions received via gossip/sync which would have
+                // artificially high latencies on lagging nodes.
+                //
+                // Note: We use rpc_submitted_txs instead of the submitted_locally field
+                // because the field tracks mempool insertion, not RPC origin. In production,
+                // RPC transactions go through gossip before reaching the mempool, so
+                // submitted_locally would always be false.
                 if status.is_final() {
-                    // Calculate latency from submission to finalization
-                    let now = self.state.now();
-                    let latency_secs = now.saturating_sub(added_at).as_secs_f64();
-                    crate::metrics::record_transaction_finalized(latency_secs, cross_shard);
+                    // Check if this was an RPC-submitted transaction
+                    let was_rpc_submitted = self.rpc_submitted_txs.remove(&tx_hash);
+                    if was_rpc_submitted {
+                        // Calculate latency from submission to finalization
+                        let now = self.state.now();
+                        let latency_secs = now.saturating_sub(added_at).as_secs_f64();
+                        crate::metrics::record_transaction_finalized(latency_secs, cross_shard);
+                    }
                 }
 
                 // Update transaction status cache for RPC queries
@@ -2117,6 +2557,16 @@ impl ProductionRunner {
                 // For now, we don't have the proposal timestamp available here,
                 // so we pass 0.0 for latency. The block height gauge is still useful.
                 crate::metrics::record_block_committed(height, 0.0);
+
+                // Record livelock metrics for deferrals in this block.
+                for _deferral in &block.deferred {
+                    crate::metrics::record_livelock_deferral();
+                    crate::metrics::record_livelock_cycle_detected();
+                }
+
+                // Update deferred transaction count gauge.
+                let livelock_stats = self.state.livelock().stats();
+                crate::metrics::set_livelock_deferred_count(livelock_stats.pending_deferrals);
 
                 // Update sync manager's committed height - critical for correct sync behavior.
                 // If sync completes, notify the state machine so it can resume view changes.
@@ -2181,11 +2631,21 @@ impl ProductionRunner {
 
                 // Run on blocking thread since RocksDB write is sync I/O
                 // RocksDB is internally thread-safe, no lock needed
+                let cert_for_persist = certificate.clone();
                 tokio::task::spawn_blocking(move || {
-                    storage.commit_certificate_with_writes(&certificate, &writes);
+                    storage.commit_certificate_with_writes(&cert_for_persist, &writes);
                 })
                 .await
                 .ok();
+
+                // After persisting, gossip certificate to same-shard peers.
+                // This ensures other validators have the certificate before the proposer
+                // includes it in a block, avoiding fetch delays that can cause backpressure.
+                let gossip = hyperscale_messages::TransactionCertificateGossip::new(certificate);
+                let _ = self.dispatch_tx.send(DispatchableAction::BroadcastToShard {
+                    shard: local_shard,
+                    message: OutboundMessage::TransactionCertificateGossip(gossip),
+                });
             }
 
             Action::PersistAndBroadcastVote {
@@ -2211,8 +2671,8 @@ impl ProductionRunner {
 
                     // After persist completes, send broadcast to action dispatcher
                     // This ensures persist-before-broadcast ordering without blocking the event loop
-                    let _ = dispatch_tx
-                        .try_send(DispatchableAction::BroadcastToShard { shard, message });
+                    let _ =
+                        dispatch_tx.send(DispatchableAction::BroadcastToShard { shard, message });
                 });
                 // Note: No .await - we don't block the event loop
             }
@@ -2638,11 +3098,144 @@ impl ProductionRunner {
         });
     }
 
+    /// Dispatch state certificate verifications to the crypto thread pool.
+    ///
+    /// State certificates contain aggregated BLS signatures that are expensive to verify.
+    /// By batching them with a 15ms window, we can use BLS batch verification which is
+    /// ~40% faster than individual verification. This is the highest volume crypto operation.
+    ///
+    /// The verification process:
+    /// 1. For each certificate, aggregate signer public keys based on bitfield (parallel with rayon)
+    /// 2. Batch verify all (aggregated_pk, message, aggregated_sig) tuples
+    /// 3. Send individual results back as events
+    fn dispatch_state_cert_verifications(
+        &self,
+        certs: Vec<(hyperscale_types::StateCertificate, Vec<PublicKey>)>,
+    ) {
+        if certs.is_empty() {
+            return;
+        }
+
+        let event_tx = self.callback_tx.clone();
+        let batch_size = certs.len();
+
+        self.thread_pools.spawn_crypto(move || {
+            use rayon::prelude::*;
+
+            let start = std::time::Instant::now();
+
+            // Step 1: Pre-process certificates in parallel - aggregate signer keys and build messages
+            // This is the expensive part that benefits from parallelization
+            let prepared: Vec<_> = certs
+                .into_par_iter()
+                .map(|(cert, public_keys)| {
+                    let msg = cert.signing_message();
+
+                    // Get signer keys based on bitfield
+                    let signer_keys: Vec<_> = public_keys
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| cert.signers.is_set(*i))
+                        .map(|(_, pk)| pk.clone())
+                        .collect();
+
+                    // Pre-aggregate the public keys
+                    let aggregated_pk = if signer_keys.is_empty() {
+                        None // Will check for zero signature
+                    } else {
+                        PublicKey::aggregate_bls(&signer_keys).ok()
+                    };
+
+                    (cert, msg, aggregated_pk)
+                })
+                .collect();
+
+            // Step 2: Batch verify all signatures
+            // Separate into verifiable (have aggregated_pk) and special cases (empty signers)
+            let mut verifiable: Vec<(hyperscale_types::StateCertificate, Vec<u8>, PublicKey)> =
+                Vec::new();
+            let mut zero_sig_certs: Vec<hyperscale_types::StateCertificate> = Vec::new();
+            let mut failed_aggregation: Vec<hyperscale_types::StateCertificate> = Vec::new();
+
+            for (cert, msg, maybe_pk) in prepared {
+                match maybe_pk {
+                    Some(pk) => verifiable.push((cert, msg, pk)),
+                    None => {
+                        // No signers - check if it's a valid zero signature case
+                        if cert.aggregated_signature == Signature::zero() {
+                            zero_sig_certs.push(cert);
+                        } else {
+                            failed_aggregation.push(cert);
+                        }
+                    }
+                }
+            }
+
+            // Batch verify the aggregated signatures
+            let verification_results = if !verifiable.is_empty() {
+                let messages: Vec<&[u8]> =
+                    verifiable.iter().map(|(_, m, _)| m.as_slice()).collect();
+                let signatures: Vec<Signature> = verifiable
+                    .iter()
+                    .map(|(c, _, _)| c.aggregated_signature.clone())
+                    .collect();
+                let pubkeys: Vec<PublicKey> =
+                    verifiable.iter().map(|(_, _, pk)| pk.clone()).collect();
+
+                PublicKey::batch_verify_bls_different_messages(&messages, &signatures, &pubkeys)
+            } else {
+                vec![]
+            };
+
+            // Step 3: Send results
+            // Verified certs
+            for ((cert, _, _), valid) in verifiable.into_iter().zip(verification_results) {
+                if !valid {
+                    crate::metrics::record_signature_verification_failure();
+                }
+                let _ = event_tx.send(Event::StateCertificateSignatureVerified {
+                    certificate: cert,
+                    valid,
+                });
+            }
+
+            // Zero signature certs (valid)
+            for cert in zero_sig_certs {
+                let _ = event_tx.send(Event::StateCertificateSignatureVerified {
+                    certificate: cert,
+                    valid: true,
+                });
+            }
+
+            // Failed aggregation certs (invalid)
+            for cert in failed_aggregation {
+                crate::metrics::record_signature_verification_failure();
+                let _ = event_tx.send(Event::StateCertificateSignatureVerified {
+                    certificate: cert,
+                    valid: false,
+                });
+            }
+
+            crate::metrics::record_signature_verification_latency(
+                "state_cert",
+                start.elapsed().as_secs_f64(),
+            );
+
+            if batch_size > 1 {
+                tracing::debug!(
+                    batch_size,
+                    "Batch verified state cert signatures (15ms window)"
+                );
+            }
+        });
+    }
+
     /// Dispatch cross-shard executions to the execution thread pool.
     ///
     /// Executes all transactions in parallel using rayon's par_iter for maximum throughput.
     /// Each transaction is executed with its provisioned state from other shards.
-    /// Results are sent back as a single batch event.
+    /// After execution, signs votes and broadcasts + sends to state machine directly,
+    /// avoiding a round-trip through the state machine for signing.
     fn dispatch_cross_shard_executions(
         &self,
         requests: Vec<hyperscale_core::CrossShardExecutionRequest>,
@@ -2652,12 +3245,15 @@ impl ProductionRunner {
         }
 
         let event_tx = self.callback_tx.clone();
+        let dispatch_tx = self.dispatch_tx.clone();
         let storage = self.storage.clone();
         let executor = self.executor.clone();
         let topology = self.topology.clone();
         let local_shard = self.local_shard;
         let thread_pools = self.thread_pools.clone();
         let batch_size = requests.len();
+        let signing_key = self.signing_key.clone();
+        let validator_id = topology.local_validator_id();
 
         self.thread_pools.spawn_execution(move || {
             let start = std::time::Instant::now();
@@ -2726,10 +3322,68 @@ impl ProductionRunner {
                 );
             }
 
-            event_tx
-                .send(Event::CrossShardTransactionsExecuted { results })
-                .expect("callback channel closed - Loss of this event would cause a deadlock");
+            // Sign votes for each execution result. The runner handles:
+            // 1. Signing (done here)
+            // 2. Broadcasting (via dispatch_tx)
+            // 3. Local handling (via StateVoteReceived to state machine)
+            for result in results {
+                let message = hyperscale_types::exec_vote_message(
+                    &result.transaction_hash,
+                    &result.state_root,
+                    local_shard,
+                    result.success,
+                );
+                let signature = signing_key.sign(&message);
+
+                let vote = StateVoteBlock {
+                    transaction_hash: result.transaction_hash,
+                    shard_group_id: local_shard,
+                    state_root: result.state_root,
+                    success: result.success,
+                    validator: validator_id,
+                    signature,
+                };
+
+                // Broadcast to shard peers via message batcher
+                let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
+                    shard: local_shard,
+                    vote: vote.clone(),
+                });
+
+                // Send to state machine for local handling (skips verification for own votes)
+                event_tx
+                    .send(Event::StateVoteReceived { vote })
+                    .expect("callback channel closed - Loss of this event would cause a deadlock");
+            }
         });
+    }
+
+    /// Persist a verified gossiped certificate and notify the state machine.
+    ///
+    /// Called after all StateCertificate signatures in a gossiped TransactionCertificate
+    /// have been verified. Persists to storage and sends GossipedCertificateVerified
+    /// to the state machine to cancel local certificate building.
+    fn persist_and_notify_gossiped_certificate(&self, certificate: TransactionCertificate) {
+        let storage = self.storage.clone();
+        let local_shard = self.local_shard;
+        let callback_tx = self.callback_tx.clone();
+
+        // Extract writes for local shard
+        let writes: Vec<_> = certificate
+            .shard_proofs
+            .get(&local_shard)
+            .map(|c| c.state_writes.clone())
+            .unwrap_or_default();
+
+        let cert_for_persist = certificate.clone();
+
+        // Fire-and-forget persist (don't block event loop)
+        tokio::task::spawn_blocking(move || {
+            storage.commit_certificate_with_writes(&cert_for_persist, &writes);
+        });
+
+        // Notify state machine to cancel local building and add to finalized
+        let _ = callback_tx.send(Event::GossipedCertificateVerified { certificate });
     }
 
     /// Submit a transaction.
@@ -2764,86 +3418,96 @@ impl ProductionRunner {
     /// Looks up the requested block from denormalized storage (reconstructing from
     /// block metadata + transactions + certificates) and sends the response.
     ///
+    /// The storage read is performed on a blocking thread pool to avoid blocking
+    /// the main event loop. RocksDB reads for large blocks can take several ms.
+    ///
     /// Response format: `(Option<Block>, Option<QC>, Option<BlockMetadata>)`
     /// - `(Some(block), Some(qc), None)` = complete block with all data
     /// - `(None, None, Some(metadata))` = metadata only (txs/certs must be fetched)
     /// - `(None, None, None)` = block not found at this height
     fn handle_inbound_sync_request(&self, request: InboundSyncRequest) {
-        use crate::storage::SyncBlockData;
+        let storage = self.storage.clone();
+        let network = self.network.clone();
 
-        let height = BlockHeight(request.height);
-        let channel_id = request.channel_id;
+        // Spawn on blocking thread pool to avoid blocking the main event loop.
+        // RocksDB reads are synchronous I/O that can take ms for large blocks.
+        tokio::task::spawn_blocking(move || {
+            use crate::storage::SyncBlockData;
 
-        tracing::debug!(
-            peer = %request.peer,
-            height = request.height,
-            channel_id = channel_id,
-            "Handling inbound sync request"
-        );
+            let height = BlockHeight(request.height);
+            let channel_id = request.channel_id;
 
-        // Look up block from storage - returns Complete, MetadataOnly, or None
-        let response = match self.storage.get_block_for_sync(height) {
-            Some(SyncBlockData::Complete(block, qc)) => {
-                // Full block available - encode as (Some(block), Some(qc), None)
-                match sbor::basic_encode(&(Some(&block), Some(&qc), None::<BlockMetadata>)) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        tracing::warn!(height = request.height, error = ?e, "Failed to encode block response");
-                        sbor::basic_encode(&(
-                            None::<Block>,
-                            None::<QuorumCertificate>,
-                            None::<BlockMetadata>,
-                        ))
-                        .unwrap_or_default()
-                    }
-                }
-            }
-            Some(SyncBlockData::MetadataOnly(metadata)) => {
-                // Metadata only - encode as (None, None, Some(metadata))
-                tracing::debug!(
-                    height = request.height,
-                    tx_count = metadata.tx_hashes.len(),
-                    cert_count = metadata.cert_hashes.len(),
-                    "Returning metadata-only sync response"
-                );
-                match sbor::basic_encode(&(
-                    None::<Block>,
-                    None::<QuorumCertificate>,
-                    Some(&metadata),
-                )) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        tracing::warn!(height = request.height, error = ?e, "Failed to encode metadata response");
-                        sbor::basic_encode(&(
-                            None::<Block>,
-                            None::<QuorumCertificate>,
-                            None::<BlockMetadata>,
-                        ))
-                        .unwrap_or_default()
-                    }
-                }
-            }
-            None => {
-                tracing::trace!(height = request.height, "Block not found for sync request");
-                // Not found - encode as (None, None, None)
-                sbor::basic_encode(&(
-                    None::<Block>,
-                    None::<QuorumCertificate>,
-                    None::<BlockMetadata>,
-                ))
-                .unwrap_or_default()
-            }
-        };
-
-        // Send response via network adapter
-        if let Err(e) = self.network.send_block_response(channel_id, response) {
-            tracing::warn!(
+            tracing::debug!(
+                peer = %request.peer,
                 height = request.height,
                 channel_id = channel_id,
-                error = ?e,
-                "Failed to send block response"
+                "Handling inbound sync request"
             );
-        }
+
+            // Look up block from storage - returns Complete, MetadataOnly, or None
+            let response = match storage.get_block_for_sync(height) {
+                Some(SyncBlockData::Complete(block, qc)) => {
+                    // Full block available - encode as (Some(block), Some(qc), None)
+                    match sbor::basic_encode(&(Some(&block), Some(&qc), None::<BlockMetadata>)) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::warn!(height = request.height, error = ?e, "Failed to encode block response");
+                            sbor::basic_encode(&(
+                                None::<Block>,
+                                None::<QuorumCertificate>,
+                                None::<BlockMetadata>,
+                            ))
+                            .unwrap_or_default()
+                        }
+                    }
+                }
+                Some(SyncBlockData::MetadataOnly(metadata)) => {
+                    // Metadata only - encode as (None, None, Some(metadata))
+                    tracing::debug!(
+                        height = request.height,
+                        tx_count = metadata.tx_hashes.len(),
+                        cert_count = metadata.cert_hashes.len(),
+                        "Returning metadata-only sync response"
+                    );
+                    match sbor::basic_encode(&(
+                        None::<Block>,
+                        None::<QuorumCertificate>,
+                        Some(&metadata),
+                    )) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            tracing::warn!(height = request.height, error = ?e, "Failed to encode metadata response");
+                            sbor::basic_encode(&(
+                                None::<Block>,
+                                None::<QuorumCertificate>,
+                                None::<BlockMetadata>,
+                            ))
+                            .unwrap_or_default()
+                        }
+                    }
+                }
+                None => {
+                    tracing::trace!(height = request.height, "Block not found for sync request");
+                    // Not found - encode as (None, None, None)
+                    sbor::basic_encode(&(
+                        None::<Block>,
+                        None::<QuorumCertificate>,
+                        None::<BlockMetadata>,
+                    ))
+                    .unwrap_or_default()
+                }
+            };
+
+            // Send response via network adapter
+            if let Err(e) = network.send_block_response(channel_id, response) {
+                tracing::warn!(
+                    height = request.height,
+                    channel_id = channel_id,
+                    error = ?e,
+                    "Failed to send block response"
+                );
+            }
+        });
     }
 
     // NOTE: handle_inbound_transaction_request and handle_inbound_certificate_request
@@ -2857,5 +3521,36 @@ impl ProductionRunner {
     /// state machine and handled in process_action().
     async fn dispatch_event(&mut self, event: Event) -> Vec<Action> {
         self.state.handle(event)
+    }
+}
+
+/// Verify a StateCertificate's aggregated BLS signature.
+///
+/// This is the same verification logic used for fetched certificates and gossiped
+/// certificates. Checks that the aggregated signature from the signers bitfield
+/// matches the signing message.
+fn verify_state_certificate_signature(
+    certificate: &hyperscale_types::StateCertificate,
+    public_keys: &[PublicKey],
+) -> bool {
+    let msg = certificate.signing_message();
+
+    // Get signer keys based on bitfield
+    let signer_keys: Vec<_> = public_keys
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| certificate.signers.is_set(*i))
+        .map(|(_, pk)| pk.clone())
+        .collect();
+
+    if signer_keys.is_empty() {
+        // No signers - valid only if zero signature (single-validator or genesis case)
+        certificate.aggregated_signature == Signature::zero()
+    } else {
+        // Verify aggregated BLS signature
+        match PublicKey::aggregate_bls(&signer_keys) {
+            Ok(aggregated_pk) => aggregated_pk.verify(&msg, &certificate.aggregated_signature),
+            Err(_) => false,
+        }
     }
 }

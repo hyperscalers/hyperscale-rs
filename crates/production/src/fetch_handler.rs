@@ -94,8 +94,8 @@ pub fn spawn_fetch_handler(
     config: FetchHandlerConfig,
     storage: Arc<RocksDbStorage>,
     network: Arc<Libp2pAdapter>,
-    tx_request_rx: mpsc::Receiver<InboundTransactionRequest>,
-    cert_request_rx: mpsc::Receiver<InboundCertificateRequest>,
+    tx_request_rx: mpsc::UnboundedReceiver<InboundTransactionRequest>,
+    cert_request_rx: mpsc::UnboundedReceiver<InboundCertificateRequest>,
 ) -> FetchHandlerHandle {
     let join_handle = tokio::spawn(async move {
         run_fetch_handler(config, storage, network, tx_request_rx, cert_request_rx).await;
@@ -111,8 +111,8 @@ async fn run_fetch_handler(
     config: FetchHandlerConfig,
     storage: Arc<RocksDbStorage>,
     network: Arc<Libp2pAdapter>,
-    mut tx_request_rx: mpsc::Receiver<InboundTransactionRequest>,
-    mut cert_request_rx: mpsc::Receiver<InboundCertificateRequest>,
+    mut tx_request_rx: mpsc::UnboundedReceiver<InboundTransactionRequest>,
+    mut cert_request_rx: mpsc::UnboundedReceiver<InboundCertificateRequest>,
 ) {
     tracing::info!("Fetch handler task started (storage-backed)");
 

@@ -26,8 +26,8 @@ use hyperscale_simulation::{NetworkTrafficAnalyzer, SimStorage, SimulatedNetwork
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, CommitmentProof, ExecutionResult, Hash, KeyPair, NodeId,
     PublicKey, QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
-    StateCertificate, StaticTopology, Topology, TransactionDecision, TransactionStatus,
-    ValidatorId, ValidatorInfo, ValidatorSet,
+    StateCertificate, StateVoteBlock, StaticTopology, Topology, TransactionDecision,
+    TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -216,6 +216,8 @@ pub struct SimNode {
     index: u32,
     state: NodeStateMachine,
     storage: SimStorage,
+    /// Signing key for state vote signing (cloned from state machine).
+    signing_key: KeyPair,
     /// Pending inbound messages from other nodes.
     inbound_queue: VecDeque<Arc<OutboundMessage>>,
     /// Pending internal events (timer fires, crypto results, etc.)
@@ -232,15 +234,23 @@ pub struct SimNode {
     pending_timers: HashMap<TimerId, Duration>,
     /// Simulated time for this node.
     simulated_time: Duration,
+    /// Outbound events that need to be broadcast to shard peers.
+    outbound_events: Vec<(ShardGroupId, Event)>,
 }
 
 impl SimNode {
     /// Create a new simulated node.
-    pub fn new(index: u32, state: NodeStateMachine, storage: SimStorage) -> Self {
+    pub fn new(
+        index: u32,
+        state: NodeStateMachine,
+        storage: SimStorage,
+        signing_key: KeyPair,
+    ) -> Self {
         Self {
             index,
             state,
             storage,
+            signing_key,
             inbound_queue: VecDeque::new(),
             internal_queue: VecDeque::new(),
             tx_queue: VecDeque::new(),
@@ -249,6 +259,7 @@ impl SimNode {
             status_updates: Vec::new(),
             pending_timers: HashMap::new(),
             simulated_time: Duration::ZERO,
+            outbound_events: Vec::new(),
         }
     }
 
@@ -361,6 +372,38 @@ impl SimNode {
             }
         }
 
+        // Handle TransactionCertificateReceived directly in runner (like production).
+        // Verify and persist before notifying state machine.
+        if let Event::TransactionCertificateReceived { ref certificate } = event {
+            let tx_hash = certificate.transaction_hash;
+
+            // Skip if already in storage
+            if self.storage.get_certificate(&tx_hash).is_some() {
+                return;
+            }
+
+            // In parallel simulation, we trust certificates (skip BLS verification for speed).
+            // Production verifies signatures before persisting.
+            let local_shard = self.state.shard();
+            let writes: Vec<_> = certificate
+                .shard_proofs
+                .get(&local_shard)
+                .map(|c| c.state_writes.clone())
+                .unwrap_or_default();
+
+            self.storage
+                .commit_certificate_with_writes(certificate, &writes);
+
+            // Notify state machine to cancel local building and add to finalized
+            let actions = self.state.handle(Event::GossipedCertificateVerified {
+                certificate: certificate.clone(),
+            });
+            for action in actions {
+                self.execute_action(action, cache);
+            }
+            return;
+        }
+
         // Process through state machine (time is set by advance_time)
         let actions = self.state.handle(event);
 
@@ -438,52 +481,99 @@ impl SimNode {
                     .push_back(Event::VoteSignatureVerified { vote, valid });
             }
 
-            Action::VerifyProvisionSignature {
-                provision,
-                public_key,
-            } => {
-                let msg = provision.signing_message();
-                let valid = public_key.verify(&msg, &provision.signature);
-                self.internal_queue
-                    .push_back(Event::ProvisionSignatureVerified { provision, valid });
-            }
-
-            Action::AggregateCommitmentProof {
+            Action::VerifyAndAggregateProvisions {
                 tx_hash,
                 source_shard,
                 block_height,
                 entries,
-                signatures,
-                signer_indices,
+                provisions,
+                public_keys,
                 committee_size,
             } => {
-                // Build signer bitfield
-                let mut signers = SignerBitfield::new(committee_size);
-                for idx in &signer_indices {
-                    signers.set(*idx);
-                }
+                // All provisions for the same (tx, source_shard) sign the SAME message.
+                // Happy path: aggregate verification with single pairing check.
+                let signatures: Vec<Signature> =
+                    provisions.iter().map(|p| p.signature.clone()).collect();
+                let message = provisions
+                    .first()
+                    .map(|p| p.signing_message())
+                    .unwrap_or_default();
 
-                // Aggregate BLS signatures
-                let aggregated_signature = if signatures.is_empty() {
-                    Signature::zero()
-                } else {
-                    Signature::aggregate_bls(&signatures).unwrap_or_else(|_| Signature::zero())
-                };
+                let topology = self.state.topology();
+                let all_valid =
+                    PublicKey::batch_verify_bls_same_message(&message, &signatures, &public_keys);
 
-                // Build the commitment proof
-                let commitment_proof = CommitmentProof::new(
-                    tx_hash,
-                    source_shard,
-                    signers,
-                    aggregated_signature,
-                    block_height,
-                    entries,
-                );
+                let (verified_provisions, commitment_proof) = if all_valid {
+                    // Fast path: all valid
+                    let mut signers = SignerBitfield::new(committee_size);
+                    for provision in &provisions {
+                        if let Some(idx) =
+                            topology.committee_index_for_shard(source_shard, provision.validator_id)
+                        {
+                            signers.set(idx);
+                        }
+                    }
 
-                self.internal_queue
-                    .push_back(Event::CommitmentProofAggregated {
+                    let aggregated_signature =
+                        Signature::aggregate_bls(&signatures).unwrap_or_else(|_| Signature::zero());
+
+                    let proof = CommitmentProof::new(
                         tx_hash,
                         source_shard,
+                        signers,
+                        aggregated_signature,
+                        block_height,
+                        entries,
+                    );
+
+                    (provisions, Some(proof))
+                } else {
+                    // Slow path: find valid signatures individually
+                    let mut verified = Vec::new();
+                    let mut valid_sigs = Vec::new();
+                    let mut signer_indices = Vec::new();
+
+                    for (provision, pk) in provisions.iter().zip(public_keys.iter()) {
+                        if pk.verify(&message, &provision.signature) {
+                            verified.push(provision.clone());
+                            valid_sigs.push(provision.signature.clone());
+                            if let Some(idx) = topology
+                                .committee_index_for_shard(source_shard, provision.validator_id)
+                            {
+                                signer_indices.push(idx);
+                            }
+                        }
+                    }
+
+                    let proof = if !valid_sigs.is_empty() {
+                        let mut signers = SignerBitfield::new(committee_size);
+                        for idx in &signer_indices {
+                            signers.set(*idx);
+                        }
+
+                        let aggregated_signature = Signature::aggregate_bls(&valid_sigs)
+                            .unwrap_or_else(|_| Signature::zero());
+
+                        Some(CommitmentProof::new(
+                            tx_hash,
+                            source_shard,
+                            signers,
+                            aggregated_signature,
+                            block_height,
+                            entries,
+                        ))
+                    } else {
+                        None
+                    };
+
+                    (verified, proof)
+                };
+
+                self.internal_queue
+                    .push_back(Event::ProvisionsVerifiedAndAggregated {
+                        tx_hash,
+                        source_shard,
+                        verified_provisions,
                         commitment_proof,
                     });
             }
@@ -599,21 +689,91 @@ impl SimNode {
                     .push_back(Event::QcSignatureVerified { block_hash, valid });
             }
 
+            // QC building (BLS signature aggregation) - runs synchronously
+            Action::BuildQuorumCertificate {
+                block_hash,
+                height,
+                round,
+                parent_block_hash,
+                votes,
+                signers,
+                voting_power,
+                timestamp_weight_sum,
+            } => {
+                // Extract signatures in sorted order (votes are pre-sorted by committee index)
+                let signatures: Vec<Signature> =
+                    votes.iter().map(|(_, v)| v.signature.clone()).collect();
+
+                // Aggregate BLS signatures
+                let qc = match Signature::aggregate_bls(&signatures) {
+                    Ok(aggregated_signature) => {
+                        // Compute stake-weighted timestamp
+                        let weighted_timestamp_ms = if voting_power.0 == 0 {
+                            0
+                        } else {
+                            (timestamp_weight_sum / voting_power.0 as u128) as u64
+                        };
+
+                        Some(QuorumCertificate {
+                            block_hash,
+                            height,
+                            parent_block_hash,
+                            round,
+                            aggregated_signature,
+                            signers,
+                            voting_power,
+                            weighted_timestamp_ms,
+                        })
+                    }
+                    Err(_) => None,
+                };
+
+                self.internal_queue
+                    .push_back(Event::QuorumCertificateBuilt { block_hash, qc });
+            }
+
             // Note: View change verification actions removed - using HotStuff-2 implicit rounds
 
             // Transaction execution - cached per shard using real Radix engine.
             // All validators in a shard execute the same block, so results are cached.
+            // After execution, sign votes and send StateVoteReceived (matches production runner).
             Action::ExecuteTransactions {
                 block_hash,
                 transactions,
                 ..
             } => {
                 let shard_id = self.state.shard().0;
+                let local_shard = self.state.shard();
+                let validator_id = self.state.topology().local_validator_id();
                 let results = cache.execute_block(shard_id, block_hash, &transactions);
-                self.internal_queue.push_back(Event::TransactionsExecuted {
-                    block_hash,
-                    results,
-                });
+
+                // Sign votes and send StateVoteReceived for each result
+                for result in results {
+                    let message = hyperscale_types::exec_vote_message(
+                        &result.transaction_hash,
+                        &result.state_root,
+                        local_shard,
+                        result.success,
+                    );
+                    let signature = self.signing_key.sign(&message);
+
+                    let vote = StateVoteBlock {
+                        transaction_hash: result.transaction_hash,
+                        shard_group_id: local_shard,
+                        state_root: result.state_root,
+                        success: result.success,
+                        validator: validator_id,
+                        signature,
+                    };
+
+                    // Broadcast to shard peers
+                    self.outbound_events
+                        .push((local_shard, Event::StateVoteReceived { vote: vote.clone() }));
+
+                    // Handle locally
+                    self.internal_queue
+                        .push_back(Event::StateVoteReceived { vote });
+                }
             }
 
             // Speculative execution - same as ExecuteTransactions but returns different event
@@ -640,10 +800,11 @@ impl SimNode {
                 transaction,
                 provisions,
             } => {
-                // Execute single cross-shard transaction, return as batch of 1
-                // (production runner batches multiple actions for parallel execution)
+                // Execute single cross-shard transaction, sign vote and send StateVoteReceived
+                // (matches production runner pattern)
                 let shard_id = self.state.shard().0;
                 let local_shard = self.state.shard();
+                let validator_id = self.state.topology().local_validator_id();
                 let topology = self.state.topology();
                 let is_local_node = |node_id: &NodeId| -> bool {
                     topology.shard_for_node_id(node_id) == local_shard
@@ -655,10 +816,65 @@ impl SimNode {
                     &provisions,
                     is_local_node,
                 );
+
+                // Sign vote and send StateVoteReceived
+                let message = hyperscale_types::exec_vote_message(
+                    &result.transaction_hash,
+                    &result.state_root,
+                    local_shard,
+                    result.success,
+                );
+                let signature = self.signing_key.sign(&message);
+
+                let vote = StateVoteBlock {
+                    transaction_hash: result.transaction_hash,
+                    shard_group_id: local_shard,
+                    state_root: result.state_root,
+                    success: result.success,
+                    validator: validator_id,
+                    signature,
+                };
+
+                // Broadcast to shard peers
+                self.outbound_events
+                    .push((local_shard, Event::StateVoteReceived { vote: vote.clone() }));
+
+                // Handle locally
                 self.internal_queue
-                    .push_back(Event::CrossShardTransactionsExecuted {
-                        results: vec![result],
-                    });
+                    .push_back(Event::StateVoteReceived { vote });
+            }
+
+            // Sign execution results (for speculative cache hits) - sign and broadcast votes
+            Action::SignExecutionResults { results } => {
+                let local_shard = self.state.shard();
+                let validator_id = self.state.topology().local_validator_id();
+
+                for result in results {
+                    let message = hyperscale_types::exec_vote_message(
+                        &result.transaction_hash,
+                        &result.state_root,
+                        local_shard,
+                        result.success,
+                    );
+                    let signature = self.signing_key.sign(&message);
+
+                    let vote = StateVoteBlock {
+                        transaction_hash: result.transaction_hash,
+                        shard_group_id: local_shard,
+                        state_root: result.state_root,
+                        success: result.success,
+                        validator: validator_id,
+                        signature,
+                    };
+
+                    // Broadcast to shard peers
+                    self.outbound_events
+                        .push((local_shard, Event::StateVoteReceived { vote: vote.clone() }));
+
+                    // Handle locally
+                    self.internal_queue
+                        .push_back(Event::StateVoteReceived { vote });
+                }
             }
 
             Action::ComputeMerkleRoot { tx_hash, .. } => {
@@ -688,8 +904,17 @@ impl SimNode {
                     cache.commit_writes(local_shard.0, &cert.state_writes);
                 } else {
                     self.storage
-                        .put_certificate(certificate.transaction_hash, certificate);
+                        .put_certificate(certificate.transaction_hash, certificate.clone());
                 }
+
+                // After persisting, gossip certificate to same-shard peers.
+                // This ensures other validators have the certificate before the proposer
+                // includes it in a block, avoiding fetch delays.
+                let gossip =
+                    hyperscale_messages::TransactionCertificateGossip::new(certificate.clone());
+                let message = OutboundMessage::TransactionCertificateGossip(gossip);
+                self.outbound_messages
+                    .push((Destination::Shard(local_shard), Arc::new(message)));
             }
 
             Action::PersistAndBroadcastVote {
@@ -942,16 +1167,17 @@ impl ParallelSimulator {
                     shard_committees.clone(),
                 ));
 
+                let signing_key = keys[node_index].clone();
                 let state = NodeStateMachine::new(
                     node_index as u32,
                     topology,
-                    keys[node_index].clone(),
+                    signing_key.clone(),
                     BftConfig::default(),
                     RecoveredState::default(),
                 );
 
                 let storage = SimStorage::new();
-                let node = SimNode::new(node_index as u32, state, storage);
+                let node = SimNode::new(node_index as u32, state, storage, signing_key);
                 self.nodes.push(node);
             }
         }
@@ -1080,16 +1306,17 @@ impl ParallelSimulator {
                     shard_committees.clone(),
                 ));
 
+                let signing_key = keys[node_index].clone();
                 let state = NodeStateMachine::new(
                     node_index as u32,
                     topology,
-                    keys[node_index].clone(),
+                    signing_key.clone(),
                     BftConfig::default(),
                     RecoveredState::default(),
                 );
 
                 let storage = SimStorage::new();
-                let node = SimNode::new(node_index as u32, state, storage);
+                let node = SimNode::new(node_index as u32, state, storage, signing_key);
                 self.nodes.push(node);
             }
         }
@@ -1333,7 +1560,6 @@ impl ParallelSimulator {
         match dest {
             Destination::Shard(shard) => self.shard_members.get(shard).cloned().unwrap_or_default(),
             Destination::Global => (0..self.nodes.len() as u32).collect(),
-            Destination::Validator(validator) => vec![validator.0 as u32],
         }
     }
 

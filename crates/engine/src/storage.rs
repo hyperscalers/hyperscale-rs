@@ -22,7 +22,6 @@ use hyperscale_types::NodeId;
 use radix_substate_store_interface::interface::{
     CommittableSubstateDatabase, DbSortKey, SubstateDatabase,
 };
-use std::sync::Arc;
 
 /// Extension trait for substate storage that adds snapshot and node listing capabilities.
 ///
@@ -35,14 +34,20 @@ use std::sync::Arc;
 /// along with `SubstateDatabase` and `CommittableSubstateDatabase`.
 pub trait SubstateStore: SubstateDatabase + CommittableSubstateDatabase + Send + Sync {
     /// The snapshot type returned by this storage.
-    type Snapshot: SubstateDatabase + Send + Sync + 'static;
+    type Snapshot<'a>: SubstateDatabase + Send + Sync
+    where
+        Self: 'a;
 
     /// Create a snapshot for isolated reads.
     ///
     /// Snapshots provide a consistent point-in-time view of the database,
     /// essential for parallel transaction execution where each transaction
     /// needs an isolated view.
-    fn snapshot(&self) -> Arc<Self::Snapshot>;
+    ///
+    /// The snapshot borrows from the storage, ensuring the storage outlives
+    /// the snapshot. This enables RocksDB's native snapshot feature which
+    /// provides true point-in-time isolation from concurrent writes.
+    fn snapshot(&self) -> Self::Snapshot<'_>;
 
     /// List all substates for a given NodeId.
     ///

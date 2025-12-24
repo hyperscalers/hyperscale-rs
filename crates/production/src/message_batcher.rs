@@ -11,6 +11,8 @@
 //!                   Action::BroadcastStateCertificate ──►    │
 //!                   Action::BroadcastStateProvision ──►      │
 //!                                                       Flush Timer (50ms)
+//!                                                            │
+//!                                                       Retry Queue (on failure)
 //! ```
 //!
 //! # Benefits
@@ -18,6 +20,14 @@
 //! - Reduces message count by ~40-60% under load
 //! - Amortizes network overhead (headers, framing) across multiple items
 //! - Minimal latency impact (max 50ms delay, typically much less)
+//! - Automatic retry with exponential backoff for failed broadcasts
+//!
+//! # Reliability
+//!
+//! Failed broadcasts are automatically retried with exponential backoff.
+//! Cross-shard messages (provisions, votes, certificates) are critical for
+//! transaction completion, so we retry up to MAX_RETRY_ATTEMPTS times before
+//! giving up and logging an error.
 
 use crate::network::Libp2pAdapter;
 use hyperscale_core::OutboundMessage;
@@ -25,12 +35,24 @@ use hyperscale_messages::{
     StateCertificateBatch, StateProvisionBatch, StateVoteBatch, TraceContext,
 };
 use hyperscale_types::{ShardGroupId, StateCertificate, StateProvision, StateVoteBlock};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, trace};
+use tracing::{debug, error, trace, warn};
+
+/// Maximum retry attempts before giving up on a failed broadcast.
+const MAX_RETRY_ATTEMPTS: u32 = 5;
+
+/// Initial retry delay (doubles with each attempt).
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Maximum retry delay cap.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// Maximum size of the retry queue before dropping oldest entries.
+const MAX_RETRY_QUEUE_SIZE: usize = 1000;
 
 /// Configuration for the message batcher.
 #[derive(Debug, Clone)]
@@ -43,7 +65,20 @@ pub struct MessageBatcherConfig {
 
     /// Whether batching is enabled (default: true).
     /// When disabled, messages are sent immediately without batching.
+    #[allow(dead_code)]
     pub enabled: bool,
+
+    /// Maximum retry attempts for failed broadcasts (default: 5).
+    pub max_retry_attempts: u32,
+
+    /// Initial retry delay, doubles with each attempt (default: 100ms).
+    pub initial_retry_delay: Duration,
+
+    /// Maximum retry delay cap (default: 5s).
+    pub max_retry_delay: Duration,
+
+    /// Maximum retry queue size before dropping oldest entries (default: 1000).
+    pub max_retry_queue_size: usize,
 }
 
 impl Default for MessageBatcherConfig {
@@ -52,6 +87,10 @@ impl Default for MessageBatcherConfig {
             flush_interval: Duration::from_millis(50),
             max_batch_size: 64,
             enabled: true,
+            max_retry_attempts: MAX_RETRY_ATTEMPTS,
+            initial_retry_delay: INITIAL_RETRY_DELAY,
+            max_retry_delay: MAX_RETRY_DELAY,
+            max_retry_queue_size: MAX_RETRY_QUEUE_SIZE,
         }
     }
 }
@@ -69,10 +108,21 @@ pub struct MessageBatcherStats {
     pub flushes_by_size: AtomicU64,
     /// Flushes triggered by timer.
     pub flushes_by_timer: AtomicU64,
+    /// Total broadcast failures (before retry).
+    pub broadcast_failures: AtomicU64,
+    /// Total successful retries.
+    pub retry_successes: AtomicU64,
+    /// Total messages dropped after max retries.
+    pub messages_dropped: AtomicU64,
+    /// Current retry queue size.
+    pub retry_queue_size: AtomicU64,
+    /// Total retries attempted.
+    pub retries_attempted: AtomicU64,
 }
 
 impl MessageBatcherStats {
     /// Get average items per batch.
+    #[cfg(test)]
     pub fn avg_batch_size(&self) -> f64 {
         let batches = self.batches_sent.load(Ordering::Relaxed);
         let items = self.items_sent.load(Ordering::Relaxed);
@@ -102,8 +152,10 @@ pub enum BatcherCommand {
         item: Box<BatchableItem>,
     },
     /// Flush all pending batches immediately.
+    #[allow(dead_code)]
     Flush,
     /// Shutdown the batcher.
+    #[allow(dead_code)]
     Shutdown,
 }
 
@@ -112,6 +164,7 @@ pub enum BatcherCommand {
 pub struct MessageBatcherHandle {
     tx: mpsc::UnboundedSender<BatcherCommand>,
     stats: Arc<MessageBatcherStats>,
+    #[allow(dead_code)]
     config: MessageBatcherConfig,
 }
 
@@ -144,21 +197,25 @@ impl MessageBatcherHandle {
     }
 
     /// Force flush all pending batches.
+    #[allow(dead_code)]
     pub fn flush(&self) {
         let _ = self.tx.send(BatcherCommand::Flush);
     }
 
     /// Shutdown the batcher.
+    #[allow(dead_code)]
     pub fn shutdown(&self) {
         let _ = self.tx.send(BatcherCommand::Shutdown);
     }
 
     /// Get current statistics.
+    #[allow(dead_code)]
     pub fn stats(&self) -> &MessageBatcherStats {
         &self.stats
     }
 
     /// Check if batching is enabled.
+    #[allow(dead_code)]
     pub fn is_enabled(&self) -> bool {
         self.config.enabled
     }
@@ -183,6 +240,66 @@ impl PendingBatch {
     }
 }
 
+/// Type of failed batch for retry purposes.
+#[derive(Debug, Clone)]
+enum FailedBatchType {
+    Votes(Vec<StateVoteBlock>),
+    Certificates(Vec<StateCertificate>),
+    Provisions(Vec<StateProvision>),
+}
+
+impl FailedBatchType {
+    fn type_name(&self) -> &'static str {
+        match self {
+            FailedBatchType::Votes(_) => "votes",
+            FailedBatchType::Certificates(_) => "certificates",
+            FailedBatchType::Provisions(_) => "provisions",
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            FailedBatchType::Votes(v) => v.len(),
+            FailedBatchType::Certificates(c) => c.len(),
+            FailedBatchType::Provisions(p) => p.len(),
+        }
+    }
+}
+
+/// Entry in the retry queue.
+#[derive(Debug, Clone)]
+struct RetryEntry {
+    /// Target shard for the broadcast.
+    shard: ShardGroupId,
+    /// The failed batch to retry.
+    batch: FailedBatchType,
+    /// Number of retry attempts so far.
+    attempts: u32,
+    /// When to next attempt the retry.
+    next_retry_at: Instant,
+    /// When this entry was first created (for logging).
+    created_at: Instant,
+}
+
+impl RetryEntry {
+    fn new(shard: ShardGroupId, batch: FailedBatchType, initial_delay: Duration) -> Self {
+        let now = Instant::now();
+        Self {
+            shard,
+            batch,
+            attempts: 0,
+            next_retry_at: now + initial_delay,
+            created_at: now,
+        }
+    }
+
+    /// Calculate the next retry delay with exponential backoff.
+    fn next_delay(&self, initial: Duration, max: Duration) -> Duration {
+        let delay = initial * 2u32.saturating_pow(self.attempts);
+        delay.min(max)
+    }
+}
+
 /// The message batcher task.
 pub struct MessageBatcher {
     config: MessageBatcherConfig,
@@ -190,6 +307,8 @@ pub struct MessageBatcher {
     stats: Arc<MessageBatcherStats>,
     /// Pending batches by shard.
     pending: HashMap<ShardGroupId, PendingBatch>,
+    /// Queue of failed broadcasts awaiting retry.
+    retry_queue: VecDeque<RetryEntry>,
 }
 
 impl MessageBatcher {
@@ -197,6 +316,10 @@ impl MessageBatcher {
     pub async fn run(mut self, mut rx: mpsc::UnboundedReceiver<BatcherCommand>) {
         let mut flush_interval = tokio::time::interval(self.config.flush_interval);
         flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Retry check interval - more frequent than flush to catch ready retries
+        let mut retry_interval = tokio::time::interval(Duration::from_millis(50));
+        retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -212,7 +335,12 @@ impl MessageBatcher {
                         Some(BatcherCommand::Shutdown) | None => {
                             // Flush remaining and exit
                             self.flush_all().await;
-                            debug!("Message batcher shutting down");
+                            // Try one final retry pass
+                            self.process_retries().await;
+                            debug!(
+                                retry_queue_remaining = self.retry_queue.len(),
+                                "Message batcher shutting down"
+                            );
                             return;
                         }
                     }
@@ -222,8 +350,163 @@ impl MessageBatcher {
                 _ = flush_interval.tick() => {
                     self.flush_expired().await;
                 }
+
+                // Process retry queue
+                _ = retry_interval.tick() => {
+                    self.process_retries().await;
+                }
             }
         }
+    }
+
+    /// Process entries in the retry queue that are ready for retry.
+    async fn process_retries(&mut self) {
+        let now = Instant::now();
+        let mut retries_to_process = Vec::new();
+
+        // Collect entries ready for retry
+        while let Some(entry) = self.retry_queue.front() {
+            if entry.next_retry_at <= now {
+                retries_to_process.push(self.retry_queue.pop_front().unwrap());
+            } else {
+                // Queue is ordered by next_retry_at, so we can stop here
+                break;
+            }
+        }
+
+        // Update queue size stat
+        self.stats
+            .retry_queue_size
+            .store(self.retry_queue.len() as u64, Ordering::Relaxed);
+
+        // Process each retry
+        for mut entry in retries_to_process {
+            entry.attempts += 1;
+            self.stats.retries_attempted.fetch_add(1, Ordering::Relaxed);
+
+            let result = self.send_batch(entry.shard, &entry.batch).await;
+
+            match result {
+                Ok(count) => {
+                    self.stats.retry_successes.fetch_add(1, Ordering::Relaxed);
+                    self.stats.batches_sent.fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .items_sent
+                        .fetch_add(count as u64, Ordering::Relaxed);
+                    debug!(
+                        shard = entry.shard.0,
+                        batch_type = entry.batch.type_name(),
+                        count,
+                        attempts = entry.attempts,
+                        elapsed_ms = entry.created_at.elapsed().as_millis(),
+                        "Retry succeeded"
+                    );
+                }
+                Err(e) => {
+                    if entry.attempts >= self.config.max_retry_attempts {
+                        // Give up after max attempts
+                        self.stats.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                        error!(
+                            shard = entry.shard.0,
+                            batch_type = entry.batch.type_name(),
+                            count = entry.batch.len(),
+                            attempts = entry.attempts,
+                            elapsed_ms = entry.created_at.elapsed().as_millis(),
+                            error = %e,
+                            "CRITICAL: Cross-shard message batch dropped after max retries - \
+                             transactions may be stuck until timeout"
+                        );
+                    } else {
+                        // Schedule for retry with exponential backoff
+                        let delay = entry.next_delay(
+                            self.config.initial_retry_delay,
+                            self.config.max_retry_delay,
+                        );
+                        entry.next_retry_at = Instant::now() + delay;
+
+                        warn!(
+                            shard = entry.shard.0,
+                            batch_type = entry.batch.type_name(),
+                            count = entry.batch.len(),
+                            attempts = entry.attempts,
+                            next_retry_ms = delay.as_millis(),
+                            error = %e,
+                            "Broadcast retry failed, will retry again"
+                        );
+
+                        self.enqueue_retry(entry);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send a batch to the network, returning item count on success.
+    async fn send_batch(
+        &self,
+        shard: ShardGroupId,
+        batch: &FailedBatchType,
+    ) -> Result<usize, String> {
+        match batch {
+            FailedBatchType::Votes(votes) => {
+                let msg = OutboundMessage::StateVoteBatch(StateVoteBatch::new(votes.clone()));
+                self.network
+                    .broadcast_shard(shard, &msg)
+                    .await
+                    .map(|_| votes.len())
+                    .map_err(|e| e.to_string())
+            }
+            FailedBatchType::Certificates(certs) => {
+                let mut batch_msg = StateCertificateBatch::new(certs.clone());
+                batch_msg.trace_context = TraceContext::from_current();
+                let msg = OutboundMessage::StateCertificateBatch(batch_msg);
+                self.network
+                    .broadcast_shard(shard, &msg)
+                    .await
+                    .map(|_| certs.len())
+                    .map_err(|e| e.to_string())
+            }
+            FailedBatchType::Provisions(provs) => {
+                let mut batch_msg = StateProvisionBatch::new(provs.clone());
+                batch_msg.trace_context = TraceContext::from_current();
+                let msg = OutboundMessage::StateProvisionBatch(batch_msg);
+                self.network
+                    .broadcast_shard(shard, &msg)
+                    .await
+                    .map(|_| provs.len())
+                    .map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    /// Enqueue a retry entry, enforcing queue size limits.
+    fn enqueue_retry(&mut self, entry: RetryEntry) {
+        // Enforce queue size limit by dropping oldest entries
+        while self.retry_queue.len() >= self.config.max_retry_queue_size {
+            if let Some(dropped) = self.retry_queue.pop_front() {
+                self.stats.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                error!(
+                    shard = dropped.shard.0,
+                    batch_type = dropped.batch.type_name(),
+                    count = dropped.batch.len(),
+                    attempts = dropped.attempts,
+                    "Cross-shard message batch dropped due to retry queue overflow"
+                );
+            }
+        }
+
+        // Insert maintaining order by next_retry_at (simple linear insert for now)
+        // In practice the queue should be small so this is fine
+        let insert_pos = self
+            .retry_queue
+            .iter()
+            .position(|e| e.next_retry_at > entry.next_retry_at)
+            .unwrap_or(self.retry_queue.len());
+        self.retry_queue.insert(insert_pos, entry);
+
+        self.stats
+            .retry_queue_size
+            .store(self.retry_queue.len() as u64, Ordering::Relaxed);
     }
 
     /// Queue an item, potentially triggering a flush if batch is full.
@@ -278,22 +561,45 @@ impl MessageBatcher {
 
     /// Flush a specific shard's pending batch.
     async fn flush_shard(&mut self, shard: ShardGroupId) {
-        let Some(batch) = self.pending.get_mut(&shard) else {
-            return;
+        // Extract data from pending batch first to avoid borrow conflicts
+        let (votes, certificates, provisions) = {
+            let Some(batch) = self.pending.get_mut(&shard) else {
+                return;
+            };
+
+            if batch.is_empty() {
+                return;
+            }
+
+            // Take all pending items
+            let votes = std::mem::take(&mut batch.votes);
+            let certificates = std::mem::take(&mut batch.certificates);
+            let provisions = std::mem::take(&mut batch.provisions);
+            batch.first_item_time = None;
+
+            (votes, certificates, provisions)
         };
 
-        if batch.is_empty() {
-            return;
-        }
+        // Collect failed batches for retry (to avoid borrowing self in the loop)
+        let mut failed_batches: Vec<FailedBatchType> = Vec::new();
+        let initial_delay = self.config.initial_retry_delay;
 
         // Send votes batch
-        if !batch.votes.is_empty() {
-            let votes = std::mem::take(&mut batch.votes);
+        if !votes.is_empty() {
             let count = votes.len();
-            let msg = OutboundMessage::StateVoteBatch(StateVoteBatch::new(votes));
+            let msg = OutboundMessage::StateVoteBatch(StateVoteBatch::new(votes.clone()));
 
             if let Err(e) = self.network.broadcast_shard(shard, &msg).await {
-                debug!(?shard, error = %e, "Failed to broadcast state vote batch");
+                self.stats
+                    .broadcast_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    shard = shard.0,
+                    count,
+                    error = %e,
+                    "Failed to broadcast state vote batch, queuing for retry"
+                );
+                failed_batches.push(FailedBatchType::Votes(votes));
             } else {
                 trace!(?shard, count, "Flushed state vote batch");
                 self.stats.batches_sent.fetch_add(1, Ordering::Relaxed);
@@ -304,15 +610,23 @@ impl MessageBatcher {
         }
 
         // Send certificates batch
-        if !batch.certificates.is_empty() {
-            let certs = std::mem::take(&mut batch.certificates);
-            let count = certs.len();
-            let mut batch_msg = StateCertificateBatch::new(certs);
+        if !certificates.is_empty() {
+            let count = certificates.len();
+            let mut batch_msg = StateCertificateBatch::new(certificates.clone());
             batch_msg.trace_context = TraceContext::from_current();
             let msg = OutboundMessage::StateCertificateBatch(batch_msg);
 
             if let Err(e) = self.network.broadcast_shard(shard, &msg).await {
-                debug!(?shard, error = %e, "Failed to broadcast state certificate batch");
+                self.stats
+                    .broadcast_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    shard = shard.0,
+                    count,
+                    error = %e,
+                    "Failed to broadcast state certificate batch, queuing for retry"
+                );
+                failed_batches.push(FailedBatchType::Certificates(certificates));
             } else {
                 trace!(?shard, count, "Flushed state certificate batch");
                 self.stats.batches_sent.fetch_add(1, Ordering::Relaxed);
@@ -323,15 +637,23 @@ impl MessageBatcher {
         }
 
         // Send provisions batch
-        if !batch.provisions.is_empty() {
-            let provs = std::mem::take(&mut batch.provisions);
-            let count = provs.len();
-            let mut batch_msg = StateProvisionBatch::new(provs);
+        if !provisions.is_empty() {
+            let count = provisions.len();
+            let mut batch_msg = StateProvisionBatch::new(provisions.clone());
             batch_msg.trace_context = TraceContext::from_current();
             let msg = OutboundMessage::StateProvisionBatch(batch_msg);
 
             if let Err(e) = self.network.broadcast_shard(shard, &msg).await {
-                debug!(?shard, error = %e, "Failed to broadcast state provision batch");
+                self.stats
+                    .broadcast_failures
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    shard = shard.0,
+                    count,
+                    error = %e,
+                    "Failed to broadcast state provision batch, queuing for retry"
+                );
+                failed_batches.push(FailedBatchType::Provisions(provisions));
             } else {
                 trace!(?shard, count, "Flushed state provision batch");
                 self.stats.batches_sent.fetch_add(1, Ordering::Relaxed);
@@ -341,7 +663,10 @@ impl MessageBatcher {
             }
         }
 
-        batch.first_item_time = None;
+        // Enqueue all failed batches for retry
+        for failed in failed_batches {
+            self.enqueue_retry(RetryEntry::new(shard, failed, initial_delay));
+        }
     }
 }
 
@@ -366,6 +691,7 @@ pub fn spawn_message_batcher(
         network,
         stats,
         pending: HashMap::new(),
+        retry_queue: VecDeque::new(),
     };
 
     tokio::spawn(async move {

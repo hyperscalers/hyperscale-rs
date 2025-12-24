@@ -19,10 +19,10 @@ services:
     image: jaegertracing/all-in-one:latest
     container_name: hyperscale-jaeger
     ports:
-      - "16686:16686"  # Jaeger UI (legacy)
-      - "4317:4317"    # OTLP gRPC receiver
-      - "4318:4318"    # OTLP HTTP receiver
-      - "16685:16685"  # Jaeger gRPC query (for Grafana)
+      - "16686:16686" # Jaeger UI (legacy)
+      - "4317:4317" # OTLP gRPC receiver
+      - "4318:4318" # OTLP HTTP receiver
+      - "16685:16685" # Jaeger gRPC query (for Grafana)
     environment:
       - COLLECTOR_OTLP_ENABLED=true
       - MEMORY_MAX_TRACES=10000000
@@ -41,7 +41,8 @@ services:
       - '--storage.tsdb.path=/prometheus'
       - '--storage.tsdb.retention.time=7d'
       - '--web.enable-lifecycle'
-
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
   grafana:
@@ -67,3 +68,5 @@ services:
 volumes:
   prometheus-data:
   grafana-data:
+
+

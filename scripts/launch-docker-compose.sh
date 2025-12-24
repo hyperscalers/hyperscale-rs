@@ -28,6 +28,7 @@ DATA_DIR="$ROOT_DIR/cluster-data"
 MONITORING_CONFIG_DIR="$SCRIPTS_DIR/monitoring"
 COMPOSE_FILE="$SCRIPTS_DIR/docker-compose.generated.yml"
 IMAGE_NAME="hyperscale-node:latest"
+DC=$(command -v docker-compose >/dev/null 2>&1 && echo "docker-compose" || echo "docker compose")
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -71,7 +72,7 @@ KEY_BIN="$ROOT_DIR/target/release/hyperscale-keygen"
 
 # --- 2. Build & Cleanup ---
 if [ "$CLEAN" = true ]; then
-    docker compose -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
+    $DC -f "$COMPOSE_FILE" down -v --remove-orphans 2>/dev/null || true
     rm -rf "$DATA_DIR"
 fi
 mkdir -p "$DATA_DIR"
@@ -84,25 +85,31 @@ if [ "$USE_GHCR" = true ]; then
 fi
 
 if [ "$BUILD" = true ]; then
-    cd "$ROOT_DIR" && docker build -t "$IMAGE_NAME" .
+    echo "Building local image (native)..."
+    cd "$ROOT_DIR" && DOCKER_BUILDKIT=1 docker build -f Dockerfile.local -t "$IMAGE_NAME" .
 fi
 
 # --- 3. Key & Genesis ---
 declare -a PUBLIC_KEYS
+declare -a PEER_IDS
 for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     NODE_DIR="$DATA_DIR/validator-$i"
     mkdir -p "$NODE_DIR"
     SEED_HEX=$(printf '%064x' $((12345 + i)))
     echo "$SEED_HEX" | xxd -r -p > "$NODE_DIR/signing.key"
-    PUBLIC_KEYS[$i]=$("$KEY_BIN" "$SEED_HEX")
+    
+    OUTPUT=$("$KEY_BIN" "$SEED_HEX")
+    PUBLIC_KEYS[$i]=$(echo "$OUTPUT" | cut -d' ' -f1)
+    PEER_IDS[$i]=$(echo "$OUTPUT" | cut -d' ' -f2)
 done
 
 BOOTSTRAP_PEERS=""
 for shard in $(seq 0 $((NUM_SHARDS - 1))); do
     first_v=$((shard * VALIDATORS_PER_SHARD))
     IP="172.99.0.$((10 + first_v))"
+    PEER_ID="${PEER_IDS[$first_v]}"
     if [ -n "$BOOTSTRAP_PEERS" ]; then BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS,"; fi
-    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/$IP/udp/9000/quic-v1\",\"/ip4/$IP/tcp/9000\""
+    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/$IP/udp/9000/quic-v1/p2p/$PEER_ID\",\"/ip4/$IP/tcp/9000\""
 done
 
 GENESIS_VALIDATORS="[genesis]"
@@ -271,11 +278,11 @@ done
 # --- 6. Final Launch & Verification ---
 echo "=== 4. Launching Cluster ==="
 chmod -R 777 "$DATA_DIR"
-docker compose -f "$COMPOSE_FILE" up -d
+$DC -f "$COMPOSE_FILE" up -d
 
 echo "Waiting for all nodes to be healthy..."
 while true; do
-    STATUS=$(docker compose -f "$COMPOSE_FILE" ps --format json)
+    STATUS=$($DC -f "$COMPOSE_FILE" ps --format json)
     UNHEALTHY=$(echo "$STATUS" | grep -v "healthy" | grep -v "running" || true)
     if [ -z "$UNHEALTHY" ]; then break; fi
     sleep 3
@@ -310,7 +317,7 @@ if $SPAM_BIN smoke-test \
 else
     echo "------------------------------------------------------------------"
     echo "ERROR: Smoke test failed. Cluster left running for inspection."
-    echo "Check logs: docker compose -f $COMPOSE_FILE logs -f"
+    echo "Check logs: $DC -f $COMPOSE_FILE logs -f"
     echo "------------------------------------------------------------------"
     exit 1
 fi

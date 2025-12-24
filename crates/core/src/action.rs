@@ -2,7 +2,7 @@
 
 use crate::{message::OutboundMessage, Event, TimerId};
 use hyperscale_types::{
-    Block, BlockHeight, BlockVote, EpochConfig, EpochId, Hash, NodeId, PublicKey,
+    Block, BlockHeight, BlockVote, EpochConfig, EpochId, ExecutionResult, Hash, NodeId, PublicKey,
     QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
     StateCertificate, StateEntry, StateProvision, StateVoteBlock, TransactionCertificate,
     ValidatorId, VotePower,
@@ -110,35 +110,27 @@ pub enum Action {
         signing_message: Vec<u8>,
     },
 
-    /// Verify a state provision's signature (cross-shard Phase 2).
+    /// Batch verify and aggregate provisions (cross-shard Phase 2).
+    ///
+    /// Verifies all provision signatures and aggregates valid ones into a CommitmentProof.
+    /// This combines verification and aggregation into a single operation, avoiding
+    /// wasted work on provisions that might never reach quorum.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::ProvisionSignatureVerified` when complete.
-    VerifyProvisionSignature {
-        /// The provision to verify.
-        provision: StateProvision,
-        /// Public key of the sending validator (pre-resolved by state machine).
-        public_key: PublicKey,
-    },
-
-    /// Aggregate provisions into a CommitmentProof (cross-shard quorum reached).
-    ///
-    /// Performs BLS signature aggregation which is compute-intensive.
-    /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::CommitmentProofAggregated` when complete.
-    AggregateCommitmentProof {
+    /// Returns `Event::ProvisionsVerifiedAndAggregated` when complete.
+    VerifyAndAggregateProvisions {
         /// Transaction hash for correlation.
         tx_hash: Hash,
-        /// Source shard that reached quorum.
+        /// Source shard the provisions are from.
         source_shard: ShardGroupId,
         /// Block height when provisions were created.
         block_height: BlockHeight,
-        /// State entries (deduplicated from provisions).
+        /// State entries (from first provision - all should match).
         entries: Vec<StateEntry>,
-        /// Signatures to aggregate (one per provision).
-        signatures: Vec<Signature>,
-        /// Validator indices in committee (for SignerBitfield).
-        signer_indices: Vec<usize>,
+        /// Provisions to verify and aggregate.
+        provisions: Vec<StateProvision>,
+        /// Public keys for each provision (same order as provisions).
+        public_keys: Vec<PublicKey>,
         /// Committee size (for SignerBitfield capacity).
         committee_size: usize,
     },
@@ -208,6 +200,31 @@ pub enum Action {
         signing_message: Vec<u8>,
     },
 
+    /// Build a Quorum Certificate by aggregating BLS signatures from collected votes.
+    ///
+    /// Performs BLS signature aggregation which is compute-intensive (~100ms for large committees).
+    /// Delegated to a thread pool in production, instant in simulation.
+    /// Returns `Event::QuorumCertificateBuilt` when complete.
+    BuildQuorumCertificate {
+        /// Block hash the QC is for.
+        block_hash: Hash,
+        /// Block height.
+        height: BlockHeight,
+        /// Round number.
+        round: u64,
+        /// Parent block hash (from the block's header).
+        parent_block_hash: Hash,
+        /// Votes to aggregate, sorted by committee index.
+        /// Each tuple is (committee_index, vote).
+        votes: Vec<(usize, BlockVote)>,
+        /// Bitfield tracking which validators have voted.
+        signers: SignerBitfield,
+        /// Total voting power accumulated.
+        voting_power: VotePower,
+        /// Weighted timestamp sum for calculating stake-weighted timestamp.
+        timestamp_weight_sum: u128,
+    },
+
     /// Execute a batch of single-shard transactions.
     ///
     /// Delegated to the engine thread pool in production, instant in simulation.
@@ -250,6 +267,16 @@ pub enum Action {
         provisions: Vec<StateProvision>,
     },
 
+    /// Sign execution results and broadcast votes.
+    ///
+    /// Used when execution results are already available (e.g., speculative execution cache hits).
+    /// The runner signs each result, broadcasts the vote, and sends `StateVoteReceived`
+    /// for local handling.
+    SignExecutionResults {
+        /// Execution results to sign and broadcast.
+        results: Vec<ExecutionResult>,
+    },
+
     /// Compute a merkle root from state changes.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
@@ -288,6 +315,9 @@ pub enum Action {
         added_at: Duration,
         /// Whether this is a cross-shard transaction (for metrics labeling).
         cross_shard: bool,
+        /// Whether this transaction was submitted locally (via RPC) vs received via gossip/fetch.
+        /// Only locally-submitted transactions should contribute to latency metrics.
+        submitted_locally: bool,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -531,15 +561,16 @@ impl Action {
         matches!(
             self,
             Action::VerifyVoteSignature { .. }
-                | Action::VerifyProvisionSignature { .. }
-                | Action::AggregateCommitmentProof { .. }
+                | Action::VerifyAndAggregateProvisions { .. }
                 | Action::AggregateStateCertificate { .. }
                 | Action::VerifyStateVoteSignature { .. }
                 | Action::VerifyStateCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
+                | Action::BuildQuorumCertificate { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
+                | Action::SignExecutionResults { .. }
                 | Action::ComputeMerkleRoot { .. }
                 | Action::FetchStateEntries { .. }
                 | Action::FetchBlock { .. }
@@ -593,17 +624,18 @@ impl Action {
 
             // Delegated Work - Crypto Verification
             Action::VerifyVoteSignature { .. } => "VerifyVoteSignature",
-            Action::VerifyProvisionSignature { .. } => "VerifyProvisionSignature",
-            Action::AggregateCommitmentProof { .. } => "AggregateCommitmentProof",
+            Action::VerifyAndAggregateProvisions { .. } => "VerifyAndAggregateProvisions",
             Action::AggregateStateCertificate { .. } => "AggregateStateCertificate",
             Action::VerifyStateVoteSignature { .. } => "VerifyStateVoteSignature",
             Action::VerifyStateCertificateSignature { .. } => "VerifyStateCertificateSignature",
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
+            Action::BuildQuorumCertificate { .. } => "BuildQuorumCertificate",
 
             // Delegated Work - Execution
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",
             Action::SpeculativeExecute { .. } => "SpeculativeExecute",
             Action::ExecuteCrossShardTransaction { .. } => "ExecuteCrossShardTransaction",
+            Action::SignExecutionResults { .. } => "SignExecutionResults",
             Action::ComputeMerkleRoot { .. } => "ComputeMerkleRoot",
 
             // External Notifications

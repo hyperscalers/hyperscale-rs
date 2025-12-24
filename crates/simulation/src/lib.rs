@@ -32,11 +32,10 @@ mod event_queue;
 mod network;
 mod runner;
 mod storage;
-pub mod traffic;
+mod traffic;
 
-pub use event_queue::EventKey;
 pub use network::{NetworkConfig, SimulatedNetwork};
-pub use runner::{SimulationRunner, SimulationStats};
+pub use runner::SimulationRunner;
 pub use storage::SimStorage;
 pub use traffic::{BandwidthReport, NetworkTrafficAnalyzer};
 

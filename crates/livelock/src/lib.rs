@@ -31,12 +31,8 @@
 //! # Components
 //!
 //! - [`LivelockState`] - Sub-state machine for cycle detection and deferral management
-//! - [`LivelockConfig`] - Configuration for tombstone TTL, timeouts, etc.
-//! - [`CommittedCrossShardTracker`] - Tracks committed TXs and their shard dependencies
-//! - [`ProvisionTracker`] - Tracks provisions for cycle detection and deduplication
 
 mod state;
 mod tracker;
 
-pub use state::{LivelockConfig, LivelockState, LivelockStats};
-pub use tracker::{CommittedCrossShardTracker, ProvisionTracker};
+pub use state::LivelockState;

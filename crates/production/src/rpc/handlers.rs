@@ -104,7 +104,7 @@ pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse 
 
 /// Handler for `GET /api/v1/sync` - sync status.
 pub async fn sync_handler(State(state): State<RpcState>) -> impl IntoResponse {
-    let sync_status = state.sync_status.read().await;
+    let sync_status = state.sync_status.load();
 
     Json(SyncStatusResponse {
         state: format!("{:?}", sync_status.state).to_lowercase(),
@@ -402,6 +402,7 @@ mod tests {
     use super::*;
     use crate::rpc::state::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
     use crate::sync::SyncStatus;
+    use arc_swap::ArcSwap;
     use axum::{body::Body, http::Request, Router};
     use hyperscale_types::{BlockHeight, TransactionDecision};
     use std::sync::atomic::AtomicBool;
@@ -414,7 +415,7 @@ mod tests {
         let (tx_submission_tx, _rx) = mpsc::unbounded_channel();
         RpcState {
             ready: Arc::new(AtomicBool::new(false)),
-            sync_status: Arc::new(RwLock::new(SyncStatus::default())),
+            sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
             node_status: Arc::new(RwLock::new(NodeStatusState::default())),
             tx_submission_tx,
             start_time: Instant::now(),

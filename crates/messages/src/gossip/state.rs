@@ -6,6 +6,7 @@
 use crate::trace_context::TraceContext;
 use hyperscale_types::{
     NetworkMessage, ShardMessage, StateCertificate, StateProvision, StateVoteBlock,
+    TransactionCertificate,
 };
 use sbor::prelude::BasicSbor;
 
@@ -192,6 +193,47 @@ impl NetworkMessage for StateCertificateBatch {
 }
 
 impl ShardMessage for StateCertificateBatch {}
+
+/// Gossip message for a finalized transaction certificate.
+///
+/// When a transaction certificate is finalized (all shard proofs collected), it is
+/// gossiped to same-shard peers so they can persist it before the proposer includes
+/// it in a block. This ensures certificates are available for fetch requests when
+/// other validators receive the block header.
+///
+/// Unlike batched messages, this uses individual gossip to enable better deduplication
+/// by gossipsub - the message hash is based on the certificate content, so identical
+/// certificates are naturally deduplicated across the network.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct TransactionCertificateGossip {
+    /// The finalized transaction certificate being gossiped
+    pub certificate: TransactionCertificate,
+}
+
+impl TransactionCertificateGossip {
+    /// Create a new transaction certificate gossip message.
+    pub fn new(certificate: TransactionCertificate) -> Self {
+        Self { certificate }
+    }
+
+    /// Get the certificate.
+    pub fn certificate(&self) -> &TransactionCertificate {
+        &self.certificate
+    }
+
+    /// Consume and return the certificate.
+    pub fn into_certificate(self) -> TransactionCertificate {
+        self.certificate
+    }
+}
+
+impl NetworkMessage for TransactionCertificateGossip {
+    fn message_type_id() -> &'static str {
+        "transaction.certificate"
+    }
+}
+
+impl ShardMessage for TransactionCertificateGossip {}
 
 #[cfg(test)]
 mod tests {

@@ -31,20 +31,12 @@
 //! println!("P99 latency: {:?}", report.p99_latency());
 //! ```
 
-pub mod config;
-pub mod livelock;
-pub mod metrics;
-pub mod parallel;
-pub mod runner;
-
-// Re-export types from hyperscale-spammer for convenience
-pub use hyperscale_spammer::{
-    AccountPool, AccountPoolError, AccountUsageStats, FundedAccount, SelectionMode,
-    TransferWorkload, WorkloadGenerator,
-};
+mod config;
+mod livelock;
+mod metrics;
+mod parallel;
+mod runner;
 
 pub use config::{SimulatorConfig, WorkloadConfig};
-pub use livelock::{LivelockAnalyzer, LivelockReport, StuckTransaction};
-pub use metrics::{MetricsCollector, SimulationReport};
-pub use parallel::{ParallelOrchestrator, ParallelOrchestratorConfig, ParallelOrchestratorError};
+pub use parallel::{ParallelOrchestrator, ParallelOrchestratorConfig};
 pub use runner::Simulator;

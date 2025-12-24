@@ -85,7 +85,8 @@ impl TimerManager {
     }
 
     /// Get the number of active timers.
-    pub fn active_count(&self) -> usize {
+    #[cfg(test)]
+    fn active_count(&self) -> usize {
         self.timers.len()
     }
 }

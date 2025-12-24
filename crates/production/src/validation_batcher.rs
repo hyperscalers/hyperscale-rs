@@ -42,6 +42,7 @@ pub struct ValidationBatcherConfig {
     pub seen_cache_capacity: usize,
 
     /// How often to clean expired entries from seen cache (default: 60s).
+    #[allow(dead_code)]
     pub seen_cache_cleanup_interval: Duration,
 }
 
@@ -105,12 +106,9 @@ impl SeenCache {
     /// Check if a hash has been seen. Returns true if already seen.
     /// This is lock-free - multiple threads can call concurrently.
     fn check_and_insert(&self, hash: Hash) -> bool {
-        // Fast path: check if already exists (lock-free read)
-        if self.hashes.contains_key(&hash) {
-            return true;
-        }
-
-        // Evict ~10% if at capacity (approximate, non-blocking)
+        // Evict ~10% if at capacity BEFORE acquiring entry lock to avoid deadlock.
+        // (DashMap's iter() can deadlock if we hold an entry lock on the same shard)
+        // This is slightly racy (capacity might change) but that's acceptable for dedup.
         if self.hashes.len() >= self.capacity {
             let to_remove: Vec<_> = self
                 .hashes
@@ -123,10 +121,15 @@ impl SeenCache {
             }
         }
 
-        // Insert and return false (not seen before)
-        // Note: There's a small race window here, but it's acceptable for dedup
-        self.hashes.insert(hash, ());
-        false
+        // Atomic check-and-insert using entry API - no race window for duplicates
+        use dashmap::mapref::entry::Entry;
+        match self.hashes.entry(hash) {
+            Entry::Occupied(_) => true, // Already seen
+            Entry::Vacant(vacant) => {
+                vacant.insert(());
+                false // Not seen before
+            }
+        }
     }
 
     /// Get current size.
@@ -265,8 +268,8 @@ impl ValidationBatcher {
 
         debug!(batch_size, "Dispatching transaction validation batch");
 
-        self.thread_pools.spawn_crypto(move || {
-            // Use rayon to validate in parallel across all crypto threads
+        self.thread_pools.spawn_tx_validation(move || {
+            // Use rayon to validate in parallel across all tx validation threads
             use rayon::prelude::*;
 
             let results: Vec<_> = batch

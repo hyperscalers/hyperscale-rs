@@ -15,8 +15,8 @@ use hyperscale_engine::RadixExecutor;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     Block, CommitmentProof, Hash as TxHash, KeyPair, KeyType, PublicKey, QuorumCertificate,
-    ShardGroupId, Signature, SignerBitfield, StateCertificate, StaticTopology, Topology,
-    TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
+    ShardGroupId, Signature, SignerBitfield, StateCertificate, StateVoteBlock, StaticTopology,
+    Topology, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
@@ -68,6 +68,10 @@ pub struct SimulationRunner {
     /// Per-node executor. Each node has its own executor instance.
     /// Index corresponds to node index.
     node_executor: Vec<RadixExecutor>,
+
+    /// Per-node signing keys. Each node has its own key for signing votes.
+    /// Index corresponds to node index.
+    node_keys: Vec<KeyPair>,
 
     /// Whether genesis has been executed on each node's storage.
     /// Index corresponds to node index.
@@ -228,6 +232,7 @@ impl SimulationRunner {
             stats: SimulationStats::default(),
             node_storage,
             node_executor,
+            node_keys: keys,
             genesis_executed,
             traffic_analyzer: None,
             seen_messages: HashSet::new(),
@@ -559,6 +564,41 @@ impl SimulationRunner {
                 }
             }
 
+            // Handle TransactionCertificateReceived directly in runner (like production).
+            // Verify signatures synchronously (no async in simulation) and persist.
+            if let Event::TransactionCertificateReceived { ref certificate } = event {
+                let storage = &mut self.node_storage[node_index as usize];
+                let tx_hash = certificate.transaction_hash;
+
+                // Skip if already in storage
+                if storage.get_certificate(&tx_hash).is_some() {
+                    continue;
+                }
+
+                // In simulation, we trust certificates (skip BLS verification for speed).
+                // Production verifies signatures before persisting.
+                // For full fidelity, we could add verification here but it would slow tests.
+                let local_shard = self.nodes[node_index as usize].shard();
+                let writes: Vec<_> = certificate
+                    .shard_proofs
+                    .get(&local_shard)
+                    .map(|c| c.state_writes.clone())
+                    .unwrap_or_default();
+
+                storage.commit_certificate_with_writes(certificate, &writes);
+
+                // Notify state machine to cancel local building and add to finalized
+                let node = &mut self.nodes[node_index as usize];
+                let actions = node.handle(Event::GossipedCertificateVerified {
+                    certificate: certificate.clone(),
+                });
+                for action in actions {
+                    self.process_action(node_index, action);
+                }
+
+                continue;
+            }
+
             // Update node's time and process event
             let node = &mut self.nodes[node_index as usize];
             node.set_time(self.now);
@@ -709,59 +749,101 @@ impl SimulationRunner {
                 self.schedule_event(from, self.now, Event::VoteSignatureVerified { vote, valid });
             }
 
-            Action::VerifyProvisionSignature {
-                provision,
-                public_key,
-            } => {
-                // Use centralized signing message (must match ExecutionState::sign_provision)
-                let msg = provision.signing_message();
-
-                let valid = public_key.verify(&msg, &provision.signature);
-                self.schedule_event(
-                    from,
-                    self.now,
-                    Event::ProvisionSignatureVerified { provision, valid },
-                );
-            }
-
-            Action::AggregateCommitmentProof {
+            Action::VerifyAndAggregateProvisions {
                 tx_hash,
                 source_shard,
                 block_height,
                 entries,
-                signatures,
-                signer_indices,
+                provisions,
+                public_keys,
                 committee_size,
             } => {
-                // Build signer bitfield
-                let mut signers = SignerBitfield::new(committee_size);
-                for idx in &signer_indices {
-                    signers.set(*idx);
-                }
+                // All provisions for the same (tx, source_shard) sign the SAME message.
+                // Happy path: aggregate verification with single pairing check.
+                let signatures: Vec<Signature> =
+                    provisions.iter().map(|p| p.signature.clone()).collect();
+                let message = provisions
+                    .first()
+                    .map(|p| p.signing_message())
+                    .unwrap_or_default();
 
-                // Aggregate BLS signatures
-                let aggregated_signature = if signatures.is_empty() {
-                    Signature::zero()
+                let topology = self.nodes[from as usize].topology();
+                let all_valid =
+                    PublicKey::batch_verify_bls_same_message(&message, &signatures, &public_keys);
+
+                let (verified_provisions, commitment_proof) = if all_valid {
+                    // Fast path: all valid
+                    let mut signers = SignerBitfield::new(committee_size);
+                    for provision in &provisions {
+                        if let Some(idx) =
+                            topology.committee_index_for_shard(source_shard, provision.validator_id)
+                        {
+                            signers.set(idx);
+                        }
+                    }
+
+                    let aggregated_signature =
+                        Signature::aggregate_bls(&signatures).unwrap_or_else(|_| Signature::zero());
+
+                    let proof = CommitmentProof::new(
+                        tx_hash,
+                        source_shard,
+                        signers,
+                        aggregated_signature,
+                        block_height,
+                        entries,
+                    );
+
+                    (provisions, Some(proof))
                 } else {
-                    Signature::aggregate_bls(&signatures).unwrap_or_else(|_| Signature::zero())
-                };
+                    // Slow path: find valid signatures individually
+                    let mut verified = Vec::new();
+                    let mut valid_sigs = Vec::new();
+                    let mut signer_indices = Vec::new();
 
-                // Build the commitment proof
-                let commitment_proof = CommitmentProof::new(
-                    tx_hash,
-                    source_shard,
-                    signers,
-                    aggregated_signature,
-                    block_height,
-                    entries,
-                );
+                    for (provision, pk) in provisions.iter().zip(public_keys.iter()) {
+                        if pk.verify(&message, &provision.signature) {
+                            verified.push(provision.clone());
+                            valid_sigs.push(provision.signature.clone());
+                            if let Some(idx) = topology
+                                .committee_index_for_shard(source_shard, provision.validator_id)
+                            {
+                                signer_indices.push(idx);
+                            }
+                        }
+                    }
+
+                    let proof = if !valid_sigs.is_empty() {
+                        let mut signers = SignerBitfield::new(committee_size);
+                        for idx in &signer_indices {
+                            signers.set(*idx);
+                        }
+
+                        let aggregated_signature = Signature::aggregate_bls(&valid_sigs)
+                            .unwrap_or_else(|_| Signature::zero());
+
+                        Some(CommitmentProof::new(
+                            tx_hash,
+                            source_shard,
+                            signers,
+                            aggregated_signature,
+                            block_height,
+                            entries,
+                        ))
+                    } else {
+                        None
+                    };
+
+                    (verified, proof)
+                };
 
                 self.schedule_event(
                     from,
                     self.now,
-                    Event::CommitmentProofAggregated {
+                    Event::ProvisionsVerifiedAndAggregated {
                         tx_hash,
                         source_shard,
+                        verified_provisions,
                         commitment_proof,
                     },
                 );
@@ -935,9 +1017,58 @@ impl SimulationRunner {
                 );
             }
 
+            // QC building (BLS signature aggregation) - runs synchronously in simulation
+            Action::BuildQuorumCertificate {
+                block_hash,
+                height,
+                round,
+                parent_block_hash,
+                votes,
+                signers,
+                voting_power,
+                timestamp_weight_sum,
+            } => {
+                // Extract signatures in sorted order (votes are pre-sorted by committee index)
+                let signatures: Vec<Signature> =
+                    votes.iter().map(|(_, v)| v.signature.clone()).collect();
+
+                // Aggregate BLS signatures
+                let qc = match Signature::aggregate_bls(&signatures) {
+                    Ok(aggregated_signature) => {
+                        // Compute stake-weighted timestamp
+                        let weighted_timestamp_ms = if voting_power.0 == 0 {
+                            0
+                        } else {
+                            (timestamp_weight_sum / voting_power.0 as u128) as u64
+                        };
+
+                        Some(QuorumCertificate {
+                            block_hash,
+                            height,
+                            parent_block_hash,
+                            round,
+                            aggregated_signature,
+                            signers,
+                            voting_power,
+                            weighted_timestamp_ms,
+                        })
+                    }
+                    Err(e) => {
+                        warn!(node = from, ?block_hash, error = %e, "Failed to aggregate BLS signatures for QC");
+                        None
+                    }
+                };
+
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::QuorumCertificateBuilt { block_hash, qc },
+                );
+            }
+
             // Note: View change verification actions removed - using HotStuff-2 implicit rounds
             Action::ExecuteTransactions {
-                block_hash,
+                block_hash: _,
                 transactions,
                 ..
             } => {
@@ -947,45 +1078,75 @@ impl SimulationRunner {
                 // NOTE: Execution is READ-ONLY. State writes are collected in the results
                 // and committed later when TransactionCertificate is included in a block
                 // (via PersistTransactionCertificate handler).
+                //
+                // After execution, sign votes and send StateVoteReceived directly
+                // (matches production runner pattern).
                 let storage = &self.node_storage[from as usize];
                 let executor = &self.node_executor[from as usize];
+                let signing_key = self.node_keys[from as usize].clone();
+                let local_shard = self.nodes[from as usize].shard();
+                let validator_id = self.nodes[from as usize].topology().local_validator_id();
 
-                let results = match executor.execute_single_shard(storage, &transactions) {
-                    Ok(output) => output
-                        .results()
-                        .iter()
-                        .map(|r| hyperscale_types::ExecutionResult {
-                            transaction_hash: r.tx_hash,
-                            success: r.success,
-                            state_root: r.outputs_merkle_root,
-                            writes: r.state_writes.clone(),
-                            error: r.error.clone(),
-                        })
-                        .collect(),
-                    Err(e) => {
-                        // Execution failed - mark all transactions as failed
-                        warn!(node = from, ?block_hash, error = %e, "Transaction execution failed");
-                        transactions
+                let results: Vec<hyperscale_types::ExecutionResult> =
+                    match executor.execute_single_shard(storage, &transactions) {
+                        Ok(output) => output
+                            .results()
                             .iter()
-                            .map(|tx| hyperscale_types::ExecutionResult {
-                                transaction_hash: tx.hash(),
-                                success: false,
-                                state_root: hyperscale_types::Hash::ZERO,
-                                writes: vec![],
-                                error: Some(format!("{}", e)),
+                            .map(|r| hyperscale_types::ExecutionResult {
+                                transaction_hash: r.tx_hash,
+                                success: r.success,
+                                state_root: r.outputs_merkle_root,
+                                writes: r.state_writes.clone(),
+                                error: r.error.clone(),
                             })
-                            .collect()
-                    }
-                };
+                            .collect(),
+                        Err(e) => {
+                            // Execution failed - mark all transactions as failed
+                            warn!(node = from, error = %e, "Transaction execution failed");
+                            transactions
+                                .iter()
+                                .map(|tx| hyperscale_types::ExecutionResult {
+                                    transaction_hash: tx.hash(),
+                                    success: false,
+                                    state_root: hyperscale_types::Hash::ZERO,
+                                    writes: vec![],
+                                    error: Some(format!("{}", e)),
+                                })
+                                .collect()
+                        }
+                    };
 
-                self.schedule_event(
-                    from,
-                    self.now,
-                    Event::TransactionsExecuted {
-                        block_hash,
-                        results,
-                    },
-                );
+                // Sign votes and send StateVoteReceived for each result
+                for result in results {
+                    let message = hyperscale_types::exec_vote_message(
+                        &result.transaction_hash,
+                        &result.state_root,
+                        local_shard,
+                        result.success,
+                    );
+                    let signature = signing_key.sign(&message);
+
+                    let vote = StateVoteBlock {
+                        transaction_hash: result.transaction_hash,
+                        shard_group_id: local_shard,
+                        state_root: result.state_root,
+                        success: result.success,
+                        validator: validator_id,
+                        signature,
+                    };
+
+                    // Broadcast to shard peers
+                    let broadcast_event = Event::StateVoteReceived { vote: vote.clone() };
+                    let peers = self.network.peers_in_shard(local_shard);
+                    for to in peers {
+                        if to != from {
+                            self.try_deliver_event(from, to, broadcast_event.clone());
+                        }
+                    }
+
+                    // Send to state machine for local handling (skips verification for own votes)
+                    self.schedule_event(from, self.now, Event::StateVoteReceived { vote });
+                }
             }
 
             Action::SpeculativeExecute {
@@ -1058,13 +1219,15 @@ impl SimulationRunner {
                 // and committed later when TransactionCertificate is included in a block
                 // (via PersistTransactionCertificate handler).
                 //
-                // In simulation, we execute immediately and return as a batch of 1.
-                // Production runner batches multiple actions for parallel execution.
+                // After execution, sign vote and send StateVoteReceived directly
+                // (matches production runner pattern).
                 let storage = &self.node_storage[from as usize];
                 let executor = &self.node_executor[from as usize];
+                let signing_key = self.node_keys[from as usize].clone();
+                let local_shard = self.nodes[from as usize].shard();
+                let validator_id = self.nodes[from as usize].topology().local_validator_id();
 
                 // Determine which nodes are local to this shard
-                let local_shard = self.nodes[from as usize].shard();
                 let is_local_node = |node_id: &hyperscale_types::NodeId| -> bool {
                     self.nodes[from as usize]
                         .topology()
@@ -1109,14 +1272,74 @@ impl SimulationRunner {
                     }
                 };
 
-                // Return as batch event (production runner batches multiple actions)
-                self.schedule_event(
-                    from,
-                    self.now,
-                    Event::CrossShardTransactionsExecuted {
-                        results: vec![result],
-                    },
+                // Sign vote and send StateVoteReceived
+                let message = hyperscale_types::exec_vote_message(
+                    &result.transaction_hash,
+                    &result.state_root,
+                    local_shard,
+                    result.success,
                 );
+                let signature = signing_key.sign(&message);
+
+                let vote = StateVoteBlock {
+                    transaction_hash: result.transaction_hash,
+                    shard_group_id: local_shard,
+                    state_root: result.state_root,
+                    success: result.success,
+                    validator: validator_id,
+                    signature,
+                };
+
+                // Broadcast to shard peers
+                let broadcast_event = Event::StateVoteReceived { vote: vote.clone() };
+                let peers = self.network.peers_in_shard(local_shard);
+                for to in peers {
+                    if to != from {
+                        self.try_deliver_event(from, to, broadcast_event.clone());
+                    }
+                }
+
+                // Send to state machine for local handling (skips verification for own votes)
+                self.schedule_event(from, self.now, Event::StateVoteReceived { vote });
+            }
+
+            // Sign already-executed results (e.g., speculative execution cache hits).
+            // Signs votes and sends StateVoteReceived for local handling.
+            Action::SignExecutionResults { results } => {
+                let signing_key = self.node_keys[from as usize].clone();
+                let local_shard = self.nodes[from as usize].shard();
+                let validator_id = self.nodes[from as usize].topology().local_validator_id();
+
+                for result in results {
+                    let message = hyperscale_types::exec_vote_message(
+                        &result.transaction_hash,
+                        &result.state_root,
+                        local_shard,
+                        result.success,
+                    );
+                    let signature = signing_key.sign(&message);
+
+                    let vote = StateVoteBlock {
+                        transaction_hash: result.transaction_hash,
+                        shard_group_id: local_shard,
+                        state_root: result.state_root,
+                        success: result.success,
+                        validator: validator_id,
+                        signature,
+                    };
+
+                    // Broadcast to shard peers
+                    let broadcast_event = Event::StateVoteReceived { vote: vote.clone() };
+                    let peers = self.network.peers_in_shard(local_shard);
+                    for to in peers {
+                        if to != from {
+                            self.try_deliver_event(from, to, broadcast_event.clone());
+                        }
+                    }
+
+                    // Send to state machine for local handling
+                    self.schedule_event(from, self.now, Event::StateVoteReceived { vote });
+                }
             }
 
             Action::ComputeMerkleRoot { tx_hash, writes } => {
@@ -1205,6 +1428,19 @@ impl SimulationRunner {
 
                 // Commit certificate + writes atomically (mirrors production behavior)
                 storage.commit_certificate_with_writes(&certificate, writes);
+
+                // After persisting, gossip certificate to same-shard peers.
+                // This ensures other validators have the certificate before the proposer
+                // includes it in a block, avoiding fetch delays.
+                let gossip =
+                    hyperscale_messages::TransactionCertificateGossip::new(certificate.clone());
+                let message = OutboundMessage::TransactionCertificateGossip(gossip);
+                let peers = self.network.peers_in_shard(local_shard);
+                for to in peers {
+                    if to != from {
+                        self.try_deliver_message(from, to, &message);
+                    }
+                }
             }
             Action::PersistAndBroadcastVote {
                 height,

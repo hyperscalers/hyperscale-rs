@@ -808,6 +808,16 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
 
     let listen_addresses = vec![listen_addr.clone()];
 
+    // Calculate default TCP fallback port if enabled but not specified (UDP port + 21500)
+    let tcp_fallback_port = if config.tcp_fallback_enabled && config.tcp_fallback_port.is_none() {
+        listen_addr.iter().find_map(|p| match p {
+            libp2p::multiaddr::Protocol::Udp(port) => Some(port + 21500),
+            _ => None,
+        })
+    } else {
+        config.tcp_fallback_port
+    };
+
     // Filter out our own listen addresses from bootstrap peers
     // Also filter TCP addresses if TCP fallback is disabled
     let bootstrap_peers: Vec<_> = config
@@ -848,7 +858,7 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
         .with_request_timeout(Duration::from_millis(config.request_timeout_ms))
         .with_max_message_size(config.max_message_size)
         .with_gossipsub_heartbeat(Duration::from_millis(config.gossipsub_heartbeat_ms))
-        .with_tcp_fallback(config.tcp_fallback_enabled, config.tcp_fallback_port))
+        .with_tcp_fallback(config.tcp_fallback_enabled, tcp_fallback_port))
 }
 
 /// Build RocksDB configuration from TOML config.
@@ -993,27 +1003,13 @@ async fn setup_upnp(config: &NetworkConfig) {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level)),
-        )
-        .init();
-
-    info!("Hyperscale Validator starting...");
-
-    // Load configuration
+    // Load configuration first (before logging init) to check if telemetry is enabled
     let mut config = ValidatorConfig::load(&cli.config)?;
     config.apply_overrides(&cli);
 
-    info!(
-        validator_id = config.node.validator_id,
-        shard = config.node.shard,
-        num_shards = config.node.num_shards,
-        "Node configuration loaded"
-    );
-
-    // Initialize telemetry if enabled
+    // Initialize telemetry/logging
+    // If telemetry is enabled, init_telemetry sets up the global subscriber with OTLP export.
+    // Otherwise, use basic fmt subscriber.
     let _telemetry_guard = if config.telemetry.enabled {
         let telemetry_config = TelemetryConfig {
             service_name: config.telemetry.service_name.clone(),
@@ -1031,8 +1027,24 @@ async fn main() -> Result<()> {
         };
         Some(init_telemetry(&telemetry_config)?)
     } else {
+        // Basic logging without OTLP export
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new(&cli.log_level)),
+            )
+            .init();
         None
     };
+
+    info!("Hyperscale Validator starting...");
+
+    info!(
+        validator_id = config.node.validator_id,
+        shard = config.node.shard,
+        num_shards = config.node.num_shards,
+        "Node configuration loaded"
+    );
 
     // Ensure data directory exists
     fs::create_dir_all(&config.node.data_dir)?;
@@ -1083,12 +1095,16 @@ async fn main() -> Result<()> {
 
     // Create shared RPC state objects that will be used by both runner and RPC server.
     // These are created first so they can be wired into both components.
+    use arc_swap::ArcSwap;
     use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
     use std::sync::atomic::AtomicBool;
     use tokio::sync::RwLock;
 
     let rpc_ready = Arc::new(AtomicBool::new(false));
-    let rpc_sync_status = Arc::new(RwLock::new(hyperscale_production::SyncStatus::default()));
+    // Use ArcSwap for lock-free reads of sync status from HTTP handlers
+    let rpc_sync_status = Arc::new(ArcSwap::new(Arc::new(
+        hyperscale_production::SyncStatus::default(),
+    )));
     let rpc_node_status = Arc::new(RwLock::new(NodeStatusState {
         validator_id: config.node.validator_id,
         shard: config.node.shard,

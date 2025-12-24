@@ -7,6 +7,7 @@ use hyperscale_types::{
     Hash, ShardGroupId, StateCertificate, TransactionCertificate, TransactionDecision,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use tracing::instrument;
 
 /// Tracks certificates for cross-shard finalization.
 ///
@@ -38,11 +39,6 @@ impl CertificateTracker {
         }
     }
 
-    /// Get the transaction hash this tracker is for.
-    pub fn tx_hash(&self) -> Hash {
-        self.tx_hash
-    }
-
     /// Get the number of certificates collected.
     pub fn certificate_count(&self) -> usize {
         self.certificates.len()
@@ -54,6 +50,12 @@ impl CertificateTracker {
     }
 
     /// Add a certificate. Returns true if all certificates are collected.
+    #[instrument(level = "debug", skip(self, cert), fields(
+        tx_hash = %self.tx_hash,
+        shard = cert.shard_group_id.0,
+        collected = self.certificates.len(),
+        expected = self.expected_shards.len(),
+    ))]
     pub fn add_certificate(&mut self, cert: StateCertificate) -> bool {
         let shard = cert.shard_group_id;
 
@@ -102,6 +104,10 @@ impl CertificateTracker {
     /// Returns `None` if:
     /// - Not all certificates have been collected
     /// - Certificates have mismatched merkle roots (Byzantine behavior)
+    #[instrument(level = "debug", skip(self), fields(
+        tx_hash = %self.tx_hash,
+        shard_count = self.certificates.len(),
+    ))]
     pub fn create_tx_certificate(&mut self) -> Option<TransactionCertificate> {
         if !self.is_complete() {
             tracing::debug!(

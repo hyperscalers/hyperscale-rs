@@ -322,12 +322,12 @@ impl CommittableSubstateDatabase for SimStorage {
 }
 
 impl SubstateStore for SimStorage {
-    type Snapshot = SimSnapshot;
+    type Snapshot<'a> = SimSnapshot;
 
-    fn snapshot(&self) -> Arc<Self::Snapshot> {
+    fn snapshot(&self) -> Self::Snapshot<'_> {
         // O(1) clone with structural sharing!
         let data = self.data.read().unwrap().clone();
-        Arc::new(SimSnapshot { data })
+        SimSnapshot { data }
     }
 
     fn list_substates_for_node(

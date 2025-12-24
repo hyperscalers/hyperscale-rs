@@ -54,13 +54,6 @@ mod metrics;
 mod router;
 mod simulator;
 
-pub use cache::SimulationCache;
 pub use config::ParallelConfig;
-pub use metrics::{
-    MetricsCollector, MetricsEvent, MetricsRx, MetricsTx, SharedMetrics, SimulationReport,
-};
-pub use router::{
-    Destination, InboundMessage, MessageRouter, NodeRx, RoutedMessage, RouterStats,
-    RouterStatsHandle, RouterTx,
-};
-pub use simulator::{ParallelSimulator, SimNode};
+pub use metrics::SimulationReport;
+pub use simulator::ParallelSimulator;

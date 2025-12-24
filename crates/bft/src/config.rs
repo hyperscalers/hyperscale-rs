@@ -48,6 +48,25 @@ pub struct BftConfig {
     /// - Removes stale pending blocks that have been incomplete too long
     /// - Checks sync health and triggers catch-up sync if needed
     pub cleanup_interval: Duration,
+
+    /// Maximum gap between QC height and committed height before applying back pressure.
+    ///
+    /// When the pipeline gets too deep (QC height far ahead of committed height),
+    /// we skip proposals to let commits catch up. This prevents runaway pipelining
+    /// that can cause slower validators to fall behind and eventually lose quorum.
+    pub pipeline_backpressure_limit: u64,
+
+    /// Minimum time between block proposals (rate limiting).
+    ///
+    /// Even when a QC forms immediately, we wait at least this long since the last
+    /// proposal before proposing the next block. This prevents burst behavior under
+    /// high load where blocks could otherwise be produced at wire speed, causing:
+    /// - Fast validators to race ahead of slower ones
+    /// - Vote accumulation storms from rapid block production
+    /// - Excessive pressure on the execution layer
+    ///
+    /// Set to Duration::ZERO to disable rate limiting (not recommended for production).
+    pub min_block_interval: Duration,
 }
 
 impl Default for BftConfig {
@@ -55,14 +74,16 @@ impl Default for BftConfig {
         Self {
             proposal_interval: Duration::from_millis(300),
             view_change_timeout: Duration::from_secs(3),
-            max_transactions_per_block: 4096,
+            max_transactions_per_block: 1024,
             max_certificates_per_block: 4096,
             max_timestamp_delay_ms: 30_000,
             max_timestamp_rush_ms: 2_000,
             transaction_fetch_timeout: Duration::from_millis(50),
-            certificate_fetch_timeout: Duration::from_millis(100),
+            certificate_fetch_timeout: Duration::from_millis(500),
             stale_pending_block_timeout: Duration::from_secs(30),
             cleanup_interval: Duration::from_secs(1),
+            pipeline_backpressure_limit: 12,
+            min_block_interval: Duration::from_millis(150),
         }
     }
 }
@@ -88,6 +109,12 @@ impl BftConfig {
     /// Set the maximum transactions per block.
     pub fn with_max_transactions(mut self, max: usize) -> Self {
         self.max_transactions_per_block = max;
+        self
+    }
+
+    /// Set the minimum block interval.
+    pub fn with_min_block_interval(mut self, interval: Duration) -> Self {
+        self.min_block_interval = interval;
         self
     }
 }

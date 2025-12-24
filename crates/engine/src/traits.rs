@@ -9,8 +9,7 @@
 //! Both use the real Radix Engine - the difference is the calling convention.
 
 use crate::result::ExecutionOutput;
-use hyperscale_consensus_types::{RoutableTransaction, StateEntry, StateProvision};
-use hyperscale_primitives::{Hash, NodeId};
+use hyperscale_types::{StateEntry, Hash, NodeId, RoutableTransaction, StateProvision};
 
 /// Trait for transaction execution backends.
 ///
@@ -67,6 +66,7 @@ pub trait ExecutionBackend: Clone + Send + Sync + 'static {
     /// Fetch state entries for the given nodes.
     ///
     /// Used by provisioning to collect state for remote shards.
+    /// Returns `StateEntry` with pre-computed storage keys for efficient cross-shard execution.
     fn fetch_state_entries(&self, nodes: &[NodeId]) -> Vec<StateEntry>;
 
     /// Compute merkle root from state writes.

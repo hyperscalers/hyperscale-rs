@@ -88,6 +88,13 @@ pub enum Event {
     /// Received a state certificate for cross-shard execution.
     StateCertificateReceived { cert: StateCertificate },
 
+    /// Received a finalized transaction certificate via gossip.
+    ///
+    /// This is gossiped to same-shard peers so they can persist the certificate
+    /// before the proposer includes it in a block. This ensures the certificate
+    /// is available for fetch requests when other validators receive the block header.
+    TransactionCertificateReceived { certificate: TransactionCertificate },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Network Messages - Mempool (priority: Network)
     // ═══════════════════════════════════════════════════════════════════════
@@ -167,27 +174,21 @@ pub enum Event {
         valid: bool,
     },
 
-    /// State provision signature verification completed.
+    /// Batch provision verification and aggregation completed.
     ///
-    /// Callback from `Action::VerifyProvisionSignature`.
-    ProvisionSignatureVerified {
-        /// The provision that was verified.
-        provision: StateProvision,
-        /// Whether the signature is valid.
-        valid: bool,
-    },
-
-    /// Commitment proof aggregation completed.
-    ///
-    /// Callback from `Action::AggregateCommitmentProof`.
-    /// Contains the aggregated BLS signature proving quorum commitment.
-    CommitmentProofAggregated {
+    /// Callback from `Action::VerifyAndAggregateProvisions`.
+    /// Contains only the provisions that passed signature verification,
+    /// plus the aggregated commitment proof (if we have enough valid signatures).
+    ProvisionsVerifiedAndAggregated {
         /// Transaction hash for correlation.
         tx_hash: Hash,
-        /// Source shard that reached quorum.
+        /// Source shard the provisions are from.
         source_shard: ShardGroupId,
-        /// The aggregated commitment proof.
-        commitment_proof: CommitmentProof,
+        /// Provisions that passed signature verification (may be fewer than input).
+        verified_provisions: Vec<StateProvision>,
+        /// Aggregated commitment proof from valid signatures, if quorum reached.
+        /// None if no valid signatures or aggregation failed.
+        commitment_proof: Option<CommitmentProof>,
     },
 
     /// State certificate aggregation completed.
@@ -230,6 +231,17 @@ pub enum Event {
         block_hash: Hash,
         /// Whether the aggregated signature is valid.
         valid: bool,
+    },
+
+    /// Quorum Certificate building completed.
+    ///
+    /// Callback from `Action::BuildQuorumCertificate`.
+    /// The QC is built by aggregating BLS signatures from collected votes.
+    QuorumCertificateBuilt {
+        /// Block hash the QC is for.
+        block_hash: Hash,
+        /// The built QC, or None if aggregation failed.
+        qc: Option<QuorumCertificate>,
     },
 
     /// Single-shard transaction execution completed.
@@ -589,6 +601,33 @@ pub enum Event {
         /// Hash of the block whose certificates failed to fetch.
         block_hash: Hash,
     },
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Gossiped Certificate Verification (priority: Internal)
+    // Runner verifies gossiped TransactionCertificates before persisting.
+    // ═══════════════════════════════════════════════════════════════════════
+    /// A shard's signature in a gossiped certificate has been verified (priority: Internal).
+    ///
+    /// Internal callback from the crypto pool. When all shards are verified,
+    /// runner emits GossipedCertificateVerified.
+    GossipedCertificateSignatureVerified {
+        /// Transaction hash identifying the certificate.
+        tx_hash: Hash,
+        /// Shard whose StateCertificate was verified.
+        shard: ShardGroupId,
+        /// Whether the aggregated signature is valid.
+        valid: bool,
+    },
+
+    /// A gossiped TransactionCertificate has been fully verified (priority: Internal).
+    ///
+    /// Emitted by the runner after verifying all embedded StateCertificate
+    /// signatures. The certificate has been persisted to storage; state machine
+    /// should cancel local certificate building and add to finalized certificates.
+    GossipedCertificateVerified {
+        /// The verified certificate.
+        certificate: TransactionCertificate,
+    },
 }
 
 impl Event {
@@ -605,11 +644,11 @@ impl Event {
             | Event::TransactionExecuted { .. }
             | Event::TransactionStatusChanged { .. }
             | Event::VoteSignatureVerified { .. }
-            | Event::ProvisionSignatureVerified { .. }
-            | Event::CommitmentProofAggregated { .. }
+            | Event::ProvisionsVerifiedAndAggregated { .. }
             | Event::StateVoteSignatureVerified { .. }
             | Event::StateCertificateSignatureVerified { .. }
             | Event::QcSignatureVerified { .. }
+            | Event::QuorumCertificateBuilt { .. }
             | Event::TransactionsExecuted { .. }
             | Event::SpeculativeExecutionComplete { .. }
             | Event::CrossShardTransactionsExecuted { .. }
@@ -671,6 +710,13 @@ impl Event {
 
             // BLS aggregation callbacks
             Event::StateCertificateAggregated { .. } => EventPriority::Internal,
+
+            // Transaction certificate gossip
+            Event::TransactionCertificateReceived { .. } => EventPriority::Network,
+
+            // Gossiped certificate verification callbacks
+            Event::GossipedCertificateSignatureVerified { .. } => EventPriority::Internal,
+            Event::GossipedCertificateVerified { .. } => EventPriority::Internal,
         }
     }
 
@@ -704,6 +750,7 @@ impl Event {
             Event::StateProvisionReceived { .. } => "StateProvisionReceived",
             Event::StateVoteReceived { .. } => "StateVoteReceived",
             Event::StateCertificateReceived { .. } => "StateCertificateReceived",
+            Event::TransactionCertificateReceived { .. } => "TransactionCertificateReceived",
 
             // Network - Mempool
             Event::TransactionGossipReceived { .. } => "TransactionGossipReceived",
@@ -717,11 +764,11 @@ impl Event {
 
             // Async Callbacks - Crypto Verification
             Event::VoteSignatureVerified { .. } => "VoteSignatureVerified",
-            Event::ProvisionSignatureVerified { .. } => "ProvisionSignatureVerified",
-            Event::CommitmentProofAggregated { .. } => "CommitmentProofAggregated",
+            Event::ProvisionsVerifiedAndAggregated { .. } => "ProvisionsVerifiedAndAggregated",
             Event::StateVoteSignatureVerified { .. } => "StateVoteSignatureVerified",
             Event::StateCertificateSignatureVerified { .. } => "StateCertificateSignatureVerified",
             Event::QcSignatureVerified { .. } => "QcSignatureVerified",
+            Event::QuorumCertificateBuilt { .. } => "QuorumCertificateBuilt",
 
             // Async Callbacks - Execution
             Event::TransactionsExecuted { .. } => "TransactionsExecuted",
@@ -774,6 +821,12 @@ impl Event {
 
             // BLS aggregation callbacks
             Event::StateCertificateAggregated { .. } => "StateCertificateAggregated",
+
+            // Gossiped certificate verification
+            Event::GossipedCertificateSignatureVerified { .. } => {
+                "GossipedCertificateSignatureVerified"
+            }
+            Event::GossipedCertificateVerified { .. } => "GossipedCertificateVerified",
         }
     }
 }

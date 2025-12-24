@@ -230,7 +230,7 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m]))) + (sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m]))) or vector(0)) / 2",
+          "expr": "sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m])) + (sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m])) or vector(0))",
           "refId": "A"
         }
       ],
@@ -757,20 +757,20 @@
       "targets": [
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m])))",
+          "expr": "sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m]))",
           "legendFormat": "Single-shard",
           "refId": "A"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "(sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m]))) or vector(0)) / 2",
-          "legendFormat": "Cross-shard (unique)",
+          "expr": "(sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m])) or vector(0))",
+          "legendFormat": "Cross-shard",
           "refId": "B"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
-          "expr": "sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m]))) + (sum(avg by (shard) (rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m]))) or vector(0)) / 2",
-          "legendFormat": "Total (unique)",
+          "expr": "sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"false\"}[1m])) + (sum(rate(hyperscale_transaction_latency_seconds_count{cross_shard=\"true\"}[1m])) or vector(0))",
+          "legendFormat": "Total",
           "refId": "C"
         }
       ],
@@ -1436,8 +1436,333 @@
       "type": "timeseries"
     },
     {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Failed to send fetch result events to BFT. This is CRITICAL - data was fetched but BFT won't receive it, causing stuck blocks.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 70 },
+      "id": 53,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (event_type) (increase(hyperscale_fetch_event_send_failed_total[5m]))",
+          "legendFormat": "{{event_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Fetch Event Send Failures (CRITICAL)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Sync and fetch timeouts indicate network issues or slow peers. High timeout rates affect liveness.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 70 },
+      "id": 54,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(hyperscale_sync_response_errors_total{error_type=~\"timeout|backfill_timeout\"}[5m]))",
+          "legendFormat": "Sync Timeouts",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (kind) (rate(hyperscale_fetch_timeouts_total[5m]))",
+          "legendFormat": "Fetch Timeout ({{kind}})",
+          "refId": "B"
+        }
+      ],
+      "title": "Sync & Fetch Timeouts",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Stale fetch cleanups indicate fetches that took too long (>30s) and were abandoned. This can cause blocks to get stuck.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 70 },
+      "id": 55,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (kind) (increase(hyperscale_fetch_stale_cleanups_total[5m]))",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Stale Fetch Cleanups",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Pending response channels in the network layer. Should be low and stable. Growing values indicate a memory leak.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 78 },
+      "id": 56,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(hyperscale_libp2p_pending_response_channels)",
+          "legendFormat": "Pending Channels (cluster)",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "max(hyperscale_libp2p_pending_response_channels)",
+          "legendFormat": "Max (single validator)",
+          "refId": "B"
+        }
+      ],
+      "title": "Pending Response Channels",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "CRITICAL: Network event loop panics. Any value > 0 means the validator's networking is DOWN and requires restart.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 78 },
+      "id": 57,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      },
+      "pluginVersion": "10.1.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(hyperscale_libp2p_event_loop_panics_total)",
+          "refId": "A"
+        }
+      ],
+      "title": "Network Event Loop Panics (CRITICAL)",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Sync response errors by type. 'timeout' and 'backfill_timeout' are liveness-related. Others may indicate malicious peers.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "normal" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 78 },
+      "id": 58,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (error_type) (rate(hyperscale_sync_response_errors_total[5m]))",
+          "legendFormat": "{{error_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Sync Response Errors by Type",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Requests dropped due to rate limiting. Validators get 1000 req/sec, unknown peers get 10 req/sec. High validator rate limits may indicate the limits are too restrictive.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "ops"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "validator" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 86 },
+      "id": 59,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum by (peer_type) (rate(hyperscale_libp2p_requests_rate_limited_total[5m]))",
+          "legendFormat": "{{peer_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Rate Limited Requests",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 70 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 94 },
       "id": 110,
       "panels": [],
       "title": "Backpressure",
@@ -1464,7 +1789,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 71 },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 95 },
       "id": 111,
       "options": {
         "colorMode": "background",
@@ -1510,7 +1835,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 71 },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 95 },
       "id": 112,
       "options": {
         "colorMode": "value",
@@ -1552,7 +1877,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 71 },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 95 },
       "id": 113,
       "options": {
         "colorMode": "value",
@@ -1616,7 +1941,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 71 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 103 },
       "id": 114,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1676,7 +2001,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 75 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 99 },
       "id": 115,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1737,7 +2062,7 @@
           }
         ]
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 79 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 103 },
       "id": 116,
       "options": {
         "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1762,7 +2087,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 87 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 111 },
       "id": 106,
       "panels": [],
       "title": "Livelock & Errors",
@@ -1799,7 +2124,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 88 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 112 },
       "id": 60,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1853,7 +2178,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 88 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 112 },
       "id": 61,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1901,7 +2226,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 88 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 112 },
       "id": 62,
       "options": {
         "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1932,7 +2257,190 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 96 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 120 },
+      "id": 200,
+      "panels": [],
+      "title": "Cross-Shard Message Delivery",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Cross-shard message delivery failures and retries. CRITICAL: Messages dropped means cross-shard transactions may be stuck.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] },
+          "unit": "ops"
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*Dropped.*" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }
+            ]
+          }
+        ]
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 121 },
+      "id": 201,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(hyperscale_broadcast_failures_total[1m]))",
+          "legendFormat": "Broadcast Failures/sec",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(hyperscale_broadcast_retry_successes_total[1m]))",
+          "legendFormat": "Retry Successes/sec",
+          "refId": "B"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(hyperscale_broadcast_messages_dropped_total[1m]))",
+          "legendFormat": "Messages Dropped/sec (CRITICAL)",
+          "refId": "C"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(hyperscale_dispatch_failures_total[1m]))",
+          "legendFormat": "Dispatch Failures/sec",
+          "refId": "D"
+        }
+      ],
+      "title": "Message Delivery Failures",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Retry queue size and gossipsub publish failures",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 121 },
+      "id": 202,
+      "options": {
+        "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(hyperscale_broadcast_retry_queue_size)",
+          "legendFormat": "Retry Queue Size",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(hyperscale_gossipsub_publish_failures_total[1m])) by (topic_type)",
+          "legendFormat": "Gossipsub Failures ({{topic_type}})",
+          "refId": "B"
+        }
+      ],
+      "title": "Retry Queue & Gossipsub",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Early arrival buffer evictions due to size limits",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": { "legend": false, "tooltip": false, "viz": false },
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": { "type": "linear" },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": { "group": "A", "mode": "none" },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 121 },
+      "id": 203,
+      "options": {
+        "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "sum(rate(hyperscale_early_arrival_evictions_total[1m]))",
+          "legendFormat": "Early Arrival Evictions/sec",
+          "refId": "A"
+        }
+      ],
+      "title": "Early Arrival Buffer Evictions",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 130 },
       "id": 107,
       "panels": [],
       "title": "Event Loop",
@@ -1969,7 +2477,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 97 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 131 },
       "id": 70,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -1987,6 +2495,12 @@
           "expr": "avg(hyperscale_crypto_pool_queue_depth)",
           "legendFormat": "General Crypto Pool (avg/validator)",
           "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${datasource}" },
+          "expr": "avg(hyperscale_tx_validation_pool_queue_depth)",
+          "legendFormat": "TX Validation Pool (avg/validator)",
+          "refId": "D"
         },
         {
           "datasource": { "type": "prometheus", "uid": "${datasource}" },
@@ -2028,7 +2542,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 97 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 139 },
       "id": 71,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -2117,7 +2631,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 105 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 139 },
       "id": 120,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -2142,7 +2656,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 113 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 155 },
       "id": 109,
       "panels": [],
       "title": "Speculative Execution",
@@ -2167,7 +2681,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 114 },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 156 },
       "id": 130,
       "options": {
         "colorMode": "value",
@@ -2223,7 +2737,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 9, "x": 6, "y": 114 },
+      "gridPos": { "h": 8, "w": 9, "x": 6, "y": 156 },
       "id": 131,
       "options": {
         "legend": { "calcs": ["mean", "sum"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -2295,7 +2809,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 9, "x": 15, "y": 114 },
+      "gridPos": { "h": 8, "w": 9, "x": 15, "y": 156 },
       "id": 132,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -2361,7 +2875,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 106 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 139 },
       "id": 80,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },
@@ -2421,7 +2935,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 106 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 147 },
       "id": 81,
       "options": {
         "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true },

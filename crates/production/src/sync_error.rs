@@ -133,8 +133,7 @@ impl SyncResponseError {
     /// # Examples
     ///
     /// ```
-    /// use hyperscale_production::sync_error::SyncResponseError;
-    ///
+    /// # use hyperscale_production::SyncResponseError;
     /// // Malicious: peer sent invalid block
     /// let err = SyncResponseError::QcSignatureInvalid { height: 100 };
     /// assert!(err.is_malicious());

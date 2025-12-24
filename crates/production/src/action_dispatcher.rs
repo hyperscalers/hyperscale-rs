@@ -84,27 +84,12 @@ pub enum DispatchableAction {
     },
 }
 
-/// Configuration for the action dispatcher.
-#[derive(Debug, Clone)]
-pub struct ActionDispatcherConfig {
-    /// Channel capacity for dispatched actions.
-    /// Higher capacity allows more buffering but uses more memory.
-    pub channel_capacity: usize,
-}
-
-impl Default for ActionDispatcherConfig {
-    fn default() -> Self {
-        Self {
-            channel_capacity: 1024,
-        }
-    }
-}
-
 /// Handle for the action dispatcher task.
 #[allow(dead_code)]
 pub struct ActionDispatcherHandle {
     /// Sender for dispatching actions.
-    pub tx: mpsc::Sender<DispatchableAction>,
+    /// Unbounded to prevent dropping critical consensus messages under load.
+    pub tx: mpsc::UnboundedSender<DispatchableAction>,
     /// Join handle for the spawned task.
     join_handle: tokio::task::JoinHandle<()>,
 }
@@ -128,11 +113,13 @@ pub struct ActionDispatcherContext {
 /// This task handles fire-and-forget network I/O independently from
 /// the main event loop, preventing network latency from blocking
 /// consensus processing.
-pub fn spawn_action_dispatcher(
-    config: ActionDispatcherConfig,
-    context: ActionDispatcherContext,
-) -> ActionDispatcherHandle {
-    let (tx, rx) = mpsc::channel(config.channel_capacity);
+///
+/// Uses an unbounded channel to ensure critical consensus messages
+/// (state votes, certificates, provisions) are never dropped under load.
+/// The dispatcher task is fast (just forwards to network/batcher), so
+/// the queue naturally drains. Memory usage is bounded by production rate.
+pub fn spawn_action_dispatcher(context: ActionDispatcherContext) -> ActionDispatcherHandle {
+    let (tx, rx) = mpsc::unbounded_channel();
 
     let join_handle = tokio::spawn(async move {
         run_action_dispatcher(rx, context).await;
@@ -143,7 +130,7 @@ pub fn spawn_action_dispatcher(
 
 /// Run the action dispatcher event loop.
 async fn run_action_dispatcher(
-    mut rx: mpsc::Receiver<DispatchableAction>,
+    mut rx: mpsc::UnboundedReceiver<DispatchableAction>,
     context: ActionDispatcherContext,
 ) {
     info!("Action dispatcher task started");
@@ -228,14 +215,3 @@ impl std::fmt::Display for ActionDispatchError {
 }
 
 impl std::error::Error for ActionDispatchError {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_config_defaults() {
-        let config = ActionDispatcherConfig::default();
-        assert_eq!(config.channel_capacity, 1024);
-    }
-}

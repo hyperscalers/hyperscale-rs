@@ -22,14 +22,14 @@ const TRANSACTION_RETENTION_BLOCKS: u64 = 100;
 /// When at this limit, new transactions without provisions are delayed.
 /// Cross-shard TXs WITH provisions (committed on another shard) can still be proposed,
 /// ensuring we don't block transactions that other shards are waiting on.
-pub const DEFAULT_IN_FLIGHT_LIMIT: usize = 512;
+pub const DEFAULT_IN_FLIGHT_LIMIT: usize = 256;
 
 /// Default hard limit on transactions in-flight.
 ///
 /// This is an absolute cap on transactions holding state locks. When at this limit,
 /// NO new transactions are proposed (even cross-shard TXs with provisions). This prevents
 /// unbounded growth and controls execution/crypto verification pressure.
-pub const DEFAULT_IN_FLIGHT_HARD_LIMIT: usize = 1024;
+pub const DEFAULT_IN_FLIGHT_HARD_LIMIT: usize = 512;
 
 /// Mempool configuration.
 #[derive(Debug, Clone)]
@@ -94,6 +94,9 @@ struct PoolEntry {
     added_at: Duration,
     /// Whether this is a cross-shard transaction (cached at insertion time).
     cross_shard: bool,
+    /// Whether this transaction was submitted locally (via RPC) vs received via gossip/fetch.
+    /// Only locally-submitted transactions should contribute to latency metrics.
+    submitted_locally: bool,
 }
 
 /// Mempool state machine.
@@ -203,6 +206,7 @@ impl MempoolState {
                 status: TransactionStatus::Pending, // Already exists
                 added_at: entry.added_at,
                 cross_shard: entry.cross_shard,
+                submitted_locally: entry.submitted_locally,
             }];
         }
 
@@ -220,6 +224,7 @@ impl MempoolState {
                 status: TransactionStatus::Pending,
                 added_at: self.now,
                 cross_shard,
+                submitted_locally: true, // Submitted via RPC
             },
         );
         tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
@@ -231,6 +236,7 @@ impl MempoolState {
             status: TransactionStatus::Pending,
             added_at: self.now,
             cross_shard,
+            submitted_locally: true,
         }]
     }
 
@@ -258,6 +264,7 @@ impl MempoolState {
                 status: TransactionStatus::Pending,
                 added_at: self.now,
                 cross_shard,
+                submitted_locally: false, // Received via gossip
             },
         );
         tracing::debug!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
@@ -373,6 +380,7 @@ impl MempoolState {
                         status: TransactionStatus::Pending, // Will be updated by execution
                         added_at: self.now,
                         cross_shard,
+                        submitted_locally: false, // Fetched for block processing
                     },
                 );
                 tracing::debug!(
@@ -411,6 +419,7 @@ impl MempoolState {
                 if matches!(entry.status, TransactionStatus::Pending) {
                     let added_at = entry.added_at;
                     let cross_shard = entry.cross_shard;
+                    let submitted_locally = entry.submitted_locally;
                     entry.status = TransactionStatus::Committed(height);
                     // Add locks for committed transactions
                     self.add_locked_nodes(tx);
@@ -419,6 +428,7 @@ impl MempoolState {
                         status: TransactionStatus::Committed(height),
                         added_at,
                         cross_shard,
+                        submitted_locally,
                     });
                 }
             }
@@ -443,6 +453,7 @@ impl MempoolState {
             if let Some(entry) = self.pool.get(&abort.tx_hash) {
                 let added_at = entry.added_at;
                 let cross_shard = entry.cross_shard;
+                let submitted_locally = entry.submitted_locally;
                 let status = TransactionStatus::Aborted {
                     reason: abort.reason.clone(),
                 };
@@ -451,6 +462,7 @@ impl MempoolState {
                     status,
                     added_at,
                     cross_shard,
+                    submitted_locally,
                 });
                 // Evict from pool and tombstone - terminal state
                 self.evict_terminal(abort.tx_hash);
@@ -518,11 +530,18 @@ impl MempoolState {
                     "Transaction deferred due to livelock cycle"
                 );
                 let cross_shard = entry.cross_shard;
+                let was_holding_lock = entry.status.holds_state_lock();
+                let tx = Arc::clone(&entry.tx);
                 entry.status = new_status.clone();
 
+                // Release locks if the transaction was holding them.
+                // Blocked transactions don't hold locks (they've been deferred).
+                if was_holding_lock {
+                    self.remove_locked_nodes(&tx);
+                }
+
                 // Track for retry when winner completes
-                self.blocked_by
-                    .insert(tx_hash, (Arc::clone(&entry.tx), *winner_tx_hash));
+                self.blocked_by.insert(tx_hash, (tx, *winner_tx_hash));
 
                 // Maintain reverse index for O(1) lookup
                 self.blocked_losers_by_winner
@@ -530,11 +549,14 @@ impl MempoolState {
                     .or_default()
                     .push(tx_hash);
 
+                // Re-borrow entry after calling helper methods
+                let entry = self.pool.get(&tx_hash).unwrap();
                 return vec![Action::EmitTransactionStatus {
                     tx_hash,
                     status: new_status,
                     added_at: entry.added_at,
                     cross_shard,
+                    submitted_locally: entry.submitted_locally,
                 }];
             }
         } else {
@@ -576,11 +598,13 @@ impl MempoolState {
         if let Some(entry) = self.pool.get(&tx_hash) {
             let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
+            let submitted_locally = entry.submitted_locally;
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Completed(decision),
                 added_at,
                 cross_shard,
+                submitted_locally,
             });
             // Evict from pool and tombstone - terminal state
             self.evict_terminal(tx_hash);
@@ -614,11 +638,13 @@ impl MempoolState {
                 if let Some(entry) = self.pool.get(&loser_hash) {
                     let added_at = entry.added_at;
                     let cross_shard = entry.cross_shard;
+                    let submitted_locally = entry.submitted_locally;
                     actions.push(Action::EmitTransactionStatus {
                         tx_hash: loser_hash,
                         status: TransactionStatus::Retried { new_tx: retry_hash },
                         added_at,
                         cross_shard,
+                        submitted_locally,
                     });
                     // Evict from pool and tombstone - terminal state
                     self.evict_terminal(loser_hash);
@@ -635,6 +661,7 @@ impl MempoolState {
                             status: TransactionStatus::Pending,
                             added_at: self.now,
                             cross_shard,
+                            submitted_locally: false, // System-generated retry
                         },
                     );
 
@@ -644,6 +671,7 @@ impl MempoolState {
                         status: TransactionStatus::Pending,
                         added_at: self.now,
                         cross_shard,
+                        submitted_locally: false,
                     });
 
                     // Gossip the retry to relevant shards
@@ -699,11 +727,13 @@ impl MempoolState {
         if let Some(entry) = self.pool.get(&loser_hash) {
             let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
+            let submitted_locally = entry.submitted_locally;
             actions.push(Action::EmitTransactionStatus {
                 tx_hash: loser_hash,
                 status: TransactionStatus::Retried { new_tx: retry_hash },
                 added_at,
                 cross_shard,
+                submitted_locally,
             });
             // Evict from pool and tombstone - terminal state
             self.evict_terminal(loser_hash);
@@ -720,6 +750,7 @@ impl MempoolState {
                     status: TransactionStatus::Pending,
                     added_at: self.now,
                     cross_shard,
+                    submitted_locally: false, // System-generated retry
                 },
             );
 
@@ -729,6 +760,7 @@ impl MempoolState {
                 status: TransactionStatus::Pending,
                 added_at: self.now,
                 cross_shard,
+                submitted_locally: false,
             });
 
             // Gossip the retry to relevant shards
@@ -777,12 +809,14 @@ impl MempoolState {
             };
             let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
+            let submitted_locally = entry.submitted_locally;
             entry.status = TransactionStatus::Executed(decision);
             actions.push(Action::EmitTransactionStatus {
                 tx_hash,
                 status: TransactionStatus::Executed(decision),
                 added_at,
                 cross_shard,
+                submitted_locally,
             });
         }
 
@@ -817,11 +851,13 @@ impl MempoolState {
             if let Some(entry) = self.pool.get(&loser_hash) {
                 let added_at = entry.added_at;
                 let cross_shard = entry.cross_shard;
+                let submitted_locally = entry.submitted_locally;
                 actions.push(Action::EmitTransactionStatus {
                     tx_hash: loser_hash,
                     status: TransactionStatus::Retried { new_tx: retry_hash },
                     added_at,
                     cross_shard,
+                    submitted_locally,
                 });
                 // Evict from pool and tombstone - terminal state
                 self.evict_terminal(loser_hash);
@@ -838,6 +874,7 @@ impl MempoolState {
                         status: TransactionStatus::Pending,
                         added_at: self.now,
                         cross_shard,
+                        submitted_locally: false, // System-generated retry
                     },
                 );
 
@@ -847,6 +884,7 @@ impl MempoolState {
                     status: TransactionStatus::Pending,
                     added_at: self.now,
                     cross_shard,
+                    submitted_locally: false,
                 });
 
                 // Gossip the retry to relevant shards
@@ -864,6 +902,7 @@ impl MempoolState {
         if let Some(entry) = self.pool.get(tx_hash) {
             let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
+            let submitted_locally = entry.submitted_locally;
             // Evict from pool and tombstone - terminal state
             self.evict_terminal(*tx_hash);
             return vec![Action::EmitTransactionStatus {
@@ -871,6 +910,7 @@ impl MempoolState {
                 status: TransactionStatus::Completed(decision),
                 added_at,
                 cross_shard,
+                submitted_locally,
             }];
         }
         vec![]
@@ -920,12 +960,14 @@ impl MempoolState {
                 // Re-borrow entry after calling helper methods
                 let entry = self.pool.get_mut(tx_hash).unwrap();
                 let added_at = entry.added_at;
+                let submitted_locally = entry.submitted_locally;
                 entry.status = new_status.clone();
                 return vec![Action::EmitTransactionStatus {
                     tx_hash: *tx_hash,
                     status: new_status,
                     added_at,
                     cross_shard,
+                    submitted_locally,
                 }];
             }
 
@@ -977,39 +1019,79 @@ impl MempoolState {
 
     /// Get transactions ready for inclusion in a block with backpressure support.
     ///
-    /// Returns transactions in two groups:
-    /// 1. **First**: Cross-shard TXs with verified provisions (priority, bypass soft limit)
-    /// 2. **Second**: All other TXs (subject to backpressure limit)
+    /// Returns transactions in three priority groups:
+    /// 1. **Highest**: Retry transactions (must be included quickly to avoid stalls)
+    /// 2. **High**: Cross-shard TXs with verified provisions (other shards waiting on us)
+    /// 3. **Normal**: All other TXs (subject to backpressure limit)
     ///
     /// Within each group, transactions are sorted by hash (ascending) for determinism.
     ///
     /// Backpressure rules:
+    /// - Retry TXs bypass soft limit (critical path - deferred TX needs fast retry)
     /// - Cross-shard TXs WITH verified provisions bypass soft limit (other shards waiting on us)
     /// - All other TXs (single-shard and cross-shard without provisions) subject to soft limit
-    /// - At hard limit, NO transactions proposed (even those with provisions)
+    /// - At hard limit, NO transactions proposed (even retries or those with provisions)
     ///
     /// The backpressure limit is based on how many transactions are currently holding
     /// state locks (Committed or Executed status). This controls execution and crypto
     /// verification pressure across the system.
     ///
-    /// This ensures transactions already committed on other shards get priority and
-    /// are never blocked (until hard limit), while preventing unbounded growth.
+    /// Retry priority is critical: when a transaction is deferred due to livelock, a retry
+    /// is created with a new hash. The retry must be included quickly so it can complete
+    /// before hitting more conflicts. Without this priority, retries would compete with
+    /// new transactions and potentially stall indefinitely.
     pub fn ready_transactions(
         &self,
         max_count: usize,
         provisions: &ProvisionCoordinator,
     ) -> Vec<Arc<RoutableTransaction>> {
-        let at_soft_limit = self.at_in_flight_limit();
-        let at_hard_limit = self.at_in_flight_hard_limit();
+        self.ready_transactions_with_pending_commits(max_count, provisions, 0, 0)
+    }
+
+    /// Get ready transactions, accounting for pending commits and completions.
+    ///
+    /// Similar to `ready_transactions`, but adjusts the in-flight count for pending
+    /// block commits. This prevents the race condition where transactions are selected
+    /// BEFORE a block commit is processed, causing the in-flight limit to be bypassed.
+    ///
+    /// Parameters:
+    /// - `pending_commit_tx_count`: Transactions about to be committed (INCREASES in-flight)
+    /// - `pending_commit_cert_count`: Certificates about to be committed (DECREASES in-flight)
+    ///
+    /// The effective in-flight is: current + pending_txs - pending_certs
+    pub fn ready_transactions_with_pending_commits(
+        &self,
+        max_count: usize,
+        provisions: &ProvisionCoordinator,
+        pending_commit_tx_count: usize,
+        pending_commit_cert_count: usize,
+    ) -> Vec<Arc<RoutableTransaction>> {
+        // Certificates reduce in-flight (transactions complete), txs increase it
+        let effective_in_flight = self
+            .in_flight()
+            .saturating_add(pending_commit_tx_count)
+            .saturating_sub(pending_commit_cert_count);
+        let at_soft_limit = effective_in_flight >= self.config.max_in_flight;
+        let at_hard_limit = effective_in_flight >= self.config.max_in_flight_hard_limit;
 
         // At hard limit: no TXs at all
         if at_hard_limit {
             return vec![];
         }
 
-        // Single pass through pool, partitioning into priority and others.
-        // Priority: cross-shard TXs with verified provisions (bypass soft limit)
-        // Others: everything else (subject to soft limit)
+        // Cap max_count to stay within hard limit
+        // We can add at most (hard_limit - effective_in_flight) transactions
+        let room_to_hard_limit = self
+            .config
+            .max_in_flight_hard_limit
+            .saturating_sub(effective_in_flight);
+        let max_count = max_count.min(room_to_hard_limit);
+
+        // Single pass through pool, partitioning into three priority tiers.
+        // Tier 1 (highest): Retry transactions (bypass soft limit, critical for livelock recovery)
+        // Tier 2: Cross-shard TXs with verified provisions (bypass soft limit)
+        // Tier 3: Everything else (subject to soft limit)
+        let mut retries = Vec::new();
         let mut with_provisions = Vec::new();
         let mut others = Vec::new();
 
@@ -1022,24 +1104,41 @@ impl MempoolState {
                 continue;
             }
 
-            // Check if this is a priority TX (cross-shard with provisions)
-            let is_priority =
+            // Tier 1: Retry transactions get highest priority
+            if entry.tx.is_retry() {
+                retries.push(Arc::clone(&entry.tx));
+                continue;
+            }
+
+            // Tier 2: Cross-shard TXs with verified provisions
+            let has_provisions =
                 entry.cross_shard && provisions.has_any_verified_provisions(&entry.tx.hash());
 
-            if is_priority {
+            if has_provisions {
                 with_provisions.push(Arc::clone(&entry.tx));
             } else if !at_soft_limit {
-                // Only collect non-priority TXs if not at soft limit
+                // Tier 3: Only collect normal TXs if not at soft limit
                 others.push(Arc::clone(&entry.tx));
             }
         }
 
-        // Combine: priority TXs first, then others, respecting max_count
-        // Both groups are already in hash order (BTreeMap iteration)
-        let remaining = max_count.saturating_sub(with_provisions.len());
-        with_provisions.extend(others.into_iter().take(remaining));
+        // Combine tiers: retries first, then provisions, then others
+        // All groups are already in hash order (BTreeMap iteration)
+        // Tiers 1 and 2 bypass soft limit but must still respect hard limit (max_count)
+        let mut result = Vec::with_capacity(max_count);
 
-        with_provisions
+        // Add retries (highest priority)
+        result.extend(retries.into_iter().take(max_count));
+
+        // Add provisions if room remains
+        let remaining = max_count.saturating_sub(result.len());
+        result.extend(with_provisions.into_iter().take(remaining));
+
+        // Add others if room remains
+        let remaining = max_count.saturating_sub(result.len());
+        result.extend(others.into_iter().take(remaining));
+
+        result
     }
 
     /// Get lock contention statistics.
@@ -1116,6 +1215,11 @@ impl MempoolState {
     /// with provisions. This prevents unbounded growth and controls system pressure.
     pub fn at_in_flight_hard_limit(&self) -> bool {
         self.in_flight() >= self.config.max_in_flight_hard_limit
+    }
+
+    /// Get the mempool configuration.
+    pub fn config(&self) -> &MempoolConfig {
+        &self.config
     }
 
     /// Check if we have a transaction.
@@ -2373,5 +2477,90 @@ mod tests {
             TransactionStatus::Completed(TransactionDecision::Accept),
         );
         assert_eq!(mempool.in_flight(), 0, "All completed");
+    }
+
+    #[test]
+    fn test_retry_transactions_have_highest_priority() {
+        let topology = make_cross_shard_topology();
+        // Use a low limit for testing
+        let config = make_mempool_config_with_limit(2);
+        let mut mempool = MempoolState::with_config(Arc::clone(&topology), config);
+        let coordinator = make_provision_coordinator(Arc::clone(&topology));
+
+        // Put mempool at the backpressure limit
+        put_mempool_at_limit(&mut mempool, topology.as_ref());
+
+        // Add a normal single-shard transaction (use seed that won't conflict with limit TXs)
+        let normal_tx = test_transaction(1);
+        mempool.on_submit_transaction(normal_tx.clone());
+
+        // Create a retry transaction (simulating a deferred TX that was retried)
+        // Use seed 200 to avoid conflicting with the limit TXs (seeds 100, 101)
+        let original_tx = test_transaction(200);
+        let retry_tx = original_tx.create_retry(Hash::from_bytes(b"winner"), BlockHeight(5));
+        let retry_hash = retry_tx.hash();
+        mempool.on_submit_transaction(retry_tx.clone());
+
+        // At soft limit: normal TXs should be rejected, but retries should be allowed
+        let ready = mempool.ready_transactions(10, &coordinator);
+
+        // Should contain ONLY the retry (normal TX blocked by backpressure)
+        assert_eq!(
+            ready.len(),
+            1,
+            "Only retry should be returned at soft limit"
+        );
+        assert_eq!(
+            ready[0].hash(),
+            retry_hash,
+            "Retry transaction should have priority over normal transactions"
+        );
+        assert!(
+            ready[0].is_retry(),
+            "The returned transaction should be a retry"
+        );
+    }
+
+    #[test]
+    fn test_retry_priority_ordering() {
+        let topology = make_cross_shard_topology();
+        let mut mempool = MempoolState::new(Arc::clone(&topology));
+        let coordinator = make_provision_coordinator(Arc::clone(&topology));
+
+        // Add transactions in mixed order: normal, retry, normal
+        let normal1 = test_transaction(1);
+        let normal2 = test_transaction(2);
+        let original = test_transaction(100);
+        let retry = original.create_retry(Hash::from_bytes(b"winner"), BlockHeight(5));
+
+        mempool.on_submit_transaction(normal1.clone());
+        mempool.on_submit_transaction(retry.clone());
+        mempool.on_submit_transaction(normal2.clone());
+
+        // Request transactions - retry should come first regardless of insertion order
+        let ready = mempool.ready_transactions(10, &coordinator);
+
+        assert_eq!(ready.len(), 3, "All transactions should be returned");
+
+        // First transaction should be the retry
+        assert!(
+            ready[0].is_retry(),
+            "Retry transaction should be first in the list"
+        );
+        assert_eq!(
+            ready[0].hash(),
+            retry.hash(),
+            "First transaction should be the retry"
+        );
+
+        // Remaining transactions should be normal ones (in hash order)
+        assert!(
+            !ready[1].is_retry(),
+            "Second transaction should not be a retry"
+        );
+        assert!(
+            !ready[2].is_retry(),
+            "Third transaction should not be a retry"
+        );
     }
 }

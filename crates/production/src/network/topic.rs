@@ -213,6 +213,14 @@ impl Topic {
         Self::shard("transaction.gossip", shard)
     }
 
+    /// Topic for transaction certificate gossip (finalized certificates).
+    ///
+    /// When a TransactionCertificate is finalized, it is gossiped to same-shard
+    /// peers so they have it before the proposer includes it in a block.
+    pub fn transaction_certificate(shard: ShardGroupId) -> Self {
+        Self::shard("transaction.certificate", shard)
+    }
+
     /// Topic for state provision batch gossip.
     pub fn state_provision_batch(shard: ShardGroupId) -> Self {
         Self::shard("state.provision.batch", shard)
