@@ -1,10 +1,9 @@
 //! Mempool state.
 
 use hyperscale_core::{Action, Event, OutboundMessage, SubStateMachine, TransactionStatus};
-use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_types::{
-    AbortReason, Block, BlockHeight, DeferReason, Hash, NodeId, RoutableTransaction, Topology,
-    TransactionAbort, TransactionDecision,
+    AbortReason, Block, BlockHeight, DeferReason, Hash, NodeId, ReadyTransactions,
+    RoutableTransaction, Topology, TransactionAbort, TransactionDecision,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -99,11 +98,34 @@ struct PoolEntry {
     submitted_locally: bool,
 }
 
+/// Entry in the ready set.
+///
+/// Contains cached information needed for ready_transactions() to avoid
+/// re-computing properties on each call.
+#[derive(Debug, Clone)]
+struct ReadyEntry {
+    tx: Arc<RoutableTransaction>,
+    /// Whether this transaction has verified provisions (for cross-shard priority).
+    has_provisions: bool,
+}
+
 /// Mempool state machine.
 ///
 /// Handles transaction lifecycle from submission to completion.
 /// Uses `BTreeMap` for the pool to maintain hash ordering, which allows
 /// ready_transactions() to iterate in sorted order without sorting.
+///
+/// # Incremental Ready Sets
+///
+/// To avoid O(n) scans on every `ready_transactions()` call, we maintain
+/// three pre-computed ready sets that are updated incrementally:
+/// - `ready_retries`: Retry transactions (highest priority)
+/// - `ready_priority`: Cross-shard TXs with verified provisions
+/// - `ready_others`: All other ready transactions
+///
+/// Transactions are added to these sets when they become ready (Pending status,
+/// no conflicts with locked nodes) and removed when they are no longer ready
+/// (status changes, conflicts arise, or evicted).
 pub struct MempoolState {
     /// Transaction pool sorted by hash (BTreeMap for ordered iteration).
     pool: BTreeMap<Hash, PoolEntry>,
@@ -156,6 +178,39 @@ pub struct MempoolState {
     /// Note: Only one transaction can lock a node at a time (enforced by ready_transactions filtering).
     locked_nodes_cache: HashSet<NodeId>,
 
+    // ========== Incremental Ready Sets ==========
+    //
+    // These sets are maintained incrementally to provide O(1) ready_transactions().
+    // Invariants:
+    // 1. A transaction is in exactly one of: ready_retries, ready_priority, ready_others,
+    //    blocked_by_nodes, or none (if not Pending or not in pool).
+    // 2. ready_* sets contain only Pending transactions with no locked node conflicts.
+    // 3. blocked_by_nodes contains Pending transactions blocked by locked nodes.
+    /// Ready retry transactions (highest priority, bypass soft limit).
+    /// BTreeMap maintains hash order for deterministic iteration.
+    ready_retries: BTreeMap<Hash, ReadyEntry>,
+
+    /// Ready cross-shard transactions with verified provisions (high priority, bypass soft limit).
+    /// BTreeMap maintains hash order for deterministic iteration.
+    ready_priority: BTreeMap<Hash, ReadyEntry>,
+
+    /// Ready normal transactions (subject to soft limit).
+    /// BTreeMap maintains hash order for deterministic iteration.
+    ready_others: BTreeMap<Hash, ReadyEntry>,
+
+    /// Pending transactions blocked by locked nodes.
+    /// Maps tx_hash -> set of blocking node IDs.
+    /// When all blocking nodes are released, tx is promoted to a ready set.
+    blocked_by_nodes: HashMap<Hash, HashSet<NodeId>>,
+
+    /// Reverse index: node_id -> set of tx_hashes blocked by that node.
+    /// Enables efficient promotion when a node is unlocked.
+    txs_blocked_by_node: HashMap<NodeId, HashSet<Hash>>,
+
+    /// Reverse index: node_id -> set of tx_hashes in ready sets that declare that node.
+    /// Enables O(1) blocking when a node becomes locked.
+    ready_txs_by_node: HashMap<NodeId, HashSet<Hash>>,
+
     /// Current time.
     now: Duration,
 
@@ -187,6 +242,12 @@ impl MempoolState {
             tombstones: HashMap::new(),
             recently_evicted: HashMap::new(),
             locked_nodes_cache: HashSet::new(),
+            ready_retries: BTreeMap::new(),
+            ready_priority: BTreeMap::new(),
+            ready_others: BTreeMap::new(),
+            blocked_by_nodes: HashMap::new(),
+            txs_blocked_by_node: HashMap::new(),
+            ready_txs_by_node: HashMap::new(),
             now: Duration::ZERO,
             topology,
             current_height: BlockHeight(0),
@@ -227,6 +288,10 @@ impl MempoolState {
                 submitted_locally: true, // Submitted via RPC
             },
         );
+
+        // Add to ready tracking
+        self.add_to_ready_tracking(hash, &tx, cross_shard);
+
         tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
 
         // Note: Broadcasting is handled by NodeStateMachine which broadcasts to all
@@ -260,13 +325,17 @@ impl MempoolState {
         self.pool.insert(
             hash,
             PoolEntry {
-                tx,
+                tx: Arc::clone(&tx),
                 status: TransactionStatus::Pending,
                 added_at: self.now,
                 cross_shard,
                 submitted_locally: false, // Received via gossip
             },
         );
+
+        // Add to ready tracking
+        self.add_to_ready_tracking(hash, &tx, cross_shard);
+
         tracing::debug!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
 
         // Note: We don't emit TransactionAccepted as an event - it was purely informational
@@ -321,6 +390,9 @@ impl MempoolState {
             self.remove_locked_nodes(&tx);
         }
 
+        // Remove from ready tracking
+        self.remove_from_ready_tracking(&tx_hash);
+
         // Move transaction to recently_evicted cache instead of discarding
         if let Some(entry) = self.pool.remove(&tx_hash) {
             self.recently_evicted
@@ -353,7 +425,7 @@ impl MempoolState {
     /// 4. Process aborts → update status to terminal
     #[instrument(skip(self, block), fields(
         height = block.header.height.0,
-        tx_count = block.transactions.len()
+        tx_count = block.transaction_count()
     ))]
     pub fn on_block_committed_full(&mut self, block: &Block) -> Vec<Action> {
         let height = block.header.height;
@@ -369,7 +441,7 @@ impl MempoolState {
         // This handles the case where we fetched transactions to vote on a block
         // but didn't receive them via gossip. We need them in the mempool for
         // status tracking (deferrals, retries, execution status updates).
-        for tx in &block.transactions {
+        for tx in block.all_transactions() {
             let hash = tx.hash();
             if !self.pool.contains_key(&hash) {
                 let cross_shard = tx.is_cross_shard(self.topology.num_shards());
@@ -412,7 +484,7 @@ impl MempoolState {
         // re-proposed before the status update is processed. The execution state machine
         // also emits TransactionStatusChanged events, but those go through an async channel
         // that may not be processed before the next proposal.
-        for tx in &block.transactions {
+        for tx in block.all_transactions() {
             let hash = tx.hash();
             if let Some(entry) = self.pool.get_mut(&hash) {
                 // Only update if still Pending (avoid overwriting later states during sync)
@@ -421,6 +493,8 @@ impl MempoolState {
                     let cross_shard = entry.cross_shard;
                     let submitted_locally = entry.submitted_locally;
                     entry.status = TransactionStatus::Committed(height);
+                    // Remove from ready tracking (no longer Pending)
+                    self.remove_from_ready_tracking(&hash);
                     // Add locks for committed transactions
                     self.add_locked_nodes(tx);
                     actions.push(Action::EmitTransactionStatus {
@@ -449,6 +523,7 @@ impl MempoolState {
         }
 
         // 4. Process aborts - mark as aborted with reason and evict
+        //    Also abort any transactions that were blocked by the aborted winner.
         for abort in &block.aborted {
             if let Some(entry) = self.pool.get(&abort.tx_hash) {
                 let added_at = entry.added_at;
@@ -467,6 +542,11 @@ impl MempoolState {
                 // Evict from pool and tombstone - terminal state
                 self.evict_terminal(abort.tx_hash);
             }
+
+            // Also abort any losers that were blocked by this winner.
+            // If the winner was aborted (e.g., timeout), the losers can never complete
+            // because they were waiting for the winner to finish.
+            actions.extend(self.on_winner_aborted(abort.tx_hash, height));
         }
 
         actions
@@ -533,6 +613,9 @@ impl MempoolState {
                 let was_holding_lock = entry.status.holds_state_lock();
                 let tx = Arc::clone(&entry.tx);
                 entry.status = new_status.clone();
+
+                // Remove from ready tracking (no longer Pending)
+                self.remove_from_ready_tracking(&tx_hash);
 
                 // Release locks if the transaction was holding them.
                 // Blocked transactions don't hold locks (they've been deferred).
@@ -665,6 +748,9 @@ impl MempoolState {
                         },
                     );
 
+                    // Add to ready tracking
+                    self.add_to_ready_tracking(retry_hash, &retry_tx, cross_shard);
+
                     // Emit status for retry transaction
                     actions.push(Action::EmitTransactionStatus {
                         tx_hash: retry_hash,
@@ -691,6 +777,87 @@ impl MempoolState {
                 );
                 self.pending_retries
                     .insert(loser_hash, (winner_hash, height));
+            }
+        }
+
+        actions
+    }
+
+    /// Handle winner transaction abort.
+    ///
+    /// When a winner transaction is aborted (e.g., due to timeout), any loser
+    /// transactions that were blocked by it should also be aborted. The losers
+    /// cannot complete without their winner completing first, so they must be
+    /// retried from scratch.
+    fn on_winner_aborted(&mut self, winner_hash: Hash, height: BlockHeight) -> Vec<Action> {
+        let mut actions = Vec::new();
+
+        // Get all losers blocked by this winner using reverse index
+        let loser_hashes = self
+            .blocked_losers_by_winner
+            .remove(&winner_hash)
+            .unwrap_or_default();
+
+        for loser_hash in loser_hashes {
+            // Get the loser from blocked_by and create a retry
+            if let Some((loser_tx, _winner)) = self.blocked_by.remove(&loser_hash) {
+                // Create retry transaction for the blocked loser
+                let retry_tx = loser_tx.create_retry(winner_hash, height);
+                let retry_hash = retry_tx.hash();
+
+                tracing::info!(
+                    loser = %loser_hash,
+                    winner = %winner_hash,
+                    retry = %retry_hash,
+                    "Winner aborted - creating retry for blocked loser"
+                );
+
+                // Emit status update for loser -> Retried
+                if let Some(entry) = self.pool.get(&loser_hash) {
+                    let added_at = entry.added_at;
+                    let cross_shard = entry.cross_shard;
+                    let submitted_locally = entry.submitted_locally;
+                    actions.push(Action::EmitTransactionStatus {
+                        tx_hash: loser_hash,
+                        status: TransactionStatus::Retried { new_tx: retry_hash },
+                        added_at,
+                        cross_shard,
+                        submitted_locally,
+                    });
+                    // Evict loser - it's been replaced by retry
+                    self.evict_terminal(loser_hash);
+                }
+
+                // Add retry to mempool if not already present
+                if !self.pool.contains_key(&retry_hash) && !self.is_tombstoned(&retry_hash) {
+                    let retry_tx = Arc::new(retry_tx);
+                    let cross_shard = retry_tx.is_cross_shard(self.topology.num_shards());
+                    self.pool.insert(
+                        retry_hash,
+                        PoolEntry {
+                            tx: Arc::clone(&retry_tx),
+                            status: TransactionStatus::Pending,
+                            added_at: self.now,
+                            cross_shard,
+                            submitted_locally: false,
+                        },
+                    );
+
+                    // Add to ready tracking
+                    self.add_to_ready_tracking(retry_hash, &retry_tx, cross_shard);
+
+                    // Emit status for retry
+                    actions.push(Action::EmitTransactionStatus {
+                        tx_hash: retry_hash,
+                        status: TransactionStatus::Pending,
+                        added_at: self.now,
+                        cross_shard,
+                        submitted_locally: false,
+                    });
+
+                    // Gossip the retry
+                    actions.extend(self.broadcast_to_transaction_shards(&retry_tx));
+                }
             }
         }
 
@@ -753,6 +920,9 @@ impl MempoolState {
                     submitted_locally: false, // System-generated retry
                 },
             );
+
+            // Add to ready tracking
+            self.add_to_ready_tracking(retry_hash, &retry_tx, cross_shard);
 
             // Emit status for retry transaction
             actions.push(Action::EmitTransactionStatus {
@@ -878,6 +1048,9 @@ impl MempoolState {
                     },
                 );
 
+                // Add to ready tracking
+                self.add_to_ready_tracking(retry_hash, &retry_tx, cross_shard);
+
                 // Emit status for retry transaction
                 actions.push(Action::EmitTransactionStatus {
                     tx_hash: retry_hash,
@@ -996,25 +1169,222 @@ impl MempoolState {
 
     /// Add a transaction's nodes to the locked set.
     /// Called when a transaction transitions TO a lock-holding state (Committed/Executed).
+    ///
+    /// Also blocks any ready transactions that conflict with the newly locked nodes.
     fn add_locked_nodes(&mut self, tx: &RoutableTransaction) {
         for node in tx.all_declared_nodes() {
-            self.locked_nodes_cache.insert(*node);
+            let is_new = self.locked_nodes_cache.insert(*node);
+            if is_new {
+                // Block any ready transactions that conflict with this newly locked node
+                self.block_transactions_for_node(*node);
+            }
         }
     }
 
     /// Remove a transaction's nodes from the locked set.
     /// Called when a transaction transitions FROM a lock-holding state (evicted).
+    ///
+    /// Also promotes any blocked transactions that were waiting on these nodes.
     fn remove_locked_nodes(&mut self, tx: &RoutableTransaction) {
         for node in tx.all_declared_nodes() {
-            self.locked_nodes_cache.remove(node);
+            if self.locked_nodes_cache.remove(node) {
+                // Promote any blocked transactions that were waiting on this node
+                self.promote_transactions_for_node(*node);
+            }
         }
     }
 
-    /// Check if a transaction conflicts with any locked nodes.
-    /// Uses the cached locked_nodes_cache for O(k) lookup where k = nodes in tx.
-    fn conflicts_with_locked(&self, tx: &RoutableTransaction) -> bool {
-        tx.all_declared_nodes()
-            .any(|node| self.locked_nodes_cache.contains(node))
+    // ========== Incremental Ready Set Operations ==========
+
+    /// Add a transaction to ready tracking when it becomes Pending.
+    ///
+    /// Determines if the transaction is blocked by locked nodes. If blocked,
+    /// adds to blocked_by_nodes. If ready, adds to the appropriate ready set.
+    fn add_to_ready_tracking(
+        &mut self,
+        hash: Hash,
+        tx: &Arc<RoutableTransaction>,
+        cross_shard: bool,
+    ) {
+        // Find all locked nodes that block this transaction
+        let blocking_nodes: HashSet<NodeId> = tx
+            .all_declared_nodes()
+            .filter(|node| self.locked_nodes_cache.contains(node))
+            .copied()
+            .collect();
+
+        if !blocking_nodes.is_empty() {
+            // Transaction is blocked by one or more locked nodes
+            for node in &blocking_nodes {
+                self.txs_blocked_by_node
+                    .entry(*node)
+                    .or_default()
+                    .insert(hash);
+            }
+            self.blocked_by_nodes.insert(hash, blocking_nodes);
+            return;
+        }
+
+        // Transaction is not blocked - add to appropriate ready set
+        self.add_to_ready_set(hash, tx, cross_shard);
+    }
+
+    /// Add a transaction to the appropriate ready set based on its properties.
+    ///
+    /// Precondition: transaction must not be blocked by any locked nodes.
+    fn add_to_ready_set(&mut self, hash: Hash, tx: &Arc<RoutableTransaction>, cross_shard: bool) {
+        let ready_entry = ReadyEntry {
+            tx: Arc::clone(tx),
+            has_provisions: false, // Updated by on_provision_verified
+        };
+
+        // Add to reverse index for O(1) blocking when nodes become locked
+        for node in tx.all_declared_nodes() {
+            self.ready_txs_by_node
+                .entry(*node)
+                .or_default()
+                .insert(hash);
+        }
+
+        if tx.is_retry() {
+            self.ready_retries.insert(hash, ready_entry);
+        } else if cross_shard {
+            // Cross-shard starts in others, promoted to priority when provisions verified
+            self.ready_others.insert(hash, ready_entry);
+        } else {
+            self.ready_others.insert(hash, ready_entry);
+        }
+    }
+
+    /// Remove a transaction from all ready tracking structures.
+    ///
+    /// Called when a transaction is no longer Pending (committed, evicted, etc.).
+    fn remove_from_ready_tracking(&mut self, hash: &Hash) {
+        // Remove from ready sets and clean reverse index
+        if let Some(entry) = self.ready_retries.remove(hash) {
+            self.remove_from_ready_txs_by_node(hash, &entry.tx);
+        } else if let Some(entry) = self.ready_priority.remove(hash) {
+            self.remove_from_ready_txs_by_node(hash, &entry.tx);
+        } else if let Some(entry) = self.ready_others.remove(hash) {
+            self.remove_from_ready_txs_by_node(hash, &entry.tx);
+        }
+
+        // Remove from blocked tracking
+        if let Some(blocking_nodes) = self.blocked_by_nodes.remove(hash) {
+            for node in blocking_nodes {
+                if let Some(blocked_txs) = self.txs_blocked_by_node.get_mut(&node) {
+                    blocked_txs.remove(hash);
+                    if blocked_txs.is_empty() {
+                        self.txs_blocked_by_node.remove(&node);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Helper to remove a transaction from the ready_txs_by_node reverse index.
+    fn remove_from_ready_txs_by_node(&mut self, hash: &Hash, tx: &RoutableTransaction) {
+        for node in tx.all_declared_nodes() {
+            if let Some(txs) = self.ready_txs_by_node.get_mut(node) {
+                txs.remove(hash);
+                if txs.is_empty() {
+                    self.ready_txs_by_node.remove(node);
+                }
+            }
+        }
+    }
+
+    /// Block ready transactions when a node becomes locked.
+    ///
+    /// Moves transactions from ready sets to blocked_by_nodes if they conflict
+    /// with the newly locked node.
+    ///
+    /// Uses the ready_txs_by_node reverse index for O(transactions_touching_node)
+    /// instead of O(total_ready_set_size).
+    fn block_transactions_for_node(&mut self, node: NodeId) {
+        // Get all ready transactions that touch this node via reverse index
+        let Some(tx_hashes) = self.ready_txs_by_node.remove(&node) else {
+            return; // No ready transactions touch this node
+        };
+
+        // Move each transaction from its ready set to blocked
+        for hash in tx_hashes {
+            // Try to remove from each ready set (transaction is in exactly one)
+            let removed_entry = self
+                .ready_retries
+                .remove(&hash)
+                .or_else(|| self.ready_priority.remove(&hash))
+                .or_else(|| self.ready_others.remove(&hash));
+
+            if let Some(entry) = removed_entry {
+                // Clean remaining nodes from ready_txs_by_node (except the one we already removed)
+                for other_node in entry.tx.all_declared_nodes() {
+                    if *other_node != node {
+                        if let Some(txs) = self.ready_txs_by_node.get_mut(other_node) {
+                            txs.remove(&hash);
+                            if txs.is_empty() {
+                                self.ready_txs_by_node.remove(other_node);
+                            }
+                        }
+                    }
+                }
+
+                // Add to blocked tracking
+                self.blocked_by_nodes.entry(hash).or_default().insert(node);
+                self.txs_blocked_by_node
+                    .entry(node)
+                    .or_default()
+                    .insert(hash);
+            }
+        }
+    }
+
+    /// Promote blocked transactions when a node becomes unlocked.
+    ///
+    /// Checks all transactions blocked by this node. If they are no longer
+    /// blocked by any locked nodes, promotes them to the appropriate ready set.
+    fn promote_transactions_for_node(&mut self, node: NodeId) {
+        // Get transactions blocked by this node
+        let Some(blocked_txs) = self.txs_blocked_by_node.remove(&node) else {
+            return;
+        };
+
+        // Collect transactions to promote (to avoid borrow checker issues)
+        let mut to_promote: Vec<(Hash, Arc<RoutableTransaction>, bool)> = Vec::new();
+
+        for tx_hash in blocked_txs {
+            if let Some(blocking_nodes) = self.blocked_by_nodes.get_mut(&tx_hash) {
+                // Remove this node from the blocking set
+                blocking_nodes.remove(&node);
+
+                // If no more blockers, collect for promotion
+                if blocking_nodes.is_empty() {
+                    self.blocked_by_nodes.remove(&tx_hash);
+
+                    // Get transaction info from pool
+                    if let Some(entry) = self.pool.get(&tx_hash) {
+                        if entry.status == TransactionStatus::Pending {
+                            to_promote.push((tx_hash, Arc::clone(&entry.tx), entry.cross_shard));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Now promote all collected transactions
+        for (hash, tx, cross_shard) in to_promote {
+            self.add_to_ready_set(hash, &tx, cross_shard);
+        }
+    }
+
+    /// Promote a cross-shard transaction from ready_others to ready_priority.
+    ///
+    /// Called when provisions are verified for a transaction.
+    pub fn on_provision_verified(&mut self, tx_hash: Hash) {
+        if let Some(mut entry) = self.ready_others.remove(&tx_hash) {
+            entry.has_provisions = true;
+            self.ready_priority.insert(tx_hash, entry);
+        }
     }
 
     /// Get transactions ready for inclusion in a block with backpressure support.
@@ -1040,32 +1410,27 @@ impl MempoolState {
     /// is created with a new hash. The retry must be included quickly so it can complete
     /// before hitting more conflicts. Without this priority, retries would compete with
     /// new transactions and potentially stall indefinitely.
-    pub fn ready_transactions(
-        &self,
-        max_count: usize,
-        provisions: &ProvisionCoordinator,
-    ) -> Vec<Arc<RoutableTransaction>> {
-        self.ready_transactions_with_pending_commits(max_count, provisions, 0, 0)
-    }
-
-    /// Get ready transactions, accounting for pending commits and completions.
     ///
-    /// Similar to `ready_transactions`, but adjusts the in-flight count for pending
-    /// block commits. This prevents the race condition where transactions are selected
-    /// BEFORE a block commit is processed, causing the in-flight limit to be bypassed.
+    /// Returns transactions organized by priority section, each sorted by hash.
+    /// This allows block building without reclassification, preserving sort order.
     ///
     /// Parameters:
+    /// - `max_count`: Maximum total transactions across all sections
     /// - `pending_commit_tx_count`: Transactions about to be committed (INCREASES in-flight)
     /// - `pending_commit_cert_count`: Certificates about to be committed (DECREASES in-flight)
     ///
     /// The effective in-flight is: current + pending_txs - pending_certs
-    pub fn ready_transactions_with_pending_commits(
+    ///
+    /// # Performance
+    ///
+    /// This method is O(min(ready_set_size, max_count)) instead of O(pool_size) because
+    /// it reads from pre-computed ready sets that are maintained incrementally.
+    pub fn ready_transactions(
         &self,
         max_count: usize,
-        provisions: &ProvisionCoordinator,
         pending_commit_tx_count: usize,
         pending_commit_cert_count: usize,
-    ) -> Vec<Arc<RoutableTransaction>> {
+    ) -> ReadyTransactions {
         // Certificates reduce in-flight (transactions complete), txs increase it
         let effective_in_flight = self
             .in_flight()
@@ -1076,7 +1441,7 @@ impl MempoolState {
 
         // At hard limit: no TXs at all
         if at_hard_limit {
-            return vec![];
+            return ReadyTransactions::default();
         }
 
         // Cap max_count to stay within hard limit
@@ -1087,56 +1452,38 @@ impl MempoolState {
             .saturating_sub(effective_in_flight);
         let max_count = max_count.min(room_to_hard_limit);
 
-        // Single pass through pool, partitioning into three priority tiers.
-        // Tier 1 (highest): Retry transactions (bypass soft limit, critical for livelock recovery)
-        // Tier 2: Cross-shard TXs with verified provisions (bypass soft limit)
-        // Tier 3: Everything else (subject to soft limit)
-        let mut retries = Vec::new();
-        let mut with_provisions = Vec::new();
-        let mut others = Vec::new();
+        let mut remaining = max_count;
+        let mut result = ReadyTransactions::default();
 
-        for entry in self.pool.values() {
-            // Skip non-pending or conflicting transactions
-            if entry.status != TransactionStatus::Pending {
-                continue;
+        // Tier 1: Retry transactions (highest priority, bypass soft limit)
+        // BTreeMap iteration is in hash order
+        for entry in self.ready_retries.values() {
+            if remaining == 0 {
+                break;
             }
-            if self.conflicts_with_locked(&entry.tx) {
-                continue;
-            }
-
-            // Tier 1: Retry transactions get highest priority
-            if entry.tx.is_retry() {
-                retries.push(Arc::clone(&entry.tx));
-                continue;
-            }
-
-            // Tier 2: Cross-shard TXs with verified provisions
-            let has_provisions =
-                entry.cross_shard && provisions.has_any_verified_provisions(&entry.tx.hash());
-
-            if has_provisions {
-                with_provisions.push(Arc::clone(&entry.tx));
-            } else if !at_soft_limit {
-                // Tier 3: Only collect normal TXs if not at soft limit
-                others.push(Arc::clone(&entry.tx));
-            }
+            result.retries.push(Arc::clone(&entry.tx));
+            remaining -= 1;
         }
 
-        // Combine tiers: retries first, then provisions, then others
-        // All groups are already in hash order (BTreeMap iteration)
-        // Tiers 1 and 2 bypass soft limit but must still respect hard limit (max_count)
-        let mut result = Vec::with_capacity(max_count);
+        // Tier 2: Priority transactions (cross-shard with provisions, bypass soft limit)
+        for entry in self.ready_priority.values() {
+            if remaining == 0 {
+                break;
+            }
+            result.priority.push(Arc::clone(&entry.tx));
+            remaining -= 1;
+        }
 
-        // Add retries (highest priority)
-        result.extend(retries.into_iter().take(max_count));
-
-        // Add provisions if room remains
-        let remaining = max_count.saturating_sub(result.len());
-        result.extend(with_provisions.into_iter().take(remaining));
-
-        // Add others if room remains
-        let remaining = max_count.saturating_sub(result.len());
-        result.extend(others.into_iter().take(remaining));
+        // Tier 3: Other transactions (subject to soft limit)
+        if !at_soft_limit {
+            for entry in self.ready_others.values() {
+                if remaining == 0 {
+                    break;
+                }
+                result.others.push(Arc::clone(&entry.tx));
+                remaining -= 1;
+            }
+        }
 
         result
     }
@@ -1150,33 +1497,27 @@ impl MempoolState {
     /// - `pending_blocked`: Number of pending transactions that conflict with locked nodes
     /// - `committed_count`: Number of transactions in Committed status
     /// - `executed_count`: Number of transactions in Executed status
+    ///
+    /// Pending stats are O(1) via ready sets. Committed/Executed still require O(n) scan.
     pub fn lock_contention_stats(&self) -> LockContentionStats {
         let locked_nodes = self.locked_nodes_cache.len() as u64;
         let blocked_count = self.blocked_by.len() as u64;
 
-        // Single pass over pool to count transactions by status
-        let (pending_count, pending_blocked, committed_count, executed_count) =
-            self.pool.values().fold(
-                (0u64, 0u64, 0u64, 0u64),
-                |(pending, pending_blocked, committed, executed), e| match &e.status {
-                    TransactionStatus::Pending => {
-                        let is_blocked = self.conflicts_with_locked(&e.tx);
-                        (
-                            pending + 1,
-                            pending_blocked + is_blocked as u64,
-                            committed,
-                            executed,
-                        )
-                    }
-                    TransactionStatus::Committed(_) => {
-                        (pending, pending_blocked, committed + 1, executed)
-                    }
-                    TransactionStatus::Executed(_) => {
-                        (pending, pending_blocked, committed, executed + 1)
-                    }
-                    _ => (pending, pending_blocked, committed, executed),
-                },
-            );
+        // Pending counts are O(1) from ready sets
+        let ready_count =
+            self.ready_retries.len() + self.ready_priority.len() + self.ready_others.len();
+        let pending_blocked = self.blocked_by_nodes.len() as u64;
+        let pending_count = (ready_count + self.blocked_by_nodes.len()) as u64;
+
+        // Committed/Executed still require pool scan (could add counters if needed)
+        let (committed_count, executed_count) =
+            self.pool
+                .values()
+                .fold((0u64, 0u64), |(committed, executed), e| match &e.status {
+                    TransactionStatus::Committed(_) => (committed + 1, executed),
+                    TransactionStatus::Executed(_) => (committed, executed + 1),
+                    _ => (committed, executed),
+                });
 
         LockContentionStats {
             locked_nodes,
@@ -1468,6 +1809,8 @@ mod tests {
                 round: 0,
                 is_fallback: false,
             },
+            retry_transactions: vec![],
+            priority_transactions: vec![],
             transactions: transactions.into_iter().map(Arc::new).collect(),
             committed_certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
@@ -2336,7 +2679,6 @@ mod tests {
         // Use a low limit for testing
         let config = make_mempool_config_with_limit(2);
         let mut mempool = MempoolState::with_config(Arc::clone(&topology), config);
-        let coordinator = make_provision_coordinator(Arc::clone(&topology));
 
         // Put mempool at the backpressure limit
         put_mempool_at_limit(&mut mempool, topology.as_ref());
@@ -2350,7 +2692,7 @@ mod tests {
         mempool.on_submit_transaction(cross_shard_tx.clone());
 
         // At soft limit: ALL new TXs without provisions should be rejected
-        let ready = mempool.ready_transactions(10, &coordinator);
+        let ready = mempool.ready_transactions(10, 0, 0);
         assert!(
             ready.is_empty(),
             "All TXs without provisions should be rejected at soft limit"
@@ -2390,7 +2732,7 @@ mod tests {
         // In a real scenario, provisions would be verified via the signature verification flow
 
         // Without provisions, TX should be rejected at limit
-        let ready = mempool.ready_transactions(10, &coordinator);
+        let ready = mempool.ready_transactions(10, 0, 0);
         assert!(
             ready.is_empty(),
             "Cross-shard TX without provisions should be rejected at limit"
@@ -2401,7 +2743,6 @@ mod tests {
     fn test_backpressure_not_at_limit_allows_all_txns() {
         let topology = make_cross_shard_topology();
         let mut mempool = MempoolState::new(Arc::clone(&topology));
-        let coordinator = make_provision_coordinator(Arc::clone(&topology));
 
         // Mempool is not at limit (nothing committed)
         assert!(!mempool.at_in_flight_limit());
@@ -2415,7 +2756,7 @@ mod tests {
         mempool.on_submit_transaction(cross_tx.clone());
 
         // Not at limit: all TXs should be allowed
-        let ready = mempool.ready_transactions(10, &coordinator);
+        let ready = mempool.ready_transactions(10, 0, 0);
         assert_eq!(ready.len(), 2);
     }
 
@@ -2485,7 +2826,6 @@ mod tests {
         // Use a low limit for testing
         let config = make_mempool_config_with_limit(2);
         let mut mempool = MempoolState::with_config(Arc::clone(&topology), config);
-        let coordinator = make_provision_coordinator(Arc::clone(&topology));
 
         // Put mempool at the backpressure limit
         put_mempool_at_limit(&mut mempool, topology.as_ref());
@@ -2502,7 +2842,7 @@ mod tests {
         mempool.on_submit_transaction(retry_tx.clone());
 
         // At soft limit: normal TXs should be rejected, but retries should be allowed
-        let ready = mempool.ready_transactions(10, &coordinator);
+        let ready = mempool.ready_transactions(10, 0, 0);
 
         // Should contain ONLY the retry (normal TX blocked by backpressure)
         assert_eq!(
@@ -2511,12 +2851,17 @@ mod tests {
             "Only retry should be returned at soft limit"
         );
         assert_eq!(
-            ready[0].hash(),
+            ready.retries.len(),
+            1,
+            "Retry should be in the retries section"
+        );
+        assert_eq!(
+            ready.retries[0].hash(),
             retry_hash,
             "Retry transaction should have priority over normal transactions"
         );
         assert!(
-            ready[0].is_retry(),
+            ready.retries[0].is_retry(),
             "The returned transaction should be a retry"
         );
     }
@@ -2525,7 +2870,6 @@ mod tests {
     fn test_retry_priority_ordering() {
         let topology = make_cross_shard_topology();
         let mut mempool = MempoolState::new(Arc::clone(&topology));
-        let coordinator = make_provision_coordinator(Arc::clone(&topology));
 
         // Add transactions in mixed order: normal, retry, normal
         let normal1 = test_transaction(1);
@@ -2537,30 +2881,31 @@ mod tests {
         mempool.on_submit_transaction(retry.clone());
         mempool.on_submit_transaction(normal2.clone());
 
-        // Request transactions - retry should come first regardless of insertion order
-        let ready = mempool.ready_transactions(10, &coordinator);
+        // Request transactions - retry should be in retries section, others in others section
+        let ready = mempool.ready_transactions(10, 0, 0);
 
         assert_eq!(ready.len(), 3, "All transactions should be returned");
 
-        // First transaction should be the retry
+        // Retry section should contain exactly the retry
+        assert_eq!(ready.retries.len(), 1, "Should have exactly one retry");
         assert!(
-            ready[0].is_retry(),
-            "Retry transaction should be first in the list"
+            ready.retries[0].is_retry(),
+            "Retry transaction should be in retries section"
         );
         assert_eq!(
-            ready[0].hash(),
+            ready.retries[0].hash(),
             retry.hash(),
-            "First transaction should be the retry"
+            "Retry should have correct hash"
         );
 
-        // Remaining transactions should be normal ones (in hash order)
-        assert!(
-            !ready[1].is_retry(),
-            "Second transaction should not be a retry"
+        // Others section should contain the normal transactions
+        assert_eq!(
+            ready.others.len(),
+            2,
+            "Should have two normal transactions in others"
         );
-        assert!(
-            !ready[2].is_retry(),
-            "Third transaction should not be a retry"
-        );
+        for tx in &ready.others {
+            assert!(!tx.is_retry(), "Normal transactions should not be retries");
+        }
     }
 }

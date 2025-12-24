@@ -121,6 +121,8 @@ pub fn decode_message(topic: &str, data: &[u8]) -> Result<DecodedMessage, CodecE
             Ok(DecodedMessage {
                 events: vec![Event::BlockHeaderReceived {
                     header: gossip.header,
+                    retry_hashes: gossip.retry_hashes,
+                    priority_hashes: gossip.priority_hashes,
                     tx_hashes: gossip.transaction_hashes,
                     cert_hashes: gossip.certificate_hashes,
                     deferred: gossip.deferred,
@@ -256,6 +258,8 @@ mod tests {
         let header = make_block_header();
         let gossip = BlockHeaderGossip {
             header: header.clone(),
+            retry_hashes: vec![],
+            priority_hashes: vec![],
             transaction_hashes: vec![],
             certificate_hashes: vec![],
             deferred: vec![],
@@ -337,6 +341,8 @@ mod tests {
         let header = make_block_header();
         let gossip = BlockHeaderGossip {
             header,
+            retry_hashes: vec![],
+            priority_hashes: vec![],
             transaction_hashes: vec![],
             certificate_hashes: vec![],
             deferred: vec![],

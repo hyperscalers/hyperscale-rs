@@ -55,9 +55,20 @@ pub enum Event {
     ///
     /// Note: Sender identity comes from message signatures (ValidatorId),
     /// not from a `from` field. Production uses gossipsub with signed messages.
+    ///
+    /// Transaction hashes are split into three priority sections:
+    /// - retry_hashes: Retry transactions (highest priority)
+    /// - priority_hashes: Cross-shard transactions with commitment proofs
+    /// - tx_hashes: All other transactions
     BlockHeaderReceived {
         header: BlockHeader,
+        /// Retry transaction hashes (highest priority).
+        retry_hashes: Vec<Hash>,
+        /// Priority transaction hashes (cross-shard with proofs).
+        priority_hashes: Vec<Hash>,
+        /// Other transaction hashes (normal priority).
         tx_hashes: Vec<Hash>,
+        /// Certificate hashes.
         cert_hashes: Vec<Hash>,
         /// Deferred transactions in this block (livelock prevention).
         deferred: Vec<TransactionDefer>,

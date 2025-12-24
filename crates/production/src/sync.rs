@@ -2489,6 +2489,8 @@ mod tests {
                 round: 0,
                 is_fallback: false,
             },
+            retry_transactions: vec![],
+            priority_transactions: vec![],
             transactions: vec![],
             committed_certificates: vec![],
             deferred: vec![],

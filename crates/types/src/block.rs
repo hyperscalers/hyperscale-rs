@@ -58,12 +58,17 @@ impl BlockHeader {
 
 /// Complete block with header and transaction data.
 ///
-/// Blocks can contain four types of transaction-related items:
-/// 1. **transactions**: New transactions being committed for the first time
-/// 2. **committed_certificates**: Finalized transaction certificates (Accept/Reject decisions)
-/// 3. **deferred**: Transactions deferred due to cross-shard cycles (livelock prevention)
-/// 4. **aborted**: Transactions aborted due to timeout or rejection
+/// Blocks contain transactions in three priority sections:
+/// 1. **retry_transactions**: Retry transactions (highest priority, critical for liveness)
+/// 2. **priority_transactions**: Cross-shard transactions with commitment proofs
+/// 3. **transactions**: All other transactions
 ///
+/// Additional block contents:
+/// - **committed_certificates**: Finalized transaction certificates (Accept/Reject decisions)
+/// - **deferred**: Transactions deferred due to cross-shard cycles (livelock prevention)
+/// - **aborted**: Transactions aborted due to timeout or rejection
+///
+/// Each section is sorted by transaction hash for deterministic ordering.
 /// Transactions and certificates are stored as `Arc` for efficient cloning
 /// and sharing across the system. When serialized (for storage or network),
 /// the underlying data is written directly.
@@ -72,7 +77,22 @@ pub struct Block {
     /// Block header with consensus metadata.
     pub header: BlockHeader,
 
-    /// Transactions included in this block.
+    /// Retry transactions (highest priority).
+    ///
+    /// These are transactions that were previously deferred due to cross-shard
+    /// cycles and are being retried. They bypass backpressure limits because
+    /// completing them is critical for liveness.
+    pub retry_transactions: Vec<Arc<RoutableTransaction>>,
+
+    /// Priority transactions (cross-shard with commitment proofs).
+    ///
+    /// These are cross-shard transactions where other shards have already
+    /// committed and are waiting for us. They bypass soft backpressure limits.
+    pub priority_transactions: Vec<Arc<RoutableTransaction>>,
+
+    /// Other transactions (normal priority).
+    ///
+    /// Fresh transactions with no special priority. Subject to backpressure limits.
     pub transactions: Vec<Arc<RoutableTransaction>>,
 
     /// Transaction certificates for finalized transactions.
@@ -94,24 +114,22 @@ pub struct Block {
 
     /// Commitment proofs for priority transaction ordering.
     ///
-    /// Maps transaction hash to its CommitmentProof. Transactions with proofs
-    /// are ordered before transactions without proofs in the block.
-    ///
-    /// This makes the block self-contained: validators can verify the ordering
-    /// is correct without needing to have received the same provisions.
+    /// Maps transaction hash to its CommitmentProof. These proofs justify
+    /// why transactions are in the priority section.
     pub commitment_proofs: HashMap<Hash, CommitmentProof>,
 }
 
 // Manual PartialEq - compare transaction/certificate content, not Arc pointers
 impl PartialEq for Block {
     fn eq(&self, other: &Self) -> bool {
+        fn tx_lists_equal(a: &[Arc<RoutableTransaction>], b: &[Arc<RoutableTransaction>]) -> bool {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.hash() == y.hash())
+        }
+
         self.header == other.header
-            && self.transactions.len() == other.transactions.len()
-            && self
-                .transactions
-                .iter()
-                .zip(other.transactions.iter())
-                .all(|(a, b)| a.hash() == b.hash())
+            && tx_lists_equal(&self.retry_transactions, &other.retry_transactions)
+            && tx_lists_equal(&self.priority_transactions, &other.priority_transactions)
+            && tx_lists_equal(&self.transactions, &other.transactions)
             && self.committed_certificates.len() == other.committed_certificates.len()
             && self
                 .committed_certificates
@@ -131,21 +149,34 @@ impl Eq for Block {}
 // We serialize/deserialize the inner RoutableTransaction directly.
 // ============================================================================
 
+/// Helper to encode a Vec<Arc<RoutableTransaction>> as an SBOR array.
+fn encode_tx_vec<E: sbor::Encoder<sbor::NoCustomValueKind>>(
+    encoder: &mut E,
+    txs: &[Arc<RoutableTransaction>],
+) -> Result<(), sbor::EncodeError> {
+    encoder.write_value_kind(sbor::ValueKind::Array)?;
+    encoder.write_value_kind(sbor::ValueKind::Tuple)?;
+    encoder.write_size(txs.len())?;
+    for tx in txs {
+        encoder.encode_deeper_body(tx.as_ref())?;
+    }
+    Ok(())
+}
+
 impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E> for Block {
     fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
         encoder.write_value_kind(sbor::ValueKind::Tuple)
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(6)?;
+        encoder.write_size(8)?;
         encoder.encode(&self.header)?;
-        // Transactions (manual encoding to unwrap Arc)
-        encoder.write_value_kind(sbor::ValueKind::Array)?;
-        encoder.write_value_kind(sbor::ValueKind::Tuple)?;
-        encoder.write_size(self.transactions.len())?;
-        for tx in &self.transactions {
-            encoder.encode_deeper_body(tx.as_ref())?;
-        }
+        // Retry transactions
+        encode_tx_vec(encoder, &self.retry_transactions)?;
+        // Priority transactions
+        encode_tx_vec(encoder, &self.priority_transactions)?;
+        // Other transactions
+        encode_tx_vec(encoder, &self.transactions)?;
         // Certificates (manual encoding to unwrap Arc)
         encoder.write_value_kind(sbor::ValueKind::Array)?;
         encoder.write_value_kind(sbor::ValueKind::Tuple)?;
@@ -171,6 +202,22 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 }
 
+/// Helper to decode a Vec<Arc<RoutableTransaction>> from an SBOR array.
+fn decode_tx_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
+    decoder: &mut D,
+) -> Result<Vec<Arc<RoutableTransaction>>, sbor::DecodeError> {
+    decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
+    decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
+    let count = decoder.read_size()?;
+    let mut txs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let tx: RoutableTransaction =
+            decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
+        txs.push(Arc::new(tx));
+    }
+    Ok(txs)
+}
+
 impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D> for Block {
     fn decode_body_with_value_kind(
         decoder: &mut D,
@@ -179,25 +226,19 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 6 {
+        if length != 8 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 6,
+                expected: 8,
                 actual: length,
             });
         }
 
         let header: BlockHeader = decoder.decode()?;
 
-        // Transactions (manual decoding to wrap in Arc)
-        decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
-        decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
-        let tx_count = decoder.read_size()?;
-        let mut transactions = Vec::with_capacity(tx_count);
-        for _ in 0..tx_count {
-            let tx: RoutableTransaction =
-                decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
-            transactions.push(Arc::new(tx));
-        }
+        // Transaction sections
+        let retry_transactions = decode_tx_vec(decoder)?;
+        let priority_transactions = decode_tx_vec(decoder)?;
+        let transactions = decode_tx_vec(decoder)?;
 
         // Certificates (manual decoding to wrap in Arc)
         decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
@@ -226,6 +267,8 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
 
         Ok(Self {
             header,
+            retry_transactions,
+            priority_transactions,
             transactions,
             committed_certificates,
             deferred,
@@ -260,17 +303,43 @@ impl Block {
         self.header.height
     }
 
-    /// Get number of transactions in this block.
+    /// Get total number of transactions across all sections.
     pub fn transaction_count(&self) -> usize {
-        self.transactions.len()
+        self.retry_transactions.len() + self.priority_transactions.len() + self.transactions.len()
+    }
+
+    /// Iterate all transactions in priority order (retries, priority, others).
+    pub fn all_transactions(&self) -> impl Iterator<Item = &Arc<RoutableTransaction>> {
+        self.retry_transactions
+            .iter()
+            .chain(self.priority_transactions.iter())
+            .chain(self.transactions.iter())
     }
 
     /// Check if this block contains a specific transaction by hash.
     pub fn contains_transaction(&self, tx_hash: &Hash) -> bool {
-        self.transactions.iter().any(|tx| tx.hash() == *tx_hash)
+        self.all_transactions().any(|tx| tx.hash() == *tx_hash)
     }
 
-    /// Get transaction hashes for gossip messages.
+    /// Get all transaction hashes in priority order.
+    pub fn all_transaction_hashes(&self) -> Vec<Hash> {
+        self.all_transactions().map(|tx| tx.hash()).collect()
+    }
+
+    /// Get retry transaction hashes.
+    pub fn retry_hashes(&self) -> Vec<Hash> {
+        self.retry_transactions.iter().map(|tx| tx.hash()).collect()
+    }
+
+    /// Get priority transaction hashes.
+    pub fn priority_hashes(&self) -> Vec<Hash> {
+        self.priority_transactions
+            .iter()
+            .map(|tx| tx.hash())
+            .collect()
+    }
+
+    /// Get other transaction hashes.
     pub fn transaction_hashes(&self) -> Vec<Hash> {
         self.transactions.iter().map(|tx| tx.hash()).collect()
     }
@@ -292,6 +361,8 @@ impl Block {
                 round: 0,
                 is_fallback: false,
             },
+            retry_transactions: vec![],
+            priority_transactions: vec![],
             transactions: vec![],
             committed_certificates: vec![],
             deferred: vec![],
@@ -389,8 +460,13 @@ pub struct BlockMetadata {
     /// Block header (contains height, parent hash, proposer, etc.)
     pub header: BlockHeader,
 
-    /// Transaction hashes in block order.
-    /// Actual transactions stored in "transactions" CF.
+    /// Retry transaction hashes (highest priority section).
+    pub retry_hashes: Vec<Hash>,
+
+    /// Priority transaction hashes (cross-shard with proofs).
+    pub priority_hashes: Vec<Hash>,
+
+    /// Other transaction hashes (normal priority section).
     pub tx_hashes: Vec<Hash>,
 
     /// Certificate hashes in block order.
@@ -415,6 +491,16 @@ impl BlockMetadata {
     pub fn from_block(block: &Block, qc: QuorumCertificate) -> Self {
         Self {
             header: block.header.clone(),
+            retry_hashes: block
+                .retry_transactions
+                .iter()
+                .map(|tx| tx.hash())
+                .collect(),
+            priority_hashes: block
+                .priority_transactions
+                .iter()
+                .map(|tx| tx.hash())
+                .collect(),
             tx_hashes: block.transactions.iter().map(|tx| tx.hash()).collect(),
             cert_hashes: block
                 .committed_certificates
@@ -436,6 +522,19 @@ impl BlockMetadata {
     /// Compute hash of this block (hashes the header).
     pub fn hash(&self) -> Hash {
         self.header.hash()
+    }
+
+    /// Get total transaction count across all sections.
+    pub fn transaction_count(&self) -> usize {
+        self.retry_hashes.len() + self.priority_hashes.len() + self.tx_hashes.len()
+    }
+
+    /// Iterate all transaction hashes in priority order.
+    pub fn all_tx_hashes(&self) -> impl Iterator<Item = &Hash> {
+        self.retry_hashes
+            .iter()
+            .chain(self.priority_hashes.iter())
+            .chain(self.tx_hashes.iter())
     }
 }
 

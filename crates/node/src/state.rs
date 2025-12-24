@@ -280,25 +280,22 @@ impl NodeStateMachine {
         self.now.saturating_sub(self.last_leader_activity) >= timeout
     }
 
-    /// Build commitment proofs for cross-shard transactions.
+    /// Build commitment proofs for priority transactions.
     ///
     /// Returns a HashMap mapping transaction hash to CommitmentProof for all
-    /// cross-shard transactions that have verified provisions. This is included
+    /// priority transactions (cross-shard with verified provisions). This is included
     /// in the block to make it self-contained for validation.
+    ///
+    /// Only priority transactions need proofs - they are already classified by the
+    /// mempool as having verified provisions.
     fn build_commitment_proofs(
         &self,
-        txs: &[Arc<hyperscale_types::RoutableTransaction>],
+        ready_txs: &hyperscale_types::ReadyTransactions,
     ) -> std::collections::HashMap<hyperscale_types::Hash, hyperscale_types::CommitmentProof> {
-        let num_shards = self.topology.num_shards();
         let mut proofs = std::collections::HashMap::new();
 
-        for tx in txs {
-            // Only build proofs for cross-shard transactions
-            if !tx.is_cross_shard(num_shards) {
-                continue;
-            }
-
-            // Check if we have verified provisions for this transaction
+        // Only priority transactions have verified provisions
+        for tx in &ready_txs.priority {
             let tx_hash = tx.hash();
             if let Some(proof) = self.provisions.build_commitment_proof(&tx_hash) {
                 proofs.insert(tx_hash, proof);
@@ -333,37 +330,14 @@ impl StateMachine for NodeStateMachine {
                     // Clear the header reset tracker since we're changing rounds
                     self.last_header_reset = None;
 
-                    // Account for pipelining: count txs/certs in ALL pending blocks
-                    let (pending_txs, pending_certs) = self.bft.pending_block_tx_cert_counts();
-
-                    // Get certificates we're about to propose
-                    let certificates = self.execution.get_finalized_certificates();
-                    let new_certs = certificates.len();
-
-                    let max_txs = self.bft.config().max_transactions_per_block;
-                    let txs = self.mempool.ready_transactions_with_pending_commits(
-                        max_txs,
-                        &self.provisions,
-                        pending_txs,               // txs in uncommitted pipeline blocks
-                        pending_certs + new_certs, // certs in pipeline + certs we're proposing
-                    );
-                    // Note: commitment_proofs not needed for advance_round - it builds empty fallback blocks
-                    let deferred = self.livelock.get_pending_deferrals();
                     let current_height =
                         hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
-                    let aborted = self.mempool.get_timed_out_transactions(
-                        current_height,
-                        30, // execution_timeout_blocks
-                        3,  // max_retries
-                    );
 
                     // Notify execution of view change to pause speculation temporarily
                     self.execution.on_view_change(current_height.0);
 
                     tracing::info!("Round timeout - advancing round (implicit view change)");
-                    return self
-                        .bft
-                        .advance_round(&txs, deferred, aborted, certificates);
+                    return self.bft.advance_round();
                 }
 
                 // Normal proposal timer - try to propose if we're the proposer
@@ -377,13 +351,12 @@ impl StateMachine for NodeStateMachine {
                 let new_certs = certificates.len();
 
                 let max_txs = self.bft.config().max_transactions_per_block;
-                let txs = self.mempool.ready_transactions_with_pending_commits(
+                let ready_txs = self.mempool.ready_transactions(
                     max_txs,
-                    &self.provisions,
                     pending_txs,               // txs in uncommitted pipeline blocks
                     pending_certs + new_certs, // certs in pipeline + certs we're proposing
                 );
-                let commitment_proofs = self.build_commitment_proofs(&txs);
+                let commitment_proofs = self.build_commitment_proofs(&ready_txs);
                 // Get pending deferrals from livelock state
                 let deferred = self.livelock.get_pending_deferrals();
                 // Get timed-out transactions from mempool
@@ -395,7 +368,7 @@ impl StateMachine for NodeStateMachine {
                     3,  // max_retries
                 );
                 let actions = self.bft.on_proposal_timer(
-                    &txs,
+                    &ready_txs,
                     deferred,
                     aborted,
                     certificates,
@@ -435,6 +408,8 @@ impl StateMachine for NodeStateMachine {
             // BlockHeaderReceived needs mempool for transaction lookup and certificates
             Event::BlockHeaderReceived {
                 header,
+                retry_hashes,
+                priority_hashes,
                 tx_hashes,
                 cert_hashes,
                 deferred,
@@ -450,6 +425,9 @@ impl StateMachine for NodeStateMachine {
                     self.last_header_reset = Some(header_key);
                 }
 
+                // Total transaction count across all sections
+                let total_tx_count = retry_hashes.len() + priority_hashes.len() + tx_hashes.len();
+
                 // Validate in-flight limits only for the next block after committed height.
                 // For blocks further ahead, skip validation - validators at different heights
                 // have different in_flight() counts, causing split votes and view changes.
@@ -463,14 +441,12 @@ impl StateMachine for NodeStateMachine {
                     let soft_limit = config.max_in_flight;
                     let hard_limit = config.max_in_flight_hard_limit;
 
-                    let with_proofs = tx_hashes
-                        .iter()
-                        .filter(|h| commitment_proofs.contains_key(h))
-                        .count();
-                    let without_proofs = tx_hashes.len() - with_proofs;
+                    // Retry and priority transactions bypass soft limit
+                    // Only "other" transactions (tx_hashes) are subject to soft limit
+                    let without_proofs = tx_hashes.len();
 
                     let new_in_flight = current_in_flight
-                        .saturating_add(tx_hashes.len())
+                        .saturating_add(total_tx_count)
                         .saturating_sub(certs_in_block);
 
                     // Reject if exceeding hard limit AND making things worse.
@@ -482,7 +458,7 @@ impl StateMachine for NodeStateMachine {
                         tracing::warn!(
                             current_in_flight,
                             certs_in_block,
-                            proposed_tx_count = tx_hashes.len(),
+                            proposed_tx_count = total_tx_count,
                             new_in_flight,
                             hard_limit,
                             block_hash = ?header.hash(),
@@ -493,6 +469,7 @@ impl StateMachine for NodeStateMachine {
                     }
 
                     // Soft limit: only allow TXs with proofs when at limit
+                    // Note: retry_hashes and priority_hashes bypass this check
                     if current_in_flight >= soft_limit && without_proofs > 0 {
                         tracing::warn!(
                             current_in_flight,
@@ -513,9 +490,14 @@ impl StateMachine for NodeStateMachine {
                 // This hides execution latency behind consensus latency
                 let block_hash = header.hash();
                 let height = header.height.0;
-                let transactions: Vec<_> = tx_hashes
+                let all_tx_hashes: Vec<_> = retry_hashes
                     .iter()
-                    .filter_map(|h| mempool_txs.get(h).cloned())
+                    .chain(priority_hashes.iter())
+                    .chain(tx_hashes.iter())
+                    .collect();
+                let transactions: Vec<_> = all_tx_hashes
+                    .iter()
+                    .filter_map(|h| mempool_txs.get(*h).cloned())
                     .collect();
                 let spec_actions =
                     self.execution
@@ -523,6 +505,8 @@ impl StateMachine for NodeStateMachine {
 
                 let mut actions = self.bft.on_block_header(
                     header.clone(),
+                    retry_hashes.clone(),
+                    priority_hashes.clone(),
                     tx_hashes.clone(),
                     cert_hashes.clone(),
                     deferred.clone(),
@@ -550,13 +534,10 @@ impl StateMachine for NodeStateMachine {
                 let (pending_tx_count, pending_cert_count) = self.bft.pending_commit_counts(qc);
 
                 let max_txs = self.bft.config().max_transactions_per_block;
-                let txs = self.mempool.ready_transactions_with_pending_commits(
-                    max_txs,
-                    &self.provisions,
-                    pending_tx_count,
-                    pending_cert_count,
-                );
-                let commitment_proofs = self.build_commitment_proofs(&txs);
+                let ready_txs =
+                    self.mempool
+                        .ready_transactions(max_txs, pending_tx_count, pending_cert_count);
+                let commitment_proofs = self.build_commitment_proofs(&ready_txs);
                 let deferred = self.livelock.get_pending_deferrals();
                 let current_height = hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
                 let aborted = self.mempool.get_timed_out_transactions(
@@ -568,7 +549,7 @@ impl StateMachine for NodeStateMachine {
                 return self.bft.on_qc_formed(
                     *block_hash,
                     qc.clone(),
-                    &txs,
+                    &ready_txs,
                     deferred,
                     aborted,
                     certificates,
@@ -598,7 +579,7 @@ impl StateMachine for NodeStateMachine {
 
                 // Register newly committed cross-shard TXs with livelock for cycle detection.
                 // Must happen BEFORE livelock.on_block_committed() processes deferrals.
-                for tx in &block.transactions {
+                for tx in block.all_transactions() {
                     if self.livelock.is_cross_shard(tx) {
                         self.livelock.on_cross_shard_committed(tx, block_height);
                     }
@@ -629,14 +610,13 @@ impl StateMachine for NodeStateMachine {
                     self.execution.invalidate_speculative_on_commit(cert);
                 }
 
-                // Pass transactions directly from block to execution (no need for mempool lookup)
+                // Pass all transactions from block to execution (no need for mempool lookup)
                 // NOTE: execution.on_block_committed emits CrossShardTxRegistered events, which
                 // will be processed by the coordinator via EnqueueInternal actions.
-                let exec_actions = self.execution.on_block_committed(
-                    *block_hash,
-                    *height,
-                    block.transactions.clone(),
-                );
+                let all_txs: Vec<_> = block.all_transactions().cloned().collect();
+                let exec_actions = self
+                    .execution
+                    .on_block_committed(*block_hash, *height, all_txs);
 
                 // Process CrossShardTxRegistered events immediately so coordinator has
                 // registrations before any subsequent provisions arrive.
@@ -685,7 +665,12 @@ impl StateMachine for NodeStateMachine {
             }
 
             // ProvisionsVerifiedAndAggregated: callback from batch verification + aggregation
-            Event::ProvisionsVerifiedAndAggregated { .. } => {
+            Event::ProvisionsVerifiedAndAggregated { tx_hash, .. } => {
+                // Notify mempool to promote this transaction to priority tier.
+                // This enables cross-shard transactions with verified provisions
+                // to bypass the soft backpressure limit.
+                self.mempool.on_provision_verified(*tx_hash);
+
                 // Route to provision coordinator to handle verified provisions and quorum
                 if let Some(actions) = self.provisions.try_handle(&event) {
                     return actions;

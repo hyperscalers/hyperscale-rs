@@ -54,9 +54,10 @@ pub use topology::{
     shard_for_node, DynamicTopology, DynamicTopologyError, StaticTopology, Topology, TopologyError,
 };
 pub use transaction::{
-    sign_and_notarize, sign_and_notarize_with_options, AbortReason, DeferReason, RetryDetails,
-    RoutableTransaction, TransactionAbort, TransactionCertificate, TransactionDecision,
-    TransactionDefer, TransactionError, TransactionStatus, TransactionStatusParseError,
+    sign_and_notarize, sign_and_notarize_with_options, AbortReason, DeferReason, ReadyTransactions,
+    RetryDetails, RoutableTransaction, TransactionAbort, TransactionCertificate,
+    TransactionDecision, TransactionDefer, TransactionError, TransactionStatus,
+    TransactionStatusParseError,
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
 

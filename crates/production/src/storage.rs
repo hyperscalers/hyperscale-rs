@@ -691,15 +691,21 @@ impl RocksDbStorage {
             .flatten()
             .and_then(|v| sbor::basic_decode(&v).ok())?;
 
-        // 2. Batch-fetch transactions (preserving order)
+        // 2. Batch-fetch transactions for each section (preserving order)
+        let retry_transactions = self.get_transactions_batch_ordered(&metadata.retry_hashes);
+        let priority_transactions = self.get_transactions_batch_ordered(&metadata.priority_hashes);
         let transactions = self.get_transactions_batch_ordered(&metadata.tx_hashes);
 
         // Verify we got ALL transactions - return None if any are missing
-        if transactions.len() != metadata.tx_hashes.len() {
+        let total_expected =
+            metadata.retry_hashes.len() + metadata.priority_hashes.len() + metadata.tx_hashes.len();
+        let total_found =
+            retry_transactions.len() + priority_transactions.len() + transactions.len();
+        if total_found != total_expected {
             tracing::warn!(
                 height = height.0,
-                expected = metadata.tx_hashes.len(),
-                found = transactions.len(),
+                expected = total_expected,
+                found = total_found,
                 "Block has missing transactions - cannot serve sync request"
             );
             return None;
@@ -722,6 +728,8 @@ impl RocksDbStorage {
         // 4. Reconstruct block
         let block = Block {
             header: metadata.header,
+            retry_transactions,
+            priority_transactions,
             transactions,
             committed_certificates: certificates,
             deferred: metadata.deferred,
@@ -784,15 +792,21 @@ impl RocksDbStorage {
             .flatten()
             .and_then(|v| sbor::basic_decode(&v).ok())?;
 
-        // 2. Try to batch-fetch transactions (preserving order)
+        // 2. Try to batch-fetch transactions for each section (preserving order)
+        let retry_transactions = self.get_transactions_batch_ordered(&metadata.retry_hashes);
+        let priority_transactions = self.get_transactions_batch_ordered(&metadata.priority_hashes);
         let transactions = self.get_transactions_batch_ordered(&metadata.tx_hashes);
 
         // Check if all transactions are present
-        if transactions.len() != metadata.tx_hashes.len() {
+        let total_expected =
+            metadata.retry_hashes.len() + metadata.priority_hashes.len() + metadata.tx_hashes.len();
+        let total_found =
+            retry_transactions.len() + priority_transactions.len() + transactions.len();
+        if total_found != total_expected {
             tracing::debug!(
                 height = height.0,
-                expected = metadata.tx_hashes.len(),
-                found = transactions.len(),
+                expected = total_expected,
+                found = total_found,
                 "Block has missing transactions - returning metadata only"
             );
             let elapsed = start.elapsed().as_secs_f64();
@@ -819,6 +833,8 @@ impl RocksDbStorage {
         // 4. Full block available - reconstruct it
         let block = Block {
             header: metadata.header,
+            retry_transactions,
+            priority_transactions,
             transactions,
             committed_certificates: certificates,
             deferred: metadata.deferred,
@@ -1673,6 +1689,8 @@ mod tests {
                 round: 0,
                 is_fallback: false,
             },
+            retry_transactions: vec![],
+            priority_transactions: vec![],
             transactions: vec![],
             committed_certificates: vec![],
             deferred: vec![],
@@ -1725,6 +1743,8 @@ mod tests {
                     round: 0,
                     is_fallback: false,
                 },
+                retry_transactions: vec![],
+                priority_transactions: vec![],
                 transactions: vec![],
                 committed_certificates: vec![],
                 deferred: vec![],

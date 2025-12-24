@@ -81,6 +81,8 @@ mod tests {
                 round: 0,
                 is_fallback: false,
             },
+            retry_transactions: vec![],
+            priority_transactions: vec![],
             transactions: vec![std::sync::Arc::new(tx)],
             committed_certificates: vec![],
             deferred: vec![],

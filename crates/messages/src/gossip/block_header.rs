@@ -9,13 +9,31 @@ use std::collections::HashMap;
 
 /// Gossips a block proposal (header only, not full block).
 /// Validators construct the full Block locally from header + mempool transactions.
+///
+/// Transaction hashes are split into three priority sections:
+/// 1. **retry_hashes**: Retry transactions (highest priority, critical for liveness)
+/// 2. **priority_hashes**: Cross-shard transactions with commitment proofs
+/// 3. **transaction_hashes**: All other transactions
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockHeaderGossip {
     /// The block header being gossiped
     pub header: BlockHeader,
 
-    /// Transaction hashes included in this block
-    /// (needed for non-proposers to assemble the block)
+    /// Retry transaction hashes (highest priority).
+    ///
+    /// These are transactions that were previously deferred due to cross-shard
+    /// cycles and are being retried. Critical for liveness.
+    pub retry_hashes: Vec<Hash>,
+
+    /// Priority transaction hashes (cross-shard with commitment proofs).
+    ///
+    /// These are cross-shard transactions where other shards have already
+    /// committed and are waiting for us.
+    pub priority_hashes: Vec<Hash>,
+
+    /// Other transaction hashes (normal priority).
+    ///
+    /// Fresh transactions with no special priority.
     pub transaction_hashes: Vec<Hash>,
 
     /// Transaction certificate hashes included in this block (finalized cross-shard transactions)
@@ -45,10 +63,17 @@ pub struct BlockHeaderGossip {
 }
 
 impl BlockHeaderGossip {
-    /// Create a new block header gossip message (no certificates, deferrals, or aborts).
-    pub fn new(header: BlockHeader, transaction_hashes: Vec<Hash>) -> Self {
+    /// Create a new block header gossip message with all sections.
+    pub fn new(
+        header: BlockHeader,
+        retry_hashes: Vec<Hash>,
+        priority_hashes: Vec<Hash>,
+        transaction_hashes: Vec<Hash>,
+    ) -> Self {
         Self {
             header,
+            retry_hashes,
+            priority_hashes,
             transaction_hashes,
             certificate_hashes: vec![],
             deferred: vec![],
@@ -60,11 +85,15 @@ impl BlockHeaderGossip {
     /// Create a new block header gossip message with certificates.
     pub fn with_certificates(
         header: BlockHeader,
+        retry_hashes: Vec<Hash>,
+        priority_hashes: Vec<Hash>,
         transaction_hashes: Vec<Hash>,
         certificate_hashes: Vec<Hash>,
     ) -> Self {
         Self {
             header,
+            retry_hashes,
+            priority_hashes,
             transaction_hashes,
             certificate_hashes,
             deferred: vec![],
@@ -74,8 +103,11 @@ impl BlockHeaderGossip {
     }
 
     /// Create a new block header gossip message with all fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn full(
         header: BlockHeader,
+        retry_hashes: Vec<Hash>,
+        priority_hashes: Vec<Hash>,
         transaction_hashes: Vec<Hash>,
         certificate_hashes: Vec<Hash>,
         deferred: Vec<TransactionDefer>,
@@ -84,6 +116,8 @@ impl BlockHeaderGossip {
     ) -> Self {
         Self {
             header,
+            retry_hashes,
+            priority_hashes,
             transaction_hashes,
             certificate_hashes,
             deferred,
@@ -97,9 +131,32 @@ impl BlockHeaderGossip {
         &self.header
     }
 
-    /// Get the transaction hashes.
+    /// Get the retry transaction hashes.
+    pub fn retry_hashes(&self) -> &[Hash] {
+        &self.retry_hashes
+    }
+
+    /// Get the priority transaction hashes.
+    pub fn priority_hashes(&self) -> &[Hash] {
+        &self.priority_hashes
+    }
+
+    /// Get the other transaction hashes.
     pub fn transaction_hashes(&self) -> &[Hash] {
         &self.transaction_hashes
+    }
+
+    /// Get total transaction count across all sections.
+    pub fn transaction_count(&self) -> usize {
+        self.retry_hashes.len() + self.priority_hashes.len() + self.transaction_hashes.len()
+    }
+
+    /// Iterate all transaction hashes in priority order.
+    pub fn all_transaction_hashes(&self) -> impl Iterator<Item = &Hash> {
+        self.retry_hashes
+            .iter()
+            .chain(self.priority_hashes.iter())
+            .chain(self.transaction_hashes.iter())
     }
 
     /// Get the certificate hashes.
@@ -135,12 +192,16 @@ impl BlockHeaderGossip {
         BlockHeader,
         Vec<Hash>,
         Vec<Hash>,
+        Vec<Hash>,
+        Vec<Hash>,
         Vec<TransactionDefer>,
         Vec<TransactionAbort>,
         HashMap<Hash, CommitmentProof>,
     ) {
         (
             self.header,
+            self.retry_hashes,
+            self.priority_hashes,
             self.transaction_hashes,
             self.certificate_hashes,
             self.deferred,
@@ -176,11 +237,21 @@ mod tests {
             round: 0,
             is_fallback: false,
         };
-        let transaction_hashes = vec![Hash::from_bytes(b"atom1"), Hash::from_bytes(b"atom2")];
+        let retry_hashes = vec![Hash::from_bytes(b"retry1")];
+        let priority_hashes = vec![Hash::from_bytes(b"priority1")];
+        let transaction_hashes = vec![Hash::from_bytes(b"tx1"), Hash::from_bytes(b"tx2")];
 
-        let gossip = BlockHeaderGossip::new(header.clone(), transaction_hashes.clone());
+        let gossip = BlockHeaderGossip::new(
+            header.clone(),
+            retry_hashes.clone(),
+            priority_hashes.clone(),
+            transaction_hashes.clone(),
+        );
         assert_eq!(gossip.header(), &header);
+        assert_eq!(gossip.retry_hashes(), &retry_hashes[..]);
+        assert_eq!(gossip.priority_hashes(), &priority_hashes[..]);
         assert_eq!(gossip.transaction_hashes(), &transaction_hashes[..]);
+        assert_eq!(gossip.transaction_count(), 4);
     }
 
     #[test]
@@ -194,10 +265,31 @@ mod tests {
             round: 0,
             is_fallback: false,
         };
-        let transaction_hashes = vec![Hash::from_bytes(b"atom1")];
+        let transaction_hashes = vec![Hash::from_bytes(b"tx1")];
 
-        let gossip = BlockHeaderGossip::new(header.clone(), transaction_hashes);
+        let gossip = BlockHeaderGossip::new(header.clone(), vec![], vec![], transaction_hashes);
         let extracted = gossip.into_header();
         assert_eq!(extracted, header);
+    }
+
+    #[test]
+    fn test_block_header_gossip_all_transaction_hashes() {
+        let header = BlockHeader {
+            height: BlockHeight(1),
+            parent_hash: Hash::from_bytes(b"parent"),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(0),
+            timestamp: 0,
+            round: 0,
+            is_fallback: false,
+        };
+        let retry = Hash::from_bytes(b"retry");
+        let priority = Hash::from_bytes(b"priority");
+        let other = Hash::from_bytes(b"other");
+
+        let gossip = BlockHeaderGossip::new(header, vec![retry], vec![priority], vec![other]);
+
+        let all: Vec<Hash> = gossip.all_transaction_hashes().copied().collect();
+        assert_eq!(all, vec![retry, priority, other]);
     }
 }

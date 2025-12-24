@@ -217,6 +217,8 @@ impl OutboundMessage {
         match self {
             OutboundMessage::BlockHeader(gossip) => vec![Event::BlockHeaderReceived {
                 header: gossip.header.clone(),
+                retry_hashes: gossip.retry_hashes.clone(),
+                priority_hashes: gossip.priority_hashes.clone(),
                 tx_hashes: gossip.transaction_hashes.clone(),
                 cert_hashes: gossip.certificate_hashes.clone(),
                 deferred: gossip.deferred.clone(),

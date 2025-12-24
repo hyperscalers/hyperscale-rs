@@ -927,6 +927,8 @@ impl ProductionRunner {
 
         let genesis_block = Block {
             header: genesis_header,
+            retry_transactions: vec![],
+            priority_transactions: vec![],
             transactions: vec![],
             committed_certificates: vec![],
             deferred: vec![],

@@ -89,6 +89,8 @@ async fn test_storage_operations() {
 
     let block = Block {
         header: header.clone(),
+        retry_transactions: vec![],
+        priority_transactions: vec![],
         transactions: vec![],
         committed_certificates: vec![],
         deferred: vec![],

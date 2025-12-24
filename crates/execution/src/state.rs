@@ -2205,8 +2205,9 @@ impl SubStateMachine for ExecutionState {
                 height,
                 block,
             } => {
-                // Now we have the full block with transactions
-                Some(self.on_block_committed(*block_hash, *height, block.transactions.clone()))
+                // Now we have the full block with transactions from all sections
+                let all_txs: Vec<_> = block.all_transactions().cloned().collect();
+                Some(self.on_block_committed(*block_hash, *height, all_txs))
             }
             // TransactionsExecuted and CrossShardTransactionsExecuted are no longer used.
             // Runners now sign votes directly and send StateVoteReceived events.
