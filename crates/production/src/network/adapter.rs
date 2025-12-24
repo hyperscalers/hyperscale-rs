@@ -186,12 +186,22 @@ struct PendingResponseChannel {
     created_at: std::time::Instant,
 }
 
+/// A pending outbound request with its creation time for timeout cleanup.
+struct PendingRequest {
+    response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
+    created_at: std::time::Instant,
+}
+
 /// Interval for periodic maintenance tasks in the event loop.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Timeout for pending response channels (after which they are cleaned up).
 /// This should be slightly longer than the request_timeout to allow for processing.
 const RESPONSE_CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Timeout for pending outbound requests (after which they are cleaned up).
+/// If a peer doesn't respond within this time, the request is considered failed.
+const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Delay before attempting to reconnect to a disconnected validator.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -992,11 +1002,9 @@ impl Libp2pAdapter {
         tx_validation_handle: ValidationBatcherHandle,
         version_interop_mode: VersionInteroperabilityMode,
     ) {
-        // Track pending sync requests (outbound)
-        let mut pending_requests: HashMap<
-            request_response::OutboundRequestId,
-            tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
-        > = HashMap::new();
+        // Track pending sync requests (outbound) with creation time for TTL cleanup
+        let mut pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest> =
+            HashMap::new();
 
         // Track pending response channels (inbound) - keyed by channel_id
         // Uses PendingResponseChannel to track creation time for timeout cleanup
@@ -1053,10 +1061,38 @@ impl Libp2pAdapter {
                         info!(cleaned, remaining = pending_response_channels.len(), "Cleaned up timed-out response channels");
                     }
 
-                    // 2. Record metrics for pending response channels
+                    // 2. Clean up timed-out pending outbound requests
+                    // Collect expired request IDs first, then remove and notify
+                    let expired_requests: Vec<_> = pending_requests
+                        .iter()
+                        .filter(|(_, pending)| now.duration_since(pending.created_at) > PENDING_REQUEST_TIMEOUT)
+                        .map(|(req_id, pending)| (*req_id, now.duration_since(pending.created_at).as_secs()))
+                        .collect();
+
+                    for (req_id, age_secs) in &expired_requests {
+                        warn!(
+                            ?req_id,
+                            age_secs,
+                            "Cleaning up timed-out outbound request"
+                        );
+                        if let Some(pending) = pending_requests.remove(req_id) {
+                            // Send timeout error to the waiting caller
+                            let _ = pending.response_tx.send(Err(NetworkError::Timeout));
+                        }
+                    }
+
+                    if !expired_requests.is_empty() {
+                        info!(
+                            cleaned_requests = expired_requests.len(),
+                            remaining = pending_requests.len(),
+                            "Cleaned up timed-out outbound requests"
+                        );
+                    }
+
+                    // 3. Record metrics for pending response channels
                     metrics::record_pending_response_channels(pending_response_channels.len());
 
-                    // 3. Process pending reconnections
+                    // 4. Process pending reconnections
                     let reconnects_due: Vec<_> = pending_reconnects
                         .iter()
                         .filter(|(_, scheduled)| now >= **scheduled)
@@ -1253,10 +1289,7 @@ impl Libp2pAdapter {
     async fn handle_command(
         swarm: &mut Swarm<Behaviour>,
         cmd: SwarmCommand,
-        pending_requests: &mut HashMap<
-            request_response::OutboundRequestId,
-            tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
-        >,
+        pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
         pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
     ) {
         match cmd {
@@ -1320,7 +1353,13 @@ impl Libp2pAdapter {
                     .behaviour_mut()
                     .request_response
                     .send_request(&peer, data);
-                pending_requests.insert(req_id, response_tx);
+                pending_requests.insert(
+                    req_id,
+                    PendingRequest {
+                        response_tx,
+                        created_at: std::time::Instant::now(),
+                    },
+                );
                 debug!("Sent block request to {:?} for height {}", peer, height);
             }
             SwarmCommand::SendBlockResponse {
@@ -1353,7 +1392,13 @@ impl Libp2pAdapter {
                     .behaviour_mut()
                     .request_response
                     .send_request(&peer, data);
-                pending_requests.insert(req_id, response_tx);
+                pending_requests.insert(
+                    req_id,
+                    PendingRequest {
+                        response_tx,
+                        created_at: std::time::Instant::now(),
+                    },
+                );
                 debug!(
                     "Sent transaction request to {:?} for block {:?}",
                     peer, block_hash
@@ -1389,7 +1434,13 @@ impl Libp2pAdapter {
                     .behaviour_mut()
                     .request_response
                     .send_request(&peer, data);
-                pending_requests.insert(req_id, response_tx);
+                pending_requests.insert(
+                    req_id,
+                    PendingRequest {
+                        response_tx,
+                        created_at: std::time::Instant::now(),
+                    },
+                );
                 debug!(
                     "Sent certificate request to {:?} for block {:?}",
                     peer, block_hash
@@ -1420,10 +1471,7 @@ impl Libp2pAdapter {
         event: SwarmEvent<BehaviourEvent>,
         consensus_tx: &mpsc::Sender<Event>,
         peer_validators: &Arc<DashMap<Libp2pPeerId, ValidatorId>>,
-        pending_requests: &mut HashMap<
-            request_response::OutboundRequestId,
-            tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
-        >,
+        pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
         pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
         next_channel_id: &mut u64,
         sync_request_tx: &mpsc::UnboundedSender<InboundSyncRequest>,
@@ -1576,8 +1624,8 @@ impl Libp2pAdapter {
                 },
             )) => {
                 // Route response to waiting requester
-                if let Some(tx) = pending_requests.remove(&request_id) {
-                    let _ = tx.send(Ok(response));
+                if let Some(pending) = pending_requests.remove(&request_id) {
+                    let _ = pending.response_tx.send(Ok(response));
                 }
             }
 
@@ -1588,11 +1636,13 @@ impl Libp2pAdapter {
                 },
             )) => {
                 warn!("Request {:?} failed: {:?}", request_id, error);
-                if let Some(tx) = pending_requests.remove(&request_id) {
-                    let _ = tx.send(Err(NetworkError::NetworkError(format!(
-                        "Request failed: {:?}",
-                        error
-                    ))));
+                if let Some(pending) = pending_requests.remove(&request_id) {
+                    let _ = pending
+                        .response_tx
+                        .send(Err(NetworkError::NetworkError(format!(
+                            "Request failed: {:?}",
+                            error
+                        ))));
                 }
             }
 

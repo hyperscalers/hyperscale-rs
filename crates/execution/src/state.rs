@@ -52,6 +52,20 @@ use crate::trackers::{CertificateTracker, VoteTracker};
 /// even after the proposer has committed the block.
 const CERTIFICATE_RETENTION_BLOCKS: u64 = 100;
 
+/// Number of blocks to retain executed transaction hashes for deduplication.
+/// This prevents re-execution of recently committed transactions while allowing
+/// cleanup of old entries to prevent unbounded memory growth.
+const EXECUTED_TX_RETENTION_BLOCKS: u64 = 100;
+
+/// Number of blocks to retain early arrival votes/certificates before cleanup.
+/// If an early arrival hasn't been processed within this many blocks, it's
+/// likely stale and should be removed to prevent unbounded memory growth.
+const EARLY_ARRIVAL_RETENTION_BLOCKS: u64 = 1000;
+
+/// Number of blocks to retain verified vote cache entries.
+/// Votes older than this are cleaned up regardless of finalization status.
+const VERIFIED_VOTE_RETENTION_BLOCKS: u64 = 200;
+
 /// Key type for the pending verifications reverse index.
 /// Identifies which type of verification and the secondary key (validator or shard).
 /// Note: Provision verification is handled by ProvisionCoordinator.
@@ -93,12 +107,8 @@ pub struct ExecutionState {
     now: Duration,
 
     /// Transactions that have been executed (deduplication).
-    executed_txs: HashSet<Hash>,
-
-    /// Pending single-shard executions waiting for callback.
-    /// Maps block_hash -> list of single-shard transactions in that block.
-    /// After execution completes, we create votes instead of direct certificates.
-    pending_single_shard_executions: HashMap<Hash, Vec<Arc<RoutableTransaction>>>,
+    /// Maps tx_hash -> block_height when executed, enabling height-based cleanup.
+    executed_txs: HashMap<Hash, u64>,
 
     /// Finalized transaction certificates ready for block inclusion.
     /// Uses BTreeMap for deterministic iteration order.
@@ -152,17 +162,17 @@ pub struct ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════
     /// ProvisioningComplete events that arrived before the block was committed.
     /// This can happen when provisions reach quorum before we've seen the block.
-    /// Maps tx_hash -> provisions.
-    /// Unbounded: eviction would cause unrecoverable transaction loss, and memory
-    /// cost is trivial (provisions are small, buffer drains on block commit).
-    early_provisioning_complete: HashMap<Hash, Vec<StateProvision>>,
+    /// Maps tx_hash -> (provisions, first_arrival_height) for cleanup of stale entries.
+    early_provisioning_complete: HashMap<Hash, (Vec<StateProvision>, u64)>,
 
     /// Votes that arrived before tracking started.
     /// Uses HashSet for O(1) deduplication instead of O(n) Vec::contains.
-    early_votes: HashMap<Hash, HashSet<StateVoteBlock>>,
+    /// Tracks (votes, first_arrival_height) for cleanup of stale entries.
+    early_votes: HashMap<Hash, (HashSet<StateVoteBlock>, u64)>,
 
     /// Certificates that arrived before tracking started.
-    early_certificates: HashMap<Hash, Vec<StateCertificate>>,
+    /// Tracks (certificates, first_arrival_height) for cleanup of stale entries.
+    early_certificates: HashMap<Hash, (Vec<StateCertificate>, u64)>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Pending signature verifications
@@ -287,8 +297,7 @@ impl ExecutionState {
             topology,
             signing_key,
             now: Duration::ZERO,
-            executed_txs: HashSet::new(),
-            pending_single_shard_executions: HashMap::new(),
+            executed_txs: HashMap::new(),
             finalized_certificates: BTreeMap::new(),
             recently_committed_certificates: HashMap::new(),
             committed_height: 0,
@@ -424,7 +433,7 @@ impl ExecutionState {
         // Filter out already-executed transactions (dedup)
         let new_txs: Vec<_> = transactions
             .into_iter()
-            .filter(|tx| !self.executed_txs.contains(&tx.hash()))
+            .filter(|tx| !self.executed_txs.contains_key(&tx.hash()))
             .collect();
 
         if new_txs.is_empty() {
@@ -437,10 +446,20 @@ impl ExecutionState {
             "Starting execution for new transactions"
         );
 
-        // Mark all as executed (for dedup)
-        for tx in &new_txs {
-            self.executed_txs.insert(tx.hash());
+        // Update committed height for cleanup calculations
+        if height > self.committed_height {
+            self.committed_height = height;
         }
+
+        // Mark all as executed (for dedup) with current height for later cleanup
+        for tx in &new_txs {
+            self.executed_txs.insert(tx.hash(), height);
+        }
+
+        // Prune old entries to prevent unbounded growth
+        self.prune_executed_txs();
+        self.prune_early_arrivals();
+        self.prune_verified_votes();
 
         // Separate single-shard and cross-shard transactions
         let (single_shard, cross_shard): (Vec<_>, Vec<_>) =
@@ -487,7 +506,7 @@ impl ExecutionState {
         // Process speculative hits - start tracking and emit results for runner to sign
         let mut cached_results = Vec::new();
         for (tx, result) in speculative_hits {
-            actions.extend(self.start_single_shard_execution(tx.clone(), height, block_hash));
+            actions.extend(self.start_single_shard_execution(tx.clone()));
             cached_results.push(result);
         }
         if !cached_results.is_empty() {
@@ -502,7 +521,7 @@ impl ExecutionState {
         for tx in awaiting_speculation {
             let tx_hash = tx.hash();
             // Start execution tracking (vote trackers, etc.) but don't emit ExecuteTransactions
-            actions.extend(self.start_single_shard_execution(tx.clone(), height, block_hash));
+            actions.extend(self.start_single_shard_execution(tx.clone()));
             // Track that this committed tx is waiting for speculation
             self.committed_awaiting_speculation
                 .insert(tx_hash, (block_hash, tx));
@@ -510,7 +529,7 @@ impl ExecutionState {
 
         // Start execution tracking for transactions that need execution
         for tx in &txs_needing_execution {
-            actions.extend(self.start_single_shard_execution(tx.clone(), height, block_hash));
+            actions.extend(self.start_single_shard_execution(tx.clone()));
         }
 
         // Batch execute transactions that didn't have cached results
@@ -539,12 +558,7 @@ impl ExecutionState {
     /// 4. Vote aggregator collects votes and creates certificate when quorum reached
     ///
     /// This requires BLS signature aggregation for all transactions, not just cross-shard ones.
-    fn start_single_shard_execution(
-        &mut self,
-        tx: Arc<RoutableTransaction>,
-        _height: u64,
-        block_hash: Hash,
-    ) -> Vec<Action> {
+    fn start_single_shard_execution(&mut self, tx: Arc<RoutableTransaction>) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = tx.hash();
         let local_shard = self.local_shard();
@@ -573,13 +587,13 @@ impl ExecutionState {
         // Step 3: Replay any early votes that arrived before tracking started.
         // IMPORTANT: We must go through on_vote() to ensure proper signature verification.
         // Early votes were buffered without verification, so they need to be verified now.
-        if let Some(early) = self.early_votes.remove(&tx_hash) {
+        if let Some((early_votes, _arrival_height)) = self.early_votes.remove(&tx_hash) {
             tracing::debug!(
                 tx_hash = ?tx_hash,
-                count = early.len(),
+                count = early_votes.len(),
                 "Replaying early votes for single-shard tx"
             );
-            for vote in early {
+            for vote in early_votes {
                 // Use on_vote() to ensure signature verification happens
                 actions.extend(self.on_vote(vote));
             }
@@ -588,24 +602,17 @@ impl ExecutionState {
         // Step 4: Replay any early certificates (shouldn't happen often for single-shard).
         // IMPORTANT: We must go through on_certificate() to ensure proper signature verification.
         // Early certificates were buffered without verification, so they need to be verified now.
-        if let Some(early) = self.early_certificates.remove(&tx_hash) {
+        if let Some((early_certs, _arrival_height)) = self.early_certificates.remove(&tx_hash) {
             tracing::debug!(
                 tx_hash = ?tx_hash,
-                count = early.len(),
+                count = early_certs.len(),
                 "Replaying early certificates for single-shard tx"
             );
-            for cert in early {
+            for cert in early_certs {
                 // Use on_certificate() to ensure signature verification happens
                 actions.extend(self.on_certificate(cert));
             }
         }
-
-        // Step 5: Track pending single-shard execution
-        // ExecuteTransactions is emitted by on_block_committed after all txs are collected
-        self.pending_single_shard_executions
-            .entry(block_hash)
-            .or_default()
-            .push(tx);
 
         actions
     }
@@ -668,7 +675,9 @@ impl ExecutionState {
                 .insert(tx_hash, (tx.clone(), height));
 
             // Check if ProvisioningComplete arrived before the block committed
-            if let Some(provisions) = self.early_provisioning_complete.remove(&tx_hash) {
+            if let Some((provisions, _arrival_height)) =
+                self.early_provisioning_complete.remove(&tx_hash)
+            {
                 tracing::debug!(
                     tx_hash = ?tx_hash,
                     count = provisions.len(),
@@ -695,9 +704,9 @@ impl ExecutionState {
         // Replay any early votes.
         // IMPORTANT: We must go through on_vote() to ensure proper signature verification.
         // Early votes were buffered without verification, so they need to be verified now.
-        if let Some(early) = self.early_votes.remove(&tx_hash) {
-            tracing::debug!(tx_hash = ?tx_hash, count = early.len(), "Replaying early votes");
-            for vote in early {
+        if let Some((early_votes, _arrival_height)) = self.early_votes.remove(&tx_hash) {
+            tracing::debug!(tx_hash = ?tx_hash, count = early_votes.len(), "Replaying early votes");
+            for vote in early_votes {
                 // Use on_vote() to ensure signature verification happens
                 actions.extend(self.on_vote(vote));
             }
@@ -706,9 +715,9 @@ impl ExecutionState {
         // Replay any early certificates.
         // IMPORTANT: We must go through on_certificate() to ensure proper signature verification.
         // Early certificates were buffered without verification, so they need to be verified now.
-        if let Some(early) = self.early_certificates.remove(&tx_hash) {
-            tracing::debug!(tx_hash = ?tx_hash, count = early.len(), "Replaying early certificates");
-            for cert in early {
+        if let Some((early_certs, _arrival_height)) = self.early_certificates.remove(&tx_hash) {
+            tracing::debug!(tx_hash = ?tx_hash, count = early_certs.len(), "Replaying early certificates");
+            for cert in early_certs {
                 // Use on_certificate() to ensure signature verification happens
                 actions.extend(self.on_certificate(cert));
             }
@@ -829,9 +838,10 @@ impl ExecutionState {
                 shard = local_shard.0,
                 "Provisioning complete before block committed, buffering"
             );
-            // No buffer limit - eviction causes unrecoverable transaction loss
-            // Memory cost is trivial (provisions are small, buffer drains on block commit)
-            self.early_provisioning_complete.insert(tx_hash, provisions);
+            // Track arrival height for cleanup of stale entries
+            let current_height = self.committed_height;
+            self.early_provisioning_complete
+                .insert(tx_hash, (provisions, current_height));
             return vec![];
         };
 
@@ -876,8 +886,13 @@ impl ExecutionState {
                 return vec![];
             }
             // Buffer for later (HashSet provides O(1) deduplication)
-            // No buffer limit - eviction causes unrecoverable transaction loss
-            self.early_votes.entry(tx_hash).or_default().insert(vote);
+            // Track arrival height for cleanup of stale entries
+            let current_height = self.committed_height;
+            self.early_votes
+                .entry(tx_hash)
+                .or_insert_with(|| (HashSet::new(), current_height))
+                .0
+                .insert(vote);
             return vec![];
         }
 
@@ -1139,11 +1154,12 @@ impl ExecutionState {
             if self.finalized_certificates.contains_key(&tx_hash) {
                 return vec![];
             }
-            // Buffer for later
-            // No buffer limit - eviction causes unrecoverable transaction loss
+            // Buffer for later, track arrival height for cleanup of stale entries
+            let current_height = self.committed_height;
             self.early_certificates
                 .entry(tx_hash)
-                .or_default()
+                .or_insert_with(|| (Vec::new(), current_height))
+                .0
                 .push(cert);
             return vec![];
         }
@@ -1485,6 +1501,34 @@ impl ExecutionState {
                 .insert(*tx_hash, (cert, commit_height));
         }
 
+        // Clean up all transaction tracking state now that it's finalized.
+        // This is the same cleanup done by cleanup_transaction() for aborts/deferrals,
+        // but we need to do it here for successful completions too.
+        self.pending_provisioning.remove(tx_hash);
+        self.pending_provision_fetches.remove(tx_hash);
+        self.vote_trackers.remove(tx_hash);
+        self.state_certificates.remove(tx_hash);
+        self.certificate_trackers.remove(tx_hash);
+        self.early_provisioning_complete.remove(tx_hash);
+        self.early_votes.remove(tx_hash);
+        self.early_certificates.remove(tx_hash);
+
+        // Pending verifications cleanup using reverse index for O(k) instead of O(n)
+        if let Some(keys) = self.pending_verifications_by_tx.remove(tx_hash) {
+            for key in keys {
+                match key {
+                    PendingVerificationKey::Vote(vid) => {
+                        self.pending_vote_verifications.remove(&(*tx_hash, vid));
+                    }
+                    PendingVerificationKey::Certificate(shard) => {
+                        self.pending_cert_verifications.remove(&(*tx_hash, shard));
+                    }
+                }
+            }
+        }
+        self.pending_fetched_cert_verifications.remove(tx_hash);
+        self.pending_cert_aggregations.remove(tx_hash);
+
         // Update committed height and prune old entries
         if commit_height > self.committed_height {
             self.committed_height = commit_height;
@@ -1503,7 +1547,98 @@ impl ExecutionState {
 
     /// Check if a transaction has been executed.
     pub fn is_executed(&self, tx_hash: &Hash) -> bool {
-        self.executed_txs.contains(tx_hash)
+        self.executed_txs.contains_key(tx_hash)
+    }
+
+    /// Prune old executed transaction entries to prevent unbounded growth.
+    fn prune_executed_txs(&mut self) {
+        let cutoff = self
+            .committed_height
+            .saturating_sub(EXECUTED_TX_RETENTION_BLOCKS);
+        self.executed_txs.retain(|_, height| *height > cutoff);
+    }
+
+    /// Prune stale early arrival entries to prevent unbounded growth.
+    ///
+    /// Early arrivals (votes, certificates, and provisioning events that arrive
+    /// before the transaction is being tracked) are kept for a generous window
+    /// to allow for block reordering and sync delays. After
+    /// EARLY_ARRIVAL_RETENTION_BLOCKS, they are considered stale and removed.
+    fn prune_early_arrivals(&mut self) {
+        let cutoff = self
+            .committed_height
+            .saturating_sub(EARLY_ARRIVAL_RETENTION_BLOCKS);
+
+        let before_provisions = self.early_provisioning_complete.len();
+        self.early_provisioning_complete
+            .retain(|_, (_, arrival_height)| *arrival_height > cutoff);
+        let pruned_provisions = before_provisions - self.early_provisioning_complete.len();
+
+        let before_votes = self.early_votes.len();
+        self.early_votes
+            .retain(|_, (_, arrival_height)| *arrival_height > cutoff);
+        let pruned_votes = before_votes - self.early_votes.len();
+
+        let before_certs = self.early_certificates.len();
+        self.early_certificates
+            .retain(|_, (_, arrival_height)| *arrival_height > cutoff);
+        let pruned_certs = before_certs - self.early_certificates.len();
+
+        if pruned_provisions > 0 || pruned_votes > 0 || pruned_certs > 0 {
+            tracing::debug!(
+                pruned_provisions,
+                pruned_votes,
+                pruned_certs,
+                cutoff_height = cutoff,
+                "Pruned stale early arrivals"
+            );
+        }
+    }
+
+    /// Prune old verified vote cache entries to prevent unbounded growth.
+    ///
+    /// The verified vote cache stores signatures we've already verified to avoid
+    /// re-verification. Entries older than VERIFIED_VOTE_RETENTION_BLOCKS are
+    /// cleaned up regardless of whether the transaction has finalized.
+    fn prune_verified_votes(&mut self) {
+        let cutoff = self
+            .committed_height
+            .saturating_sub(VERIFIED_VOTE_RETENTION_BLOCKS);
+
+        // Collect tx_hashes that have all votes older than cutoff
+        let mut tx_hashes_to_clean = Vec::new();
+        for (tx_hash, validators) in &self.verified_votes_by_tx {
+            // Check if all votes for this tx are old
+            let all_old = validators.iter().all(|vid| {
+                self.verified_state_votes
+                    .get(&(*tx_hash, *vid))
+                    .map(|h| *h <= cutoff)
+                    .unwrap_or(true)
+            });
+            if all_old {
+                tx_hashes_to_clean.push(*tx_hash);
+            }
+        }
+
+        // Clean up old entries
+        let mut pruned_count = 0;
+        for tx_hash in tx_hashes_to_clean {
+            if let Some(validators) = self.verified_votes_by_tx.remove(&tx_hash) {
+                for vid in validators {
+                    if self.verified_state_votes.remove(&(tx_hash, vid)).is_some() {
+                        pruned_count += 1;
+                    }
+                }
+            }
+        }
+
+        if pruned_count > 0 {
+            tracing::debug!(
+                pruned_count,
+                cutoff_height = cutoff,
+                "Pruned old verified vote cache entries"
+            );
+        }
     }
 
     /// Check if a transaction is finalized.
@@ -1536,7 +1671,7 @@ impl ExecutionState {
         let early_cert_count = self
             .early_certificates
             .get(tx_hash)
-            .map(|v| v.len())
+            .map(|(v, _)| v.len())
             .unwrap_or(0);
 
         let cert_tracker_info = if let Some(tracker) = self.certificate_trackers.get(tx_hash) {
@@ -1868,7 +2003,7 @@ impl ExecutionState {
             .filter(|tx| self.is_single_shard(tx))
             .filter(|tx| !self.speculative_results.contains_key(&tx.hash()))
             .filter(|tx| !self.speculative_in_flight_txs.contains(&tx.hash()))
-            .filter(|tx| !self.executed_txs.contains(&tx.hash()))
+            .filter(|tx| !self.executed_txs.contains_key(&tx.hash()))
             .collect();
 
         if single_shard_txs.is_empty() {
@@ -1952,7 +2087,7 @@ impl ExecutionState {
             }
 
             // Skip if already executed through some other path
-            if self.executed_txs.contains(&tx_hash) {
+            if self.executed_txs.contains_key(&tx_hash) {
                 tracing::debug!(
                     tx_hash = ?tx_hash,
                     "Discarding speculative result - tx already executed"
@@ -2185,10 +2320,6 @@ impl std::fmt::Debug for ExecutionState {
             .field("validator_id", &self.validator_id())
             .field("shard", &self.local_shard())
             .field("executed_txs", &self.executed_txs.len())
-            .field(
-                "pending_single_shard_executions",
-                &self.pending_single_shard_executions.len(),
-            )
             .field("finalized_certificates", &self.finalized_certificates.len())
             .field("pending_provisioning", &self.pending_provisioning.len())
             .field("vote_trackers", &self.vote_trackers.len())
@@ -2282,7 +2413,6 @@ mod tests {
     fn test_execution_state_creation() {
         let state = make_test_state();
         assert!(state.finalized_certificates.is_empty());
-        assert!(state.pending_single_shard_executions.is_empty());
     }
 
     #[test]

@@ -131,11 +131,12 @@ pub struct MempoolState {
     pool: BTreeMap<Hash, PoolEntry>,
 
     /// Blocked transactions waiting for their winner to complete.
-    /// Maps: loser_tx_hash -> (loser_tx, winner_tx_hash)
+    /// Maps: loser_tx_hash -> (loser_tx, winner_tx_hash, blocked_at_height)
     ///
     /// When a deferral commits, the loser is added here with status Blocked.
     /// When the winner's certificate commits, we create a retry.
-    blocked_by: HashMap<Hash, (Arc<RoutableTransaction>, Hash)>,
+    /// The blocked_at_height enables cleanup of stale entries.
+    blocked_by: HashMap<Hash, (Arc<RoutableTransaction>, Hash, BlockHeight)>,
 
     /// Reverse index: winner_tx_hash -> Vec<loser_tx_hash>
     /// Allows O(1) lookup of all losers blocked by a winner.
@@ -623,8 +624,9 @@ impl MempoolState {
                     self.remove_locked_nodes(&tx);
                 }
 
-                // Track for retry when winner completes
-                self.blocked_by.insert(tx_hash, (tx, *winner_tx_hash));
+                // Track for retry when winner completes, with height for cleanup
+                self.blocked_by
+                    .insert(tx_hash, (tx, *winner_tx_hash, height));
 
                 // Maintain reverse index for O(1) lookup
                 self.blocked_losers_by_winner
@@ -704,7 +706,8 @@ impl MempoolState {
 
         for loser_hash in loser_hashes {
             // First check if the loser is in blocked_by (normal case - tx was in pool when deferred)
-            if let Some((loser_tx, winner_hash)) = self.blocked_by.remove(&loser_hash) {
+            if let Some((loser_tx, winner_hash, _blocked_at)) = self.blocked_by.remove(&loser_hash)
+            {
                 // Create retry transaction
                 let retry_tx = loser_tx.create_retry(winner_hash, height);
                 let retry_hash = retry_tx.hash();
@@ -800,7 +803,7 @@ impl MempoolState {
 
         for loser_hash in loser_hashes {
             // Get the loser from blocked_by and create a retry
-            if let Some((loser_tx, _winner)) = self.blocked_by.remove(&loser_hash) {
+            if let Some((loser_tx, _winner, _blocked_at)) = self.blocked_by.remove(&loser_hash) {
                 // Create retry transaction for the blocked loser
                 let retry_tx = loser_tx.create_retry(winner_hash, height);
                 let retry_hash = retry_tx.hash();
@@ -1002,7 +1005,8 @@ impl MempoolState {
         let height = self.current_height;
         for loser_hash in loser_hashes {
             // Get the loser transaction from blocked_by
-            let Some((loser_tx, winner_hash)) = self.blocked_by.remove(&loser_hash) else {
+            let Some((loser_tx, winner_hash, _blocked_at)) = self.blocked_by.remove(&loser_hash)
+            else {
                 continue;
             };
             // Create retry transaction
@@ -1733,6 +1737,54 @@ impl MempoolState {
 
         // Also clean up completed_winners using the same retention policy
         self.completed_winners.retain(|_, height| height.0 > cutoff);
+
+        // Clean up pending_deferrals - these are waiting for a transaction that
+        // hasn't arrived yet. If it's been too long, the transaction is likely
+        // never coming and we should clean up to prevent unbounded growth.
+        let before_deferrals = self.pending_deferrals.len();
+        self.pending_deferrals
+            .retain(|_, (_, height)| height.0 > cutoff);
+        let cleaned_deferrals = before_deferrals - self.pending_deferrals.len();
+
+        // Clean up pending_retries - these are waiting for a loser transaction
+        // to arrive so we can create a retry. Same cleanup logic applies.
+        let before_retries = self.pending_retries.len();
+        self.pending_retries
+            .retain(|_, (_, height)| height.0 > cutoff);
+        let cleaned_retries = before_retries - self.pending_retries.len();
+
+        // Clean up blocked_by - these are transactions waiting for their winner to
+        // complete. If it's been too long, the winner is likely never completing.
+        let before_blocked = self.blocked_by.len();
+        let stale_blocked: Vec<Hash> = self
+            .blocked_by
+            .iter()
+            .filter(|(_, (_, _, blocked_at))| blocked_at.0 <= cutoff)
+            .map(|(hash, _)| *hash)
+            .collect();
+
+        for loser_hash in &stale_blocked {
+            if let Some((_, winner_hash, _)) = self.blocked_by.remove(loser_hash) {
+                // Also clean up the reverse index
+                if let Some(losers) = self.blocked_losers_by_winner.get_mut(&winner_hash) {
+                    losers.retain(|h| h != loser_hash);
+                    if losers.is_empty() {
+                        self.blocked_losers_by_winner.remove(&winner_hash);
+                    }
+                }
+            }
+        }
+        let cleaned_blocked = before_blocked - self.blocked_by.len();
+
+        if cleaned_deferrals > 0 || cleaned_retries > 0 || cleaned_blocked > 0 {
+            tracing::debug!(
+                cleaned_deferrals,
+                cleaned_retries,
+                cleaned_blocked,
+                cutoff_height = cutoff,
+                "Cleaned up stale pending deferrals/retries/blocked"
+            );
+        }
 
         before_count - self.tombstones.len()
     }

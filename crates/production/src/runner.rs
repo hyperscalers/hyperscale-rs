@@ -175,7 +175,20 @@ struct PendingGossipCertVerification {
     pending_shards: std::collections::HashSet<ShardGroupId>,
     /// Whether any verification has failed.
     failed: bool,
+    /// When this verification started (for TTL cleanup).
+    created_at: std::time::Instant,
 }
+
+/// Maximum age for pending gossip certificate verifications before cleanup.
+/// If verification callbacks don't arrive within this time, the entry is removed.
+/// This is short (30s) since verification should complete in milliseconds.
+const PENDING_GOSSIP_CERT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum age for RPC-submitted transaction tracking before cleanup.
+/// If a transaction doesn't finalize within this time, it's removed from tracking
+/// to prevent unbounded memory growth. This is generous (10 minutes) to allow
+/// for slow cross-shard transactions.
+const RPC_SUBMITTED_TX_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Handle for shutting down a running ProductionRunner.
 ///
@@ -639,7 +652,7 @@ impl ProductionRunnerBuilder {
             fetch_handler,
             dispatch_tx,
             action_dispatcher,
-            rpc_submitted_txs: std::collections::HashSet::new(),
+            rpc_submitted_txs: std::collections::HashMap::new(),
             pending_gossip_cert_verifications: std::collections::HashMap::new(),
         })
     }
@@ -766,10 +779,11 @@ pub struct ProductionRunner {
     /// Handle for the dedicated action dispatcher task.
     #[allow(dead_code)]
     action_dispatcher: ActionDispatcherHandle,
-    /// Set of transaction hashes that were submitted via RPC (locally).
+    /// Transaction hashes that were submitted via RPC (locally) with submission time.
     /// Used to track which transactions should contribute to latency metrics.
     /// Transactions are added when received via RPC, removed when finalized.
-    rpc_submitted_txs: std::collections::HashSet<hyperscale_types::Hash>,
+    /// Old entries are cleaned up periodically to prevent unbounded growth.
+    rpc_submitted_txs: std::collections::HashMap<hyperscale_types::Hash, std::time::Instant>,
     /// Pending verifications for gossiped TransactionCertificates.
     /// Maps tx_hash -> verification state. When all shards verified, certificate is
     /// persisted and GossipedCertificateVerified event sent to state machine.
@@ -1123,6 +1137,46 @@ impl ProductionRunner {
                             snap.accepting_rpc_transactions = accepting;
                         }
                     }
+
+                    // Clean up old RPC-submitted transaction entries to prevent unbounded growth.
+                    // Transactions that don't finalize within RPC_SUBMITTED_TX_TIMEOUT are removed.
+                    let now = std::time::Instant::now();
+                    let before_count = self.rpc_submitted_txs.len();
+                    self.rpc_submitted_txs
+                        .retain(|_, submitted_at| now.duration_since(*submitted_at) < RPC_SUBMITTED_TX_TIMEOUT);
+                    let cleaned = before_count - self.rpc_submitted_txs.len();
+                    if cleaned > 0 {
+                        tracing::debug!(
+                            cleaned,
+                            remaining = self.rpc_submitted_txs.len(),
+                            "Cleaned up stale RPC-submitted transaction tracking"
+                        );
+                    }
+
+                    // Clean up stale pending gossip certificate verifications.
+                    // These can leak if verification callbacks never arrive (e.g., thread pool issues).
+                    // Each entry holds a full TransactionCertificate (~2-10KB), so this is critical.
+                    let before_gossip = self.pending_gossip_cert_verifications.len();
+                    self.pending_gossip_cert_verifications.retain(|tx_hash, pending| {
+                        let expired = now.duration_since(pending.created_at) >= PENDING_GOSSIP_CERT_TIMEOUT;
+                        if expired {
+                            tracing::warn!(
+                                ?tx_hash,
+                                pending_shards = pending.pending_shards.len(),
+                                age_secs = now.duration_since(pending.created_at).as_secs(),
+                                "Cleaning up stale pending gossip cert verification"
+                            );
+                        }
+                        !expired
+                    });
+                    let cleaned_gossip = before_gossip - self.pending_gossip_cert_verifications.len();
+                    if cleaned_gossip > 0 {
+                        tracing::warn!(
+                            cleaned_gossip,
+                            remaining = self.pending_gossip_cert_verifications.len(),
+                            "Cleaned up stale pending gossip cert verifications - possible crypto pool issue"
+                        );
+                    }
                 }
 
                 // CRITICAL PRIORITY: Timer events (proposal, cleanup)
@@ -1237,6 +1291,7 @@ impl ProductionRunner {
                                         certificate: certificate.clone(),
                                         pending_shards: pending_shards.clone(),
                                         failed: false,
+                                        created_at: std::time::Instant::now(),
                                     },
                                 );
 
@@ -1638,7 +1693,7 @@ impl ProductionRunner {
                     let _tx_guard = tx_span.enter();
 
                     // Track this as an RPC-submitted transaction for latency metrics
-                    self.rpc_submitted_txs.insert(tx_hash);
+                    self.rpc_submitted_txs.insert(tx_hash, std::time::Instant::now());
 
                     // Step 1: Gossip to all relevant shards FIRST
                     // This ensures other validators see the transaction even if we fail later
@@ -2523,8 +2578,7 @@ impl ProductionRunner {
                 // submitted_locally would always be false.
                 if status.is_final() {
                     // Check if this was an RPC-submitted transaction
-                    let was_rpc_submitted = self.rpc_submitted_txs.remove(&tx_hash);
-                    if was_rpc_submitted {
+                    if let Some(_submitted_at) = self.rpc_submitted_txs.remove(&tx_hash) {
                         // Calculate latency from submission to finalization
                         let now = self.state.now();
                         let latency_secs = now.saturating_sub(added_at).as_secs_f64();

@@ -397,6 +397,7 @@ impl LivelockState {
         // Remove from tracking
         self.committed_tracker.remove(tx_hash);
         self.provision_tracker.remove_tx(tx_hash);
+        self.commitment_proofs.remove(tx_hash);
 
         debug!(
             tx = %tx_hash,
@@ -410,6 +411,7 @@ impl LivelockState {
         // Remove from tracking (no tombstone needed - abort is terminal)
         self.committed_tracker.remove(tx_hash);
         self.provision_tracker.remove_tx(tx_hash);
+        self.commitment_proofs.remove(tx_hash);
 
         debug!(tx = %tx_hash, "Abort committed - removed from tracking");
     }
@@ -419,6 +421,7 @@ impl LivelockState {
         // Remove from tracking
         self.committed_tracker.remove(tx_hash);
         self.provision_tracker.remove_tx(tx_hash);
+        self.commitment_proofs.remove(tx_hash);
 
         trace!(tx = %tx_hash, "Certificate committed - removed from tracking");
     }
