@@ -1887,10 +1887,15 @@ impl Libp2pAdapter {
                             }
                         }
 
-                        // Direct messages are critical, send to consensus immediately
-                        if consensus_tx.send(event).await.is_err() {
-                            warn!("Consensus channel closed during direct message dispatch");
-                        }
+                        // Direct messages are time critical, send to consensus immediately
+                        // We spawn this to avoid blocking the swarm loop waiting for channel capacity.
+                        // Blocking here prevents sending the Response, causing timeouts on the sender side.
+                        let tx = consensus_tx.clone();
+                        tokio::spawn(async move {
+                            if tx.send(event).await.is_err() {
+                                warn!("Consensus channel closed during direct message dispatch");
+                            }
+                        });
                     }
                     SwarmAction::SendResponse {
                         channel,
