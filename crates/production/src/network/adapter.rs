@@ -1687,12 +1687,14 @@ impl Libp2pAdapter {
                                 }
                                 event => {
                                     // Consensus messages go directly to high-priority channel
-                                    // Extract trace context for distributed tracing (when feature enabled)
-                                    let send_future = async {
-                                        if consensus_tx.send(event).await.is_err() {
+                                    // CRITICAL: Spawn to avoid blocking the swarm loop
+                                    let tx = consensus_tx.clone();
+                                    let send_future = async move {
+                                        if tx.send(event).await.is_err() {
                                             warn!("Consensus channel closed");
                                         }
                                     };
+
                                     #[cfg(feature = "trace-propagation")]
                                     let send_future = {
                                         let span = tracing::trace_span!("cross_shard_message");
@@ -1705,7 +1707,7 @@ impl Libp2pAdapter {
                                         send_future.instrument(span)
                                     };
 
-                                    send_future.await;
+                                    tokio::spawn(send_future);
                                 }
                             }
                         }
