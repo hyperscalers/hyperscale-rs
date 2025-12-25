@@ -92,11 +92,15 @@ impl DirectValidatorNetwork {
         let topic = super::codec::topic_for_message(message, shard);
 
         if committee.is_empty() {
-            debug!("Direct broadcast to empty committee (skipping)");
+            info!(
+                msg_type = message.type_name(),
+                "Direct broadcast to empty committee (skipping)"
+            );
             return Ok(());
         }
 
-        debug!(
+        info!(
+            msg_type = message.type_name(),
             topic = %topic,
             shard = shard.0,
             recipient_count = committee.len(),
@@ -139,6 +143,12 @@ impl DirectValidatorNetwork {
                     // If channel closed, we are shutting down
                     return Err(NetworkError::NetworkShutdown);
                 } else {
+                    info!(
+                        msg_type = message.type_name(),
+                        target = %validator_id,
+                        peer = %*peer_id,
+                        "Sent direct message"
+                    );
                     sent_count += 1;
                 }
             } else {
