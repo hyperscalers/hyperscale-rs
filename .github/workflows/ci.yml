@@ -34,7 +34,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
+      - name: Install lld
+        run: sudo apt-get update && sudo apt-get install -y lld
       - name: Cargo Test
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
         run: cargo test
       - name: Cargo Clippy
         run: cargo clippy -- -D warnings
