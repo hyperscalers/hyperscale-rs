@@ -179,19 +179,25 @@ voting_power = 1"
 done
 
 # 4. Build Bootstrap Peer List
+# 4. Build Bootstrap Peer List
 BOOTSTRAP_PEERS=""
+# Only use the first node as bootstrap peer to avoid a full mesh connection storm
+# and ensure O(N) connections instead of O(N^2)
+MAX_BOOTSTRAP_PEERS=1
+
 for id in $(seq 0 $((TOTAL_NODES - 1))); do
+    if [ "$id" -ge "$MAX_BOOTSTRAP_PEERS" ]; then
+        break
+    fi
+
     IP="${NODE_HOST_IPS[$id]}"
     PID="${PEER_IDS[$id]}"
     PORT="${NODE_P2P_PORTS[$id]}"
     
-    # Calculate local node index to determine port offset
-    v=$((id % NODES_PER_HOST))
-    TCP_PORT=$((TCP_BASE_PORT + v))
-    
     if [ -n "$BOOTSTRAP_PEERS" ]; then BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS,"; fi
     
-    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/$IP/udp/$PORT/quic-v1/p2p/$PID\",\"/ip4/$IP/tcp/$TCP_PORT/p2p/$PID\""
+    # TCP fallback is disabled in this config, so only provide QUIC address
+    BOOTSTRAP_PEERS="$BOOTSTRAP_PEERS\"/ip4/$IP/udp/$PORT/quic-v1/p2p/$PID\""
 done
 
 # 5. Generate Config Files
