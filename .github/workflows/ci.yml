@@ -38,7 +38,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y lld
       - name: Cargo Test
         env:
-          RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+          RUSTFLAGS: "-C link-arg=-fuse-ld=lld -C debuginfo=0"
         run: cargo test
       - name: Cargo Clippy
         run: cargo clippy -- -D warnings
