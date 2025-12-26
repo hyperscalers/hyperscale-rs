@@ -20,6 +20,9 @@ RPC_BASE_PORT=8080
 NUM_SHARDS=1 # Simplification for now: 1 shard for N nodes
 CLEAN=false
 NODES_PER_HOST=1
+CRYPTO_THREADS=0
+EXECUTION_THREADS=0
+IO_THREADS=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -51,8 +54,21 @@ while [[ $# -gt 0 ]]; do
             NUM_SHARDS="$2"
             shift 2
             ;;
+        --crypto-threads)
+            CRYPTO_THREADS="$2"
+            shift 2
+            ;;
+        --execution-threads)
+            EXECUTION_THREADS="$2"
+            shift 2
+            ;;
+        --io-threads)
+            IO_THREADS="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 --hosts \"IP1,IP2...\" [--nodes-per-host N] [--shards N] [--out-dir DIR] [--clean]"
+            echo "       [--crypto-threads N] [--execution-threads N] [--io-threads N]"
             exit 0
             ;;
         *)
@@ -247,6 +263,11 @@ upnp_enabled = false
 request_timeout_ms = 30000
 max_message_size = 10485760
 gossipsub_heartbeat_ms = 100
+direct_connection_limit = 50
+direct_connection_timeout_ms = 10000
+# Aggressive keep-alive for distributed deployments (WAN tolerant)
+idle_connection_timeout_ms = 120000
+keep_alive_interval_ms = 10000
 
 [consensus]
 proposal_interval_ms = 300
@@ -254,6 +275,12 @@ view_change_timeout_ms = 3000
 max_transactions_per_block = 1024
 max_certificates_per_block = 4096
 rpc_mempool_limit = 16384
+
+[threads]
+crypto_threads = $CRYPTO_THREADS
+execution_threads = $EXECUTION_THREADS
+io_threads = $IO_THREADS
+pin_cores = false
 
 [metrics]
 enabled = true

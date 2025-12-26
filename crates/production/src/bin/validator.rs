@@ -208,12 +208,27 @@ pub struct NetworkConfig {
     pub gossipsub_heartbeat_ms: u64,
 
     /// Enable UPnP port forwarding
-    /// Enable UPnP port forwarding
     #[serde(default = "default_upnp_enabled")]
     pub upnp_enabled: bool,
 
     /// Version interoperability mode
     pub version_interop_mode: Option<VersionInteroperabilityMode>,
+
+    /// Maximum number of direct validator connections
+    #[serde(default = "default_direct_connection_limit")]
+    pub direct_connection_limit: usize,
+
+    /// Direct connection timeout in milliseconds
+    #[serde(default = "default_direct_connection_timeout_ms")]
+    pub direct_connection_timeout_ms: u64,
+
+    /// Idle connection timeout in milliseconds
+    #[serde(default = "default_idle_connection_timeout_ms")]
+    pub idle_connection_timeout_ms: u64,
+
+    /// QUIC keep-alive interval in milliseconds
+    #[serde(default = "default_keep_alive_interval_ms")]
+    pub keep_alive_interval_ms: u64,
 }
 
 fn default_listen_addr() -> String {
@@ -238,6 +253,22 @@ fn default_gossipsub_heartbeat_ms() -> u64 {
 
 fn default_upnp_enabled() -> bool {
     true
+}
+
+fn default_direct_connection_limit() -> usize {
+    50
+}
+
+fn default_direct_connection_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_idle_connection_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_keep_alive_interval_ms() -> u64 {
+    15_000
 }
 
 /// Consensus configuration.
@@ -872,13 +903,16 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
         .with_request_timeout(Duration::from_millis(config.request_timeout_ms))
         .with_max_message_size(config.max_message_size)
         .with_gossipsub_heartbeat(Duration::from_millis(config.gossipsub_heartbeat_ms))
-        .with_gossipsub_heartbeat(Duration::from_millis(config.gossipsub_heartbeat_ms))
+        .with_idle_connection_timeout(Duration::from_millis(config.idle_connection_timeout_ms))
+        .with_keep_alive_interval(Duration::from_millis(config.keep_alive_interval_ms))
         .with_tcp_fallback(config.tcp_fallback_enabled, tcp_fallback_port)
         .with_version_interop_mode(
             config
                 .version_interop_mode
                 .unwrap_or(VersionInteroperabilityMode::Strict),
-        ))
+        )
+        .with_direct_connection_limit(config.direct_connection_limit)
+        .with_direct_connection_timeout(Duration::from_millis(config.direct_connection_timeout_ms)))
 }
 
 /// Build RocksDB configuration from TOML config.

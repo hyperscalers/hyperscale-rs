@@ -50,6 +50,7 @@
 mod adapter;
 mod codec;
 mod config;
+pub mod direct;
 mod rate_limiter;
 mod topic;
 

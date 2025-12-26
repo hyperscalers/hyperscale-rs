@@ -8,6 +8,7 @@
 
 use super::codec::{decode_message, encode_message, CodecError};
 use super::config::Libp2pConfig;
+use super::direct::DirectValidatorNetwork;
 use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
 use super::topic::Topic;
 use crate::metrics;
@@ -127,7 +128,8 @@ pub struct InboundCertificateRequest {
 }
 
 /// Commands sent to the swarm task.
-enum SwarmCommand {
+#[derive(Debug)]
+pub enum SwarmCommand {
     /// Subscribe to a gossipsub topic.
     Subscribe { topic: String },
 
@@ -178,6 +180,16 @@ enum SwarmCommand {
 
     /// Send a response to a certificate request (by channel ID).
     SendCertificateResponse { channel_id: u64, response: Vec<u8> },
+
+    /// Send a direct message to a peer (unicast).
+    SendDirectMessage { peer: Libp2pPeerId, data: Vec<u8> },
+
+    /// Broadcast a direct message to multiple peers in parallel (fire-and-forget).
+    /// Used for consensus messages where we don't need ACK tracking.
+    DirectBroadcast {
+        peers: Vec<Libp2pPeerId>,
+        data: Vec<u8>,
+    },
 }
 
 /// A pending response channel with its creation time for timeout cleanup.
@@ -389,6 +401,9 @@ pub struct Libp2pAdapter {
     /// Cached connected peer count (updated by background task).
     /// This avoids blocking the consensus loop to query peer count.
     cached_peer_count: Arc<AtomicUsize>,
+
+    /// Direct validator network for high-performance consensus messaging.
+    direct_network: Arc<DirectValidatorNetwork>,
 }
 
 impl Libp2pAdapter {
@@ -514,10 +529,11 @@ impl Libp2pAdapter {
             // QUIC configuration
             let mut quic_config = libp2p::quic::Config::new(&keypair);
             quic_config.max_concurrent_stream_limit = 4096;
-            // Enable QUIC keep-alive to detect dead connections early.
-            // Sends PING frames at this interval to keep connections alive and detect failures.
-            // Set to half of idle_connection_timeout to ensure we ping before connection is closed.
-            quic_config.keep_alive_interval = config.idle_connection_timeout / 2;
+            // QUIC keep-alive: sends PING frames at this interval to keep connections alive
+            quic_config.keep_alive_interval = config.keep_alive_interval;
+            // QUIC idle timeout: connections are closed after this duration of inactivity
+            // Must be longer than keep_alive_interval to allow keep-alives to work
+            quic_config.max_idle_timeout = config.idle_connection_timeout.as_millis() as u32;
 
             let quic_transport = libp2p::quic::tokio::Transport::new(quic_config)
                 .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
@@ -575,8 +591,12 @@ impl Libp2pAdapter {
                     // Default is 256 which causes "max sub-streams reached" errors
                     // during burst sync traffic when catching up.
                     quic_config.max_concurrent_stream_limit = 4096;
-                    // Enable QUIC keep-alive to detect dead connections early.
-                    quic_config.keep_alive_interval = config.idle_connection_timeout / 2;
+                    // QUIC keep-alive: sends PING frames at this interval to keep connections alive
+                    quic_config.keep_alive_interval = config.keep_alive_interval;
+                    // QUIC idle timeout: connections are closed after this duration of inactivity
+                    // Must be longer than keep_alive_interval to allow keep-alives to work
+                    quic_config.max_idle_timeout =
+                        config.idle_connection_timeout.as_millis() as u32;
                     quic_config
                 })
                 .with_behaviour(|_| behaviour)
@@ -645,6 +665,13 @@ impl Libp2pAdapter {
         let (cert_request_tx, cert_request_rx) = mpsc::unbounded_channel();
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
+        let direct_network = Arc::new(DirectValidatorNetwork::new(
+            validator_id,
+            command_tx.clone(),
+            validator_peers.clone(),
+            config.clone(),
+        ));
+
         let adapter = Arc::new(Self {
             local_peer_id,
             local_validator_id: validator_id,
@@ -659,6 +686,7 @@ impl Libp2pAdapter {
             tx_request_tx: tx_request_tx.clone(),
             cert_request_tx: cert_request_tx.clone(),
             cached_peer_count: cached_peer_count.clone(),
+            direct_network: direct_network.clone(),
         });
 
         // Spawn event loop (takes ownership of swarm)
@@ -729,6 +757,11 @@ impl Libp2pAdapter {
         );
     }
 
+    /// Update the committee for a shard (delegates to direct network).
+    pub fn update_committee(&self, shard: ShardGroupId, validators: Vec<ValidatorId>) {
+        self.direct_network.update_committee(shard, validators);
+    }
+
     /// Subscribe to all message types for a shard.
     ///
     /// Called once at startup to subscribe to the local shard's topics.
@@ -763,6 +796,10 @@ impl Libp2pAdapter {
         shard: ShardGroupId,
         message: &OutboundMessage,
     ) -> Result<(), NetworkError> {
+        // Use gossipsub for all consensus broadcasts - it's optimized for this use case.
+        // GossipSub has pre-established mesh connections with minimal latency for small committees.
+        // DirectBroadcast via request-response adds per-message substream overhead.
+
         let topic = super::codec::topic_for_message(message, shard);
         let data = encode_message(message)?;
         let data_len = data.len();
@@ -1007,6 +1044,12 @@ impl Libp2pAdapter {
         let mut pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest> =
             HashMap::new();
 
+        // Track pending direct messages (outbound) for debugging delivery
+        let mut pending_direct_messages: HashMap<
+            request_response::OutboundRequestId,
+            std::time::Instant,
+        > = HashMap::new();
+
         // Track pending response channels (inbound) - keyed by channel_id
         // Uses PendingResponseChannel to track creation time for timeout cleanup
         let mut pending_response_channels: HashMap<u64, PendingResponseChannel> = HashMap::new();
@@ -1090,6 +1133,18 @@ impl Libp2pAdapter {
                         );
                     }
 
+                    // 3. Clean up timed-out direct messages
+                    let expired_direct: Vec<_> = pending_direct_messages
+                        .iter()
+                        .filter(|(_, &created_at)| now.duration_since(created_at) > PENDING_REQUEST_TIMEOUT)
+                        .map(|(id, _)| *id)
+                        .collect();
+
+                    for req_id in &expired_direct {
+                         warn!(?req_id, "Timed out waiting for direct message acknowledgement");
+                         pending_direct_messages.remove(req_id);
+                    }
+
                     // 3. Record metrics for pending response channels
                     metrics::record_pending_response_channels(pending_response_channels.len());
 
@@ -1157,11 +1212,11 @@ impl Libp2pAdapter {
                 // Response commands (SendCertificateResponse, etc.) are time-critical
                 // as they unblock other validators waiting for data.
                 Some(cmd) = command_rx.recv() => {
-                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_response_channels).await;
+                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages, &mut pending_response_channels).await;
 
                     // Drain any additional pending commands
                     while let Ok(cmd) = command_rx.try_recv() {
-                        Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_response_channels).await;
+                        Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages, &mut pending_response_channels).await;
                     }
                 }
 
@@ -1261,11 +1316,12 @@ impl Libp2pAdapter {
                         }
                     }
 
-                    Self::handle_swarm_event(
+                    let action = Self::handle_swarm_event(
                         event,
                         &consensus_tx,
                         &peer_validators,
                         &mut pending_requests,
+                        &mut pending_direct_messages,
                         &mut pending_response_channels,
                         &mut next_channel_id,
                         &sync_request_tx,
@@ -1275,6 +1331,20 @@ impl Libp2pAdapter {
                         local_shard,
                         &tx_validation_handle,
                     ).await;
+
+                    // Execute any action returned by the event handler
+                    match action {
+                        SwarmAction::SendResponse { channel, data } => {
+                            if let Err(e) = swarm
+                                .behaviour_mut()
+                                .request_response
+                                .send_response(channel, data)
+                            {
+                                warn!("Failed to send direct response: {:?}", e);
+                            }
+                        }
+                        SwarmAction::None => {}
+                    }
 
                     // Update cached peer count after connection changes
                     if is_connection_event {
@@ -1291,6 +1361,10 @@ impl Libp2pAdapter {
         swarm: &mut Swarm<Behaviour>,
         cmd: SwarmCommand,
         pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
+        pending_direct_messages: &mut HashMap<
+            request_response::OutboundRequestId,
+            std::time::Instant,
+        >,
         pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
     ) {
         match cmd {
@@ -1463,9 +1537,50 @@ impl Libp2pAdapter {
                     warn!(channel_id, "Unknown channel ID for certificate response");
                 }
             }
+            SwarmCommand::SendDirectMessage { peer, data } => {
+                // Send as a request, reusing the existing request-response protocol.
+                let req_id = swarm
+                    .behaviour_mut()
+                    .request_response
+                    .send_request(&peer, data);
+
+                pending_direct_messages.insert(req_id, std::time::Instant::now());
+            }
+            SwarmCommand::DirectBroadcast { peers, data } => {
+                // Send to all peers in a single event loop iteration (fire-and-forget).
+                // No ACK tracking - consensus messages don't need delivery confirmation.
+                let peer_count = peers.len();
+                let mut sent = 0;
+                for peer in peers {
+                    // send_request returns immediately, queuing the message internally
+                    let _req_id = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_request(&peer, data.clone());
+                    // Intentionally not tracking req_id for ACK - fire and forget
+                    sent += 1;
+                }
+                trace!(
+                    sent = sent,
+                    total = peer_count,
+                    "Direct broadcast sent to all peers"
+                );
+            }
         }
     }
+}
 
+/// Internal action to take after handling a swarm event
+/// Internal action to take after handling a swarm event
+enum SwarmAction {
+    None,
+    SendResponse {
+        channel: request_response::ResponseChannel<Vec<u8>>,
+        data: Vec<u8>,
+    },
+}
+
+impl Libp2pAdapter {
     /// Handle a single swarm event.
     #[allow(clippy::too_many_arguments)]
     async fn handle_swarm_event(
@@ -1473,6 +1588,10 @@ impl Libp2pAdapter {
         consensus_tx: &mpsc::Sender<Event>,
         peer_validators: &Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
+        pending_direct_messages: &mut HashMap<
+            request_response::OutboundRequestId,
+            std::time::Instant,
+        >,
         pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
         next_channel_id: &mut u64,
         sync_request_tx: &mpsc::UnboundedSender<InboundSyncRequest>,
@@ -1481,7 +1600,7 @@ impl Libp2pAdapter {
         rate_limiter: &mut SyncRateLimiter,
         local_shard: ShardGroupId,
         tx_validation_handle: &ValidationBatcherHandle,
-    ) {
+    ) -> SwarmAction {
         match event {
             // Handle gossipsub messages
             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -1501,7 +1620,7 @@ impl Libp2pAdapter {
                             "Received message with invalid topic format"
                         );
                         metrics::record_invalid_message();
-                        return;
+                        return SwarmAction::None;
                     }
                 };
 
@@ -1521,7 +1640,7 @@ impl Libp2pAdapter {
                         "Ignoring message from unknown peer (not in validator set)"
                     );
                     metrics::record_invalid_message();
-                    return;
+                    return SwarmAction::None;
                 }
                 //
                 // Cross-shard messages (allowed from any shard):
@@ -1544,7 +1663,7 @@ impl Libp2pAdapter {
                                 "Dropping shard-local message from wrong shard (cross-shard contamination attempt)"
                             );
                             metrics::record_invalid_message();
-                            return;
+                            return SwarmAction::None;
                         }
                     }
                 }
@@ -1575,12 +1694,14 @@ impl Libp2pAdapter {
                                 }
                                 event => {
                                     // Consensus messages go directly to high-priority channel
-                                    // Extract trace context for distributed tracing (when feature enabled)
-                                    let send_future = async {
-                                        if consensus_tx.send(event).await.is_err() {
+                                    // CRITICAL: Spawn to avoid blocking the swarm loop
+                                    let tx = consensus_tx.clone();
+                                    let send_future = async move {
+                                        if tx.send(event).await.is_err() {
                                             warn!("Consensus channel closed");
                                         }
                                     };
+
                                     #[cfg(feature = "trace-propagation")]
                                     let send_future = {
                                         let span = tracing::trace_span!("cross_shard_message");
@@ -1593,10 +1714,11 @@ impl Libp2pAdapter {
                                         send_future.instrument(span)
                                     };
 
-                                    send_future.await;
+                                    tokio::spawn(send_future);
                                 }
                             }
                         }
+                        SwarmAction::None
                     }
                     Err(e) => {
                         warn!(
@@ -1606,6 +1728,7 @@ impl Libp2pAdapter {
                             "Failed to decode message"
                         );
                         metrics::record_invalid_message();
+                        SwarmAction::None
                     }
                 }
             }
@@ -1616,6 +1739,7 @@ impl Libp2pAdapter {
                 topic,
             })) => {
                 debug!("Peer {:?} subscribed to topic: {}", peer_id, topic);
+                SwarmAction::None
             }
 
             // Handle request-response messages
@@ -1633,16 +1757,29 @@ impl Libp2pAdapter {
                 // Route response to waiting requester
                 if let Some(pending) = pending_requests.remove(&request_id) {
                     let _ = pending.response_tx.send(Ok(response));
+                } else if pending_direct_messages.remove(&request_id).is_some() {
+                    // Direct message acknowledged (empty response received)
+                    trace!("Direct message acknowledged {:?}", request_id);
                 }
+                SwarmAction::None
             }
 
             // Handle request failures
             SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(
                 request_response::Event::OutboundFailure {
-                    request_id, error, ..
+                    request_id,
+                    error,
+                    peer,
+                    ..
                 },
             )) => {
-                warn!("Request {:?} failed: {:?}", request_id, error);
+                // Log detailed failure info to understand connection timeouts
+                warn!(
+                    peer = %peer,
+                    request_id = ?request_id,
+                    error = ?error,
+                    "Request-response outbound failure"
+                );
                 if let Some(pending) = pending_requests.remove(&request_id) {
                     let _ = pending
                         .response_tx
@@ -1650,7 +1787,15 @@ impl Libp2pAdapter {
                             "Request failed: {:?}",
                             error
                         ))));
+                } else if pending_direct_messages.remove(&request_id).is_some() {
+                    warn!(
+                        peer = %peer,
+                        request_id = ?request_id,
+                        error = ?error,
+                        "Direct message failed (fire-and-forget, no ACK expected)"
+                    );
                 }
+                SwarmAction::None
             }
 
             // Handle inbound requests (sync blocks or transaction fetch)
@@ -1677,7 +1822,7 @@ impl Libp2pAdapter {
                     metrics::record_request_rate_limited(is_validator);
                     // Drop the request by not processing it
                     // The channel will be dropped, which signals failure to the requester
-                    return;
+                    return SwarmAction::None;
                 }
 
                 // Determine request type:
@@ -1720,6 +1865,61 @@ impl Libp2pAdapter {
                         );
                         // Remove the channel since we can't process this request
                         pending_response_channels.remove(&channel_id);
+                    }
+                    SwarmAction::None
+                } else if let Ok(decoded) = super::codec::decode_direct_message(&request) {
+                    // Direct consensus message (Block/Vote)
+                    // We cannot send a response here because we don't have access to the swarm behavior.
+                    // Instead, we drop the channel which will close the stream (implicit done).
+
+                    // Process events
+                    for event in decoded.events {
+                        match &event {
+                            Event::BlockHeaderReceived { header, .. } => {
+                                info!(
+                                    peer = %peer,
+                                    is_validator = is_validator,
+                                    msg_type = "BlockHeader",
+                                    round = header.round,
+                                    height = header.height.0,
+                                    hash = %header.hash(),
+                                    "Received direct consensus message"
+                                );
+                            }
+                            Event::BlockVoteReceived { vote } => {
+                                info!(
+                                    peer = %peer,
+                                    is_validator = is_validator,
+                                    msg_type = "BlockVote",
+                                    round = vote.round,
+                                    height = vote.height.0,
+                                    block_hash = %vote.block_hash,
+                                    "Received direct consensus message"
+                                );
+                            }
+                            _ => {
+                                info!(
+                                    peer = %peer,
+                                    is_validator = is_validator,
+                                    msg_type = "Other",
+                                    "Received direct consensus message"
+                                );
+                            }
+                        }
+
+                        // Direct messages are time critical, send to consensus immediately
+                        // We spawn this to avoid blocking the swarm loop waiting for channel capacity.
+                        // Blocking here prevents sending the Response, causing timeouts on the sender side.
+                        let tx = consensus_tx.clone();
+                        tokio::spawn(async move {
+                            if tx.send(event).await.is_err() {
+                                warn!("Consensus channel closed during direct message dispatch");
+                            }
+                        });
+                    }
+                    SwarmAction::SendResponse {
+                        channel,
+                        data: vec![],
                     }
                 } else if request.len() > 8 {
                     // Decode as transaction or certificate fetch request based on fetch_type tag.
@@ -1823,8 +2023,10 @@ impl Libp2pAdapter {
                             warn!(peer = %peer, len = request.len(), ?fetch_type, "Unknown fetch request type");
                         }
                     }
+                    SwarmAction::None
                 } else {
                     warn!(peer = %peer, len = request.len(), "Invalid request (too short)");
+                    SwarmAction::None
                 }
             }
 
@@ -1841,6 +2043,7 @@ impl Libp2pAdapter {
                     protocols = ?info.protocols,
                     "Identified peer"
                 );
+                SwarmAction::None
             }
 
             // Connection events
@@ -1860,28 +2063,39 @@ impl Libp2pAdapter {
                 // Note: num_established is connections to this peer, not total peers
                 // We would need swarm.connected_peers().count() for total, but we don't have access here
                 // The metrics tick in runner.rs can poll connected_peers() periodically instead
+                SwarmAction::None
             }
 
             SwarmEvent::ConnectionClosed {
                 peer_id,
                 cause,
                 num_established,
+                connection_id,
                 ..
             } => {
-                info!(
+                // Detailed logging to debug connection timeouts
+                let cause_str = match &cause {
+                    Some(e) => format!("{:?}", e),
+                    None => "None (graceful)".to_string(),
+                };
+                warn!(
                     peer = %peer_id,
-                    cause = ?cause,
+                    connection_id = ?connection_id,
+                    cause = %cause_str,
                     remaining_connections = num_established,
-                    "Connection closed"
+                    "Connection closed - investigating timeout cause"
                 );
+                SwarmAction::None
             }
 
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!("Listening on new address: {}", address);
+                SwarmAction::None
             }
 
             _ => {
                 // Ignore other events
+                SwarmAction::None
             }
         }
     }

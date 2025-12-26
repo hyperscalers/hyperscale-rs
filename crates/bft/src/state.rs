@@ -1052,6 +1052,21 @@ impl BftState {
             }
         }
 
+        // View synchronization from block header round.
+        // When we receive a block proposed at round R > our view, we know the network
+        // has made progress and we should catch up. This helps late joiners converge
+        // faster than waiting for QC-based sync alone.
+        if round > self.view {
+            info!(
+                validator = ?self.validator_id(),
+                old_view = self.view,
+                new_view = round,
+                header_height = height,
+                "View synchronization: advancing view to match received block header"
+            );
+            self.view = round;
+        }
+
         // Basic validation
         if let Err(e) = self.validate_header(&header) {
             warn!(
@@ -1110,6 +1125,10 @@ impl BftState {
         if let Some(vote_set) = self.vote_sets.get_mut(&block_hash) {
             // Update the vote set with header info (needed for parent_block_hash in QC)
             vote_set.set_header(&header);
+            info!(
+                block_hash = ?block_hash,
+                "Updated VoteSet with header info via on_block_header"
+            );
 
             // Check if we now have quorum
             if vote_set.has_quorum(total_power) {
@@ -1896,6 +1915,21 @@ impl BftState {
             return vec![];
         }
 
+        // View synchronization from vote round.
+        // When we receive a vote at round R > our view, the voter has made progress
+        // and we should catch up. This helps late joiners converge with the network.
+        if vote.round > self.view {
+            info!(
+                validator = ?self.validator_id(),
+                old_view = self.view,
+                new_view = vote.round,
+                vote_height = height,
+                voter = ?vote.voter,
+                "View synchronization: advancing view to match received vote"
+            );
+            self.view = vote.round;
+        }
+
         // HotStuff-2 voting rules: A validator can vote for different blocks at the same height
         // as long as they're at different rounds. This is because validators can unlock their
         // votes when they advance rounds (no QC formed within timeout).
@@ -1972,11 +2006,13 @@ impl BftState {
             return vec![];
         }
 
-        debug!(
+        info!(
             validator = ?validator_id,
             block_hash = ?block_hash,
             voting_power = vote_set.voting_power(),
             total_power = total_power,
+            has_quorum = vote_set.has_quorum(total_power),
+            parent_hash_present = vote_set.has_parent_hash(),
             "Vote added (signature verified)"
         );
 

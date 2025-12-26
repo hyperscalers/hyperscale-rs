@@ -232,6 +232,76 @@ pub fn topic_for_message(message: &OutboundMessage, shard: ShardGroupId) -> crat
     }
 }
 
+/// Encode a message for direct validator transmission (unicast).
+///
+/// Unlike gossipsub, we don't have a topic to determine the type, so we prepend
+/// a type tag to the payload.
+pub fn encode_direct_message(message: &OutboundMessage) -> Result<Vec<u8>, CodecError> {
+    let (tag, payload) = match message {
+        OutboundMessage::BlockHeader(gossip) => (
+            1u8,
+            sbor::basic_encode(gossip.as_ref())
+                .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
+        ),
+        OutboundMessage::BlockVote(gossip) => (
+            2u8,
+            sbor::basic_encode(gossip).map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
+        ),
+        _ => {
+            return Err(CodecError::SborEncode(
+                "Unsupported message type for direct broadcast".to_string(),
+            ))
+        }
+    };
+
+    let mut bytes = Vec::with_capacity(1 + payload.len());
+    bytes.push(tag);
+    bytes.extend(payload);
+    Ok(bytes)
+}
+
+/// Decode a directly transmitted message.
+pub fn decode_direct_message(data: &[u8]) -> Result<DecodedMessage, CodecError> {
+    if data.is_empty() {
+        return Err(CodecError::MessageTooShort);
+    }
+
+    let tag = data[0];
+    let payload = &data[1..];
+
+    match tag {
+        1 => {
+            let gossip: BlockHeaderGossip = sbor::basic_decode(payload)
+                .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
+            Ok(DecodedMessage {
+                events: vec![Event::BlockHeaderReceived {
+                    header: gossip.header,
+                    retry_hashes: gossip.retry_hashes,
+                    priority_hashes: gossip.priority_hashes,
+                    tx_hashes: gossip.transaction_hashes,
+                    cert_hashes: gossip.certificate_hashes,
+                    deferred: gossip.deferred,
+                    aborted: gossip.aborted,
+                    commitment_proofs: gossip.commitment_proofs,
+                }],
+                trace_context: None,
+            })
+        }
+        2 => {
+            let gossip: BlockVoteGossip = sbor::basic_decode(payload)
+                .map_err(|e| CodecError::SborDecode(format!("{:?}", e)))?;
+            Ok(DecodedMessage {
+                events: vec![Event::BlockVoteReceived { vote: gossip.vote }],
+                trace_context: None,
+            })
+        }
+        _ => Err(CodecError::SborDecode(format!(
+            "Unknown direct message tag: {}",
+            tag
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

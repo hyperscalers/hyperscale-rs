@@ -145,6 +145,11 @@ impl VoteSet {
         self.round
     }
 
+    /// Check if parent block hash is present.
+    pub fn has_parent_hash(&self) -> bool {
+        self.parent_block_hash.is_some()
+    }
+
     /// Update the vote set with header information.
     ///
     /// This is needed when votes arrive before the header. The vote set

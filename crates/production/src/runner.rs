@@ -546,6 +546,13 @@ impl ProductionRunnerBuilder {
                 .await;
         }
 
+        // Initialize shard committees in DirectValidatorNetwork to enable direct messaging
+        for shard_idx in 0..topology.num_shards() {
+            let shard_id = hyperscale_types::ShardGroupId(shard_idx);
+            let committee = topology.committee_for_shard(shard_id).into_owned();
+            network.update_committee(shard_id, committee);
+        }
+
         // Create sync manager (uses consensus channel for sync events)
         // The topology is passed directly - SyncManager queries it for committee members
         let sync_manager = SyncManager::new(
@@ -2663,7 +2670,7 @@ impl ProductionRunner {
                 // enables storage-backed fetch requests.
                 let storage = self.storage.clone();
                 let height = block.height();
-                tokio::spawn(async move {
+                tokio::task::spawn_blocking(move || {
                     storage.put_block_denormalized(&block, &qc);
                     // Update chain metadata
                     storage.set_chain_metadata(height, None, None);
