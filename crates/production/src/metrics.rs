@@ -159,6 +159,10 @@ pub struct Metrics {
     pub gossipsub_publish_failures: CounterVec,
     /// Early arrival buffer evictions.
     pub early_arrival_evictions: Counter,
+    /// Backpressure events by source (e.g., "gossiped_cert_verification").
+    pub backpressure_events: CounterVec,
+    /// Pending gossiped certificate verifications (waiting for batch dispatch).
+    pub pending_gossiped_cert_batch_size: Gauge,
 }
 
 impl Metrics {
@@ -694,6 +698,19 @@ impl Metrics {
             early_arrival_evictions: register_counter!(
                 "hyperscale_early_arrival_evictions_total",
                 "Early arrival buffer entries evicted due to size limit"
+            )
+            .unwrap(),
+
+            backpressure_events: register_counter_vec!(
+                "hyperscale_backpressure_events_total",
+                "Backpressure events by source",
+                &["source"]
+            )
+            .unwrap(),
+
+            pending_gossiped_cert_batch_size: register_gauge!(
+                "hyperscale_pending_gossiped_cert_batch_size",
+                "Number of gossiped certificates waiting for batch verification"
             )
             .unwrap(),
         }
@@ -1233,4 +1250,20 @@ pub fn record_gossipsub_publish_failure(topic: &str) {
 /// Record an early arrival buffer eviction.
 pub fn record_early_arrival_eviction() {
     metrics().early_arrival_evictions.inc();
+}
+
+/// Record a backpressure event.
+///
+/// Called when work is rejected due to queue saturation.
+/// Source examples: "gossiped_cert_verification", "tx_validation"
+pub fn record_backpressure_event(source: &str) {
+    metrics()
+        .backpressure_events
+        .with_label_values(&[source])
+        .inc();
+}
+
+/// Update the pending gossiped certificate batch size gauge.
+pub fn set_pending_gossiped_cert_batch_size(size: usize) {
+    metrics().pending_gossiped_cert_batch_size.set(size as f64);
 }

@@ -135,6 +135,7 @@ pub struct InboundCertificateRequest {
 /// other validators waiting for data. Using a separate channel ensures
 /// response commands don't get queued behind broadcasts/requests.
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum ResponseCommand {
     /// Send a response to a block request (by channel ID).
     SendBlockResponse { channel_id: u64, response: Vec<u8> },
@@ -230,6 +231,11 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
 /// Interval for periodic Kademlia refresh to discover new peers.
 const KADEMLIA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Maximum number of commands to drain per event loop iteration.
+/// Prevents tight loops from monopolizing the event loop when channels are flooded.
+/// High-priority response commands and normal commands each have this limit.
+const MAX_COMMANDS_PER_DRAIN: usize = 100;
 
 /// Network errors.
 #[derive(Debug, thiserror::Error)]
@@ -1167,19 +1173,21 @@ impl Libp2pAdapter {
                         );
                     }
 
-                    // 3. Clean up timed-out direct messages
-                    let expired_direct: Vec<_> = pending_direct_messages
-                        .iter()
-                        .filter(|(_, &created_at)| now.duration_since(created_at) > PENDING_REQUEST_TIMEOUT)
-                        .map(|(id, _)| *id)
-                        .collect();
-
-                    for req_id in &expired_direct {
-                         warn!(?req_id, "Timed out waiting for direct message acknowledgement");
-                         pending_direct_messages.remove(req_id);
+                    // 3. Clean up timed-out direct messages using retain (single pass)
+                    let before_direct = pending_direct_messages.len();
+                    pending_direct_messages.retain(|req_id, &mut created_at| {
+                        let expired = now.duration_since(created_at) > PENDING_REQUEST_TIMEOUT;
+                        if expired {
+                            warn!(?req_id, "Timed out waiting for direct message acknowledgement");
+                        }
+                        !expired
+                    });
+                    let cleaned_direct = before_direct - pending_direct_messages.len();
+                    if cleaned_direct > 0 {
+                        debug!(cleaned_direct, "Cleaned up timed-out direct messages");
                     }
 
-                    // 3. Record metrics for pending response channels
+                    // 4. Record metrics for pending response channels
                     metrics::record_pending_response_channels(pending_response_channels.len());
 
                     // 4. Process pending reconnections
@@ -1246,24 +1254,33 @@ impl Libp2pAdapter {
                 Some(cmd) = response_rx.recv() => {
                     Self::handle_response_command(&mut swarm, cmd, &mut pending_response_channels);
 
-                    // Drain all pending response commands
-                    while let Ok(cmd) = response_rx.try_recv() {
-                        Self::handle_response_command(&mut swarm, cmd, &mut pending_response_channels);
+                    // Drain pending response commands (bounded to prevent tight loops)
+                    for _ in 0..MAX_COMMANDS_PER_DRAIN {
+                        match response_rx.try_recv() {
+                            Ok(cmd) => Self::handle_response_command(&mut swarm, cmd, &mut pending_response_channels),
+                            Err(_) => break,
+                        }
                     }
                 }
 
                 // Handle normal-priority commands from adapter methods.
                 Some(cmd) = command_rx.recv() => {
-                    // First, drain any pending response commands (priority)
-                    while let Ok(resp_cmd) = response_rx.try_recv() {
-                        Self::handle_response_command(&mut swarm, resp_cmd, &mut pending_response_channels);
+                    // First, drain any pending response commands (priority, bounded)
+                    for _ in 0..MAX_COMMANDS_PER_DRAIN {
+                        match response_rx.try_recv() {
+                            Ok(resp_cmd) => Self::handle_response_command(&mut swarm, resp_cmd, &mut pending_response_channels),
+                            Err(_) => break,
+                        }
                     }
 
                     Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
 
-                    // Drain any additional pending commands
-                    while let Ok(cmd) = command_rx.try_recv() {
-                        Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
+                    // Drain additional pending commands (bounded)
+                    for _ in 0..MAX_COMMANDS_PER_DRAIN {
+                        match command_rx.try_recv() {
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Err(_) => break,
+                        }
                     }
                 }
 
