@@ -1199,9 +1199,10 @@ impl ProductionRunner {
                     // Clean up old RPC-submitted transaction entries to prevent unbounded growth.
                     // Transactions that don't finalize within RPC_SUBMITTED_TX_TIMEOUT are removed.
                     let now = std::time::Instant::now();
+                    let rpc_expiry_threshold = now - RPC_SUBMITTED_TX_TIMEOUT;
                     let before_count = self.rpc_submitted_txs.len();
                     self.rpc_submitted_txs
-                        .retain(|_, submitted_at| now.duration_since(*submitted_at) < RPC_SUBMITTED_TX_TIMEOUT);
+                        .retain(|_, submitted_at| *submitted_at >= rpc_expiry_threshold);
                     let cleaned = before_count - self.rpc_submitted_txs.len();
                     if cleaned > 0 {
                         tracing::debug!(
@@ -1215,19 +1216,9 @@ impl ProductionRunner {
                     // These can leak if verification callbacks never arrive (e.g., thread pool issues).
                     // Each entry holds a full TransactionCertificate (~2-10KB), so this is critical.
                     let before_gossip = self.pending_gossip_cert_verifications.len();
-                    self.pending_gossip_cert_verifications.retain(|tx_hash, pending| {
-                        let expired = now.duration_since(pending.created_at) >= PENDING_GOSSIP_CERT_TIMEOUT;
-                        if expired {
-                            // Debug level to avoid log spam - summary at WARN below
-                            tracing::debug!(
-                                ?tx_hash,
-                                pending_shards = pending.pending_shards.len(),
-                                age_secs = now.duration_since(pending.created_at).as_secs(),
-                                "Cleaning up stale pending gossip cert verification"
-                            );
-                        }
-                        !expired
-                    });
+                    let expiry_threshold = now - PENDING_GOSSIP_CERT_TIMEOUT;
+                    self.pending_gossip_cert_verifications
+                        .retain(|_, pending| pending.created_at >= expiry_threshold);
                     let cleaned_gossip = before_gossip - self.pending_gossip_cert_verifications.len();
                     if cleaned_gossip > 0 {
                         tracing::warn!(
