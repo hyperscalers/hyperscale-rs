@@ -70,27 +70,14 @@ impl DirectValidatorNetwork {
 
     /// Broadcast a message to all members of a shard committee directly.
     ///
-    /// This iterates over the provided committee members and sends the message
-    /// to each one individually (unicast), bypassing the GossipSub mesh.
+    /// This collects all target peers and sends them via a single DirectBroadcast
+    /// command, enabling parallel sends in one event loop iteration.
     pub fn broadcast_to_shard(
         &self,
         shard: ShardGroupId,
         message: &OutboundMessage,
         committee: &[ValidatorId],
     ) -> Result<(), NetworkError> {
-        let mut sent_count = 0;
-        let mut fail_count = 0;
-
-        // Encode once (if possible) - but Libp2pAdapter::broadcast_shard encodes inside.
-        // Here we'll leverage a new SwarmCommand::DirectBroadcast or multiple DirectSend.
-        // For now, let's assume we use multiple unicast requests.
-        // Ideally, we want to encode ONCE.
-        // But `SwarmCommand::DirectSend` (which we need to add) would take bytes.
-
-        // Optimization: Encode message once here
-        let data = super::codec::encode_direct_message(message)?;
-        let topic = super::codec::topic_for_message(message, shard);
-
         if committee.is_empty() {
             info!(
                 msg_type = message.type_name(),
@@ -99,13 +86,13 @@ impl DirectValidatorNetwork {
             return Ok(());
         }
 
-        info!(
-            msg_type = message.type_name(),
-            topic = %topic,
-            shard = shard.0,
-            recipient_count = committee.len(),
-            "Starting direct broadcast"
-        );
+        // Encode message once
+        let data = super::codec::encode_direct_message(message)?;
+        let topic = super::codec::topic_for_message(message, shard);
+
+        // Collect all target peers
+        let mut target_peers = Vec::with_capacity(committee.len());
+        let mut missing_count = 0;
 
         for &validator_id in committee {
             // Skip self
@@ -114,66 +101,48 @@ impl DirectValidatorNetwork {
             }
 
             if let Some(peer_id) = self.validator_peers.get(&validator_id) {
-                // Send direct message
-                // We use a "fire and forget" style here, or rather, we send to the swarm
-                // and let it handle the actual transmission.
-                // We need to add `SwarmCommand::SendDirectMessage` to adapter.rs first.
-                // For now, let's assume we reuse the Request-Response mechanism
-                // BUT we want a 'one-way' stream if possible or just ignore response.
-                // Actually `send_request` requires a response.
-                //
-                // If we want true "Direct Streams" as per proposal ("persistent TCP or QUIC streams"),
-                // we should probably use `libp2p`'s `Stream` directly or a `OneShot` protocol.
-                //
-                // However, `request_response` is simplest to integrate.
-                // Let's use `SwarmCommand::SendDirectMessage` which we will implement to use
-                // a new `DirectMessage` protocol (fire-and-forget or simple ack).
-
-                // Sending command to swarm is non-blocking (unbounded channel)
-                let cmd = SwarmCommand::SendDirectMessage {
-                    peer: *peer_id,
-                    data: data.clone(),
-                };
-
-                if let Err(_e) = self.swarm_command_tx.send(cmd) {
-                    warn!(
-                        "Failed to queue direct message to validator {:?}",
-                        validator_id
-                    );
-                    // If channel closed, we are shutting down
-                    return Err(NetworkError::NetworkShutdown);
-                } else {
-                    info!(
-                        msg_type = message.type_name(),
-                        target = %validator_id,
-                        peer = %*peer_id,
-                        "Sent direct message"
-                    );
-                    sent_count += 1;
-                }
+                target_peers.push(*peer_id);
             } else {
                 // Validator peer not known yet
-                // This is expected during startup or if validator is new
                 debug!(
                     validator_id = validator_id.0,
                     "Validator peer ID unknown, skipping direct send"
                 );
-                fail_count += 1;
+                missing_count += 1;
             }
         }
 
-        // Detailed logging for significant broadcasts (like blocks)
-        if message.type_name().contains("Block") {
-            info!(
+        if target_peers.is_empty() {
+            debug!(
                 msg_type = message.type_name(),
-                sent = sent_count,
-                missing_peers = fail_count,
-                "Direct broadcast completed"
+                missing = missing_count,
+                "No target peers available for direct broadcast"
             );
+            return Ok(());
         }
 
+        // Send single batch command
+        let cmd = SwarmCommand::DirectBroadcast {
+            peers: target_peers.clone(),
+            data,
+        };
+
+        if self.swarm_command_tx.send(cmd).is_err() {
+            warn!("Failed to queue direct broadcast command (channel closed)");
+            return Err(NetworkError::NetworkShutdown);
+        }
+
+        info!(
+            msg_type = message.type_name(),
+            topic = %topic,
+            shard = shard.0,
+            sent = target_peers.len(),
+            missing = missing_count,
+            "Direct broadcast queued"
+        );
+
         // Metrics
-        metrics::record_direct_message_sent(sent_count);
+        metrics::record_direct_message_sent(target_peers.len());
 
         Ok(())
     }

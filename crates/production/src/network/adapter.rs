@@ -183,6 +183,13 @@ pub enum SwarmCommand {
 
     /// Send a direct message to a peer (unicast).
     SendDirectMessage { peer: Libp2pPeerId, data: Vec<u8> },
+
+    /// Broadcast a direct message to multiple peers in parallel (fire-and-forget).
+    /// Used for consensus messages where we don't need ACK tracking.
+    DirectBroadcast {
+        peers: Vec<Libp2pPeerId>,
+        data: Vec<u8>,
+    },
 }
 
 /// A pending response channel with its creation time for timeout cleanup.
@@ -1557,6 +1564,26 @@ impl Libp2pAdapter {
                     .send_request(&peer, data);
 
                 pending_direct_messages.insert(req_id, std::time::Instant::now());
+            }
+            SwarmCommand::DirectBroadcast { peers, data } => {
+                // Send to all peers in a single event loop iteration (fire-and-forget).
+                // No ACK tracking - consensus messages don't need delivery confirmation.
+                let peer_count = peers.len();
+                let mut sent = 0;
+                for peer in peers {
+                    // send_request returns immediately, queuing the message internally
+                    let _req_id = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_request(&peer, data.clone());
+                    // Intentionally not tracking req_id for ACK - fire and forget
+                    sent += 1;
+                }
+                trace!(
+                    sent = sent,
+                    total = peer_count,
+                    "Direct broadcast sent to all peers"
+                );
             }
         }
     }
