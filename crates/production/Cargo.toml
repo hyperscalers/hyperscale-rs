@@ -53,6 +53,7 @@ parking_lot = "0.12"
 # Lock-free concurrent data structures
 arc-swap = "1.8.0"
 dashmap = "6.1.0"
+quick_cache = "0.6"
 
 # OpenTelemetry for distributed tracing
 opentelemetry = "0.31.0"

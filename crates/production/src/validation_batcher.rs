@@ -18,10 +18,10 @@
 //! 3. Dispatches a single crypto task that validates all in parallel via rayon
 
 use crate::thread_pools::ThreadPoolManager;
-use dashmap::DashMap;
 use hyperscale_core::Event;
 use hyperscale_engine::TransactionValidation;
 use hyperscale_types::{Hash, RoutableTransaction};
+use quick_cache::sync::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -87,54 +87,37 @@ impl ValidationBatcherStats {
 
 /// A lock-free cache of recently seen transaction hashes for deduplication.
 ///
-/// Uses DashMap for lock-free concurrent access. When capacity is exceeded,
-/// we evict approximately 10% of entries (random eviction is acceptable for
-/// this deduplication use case).
+/// Uses quick_cache for O(1) concurrent LRU eviction. When capacity is exceeded,
+/// entries are automatically evicted in approximate LRU order without scanning.
 struct SeenCache {
-    hashes: DashMap<Hash, ()>,
-    capacity: usize,
+    cache: Cache<Hash, ()>,
 }
 
 impl SeenCache {
     fn new(capacity: usize) -> Self {
         Self {
-            hashes: DashMap::with_capacity(capacity),
-            capacity,
+            cache: Cache::new(capacity),
         }
     }
 
     /// Check if a hash has been seen. Returns true if already seen.
     /// This is lock-free - multiple threads can call concurrently.
+    /// Eviction is O(1) and happens automatically when capacity is exceeded.
     fn check_and_insert(&self, hash: Hash) -> bool {
-        // Evict ~10% if at capacity BEFORE acquiring entry lock to avoid deadlock.
-        // (DashMap's iter() can deadlock if we hold an entry lock on the same shard)
-        // This is slightly racy (capacity might change) but that's acceptable for dedup.
-        if self.hashes.len() >= self.capacity {
-            let to_remove: Vec<_> = self
-                .hashes
-                .iter()
-                .take(self.capacity / 10)
-                .map(|r| *r.key())
-                .collect();
-            for h in to_remove {
-                self.hashes.remove(&h);
-            }
+        // get_or_insert_with returns the value and whether it was newly inserted.
+        // We use peek first to avoid updating LRU order for duplicates.
+        if self.cache.peek(&hash).is_some() {
+            return true; // Already seen
         }
 
-        // Atomic check-and-insert using entry API - no race window for duplicates
-        use dashmap::mapref::entry::Entry;
-        match self.hashes.entry(hash) {
-            Entry::Occupied(_) => true, // Already seen
-            Entry::Vacant(vacant) => {
-                vacant.insert(());
-                false // Not seen before
-            }
-        }
+        // Insert and let quick_cache handle eviction automatically (O(1) LRU)
+        self.cache.insert(hash, ());
+        false // Not seen before (or was just evicted and re-added, which is fine)
     }
 
     /// Get current size.
     fn len(&self) -> usize {
-        self.hashes.len()
+        self.cache.len()
     }
 }
 
@@ -372,12 +355,11 @@ mod tests {
         }
         assert_eq!(cache.len(), 10);
 
-        // Insert one more should trigger eviction (~10% = 1 entry)
+        // Insert one more should trigger automatic LRU eviction
         let hash = Hash::from_hash_bytes(&[100; 32]);
         assert!(!cache.check_and_insert(hash));
 
-        // Should have evicted ~10% (1 entry) then added 1
-        // Result: 10 - 1 + 1 = 10
+        // quick_cache maintains capacity automatically via O(1) LRU eviction
         assert!(cache.len() <= 10);
     }
 
