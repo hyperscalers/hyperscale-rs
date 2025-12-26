@@ -43,7 +43,7 @@ use tracing::{debug, instrument};
 
 use crate::pending::{
     PendingCertificateAggregation, PendingCertificateVerification,
-    PendingFetchedCertificateVerification, PendingProvisionBroadcast, PendingStateVoteVerification,
+    PendingFetchedCertificateVerification, PendingProvisionBroadcast,
 };
 use crate::trackers::{CertificateTracker, VoteTracker};
 
@@ -69,10 +69,9 @@ const VERIFIED_VOTE_RETENTION_BLOCKS: u64 = 200;
 /// Key type for the pending verifications reverse index.
 /// Identifies which type of verification and the secondary key (validator or shard).
 /// Note: Provision verification is handled by ProvisionCoordinator.
+/// Note: Vote verification is handled by VoteTracker with deferred batch verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PendingVerificationKey {
-    /// Pending vote verification for a validator.
-    Vote(ValidatorId),
     /// Pending certificate verification for a shard.
     Certificate(ShardGroupId),
 }
@@ -178,10 +177,7 @@ pub struct ExecutionState {
     // Pending signature verifications
     // ═══════════════════════════════════════════════════════════════════════
     /// Note: Provision signature verification is handled by ProvisionCoordinator.
-
-    /// State votes awaiting signature verification.
-    /// Maps (tx_hash, validator_id) -> PendingStateVoteVerification
-    pending_vote_verifications: HashMap<(Hash, ValidatorId), PendingStateVoteVerification>,
+    /// Note: Vote signature verification is handled by VoteTracker with deferred batch verification.
 
     /// Certificates awaiting signature verification.
     /// Maps (tx_hash, shard_id) -> PendingCertificateVerification
@@ -310,7 +306,6 @@ impl ExecutionState {
             early_provisioning_complete: HashMap::new(),
             early_votes: HashMap::new(),
             early_certificates: HashMap::new(),
-            pending_vote_verifications: HashMap::new(),
             pending_cert_verifications: HashMap::new(),
             pending_fetched_cert_verifications: HashMap::new(),
             pending_verifications_by_tx: HashMap::new(),
@@ -865,9 +860,11 @@ impl ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Handle state vote received.
-    ///
-    /// Delegates signature verification to the runner before processing.
     /// Handle a state vote received from another validator.
+    ///
+    /// Uses deferred verification: votes are buffered until we have enough
+    /// voting power to possibly reach quorum. Only then do we batch-verify
+    /// all buffered votes, avoiding wasted CPU on votes we'll never use.
     ///
     /// Sender identity comes from vote.validator_id.
     #[instrument(skip(self, vote), fields(
@@ -903,7 +900,7 @@ impl ExecutionState {
                 tx_hash = ?tx_hash,
                 "Skipping verification for own vote"
             );
-            return self.handle_vote_internal(vote);
+            return self.handle_verified_vote(vote);
         }
 
         // Check if we've already verified this exact vote (by tx_hash + validator).
@@ -918,15 +915,7 @@ impl ExecutionState {
                 validator = validator_id.0,
                 "State vote already verified, skipping re-verification"
             );
-            return self.handle_vote_internal(vote);
-        }
-
-        // Check if already pending verification (duplicate vote in parallel execution)
-        if self
-            .pending_vote_verifications
-            .contains_key(&(tx_hash, validator_id))
-        {
-            return vec![];
+            return self.handle_verified_vote(vote);
         }
 
         // Get public key for signature verification
@@ -939,147 +928,196 @@ impl ExecutionState {
             return vec![];
         };
 
-        // Get voting power for later processing
+        // Get voting power
         let voting_power = self.voting_power(validator_id);
 
-        // Track pending verification
-        self.pending_vote_verifications.insert(
-            (tx_hash, validator_id),
-            PendingStateVoteVerification {
-                vote: vote.clone(),
-                voting_power,
-            },
-        );
-        // Update reverse index for O(k) cleanup
-        self.pending_verifications_by_tx
-            .entry(tx_hash)
-            .or_default()
-            .insert(PendingVerificationKey::Vote(validator_id));
+        // Get the tracker and buffer the vote
+        let tracker = self.vote_trackers.get_mut(&tx_hash).unwrap();
 
-        // Delegate signature verification to runner
-        vec![Action::VerifyStateVoteSignature { vote, public_key }]
+        // Check if already seen (dedup within tracker)
+        if tracker.has_seen_validator(validator_id) {
+            return vec![];
+        }
+
+        // Buffer the unverified vote
+        tracker.buffer_unverified_vote(vote, public_key, voting_power);
+
+        // Check if we should trigger batch verification
+        self.maybe_trigger_state_vote_verification(tx_hash)
     }
 
-    /// Handle state vote signature verification result.
-    #[instrument(skip(self, vote), fields(
-        tx_hash = ?vote.transaction_hash,
-        validator = ?vote.validator,
-        valid = valid
-    ))]
-    pub fn on_state_vote_verified(&mut self, vote: StateVoteBlock, valid: bool) -> Vec<Action> {
-        let tx_hash = vote.transaction_hash;
-        let validator_id = vote.validator;
+    /// Check if we have enough buffered votes to trigger verification.
+    fn maybe_trigger_state_vote_verification(&mut self, tx_hash: Hash) -> Vec<Action> {
+        let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
+            return vec![];
+        };
 
-        // Remove from pending and get cached voting power
-        let Some(pending) = self
-            .pending_vote_verifications
-            .remove(&(tx_hash, validator_id))
-        else {
-            // Vote verification arrived after transaction was cleaned up (deferred/aborted)
-            // or after quorum was already reached. This is a benign race condition.
+        if !tracker.should_trigger_verification() {
+            return vec![];
+        }
+
+        // Take the unverified votes for batch verification
+        let votes = tracker.take_unverified_votes();
+
+        if votes.is_empty() {
+            return vec![];
+        }
+
+        tracing::debug!(
+            tx_hash = ?tx_hash,
+            vote_count = votes.len(),
+            "Triggering batch state vote verification (have enough for quorum)"
+        );
+
+        vec![Action::VerifyAndAggregateStateVotes { tx_hash, votes }]
+    }
+
+    /// Handle batch state vote verification result.
+    ///
+    /// Callback from `Action::VerifyAndAggregateStateVotes`.
+    #[instrument(skip(self, verified_votes), fields(
+        tx_hash = ?tx_hash,
+        verified_count = verified_votes.len()
+    ))]
+    pub fn on_state_votes_verified(
+        &mut self,
+        tx_hash: Hash,
+        verified_votes: Vec<(StateVoteBlock, u64)>,
+    ) -> Vec<Action> {
+        let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
             tracing::debug!(
                 tx_hash = ?tx_hash,
-                validator = validator_id.0,
-                "State vote verification for cleaned-up transaction"
+                "State votes verified but no tracker found (tx cleaned up)"
             );
             return vec![];
         };
-        // Update reverse index
-        if let Some(keys) = self.pending_verifications_by_tx.get_mut(&tx_hash) {
-            keys.remove(&PendingVerificationKey::Vote(validator_id));
-        }
 
-        if !valid {
+        // Clear the pending verification flag
+        tracker.on_verification_complete();
+
+        if verified_votes.is_empty() {
             tracing::warn!(
                 tx_hash = ?tx_hash,
-                validator = validator_id.0,
-                "Invalid state vote signature"
+                "All state votes in batch failed verification"
             );
-            return vec![];
+            // Check if more votes arrived while we were verifying
+            return self.maybe_trigger_state_vote_verification(tx_hash);
         }
 
-        // Cache the verified vote so we don't re-verify it if we see it again
-        // (e.g., during gossiping or retries). We use 0 as a placeholder height
-        // since cleanup is done by tx_hash in cleanup_transaction().
-        self.verified_state_votes.insert((tx_hash, validator_id), 0);
-        // Update reverse index for O(k) cleanup
-        self.verified_votes_by_tx
-            .entry(tx_hash)
-            .or_default()
-            .insert(validator_id);
-        tracing::trace!(
+        tracing::debug!(
             tx_hash = ?tx_hash,
-            validator = validator_id.0,
-            "Cached verified state vote"
+            verified_count = verified_votes.len(),
+            "Batch state vote verification complete"
         );
 
-        // Process with cached voting power
-        self.handle_vote_internal_with_power(pending.vote, pending.voting_power)
-    }
-
-    /// Internal vote handling (assumes tracking is active).
-    fn handle_vote_internal(&mut self, vote: StateVoteBlock) -> Vec<Action> {
-        let voting_power = self.voting_power(vote.validator);
-        self.handle_vote_internal_with_power(vote, voting_power)
-    }
-
-    /// Internal vote handling with pre-computed voting power.
-    fn handle_vote_internal_with_power(
-        &mut self,
-        vote: StateVoteBlock,
-        voting_power: u64,
-    ) -> Vec<Action> {
+        // Add all verified votes to the tracker and cache them
         let mut actions = Vec::new();
+        for (vote, voting_power) in verified_votes {
+            let validator_id = vote.validator;
+
+            // Cache the verified vote
+            self.verified_state_votes.insert((tx_hash, validator_id), 0);
+            self.verified_votes_by_tx
+                .entry(tx_hash)
+                .or_default()
+                .insert(validator_id);
+
+            // Add to tracker as verified
+            if let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) {
+                tracker.add_verified_vote(vote, voting_power);
+            }
+        }
+
+        // Check for quorum after adding all verified votes
+        actions.extend(self.check_vote_quorum(tx_hash));
+
+        // Check if more votes arrived while we were verifying
+        actions.extend(self.maybe_trigger_state_vote_verification(tx_hash));
+
+        actions
+    }
+
+    /// Handle a verified vote (own vote or already-verified vote).
+    ///
+    /// Adds the vote to the tracker and checks for quorum.
+    fn handle_verified_vote(&mut self, vote: StateVoteBlock) -> Vec<Action> {
         let tx_hash = vote.transaction_hash;
+        let voting_power = self.voting_power(vote.validator);
+
+        let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
+            return vec![];
+        };
+
+        // Mark as seen to prevent re-buffering if vote arrives again
+        let validator_id = vote.validator;
+        if !tracker.has_seen_validator(validator_id) {
+            // We need to mark it as seen even though we're adding it directly
+            // Use a dummy public key since we won't actually verify
+            // Actually, we should track this differently - let's just add to verified_state_votes
+            self.verified_state_votes.insert((tx_hash, validator_id), 0);
+            self.verified_votes_by_tx
+                .entry(tx_hash)
+                .or_default()
+                .insert(validator_id);
+        }
+
+        tracker.add_verified_vote(vote, voting_power);
+
+        self.check_vote_quorum(tx_hash)
+    }
+
+    /// Check if quorum is reached for a transaction's votes.
+    ///
+    /// If quorum is reached, triggers BLS signature aggregation.
+    fn check_vote_quorum(&mut self, tx_hash: Hash) -> Vec<Action> {
         let local_shard = self.local_shard();
 
         let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
-            return actions;
+            return vec![];
         };
 
-        tracker.add_vote(vote, voting_power);
-
         // Check for quorum
-        if let Some((merkle_root, total_power)) = tracker.check_quorum() {
-            // Extract data from tracker - use take_votes_for_root to avoid cloning
-            let votes = tracker.take_votes_for_root(&merkle_root);
-            let read_nodes = tracker.read_nodes().to_vec();
-            let participating_shards = tracker.participating_shards().to_vec();
+        let Some((merkle_root, total_power)) = tracker.check_quorum() else {
+            return vec![];
+        };
 
-            tracing::debug!(
-                tx_hash = ?tx_hash,
-                shard = local_shard.0,
-                merkle_root = ?merkle_root,
-                votes = votes.len(),
-                power = total_power,
-                "Vote quorum reached - delegating BLS aggregation"
-            );
+        // Extract data from tracker - use take_votes_for_root to avoid cloning
+        let votes = tracker.take_votes_for_root(&merkle_root);
+        let read_nodes = tracker.read_nodes().to_vec();
+        let participating_shards = tracker.participating_shards().to_vec();
 
-            // Store pending aggregation state for callback
-            self.pending_cert_aggregations.insert(
-                tx_hash,
-                PendingCertificateAggregation {
-                    participating_shards,
-                },
-            );
+        tracing::debug!(
+            tx_hash = ?tx_hash,
+            shard = local_shard.0,
+            merkle_root = ?merkle_root,
+            votes = votes.len(),
+            power = total_power,
+            "Vote quorum reached - delegating BLS aggregation"
+        );
 
-            // Delegate BLS signature aggregation to crypto pool
-            let committee_size = self.committee().len();
-            actions.push(Action::AggregateStateCertificate {
-                tx_hash,
-                shard: local_shard,
-                merkle_root,
-                votes,
-                read_nodes,
-                voting_power: VotePower(total_power),
-                committee_size,
-            });
+        // Store pending aggregation state for callback
+        self.pending_cert_aggregations.insert(
+            tx_hash,
+            PendingCertificateAggregation {
+                participating_shards,
+            },
+        );
 
-            // Remove vote tracker (we've extracted what we need)
-            self.vote_trackers.remove(&tx_hash);
-        }
+        // Delegate BLS signature aggregation to crypto pool
+        let committee_size = self.committee().len();
 
-        actions
+        // Remove vote tracker (we've extracted what we need)
+        self.vote_trackers.remove(&tx_hash);
+
+        vec![Action::AggregateStateCertificate {
+            tx_hash,
+            shard: local_shard,
+            merkle_root,
+            votes,
+            read_nodes,
+            voting_power: VotePower(total_power),
+            committee_size,
+        }]
     }
 
     /// Handle state certificate aggregation completed.
@@ -1517,9 +1555,6 @@ impl ExecutionState {
         if let Some(keys) = self.pending_verifications_by_tx.remove(tx_hash) {
             for key in keys {
                 match key {
-                    PendingVerificationKey::Vote(vid) => {
-                        self.pending_vote_verifications.remove(&(*tx_hash, vid));
-                    }
                     PendingVerificationKey::Certificate(shard) => {
                         self.pending_cert_verifications.remove(&(*tx_hash, shard));
                     }
@@ -1731,9 +1766,6 @@ impl ExecutionState {
         if let Some(keys) = self.pending_verifications_by_tx.remove(tx_hash) {
             for key in keys {
                 match key {
-                    PendingVerificationKey::Vote(vid) => {
-                        self.pending_vote_verifications.remove(&(*tx_hash, vid));
-                    }
                     PendingVerificationKey::Certificate(shard) => {
                         self.pending_cert_verifications.remove(&(*tx_hash, shard));
                     }
@@ -1779,9 +1811,7 @@ impl ExecutionState {
 
         // Clean up pending verifications using reverse index
         let mut removed_cert_count = 0;
-        let mut removed_vote_count = 0;
         if let Some(keys) = self.pending_verifications_by_tx.get_mut(tx_hash) {
-            // Remove both Certificate and Vote verification keys - we don't need either
             let keys_to_remove: Vec<_> = keys.iter().cloned().collect();
             for key in keys_to_remove {
                 match key {
@@ -1789,11 +1819,6 @@ impl ExecutionState {
                         self.pending_cert_verifications.remove(&(*tx_hash, shard));
                         keys.remove(&key);
                         removed_cert_count += 1;
-                    }
-                    PendingVerificationKey::Vote(vid) => {
-                        self.pending_vote_verifications.remove(&(*tx_hash, vid));
-                        keys.remove(&key);
-                        removed_vote_count += 1;
                     }
                 }
             }
@@ -1806,12 +1831,7 @@ impl ExecutionState {
             }
         }
 
-        if had_tracker
-            || had_early
-            || had_vote_tracker
-            || had_aggregation
-            || removed_cert_count > 0
-            || removed_vote_count > 0
+        if had_tracker || had_early || had_vote_tracker || had_aggregation || removed_cert_count > 0
         {
             tracing::debug!(
                 tx_hash = %tx_hash,
@@ -1819,7 +1839,6 @@ impl ExecutionState {
                 had_vote_tracker = had_vote_tracker,
                 had_aggregation = had_aggregation,
                 removed_cert_verifications = removed_cert_count,
-                removed_vote_verifications = removed_vote_count,
                 "Cancelled local certificate building - using external certificate"
             );
         }
@@ -2355,9 +2374,10 @@ impl SubStateMachine for ExecutionState {
                 Some(self.on_state_entries_fetched(*tx_hash, entries.clone()))
             }
             // Signature verification callbacks
-            Event::StateVoteSignatureVerified { vote, valid } => {
-                Some(self.on_state_vote_verified(vote.clone(), *valid))
-            }
+            Event::StateVotesVerifiedAndAggregated {
+                tx_hash,
+                verified_votes,
+            } => Some(self.on_state_votes_verified(*tx_hash, verified_votes.clone())),
             Event::StateCertificateSignatureVerified { certificate, valid } => {
                 Some(self.on_certificate_verified(certificate.clone(), *valid))
             }

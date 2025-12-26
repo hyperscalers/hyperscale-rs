@@ -726,7 +726,7 @@ impl StateMachine for NodeStateMachine {
             | Event::StateVoteReceived { .. }
             | Event::StateCertificateReceived { .. }
             | Event::MerkleRootComputed { .. }
-            | Event::StateVoteSignatureVerified { .. }
+            | Event::StateVotesVerifiedAndAggregated { .. }
             | Event::StateCertificateSignatureVerified { .. }
             | Event::StateCertificateAggregated { .. }
             | Event::SpeculativeExecutionComplete { .. } => {

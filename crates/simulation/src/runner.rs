@@ -923,15 +923,67 @@ impl SimulationRunner {
                 );
             }
 
-            Action::VerifyStateVoteSignature { vote, public_key } => {
-                // Use centralized signing message (must match ExecutionState::create_vote)
-                let msg = vote.signing_message();
+            Action::VerifyAndAggregateStateVotes { tx_hash, votes } => {
+                // Batch verify state votes using BLS same-message optimization.
+                // All votes for the same (tx_hash, state_root, shard, success) sign the SAME message,
+                // enabling aggregate signature verification.
+                //
+                // In simulation, we use the same logic as production for correctness,
+                // just without parallelism.
+                use std::collections::HashMap;
+                let mut by_message: HashMap<Vec<u8>, Vec<(StateVoteBlock, PublicKey, u64)>> =
+                    HashMap::new();
+                for (vote, pk, power) in votes {
+                    let msg = vote.signing_message();
+                    by_message.entry(msg).or_default().push((vote, pk, power));
+                }
 
-                let valid = public_key.verify(&msg, &vote.signature);
+                let mut verified_votes: Vec<(StateVoteBlock, u64)> = Vec::new();
+
+                for (message, votes_for_root) in by_message {
+                    if votes_for_root.len() >= 2 {
+                        // Use BLS same-message batch verification
+                        let signatures: Vec<Signature> = votes_for_root
+                            .iter()
+                            .map(|(v, _, _)| v.signature.clone())
+                            .collect();
+                        let pubkeys: Vec<PublicKey> =
+                            votes_for_root.iter().map(|(_, pk, _)| pk.clone()).collect();
+
+                        let batch_valid = PublicKey::batch_verify_bls_same_message(
+                            &message,
+                            &signatures,
+                            &pubkeys,
+                        );
+
+                        if batch_valid {
+                            for (vote, _, power) in votes_for_root {
+                                verified_votes.push((vote, power));
+                            }
+                        } else {
+                            // Fallback to individual verification
+                            for (vote, pk, power) in votes_for_root {
+                                if pk.verify(&message, &vote.signature) {
+                                    verified_votes.push((vote, power));
+                                }
+                            }
+                        }
+                    } else {
+                        // Single vote - verify individually
+                        let (vote, pk, power) = votes_for_root.into_iter().next().unwrap();
+                        if pk.verify(&message, &vote.signature) {
+                            verified_votes.push((vote, power));
+                        }
+                    }
+                }
+
                 self.schedule_event(
                     from,
                     self.now,
-                    Event::StateVoteSignatureVerified { vote, valid },
+                    Event::StateVotesVerifiedAndAggregated {
+                        tx_hash,
+                        verified_votes,
+                    },
                 );
             }
 

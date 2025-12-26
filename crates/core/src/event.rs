@@ -213,14 +213,16 @@ pub enum Event {
         certificate: StateCertificate,
     },
 
-    /// State vote signature verification completed.
+    /// Batch state vote verification completed.
     ///
-    /// Callback from `Action::VerifyStateVoteSignature`.
-    StateVoteSignatureVerified {
-        /// The state vote that was verified.
-        vote: StateVoteBlock,
-        /// Whether the signature is valid.
-        valid: bool,
+    /// Callback from `Action::VerifyAndAggregateStateVotes`.
+    /// Contains only the votes that passed signature verification.
+    StateVotesVerifiedAndAggregated {
+        /// Transaction hash for correlation.
+        tx_hash: Hash,
+        /// Verified votes with their voting power.
+        /// Only includes votes that passed signature verification.
+        verified_votes: Vec<(StateVoteBlock, u64)>,
     },
 
     /// State certificate signature verification completed.
@@ -656,7 +658,7 @@ impl Event {
             | Event::TransactionStatusChanged { .. }
             | Event::VoteSignatureVerified { .. }
             | Event::ProvisionsVerifiedAndAggregated { .. }
-            | Event::StateVoteSignatureVerified { .. }
+            | Event::StateVotesVerifiedAndAggregated { .. }
             | Event::StateCertificateSignatureVerified { .. }
             | Event::QcSignatureVerified { .. }
             | Event::QuorumCertificateBuilt { .. }
@@ -776,7 +778,7 @@ impl Event {
             // Async Callbacks - Crypto Verification
             Event::VoteSignatureVerified { .. } => "VoteSignatureVerified",
             Event::ProvisionsVerifiedAndAggregated { .. } => "ProvisionsVerifiedAndAggregated",
-            Event::StateVoteSignatureVerified { .. } => "StateVoteSignatureVerified",
+            Event::StateVotesVerifiedAndAggregated { .. } => "StateVotesVerifiedAndAggregated",
             Event::StateCertificateSignatureVerified { .. } => "StateCertificateSignatureVerified",
             Event::QcSignatureVerified { .. } => "QcSignatureVerified",
             Event::QuorumCertificateBuilt { .. } => "QuorumCertificateBuilt",

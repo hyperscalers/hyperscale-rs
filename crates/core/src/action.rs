@@ -157,15 +157,24 @@ pub enum Action {
         committee_size: usize,
     },
 
-    /// Verify a state vote's signature (cross-shard Phase 4).
+    /// Batch verify state votes and aggregate valid ones (cross-shard Phase 4).
+    ///
+    /// Similar to `VerifyAndAggregateProvisions`, this defers verification until
+    /// we have enough votes to possibly reach quorum. This avoids wasting CPU on
+    /// votes that will never be used.
+    ///
+    /// The runner:
+    /// 1. Batch-verifies all vote signatures (faster than individual verification)
+    /// 2. Reports which votes passed verification with their voting power
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::StateVoteSignatureVerified` when complete.
-    VerifyStateVoteSignature {
-        /// The state vote to verify.
-        vote: StateVoteBlock,
-        /// Public key of the voter (pre-resolved by state machine).
-        public_key: PublicKey,
+    /// Returns `Event::StateVotesVerifiedAndAggregated` when complete.
+    VerifyAndAggregateStateVotes {
+        /// Transaction hash for correlation.
+        tx_hash: Hash,
+        /// Votes to verify with their public keys and voting power.
+        /// Each tuple is (vote, public_key, voting_power).
+        votes: Vec<(StateVoteBlock, PublicKey, u64)>,
     },
 
     /// Verify a state certificate's aggregated signature (cross-shard Phase 5).
@@ -563,7 +572,7 @@ impl Action {
             Action::VerifyVoteSignature { .. }
                 | Action::VerifyAndAggregateProvisions { .. }
                 | Action::AggregateStateCertificate { .. }
-                | Action::VerifyStateVoteSignature { .. }
+                | Action::VerifyAndAggregateStateVotes { .. }
                 | Action::VerifyStateCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
                 | Action::BuildQuorumCertificate { .. }
@@ -626,7 +635,7 @@ impl Action {
             Action::VerifyVoteSignature { .. } => "VerifyVoteSignature",
             Action::VerifyAndAggregateProvisions { .. } => "VerifyAndAggregateProvisions",
             Action::AggregateStateCertificate { .. } => "AggregateStateCertificate",
-            Action::VerifyStateVoteSignature { .. } => "VerifyStateVoteSignature",
+            Action::VerifyAndAggregateStateVotes { .. } => "VerifyAndAggregateStateVotes",
             Action::VerifyStateCertificateSignature { .. } => "VerifyStateCertificateSignature",
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
             Action::BuildQuorumCertificate { .. } => "BuildQuorumCertificate",

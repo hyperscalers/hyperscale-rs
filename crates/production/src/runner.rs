@@ -53,10 +53,11 @@ pub enum RunnerError {
 mod batch_limits {
     /// Block votes: consensus-critical, lighter preprocessing. 128 matches ValidationBatcher.
     pub const MAX_BLOCK_VOTES: usize = 128;
-    /// State votes: same crypto pattern as block votes, 20ms window needs tighter cap.
-    pub const MAX_STATE_VOTES: usize = 64;
     /// State certs: parallel key aggregation benefits from ~core-count batches.
     pub const MAX_STATE_CERTS: usize = 64;
+    /// State votes: cross-tx batching with 20ms window. Uses batch_verify_bls_different_messages
+    /// which achieves ~2 pairings regardless of batch size, so larger batches = better efficiency.
+    pub const MAX_STATE_VOTES: usize = 64;
     /// Cross-shard execution: heavy per-item work, memory pressure from provisions.
     pub const MAX_CROSS_SHARD_EXECUTIONS: usize = 32;
     /// Gossiped certs: non-critical, can be re-fetched. Larger batches for efficiency.
@@ -87,31 +88,6 @@ impl PendingBlockVotes {
 
     fn is_full(&self) -> bool {
         self.votes.len() >= batch_limits::MAX_BLOCK_VOTES
-    }
-}
-
-/// Pending state vote verifications with a longer batching window.
-///
-/// State votes (cross-shard execution) are less latency-sensitive than block votes,
-/// so we use a longer batching window (20ms) to accumulate more signatures and
-/// get better batch verification throughput.
-#[derive(Default)]
-struct PendingStateVotes {
-    /// State votes waiting for verification.
-    votes: Vec<(StateVoteBlock, PublicKey)>,
-}
-
-impl PendingStateVotes {
-    fn is_empty(&self) -> bool {
-        self.votes.is_empty()
-    }
-
-    fn take(&mut self) -> Vec<(StateVoteBlock, PublicKey)> {
-        std::mem::take(&mut self.votes)
-    }
-
-    fn is_full(&self) -> bool {
-        self.votes.len() >= batch_limits::MAX_STATE_VOTES
     }
 }
 
@@ -162,6 +138,48 @@ impl PendingStateCerts {
 
     fn is_full(&self) -> bool {
         self.certs.len() >= batch_limits::MAX_STATE_CERTS
+    }
+}
+
+/// Pending state vote verifications with cross-transaction batching.
+///
+/// State votes from different transactions can be batched together for verification
+/// using `batch_verify_bls_different_messages`, which achieves ~2 pairings regardless
+/// of batch size (vs 2 pairings per transaction with separate batches).
+///
+/// Uses a 20ms batching window (longer than state certs' 15ms) since state votes
+/// are less latency-sensitive - they're part of cross-shard execution which has
+/// inherent network latency.
+///
+/// Batched state votes: (tx_hash, votes) where each vote is (vote, public_key, voting_power).
+type BatchedStateVotes = Vec<(Hash, Vec<(StateVoteBlock, PublicKey, u64)>)>;
+
+#[derive(Default)]
+struct PendingStateVotes {
+    /// State votes waiting for verification, grouped by originating tx_hash.
+    items: BatchedStateVotes,
+    /// Total number of individual votes across all transactions.
+    vote_count: usize,
+}
+
+impl PendingStateVotes {
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn push(&mut self, tx_hash: Hash, votes: Vec<(StateVoteBlock, PublicKey, u64)>) {
+        self.vote_count += votes.len();
+        self.items.push((tx_hash, votes));
+    }
+
+    fn take(&mut self) -> BatchedStateVotes {
+        self.vote_count = 0;
+        std::mem::take(&mut self.items)
+    }
+
+    fn is_full(&self) -> bool {
+        // Cap by number of transactions OR total votes, whichever hits first
+        self.items.len() >= batch_limits::MAX_STATE_VOTES || self.vote_count >= 256
     }
 }
 
@@ -699,12 +717,12 @@ impl ProductionRunnerBuilder {
             sync_request_rx,
             shutdown_rx,
             shutdown_tx: Some(shutdown_tx),
-            pending_state_votes: PendingStateVotes::default(),
-            state_vote_deadline: None,
             pending_cross_shard_executions: PendingCrossShardExecutions::default(),
             cross_shard_execution_deadline: None,
             pending_state_certs: PendingStateCerts::default(),
             state_cert_deadline: None,
+            pending_state_votes: PendingStateVotes::default(),
+            state_vote_deadline: None,
             signing_key: runner_signing_key,
             message_batcher,
             fetch_handler,
@@ -806,11 +824,6 @@ pub struct ProductionRunner {
     shutdown_rx: oneshot::Receiver<()>,
     /// Shutdown handle sender (stored to return to caller).
     shutdown_tx: Option<oneshot::Sender<()>>,
-    /// Pending state votes accumulated for batch verification.
-    /// State votes use a longer batching window (20ms) than block votes (5ms).
-    pending_state_votes: PendingStateVotes,
-    /// Deadline for flushing pending state votes. None if no votes pending.
-    state_vote_deadline: Option<tokio::time::Instant>,
     /// Pending cross-shard executions accumulated for batch parallel execution.
     /// Uses a short batching window (5ms) to balance latency vs throughput.
     pending_cross_shard_executions: PendingCrossShardExecutions,
@@ -821,6 +834,12 @@ pub struct ProductionRunner {
     pending_state_certs: PendingStateCerts,
     /// Deadline for flushing pending state certificates. None if none pending.
     state_cert_deadline: Option<tokio::time::Instant>,
+    /// Pending state votes accumulated for cross-transaction batch verification.
+    /// Uses a 20ms batching window with batch_verify_bls_different_messages for
+    /// ~2 pairings regardless of batch size (vs 2 pairings per tx with separate batches).
+    pending_state_votes: PendingStateVotes,
+    /// Deadline for flushing pending state votes. None if none pending.
+    state_vote_deadline: Option<tokio::time::Instant>,
     /// Signing key for state vote signing (cloned from state machine).
     signing_key: KeyPair,
     /// Message batcher for execution layer messages (votes, certificates, provisions).
@@ -1470,22 +1489,6 @@ impl ProductionRunner {
                                     Action::VerifyVoteSignature { vote, public_key, signing_message } => {
                                         pending_block_votes.votes.push((vote, public_key, signing_message));
                                     }
-                                    Action::VerifyStateVoteSignature { vote, public_key } => {
-                                        // Add to accumulated state votes with longer batching window
-                                        if self.pending_state_votes.is_empty() {
-                                            // Start the 20ms deadline on first state vote
-                                            self.state_vote_deadline = Some(
-                                                tokio::time::Instant::now() + Duration::from_millis(20)
-                                            );
-                                        }
-                                        self.pending_state_votes.votes.push((vote, public_key));
-                                        // Flush early if batch is full to cap p99 latency
-                                        if self.pending_state_votes.is_full() {
-                                            let votes = self.pending_state_votes.take();
-                                            self.state_vote_deadline = None;
-                                            self.dispatch_state_vote_verifications(votes);
-                                        }
-                                    }
                                     Action::VerifyStateCertificateSignature { certificate, public_keys } => {
                                         // Add to accumulated state certs with 15ms batching window
                                         if self.pending_state_certs.is_empty() {
@@ -1525,19 +1528,6 @@ impl ProductionRunner {
                                         Action::VerifyVoteSignature { vote, public_key, signing_message } => {
                                             pending_block_votes.votes.push((vote, public_key, signing_message));
                                         }
-                                        Action::VerifyStateVoteSignature { vote, public_key } => {
-                                            if self.pending_state_votes.is_empty() {
-                                                self.state_vote_deadline = Some(
-                                                    tokio::time::Instant::now() + Duration::from_millis(20)
-                                                );
-                                            }
-                                            self.pending_state_votes.votes.push((vote, public_key));
-                                            if self.pending_state_votes.is_full() {
-                                                let votes = self.pending_state_votes.take();
-                                                self.state_vote_deadline = None;
-                                                self.dispatch_state_vote_verifications(votes);
-                                            }
-                                        }
                                         Action::VerifyStateCertificateSignature { certificate, public_keys } => {
                                             if self.pending_state_certs.is_empty() {
                                                 self.state_cert_deadline = Some(
@@ -1564,7 +1554,6 @@ impl ProductionRunner {
                             // This allows votes that arrive close together to be batched,
                             // improving verification throughput (batch BLS verification is faster).
                             // The 5ms delay is small relative to the ~300ms block interval.
-                            // Note: State votes use a separate 20ms window handled by a dedicated select branch.
                             //
                             // NOTE: Fetch requests are now handled by the dedicated fetch handler task,
                             // so we don't need to interleave them here. This simplifies the loop.
@@ -1583,19 +1572,6 @@ impl ProductionRunner {
                                                 match action {
                                                     Action::VerifyVoteSignature { vote, public_key, signing_message } => {
                                                         pending_block_votes.votes.push((vote, public_key, signing_message));
-                                                    }
-                                                    Action::VerifyStateVoteSignature { vote, public_key } => {
-                                                        if self.pending_state_votes.is_empty() {
-                                                            self.state_vote_deadline = Some(
-                                                                tokio::time::Instant::now() + Duration::from_millis(20)
-                                                            );
-                                                        }
-                                                        self.pending_state_votes.votes.push((vote, public_key));
-                                                        if self.pending_state_votes.is_full() {
-                                                            let votes = self.pending_state_votes.take();
-                                                            self.state_vote_deadline = None;
-                                                            self.dispatch_state_vote_verifications(votes);
-                                                        }
                                                     }
                                                     Action::VerifyStateCertificateSignature { certificate, public_keys } => {
                                                         if self.pending_state_certs.is_empty() {
@@ -1645,29 +1621,6 @@ impl ProductionRunner {
                     }
                 }
 
-                // STATE VOTE BATCHING: Flush accumulated state votes when deadline expires.
-                // State votes use a longer batching window (20ms) than block votes (5ms)
-                // because they are less latency-sensitive - they don't block consensus progress,
-                // only cross-shard certificate formation.
-                _ = async {
-                    match self.state_vote_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                }, if self.state_vote_deadline.is_some() => {
-                    let votes = self.pending_state_votes.take();
-                    let batch_size = votes.len();
-                    self.state_vote_deadline = None;
-
-                    if !votes.is_empty() {
-                        tracing::debug!(
-                            batch_size,
-                            "Flushing state vote batch after 20ms window"
-                        );
-                        self.dispatch_state_vote_verifications(votes);
-                    }
-                }
-
                 // CROSS-SHARD EXECUTION BATCHING: Flush accumulated executions when deadline expires.
                 // Uses a short batching window (5ms) to balance latency vs throughput.
                 // These are executed in parallel using rayon's par_iter.
@@ -1709,6 +1662,30 @@ impl ProductionRunner {
                             "Flushing state cert batch after 15ms window"
                         );
                         self.dispatch_state_cert_verifications(certs);
+                    }
+                }
+
+                // STATE VOTE BATCHING: Flush accumulated state votes when deadline expires.
+                // Uses a 20ms batching window - longer than state certs since state votes are
+                // part of cross-shard execution which has inherent network latency.
+                // Cross-tx batching uses batch_verify_bls_different_messages for ~2 pairings
+                // regardless of batch size (vs 2 pairings per tx with separate batches).
+                _ = async {
+                    match self.state_vote_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.state_vote_deadline.is_some() => {
+                    let votes = self.pending_state_votes.take();
+                    let tx_count = votes.len();
+                    self.state_vote_deadline = None;
+
+                    if !votes.is_empty() {
+                        tracing::debug!(
+                            tx_count,
+                            "Flushing state vote batch after 20ms window"
+                        );
+                        self.dispatch_state_vote_verifications(votes);
                     }
                 }
 
@@ -2217,27 +2194,25 @@ impl ProductionRunner {
                 });
             }
 
-            Action::VerifyStateVoteSignature { vote, public_key } => {
-                let event_tx = self.callback_tx.clone();
-                self.thread_pools.spawn_crypto(move || {
-                    let start = std::time::Instant::now();
-                    // Use centralized signing message (must match ExecutionState::create_vote)
-                    let msg = vote.signing_message();
-
-                    let valid = public_key.verify(&msg, &vote.signature);
-                    crate::metrics::record_signature_verification_latency(
-                        "state_vote",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        crate::metrics::record_signature_verification_failure();
-                    }
-                    event_tx
-                        .send(Event::StateVoteSignatureVerified { vote, valid })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
+            Action::VerifyAndAggregateStateVotes { tx_hash, votes } => {
+                // Accumulate state votes for cross-transaction batch verification.
+                // Uses a 20ms batching window with batch_verify_bls_different_messages
+                // which achieves ~2 pairings regardless of batch size.
+                //
+                // NOTE: State votes should normally be batched via the event loop's
+                // pending_state_votes accumulator. This fallback handles any votes
+                // that come through process_action (e.g., from callback channel events).
+                if self.pending_state_votes.is_empty() {
+                    self.state_vote_deadline =
+                        Some(tokio::time::Instant::now() + Duration::from_millis(20));
+                }
+                self.pending_state_votes.push(tx_hash, votes);
+                // Flush early if batch is full to cap p99 latency
+                if self.pending_state_votes.is_full() {
+                    let votes = self.pending_state_votes.take();
+                    self.state_vote_deadline = None;
+                    self.dispatch_state_vote_verifications(votes);
+                }
             }
 
             Action::VerifyStateCertificateSignature {
@@ -3133,127 +3108,6 @@ impl ProductionRunner {
         });
     }
 
-    /// Dispatch state vote verifications to the crypto thread pool.
-    ///
-    /// State votes use a longer batching window (20ms) than block votes since they
-    /// are less latency-sensitive - they don't block consensus progress, only
-    /// cross-shard certificate formation. The longer window allows more signatures
-    /// to accumulate for better batch verification throughput.
-    ///
-    /// Results are sent back as individual events to maintain compatibility
-    /// with the state machine's expectations.
-    fn dispatch_state_vote_verifications(&self, votes: Vec<(StateVoteBlock, PublicKey)>) {
-        if votes.is_empty() {
-            return;
-        }
-
-        let event_tx = self.callback_tx.clone();
-        let batch_size = votes.len();
-
-        self.thread_pools.spawn_crypto(move || {
-            let start = std::time::Instant::now();
-
-            // Build signing messages for state votes (must match ExecutionState::create_vote)
-            let votes_with_msgs: Vec<(StateVoteBlock, PublicKey, Vec<u8>)> = votes
-                .into_iter()
-                .map(|(vote, pk)| {
-                    let mut msg = Vec::with_capacity(9 + 32 + 32 + 8 + 1); // Pre-allocate exact size
-                    msg.extend_from_slice(b"EXEC_VOTE");
-                    msg.extend_from_slice(vote.transaction_hash.as_bytes());
-                    msg.extend_from_slice(vote.state_root.as_bytes());
-                    msg.extend_from_slice(&vote.shard_group_id.0.to_le_bytes());
-                    msg.push(if vote.success { 1 } else { 0 });
-                    (vote, pk, msg)
-                })
-                .collect();
-
-            let mut ed25519_votes: Vec<(StateVoteBlock, PublicKey, Vec<u8>)> = Vec::new();
-            let mut bls_votes: Vec<(StateVoteBlock, PublicKey, Vec<u8>)> = Vec::new();
-
-            for (vote, pk, msg) in votes_with_msgs {
-                match &pk {
-                    PublicKey::Ed25519(_) => ed25519_votes.push((vote, pk, msg)),
-                    PublicKey::Bls12381(_) => bls_votes.push((vote, pk, msg)),
-                }
-            }
-
-            // Process Ed25519 state votes using batch verification
-            if !ed25519_votes.is_empty() {
-                let messages: Vec<&[u8]> =
-                    ed25519_votes.iter().map(|(_, _, m)| m.as_slice()).collect();
-                let signatures: Vec<Signature> = ed25519_votes
-                    .iter()
-                    .map(|(v, _, _)| v.signature.clone())
-                    .collect();
-                let pubkeys: Vec<PublicKey> =
-                    ed25519_votes.iter().map(|(_, pk, _)| pk.clone()).collect();
-
-                let batch_valid =
-                    PublicKey::batch_verify_ed25519(&messages, &signatures, &pubkeys);
-
-                if batch_valid {
-                    for (vote, _, _) in ed25519_votes {
-                        event_tx
-                            .send(Event::StateVoteSignatureVerified { vote, valid: true })
-                            .expect("callback channel closed - Loss of this event would cause a deadlock");
-                    }
-                } else {
-                    for (vote, pk, msg) in ed25519_votes {
-                        let valid = pk.verify(&msg, &vote.signature);
-                        if !valid {
-                            crate::metrics::record_signature_verification_failure();
-                        }
-                        event_tx
-                            .send(Event::StateVoteSignatureVerified { vote, valid })
-                            .expect("callback channel closed - Loss of this event would cause a deadlock");
-                    }
-                }
-            }
-
-            // Process BLS state votes using blst's native batch verification.
-            // Uses random linear combination to batch verify different messages efficiently.
-            // The longer batching window (20ms) means we typically have larger batches here,
-            // making batch verification more beneficial.
-            if !bls_votes.is_empty() {
-                let messages: Vec<&[u8]> =
-                    bls_votes.iter().map(|(_, _, m)| m.as_slice()).collect();
-                let signatures: Vec<Signature> = bls_votes
-                    .iter()
-                    .map(|(v, _, _)| v.signature.clone())
-                    .collect();
-                let pubkeys: Vec<PublicKey> =
-                    bls_votes.iter().map(|(_, pk, _)| pk.clone()).collect();
-
-                let results = PublicKey::batch_verify_bls_different_messages(
-                    &messages,
-                    &signatures,
-                    &pubkeys,
-                );
-
-                for ((vote, _, _), valid) in bls_votes.into_iter().zip(results) {
-                    if !valid {
-                        crate::metrics::record_signature_verification_failure();
-                    }
-                    event_tx
-                        .send(Event::StateVoteSignatureVerified { vote, valid })
-                        .expect("callback channel closed - Loss of this event would cause a deadlock");
-                }
-            }
-
-            crate::metrics::record_signature_verification_latency(
-                "state_vote",
-                start.elapsed().as_secs_f64(),
-            );
-
-            if batch_size > 1 {
-                tracing::debug!(
-                    batch_size,
-                    "Batch verified state vote signatures (20ms window)"
-                );
-            }
-        });
-    }
-
     /// Dispatch state certificate verifications to the crypto thread pool.
     ///
     /// State certificates contain aggregated BLS signatures that are expensive to verify.
@@ -3384,6 +3238,97 @@ impl ProductionRunner {
                 tracing::debug!(
                     batch_size,
                     "Batch verified state cert signatures (15ms window)"
+                );
+            }
+        });
+    }
+
+    /// Dispatch state vote verifications to the crypto thread pool.
+    ///
+    /// State votes from multiple transactions are batched together for verification
+    /// using `batch_verify_bls_different_messages`, which achieves ~2 pairings
+    /// regardless of batch size. This is significantly faster than verifying
+    /// each transaction's votes separately (which would be 2 pairings per tx).
+    ///
+    /// Uses a 20ms batching window (longer than state certs) since state votes
+    /// are part of cross-shard execution which has inherent network latency.
+    fn dispatch_state_vote_verifications(&self, batched_votes: BatchedStateVotes) {
+        if batched_votes.is_empty() {
+            return;
+        }
+
+        let event_tx = self.callback_tx.clone();
+        let tx_count = batched_votes.len();
+        let vote_count: usize = batched_votes.iter().map(|(_, v)| v.len()).sum();
+
+        self.thread_pools.spawn_crypto(move || {
+            let start = std::time::Instant::now();
+
+            // Flatten all votes into a single list for batch verification
+            // Track which tx each vote belongs to for result correlation
+            let mut all_votes: Vec<(Hash, StateVoteBlock, PublicKey, u64)> = Vec::new();
+            for (tx_hash, votes) in batched_votes {
+                for (vote, pk, power) in votes {
+                    all_votes.push((tx_hash, vote, pk, power));
+                }
+            }
+
+            // Build arrays for batch verification
+            let messages: Vec<Vec<u8>> = all_votes
+                .iter()
+                .map(|(_, vote, _, _)| vote.signing_message())
+                .collect();
+            let message_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+            let signatures: Vec<Signature> = all_votes
+                .iter()
+                .map(|(_, vote, _, _)| vote.signature.clone())
+                .collect();
+            let pubkeys: Vec<PublicKey> =
+                all_votes.iter().map(|(_, _, pk, _)| pk.clone()).collect();
+
+            // Batch verify all signatures at once (~2 pairings regardless of count)
+            let results = PublicKey::batch_verify_bls_different_messages(
+                &message_refs,
+                &signatures,
+                &pubkeys,
+            );
+
+            // Group verified votes by tx_hash for result events
+            use std::collections::HashMap;
+            let mut verified_by_tx: HashMap<Hash, Vec<(StateVoteBlock, u64)>> = HashMap::new();
+
+            for ((tx_hash, vote, _, power), valid) in all_votes.into_iter().zip(results) {
+                if valid {
+                    verified_by_tx
+                        .entry(tx_hash)
+                        .or_default()
+                        .push((vote, power));
+                } else {
+                    crate::metrics::record_signature_verification_failure();
+                }
+            }
+
+            // Send results grouped by transaction
+            for (tx_hash, verified_votes) in verified_by_tx {
+                event_tx
+                    .send(Event::StateVotesVerifiedAndAggregated {
+                        tx_hash,
+                        verified_votes,
+                    })
+                    .expect("callback channel closed - Loss of this event would cause a deadlock");
+            }
+
+            crate::metrics::record_signature_verification_latency(
+                "state_vote_batch",
+                start.elapsed().as_secs_f64(),
+            );
+
+            if tx_count > 1 {
+                tracing::debug!(
+                    tx_count,
+                    vote_count,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "Batch verified state votes across transactions (20ms window)"
                 );
             }
         });

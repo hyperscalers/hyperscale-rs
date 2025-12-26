@@ -7,9 +7,7 @@
 //! Note: Provision signature verification is now handled by ProvisionCoordinator
 //! in the `hyperscale-provisions` crate.
 
-use hyperscale_types::{
-    BlockHeight, Hash, ShardGroupId, StateCertificate, StateVoteBlock, TransactionCertificate,
-};
+use hyperscale_types::{BlockHeight, Hash, ShardGroupId, StateCertificate, TransactionCertificate};
 use std::collections::HashSet;
 
 /// Tracks a pending provision broadcast waiting for state fetch.
@@ -22,18 +20,6 @@ pub struct PendingProvisionBroadcast {
     pub block_height: BlockHeight,
     /// Target shards to broadcast to.
     pub target_shards: Vec<ShardGroupId>,
-}
-
-/// Tracks a pending state vote signature verification.
-///
-/// When we receive a state vote, we delegate signature verification to
-/// the runner before counting it toward quorum.
-#[derive(Debug, Clone)]
-pub struct PendingStateVoteVerification {
-    /// The vote awaiting verification.
-    pub vote: StateVoteBlock,
-    /// Voting power of the voter.
-    pub voting_power: u64,
 }
 
 /// Tracks a pending state certificate signature verification.

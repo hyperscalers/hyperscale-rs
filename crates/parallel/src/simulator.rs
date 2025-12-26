@@ -640,11 +640,25 @@ impl SimNode {
                     });
             }
 
-            Action::VerifyStateVoteSignature { vote, public_key } => {
-                let msg = vote.signing_message();
-                let valid = public_key.verify(&msg, &vote.signature);
+            Action::VerifyAndAggregateStateVotes { tx_hash, votes } => {
+                // Batch verify state votes - deferred verification pattern.
+                let verified_votes: Vec<(StateVoteBlock, u64)> = votes
+                    .into_iter()
+                    .filter_map(|(vote, public_key, voting_power)| {
+                        let msg = vote.signing_message();
+                        let valid = public_key.verify(&msg, &vote.signature);
+                        if valid {
+                            Some((vote, voting_power))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 self.internal_queue
-                    .push_back(Event::StateVoteSignatureVerified { vote, valid });
+                    .push_back(Event::StateVotesVerifiedAndAggregated {
+                        tx_hash,
+                        verified_votes,
+                    });
             }
 
             Action::VerifyStateCertificateSignature {
