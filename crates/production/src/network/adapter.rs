@@ -15,6 +15,7 @@ use super::topic::Topic;
 use crate::metrics;
 use crate::network::config::VersionInteroperabilityMode;
 use crate::validation_batcher::ValidationBatcherHandle;
+use bytes::Bytes;
 use dashmap::DashMap;
 use futures::future::Either;
 use futures::{FutureExt, StreamExt};
@@ -189,7 +190,7 @@ pub enum SwarmCommand {
     /// Used for consensus messages where we don't need ACK tracking.
     DirectBroadcast {
         peers: Vec<Libp2pPeerId>,
-        data: Vec<u8>,
+        data: Bytes,
     },
 }
 
@@ -251,7 +252,7 @@ struct HyperscaleCodec;
 #[async_trait::async_trait]
 impl request_response::Codec for HyperscaleCodec {
     type Protocol = StreamProtocol;
-    type Request = Vec<u8>;
+    type Request = Bytes;
     type Response = Vec<u8>;
 
     async fn read_request<T>(
@@ -272,7 +273,7 @@ impl request_response::Codec for HyperscaleCodec {
         // Read message body
         let mut buf = vec![0u8; len];
         io.read_exact(&mut buf).await?;
-        Ok(buf)
+        Ok(Bytes::from(buf))
     }
 
     async fn read_response<T>(
@@ -1436,7 +1437,7 @@ impl Libp2pAdapter {
                 response_tx,
             } => {
                 // Encode block request as simple height bytes
-                let data = height.to_le_bytes().to_vec();
+                let data = Bytes::copy_from_slice(&height.to_le_bytes());
                 let req_id = swarm
                     .behaviour_mut()
                     .request_response
@@ -1475,7 +1476,7 @@ impl Libp2pAdapter {
                 // Encode transaction request using SBOR
                 use hyperscale_messages::request::GetTransactionsRequest;
                 let request = GetTransactionsRequest::new(block_hash, tx_hashes);
-                let data = sbor::basic_encode(&request).unwrap_or_default();
+                let data = Bytes::from(sbor::basic_encode(&request).unwrap_or_default());
                 let req_id = swarm
                     .behaviour_mut()
                     .request_response
@@ -1517,7 +1518,7 @@ impl Libp2pAdapter {
                 // Encode certificate request using SBOR
                 use hyperscale_messages::request::GetCertificatesRequest;
                 let request = GetCertificatesRequest::new(block_hash, cert_hashes);
-                let data = sbor::basic_encode(&request).unwrap_or_default();
+                let data = Bytes::from(sbor::basic_encode(&request).unwrap_or_default());
                 let req_id = swarm
                     .behaviour_mut()
                     .request_response
@@ -1555,7 +1556,7 @@ impl Libp2pAdapter {
                 let req_id = swarm
                     .behaviour_mut()
                     .request_response
-                    .send_request(&peer, data);
+                    .send_request(&peer, Bytes::from(data));
 
                 pending_direct_messages.insert(req_id, std::time::Instant::now());
             }
@@ -1563,7 +1564,6 @@ impl Libp2pAdapter {
                 // Send to all peers in a single event loop iteration (fire-and-forget).
                 // No ACK tracking - consensus messages don't need delivery confirmation.
                 let peer_count = peers.len();
-                let mut sent = 0;
                 for peer in peers {
                     // send_request returns immediately, queuing the message internally
                     let _req_id = swarm
@@ -1571,10 +1571,9 @@ impl Libp2pAdapter {
                         .request_response
                         .send_request(&peer, data.clone());
                     // Intentionally not tracking req_id for ACK - fire and forget
-                    sent += 1;
                 }
                 trace!(
-                    sent = sent,
+                    sent = peer_count,
                     total = peer_count,
                     "Direct broadcast sent to all peers"
                 );
@@ -1583,7 +1582,6 @@ impl Libp2pAdapter {
     }
 }
 
-/// Internal action to take after handling a swarm event
 /// Internal action to take after handling a swarm event
 enum SwarmAction {
     None,

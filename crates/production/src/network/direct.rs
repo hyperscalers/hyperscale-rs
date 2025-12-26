@@ -2,6 +2,7 @@ use super::config::Libp2pConfig;
 use crate::metrics;
 use crate::network::adapter::SwarmCommand;
 use crate::network::NetworkError;
+use bytes::Bytes;
 use dashmap::DashMap;
 use hyperscale_core::OutboundMessage;
 use hyperscale_types::{ShardGroupId, ValidatorId};
@@ -121,10 +122,10 @@ impl DirectValidatorNetwork {
             return Ok(());
         }
 
-        // Send single batch command
+        // Send single batch command using Bytes for O(1) cloning in the handler.
         let cmd = SwarmCommand::DirectBroadcast {
             peers: target_peers.clone(),
-            data,
+            data: Bytes::from(data),
         };
 
         if self.swarm_command_tx.send(cmd).is_err() {
