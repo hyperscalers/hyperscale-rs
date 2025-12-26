@@ -96,18 +96,39 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Delegated Work (async, returns callback event)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Verify a block vote's signature.
+    /// Verify block votes and build a Quorum Certificate if quorum is reached.
+    ///
+    /// This combines vote verification and QC building into a single operation:
+    /// 1. Batch-verifies all vote signatures using `batch_verify_bls_same_message`
+    /// 2. If enough valid votes for quorum: aggregates signatures into a QC
+    /// 3. If not enough valid votes: returns the verified votes so state machine
+    ///    can wait for more votes
+    ///
+    /// This avoids wasting CPU on votes that will never be used (e.g., when a
+    /// block never reaches quorum due to view change or leader failure).
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::VoteSignatureVerified` when complete.
-    VerifyVoteSignature {
-        /// The vote to verify.
-        vote: BlockVote,
-        /// Public key of the voter (pre-resolved by state machine).
-        public_key: PublicKey,
+    /// Returns `Event::QuorumCertificateResult` when complete.
+    VerifyAndBuildQuorumCertificate {
+        /// Block hash the QC would be for.
+        block_hash: Hash,
+        /// Block height.
+        height: BlockHeight,
+        /// Round number.
+        round: u64,
+        /// Parent block hash (from the block's header).
+        parent_block_hash: Hash,
         /// The signing message (domain_tag || shard_group || height || round || block_hash).
         /// Pre-computed by state machine since it has the shard_group context.
         signing_message: Vec<u8>,
+        /// Votes to verify and potentially aggregate.
+        /// Each tuple is (committee_index, vote, public_key, voting_power).
+        votes_to_verify: Vec<(usize, BlockVote, PublicKey, u64)>,
+        /// Already-verified votes (e.g., our own vote).
+        /// Each tuple is (committee_index, vote, voting_power).
+        verified_votes: Vec<(usize, BlockVote, u64)>,
+        /// Total voting power in the committee (for quorum calculation).
+        total_voting_power: u64,
     },
 
     /// Batch verify and aggregate provisions (cross-shard Phase 2).
@@ -207,31 +228,6 @@ pub enum Action {
         /// The signing message (domain_tag || shard_group || height || round || qc.block_hash).
         /// Pre-computed by state machine since it has the shard_group context.
         signing_message: Vec<u8>,
-    },
-
-    /// Build a Quorum Certificate by aggregating BLS signatures from collected votes.
-    ///
-    /// Performs BLS signature aggregation which is compute-intensive (~100ms for large committees).
-    /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::QuorumCertificateBuilt` when complete.
-    BuildQuorumCertificate {
-        /// Block hash the QC is for.
-        block_hash: Hash,
-        /// Block height.
-        height: BlockHeight,
-        /// Round number.
-        round: u64,
-        /// Parent block hash (from the block's header).
-        parent_block_hash: Hash,
-        /// Votes to aggregate, sorted by committee index.
-        /// Each tuple is (committee_index, vote).
-        votes: Vec<(usize, BlockVote)>,
-        /// Bitfield tracking which validators have voted.
-        signers: SignerBitfield,
-        /// Total voting power accumulated.
-        voting_power: VotePower,
-        /// Weighted timestamp sum for calculating stake-weighted timestamp.
-        timestamp_weight_sum: u128,
     },
 
     /// Execute a batch of single-shard transactions.
@@ -569,13 +565,12 @@ impl Action {
     pub fn is_delegated(&self) -> bool {
         matches!(
             self,
-            Action::VerifyVoteSignature { .. }
+            Action::VerifyAndBuildQuorumCertificate { .. }
                 | Action::VerifyAndAggregateProvisions { .. }
                 | Action::AggregateStateCertificate { .. }
                 | Action::VerifyAndAggregateStateVotes { .. }
                 | Action::VerifyStateCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
-                | Action::BuildQuorumCertificate { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
@@ -632,13 +627,12 @@ impl Action {
             Action::EnqueueInternal { .. } => "EnqueueInternal",
 
             // Delegated Work - Crypto Verification
-            Action::VerifyVoteSignature { .. } => "VerifyVoteSignature",
+            Action::VerifyAndBuildQuorumCertificate { .. } => "VerifyAndBuildQuorumCertificate",
             Action::VerifyAndAggregateProvisions { .. } => "VerifyAndAggregateProvisions",
             Action::AggregateStateCertificate { .. } => "AggregateStateCertificate",
             Action::VerifyAndAggregateStateVotes { .. } => "VerifyAndAggregateStateVotes",
             Action::VerifyStateCertificateSignature { .. } => "VerifyStateCertificateSignature",
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
-            Action::BuildQuorumCertificate { .. } => "BuildQuorumCertificate",
 
             // Delegated Work - Execution
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",

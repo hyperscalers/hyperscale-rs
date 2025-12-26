@@ -1,22 +1,23 @@
 //! Vote set for collecting block votes.
+//!
+//! ## Deferred Verification Optimization
+//!
+//! Votes are NOT verified when received. Instead, they are buffered until
+//! we have enough for quorum. At that point, we send a single
+//! `VerifyAndBuildQuorumCertificate` action that batch-verifies all signatures
+//! and builds the QC in one operation.
+//!
+//! This avoids wasting CPU on votes we'll never use (e.g., if a block
+//! never reaches quorum due to view change or leader failure).
 
 #[cfg(test)]
 use hyperscale_types::QuorumCertificate;
-use hyperscale_types::{BlockHeader, BlockHeight, BlockVote, Hash, SignerBitfield, VotePower};
-use tracing::instrument;
-
-/// Data needed to build a QC asynchronously.
-type QcBuildData = (
-    BlockHeight,
-    u64,
-    Hash,
-    Vec<(usize, BlockVote)>,
-    SignerBitfield,
-    u64,
-    u128,
-);
+use hyperscale_types::{BlockHeader, BlockHeight, BlockVote, Hash, PublicKey, VotePower};
 
 /// Votes for a specific block.
+///
+/// The vote set supports deferred verification: unverified votes are buffered
+/// until we have enough voting power to possibly reach quorum, then batch-verified.
 #[derive(Debug, Clone)]
 pub struct VoteSet {
     /// Block hash being voted on.
@@ -31,23 +32,35 @@ pub struct VoteSet {
     /// Parent block hash (from the block's header).
     parent_block_hash: Option<Hash>,
 
-    /// Collected votes with their committee indices.
-    /// The committee index is needed to ensure signatures are aggregated in the
-    /// same order as public keys during verification.
-    votes: Vec<(usize, BlockVote)>,
+    // ═══════════════════════════════════════════════════════════════════════
+    // Verified votes (passed signature verification)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Verified votes with their committee indices.
+    /// Each tuple is (committee_index, vote, voting_power).
+    verified_votes: Vec<(usize, BlockVote, u64)>,
 
-    /// Bitfield tracking which validators have voted.
-    signers: SignerBitfield,
+    /// Total voting power from verified votes.
+    verified_power: u64,
 
-    /// Total voting power accumulated from votes (stake-weighted).
-    voting_power: u64,
+    /// Sum of (timestamp * stake_weight) for verified votes.
+    verified_timestamp_weight_sum: u128,
 
-    /// Sum of (timestamp * stake_weight) for weighted timestamp calculation.
-    timestamp_weight_sum: u128,
+    // ═══════════════════════════════════════════════════════════════════════
+    // Unverified votes (buffered until quorum possible)
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Unverified votes buffered for batch verification.
+    /// Each tuple is (committee_index, vote, public_key, voting_power).
+    unverified_votes: Vec<(usize, BlockVote, PublicKey, u64)>,
 
-    /// Total number of validators (for bitfield sizing).
-    #[allow(dead_code)]
-    num_validators: usize,
+    /// Total voting power of unverified votes.
+    unverified_power: u64,
+
+    /// Bitfield tracking which validators we've seen votes from (verified or unverified).
+    /// Used for deduplication.
+    seen_validators: Vec<bool>,
+
+    /// Whether a verification batch is currently in flight.
+    pending_verification: bool,
 
     /// Whether QC has already been built from this vote set.
     qc_built: bool,
@@ -72,67 +85,15 @@ impl VoteSet {
             height,
             round,
             parent_block_hash,
-            votes: Vec::new(),
-            signers: SignerBitfield::new(num_validators),
-            voting_power: 0,
-            timestamp_weight_sum: 0,
-            num_validators,
+            verified_votes: Vec::new(),
+            verified_power: 0,
+            verified_timestamp_weight_sum: 0,
+            unverified_votes: Vec::new(),
+            unverified_power: 0,
+            seen_validators: vec![false; num_validators],
+            pending_verification: false,
             qc_built: false,
         }
-    }
-
-    /// Add a vote to this set using the committee index and stake weight.
-    ///
-    /// The `committee_index` is the position of the validator in the shard's committee,
-    /// NOT the raw validator ID. This allows non-contiguous validator IDs to work correctly.
-    ///
-    /// The `stake_weight` is the validator's voting power from their stake.
-    ///
-    /// Returns true if vote was added, false if validator already voted.
-    #[instrument(level = "debug", skip(self, vote), fields(
-        block_hash = ?self.block_hash,
-        height = ?self.height.map(|h| h.0),
-        voter = vote.voter.0,
-        power_before = self.voting_power,
-        stake_weight = stake_weight,
-    ))]
-    pub fn add_vote(&mut self, vote: BlockVote, committee_index: usize, stake_weight: u64) -> bool {
-        // Check if validator already voted (using committee index)
-        if self.signers.is_set(committee_index) {
-            return false;
-        }
-
-        // Update block hash, height, and round from first vote if not set
-        if self.block_hash.is_none() {
-            self.block_hash = Some(vote.block_hash);
-            self.height = Some(vote.height);
-            self.round = Some(vote.round);
-        }
-
-        self.signers.set(committee_index);
-        self.voting_power += stake_weight;
-        // Accumulate weighted timestamp: timestamp * stake_weight
-        self.timestamp_weight_sum += vote.timestamp as u128 * stake_weight as u128;
-        self.votes.push((committee_index, vote));
-
-        true
-    }
-
-    /// Check if this set has quorum and can build a QC.
-    ///
-    /// Quorum formula: voted_power * 3 > total_power * 2 (i.e., > 2/3)
-    ///
-    /// Note: This also requires the header to be set (via constructor or `set_header`),
-    /// since building a QC requires the parent_block_hash from the header.
-    pub fn has_quorum(&self, total_power: u64) -> bool {
-        !self.qc_built
-            && self.parent_block_hash.is_some()
-            && VotePower::has_quorum(self.voting_power, total_power)
-    }
-
-    /// Get the current voting power.
-    pub fn voting_power(&self) -> u64 {
-        self.voting_power
     }
 
     /// Get the block height.
@@ -145,16 +106,26 @@ impl VoteSet {
         self.round
     }
 
-    /// Check if parent block hash is present.
-    pub fn has_parent_hash(&self) -> bool {
-        self.parent_block_hash.is_some()
+    /// Get the current verified voting power.
+    pub fn verified_power(&self) -> u64 {
+        self.verified_power
+    }
+
+    /// Get the current unverified voting power.
+    pub fn unverified_power(&self) -> u64 {
+        self.unverified_power
+    }
+
+    /// Check if we've already seen a vote from this validator.
+    pub fn has_seen_validator(&self, committee_index: usize) -> bool {
+        committee_index < self.seen_validators.len() && self.seen_validators[committee_index]
     }
 
     /// Update the vote set with header information.
     ///
     /// This is needed when votes arrive before the header. The vote set
     /// can accumulate votes, but it needs the header info (particularly
-    /// parent_block_hash) to build a valid QC.
+    /// parent_block_hash) to trigger verification.
     pub fn set_header(&mut self, header: &BlockHeader) {
         if self.height.is_none() {
             self.height = Some(header.height);
@@ -170,42 +141,159 @@ impl VoteSet {
         }
     }
 
-    /// Extract data needed to build a QC asynchronously.
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Unverified Vote Buffering
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Buffer an unverified vote for later batch verification.
     ///
-    /// This marks the vote set as "QC building in progress" and returns all data
-    /// needed by the runner to perform BLS signature aggregation off the main thread.
-    ///
-    /// Returns None if:
-    /// - No votes collected
-    /// - QC already built or being built
-    /// - Missing height or parent_block_hash
-    pub fn prepare_qc_build(&mut self) -> Option<QcBuildData> {
-        if self.votes.is_empty() || self.qc_built {
-            return None;
+    /// Returns `true` if the vote was buffered, `false` if it was a duplicate.
+    pub fn buffer_unverified_vote(
+        &mut self,
+        committee_index: usize,
+        vote: BlockVote,
+        public_key: PublicKey,
+        voting_power: u64,
+    ) -> bool {
+        // Check for duplicate
+        if self.has_seen_validator(committee_index) {
+            return false;
         }
 
-        let height = self.height?;
-        let round = self.round.unwrap_or(0);
-        let parent_block_hash = self.parent_block_hash?;
+        // Update block hash, height, and round from first vote if not set
+        if self.block_hash.is_none() {
+            self.block_hash = Some(vote.block_hash);
+            self.height = Some(vote.height);
+            self.round = Some(vote.round);
+        }
 
-        // Sort votes by committee index for deterministic aggregation
-        self.votes.sort_by_key(|(idx, _)| *idx);
+        // Mark as seen
+        if committee_index < self.seen_validators.len() {
+            self.seen_validators[committee_index] = true;
+        }
 
-        // Mark as built to prevent duplicate building
-        self.qc_built = true;
+        self.unverified_power += voting_power;
+        self.unverified_votes
+            .push((committee_index, vote, public_key, voting_power));
 
+        true
+    }
+
+    /// Check if we should trigger batch verification.
+    ///
+    /// Returns true if:
+    /// - We have enough total power (verified + unverified) to possibly reach quorum
+    /// - We have unverified votes to verify
+    /// - We're not already waiting for a verification result
+    /// - We have the header info needed to build a QC
+    pub fn should_trigger_verification(&self, total_committee_power: u64) -> bool {
+        !self.pending_verification
+            && !self.qc_built
+            && !self.unverified_votes.is_empty()
+            && self.parent_block_hash.is_some()
+            && VotePower::has_quorum(
+                self.verified_power + self.unverified_power,
+                total_committee_power,
+            )
+    }
+
+    /// Take the unverified votes for batch verification.
+    ///
+    /// Returns the votes and marks the vote set as pending verification.
+    /// Each tuple is (committee_index, vote, public_key, voting_power).
+    pub fn take_unverified_votes(&mut self) -> Vec<(usize, BlockVote, PublicKey, u64)> {
+        self.pending_verification = true;
+        self.unverified_power = 0;
+        std::mem::take(&mut self.unverified_votes)
+    }
+
+    /// Get copies of the already-verified votes.
+    ///
+    /// These are votes that were added via `add_verified_vote` (e.g., our own vote)
+    /// and need to be included in the QC along with newly verified votes.
+    pub fn get_verified_votes(&self) -> Vec<(usize, BlockVote, u64)> {
+        self.verified_votes.clone()
+    }
+
+    /// Get data needed for verification action.
+    ///
+    /// Returns (block_hash, height, round, parent_block_hash) or None if not ready.
+    pub fn verification_data(&self) -> Option<(Hash, BlockHeight, u64, Hash)> {
         Some((
-            height,
-            round,
-            parent_block_hash,
-            self.votes.clone(),
-            self.signers.clone(),
-            self.voting_power,
-            self.timestamp_weight_sum,
+            self.block_hash?,
+            self.height?,
+            self.round.unwrap_or(0),
+            self.parent_block_hash?,
         ))
     }
 
-    /// Build a Quorum Certificate from collected votes.
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Verification Result Handling
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Called when verification completes successfully with a QC.
+    ///
+    /// Marks the vote set as built.
+    pub fn on_qc_built(&mut self) {
+        self.qc_built = true;
+        self.pending_verification = false;
+    }
+
+    /// Called when verification completes but quorum wasn't reached.
+    ///
+    /// Adds the verified votes to the verified set and clears pending flag.
+    pub fn on_votes_verified(&mut self, verified_votes: Vec<(usize, BlockVote, u64)>) {
+        self.pending_verification = false;
+
+        for (committee_index, vote, voting_power) in verified_votes {
+            // Accumulate weighted timestamp
+            self.verified_timestamp_weight_sum += vote.timestamp as u128 * voting_power as u128;
+            self.verified_power += voting_power;
+            self.verified_votes
+                .push((committee_index, vote, voting_power));
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Legacy / Test Support
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Add a verified vote directly (for own votes that skip verification).
+    ///
+    /// Returns true if vote was added, false if validator already voted.
+    pub fn add_verified_vote(
+        &mut self,
+        committee_index: usize,
+        vote: BlockVote,
+        voting_power: u64,
+    ) -> bool {
+        // Check for duplicate
+        if self.has_seen_validator(committee_index) {
+            return false;
+        }
+
+        // Update block hash, height, and round from first vote if not set
+        if self.block_hash.is_none() {
+            self.block_hash = Some(vote.block_hash);
+            self.height = Some(vote.height);
+            self.round = Some(vote.round);
+        }
+
+        // Mark as seen
+        if committee_index < self.seen_validators.len() {
+            self.seen_validators[committee_index] = true;
+        }
+
+        // Accumulate weighted timestamp
+        self.verified_timestamp_weight_sum += vote.timestamp as u128 * voting_power as u128;
+        self.verified_power += voting_power;
+        self.verified_votes
+            .push((committee_index, vote, voting_power));
+
+        true
+    }
+
+    /// Build a Quorum Certificate from collected votes (test only).
     ///
     /// Two-chain rule (HotStuff-2): when creating a QC for block N,
     /// the committable block is at height N-1 (the parent). The committable
@@ -217,9 +305,9 @@ impl VoteSet {
     /// Returns error if called before reaching quorum or with no votes.
     #[cfg(test)]
     pub fn build_qc(&mut self, block_hash: Hash) -> Result<QuorumCertificate, String> {
-        use hyperscale_types::Signature;
+        use hyperscale_types::{Signature, SignerBitfield};
 
-        if self.votes.is_empty() {
+        if self.verified_votes.is_empty() {
             return Err("cannot build QC with no votes".to_string());
         }
 
@@ -230,13 +318,25 @@ impl VoteSet {
         // Sort votes by committee index to ensure deterministic signature aggregation.
         // This is critical: the aggregated signature must be built in the same order
         // as the public keys will be aggregated during verification.
-        self.votes.sort_by_key(|(idx, _)| *idx);
+        self.verified_votes.sort_by_key(|(idx, _, _)| *idx);
+
+        // Build signers bitfield - size based on max committee index
+        let max_idx = self
+            .verified_votes
+            .iter()
+            .map(|(idx, _, _)| *idx)
+            .max()
+            .unwrap_or(0);
+        let mut signers = SignerBitfield::new(max_idx + 1);
+        for (idx, _, _) in &self.verified_votes {
+            signers.set(*idx);
+        }
 
         // Extract signatures in sorted order
         let signatures: Vec<Signature> = self
-            .votes
+            .verified_votes
             .iter()
-            .map(|(_, v)| v.signature.clone())
+            .map(|(_, v, _)| v.signature.clone())
             .collect();
 
         // Aggregate BLS signatures
@@ -244,10 +344,10 @@ impl VoteSet {
             .map_err(|e| format!("failed to aggregate signatures: {}", e))?;
 
         // Compute stake-weighted timestamp: sum(timestamp * stake) / sum(stake)
-        let weighted_timestamp_ms = if self.voting_power == 0 {
+        let weighted_timestamp_ms = if self.verified_power == 0 {
             0
         } else {
-            (self.timestamp_weight_sum / self.voting_power as u128) as u64
+            (self.verified_timestamp_weight_sum / self.verified_power as u128) as u64
         };
 
         let height = self.height.ok_or("no height in vote set")?;
@@ -264,8 +364,8 @@ impl VoteSet {
             parent_block_hash,
             round,
             aggregated_signature,
-            signers: self.signers.clone(),
-            voting_power: VotePower(self.voting_power),
+            signers,
+            voting_power: VotePower(self.verified_power),
             weighted_timestamp_ms,
         })
     }
@@ -315,50 +415,77 @@ mod tests {
         let header = make_header(1);
         let vote_set = VoteSet::new(Some(header.clone()), 4);
 
-        assert_eq!(vote_set.voting_power(), 0);
+        assert_eq!(vote_set.verified_power(), 0);
         assert_eq!(vote_set.height(), Some(1));
-        assert!(!vote_set.has_quorum(4));
     }
 
     #[test]
-    fn test_add_votes() {
+    fn test_buffer_unverified_votes() {
         let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
         let header = make_header(1);
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(header), 4);
 
-        // Add first vote
+        // Buffer first vote
         let vote0 = make_vote(&keys, 0, block_hash, 1);
-        assert!(vote_set.add_vote(vote0, 0, 1));
-        assert_eq!(vote_set.voting_power(), 1);
-        assert!(!vote_set.has_quorum(4));
+        let pk0 = keys[0].public_key();
+        assert!(vote_set.buffer_unverified_vote(0, vote0, pk0, 1));
+        assert_eq!(vote_set.unverified_power(), 1);
+        assert_eq!(vote_set.verified_power(), 0);
 
-        // Add duplicate (should fail)
+        // Buffer duplicate (should fail)
         let vote0_dup = make_vote(&keys, 0, block_hash, 1);
-        assert!(!vote_set.add_vote(vote0_dup, 0, 1));
-        assert_eq!(vote_set.voting_power(), 1);
+        let pk0_dup = keys[0].public_key();
+        assert!(!vote_set.buffer_unverified_vote(0, vote0_dup, pk0_dup, 1));
+        assert_eq!(vote_set.unverified_power(), 1);
 
-        // Add second and third votes
+        // Buffer more votes
         let vote1 = make_vote(&keys, 1, block_hash, 1);
         let vote2 = make_vote(&keys, 2, block_hash, 1);
-        assert!(vote_set.add_vote(vote1, 1, 1));
-        assert!(vote_set.add_vote(vote2, 2, 1));
-        assert_eq!(vote_set.voting_power(), 3);
-        assert!(vote_set.has_quorum(4)); // 3/4 > 2/3
+        assert!(vote_set.buffer_unverified_vote(1, vote1, keys[1].public_key(), 1));
+        assert!(vote_set.buffer_unverified_vote(2, vote2, keys[2].public_key(), 1));
+        assert_eq!(vote_set.unverified_power(), 3);
     }
 
     #[test]
-    fn test_build_qc() {
+    fn test_should_trigger_verification() {
         let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
         let header = make_header(1);
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(header), 4);
 
-        // Add quorum of votes
+        let total_power = 4u64;
+
+        // Not enough votes yet
+        let vote0 = make_vote(&keys, 0, block_hash, 1);
+        vote_set.buffer_unverified_vote(0, vote0, keys[0].public_key(), 1);
+        assert!(!vote_set.should_trigger_verification(total_power));
+
+        // Still not enough
+        let vote1 = make_vote(&keys, 1, block_hash, 1);
+        vote_set.buffer_unverified_vote(1, vote1, keys[1].public_key(), 1);
+        assert!(!vote_set.should_trigger_verification(total_power));
+
+        // Now we have quorum potential (3/4 > 2/3)
+        let vote2 = make_vote(&keys, 2, block_hash, 1);
+        vote_set.buffer_unverified_vote(2, vote2, keys[2].public_key(), 1);
+        assert!(vote_set.should_trigger_verification(total_power));
+    }
+
+    #[test]
+    fn test_add_verified_votes() {
+        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let header = make_header(1);
+        let block_hash = header.hash();
+        let mut vote_set = VoteSet::new(Some(header), 4);
+
+        // Add verified votes directly (e.g., own votes)
         for i in 0..3 {
             let vote = make_vote(&keys, i, block_hash, 1);
-            vote_set.add_vote(vote, i, 1);
+            assert!(vote_set.add_verified_vote(i, vote, 1));
         }
+
+        assert_eq!(vote_set.verified_power(), 3);
 
         // Build QC
         let qc = vote_set.build_qc(block_hash).unwrap();

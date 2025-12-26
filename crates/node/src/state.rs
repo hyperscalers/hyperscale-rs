@@ -560,9 +560,8 @@ impl StateMachine for NodeStateMachine {
             // Other BFT events don't need mempool context
             Event::BlockVoteReceived { .. }
             | Event::BlockReadyToCommit { .. }
-            | Event::VoteSignatureVerified { .. }
-            | Event::QcSignatureVerified { .. }
-            | Event::QuorumCertificateBuilt { .. } => {
+            | Event::QuorumCertificateResult { .. }
+            | Event::QcSignatureVerified { .. } => {
                 if let Some(actions) = self.bft.try_handle(&event) {
                     return actions;
                 }

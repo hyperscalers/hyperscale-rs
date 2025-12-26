@@ -22,7 +22,7 @@ use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     Block, BlockHeader, BlockMetadata, BlockVote, CommitmentProof, Hash, KeyPair, PublicKey,
     QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
-    StateVoteBlock, Topology, TransactionCertificate, ValidatorId,
+    StateVoteBlock, Topology, TransactionCertificate, ValidatorId, VotePower,
 };
 use libp2p::identity;
 use sbor::prelude::*;
@@ -51,8 +51,6 @@ pub enum RunnerError {
 /// Values are tuned to balance throughput (larger batches = better amortization)
 /// against latency (smaller batches = faster completion).
 mod batch_limits {
-    /// Block votes: consensus-critical, lighter preprocessing. 128 matches ValidationBatcher.
-    pub const MAX_BLOCK_VOTES: usize = 128;
     /// State certs: parallel key aggregation benefits from ~core-count batches.
     pub const MAX_STATE_CERTS: usize = 64;
     /// State votes: cross-tx batching with 20ms window. Uses batch_verify_bls_different_messages
@@ -64,32 +62,8 @@ mod batch_limits {
     pub const MAX_GOSSIPED_CERTS: usize = 64;
 }
 
-/// Pending block vote verifications that can be batched.
-///
-/// Collects verification actions and processes them together using
-/// batch verification for better performance (2-8x speedup for large batches).
-///
-/// Note: State votes are batched separately with a longer window (20ms vs 5ms)
-/// since they are less latency-sensitive than consensus block votes.
-#[derive(Default)]
-struct PendingBlockVotes {
-    /// Block votes waiting for verification (public key and signing message included).
-    votes: Vec<(BlockVote, PublicKey, Vec<u8>)>,
-}
-
-impl PendingBlockVotes {
-    fn is_empty(&self) -> bool {
-        self.votes.is_empty()
-    }
-
-    fn len(&self) -> usize {
-        self.votes.len()
-    }
-
-    fn is_full(&self) -> bool {
-        self.votes.len() >= batch_limits::MAX_BLOCK_VOTES
-    }
-}
+// Note: Block vote batching removed - vote verification is now deferred in the BFT
+// state machine until quorum is possible, then emitted as VerifyAndBuildQuorumCertificate.
 
 /// Pending cross-shard executions that can be batched.
 ///
@@ -1478,17 +1452,14 @@ impl ProductionRunner {
                             // Process event synchronously (span created by state.handle())
                             // Note: Runner I/O requests (StartSync, FetchTransactions, FetchCertificates)
                             // are now Actions emitted by the state machine and handled in process_action().
+                            //
+                            // Block vote verification is now deferred in the BFT state machine until
+                            // quorum is possible, then emitted as a single VerifyAndBuildQuorumCertificate
+                            // action. No runner-level vote batching is needed.
                             let actions = self.state.handle(event);
-
-                            // Collect block vote verifications for batching (5ms window).
-                            // State votes are accumulated separately with a longer window (20ms).
-                            let mut pending_block_votes = PendingBlockVotes::default();
 
                             for action in actions {
                                 match action {
-                                    Action::VerifyVoteSignature { vote, public_key, signing_message } => {
-                                        pending_block_votes.votes.push((vote, public_key, signing_message));
-                                    }
                                     Action::VerifyStateCertificateSignature { certificate, public_keys } => {
                                         // Add to accumulated state certs with 15ms batching window
                                         if self.pending_state_certs.is_empty() {
@@ -1504,8 +1475,6 @@ impl ProductionRunner {
                                             self.dispatch_state_cert_verifications(certs);
                                         }
                                     }
-                                    // Note: ExecuteCrossShardTransaction only comes from ProvisioningComplete
-                                    // which routes through the callback channel, not the consensus channel.
                                     other => {
                                         if let Err(e) = self.process_action(other).await {
                                             tracing::error!(error = ?e, "Error processing action");
@@ -1513,106 +1482,6 @@ impl ProductionRunner {
                                     }
                                 }
                             }
-
-                            // Try to collect more block vote verifications from queued consensus events.
-                            // First drain any immediately available events.
-                            while let Ok(more_event) = self.consensus_rx.try_recv() {
-                                // Update time for each event
-                                let now = self.wall_clock_time();
-                                self.state.set_time(now);
-
-                                let more_actions = self.state.handle(more_event);
-
-                                for action in more_actions {
-                                    match action {
-                                        Action::VerifyVoteSignature { vote, public_key, signing_message } => {
-                                            pending_block_votes.votes.push((vote, public_key, signing_message));
-                                        }
-                                        Action::VerifyStateCertificateSignature { certificate, public_keys } => {
-                                            if self.pending_state_certs.is_empty() {
-                                                self.state_cert_deadline = Some(
-                                                    tokio::time::Instant::now() + Duration::from_millis(15)
-                                                );
-                                            }
-                                            self.pending_state_certs.certs.push((certificate, public_keys));
-                                            if self.pending_state_certs.is_full() {
-                                                let certs = self.pending_state_certs.take();
-                                                self.state_cert_deadline = None;
-                                                self.dispatch_state_cert_verifications(certs);
-                                            }
-                                        }
-                                        other => {
-                                            if let Err(e) = self.process_action(other).await {
-                                                tracing::error!(error = ?e, "Error processing action");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // If we have pending block vote verifications, wait briefly for more to arrive.
-                            // This allows votes that arrive close together to be batched,
-                            // improving verification throughput (batch BLS verification is faster).
-                            // The 5ms delay is small relative to the ~300ms block interval.
-                            //
-                            // NOTE: Fetch requests are now handled by the dedicated fetch handler task,
-                            // so we don't need to interleave them here. This simplifies the loop.
-                            if !pending_block_votes.is_empty() {
-                                let batch_deadline = tokio::time::Instant::now() + Duration::from_millis(5);
-                                loop {
-                                    match tokio::time::timeout_at(batch_deadline, self.consensus_rx.recv()).await {
-                                        Ok(Some(more_event)) => {
-                                            // Update time for each event
-                                            let now = self.wall_clock_time();
-                                            self.state.set_time(now);
-
-                                            let more_actions = self.state.handle(more_event);
-
-                                            for action in more_actions {
-                                                match action {
-                                                    Action::VerifyVoteSignature { vote, public_key, signing_message } => {
-                                                        pending_block_votes.votes.push((vote, public_key, signing_message));
-                                                    }
-                                                    Action::VerifyStateCertificateSignature { certificate, public_keys } => {
-                                                        if self.pending_state_certs.is_empty() {
-                                                            self.state_cert_deadline = Some(
-                                                                tokio::time::Instant::now() + Duration::from_millis(15)
-                                                            );
-                                                        }
-                                                        self.pending_state_certs.certs.push((certificate, public_keys));
-                                                        if self.pending_state_certs.is_full() {
-                                                            let certs = self.pending_state_certs.take();
-                                                            self.state_cert_deadline = None;
-                                                            self.dispatch_state_cert_verifications(certs);
-                                                        }
-                                                    }
-                                                    other => {
-                                                        if let Err(e) = self.process_action(other).await {
-                                                            tracing::error!(error = ?e, "Error processing action");
-                                                        }
-                                                    }
-                                                }
-                                            }
-
-                                            // Break early if block votes batch is full
-                                            if pending_block_votes.is_full() {
-                                                break;
-                                            }
-                                        }
-                                        Ok(None) => {
-                                            // Channel closed
-                                            break;
-                                        }
-                                        Err(_) => {
-                                            // Timeout reached, proceed with current batch
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Dispatch collected block vote verifications
-                            self.dispatch_block_vote_verifications(pending_block_votes);
                         }
                         None => {
                             // Channel closed, exit loop
@@ -1948,30 +1817,152 @@ impl ProductionRunner {
                 self.timer_manager.cancel_timer(id);
             }
 
-            // Block vote verification on CONSENSUS crypto pool (liveness-critical)
-            Action::VerifyVoteSignature {
-                vote,
-                public_key,
+            // Block vote verification + QC building on CONSENSUS crypto pool (liveness-critical)
+            //
+            // With deferred verification, votes are buffered until quorum is possible, then
+            // batch-verified and aggregated in a single operation. This avoids wasting CPU
+            // on votes that will never be used (e.g., view change, leader failure).
+            Action::VerifyAndBuildQuorumCertificate {
+                block_hash,
+                height,
+                round,
+                parent_block_hash,
                 signing_message,
+                votes_to_verify,
+                verified_votes: already_verified,
+                total_voting_power,
             } => {
                 let event_tx = self.callback_tx.clone();
-                // Block votes are liveness-critical - use dedicated consensus crypto pool
+                // QC building is liveness-critical - use dedicated consensus crypto pool
                 self.thread_pools.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
-                    // Verify vote signature against domain-separated message
-                    let valid = public_key.verify(&signing_message, &vote.signature);
-                    crate::metrics::record_signature_verification_latency(
-                        "vote",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        crate::metrics::record_signature_verification_failure();
-                    }
-                    event_tx
-                        .send(Event::VoteSignatureVerified { vote, valid })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
+
+                    // Start with already-verified votes (e.g., our own vote)
+                    let mut all_verified: Vec<(usize, BlockVote, u64)> = already_verified;
+                    let mut all_signatures: Vec<Signature> = all_verified
+                        .iter()
+                        .map(|(_, v, _)| v.signature.clone())
+                        .collect();
+
+                    // Extract signatures and public keys from votes to verify
+                    let signatures: Vec<Signature> =
+                        votes_to_verify.iter().map(|(_, v, _, _)| v.signature.clone()).collect();
+                    let public_keys: Vec<PublicKey> =
+                        votes_to_verify.iter().map(|(_, _, pk, _)| pk.clone()).collect();
+
+                    // Batch verify all new signatures (same message optimization)
+                    let batch_valid = if votes_to_verify.is_empty() {
+                        true
+                    } else {
+                        PublicKey::batch_verify_bls_same_message(
+                            &signing_message,
+                            &signatures,
+                            &public_keys,
+                        )
+                    };
+
+                    if batch_valid {
+                        // Happy path: all new signatures valid, add them to verified set
+                        for (idx, vote, _, power) in votes_to_verify {
+                            all_signatures.push(vote.signature.clone());
+                            all_verified.push((idx, vote, power));
+                        }
+                    } else {
+                        // Some signatures invalid - verify individually to find valid ones
+                        tracing::warn!(
+                            block_hash = ?block_hash,
+                            vote_count = votes_to_verify.len(),
+                            "Batch vote verification failed, falling back to individual verification"
                         );
+
+                        for (idx, vote, pk, power) in &votes_to_verify {
+                            if pk.verify(&signing_message, &vote.signature) {
+                                all_signatures.push(vote.signature.clone());
+                                all_verified.push((*idx, vote.clone(), *power));
+                            } else {
+                                crate::metrics::record_signature_verification_failure();
+                                tracing::warn!(
+                                    voter = ?vote.voter,
+                                    block_hash = ?block_hash,
+                                    "Invalid vote signature detected"
+                                );
+                            }
+                        }
+                    }
+
+                    let verified_power: u64 = all_verified.iter().map(|(_, _, power)| power).sum();
+
+                    // Check if we have quorum with all verified votes
+                    if VotePower::has_quorum(verified_power, total_voting_power) && !all_signatures.is_empty() {
+                        // Build QC - aggregate signatures
+                        let qc = match Signature::aggregate_bls(&all_signatures) {
+                            Ok(aggregated_signature) => {
+                                // Sort votes by committee index for deterministic bitfield
+                                let mut sorted_votes = all_verified.clone();
+                                sorted_votes.sort_by_key(|(idx, _, _)| *idx);
+
+                                // Build signers bitfield and calculate weighted timestamp
+                                let max_idx = sorted_votes.iter().map(|(idx, _, _)| *idx).max().unwrap_or(0);
+                                let mut signers = SignerBitfield::new(max_idx + 1);
+                                let mut timestamp_weight_sum: u128 = 0;
+
+                                for (idx, vote, power) in &sorted_votes {
+                                    signers.set(*idx);
+                                    timestamp_weight_sum += vote.timestamp as u128 * *power as u128;
+                                }
+
+                                let weighted_timestamp_ms = if verified_power == 0 {
+                                    0
+                                } else {
+                                    (timestamp_weight_sum / verified_power as u128) as u64
+                                };
+
+                                Some(QuorumCertificate {
+                                    block_hash,
+                                    height,
+                                    parent_block_hash,
+                                    round,
+                                    aggregated_signature,
+                                    signers,
+                                    voting_power: VotePower(verified_power),
+                                    weighted_timestamp_ms,
+                                })
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to aggregate BLS signatures for QC: {}", e);
+                                None
+                            }
+                        };
+
+                        crate::metrics::record_signature_verification_latency(
+                            "qc_build",
+                            start.elapsed().as_secs_f64(),
+                        );
+
+                        // Determine verified_votes before moving qc
+                        let return_votes = if qc.is_none() { all_verified } else { vec![] };
+                        event_tx
+                            .send(Event::QuorumCertificateResult {
+                                block_hash,
+                                qc,
+                                verified_votes: return_votes,
+                            })
+                            .expect("callback channel closed");
+                    } else {
+                        // No quorum with valid votes - return verified votes for later
+                        crate::metrics::record_signature_verification_latency(
+                            "vote_batch",
+                            start.elapsed().as_secs_f64(),
+                        );
+
+                        event_tx
+                            .send(Event::QuorumCertificateResult {
+                                block_hash,
+                                qc: None,
+                                verified_votes: all_verified,
+                            })
+                            .expect("callback channel closed");
+                    }
                 });
             }
 
@@ -2282,68 +2273,6 @@ impl ProductionRunner {
                         );
                 });
             }
-
-            // QC building (BLS signature aggregation) on CONSENSUS crypto pool (liveness-critical)
-            Action::BuildQuorumCertificate {
-                block_hash,
-                height,
-                round,
-                parent_block_hash,
-                votes,
-                signers,
-                voting_power,
-                timestamp_weight_sum,
-            } => {
-                let event_tx = self.callback_tx.clone();
-                // QC building is liveness-critical - use dedicated consensus crypto pool
-                self.thread_pools.spawn_consensus_crypto(move || {
-                    let start = std::time::Instant::now();
-
-                    // Extract signatures in sorted order (votes are pre-sorted by committee index)
-                    let signatures: Vec<Signature> =
-                        votes.iter().map(|(_, v)| v.signature.clone()).collect();
-
-                    // Aggregate BLS signatures
-                    let qc = match Signature::aggregate_bls(&signatures) {
-                        Ok(aggregated_signature) => {
-                            // Compute stake-weighted timestamp
-                            let weighted_timestamp_ms = if voting_power.0 == 0 {
-                                0
-                            } else {
-                                (timestamp_weight_sum / voting_power.0 as u128) as u64
-                            };
-
-                            Some(QuorumCertificate {
-                                block_hash,
-                                height,
-                                parent_block_hash,
-                                round,
-                                aggregated_signature,
-                                signers,
-                                voting_power,
-                                weighted_timestamp_ms,
-                            })
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to aggregate BLS signatures for QC: {}", e);
-                            None
-                        }
-                    };
-
-                    crate::metrics::record_signature_verification_latency(
-                        "qc_build",
-                        start.elapsed().as_secs_f64(),
-                    );
-
-                    event_tx
-                        .send(Event::QuorumCertificateBuilt { block_hash, qc })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
-            }
-
-            // Note: View change verification actions removed - using HotStuff-2 implicit rounds
 
             // Transaction execution on dedicated execution thread pool
             // NOTE: Execution is READ-ONLY. State writes are collected in the results
@@ -2960,152 +2889,6 @@ impl ProductionRunner {
         }
 
         Ok(())
-    }
-
-    /// Dispatch block vote verifications to the CONSENSUS crypto thread pool.
-    ///
-    /// Block votes are LIVENESS-CRITICAL and use the dedicated consensus crypto pool
-    /// to ensure they are never blocked by general crypto work (provisions, state votes).
-    /// This is essential for forming QCs within the view_change_timeout (default 3s).
-    ///
-    /// Block votes use a short batching window (5ms) since they are latency-sensitive
-    /// for consensus progress.
-    ///
-    /// Results are sent back as individual events to maintain compatibility
-    /// with the state machine's expectations.
-    fn dispatch_block_vote_verifications(&self, pending: PendingBlockVotes) {
-        if pending.is_empty() {
-            return;
-        }
-
-        let event_tx = self.callback_tx.clone();
-        let batch_size = pending.len();
-
-        // Use dedicated consensus crypto pool - never blocked by provisions/state votes
-        self.thread_pools.spawn_consensus_crypto(move || {
-            let start = std::time::Instant::now();
-
-            // Separate by key type for appropriate batch verification
-            let mut ed25519_votes: Vec<(BlockVote, PublicKey, Vec<u8>)> = Vec::new();
-            let mut bls_votes: Vec<(BlockVote, PublicKey, Vec<u8>)> = Vec::new();
-
-            for (vote, pk, msg) in pending.votes {
-                match &pk {
-                    PublicKey::Ed25519(_) => ed25519_votes.push((vote, pk, msg)),
-                    PublicKey::Bls12381(_) => bls_votes.push((vote, pk, msg)),
-                }
-            }
-
-            // Process Ed25519 block votes using batch verification
-            if !ed25519_votes.is_empty() {
-                let messages: Vec<&[u8]> =
-                    ed25519_votes.iter().map(|(_, _, m)| m.as_slice()).collect();
-                let signatures: Vec<Signature> = ed25519_votes
-                    .iter()
-                    .map(|(v, _, _)| v.signature.clone())
-                    .collect();
-                let pubkeys: Vec<PublicKey> =
-                    ed25519_votes.iter().map(|(_, pk, _)| pk.clone()).collect();
-
-                let batch_valid =
-                    PublicKey::batch_verify_ed25519(&messages, &signatures, &pubkeys);
-
-                if batch_valid {
-                    for (vote, _, _) in ed25519_votes {
-                        event_tx
-                            .send(Event::VoteSignatureVerified { vote, valid: true })
-                            .expect("callback channel closed - Loss of this event would cause a deadlock");
-                    }
-                } else {
-                    // Fallback to individual verification to find which ones failed
-                    for (vote, pk, msg) in ed25519_votes {
-                        let valid = pk.verify(&msg, &vote.signature);
-                        if !valid {
-                            crate::metrics::record_signature_verification_failure();
-                        }
-                        event_tx
-                            .send(Event::VoteSignatureVerified { vote, valid })
-                            .expect("callback channel closed - Loss of this event would cause a deadlock");
-                    }
-                }
-            }
-
-            // Process BLS block votes using same-message batch verification.
-            // Votes for the same block (same height, round, block_hash) share the same signing
-            // message, so we can use aggregate signature verification: O(1) pairings instead of O(n).
-            // This is a significant optimization during consensus when multiple validators
-            // vote on the same block.
-            if !bls_votes.is_empty() {
-                use std::collections::HashMap;
-
-                // Group votes by signing message (votes for same block have same message)
-                let mut by_message: HashMap<Vec<u8>, Vec<(BlockVote, PublicKey)>> = HashMap::new();
-                for (vote, pk, msg) in bls_votes {
-                    by_message.entry(msg).or_default().push((vote, pk));
-                }
-
-                for (message, votes_for_block) in by_message {
-                    if votes_for_block.len() >= 2 {
-                        // Use same-message batch verification (aggregate signatures)
-                        let signatures: Vec<Signature> = votes_for_block
-                            .iter()
-                            .map(|(v, _)| v.signature.clone())
-                            .collect();
-                        let pubkeys: Vec<PublicKey> = votes_for_block
-                            .iter()
-                            .map(|(_, pk)| pk.clone())
-                            .collect();
-
-                        let batch_valid = PublicKey::batch_verify_bls_same_message(
-                            &message,
-                            &signatures,
-                            &pubkeys,
-                        );
-
-                        if batch_valid {
-                            for (vote, _) in votes_for_block {
-                                event_tx
-                                    .send(Event::VoteSignatureVerified { vote, valid: true })
-                                    .expect("callback channel closed");
-                            }
-                        } else {
-                            // Batch failed - fall back to individual verification to find bad ones
-                            for (vote, pk) in votes_for_block {
-                                let valid = pk.verify(&message, &vote.signature);
-                                if !valid {
-                                    crate::metrics::record_signature_verification_failure();
-                                }
-                                event_tx
-                                    .send(Event::VoteSignatureVerified { vote, valid })
-                                    .expect("callback channel closed");
-                            }
-                        }
-                    } else {
-                        // Single vote for this block - verify individually
-                        let (vote, pk) = votes_for_block.into_iter().next().unwrap();
-                        let valid = pk.verify(&message, &vote.signature);
-                        if !valid {
-                            crate::metrics::record_signature_verification_failure();
-                        }
-                        event_tx
-                            .send(Event::VoteSignatureVerified { vote, valid })
-                            .expect("callback channel closed");
-                    }
-                }
-            }
-
-            crate::metrics::record_signature_verification_latency(
-                "block_vote",
-                start.elapsed().as_secs_f64(),
-            );
-
-            if batch_size > 1 {
-                tracing::debug!(
-                    batch_size,
-                    "Batch verified block vote signatures"
-                );
-            }
-        });
     }
 
     /// Dispatch state certificate verifications to the crypto thread pool.

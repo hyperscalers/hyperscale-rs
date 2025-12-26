@@ -14,9 +14,10 @@ use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_engine::RadixExecutor;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
-    Block, CommitmentProof, Hash as TxHash, KeyPair, KeyType, PublicKey, QuorumCertificate,
-    ShardGroupId, Signature, SignerBitfield, StateCertificate, StateVoteBlock, StaticTopology,
-    Topology, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
+    Block, BlockVote, CommitmentProof, Hash as TxHash, KeyPair, KeyType, PublicKey,
+    QuorumCertificate, ShardGroupId, Signature, SignerBitfield, StateCertificate, StateVoteBlock,
+    StaticTopology, Topology, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
+    VotePower,
 };
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
@@ -743,14 +744,127 @@ impl SimulationRunner {
             }
 
             // Delegated work executes instantly in simulation
-            Action::VerifyVoteSignature {
-                vote,
-                public_key,
+            Action::VerifyAndBuildQuorumCertificate {
+                block_hash,
+                height,
+                round,
+                parent_block_hash,
                 signing_message,
+                votes_to_verify,
+                verified_votes: already_verified,
+                total_voting_power,
             } => {
-                // In simulation, verify signature against domain-separated message (instant, deterministic)
-                let valid = public_key.verify(&signing_message, &vote.signature);
-                self.schedule_event(from, self.now, Event::VoteSignatureVerified { vote, valid });
+                // Start with already-verified votes (e.g., our own vote)
+                let mut all_verified: Vec<(usize, BlockVote, u64)> = already_verified;
+                let mut all_signatures: Vec<Signature> = all_verified
+                    .iter()
+                    .map(|(_, v, _)| v.signature.clone())
+                    .collect();
+
+                // Batch verify all new signatures (same message optimization)
+                let signatures: Vec<Signature> = votes_to_verify
+                    .iter()
+                    .map(|(_, v, _, _)| v.signature.clone())
+                    .collect();
+                let public_keys: Vec<PublicKey> = votes_to_verify
+                    .iter()
+                    .map(|(_, _, pk, _)| pk.clone())
+                    .collect();
+
+                let batch_valid = if votes_to_verify.is_empty() {
+                    true
+                } else {
+                    PublicKey::batch_verify_bls_same_message(
+                        &signing_message,
+                        &signatures,
+                        &public_keys,
+                    )
+                };
+
+                if batch_valid {
+                    // Happy path: all new signatures valid, add them to verified set
+                    for (idx, vote, _, power) in votes_to_verify {
+                        all_signatures.push(vote.signature.clone());
+                        all_verified.push((idx, vote, power));
+                    }
+                } else {
+                    // Some signatures invalid - verify individually
+                    for (idx, vote, pk, power) in &votes_to_verify {
+                        if pk.verify(&signing_message, &vote.signature) {
+                            all_signatures.push(vote.signature.clone());
+                            all_verified.push((*idx, vote.clone(), *power));
+                        }
+                    }
+                }
+
+                let verified_power: u64 = all_verified.iter().map(|(_, _, power)| power).sum();
+
+                // Check if we have quorum with all verified votes
+                if VotePower::has_quorum(verified_power, total_voting_power)
+                    && !all_signatures.is_empty()
+                {
+                    // Build QC - aggregate signatures
+                    let qc = match Signature::aggregate_bls(&all_signatures) {
+                        Ok(aggregated_signature) => {
+                            let mut sorted_votes = all_verified.clone();
+                            sorted_votes.sort_by_key(|(idx, _, _)| *idx);
+
+                            let max_idx = sorted_votes
+                                .iter()
+                                .map(|(idx, _, _)| *idx)
+                                .max()
+                                .unwrap_or(0);
+                            let mut signers = SignerBitfield::new(max_idx + 1);
+                            let mut timestamp_weight_sum: u128 = 0;
+
+                            for (idx, vote, power) in &sorted_votes {
+                                signers.set(*idx);
+                                timestamp_weight_sum += vote.timestamp as u128 * *power as u128;
+                            }
+
+                            let weighted_timestamp_ms = if verified_power == 0 {
+                                0
+                            } else {
+                                (timestamp_weight_sum / verified_power as u128) as u64
+                            };
+
+                            Some(QuorumCertificate {
+                                block_hash,
+                                height,
+                                parent_block_hash,
+                                round,
+                                aggregated_signature,
+                                signers,
+                                voting_power: VotePower(verified_power),
+                                weighted_timestamp_ms,
+                            })
+                        }
+                        Err(_) => None,
+                    };
+
+                    // Determine verified_votes before moving qc
+                    let return_votes = if qc.is_none() { all_verified } else { vec![] };
+                    self.schedule_event(
+                        from,
+                        self.now,
+                        Event::QuorumCertificateResult {
+                            block_hash,
+                            qc,
+                            verified_votes: return_votes,
+                        },
+                    );
+                } else {
+                    // No quorum - return all verified votes
+                    self.schedule_event(
+                        from,
+                        self.now,
+                        Event::QuorumCertificateResult {
+                            block_hash,
+                            qc: None,
+                            verified_votes: all_verified,
+                        },
+                    );
+                }
             }
 
             Action::VerifyAndAggregateProvisions {
@@ -1073,54 +1187,8 @@ impl SimulationRunner {
                 );
             }
 
-            // QC building (BLS signature aggregation) - runs synchronously in simulation
-            Action::BuildQuorumCertificate {
-                block_hash,
-                height,
-                round,
-                parent_block_hash,
-                votes,
-                signers,
-                voting_power,
-                timestamp_weight_sum,
-            } => {
-                // Extract signatures in sorted order (votes are pre-sorted by committee index)
-                let signatures: Vec<Signature> =
-                    votes.iter().map(|(_, v)| v.signature.clone()).collect();
-
-                // Aggregate BLS signatures
-                let qc = match Signature::aggregate_bls(&signatures) {
-                    Ok(aggregated_signature) => {
-                        // Compute stake-weighted timestamp
-                        let weighted_timestamp_ms = if voting_power.0 == 0 {
-                            0
-                        } else {
-                            (timestamp_weight_sum / voting_power.0 as u128) as u64
-                        };
-
-                        Some(QuorumCertificate {
-                            block_hash,
-                            height,
-                            parent_block_hash,
-                            round,
-                            aggregated_signature,
-                            signers,
-                            voting_power,
-                            weighted_timestamp_ms,
-                        })
-                    }
-                    Err(e) => {
-                        warn!(node = from, ?block_hash, error = %e, "Failed to aggregate BLS signatures for QC");
-                        None
-                    }
-                };
-
-                self.schedule_event(
-                    from,
-                    self.now,
-                    Event::QuorumCertificateBuilt { block_hash, qc },
-                );
-            }
+            // Note: BuildQuorumCertificate has been replaced by VerifyAndBuildQuorumCertificate
+            // which combines vote verification and QC building into a single operation.
 
             // Note: View change verification actions removed - using HotStuff-2 implicit rounds
             Action::ExecuteTransactions {

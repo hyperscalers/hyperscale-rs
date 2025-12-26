@@ -175,14 +175,22 @@ pub enum Event {
     // Async Callbacks (priority: Internal)
     // Results from delegated work (crypto, execution)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Vote signature verification completed.
+    /// Quorum Certificate verification and building result.
     ///
-    /// Callback from `Action::VerifyVoteSignature`.
-    VoteSignatureVerified {
-        /// The vote that was verified.
-        vote: BlockVote,
-        /// Whether the signature is valid.
-        valid: bool,
+    /// Callback from `Action::VerifyAndBuildQuorumCertificate`.
+    ///
+    /// Either contains a successfully built QC (if quorum was reached with valid
+    /// signatures), or the verified votes that passed signature verification
+    /// (so the state machine can wait for more votes and retry).
+    QuorumCertificateResult {
+        /// Block hash the QC is for.
+        block_hash: Hash,
+        /// The built QC if quorum was reached with valid signatures.
+        qc: Option<QuorumCertificate>,
+        /// Votes that passed signature verification, with their committee index
+        /// and voting power. Only populated when `qc` is None (need more votes).
+        /// Each tuple is (committee_index, vote, voting_power).
+        verified_votes: Vec<(usize, BlockVote, u64)>,
     },
 
     /// Batch provision verification and aggregation completed.
@@ -244,17 +252,6 @@ pub enum Event {
         block_hash: Hash,
         /// Whether the aggregated signature is valid.
         valid: bool,
-    },
-
-    /// Quorum Certificate building completed.
-    ///
-    /// Callback from `Action::BuildQuorumCertificate`.
-    /// The QC is built by aggregating BLS signatures from collected votes.
-    QuorumCertificateBuilt {
-        /// Block hash the QC is for.
-        block_hash: Hash,
-        /// The built QC, or None if aggregation failed.
-        qc: Option<QuorumCertificate>,
     },
 
     /// Single-shard transaction execution completed.
@@ -656,12 +653,11 @@ impl Event {
             | Event::BlockCommitted { .. }
             | Event::TransactionExecuted { .. }
             | Event::TransactionStatusChanged { .. }
-            | Event::VoteSignatureVerified { .. }
+            | Event::QuorumCertificateResult { .. }
             | Event::ProvisionsVerifiedAndAggregated { .. }
             | Event::StateVotesVerifiedAndAggregated { .. }
             | Event::StateCertificateSignatureVerified { .. }
             | Event::QcSignatureVerified { .. }
-            | Event::QuorumCertificateBuilt { .. }
             | Event::TransactionsExecuted { .. }
             | Event::SpeculativeExecutionComplete { .. }
             | Event::CrossShardTransactionsExecuted { .. }
@@ -776,12 +772,11 @@ impl Event {
             Event::TransactionStatusChanged { .. } => "TransactionStatusChanged",
 
             // Async Callbacks - Crypto Verification
-            Event::VoteSignatureVerified { .. } => "VoteSignatureVerified",
+            Event::QuorumCertificateResult { .. } => "QuorumCertificateResult",
             Event::ProvisionsVerifiedAndAggregated { .. } => "ProvisionsVerifiedAndAggregated",
             Event::StateVotesVerifiedAndAggregated { .. } => "StateVotesVerifiedAndAggregated",
             Event::StateCertificateSignatureVerified { .. } => "StateCertificateSignatureVerified",
             Event::QcSignatureVerified { .. } => "QcSignatureVerified",
-            Event::QuorumCertificateBuilt { .. } => "QuorumCertificateBuilt",
 
             // Async Callbacks - Execution
             Event::TransactionsExecuted { .. } => "TransactionsExecuted",

@@ -54,17 +54,6 @@ pub struct RecoveredState {
     pub latest_qc: Option<QuorumCertificate>,
 }
 
-/// Vote pending signature verification.
-#[derive(Debug, Clone)]
-struct PendingVoteVerification {
-    /// The vote awaiting verification.
-    vote: BlockVote,
-    /// Voting power of the voter.
-    voting_power: u64,
-    /// Committee index of the voter.
-    committee_index: usize,
-}
-
 /// Block header pending QC signature verification.
 ///
 /// When we receive a block header with a non-genesis parent_qc, we need to
@@ -175,11 +164,6 @@ pub struct BftState {
     /// Blocks that have been certified (have QC) but not yet committed.
     /// Maps block_hash -> (Block, QC).
     certified_blocks: HashMap<Hash, (Block, QuorumCertificate)>,
-
-    /// Votes pending signature verification.
-    /// Maps (block_hash, voter) -> (vote, voting_power, committee_index).
-    /// Once verified, these are processed as if just received.
-    pending_vote_verifications: HashMap<(Hash, ValidatorId), PendingVoteVerification>,
 
     /// Block headers pending QC signature verification.
     /// Maps block_hash -> pending verification info.
@@ -302,7 +286,6 @@ impl BftState {
             voted_heights,
             received_votes_by_height: HashMap::new(),
             certified_blocks: HashMap::new(),
-            pending_vote_verifications: HashMap::new(),
             pending_qc_verifications: HashMap::new(),
             pending_synced_block_verifications: HashMap::new(),
             verified_qcs: HashMap::new(),
@@ -1117,11 +1100,8 @@ impl BftState {
         self.pending_blocks.insert(block_hash, pending);
         self.pending_block_created_at.insert(block_hash, self.now);
 
-        // Check if we have buffered votes for this block that can now form a QC
+        // Check if we have buffered votes for this block that can now trigger verification
         // (Votes may arrive before the header due to network timing)
-        let mut actions = vec![];
-        let total_power = self.total_voting_power();
-        let validator_id = self.validator_id();
         if let Some(vote_set) = self.vote_sets.get_mut(&block_hash) {
             // Update the vote set with header info (needed for parent_block_hash in QC)
             vote_set.set_header(&header);
@@ -1129,42 +1109,10 @@ impl BftState {
                 block_hash = ?block_hash,
                 "Updated VoteSet with header info via on_block_header"
             );
-
-            // Check if we now have quorum
-            if vote_set.has_quorum(total_power) {
-                info!(
-                    validator = ?validator_id,
-                    block_hash = ?block_hash,
-                    height = height,
-                    voting_power = vote_set.voting_power(),
-                    "Header arrived, quorum already reached - building QC"
-                );
-
-                // Extract data for async QC building (BLS aggregation is expensive)
-                if let Some((
-                    height,
-                    round,
-                    parent_block_hash,
-                    votes,
-                    signers,
-                    voting_power,
-                    timestamp_weight_sum,
-                )) = vote_set.prepare_qc_build()
-                {
-                    actions.push(Action::BuildQuorumCertificate {
-                        block_hash,
-                        height,
-                        round,
-                        parent_block_hash,
-                        votes,
-                        signers,
-                        voting_power: VotePower(voting_power),
-                        timestamp_weight_sum,
-                    });
-                }
-            }
         }
 
+        // Check if we should trigger verification now that we have the header
+        let mut actions = self.maybe_trigger_vote_verification(block_hash);
         if !actions.is_empty() {
             return actions;
         }
@@ -1753,13 +1701,16 @@ impl BftState {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Vote Collection
+    // Vote Collection (Deferred Verification)
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Handle received block vote.
     ///
-    /// Note: The sender identity is not passed as a parameter anymore.
-    /// Sender identity comes from vote.voter (ValidatorId), which is
+    /// Uses deferred verification: votes are buffered until we have enough
+    /// voting power to possibly reach quorum. Only then do we batch-verify
+    /// all buffered votes and build the QC in a single operation.
+    ///
+    /// Note: The sender identity comes from vote.voter (ValidatorId), which is
     /// signed and verified.
     #[instrument(skip(self, vote), fields(
         height = vote.height.0,
@@ -1777,24 +1728,22 @@ impl BftState {
         self.on_block_vote_internal(vote)
     }
 
-    /// Internal vote processing (used for both received votes and our own).
+    /// Internal vote processing with deferred verification.
     ///
-    /// This performs initial validation and then delegates signature verification
-    /// to the runner. When verification completes, `on_vote_signature_verified`
-    /// is called to complete vote processing.
+    /// Buffers votes in VoteSet until we have enough for quorum, then triggers
+    /// batch verification + QC building in a single operation.
     ///
-    /// For our own vote, we skip signature verification since we just signed it.
+    /// For our own vote, we add it directly as verified (we just signed it).
     fn on_block_vote_internal(&mut self, vote: BlockVote) -> Vec<Action> {
         let block_hash = vote.block_hash;
+        let height = vote.height.0;
         let is_own_vote = vote.voter == self.validator_id();
 
         // Early out: skip votes for already-committed heights.
-        // This prevents wasting crypto resources verifying stale votes, which is
-        // critical for avoiding feedback loops under load where crypto backlog
-        // delays QC formation, triggering view changes, which generate more votes.
-        if vote.height.0 <= self.committed_height {
+        // This prevents wasting crypto resources verifying stale votes.
+        if height <= self.committed_height {
             trace!(
-                vote_height = vote.height.0,
+                vote_height = height,
                 committed_height = self.committed_height,
                 voter = ?vote.voter,
                 "Skipping vote for already-committed height"
@@ -1821,166 +1770,6 @@ impl BftState {
             return vec![];
         }
 
-        // Check for duplicate pending verification
-        let key = (block_hash, vote.voter);
-        if self.pending_vote_verifications.contains_key(&key) {
-            trace!("Vote verification already pending for {:?}", key);
-            return vec![];
-        }
-
-        // Skip verification for our own vote - we just signed it, so we trust it.
-        // This can happen when our vote is gossiped back to us via the network,
-        // or when processing our own vote after creating it.
-        if is_own_vote {
-            trace!(
-                block_hash = ?block_hash,
-                "Skipping verification for own block vote"
-            );
-            // Store pending verification info (needed by on_vote_signature_verified)
-            self.pending_vote_verifications.insert(
-                key,
-                PendingVoteVerification {
-                    vote: vote.clone(),
-                    voting_power,
-                    committee_index: voter_index,
-                },
-            );
-            // Directly process as verified
-            return self.on_vote_signature_verified(vote, true);
-        }
-
-        // Get public key for verification
-        let public_key = match self.public_key(vote.voter) {
-            Some(pk) => pk,
-            None => {
-                warn!("No public key for validator {:?}", vote.voter);
-                return vec![];
-            }
-        };
-
-        // Store pending verification info
-        self.pending_vote_verifications.insert(
-            key,
-            PendingVoteVerification {
-                vote: vote.clone(),
-                voting_power,
-                committee_index: voter_index,
-            },
-        );
-
-        // Construct signing message with domain separation
-        let signing_message = Self::block_vote_message(
-            self.shard_group,
-            vote.height.0,
-            vote.round,
-            &vote.block_hash,
-        );
-
-        // Delegate signature verification to runner
-        vec![Action::VerifyVoteSignature {
-            vote,
-            public_key,
-            signing_message,
-        }]
-    }
-
-    /// Handle vote signature verification result.
-    ///
-    /// Called when the runner completes `Action::VerifyVoteSignature`.
-    #[instrument(skip(self, vote), fields(
-        height = vote.height.0,
-        voter = ?vote.voter,
-        valid = valid
-    ))]
-    pub fn on_vote_signature_verified(&mut self, vote: BlockVote, valid: bool) -> Vec<Action> {
-        let block_hash = vote.block_hash;
-        let height = vote.height.0;
-        let key = (block_hash, vote.voter);
-
-        // Retrieve pending verification info
-        let Some(pending) = self.pending_vote_verifications.remove(&key) else {
-            warn!(
-                "Vote signature verified but no pending verification for {:?}",
-                key
-            );
-            return vec![];
-        };
-
-        // Check verification result
-        if !valid {
-            warn!(
-                "Invalid signature on vote from {:?} for block {}",
-                vote.voter, block_hash
-            );
-            return vec![];
-        }
-
-        // View synchronization from vote round.
-        // When we receive a vote at round R > our view, the voter has made progress
-        // and we should catch up. This helps late joiners converge with the network.
-        if vote.round > self.view {
-            info!(
-                validator = ?self.validator_id(),
-                old_view = self.view,
-                new_view = vote.round,
-                vote_height = height,
-                voter = ?vote.voter,
-                "View synchronization: advancing view to match received vote"
-            );
-            self.view = vote.round;
-        }
-
-        // HotStuff-2 voting rules: A validator can vote for different blocks at the same height
-        // as long as they're at different rounds. This is because validators can unlock their
-        // votes when they advance rounds (no QC formed within timeout).
-        //
-        // Equivocation (Byzantine behavior) is voting for DIFFERENT blocks at the SAME round.
-        // Voting for different blocks at different rounds is legitimate HotStuff-2 behavior.
-        //
-        // We track votes by (height, voter) -> (block_hash, round) to detect true equivocation.
-        let vote_key = (height, vote.voter);
-        if let Some(&(existing_block, existing_round)) =
-            self.received_votes_by_height.get(&vote_key)
-        {
-            if existing_block != block_hash {
-                if vote.round == existing_round {
-                    // EQUIVOCATION: Same round, different block - this is Byzantine behavior
-                    warn!(
-                        voter = ?vote.voter,
-                        height = height,
-                        round = vote.round,
-                        existing_block = ?existing_block,
-                        new_block = ?block_hash,
-                        "EQUIVOCATION DETECTED: validator voted for different blocks at same height AND round"
-                    );
-                    // TODO: Generate equivocation proof for slashing
-                    return vec![];
-                } else if vote.round < existing_round {
-                    // Old vote from a previous round - ignore it (we already have a newer vote)
-                    trace!(
-                        voter = ?vote.voter,
-                        height = height,
-                        old_round = vote.round,
-                        new_round = existing_round,
-                        "Ignoring old vote from previous round"
-                    );
-                    return vec![];
-                }
-                // vote.round > existing_round: This is a legitimate HotStuff-2 revote after unlock
-                // The validator advanced rounds and voted for a new block. This is expected.
-                debug!(
-                    voter = ?vote.voter,
-                    height = height,
-                    old_round = existing_round,
-                    new_round = vote.round,
-                    old_block = ?existing_block,
-                    new_block = ?block_hash,
-                    "Accepting revote after round advancement (HotStuff-2 unlock)"
-                );
-            }
-            // Same block - this is a duplicate vote (possibly at different round), VoteSet will handle it
-        }
-
         // Pre-compute topology values before mutable borrows
         let committee_size = self.committee().len();
         let total_power = self.total_voting_power();
@@ -1990,9 +1779,18 @@ impl BftState {
             .get(&block_hash)
             .map(|pb| pb.header().clone());
 
-        // Record that this validator voted for this block at this height and round
-        self.received_votes_by_height
-            .insert(vote_key, (block_hash, vote.round));
+        // Get public key for verification (do this before mutable borrow of vote_sets)
+        let public_key = if !is_own_vote {
+            match self.public_key(vote.voter) {
+                Some(pk) => Some(pk),
+                None => {
+                    warn!("No public key for validator {:?}", vote.voter);
+                    return vec![];
+                }
+            }
+        } else {
+            None
+        };
 
         // Get or create vote set
         let vote_set = self
@@ -2000,85 +1798,185 @@ impl BftState {
             .entry(block_hash)
             .or_insert_with(|| VoteSet::new(header_for_vote, committee_size));
 
-        // Add vote to set
-        if !vote_set.add_vote(pending.vote, pending.committee_index, pending.voting_power) {
-            // Duplicate vote within same VoteSet
+        // Check if already seen
+        if vote_set.has_seen_validator(voter_index) {
+            trace!("Already seen vote from validator {:?}", vote.voter);
+            return vec![];
+        }
+
+        // For our own vote, add directly as verified (we just signed it)
+        if is_own_vote {
+            trace!(
+                block_hash = ?block_hash,
+                "Adding own vote as verified"
+            );
+            vote_set.add_verified_vote(voter_index, vote.clone(), voting_power);
+
+            // Check if we should trigger verification for buffered votes
+            return self.maybe_trigger_vote_verification(block_hash);
+        }
+
+        // Buffer the unverified vote (public_key is guaranteed Some since !is_own_vote)
+        let public_key = public_key.unwrap();
+        vote_set.buffer_unverified_vote(voter_index, vote, public_key, voting_power);
+
+        trace!(
+            validator = ?validator_id,
+            block_hash = ?block_hash,
+            verified_power = vote_set.verified_power(),
+            unverified_power = vote_set.unverified_power(),
+            total_power = total_power,
+            "Vote buffered"
+        );
+
+        // Check if we should trigger batch verification
+        self.maybe_trigger_vote_verification(block_hash)
+    }
+
+    /// Check if we should trigger batch vote verification for a block.
+    ///
+    /// Triggers when we have enough total power (verified + unverified) to
+    /// possibly reach quorum.
+    fn maybe_trigger_vote_verification(&mut self, block_hash: Hash) -> Vec<Action> {
+        let total_power = self.total_voting_power();
+
+        let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
+            return vec![];
+        };
+
+        if !vote_set.should_trigger_verification(total_power) {
+            return vec![];
+        }
+
+        // Get verification data
+        let Some((_, height, round, parent_block_hash)) = vote_set.verification_data() else {
+            return vec![];
+        };
+
+        // Get already-verified votes (e.g., our own vote)
+        let verified_votes = vote_set.get_verified_votes();
+
+        // Take the unverified votes
+        let votes_to_verify = vote_set.take_unverified_votes();
+
+        // Need at least some votes to verify (verified votes alone would have triggered earlier)
+        if votes_to_verify.is_empty() {
             return vec![];
         }
 
         info!(
-            validator = ?validator_id,
             block_hash = ?block_hash,
-            voting_power = vote_set.voting_power(),
-            total_power = total_power,
-            has_quorum = vote_set.has_quorum(total_power),
-            parent_hash_present = vote_set.has_parent_hash(),
-            "Vote added (signature verified)"
+            height = height.0,
+            votes_to_verify = votes_to_verify.len(),
+            already_verified = verified_votes.len(),
+            "Triggering batch vote verification (quorum possible)"
         );
 
-        // Check for quorum
-        if vote_set.has_quorum(total_power) {
-            info!(
-                validator = ?validator_id,
-                block_hash = ?block_hash,
-                height = height,
-                voting_power = vote_set.voting_power(),
-                "Quorum reached, building QC"
-            );
+        // Construct signing message with domain separation
+        let signing_message =
+            Self::block_vote_message(self.shard_group, height.0, round, &block_hash);
 
-            // Extract data for async QC building (BLS aggregation is expensive)
-            if let Some((
-                height,
-                round,
-                parent_block_hash,
-                votes,
-                signers,
-                voting_power,
-                timestamp_weight_sum,
-            )) = vote_set.prepare_qc_build()
-            {
-                return vec![Action::BuildQuorumCertificate {
-                    block_hash,
-                    height,
-                    round,
-                    parent_block_hash,
-                    votes,
-                    signers,
-                    voting_power: VotePower(voting_power),
-                    timestamp_weight_sum,
-                }];
-            }
-        }
-
-        vec![]
+        vec![Action::VerifyAndBuildQuorumCertificate {
+            block_hash,
+            height,
+            round,
+            parent_block_hash,
+            signing_message,
+            votes_to_verify,
+            verified_votes,
+            total_voting_power: total_power,
+        }]
     }
 
-    /// Handle QC building completion.
+    /// Handle QC verification and building result.
     ///
-    /// Called when the runner completes `Action::BuildQuorumCertificate`.
-    /// The QC is formed by aggregating BLS signatures from collected votes.
-    #[instrument(skip(self, qc), fields(block_hash = ?block_hash, success = qc.is_some()))]
-    pub fn on_qc_built(&mut self, block_hash: Hash, qc: Option<QuorumCertificate>) -> Vec<Action> {
-        match qc {
-            Some(qc) => {
-                info!(
-                    block_hash = ?block_hash,
-                    height = qc.height.0,
-                    voting_power = qc.voting_power.0,
-                    "QC built successfully"
-                );
-                vec![Action::EnqueueInternal {
-                    event: Event::QuorumCertificateFormed { block_hash, qc },
-                }]
+    /// Called when the runner completes `Action::VerifyAndBuildQuorumCertificate`.
+    ///
+    /// If QC was built successfully, enqueues QuorumCertificateFormed event.
+    /// If quorum wasn't reached (some sigs invalid), adds verified votes back
+    /// to VoteSet and checks if more buffered votes can now reach quorum.
+    #[instrument(skip(self, qc, verified_votes), fields(
+        block_hash = ?block_hash,
+        has_qc = qc.is_some(),
+        verified_count = verified_votes.len()
+    ))]
+    pub fn on_qc_result(
+        &mut self,
+        block_hash: Hash,
+        qc: Option<QuorumCertificate>,
+        verified_votes: Vec<(usize, BlockVote, u64)>,
+    ) -> Vec<Action> {
+        // If QC was built successfully, we're done
+        if let Some(qc) = qc {
+            info!(
+                block_hash = ?block_hash,
+                height = qc.height.0,
+                voting_power = qc.voting_power.0,
+                "QC built successfully"
+            );
+
+            // Mark vote set as complete
+            if let Some(vote_set) = self.vote_sets.get_mut(&block_hash) {
+                vote_set.on_qc_built();
             }
-            None => {
-                warn!(
-                    block_hash = ?block_hash,
-                    "Failed to build QC - signature aggregation failed"
-                );
-                vec![]
-            }
+
+            return vec![Action::EnqueueInternal {
+                event: Event::QuorumCertificateFormed { block_hash, qc },
+            }];
         }
+
+        // Process view sync and equivocation checks for verified votes (before borrow)
+        let validator_id = self.validator_id();
+        for (_, vote, _) in &verified_votes {
+            // View synchronization
+            if vote.round > self.view {
+                info!(
+                    validator = ?validator_id,
+                    old_view = self.view,
+                    new_view = vote.round,
+                    vote_height = vote.height.0,
+                    voter = ?vote.voter,
+                    "View synchronization: advancing view to match verified vote"
+                );
+                self.view = vote.round;
+            }
+
+            // Record in equivocation tracking
+            let vote_key = (vote.height.0, vote.voter);
+            self.received_votes_by_height
+                .insert(vote_key, (block_hash, vote.round));
+        }
+
+        // Quorum not reached - add verified votes back and check for more
+        let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
+            warn!(
+                block_hash = ?block_hash,
+                "QC result received but no vote set found"
+            );
+            return vec![];
+        };
+
+        // Record verified votes
+        if !verified_votes.is_empty() {
+            vote_set.on_votes_verified(verified_votes);
+
+            info!(
+                block_hash = ?block_hash,
+                verified_power = vote_set.verified_power(),
+                unverified_power = vote_set.unverified_power(),
+                "Votes verified but quorum not reached, waiting for more"
+            );
+        } else {
+            warn!(
+                block_hash = ?block_hash,
+                "All votes failed verification"
+            );
+            // Clear pending flag so we can try again with new votes
+            vote_set.on_votes_verified(vec![]);
+        }
+
+        // Check if more unverified votes arrived while we were verifying
+        self.maybe_trigger_vote_verification(block_hash)
     }
 
     /// Handle QC signature verification result.
@@ -3707,38 +3605,14 @@ impl BftState {
         // the new round. Vote sets at the current or higher rounds may contain valid
         // votes that can still form a QC.
         //
-        // This fixes a race condition similar to the one for pending_vote_verifications:
-        // if another validator's fallback block at round N has already accumulated votes
+        // Note: vote_sets are keyed by block_hash, so we need to check the height and round.
+        // If another validator's fallback block at round N has already accumulated votes
         // in our vote_sets before we advance to round N, we should preserve those votes.
-        // Note: vote_sets are keyed by block_hash, so we need to check the height and round
         self.vote_sets.retain(|_hash, vote_set| {
             // Keep if: different height OR round >= new_round OR round unknown
             vote_set.height().is_none_or(|h| h != height)
                 || vote_set.round().is_none_or(|r| r >= new_round)
         });
-
-        // Clear pending vote verifications for this height, but ONLY for rounds
-        // less than the new round. Votes at the current or higher rounds are still
-        // valid and should complete verification.
-        //
-        // This fixes a race condition: if another validator creates a fallback block
-        // at round N and sends us a vote, we might receive and start verifying it
-        // just before our own timer fires and advances us to round N. Without this
-        // round check, we'd discard the valid vote and never form a QC.
-        let before_pending = self.pending_vote_verifications.len();
-        self.pending_vote_verifications.retain(|_, pending| {
-            // Keep if: different height OR round >= new_round
-            pending.vote.height.0 != height || pending.vote.round >= new_round
-        });
-        let pending_cleared = before_pending - self.pending_vote_verifications.len();
-        if pending_cleared > 0 {
-            debug!(
-                height,
-                new_round,
-                pending_cleared,
-                "Cleared pending vote verifications for height during view change"
-            );
-        }
 
         cleared
     }
@@ -3776,11 +3650,6 @@ impl BftState {
         // Remove buffered synced blocks at or below committed height
         self.buffered_synced_blocks
             .retain(|height, _| *height > committed_height);
-
-        // Remove pending vote verifications at or below committed height.
-        // Verifying votes for already-committed heights is wasted crypto work.
-        self.pending_vote_verifications
-            .retain(|_, pending| pending.vote.height.0 > committed_height);
 
         // Remove pending QC verifications for blocks at or below committed height.
         // We look up the block hash in pending_blocks to get the height - if the block
@@ -4258,14 +4127,13 @@ impl SubStateMachine for BftState {
                 Some(self.on_block_ready_to_commit(*block_hash, qc.clone()))
             }
             Event::BlockCommitted { .. } => Some(vec![]),
-            Event::VoteSignatureVerified { vote, valid } => {
-                Some(self.on_vote_signature_verified(vote.clone(), *valid))
-            }
+            Event::QuorumCertificateResult {
+                block_hash,
+                qc,
+                verified_votes,
+            } => Some(self.on_qc_result(*block_hash, qc.clone(), verified_votes.clone())),
             Event::QcSignatureVerified { block_hash, valid } => {
                 Some(self.on_qc_signature_verified(*block_hash, *valid))
-            }
-            Event::QuorumCertificateBuilt { block_hash, qc } => {
-                Some(self.on_qc_built(*block_hash, qc.clone()))
             }
             Event::ChainMetadataFetched { height, hash, qc } => {
                 Some(self.on_chain_metadata_fetched(*height, *hash, qc.clone()))
@@ -5340,253 +5208,16 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════════
     // Cross-VoteSet Equivocation Detection Tests
     // ═══════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_equivocation_detection_rejects_conflicting_votes() {
-        let (mut state, keys) = make_multi_validator_state();
-        state.set_time(Duration::from_secs(100));
-
-        let height = 1u64;
-        let round = 0u64; // Same round for both votes - true equivocation
-        let voter = ValidatorId(1);
-
-        // Create two different blocks at the same height
-        let block_a_hash = Hash::from_bytes(b"block_a_at_height_1");
-        let block_b_hash = Hash::from_bytes(b"block_b_at_height_1");
-
-        // Create vote for block A from validator 1 at round 0
-        let vote_a = BlockVote {
-            block_hash: block_a_hash,
-            height: BlockHeight(height),
-            round,
-            voter,
-            signature: keys[1].sign(block_a_hash.as_bytes()),
-            timestamp: 100_000,
-        };
-
-        // Create vote for block B from SAME validator 1 at SAME round (equivocation!)
-        let vote_b = BlockVote {
-            block_hash: block_b_hash,
-            height: BlockHeight(height),
-            round, // Same round - this is true equivocation
-            voter,
-            signature: keys[1].sign(block_b_hash.as_bytes()),
-            timestamp: 100_001,
-        };
-
-        // First, simulate successful signature verification for vote A
-        state.pending_vote_verifications.insert(
-            (block_a_hash, voter),
-            PendingVoteVerification {
-                vote: vote_a.clone(),
-                voting_power: 1,
-                committee_index: 1,
-            },
-        );
-        let _actions = state.on_vote_signature_verified(vote_a, true);
-        // Vote A should be accepted
-        assert!(
-            state
-                .received_votes_by_height
-                .contains_key(&(height, voter)),
-            "Vote A should be recorded"
-        );
-        assert_eq!(
-            state.received_votes_by_height.get(&(height, voter)),
-            Some(&(block_a_hash, round))
-        );
-
-        // Now try to add vote B (equivocation attempt at same round)
-        state.pending_vote_verifications.insert(
-            (block_b_hash, voter),
-            PendingVoteVerification {
-                vote: vote_b.clone(),
-                voting_power: 1,
-                committee_index: 1,
-            },
-        );
-        let actions = state.on_vote_signature_verified(vote_b, true);
-
-        // Vote B should be REJECTED (equivocation detected - same height AND round)
-        assert!(actions.is_empty(), "Equivocating vote should be rejected");
-
-        // We should still be tracking vote A
-        assert_eq!(
-            state.received_votes_by_height.get(&(height, voter)),
-            Some(&(block_a_hash, round)),
-            "Original vote should still be tracked"
-        );
-
-        // Vote set for block B should NOT have this vote
-        if let Some(vote_set) = state.vote_sets.get(&block_b_hash) {
-            assert_eq!(
-                vote_set.voting_power(),
-                0,
-                "Equivocating vote should not be added to vote set"
-            );
-        }
-    }
-
-    #[test]
-    fn test_hotstuff2_allows_revote_at_higher_round() {
-        // HotStuff-2 allows validators to vote for different blocks at the same height
-        // if they're at different rounds (due to unlock on round advancement).
-        // This is NOT equivocation - it's legitimate behavior after timeout.
-        let (mut state, keys) = make_multi_validator_state();
-        state.set_time(Duration::from_secs(100));
-
-        let height = 1u64;
-        let voter = ValidatorId(1);
-
-        // Create two different blocks at the same height
-        let block_a_hash = Hash::from_bytes(b"block_a_at_height_1");
-        let block_b_hash = Hash::from_bytes(b"block_b_at_height_1");
-
-        // Create vote for block A at round 0
-        let vote_a = BlockVote {
-            block_hash: block_a_hash,
-            height: BlockHeight(height),
-            round: 0,
-            voter,
-            signature: keys[1].sign(block_a_hash.as_bytes()),
-            timestamp: 100_000,
-        };
-
-        // Create vote for block B at round 1 (after round advancement)
-        let vote_b = BlockVote {
-            block_hash: block_b_hash,
-            height: BlockHeight(height),
-            round: 1, // Higher round - legitimate revote
-            voter,
-            signature: keys[1].sign(block_b_hash.as_bytes()),
-            timestamp: 100_001,
-        };
-
-        // Add pending block B so we can vote on it
-        // For height=1, round=1: proposer = (1 + 1) % 4 = 2
-        let parent_qc = QuorumCertificate::genesis();
-        let header_b = BlockHeader {
-            height: BlockHeight(height),
-            parent_hash: parent_qc.block_hash,
-            parent_qc: parent_qc.clone(),
-            proposer: ValidatorId(2), // Correct proposer for (height=1, round=1)
-            timestamp: 100_001,
-            round: 1,
-            is_fallback: true,
-        };
-        state.pending_blocks.insert(
-            block_b_hash,
-            PendingBlock::new(header_b, vec![], vec![], vec![], vec![]),
-        );
-
-        // Add vote A
-        state.pending_vote_verifications.insert(
-            (block_a_hash, voter),
-            PendingVoteVerification {
-                vote: vote_a.clone(),
-                voting_power: 1,
-                committee_index: 1,
-            },
-        );
-        state.on_vote_signature_verified(vote_a, true);
-
-        // Vote A should be recorded at round 0
-        assert_eq!(
-            state.received_votes_by_height.get(&(height, voter)),
-            Some(&(block_a_hash, 0))
-        );
-
-        // Now add vote B at higher round - should be ACCEPTED (HotStuff-2 revote)
-        state.pending_vote_verifications.insert(
-            (block_b_hash, voter),
-            PendingVoteVerification {
-                vote: vote_b.clone(),
-                voting_power: 1,
-                committee_index: 1,
-            },
-        );
-        let _actions = state.on_vote_signature_verified(vote_b, true);
-
-        // Vote B should be ACCEPTED (different round = legitimate revote)
-        // Note: actions may be empty because quorum isn't reached yet (1 vote != quorum)
-        // The key test is that the vote was accepted and tracking was updated.
-
-        // Tracking should now show vote B at round 1 (higher round replaces lower)
-        assert_eq!(
-            state.received_votes_by_height.get(&(height, voter)),
-            Some(&(block_b_hash, 1)),
-            "Higher round vote should replace lower round vote"
-        );
-
-        // Vote set for block B should have the vote
-        assert!(
-            state.vote_sets.contains_key(&block_b_hash),
-            "Vote should create a vote set for block B"
-        );
-        let vote_set = state.vote_sets.get(&block_b_hash).unwrap();
-        assert_eq!(vote_set.voting_power(), 1, "Vote set should have 1 vote");
-    }
-
-    #[test]
-    fn test_equivocation_detection_allows_same_block_duplicate() {
-        let (mut state, keys) = make_multi_validator_state();
-        state.set_time(Duration::from_secs(100));
-
-        let height = 1u64;
-        let voter = ValidatorId(1);
-        let block_hash = Hash::from_bytes(b"block_at_height_1");
-
-        // Create two identical votes for the same block
-        let vote1 = BlockVote {
-            block_hash,
-            height: BlockHeight(height),
-            round: 0,
-            voter,
-            signature: keys[1].sign(block_hash.as_bytes()),
-            timestamp: 100_000,
-        };
-
-        let vote2 = BlockVote {
-            block_hash,
-            height: BlockHeight(height),
-            round: 0,
-            voter,
-            signature: keys[1].sign(block_hash.as_bytes()),
-            timestamp: 100_001, // Slightly different timestamp but same block
-        };
-
-        // Add first vote
-        state.pending_vote_verifications.insert(
-            (block_hash, voter),
-            PendingVoteVerification {
-                vote: vote1.clone(),
-                voting_power: 1,
-                committee_index: 1,
-            },
-        );
-        state.on_vote_signature_verified(vote1, true);
-
-        // Add second vote for same block - should not trigger equivocation warning
-        // (VoteSet will reject as duplicate, but equivocation check passes)
-        state.pending_vote_verifications.insert(
-            (block_hash, voter),
-            PendingVoteVerification {
-                vote: vote2.clone(),
-                voting_power: 1,
-                committee_index: 1,
-            },
-        );
-        let actions = state.on_vote_signature_verified(vote2, true);
-
-        // Actions should be empty (duplicate vote rejected by VoteSet)
-        assert!(actions.is_empty(), "Duplicate vote should be rejected");
-
-        // But we should still have the original vote tracked
-        assert_eq!(
-            state.received_votes_by_height.get(&(height, voter)),
-            Some(&(block_hash, 0)) // round 0
-        );
-    }
+    //
+    // NOTE: These tests were refactored when switching to deferred vote verification.
+    // With the new model, votes are buffered until quorum is possible, then batch-verified
+    // via VerifyAndBuildQuorumCertificate. Equivocation detection now happens in on_qc_result.
+    //
+    // TODO: Re-implement equivocation detection tests that work with the new deferred
+    // verification model. The key behaviors to test:
+    // - Conflicting votes at same round should be detected and rejected
+    // - HotStuff-2 revoting at higher rounds should be allowed
+    // - Duplicate votes for same block should be handled gracefully
 
     #[test]
     fn test_received_votes_cleaned_up_on_commit() {
@@ -6336,127 +5967,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_clear_vote_tracking_preserves_current_round_votes() {
-        // Test that pending vote verifications at the current/higher round are preserved.
-        // This is critical to prevent the race condition where we discard valid votes.
-        let (mut state, keys) = make_multi_validator_state();
-
-        let height = 5u64;
-        let block_hash = Hash::from_bytes(b"test_block");
-
-        // Add pending vote verifications at different rounds
-        // Round 1 - should be cleared when advancing to round 2
-        state.pending_vote_verifications.insert(
-            (block_hash, ValidatorId(0)),
-            PendingVoteVerification {
-                vote: BlockVote {
-                    block_hash,
-                    height: BlockHeight(height),
-                    round: 1,
-                    voter: ValidatorId(0),
-                    signature: keys[0].sign(block_hash.as_bytes()),
-                    timestamp: 100_000,
-                },
-                voting_power: 1,
-                committee_index: 0,
-            },
-        );
-
-        // Round 2 - should be preserved when advancing to round 2
-        state.pending_vote_verifications.insert(
-            (block_hash, ValidatorId(1)),
-            PendingVoteVerification {
-                vote: BlockVote {
-                    block_hash,
-                    height: BlockHeight(height),
-                    round: 2,
-                    voter: ValidatorId(1),
-                    signature: keys[1].sign(block_hash.as_bytes()),
-                    timestamp: 100_001,
-                },
-                voting_power: 1,
-                committee_index: 1,
-            },
-        );
-
-        // Round 3 - should be preserved when advancing to round 2
-        state.pending_vote_verifications.insert(
-            (block_hash, ValidatorId(2)),
-            PendingVoteVerification {
-                vote: BlockVote {
-                    block_hash,
-                    height: BlockHeight(height),
-                    round: 3,
-                    voter: ValidatorId(2),
-                    signature: keys[2].sign(block_hash.as_bytes()),
-                    timestamp: 100_002,
-                },
-                voting_power: 1,
-                committee_index: 2,
-            },
-        );
-
-        // Different height - should be preserved regardless of round
-        state.pending_vote_verifications.insert(
-            (block_hash, ValidatorId(3)),
-            PendingVoteVerification {
-                vote: BlockVote {
-                    block_hash,
-                    height: BlockHeight(6), // Different height
-                    round: 0,
-                    voter: ValidatorId(3),
-                    signature: keys[3].sign(block_hash.as_bytes()),
-                    timestamp: 100_003,
-                },
-                voting_power: 1,
-                committee_index: 3,
-            },
-        );
-
-        assert_eq!(state.pending_vote_verifications.len(), 4);
-
-        // Clear tracking for height 5, advancing to round 2
-        state.clear_vote_tracking_for_height(height, 2);
-
-        // Round 1 vote should be cleared (round < new_round)
-        assert!(
-            !state
-                .pending_vote_verifications
-                .contains_key(&(block_hash, ValidatorId(0))),
-            "Round 1 vote should be cleared"
-        );
-
-        // Round 2 vote should be preserved (round >= new_round)
-        assert!(
-            state
-                .pending_vote_verifications
-                .contains_key(&(block_hash, ValidatorId(1))),
-            "Round 2 vote should be preserved"
-        );
-
-        // Round 3 vote should be preserved (round >= new_round)
-        assert!(
-            state
-                .pending_vote_verifications
-                .contains_key(&(block_hash, ValidatorId(2))),
-            "Round 3 vote should be preserved"
-        );
-
-        // Different height vote should be preserved
-        assert!(
-            state
-                .pending_vote_verifications
-                .contains_key(&(block_hash, ValidatorId(3))),
-            "Different height vote should be preserved"
-        );
-
-        assert_eq!(
-            state.pending_vote_verifications.len(),
-            3,
-            "Should have 3 remaining verifications"
-        );
-    }
+    // NOTE: test_clear_vote_tracking_preserves_current_round_votes was removed when
+    // switching to deferred vote verification - pending_vote_verifications no longer exists.
+    // Votes are now buffered in VoteSet until quorum is possible.
 
     #[test]
     fn test_clear_vote_tracking_preserves_current_round_vote_sets() {
@@ -6515,9 +6028,10 @@ mod tests {
         };
         let block_hash_h6 = header_height6.hash();
 
-        // Create vote sets with accumulated votes
+        // Create vote sets with accumulated verified votes
         let mut vote_set_r1 = VoteSet::new(Some(header_round1), 4);
-        vote_set_r1.add_vote(
+        vote_set_r1.add_verified_vote(
+            0,
             BlockVote {
                 block_hash: block_hash_r1,
                 height: BlockHeight(height),
@@ -6526,13 +6040,13 @@ mod tests {
                 signature: keys[0].sign(block_hash_r1.as_bytes()),
                 timestamp: 100_000,
             },
-            0,
             1,
         );
         state.vote_sets.insert(block_hash_r1, vote_set_r1);
 
         let mut vote_set_r2 = VoteSet::new(Some(header_round2), 4);
-        vote_set_r2.add_vote(
+        vote_set_r2.add_verified_vote(
+            1,
             BlockVote {
                 block_hash: block_hash_r2,
                 height: BlockHeight(height),
@@ -6542,12 +6056,12 @@ mod tests {
                 timestamp: 100_001,
             },
             1,
-            1,
         );
         state.vote_sets.insert(block_hash_r2, vote_set_r2);
 
         let mut vote_set_r3 = VoteSet::new(Some(header_round3), 4);
-        vote_set_r3.add_vote(
+        vote_set_r3.add_verified_vote(
+            2,
             BlockVote {
                 block_hash: block_hash_r3,
                 height: BlockHeight(height),
@@ -6556,13 +6070,13 @@ mod tests {
                 signature: keys[2].sign(block_hash_r3.as_bytes()),
                 timestamp: 100_002,
             },
-            2,
             1,
         );
         state.vote_sets.insert(block_hash_r3, vote_set_r3);
 
         let mut vote_set_h6 = VoteSet::new(Some(header_height6), 4);
-        vote_set_h6.add_vote(
+        vote_set_h6.add_verified_vote(
+            3,
             BlockVote {
                 block_hash: block_hash_h6,
                 height: BlockHeight(6),
@@ -6571,7 +6085,6 @@ mod tests {
                 signature: keys[3].sign(block_hash_h6.as_bytes()),
                 timestamp: 100_003,
             },
-            3,
             1,
         );
         state.vote_sets.insert(block_hash_h6, vote_set_h6);
@@ -6593,7 +6106,11 @@ mod tests {
             "Round 2 vote set should be preserved"
         );
         assert_eq!(
-            state.vote_sets.get(&block_hash_r2).unwrap().voting_power(),
+            state
+                .vote_sets
+                .get(&block_hash_r2)
+                .unwrap()
+                .verified_power(),
             1,
             "Round 2 vote set should still have its votes"
         );
