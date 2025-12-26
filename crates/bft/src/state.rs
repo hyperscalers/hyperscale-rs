@@ -1052,6 +1052,21 @@ impl BftState {
             }
         }
 
+        // View synchronization from block header round.
+        // When we receive a block proposed at round R > our view, we know the network
+        // has made progress and we should catch up. This helps late joiners converge
+        // faster than waiting for QC-based sync alone.
+        if round > self.view {
+            info!(
+                validator = ?self.validator_id(),
+                old_view = self.view,
+                new_view = round,
+                header_height = height,
+                "View synchronization: advancing view to match received block header"
+            );
+            self.view = round;
+        }
+
         // Basic validation
         if let Err(e) = self.validate_header(&header) {
             warn!(
@@ -1898,6 +1913,21 @@ impl BftState {
                 vote.voter, block_hash
             );
             return vec![];
+        }
+
+        // View synchronization from vote round.
+        // When we receive a vote at round R > our view, the voter has made progress
+        // and we should catch up. This helps late joiners converge with the network.
+        if vote.round > self.view {
+            info!(
+                validator = ?self.validator_id(),
+                old_view = self.view,
+                new_view = vote.round,
+                vote_height = height,
+                voter = ?vote.voter,
+                "View synchronization: advancing view to match received vote"
+            );
+            self.view = vote.round;
         }
 
         // HotStuff-2 voting rules: A validator can vote for different blocks at the same height

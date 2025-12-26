@@ -796,34 +796,9 @@ impl Libp2pAdapter {
         shard: ShardGroupId,
         message: &OutboundMessage,
     ) -> Result<(), NetworkError> {
-        // Direct broadcast for critical consensus messages (BlockHeader, BlockVote)
-        if message.type_name().contains("Block") {
-            // Check if we have the committee info for this shard
-            if let Some(committee) = self.direct_network.get_committee(shard) {
-                // Try direct broadcast
-                match self
-                    .direct_network
-                    .broadcast_to_shard(shard, message, &committee)
-                {
-                    Ok(_) => {
-                        // Successfully queued direct messages.
-                        // We can return early, OR we can also gossip as a backup (redundancy).
-                        // For now, let's return early to test the "bypass" goal.
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        // Log error and fall back to gossip
-                        warn!(shard = shard.0, error = ?e, "Direct broadcast failed, falling back to gossip");
-                    }
-                }
-            } else {
-                // No committee info, fallback to gossip (and maybe log a debug warning)
-                debug!(
-                    shard = shard.0,
-                    "No committee info for direct broadcast, using gossip"
-                );
-            }
-        }
+        // Use gossipsub for all consensus broadcasts - it's optimized for this use case.
+        // GossipSub has pre-established mesh connections with minimal latency for small committees.
+        // DirectBroadcast via request-response adds per-message substream overhead.
 
         let topic = super::codec::topic_for_message(message, shard);
         let data = encode_message(message)?;
