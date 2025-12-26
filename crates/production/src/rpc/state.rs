@@ -5,7 +5,7 @@ use crate::tx_ingress::TxIngressHandle;
 use arc_swap::ArcSwap;
 use hyperscale_core::TransactionStatus;
 use hyperscale_types::{Hash, RoutableTransaction};
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -62,18 +62,50 @@ impl CachedTransactionStatus {
     }
 }
 
+/// Entry in the terminal entries min-heap for O(log n) eviction.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct TerminalHeapEntry {
+    updated_at: Instant,
+    hash: Hash,
+}
+
+impl Ord for TerminalHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Reverse ordering so oldest entries are at the top (min-heap behavior)
+        other.updated_at.cmp(&self.updated_at)
+    }
+}
+
+impl PartialOrd for TerminalHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 /// Cache of transaction statuses for RPC queries.
 ///
 /// This cache is updated by the runner when processing `EmitTransactionStatus` actions.
 /// Entries are kept for a configurable TTL to allow status queries after completion.
-#[derive(Debug, Default)]
+///
+/// Uses a min-heap to track terminal entries by timestamp for O(log n) eviction
+/// instead of O(n log n) sorting on every eviction.
+#[derive(Debug)]
 pub struct TransactionStatusCache {
     /// Map of transaction hash to cached status.
     entries: HashMap<Hash, CachedTransactionStatus>,
+    /// Min-heap of terminal entries ordered by updated_at (oldest first).
+    /// Enables O(log n) eviction of oldest terminal entries.
+    terminal_heap: BinaryHeap<TerminalHeapEntry>,
     /// Maximum number of entries to keep (prevents unbounded growth).
     max_entries: usize,
     /// TTL for completed transaction entries.
     completed_ttl: Duration,
+}
+
+impl Default for TransactionStatusCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TransactionStatusCache {
@@ -81,6 +113,7 @@ impl TransactionStatusCache {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            terminal_heap: BinaryHeap::new(),
             max_entries: 100_000,
             completed_ttl: Duration::from_secs(300), // 5 minutes
         }
@@ -90,6 +123,7 @@ impl TransactionStatusCache {
     pub fn with_config(max_entries: usize, completed_ttl: Duration) -> Self {
         Self {
             entries: HashMap::new(),
+            terminal_heap: BinaryHeap::new(),
             max_entries,
             completed_ttl,
         }
@@ -97,13 +131,26 @@ impl TransactionStatusCache {
 
     /// Update or insert a transaction status.
     pub fn update(&mut self, tx_hash: Hash, status: TransactionStatus) {
+        let is_new_entry = !self.entries.contains_key(&tx_hash);
+
         // If at capacity and this is a new entry, evict old completed entries first
-        if self.entries.len() >= self.max_entries && !self.entries.contains_key(&tx_hash) {
+        if self.entries.len() >= self.max_entries && is_new_entry {
             self.evict_old_entries();
         }
 
-        self.entries
-            .insert(tx_hash, CachedTransactionStatus::new(status));
+        let is_terminal = status.is_final();
+        let entry = CachedTransactionStatus::new(status);
+        let updated_at = entry.updated_at;
+
+        self.entries.insert(tx_hash, entry);
+
+        // Track terminal entries in the heap for efficient eviction
+        if is_terminal {
+            self.terminal_heap.push(TerminalHeapEntry {
+                updated_at,
+                hash: tx_hash,
+            });
+        }
     }
 
     /// Get the status of a transaction.
@@ -112,32 +159,48 @@ impl TransactionStatusCache {
     }
 
     /// Evict old completed entries to make room for new ones.
+    /// Uses a min-heap for O(log n) per-eviction instead of O(n log n) sort.
     fn evict_old_entries(&mut self) {
         let now = Instant::now();
         let ttl = self.completed_ttl;
 
-        // Remove entries that are completed/retried and older than TTL
-        self.entries.retain(|_, entry| {
-            let is_terminal = entry.status.is_final();
-            let is_old = now.duration_since(entry.updated_at) > ttl;
-            !(is_terminal && is_old)
-        });
+        // First pass: evict entries older than TTL using the heap
+        // This is O(k log n) where k is the number of entries evicted
+        while let Some(heap_entry) = self.terminal_heap.peek() {
+            // Check if oldest entry is past TTL
+            if now.duration_since(heap_entry.updated_at) <= ttl {
+                break; // All remaining entries are within TTL
+            }
 
-        // If still at capacity, remove oldest terminal entries
+            let heap_entry = self.terminal_heap.pop().unwrap();
+
+            // Verify the entry still exists and matches (might have been updated)
+            if let Some(cached) = self.entries.get(&heap_entry.hash) {
+                if cached.updated_at == heap_entry.updated_at && cached.status.is_final() {
+                    self.entries.remove(&heap_entry.hash);
+                }
+            }
+            // If entry doesn't exist or was updated, the heap entry is stale - just drop it
+        }
+
+        // Second pass: if still at capacity, evict oldest 10% of terminal entries
         if self.entries.len() >= self.max_entries {
-            let mut terminal_entries: Vec<_> = self
-                .entries
-                .iter()
-                .filter(|(_, e)| e.status.is_final())
-                .map(|(h, e)| (*h, e.updated_at))
-                .collect();
+            let to_remove = self.terminal_heap.len() / 10 + 1;
+            let mut removed = 0;
 
-            terminal_entries.sort_by_key(|(_, t)| *t);
+            while removed < to_remove {
+                let Some(heap_entry) = self.terminal_heap.pop() else {
+                    break;
+                };
 
-            // Remove oldest 10% of terminal entries
-            let to_remove = terminal_entries.len() / 10 + 1;
-            for (hash, _) in terminal_entries.into_iter().take(to_remove) {
-                self.entries.remove(&hash);
+                // Verify the entry still exists and matches
+                if let Some(cached) = self.entries.get(&heap_entry.hash) {
+                    if cached.updated_at == heap_entry.updated_at && cached.status.is_final() {
+                        self.entries.remove(&heap_entry.hash);
+                        removed += 1;
+                    }
+                }
+                // Stale heap entries don't count toward removal quota
             }
         }
     }
