@@ -524,8 +524,7 @@ impl Libp2pAdapter {
             quic_config.max_concurrent_stream_limit = 4096;
             // Enable QUIC keep-alive to detect dead connections early.
             // Sends PING frames at this interval to keep connections alive and detect failures.
-            // Set to half of idle_connection_timeout to ensure we ping before connection is closed.
-            quic_config.keep_alive_interval = config.idle_connection_timeout / 2;
+            quic_config.keep_alive_interval = config.keep_alive_interval;
 
             let quic_transport = libp2p::quic::tokio::Transport::new(quic_config)
                 .map(|(p, c), _| (p, StreamMuxerBox::new(c)));
@@ -584,7 +583,7 @@ impl Libp2pAdapter {
                     // during burst sync traffic when catching up.
                     quic_config.max_concurrent_stream_limit = 4096;
                     // Enable QUIC keep-alive to detect dead connections early.
-                    quic_config.keep_alive_interval = config.idle_connection_timeout / 2;
+                    quic_config.keep_alive_interval = config.keep_alive_interval;
                     quic_config
                 })
                 .with_behaviour(|_| behaviour)

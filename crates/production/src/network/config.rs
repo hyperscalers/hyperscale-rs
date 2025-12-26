@@ -47,6 +47,14 @@ pub struct Libp2pConfig {
     /// Default: 60 seconds
     pub idle_connection_timeout: Duration,
 
+    /// QUIC keep-alive interval.
+    ///
+    /// Sends PING frames at this interval to keep connections alive and detect failures.
+    /// Should be significantly less than `idle_connection_timeout` to prevent connection drops.
+    ///
+    /// Default: 15 seconds
+    pub keep_alive_interval: Duration,
+
     /// Whether to enable TCP fallback transport alongside QUIC.
     ///
     /// When enabled, the node will listen on TCP as well as QUIC,
@@ -135,6 +143,7 @@ impl Default for Libp2pConfig {
             max_message_size: 1024 * 1024 * 10, // 10MB
             gossipsub_heartbeat: Duration::from_millis(100),
             idle_connection_timeout: Duration::from_secs(60),
+            keep_alive_interval: Duration::from_secs(15),
             tcp_fallback_enabled: true,
             tcp_fallback_port: None,
             version_interop_mode: VersionInteroperabilityMode::Relaxed,
@@ -181,6 +190,12 @@ impl Libp2pConfig {
         self
     }
 
+    /// Set the QUIC keep-alive interval.
+    pub fn with_keep_alive_interval(mut self, interval: Duration) -> Self {
+        self.keep_alive_interval = interval;
+        self
+    }
+
     /// Enable or disable TCP fallback transport.
     pub fn with_tcp_fallback(mut self, enabled: bool, port: Option<u16>) -> Self {
         self.tcp_fallback_enabled = enabled;
@@ -199,6 +214,7 @@ impl Libp2pConfig {
             max_message_size: 1024 * 1024, // 1MB
             gossipsub_heartbeat: Duration::from_millis(500),
             idle_connection_timeout: Duration::from_secs(30),
+            keep_alive_interval: Duration::from_secs(10),
             tcp_fallback_enabled: true,
             tcp_fallback_port: None,
             version_interop_mode: VersionInteroperabilityMode::Relaxed,

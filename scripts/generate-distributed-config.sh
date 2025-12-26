@@ -20,9 +20,9 @@ RPC_BASE_PORT=8080
 NUM_SHARDS=1 # Simplification for now: 1 shard for N nodes
 CLEAN=false
 NODES_PER_HOST=1
-CRYPTO_THREADS=2
-EXECUTION_THREADS=4
-IO_THREADS=2
+CRYPTO_THREADS=0
+EXECUTION_THREADS=0
+IO_THREADS=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -265,6 +265,9 @@ max_message_size = 10485760
 gossipsub_heartbeat_ms = 100
 direct_connection_limit = 50
 direct_connection_timeout_ms = 10000
+# Aggressive keep-alive for distributed deployments (WAN tolerant)
+idle_connection_timeout_ms = 120000
+keep_alive_interval_ms = 10000
 
 [consensus]
 proposal_interval_ms = 300
