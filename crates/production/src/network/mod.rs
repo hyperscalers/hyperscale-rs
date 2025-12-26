@@ -49,6 +49,7 @@
 
 mod adapter;
 mod codec;
+mod codec_pool;
 mod config;
 pub mod direct;
 mod rate_limiter;
@@ -58,6 +59,7 @@ pub use adapter::{
     compute_peer_id_for_validator, derive_libp2p_keypair, InboundCertificateRequest,
     InboundSyncRequest, InboundTransactionRequest, Libp2pAdapter, NetworkError,
 };
+pub use codec_pool::CodecPoolHandle;
 pub use config::{Libp2pConfig, VersionInteroperabilityMode};
 pub use rate_limiter::{RateLimitConfig, SyncRateLimiter};
 pub use topic::{ProtocolVersion, Topic};

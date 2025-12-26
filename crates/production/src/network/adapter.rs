@@ -6,7 +6,8 @@
 //! - Request-Response for sync block fetching
 //! - QUIC transport for reliable, encrypted connections
 
-use super::codec::{decode_message, encode_message, CodecError};
+use super::codec::CodecError;
+use super::codec_pool::CodecPoolHandle;
 use super::config::Libp2pConfig;
 use super::direct::DirectValidatorNetwork;
 use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
@@ -404,6 +405,9 @@ pub struct Libp2pAdapter {
 
     /// Direct validator network for high-performance consensus messaging.
     direct_network: Arc<DirectValidatorNetwork>,
+
+    /// Codec pool handle for async encoding (encoding happens on caller thread for broadcast).
+    codec_pool: CodecPoolHandle,
 }
 
 impl Libp2pAdapter {
@@ -417,6 +421,7 @@ impl Libp2pAdapter {
     /// * `shard` - Local shard assignment
     /// * `consensus_tx` - Channel for high-priority consensus events (BFT messages)
     /// * `tx_validation_handle` - Handle for submitting transactions to the shared batcher
+    /// * `codec_pool` - Handle for async message encoding/decoding
     ///
     /// # Returns
     ///
@@ -432,6 +437,7 @@ impl Libp2pAdapter {
         shard: ShardGroupId,
         consensus_tx: mpsc::Sender<Event>,
         tx_validation_handle: ValidationBatcherHandle,
+        codec_pool: CodecPoolHandle,
     ) -> Result<
         (
             Arc<Self>,
@@ -687,6 +693,7 @@ impl Libp2pAdapter {
             cert_request_tx: cert_request_tx.clone(),
             cached_peer_count: cached_peer_count.clone(),
             direct_network: direct_network.clone(),
+            codec_pool: codec_pool.clone(),
         });
 
         // Spawn event loop (takes ownership of swarm)
@@ -710,6 +717,7 @@ impl Libp2pAdapter {
                 shard,
                 tx_validation_handle,
                 config.version_interop_mode,
+                codec_pool,
             ))
             .catch_unwind()
             .await;
@@ -801,7 +809,10 @@ impl Libp2pAdapter {
         // DirectBroadcast via request-response adds per-message substream overhead.
 
         let topic = super::codec::topic_for_message(message, shard);
-        let data = encode_message(message)?;
+        // Use synchronous encoding here since we're already on an async task
+        // and encoding is fast for most messages. The codec pool is primarily
+        // beneficial for decoding in the event loop.
+        let data = self.codec_pool.encode_sync(message)?;
         let data_len = data.len();
 
         self.command_tx
@@ -1039,6 +1050,7 @@ impl Libp2pAdapter {
         local_shard: ShardGroupId,
         tx_validation_handle: ValidationBatcherHandle,
         version_interop_mode: VersionInteroperabilityMode,
+        codec_pool: CodecPoolHandle,
     ) {
         // Track pending sync requests (outbound) with creation time for TTL cleanup
         let mut pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest> =
@@ -1330,6 +1342,7 @@ impl Libp2pAdapter {
                         &mut rate_limiter,
                         local_shard,
                         &tx_validation_handle,
+                        &codec_pool,
                     ).await;
 
                     // Execute any action returned by the event handler
@@ -1600,6 +1613,7 @@ impl Libp2pAdapter {
         rate_limiter: &mut SyncRateLimiter,
         local_shard: ShardGroupId,
         tx_validation_handle: &ValidationBatcherHandle,
+        codec_pool: &CodecPoolHandle,
     ) -> SwarmAction {
         match event {
             // Handle gossipsub messages
@@ -1668,69 +1682,19 @@ impl Libp2pAdapter {
                     }
                 }
 
-                // Decode message based on topic
-                match decode_message(&parsed_topic, &message.data) {
-                    Ok(decoded) => {
-                        metrics::record_network_message_received();
+                // Dispatch decoding to the codec pool (non-blocking).
+                // The codec pool handles SBOR decoding on a separate thread pool,
+                // then sends decoded events directly to the consensus channel.
+                // This prevents large messages (state batches) from blocking the event loop.
+                codec_pool.decode_async(
+                    parsed_topic,
+                    message.data,
+                    propagation_source,
+                    consensus_tx.clone(),
+                    tx_validation_handle.clone(),
+                );
 
-                        // Route based on event type:
-                        // - Transactions: submit to batched validator (dedup + batch validation)
-                        // - Consensus messages: send directly to high-priority channel
-                        // Batched messages produce multiple events
-                        for event in decoded.events {
-                            match event {
-                                Event::TransactionGossipReceived { tx } => {
-                                    // Submit to batched validator for dedup and parallel validation
-                                    // The batcher handles:
-                                    // 1. Deduplication via seen-cache (skips already-seen txs)
-                                    // 2. Batching over time window for better throughput
-                                    // 3. Parallel validation via rayon on crypto thread pool
-                                    if !tx_validation_handle.submit(tx) {
-                                        trace!(
-                                            peer = %propagation_source,
-                                            "Transaction deduplicated or batcher closed"
-                                        );
-                                    }
-                                }
-                                event => {
-                                    // Consensus messages go directly to high-priority channel
-                                    // CRITICAL: Spawn to avoid blocking the swarm loop
-                                    let tx = consensus_tx.clone();
-                                    let send_future = async move {
-                                        if tx.send(event).await.is_err() {
-                                            warn!("Consensus channel closed");
-                                        }
-                                    };
-
-                                    #[cfg(feature = "trace-propagation")]
-                                    let send_future = {
-                                        let span = tracing::trace_span!("cross_shard_message");
-                                        if let Some(ref trace_ctx) = decoded.trace_context {
-                                            let _ = span.set_parent(trace_ctx.extract());
-                                            tracing::trace!(
-                                                "Extracted trace context from cross-shard message"
-                                            );
-                                        }
-                                        send_future.instrument(span)
-                                    };
-
-                                    tokio::spawn(send_future);
-                                }
-                            }
-                        }
-                        SwarmAction::None
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            topic = %topic_str,
-                            peer = %propagation_source,
-                            "Failed to decode message"
-                        );
-                        metrics::record_invalid_message();
-                        SwarmAction::None
-                    }
-                }
+                SwarmAction::None
             }
 
             // Handle subscription events

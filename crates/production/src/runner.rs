@@ -518,6 +518,11 @@ impl ProductionRunnerBuilder {
             validated_tx_tx,
         );
 
+        // Create codec pool handle for async message encoding/decoding
+        // This uses the shared thread pool manager's codec pool to offload SBOR
+        // operations from the network event loop.
+        let codec_pool_handle = crate::network::CodecPoolHandle::new(thread_pools.clone());
+
         // Create network adapter with shared transaction validation batcher
         let (network, sync_request_rx, tx_request_rx, cert_request_rx) = Libp2pAdapter::new(
             network_config,
@@ -526,6 +531,7 @@ impl ProductionRunnerBuilder {
             local_shard,
             consensus_tx.clone(),
             tx_validation_handle.clone(),
+            codec_pool_handle,
         )
         .await?;
 

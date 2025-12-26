@@ -53,6 +53,11 @@ fn test_tx_validation_handle() -> (
     (handle, output_rx)
 }
 
+/// Create a test codec pool handle for network adapter tests.
+fn test_codec_pool_handle() -> hyperscale_production::network::CodecPoolHandle {
+    hyperscale_production::network::CodecPoolHandle::new(test_thread_pools())
+}
+
 /// Test timeout values (from design spec).
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 #[allow(dead_code)]
@@ -147,6 +152,7 @@ async fn test_network_adapter_starts() {
     let (consensus_tx, _consensus_rx) = mpsc::channel(100);
     let (tx_validation_handle, _tx_rx) = test_tx_validation_handle();
 
+    let codec_pool = test_codec_pool_handle();
     let result = timeout(
         CONNECTION_TIMEOUT,
         Libp2pAdapter::new(
@@ -156,6 +162,7 @@ async fn test_network_adapter_starts() {
             shard,
             consensus_tx,
             tx_validation_handle,
+            codec_pool,
         ),
     )
     .await;
@@ -191,6 +198,7 @@ async fn test_two_node_connection() {
     };
     let (consensus_tx1, _consensus_rx1) = mpsc::channel(100);
     let (tx_validation_handle1, _tx_rx1) = test_tx_validation_handle();
+    let codec_pool1 = test_codec_pool_handle();
 
     let (adapter1, _sync_rx1, _tx_req_rx1, _cert_rx1) = Libp2pAdapter::new(
         config1,
@@ -199,6 +207,7 @@ async fn test_two_node_connection() {
         ShardGroupId(0),
         consensus_tx1,
         tx_validation_handle1,
+        codec_pool1,
     )
     .await
     .unwrap();
@@ -219,6 +228,7 @@ async fn test_two_node_connection() {
     };
     let (consensus_tx2, _consensus_rx2) = mpsc::channel(100);
     let (tx_validation_handle2, _tx_rx2) = test_tx_validation_handle();
+    let codec_pool2 = test_codec_pool_handle();
 
     let (adapter2, _sync_rx2, _tx_req_rx2, _cert_rx2) = Libp2pAdapter::new(
         config2,
@@ -227,6 +237,7 @@ async fn test_two_node_connection() {
         ShardGroupId(0),
         consensus_tx2,
         tx_validation_handle2,
+        codec_pool2,
     )
     .await
     .unwrap();
@@ -275,6 +286,7 @@ async fn test_topic_subscription() {
     };
     let (consensus_tx, _consensus_rx) = mpsc::channel(100);
     let (tx_validation_handle, _tx_rx) = test_tx_validation_handle();
+    let codec_pool = test_codec_pool_handle();
 
     let (adapter, _sync_rx, _tx_req_rx, _cert_rx) = Libp2pAdapter::new(
         config,
@@ -283,6 +295,7 @@ async fn test_topic_subscription() {
         ShardGroupId(0),
         consensus_tx,
         tx_validation_handle,
+        codec_pool,
     )
     .await
     .unwrap();
