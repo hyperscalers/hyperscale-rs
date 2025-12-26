@@ -251,7 +251,7 @@ impl ValidationBatcher {
         }
     }
 
-    /// Dispatch a batch of transactions to the crypto thread pool.
+    /// Dispatch a batch of transactions to the tx validation thread pool.
     fn dispatch_batch(&self, batch: Vec<Arc<RoutableTransaction>>) {
         if batch.is_empty() {
             return;
@@ -265,20 +265,24 @@ impl ValidationBatcher {
         let validator = Arc::clone(&self.validator);
         let output_tx = self.output_tx.clone();
         let stats = Arc::clone(&self.stats);
+        let thread_pools = Arc::clone(&self.thread_pools);
 
         debug!(batch_size, "Dispatching transaction validation batch");
 
+        // Spawn a single task that uses pool.install() to run par_iter on the correct pool.
+        // This ensures all parallel work stays within the tx_validation pool.
         self.thread_pools.spawn_tx_validation(move || {
-            // Use rayon to validate in parallel across all tx validation threads
-            use rayon::prelude::*;
-
-            let results: Vec<_> = batch
-                .into_par_iter()
-                .map(|tx| {
-                    let result = validator.validate_transaction(&tx);
-                    (tx, result)
-                })
-                .collect();
+            // Use pool.install() to ensure par_iter uses tx_validation pool, not global
+            let results: Vec<_> = thread_pools.tx_validation_pool().install(|| {
+                use rayon::prelude::*;
+                batch
+                    .into_par_iter()
+                    .map(|tx| {
+                        let result = validator.validate_transaction(&tx);
+                        (tx, result)
+                    })
+                    .collect()
+            });
 
             // Send results back
             for (tx, result) in results {

@@ -3274,37 +3274,40 @@ impl ProductionRunner {
 
         let event_tx = self.callback_tx.clone();
         let batch_size = certs.len();
+        let thread_pools = Arc::clone(&self.thread_pools);
 
         self.thread_pools.spawn_crypto(move || {
-            use rayon::prelude::*;
-
             let start = std::time::Instant::now();
 
             // Step 1: Pre-process certificates in parallel - aggregate signer keys and build messages
             // This is the expensive part that benefits from parallelization
-            let prepared: Vec<_> = certs
-                .into_par_iter()
-                .map(|(cert, public_keys)| {
-                    let msg = cert.signing_message();
+            // Use pool.install() to ensure par_iter uses crypto pool, not global
+            let prepared: Vec<_> = thread_pools.crypto_pool().install(|| {
+                use rayon::prelude::*;
+                certs
+                    .into_par_iter()
+                    .map(|(cert, public_keys)| {
+                        let msg = cert.signing_message();
 
-                    // Get signer keys based on bitfield
-                    let signer_keys: Vec<_> = public_keys
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| cert.signers.is_set(*i))
-                        .map(|(_, pk)| pk.clone())
-                        .collect();
+                        // Get signer keys based on bitfield
+                        let signer_keys: Vec<_> = public_keys
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| cert.signers.is_set(*i))
+                            .map(|(_, pk)| pk.clone())
+                            .collect();
 
-                    // Pre-aggregate the public keys
-                    let aggregated_pk = if signer_keys.is_empty() {
-                        None // Will check for zero signature
-                    } else {
-                        PublicKey::aggregate_bls(&signer_keys).ok()
-                    };
+                        // Pre-aggregate the public keys
+                        let aggregated_pk = if signer_keys.is_empty() {
+                            None // Will check for zero signature
+                        } else {
+                            PublicKey::aggregate_bls(&signer_keys).ok()
+                        };
 
-                    (cert, msg, aggregated_pk)
-                })
-                .collect();
+                        (cert, msg, aggregated_pk)
+                    })
+                    .collect()
+            });
 
             // Step 2: Batch verify all signatures
             // Separate into verifiable (have aggregated_pk) and special cases (empty signers)
@@ -3406,39 +3409,42 @@ impl ProductionRunner {
 
         let event_tx = self.callback_tx.clone();
         let batch_size = batch.len();
+        let thread_pools = Arc::clone(&self.thread_pools);
 
         // Check backpressure before spawning - if crypto pool is overloaded,
         // these gossiped certs will timeout and be cleaned up by TTL.
         // This is acceptable since gossiped certs are non-critical and can be re-fetched.
         if !self.thread_pools.try_spawn_crypto(move || {
-            use rayon::prelude::*;
-
             let start = std::time::Instant::now();
 
             // Step 1: Pre-process certificates in parallel - aggregate signer keys and build messages
-            let prepared: Vec<_> = batch
-                .into_par_iter()
-                .map(|(tx_hash, _tx_cert, shard, cert, public_keys)| {
-                    let msg = cert.signing_message();
+            // Use pool.install() to ensure par_iter uses crypto pool, not global
+            let prepared: Vec<_> = thread_pools.crypto_pool().install(|| {
+                use rayon::prelude::*;
+                batch
+                    .into_par_iter()
+                    .map(|(tx_hash, _tx_cert, shard, cert, public_keys)| {
+                        let msg = cert.signing_message();
 
-                    // Get signer keys based on bitfield
-                    let signer_keys: Vec<_> = public_keys
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| cert.signers.is_set(*i))
-                        .map(|(_, pk)| pk.clone())
-                        .collect();
+                        // Get signer keys based on bitfield
+                        let signer_keys: Vec<_> = public_keys
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| cert.signers.is_set(*i))
+                            .map(|(_, pk)| pk.clone())
+                            .collect();
 
-                    // Pre-aggregate the public keys
-                    let aggregated_pk = if signer_keys.is_empty() {
-                        None // Will check for zero signature
-                    } else {
-                        PublicKey::aggregate_bls(&signer_keys).ok()
-                    };
+                        // Pre-aggregate the public keys
+                        let aggregated_pk = if signer_keys.is_empty() {
+                            None // Will check for zero signature
+                        } else {
+                            PublicKey::aggregate_bls(&signer_keys).ok()
+                        };
 
-                    (tx_hash, shard, cert, msg, aggregated_pk)
-                })
-                .collect();
+                        (tx_hash, shard, cert, msg, aggregated_pk)
+                    })
+                    .collect()
+            });
 
             // Step 2: Batch verify all signatures
             // Separate into verifiable (have aggregated_pk) and special cases
