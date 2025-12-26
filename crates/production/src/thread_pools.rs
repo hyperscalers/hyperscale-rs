@@ -117,13 +117,14 @@ impl ThreadPoolConfig {
     /// Uses the following allocation ratios:
     /// - State Machine: 1 core (always)
     /// - Consensus Crypto: 2 threads (dedicated for block votes/QC - liveness critical)
-    /// - TX Validation: 2 threads (dedicated for transaction signature verification)
-    /// - Codec: 2 threads (dedicated for SBOR encode/decode to unblock network event loop)
-    /// - Execution: 40% of remaining cores (min 1)
-    /// - General Crypto: 30% of remaining cores (min 1)
-    /// - I/O: 30% of remaining cores (min 1)
+    /// - After reserving state machine and consensus crypto, remaining cores are split:
+    ///   - Crypto: 35% (provisions, state votes, gossiped cert verification - highest load)
+    ///   - Execution: 25% (Radix Engine)
+    ///   - TX Validation: 15% (transaction signature verification)
+    ///   - I/O: 15% (network, storage, timers)
+    ///   - Codec: 10% (SBOR encode/decode)
     ///
-    /// On systems with fewer than 6 cores, all pools get 1 thread each.
+    /// On systems with fewer than 8 cores, all pools get 1 thread each.
     pub fn auto() -> Self {
         let available = std::thread::available_parallelism()
             .map(NonZeroUsize::get)
@@ -136,32 +137,35 @@ impl ThreadPoolConfig {
     ///
     /// Useful for testing or when you want to limit resource usage.
     pub fn for_core_count(total_cores: usize) -> Self {
-        // Reserve 1 core for state machine
-        let remaining = total_cores.saturating_sub(1).max(6);
+        // Reserve 1 core for state machine + 2 for consensus crypto
+        let remaining = total_cores.saturating_sub(3).max(6);
 
-        // Allocation: consensus_crypto, tx_validation, and codec get dedicated threads, rest split among others
-        // Consensus crypto is critical for liveness - even under heavy load, block votes
-        // must be verified quickly to form QCs within the view_change_timeout (3s default)
-        // TX validation is separate to prevent transaction floods from blocking execution-layer crypto
-        // Codec is separate to prevent large message decoding from blocking the network event loop
+        // Allocation:
+        // - Consensus crypto is fixed at 2 threads (liveness critical for block votes/QC)
+        // - All other pools use percentage-based allocation from remaining cores
         let (consensus_crypto, tx_validation, codec, crypto, execution, io) = if remaining <= 6 {
-            // Minimum viable: 1 each
-            (1, 1, 1, 1, 1, 1)
+            // Minimum viable: 1 each for variable pools, 2 for consensus crypto
+            (2, 1, 1, 1, 1, 1)
         } else {
             // Consensus crypto: fixed 2 threads (enough for ~1000 votes/sec)
-            // TX validation: fixed 2 threads (enough for transaction flood isolation)
-            // Codec: fixed 2 threads (enough for message encode/decode throughput)
             let consensus_crypto = 2;
-            let tx_validation = 2;
-            let codec = 2;
-            let after_dedicated =
-                remaining.saturating_sub(consensus_crypto + tx_validation + codec);
-            // Remaining split: execution 40%, crypto 30%, I/O 30%
-            let execution = (after_dedicated * 40 / 100).max(1);
-            let crypto = (after_dedicated * 30 / 100).max(1);
-            let io = after_dedicated
+
+            // Remaining cores split by percentage:
+            // - Crypto: 35% (provisions, state votes, gossiped cert verification - highest load)
+            // - Execution: 25% (Radix Engine)
+            // - TX Validation: 15% (transaction signature verification, bursty)
+            // - I/O: 15% (network, storage, timers)
+            // - Codec: 10% (SBOR encode/decode)
+            let crypto = (remaining * 35 / 100).max(1);
+            let execution = (remaining * 25 / 100).max(1);
+            let tx_validation = (remaining * 15 / 100).max(1);
+            let io = (remaining * 15 / 100).max(1);
+            // Codec gets the remainder to ensure we use all cores
+            let codec = remaining
                 .saturating_sub(crypto)
                 .saturating_sub(execution)
+                .saturating_sub(tx_validation)
+                .saturating_sub(io)
                 .max(1);
             (
                 consensus_crypto,
@@ -919,34 +923,45 @@ mod tests {
 
     #[test]
     fn test_for_core_count() {
-        // 6 cores: 1 state + 1 each for all pools (minimum viable)
+        // 6 cores: remaining = max(6-3, 6) = 6, so minimum viable mode
+        // 2 consensus_crypto + 1 each for other pools
         let config = ThreadPoolConfig::for_core_count(6);
-        assert_eq!(config.consensus_crypto_threads, 1);
+        assert_eq!(config.consensus_crypto_threads, 2);
         assert_eq!(config.crypto_threads, 1);
         assert_eq!(config.tx_validation_threads, 1);
         assert_eq!(config.execution_threads, 1);
         assert_eq!(config.codec_threads, 1);
         assert_eq!(config.io_threads, 1);
 
-        // 12 cores: 1 state + 2 consensus_crypto + 2 tx_validation + 2 codec + rest split
+        // 12 cores: remaining = 12 - 3 = 9 (percentage mode)
+        // crypto 35% = 3, execution 25% = 2, tx_validation 15% = 1, io 15% = 1, codec = remainder = 2
         let config = ThreadPoolConfig::for_core_count(12);
-        assert!(config.consensus_crypto_threads >= 1);
-        assert!(config.crypto_threads >= 1);
-        assert!(config.tx_validation_threads >= 1);
-        assert!(config.execution_threads >= 1);
-        assert!(config.codec_threads >= 1);
-        assert!(config.io_threads >= 1);
+        assert_eq!(config.consensus_crypto_threads, 2);
+        assert_eq!(config.crypto_threads, 3);
+        assert_eq!(config.execution_threads, 2);
+        assert_eq!(config.tx_validation_threads, 1);
+        assert_eq!(config.io_threads, 1);
+        assert_eq!(config.codec_threads, 2);
 
-        // 18 cores: more balanced with dedicated consensus crypto, tx validation, and codec
-        // 17 remaining after state machine, 11 after consensus crypto (2), tx_validation (2), codec (2)
-        // execution 40% = 4, crypto 30% = 3, io = 4
+        // 18 cores: remaining = 18 - 3 = 15 (percentage mode)
+        // crypto 35% = 5, execution 25% = 3, tx_validation 15% = 2, io 15% = 2, codec = remainder = 3
         let config = ThreadPoolConfig::for_core_count(18);
-        assert_eq!(config.consensus_crypto_threads, 2); // Fixed 2 threads for consensus crypto
-        assert_eq!(config.tx_validation_threads, 2); // Fixed 2 threads for tx validation
-        assert_eq!(config.codec_threads, 2); // Fixed 2 threads for codec
-        assert!(config.crypto_threads >= 2);
-        assert!(config.execution_threads >= 3);
-        assert!(config.io_threads >= 2);
+        assert_eq!(config.consensus_crypto_threads, 2);
+        assert_eq!(config.crypto_threads, 5);
+        assert_eq!(config.execution_threads, 3);
+        assert_eq!(config.tx_validation_threads, 2);
+        assert_eq!(config.io_threads, 2);
+        assert_eq!(config.codec_threads, 3);
+
+        // 32 cores: remaining = 32 - 3 = 29 (percentage mode)
+        // crypto 35% = 10, execution 25% = 7, tx_validation 15% = 4, io 15% = 4, codec = remainder = 4
+        let config = ThreadPoolConfig::for_core_count(32);
+        assert_eq!(config.consensus_crypto_threads, 2);
+        assert_eq!(config.crypto_threads, 10);
+        assert_eq!(config.execution_threads, 7);
+        assert_eq!(config.tx_validation_threads, 4);
+        assert_eq!(config.io_threads, 4);
+        assert_eq!(config.codec_threads, 4);
     }
 
     #[test]
