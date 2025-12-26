@@ -59,6 +59,8 @@ mod batch_limits {
     pub const MAX_STATE_CERTS: usize = 64;
     /// Cross-shard execution: heavy per-item work, memory pressure from provisions.
     pub const MAX_CROSS_SHARD_EXECUTIONS: usize = 32;
+    /// Gossiped certs: non-critical, can be re-fetched. Larger batches for efficiency.
+    pub const MAX_GOSSIPED_CERTS: usize = 64;
 }
 
 /// Pending block vote verifications that can be batched.
@@ -177,6 +179,49 @@ struct PendingGossipCertVerification {
     failed: bool,
     /// When this verification started (for TTL cleanup).
     created_at: std::time::Instant,
+}
+
+/// Pending gossiped certificate verifications that can be batched.
+///
+/// Instead of spawning one crypto task per shard, we accumulate gossiped certificates
+/// and verify them in batches using batch BLS verification. This significantly reduces
+/// crypto pool pressure under high gossip load.
+///
+/// Uses a 15ms batching window (same as state certs) since gossiped certs are
+/// not latency-critical - they can be re-fetched if needed.
+#[derive(Default)]
+struct PendingGossipedCertBatch {
+    /// Gossiped certificates waiting for batch verification.
+    /// Each entry contains: (tx_hash, certificate, shard_id, state_cert, public_keys)
+    items: Vec<(
+        Hash,
+        TransactionCertificate,
+        ShardGroupId,
+        hyperscale_types::StateCertificate,
+        Vec<PublicKey>,
+    )>,
+}
+
+impl PendingGossipedCertBatch {
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn take(
+        &mut self,
+    ) -> Vec<(
+        Hash,
+        TransactionCertificate,
+        ShardGroupId,
+        hyperscale_types::StateCertificate,
+        Vec<PublicKey>,
+    )> {
+        std::mem::take(&mut self.items)
+    }
+
+    fn is_full(&self) -> bool {
+        self.items.len() >= batch_limits::MAX_GOSSIPED_CERTS
+    }
 }
 
 /// Maximum age for pending gossip certificate verifications before cleanup.
@@ -667,6 +712,8 @@ impl ProductionRunnerBuilder {
             action_dispatcher,
             rpc_submitted_txs: std::collections::HashMap::new(),
             pending_gossip_cert_verifications: std::collections::HashMap::new(),
+            pending_gossiped_cert_batch: PendingGossipedCertBatch::default(),
+            gossiped_cert_batch_deadline: None,
         })
     }
 }
@@ -802,6 +849,11 @@ pub struct ProductionRunner {
     /// persisted and GossipedCertificateVerified event sent to state machine.
     pending_gossip_cert_verifications:
         std::collections::HashMap<Hash, PendingGossipCertVerification>,
+    /// Pending gossiped certificates accumulated for batch signature verification.
+    /// Uses a 15ms batching window with backpressure to prevent crypto pool saturation.
+    pending_gossiped_cert_batch: PendingGossipedCertBatch,
+    /// Deadline for flushing pending gossiped certificate batch. None if none pending.
+    gossiped_cert_batch_deadline: Option<tokio::time::Instant>,
 }
 
 impl ProductionRunner {
@@ -1173,7 +1225,8 @@ impl ProductionRunner {
                     self.pending_gossip_cert_verifications.retain(|tx_hash, pending| {
                         let expired = now.duration_since(pending.created_at) >= PENDING_GOSSIP_CERT_TIMEOUT;
                         if expired {
-                            tracing::warn!(
+                            // Debug level to avoid log spam - summary at WARN below
+                            tracing::debug!(
                                 ?tx_hash,
                                 pending_shards = pending.pending_shards.len(),
                                 age_secs = now.duration_since(pending.created_at).as_secs(),
@@ -1275,6 +1328,10 @@ impl ProductionRunner {
                             // This is a certificate gossiped from another validator. We verify all
                             // embedded StateCertificate BLS signatures before persisting to prevent
                             // malicious peers from filling our storage with invalid certificates.
+                            //
+                            // BATCHING: Instead of spawning one crypto task per shard, we accumulate
+                            // certificates for batch verification. This significantly reduces crypto
+                            // pool pressure under high gossip load.
                             if let Event::TransactionCertificateReceived { certificate } = &event {
                                 let tx_hash = certificate.transaction_hash;
 
@@ -1308,7 +1365,7 @@ impl ProductionRunner {
                                     },
                                 );
 
-                                // Spawn verification for each StateCertificate on crypto pool
+                                // Add each shard's state cert to the batch for verification
                                 for (shard_id, state_cert) in &certificate.shard_proofs {
                                     let committee = self.topology.committee_for_shard(*shard_id);
                                     let public_keys: Vec<PublicKey> = committee
@@ -1332,21 +1389,28 @@ impl ProductionRunner {
                                         continue;
                                     }
 
-                                    let cert = state_cert.clone();
-                                    let shard = *shard_id;
-                                    let callback_tx = self.callback_tx.clone();
-
-                                    self.thread_pools.spawn_crypto(move || {
-                                        let valid =
-                                            verify_state_certificate_signature(&cert, &public_keys);
-                                        let _ = callback_tx.send(
-                                            Event::GossipedCertificateSignatureVerified {
-                                                tx_hash,
-                                                shard,
-                                                valid,
-                                            },
+                                    // Start batching deadline on first item
+                                    if self.pending_gossiped_cert_batch.is_empty() {
+                                        self.gossiped_cert_batch_deadline = Some(
+                                            tokio::time::Instant::now() + Duration::from_millis(15),
                                         );
-                                    });
+                                    }
+
+                                    // Add to batch
+                                    self.pending_gossiped_cert_batch.items.push((
+                                        tx_hash,
+                                        certificate.clone(),
+                                        *shard_id,
+                                        state_cert.clone(),
+                                        public_keys,
+                                    ));
+
+                                    // Flush early if batch is full to cap p99 latency
+                                    if self.pending_gossiped_cert_batch.is_full() {
+                                        let batch = self.pending_gossiped_cert_batch.take();
+                                        self.gossiped_cert_batch_deadline = None;
+                                        self.dispatch_gossiped_cert_batch_verifications(batch);
+                                    }
                                 }
 
                                 // Don't dispatch to state machine yet - wait for verification
@@ -1645,6 +1709,29 @@ impl ProductionRunner {
                             "Flushing state cert batch after 15ms window"
                         );
                         self.dispatch_state_cert_verifications(certs);
+                    }
+                }
+
+                // GOSSIPED CERTIFICATE BATCHING: Flush accumulated gossiped certs when deadline expires.
+                // Uses a 15ms batching window - same as state certs since gossiped certs are not
+                // latency-critical (they can be re-fetched if needed). Batching significantly
+                // reduces crypto pool pressure under high gossip load.
+                _ = async {
+                    match self.gossiped_cert_batch_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.gossiped_cert_batch_deadline.is_some() => {
+                    let batch = self.pending_gossiped_cert_batch.take();
+                    let batch_size = batch.len();
+                    self.gossiped_cert_batch_deadline = None;
+
+                    if !batch.is_empty() {
+                        tracing::debug!(
+                            batch_size,
+                            "Flushing gossiped cert batch after 15ms window"
+                        );
+                        self.dispatch_gossiped_cert_batch_verifications(batch);
                     }
                 }
 
@@ -3299,6 +3386,163 @@ impl ProductionRunner {
         });
     }
 
+    /// Dispatch batched gossiped certificate verifications to the crypto thread pool.
+    ///
+    /// Uses batch BLS verification for efficiency and backpressure to prevent
+    /// crypto pool saturation under high gossip load.
+    fn dispatch_gossiped_cert_batch_verifications(
+        &self,
+        batch: Vec<(
+            Hash,
+            TransactionCertificate,
+            ShardGroupId,
+            hyperscale_types::StateCertificate,
+            Vec<PublicKey>,
+        )>,
+    ) {
+        if batch.is_empty() {
+            return;
+        }
+
+        let event_tx = self.callback_tx.clone();
+        let batch_size = batch.len();
+
+        // Check backpressure before spawning - if crypto pool is overloaded,
+        // these gossiped certs will timeout and be cleaned up by TTL.
+        // This is acceptable since gossiped certs are non-critical and can be re-fetched.
+        if !self.thread_pools.try_spawn_crypto(move || {
+            use rayon::prelude::*;
+
+            let start = std::time::Instant::now();
+
+            // Step 1: Pre-process certificates in parallel - aggregate signer keys and build messages
+            let prepared: Vec<_> = batch
+                .into_par_iter()
+                .map(|(tx_hash, _tx_cert, shard, cert, public_keys)| {
+                    let msg = cert.signing_message();
+
+                    // Get signer keys based on bitfield
+                    let signer_keys: Vec<_> = public_keys
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| cert.signers.is_set(*i))
+                        .map(|(_, pk)| pk.clone())
+                        .collect();
+
+                    // Pre-aggregate the public keys
+                    let aggregated_pk = if signer_keys.is_empty() {
+                        None // Will check for zero signature
+                    } else {
+                        PublicKey::aggregate_bls(&signer_keys).ok()
+                    };
+
+                    (tx_hash, shard, cert, msg, aggregated_pk)
+                })
+                .collect();
+
+            // Step 2: Batch verify all signatures
+            // Separate into verifiable (have aggregated_pk) and special cases
+            let mut verifiable: Vec<(
+                Hash,
+                ShardGroupId,
+                hyperscale_types::StateCertificate,
+                Vec<u8>,
+                PublicKey,
+            )> = Vec::new();
+            let mut zero_sig_certs: Vec<(Hash, ShardGroupId)> = Vec::new();
+            let mut failed_aggregation: Vec<(Hash, ShardGroupId)> = Vec::new();
+
+            for (tx_hash, shard, cert, msg, maybe_pk) in prepared {
+                match maybe_pk {
+                    Some(pk) => verifiable.push((tx_hash, shard, cert, msg, pk)),
+                    None => {
+                        // No signers - check if it's a valid zero signature case
+                        if cert.aggregated_signature == Signature::zero() {
+                            zero_sig_certs.push((tx_hash, shard));
+                        } else {
+                            failed_aggregation.push((tx_hash, shard));
+                        }
+                    }
+                }
+            }
+
+            // Batch verify the aggregated signatures
+            let verification_results = if !verifiable.is_empty() {
+                let messages: Vec<&[u8]> = verifiable
+                    .iter()
+                    .map(|(_, _, _, m, _)| m.as_slice())
+                    .collect();
+                let signatures: Vec<Signature> = verifiable
+                    .iter()
+                    .map(|(_, _, c, _, _)| c.aggregated_signature.clone())
+                    .collect();
+                let pubkeys: Vec<PublicKey> = verifiable
+                    .iter()
+                    .map(|(_, _, _, _, pk)| pk.clone())
+                    .collect();
+
+                PublicKey::batch_verify_bls_different_messages(&messages, &signatures, &pubkeys)
+            } else {
+                vec![]
+            };
+
+            // Step 3: Send results
+            // Verified certs
+            for ((tx_hash, shard, _, _, _), valid) in
+                verifiable.into_iter().zip(verification_results)
+            {
+                if !valid {
+                    crate::metrics::record_signature_verification_failure();
+                }
+                let _ = event_tx.send(Event::GossipedCertificateSignatureVerified {
+                    tx_hash,
+                    shard,
+                    valid,
+                });
+            }
+
+            // Zero signature certs (valid)
+            for (tx_hash, shard) in zero_sig_certs {
+                let _ = event_tx.send(Event::GossipedCertificateSignatureVerified {
+                    tx_hash,
+                    shard,
+                    valid: true,
+                });
+            }
+
+            // Failed aggregation certs (invalid)
+            for (tx_hash, shard) in failed_aggregation {
+                crate::metrics::record_signature_verification_failure();
+                let _ = event_tx.send(Event::GossipedCertificateSignatureVerified {
+                    tx_hash,
+                    shard,
+                    valid: false,
+                });
+            }
+
+            crate::metrics::record_signature_verification_latency(
+                "gossiped_cert",
+                start.elapsed().as_secs_f64(),
+            );
+
+            if batch_size > 1 {
+                tracing::debug!(
+                    batch_size,
+                    "Batch verified gossiped cert signatures (15ms window)"
+                );
+            }
+        }) {
+            // Backpressure triggered - crypto pool queue > 100
+            // Log and let TTL cleanup handle these certs
+            tracing::warn!(
+                batch_size,
+                crypto_queue_depth = self.thread_pools.crypto_queue_depth(),
+                "Gossiped cert batch rejected due to crypto pool backpressure"
+            );
+            crate::metrics::record_backpressure_event("gossiped_cert_verification");
+        }
+    }
+
     /// Dispatch cross-shard executions to the execution thread pool.
     ///
     /// Executes all transactions in parallel using rayon's par_iter for maximum throughput.
@@ -3590,36 +3834,5 @@ impl ProductionRunner {
     /// state machine and handled in process_action().
     async fn dispatch_event(&mut self, event: Event) -> Vec<Action> {
         self.state.handle(event)
-    }
-}
-
-/// Verify a StateCertificate's aggregated BLS signature.
-///
-/// This is the same verification logic used for fetched certificates and gossiped
-/// certificates. Checks that the aggregated signature from the signers bitfield
-/// matches the signing message.
-fn verify_state_certificate_signature(
-    certificate: &hyperscale_types::StateCertificate,
-    public_keys: &[PublicKey],
-) -> bool {
-    let msg = certificate.signing_message();
-
-    // Get signer keys based on bitfield
-    let signer_keys: Vec<_> = public_keys
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| certificate.signers.is_set(*i))
-        .map(|(_, pk)| pk.clone())
-        .collect();
-
-    if signer_keys.is_empty() {
-        // No signers - valid only if zero signature (single-validator or genesis case)
-        certificate.aggregated_signature == Signature::zero()
-    } else {
-        // Verify aggregated BLS signature
-        match PublicKey::aggregate_bls(&signer_keys) {
-            Ok(aggregated_pk) => aggregated_pk.verify(&msg, &certificate.aggregated_signature),
-            Err(_) => false,
-        }
     }
 }
