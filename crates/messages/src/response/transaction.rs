@@ -1,6 +1,6 @@
 //! Transaction fetch response.
 
-use hyperscale_types::{NetworkMessage, RoutableTransaction};
+use hyperscale_types::{MessagePriority, NetworkMessage, RoutableTransaction};
 use std::sync::Arc;
 
 /// Response to a transaction fetch request.
@@ -135,6 +135,10 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for GetTransactionsResponse {
 impl NetworkMessage for GetTransactionsResponse {
     fn message_type_id() -> &'static str {
         "transaction.response"
+    }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Critical
     }
 }
 

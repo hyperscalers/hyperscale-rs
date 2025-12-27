@@ -1,7 +1,7 @@
 //! Block fetch request.
 
 use crate::response::GetBlockResponse;
-use hyperscale_types::{BlockHeight, NetworkMessage, Request};
+use hyperscale_types::{BlockHeight, MessagePriority, NetworkMessage, Request};
 use sbor::prelude::BasicSbor;
 
 /// Request to fetch a full Block by height during sync or catch-up.
@@ -25,6 +25,10 @@ impl GetBlockRequest {
 impl NetworkMessage for GetBlockRequest {
     fn message_type_id() -> &'static str {
         "block.request"
+    }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Background
     }
 }
 

@@ -1,6 +1,8 @@
 //! Sync-related request messages.
 
-use hyperscale_types::{BlockHeight, NetworkMessage, ShardMessage, Signature, ValidatorId};
+use hyperscale_types::{
+    BlockHeight, MessagePriority, NetworkMessage, ShardMessage, Signature, ValidatorId,
+};
 use sbor::prelude::BasicSbor;
 
 /// Broadcast that validator has caught up to network head and is ready to participate.
@@ -31,6 +33,10 @@ impl SyncCompleteAnnouncement {
 impl NetworkMessage for SyncCompleteAnnouncement {
     fn message_type_id() -> &'static str {
         "sync.complete"
+    }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Background
     }
 }
 

@@ -1,6 +1,6 @@
 use super::config::Libp2pConfig;
 use crate::metrics;
-use crate::network::adapter::SwarmCommand;
+use crate::network::adapter::{PriorityCommandChannels, SwarmCommand};
 use crate::network::NetworkError;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -10,7 +10,6 @@ use libp2p::PeerId;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Direct validator network for high-performance consensus messaging.
@@ -22,8 +21,8 @@ pub struct DirectValidatorNetwork {
     /// Local validator ID.
     local_validator_id: ValidatorId,
 
-    /// Command channel to the swarm (to send requests).
-    swarm_command_tx: mpsc::UnboundedSender<SwarmCommand>,
+    /// Priority command channels to the swarm.
+    priority_channels: PriorityCommandChannels,
 
     /// Map of ValidatorId -> PeerId for looking up destinations.
     /// Shared with the adapter.
@@ -41,7 +40,7 @@ impl DirectValidatorNetwork {
     /// Create a new direct validator network.
     pub fn new(
         local_validator_id: ValidatorId,
-        swarm_command_tx: mpsc::UnboundedSender<SwarmCommand>,
+        priority_channels: PriorityCommandChannels,
         validator_peers: Arc<DashMap<ValidatorId, PeerId>>,
         config: Libp2pConfig,
     ) -> Self {
@@ -51,7 +50,7 @@ impl DirectValidatorNetwork {
         );
         Self {
             local_validator_id,
-            swarm_command_tx,
+            priority_channels,
             validator_peers,
             config,
             shard_committees: RwLock::new(HashMap::new()),
@@ -123,12 +122,13 @@ impl DirectValidatorNetwork {
         }
 
         // Send single batch command using Bytes for O(1) cloning in the handler.
+        // DirectBroadcast is always Critical priority (consensus messages).
         let cmd = SwarmCommand::DirectBroadcast {
             peers: target_peers.clone(),
             data: Bytes::from(data),
         };
 
-        if self.swarm_command_tx.send(cmd).is_err() {
+        if self.priority_channels.send(cmd).is_err() {
             warn!("Failed to queue direct broadcast command (channel closed)");
             return Err(NetworkError::NetworkShutdown);
         }

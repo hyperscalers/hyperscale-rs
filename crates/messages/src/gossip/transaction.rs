@@ -1,7 +1,7 @@
 //! Transaction gossip message.
 
 use crate::trace_context::TraceContext;
-use hyperscale_types::{NetworkMessage, RoutableTransaction, ShardMessage};
+use hyperscale_types::{MessagePriority, NetworkMessage, RoutableTransaction, ShardMessage};
 use std::sync::Arc;
 
 /// Gossips a transaction to all shard groups with state touched by it.
@@ -144,6 +144,10 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for TransactionGossip {
 impl NetworkMessage for TransactionGossip {
     fn message_type_id() -> &'static str {
         "transaction.gossip"
+    }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Propagation
     }
 }
 

@@ -37,7 +37,7 @@ pub use epoch::{
 };
 pub use hash::Hash;
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
-pub use network::{NetworkMessage, Request, ShardMessage};
+pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
 pub use proofs::{commitment_proof_message, CommitmentProof, CycleProof};
 pub use signing::{
     block_vote_message, exec_vote_message, state_provision_message, DOMAIN_BLOCK_VOTE,

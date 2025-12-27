@@ -5,8 +5,8 @@
 
 use crate::trace_context::TraceContext;
 use hyperscale_types::{
-    NetworkMessage, ShardMessage, StateCertificate, StateProvision, StateVoteBlock,
-    TransactionCertificate,
+    MessagePriority, NetworkMessage, ShardMessage, StateCertificate, StateProvision,
+    StateVoteBlock, TransactionCertificate,
 };
 use sbor::prelude::BasicSbor;
 
@@ -74,6 +74,10 @@ impl NetworkMessage for StateProvisionBatch {
     fn message_type_id() -> &'static str {
         "state.provision.batch"
     }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Coordination
+    }
 }
 
 impl ShardMessage for StateProvisionBatch {}
@@ -122,6 +126,10 @@ impl StateVoteBatch {
 impl NetworkMessage for StateVoteBatch {
     fn message_type_id() -> &'static str {
         "state.vote.batch"
+    }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Coordination
     }
 }
 
@@ -190,6 +198,10 @@ impl NetworkMessage for StateCertificateBatch {
     fn message_type_id() -> &'static str {
         "state.certificate.batch"
     }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Coordination
+    }
 }
 
 impl ShardMessage for StateCertificateBatch {}
@@ -230,6 +242,10 @@ impl TransactionCertificateGossip {
 impl NetworkMessage for TransactionCertificateGossip {
     fn message_type_id() -> &'static str {
         "transaction.certificate"
+    }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Finalization
     }
 }
 

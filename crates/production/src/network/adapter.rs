@@ -20,7 +20,7 @@ use dashmap::DashMap;
 use futures::future::Either;
 use futures::{FutureExt, StreamExt};
 use hyperscale_core::{Event, OutboundMessage};
-use hyperscale_types::{PublicKey, ShardGroupId, ValidatorId};
+use hyperscale_types::{MessagePriority, PublicKey, ShardGroupId, ValidatorId};
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::{OrTransport, Transport};
 use libp2p::core::upgrade::Version;
@@ -147,14 +147,25 @@ pub enum ResponseCommand {
     SendCertificateResponse { channel_id: u64, response: Vec<u8> },
 }
 
-/// Commands sent to the swarm task (normal priority).
+/// Commands sent to the swarm task.
+///
+/// Commands are processed in priority order when using priority channels.
+/// Non-broadcast commands (Subscribe, Dial, etc.) are always processed
+/// with high priority since they're control operations.
 #[derive(Debug)]
 pub enum SwarmCommand {
     /// Subscribe to a gossipsub topic.
     Subscribe { topic: String },
 
-    /// Broadcast a message to a topic.
-    Broadcast { topic: String, data: Vec<u8> },
+    /// Broadcast a message to a topic with priority.
+    ///
+    /// Priority determines processing order in the event loop.
+    /// Higher priority messages are processed before lower priority ones.
+    Broadcast {
+        topic: String,
+        data: Vec<u8>,
+        priority: MessagePriority,
+    },
 
     /// Dial a peer.
     Dial { address: Multiaddr },
@@ -236,6 +247,101 @@ const KADEMLIA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// Prevents tight loops from monopolizing the event loop when channels are flooded.
 /// High-priority response commands and normal commands each have this limit.
 const MAX_COMMANDS_PER_DRAIN: usize = 100;
+
+/// Priority-based command channels for the swarm task.
+///
+/// Commands are sent to the appropriate channel based on message priority.
+/// The event loop processes channels in priority order (Critical first, Background last).
+#[derive(Clone, Debug)]
+pub struct PriorityCommandChannels {
+    /// Critical priority - BFT consensus messages, pending block requests.
+    /// Never dropped, processed immediately.
+    critical: mpsc::UnboundedSender<SwarmCommand>,
+
+    /// Coordination priority - Cross-shard 2PC messages.
+    /// High priority, may be batched.
+    coordination: mpsc::UnboundedSender<SwarmCommand>,
+
+    /// Finalization priority - Transaction certificate gossip.
+    /// Important but not liveness-critical.
+    finalization: mpsc::UnboundedSender<SwarmCommand>,
+
+    /// Propagation priority - Transaction gossip (mempool).
+    /// Best-effort, can be shed under load.
+    propagation: mpsc::UnboundedSender<SwarmCommand>,
+
+    /// Background priority - Sync operations.
+    /// Lowest priority, fully deferrable.
+    background: mpsc::UnboundedSender<SwarmCommand>,
+}
+
+/// Receiver type for priority command channels.
+type PriorityReceivers = (
+    mpsc::UnboundedReceiver<SwarmCommand>,
+    mpsc::UnboundedReceiver<SwarmCommand>,
+    mpsc::UnboundedReceiver<SwarmCommand>,
+    mpsc::UnboundedReceiver<SwarmCommand>,
+    mpsc::UnboundedReceiver<SwarmCommand>,
+);
+
+impl PriorityCommandChannels {
+    /// Create new priority channels, returning (senders, receivers).
+    fn new() -> (Self, PriorityReceivers) {
+        let (critical_tx, critical_rx) = mpsc::unbounded_channel();
+        let (coordination_tx, coordination_rx) = mpsc::unbounded_channel();
+        let (finalization_tx, finalization_rx) = mpsc::unbounded_channel();
+        let (propagation_tx, propagation_rx) = mpsc::unbounded_channel();
+        let (background_tx, background_rx) = mpsc::unbounded_channel();
+
+        (
+            Self {
+                critical: critical_tx,
+                coordination: coordination_tx,
+                finalization: finalization_tx,
+                propagation: propagation_tx,
+                background: background_tx,
+            },
+            (
+                critical_rx,
+                coordination_rx,
+                finalization_rx,
+                propagation_rx,
+                background_rx,
+            ),
+        )
+    }
+
+    /// Send a command to the appropriate priority channel.
+    ///
+    /// For Broadcast commands, uses the embedded priority.
+    /// For control commands (Subscribe, Dial, etc.), uses Critical priority.
+    #[allow(clippy::result_large_err)]
+    pub fn send(&self, cmd: SwarmCommand) -> Result<(), mpsc::error::SendError<SwarmCommand>> {
+        let priority = match &cmd {
+            SwarmCommand::Broadcast { priority, .. } => *priority,
+            // Control commands always get critical priority
+            SwarmCommand::Subscribe { .. }
+            | SwarmCommand::Dial { .. }
+            | SwarmCommand::GetListenAddresses { .. }
+            | SwarmCommand::GetConnectedPeers { .. }
+            | SwarmCommand::SendDirectMessage { .. }
+            | SwarmCommand::DirectBroadcast { .. } => MessagePriority::Critical,
+            // Requests use their inherent priority
+            SwarmCommand::RequestBlock { .. } => MessagePriority::Background,
+            SwarmCommand::RequestTransactions { .. } | SwarmCommand::RequestCertificates { .. } => {
+                MessagePriority::Critical
+            }
+        };
+
+        match priority {
+            MessagePriority::Critical => self.critical.send(cmd),
+            MessagePriority::Coordination => self.coordination.send(cmd),
+            MessagePriority::Finalization => self.finalization.send(cmd),
+            MessagePriority::Propagation => self.propagation.send(cmd),
+            MessagePriority::Background => self.background.send(cmd),
+        }
+    }
+}
 
 /// Network errors.
 #[derive(Debug, thiserror::Error)]
@@ -368,6 +474,7 @@ struct Behaviour {
 /// libp2p-based network adapter for production use.
 ///
 /// Uses gossipsub for efficient broadcast and Kademlia DHT for peer discovery.
+/// Commands are processed in priority order via [`PriorityCommandChannels`].
 pub struct Libp2pAdapter {
     /// Local peer ID.
     local_peer_id: Libp2pPeerId,
@@ -379,8 +486,9 @@ pub struct Libp2pAdapter {
     #[allow(dead_code)]
     local_shard: ShardGroupId,
 
-    /// Command channel to swarm task (normal priority).
-    command_tx: mpsc::UnboundedSender<SwarmCommand>,
+    /// Priority-based command channels to swarm task.
+    /// Commands are routed to the appropriate channel based on message priority.
+    priority_channels: PriorityCommandChannels,
 
     /// High-priority response command channel.
     /// Responses are processed first to unblock waiting validators.
@@ -678,7 +786,14 @@ impl Libp2pAdapter {
         let validator_peers = Arc::new(DashMap::new());
         let peer_validators = Arc::new(DashMap::new());
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
+
+        // Priority-based command channels - commands are routed by message priority.
+        // Critical messages (BFT consensus) are processed before Background (sync).
+        let (
+            priority_channels,
+            (critical_rx, coordination_rx, finalization_rx, propagation_rx, background_rx),
+        ) = PriorityCommandChannels::new();
+
         // High-priority channel for response commands - processed before normal commands
         // to minimize latency for validators waiting for sync data.
         let (response_tx, response_rx) = mpsc::unbounded_channel();
@@ -695,7 +810,7 @@ impl Libp2pAdapter {
 
         let direct_network = Arc::new(DirectValidatorNetwork::new(
             validator_id,
-            command_tx.clone(),
+            priority_channels.clone(),
             validator_peers.clone(),
             config.clone(),
         ));
@@ -704,7 +819,7 @@ impl Libp2pAdapter {
             local_peer_id,
             local_validator_id: validator_id,
             local_shard: shard,
-            command_tx,
+            priority_channels,
             response_tx,
             consensus_tx: consensus_tx.clone(),
             validator_peers: validator_peers.clone(),
@@ -728,7 +843,11 @@ impl Libp2pAdapter {
         tokio::spawn(async move {
             let result = std::panic::AssertUnwindSafe(Self::event_loop(
                 swarm,
-                command_rx,
+                critical_rx,
+                coordination_rx,
+                finalization_rx,
+                propagation_rx,
+                background_rx,
                 response_rx,
                 consensus_tx,
                 peer_validators,
@@ -810,7 +929,7 @@ impl Libp2pAdapter {
         ];
 
         for topic in &topics {
-            self.command_tx
+            self.priority_channels
                 .send(SwarmCommand::Subscribe {
                     topic: topic.to_string(),
                 })
@@ -823,6 +942,10 @@ impl Libp2pAdapter {
     }
 
     /// Broadcast a message to a shard.
+    ///
+    /// Messages are routed to the appropriate priority channel based on their
+    /// [`MessagePriority`]. Critical messages (BFT consensus) are processed before
+    /// Background messages (sync).
     pub async fn broadcast_shard(
         &self,
         shard: ShardGroupId,
@@ -833,16 +956,18 @@ impl Libp2pAdapter {
         // DirectBroadcast via request-response adds per-message substream overhead.
 
         let topic = super::codec::topic_for_message(message, shard);
+        let priority = message.priority();
         // Use synchronous encoding here since we're already on an async task
         // and encoding is fast for most messages. The codec pool is primarily
         // beneficial for decoding in the event loop.
         let data = self.codec_pool.encode_sync(message)?;
         let data_len = data.len();
 
-        self.command_tx
+        self.priority_channels
             .send(SwarmCommand::Broadcast {
                 topic: topic.to_string(),
                 data,
+                priority,
             })
             .map_err(|_| NetworkError::NetworkShutdown)?;
 
@@ -853,6 +978,7 @@ impl Libp2pAdapter {
         trace!(
             topic = %topic,
             msg_type = message.type_name(),
+            priority = ?priority,
             "Broadcast to shard"
         );
 
@@ -871,7 +997,7 @@ impl Libp2pAdapter {
 
     /// Dial a peer address.
     pub async fn dial(&self, address: Multiaddr) -> Result<(), NetworkError> {
-        self.command_tx
+        self.priority_channels
             .send(SwarmCommand::Dial { address })
             .map_err(|_| NetworkError::NetworkShutdown)
     }
@@ -904,7 +1030,7 @@ impl Libp2pAdapter {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = SwarmCommand::GetConnectedPeers { response_tx: tx };
 
-        if self.command_tx.send(cmd).is_err() {
+        if self.priority_channels.send(cmd).is_err() {
             return vec![];
         }
 
@@ -916,7 +1042,7 @@ impl Libp2pAdapter {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let cmd = SwarmCommand::GetListenAddresses { response_tx: tx };
 
-        if self.command_tx.send(cmd).is_err() {
+        if self.priority_channels.send(cmd).is_err() {
             return vec![];
         }
 
@@ -933,7 +1059,7 @@ impl Libp2pAdapter {
     ) -> Result<Vec<u8>, NetworkError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        self.command_tx
+        self.priority_channels
             .send(SwarmCommand::RequestBlock {
                 peer,
                 height: height.0,
@@ -974,6 +1100,7 @@ impl Libp2pAdapter {
     /// Request transactions from a peer for pending block completion.
     ///
     /// Returns the raw response bytes. The caller is responsible for decoding.
+    /// Uses Critical priority since pending block completion is liveness-critical.
     pub async fn request_transactions(
         &self,
         peer: Libp2pPeerId,
@@ -982,7 +1109,7 @@ impl Libp2pAdapter {
     ) -> Result<Vec<u8>, NetworkError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        self.command_tx
+        self.priority_channels
             .send(SwarmCommand::RequestTransactions {
                 peer,
                 block_hash,
@@ -1019,6 +1146,7 @@ impl Libp2pAdapter {
     /// Request certificates from a peer for pending block completion.
     ///
     /// Returns the raw response bytes. The caller is responsible for decoding.
+    /// Uses Critical priority since pending block completion is liveness-critical.
     pub async fn request_certificates(
         &self,
         peer: Libp2pPeerId,
@@ -1027,7 +1155,7 @@ impl Libp2pAdapter {
     ) -> Result<Vec<u8>, NetworkError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        self.command_tx
+        self.priority_channels
             .send(SwarmCommand::RequestCertificates {
                 peer,
                 block_hash,
@@ -1062,10 +1190,22 @@ impl Libp2pAdapter {
     }
 
     /// Background event loop that processes swarm events and routes messages.
+    ///
+    /// Commands are processed in priority order:
+    /// 1. Response commands (highest - unblock waiting validators)
+    /// 2. Critical priority (BFT consensus)
+    /// 3. Coordination priority (cross-shard 2PC)
+    /// 4. Finalization priority (certificate gossip)
+    /// 5. Propagation priority (transaction gossip)
+    /// 6. Background priority (sync operations)
     #[allow(clippy::too_many_arguments)]
     async fn event_loop(
         mut swarm: Swarm<Behaviour>,
-        mut command_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+        mut critical_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+        mut coordination_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+        mut finalization_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+        mut propagation_rx: mpsc::UnboundedReceiver<SwarmCommand>,
+        mut background_rx: mpsc::UnboundedReceiver<SwarmCommand>,
         mut response_rx: mpsc::UnboundedReceiver<ResponseCommand>,
         consensus_tx: mpsc::Sender<Event>,
         peer_validators: Arc<DashMap<Libp2pPeerId, ValidatorId>>,
@@ -1263,9 +1403,13 @@ impl Libp2pAdapter {
                     }
                 }
 
-                // Handle normal-priority commands from adapter methods.
-                Some(cmd) = command_rx.recv() => {
-                    // First, drain any pending response commands (priority, bounded)
+                // Priority-ordered command processing.
+                // Each priority level is checked in order, with higher priorities processed first.
+                // Within each branch, we also drain higher-priority channels to maintain ordering.
+
+                // Critical priority - BFT consensus messages (highest command priority)
+                Some(cmd) = critical_rx.recv() => {
+                    // Drain response commands first (even higher priority)
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match response_rx.try_recv() {
                             Ok(resp_cmd) => Self::handle_response_command(&mut swarm, resp_cmd, &mut pending_response_channels),
@@ -1275,9 +1419,121 @@ impl Libp2pAdapter {
 
                     Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
 
-                    // Drain additional pending commands (bounded)
+                    // Drain critical commands
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
-                        match command_rx.try_recv() {
+                        match critical_rx.try_recv() {
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Err(_) => break,
+                        }
+                    }
+                }
+
+                // Coordination priority - Cross-shard 2PC messages
+                Some(cmd) = coordination_rx.recv() => {
+                    // Drain higher priority channels first
+                    Self::drain_higher_priority_commands(
+                        &mut swarm,
+                        &mut response_rx,
+                        &mut critical_rx,
+                        &mut pending_response_channels,
+                        &mut pending_requests,
+                        &mut pending_direct_messages,
+                    ).await;
+
+                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
+
+                    // Drain coordination commands
+                    for _ in 0..MAX_COMMANDS_PER_DRAIN {
+                        match coordination_rx.try_recv() {
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Err(_) => break,
+                        }
+                    }
+                }
+
+                // Finalization priority - Certificate gossip
+                Some(cmd) = finalization_rx.recv() => {
+                    // Drain higher priority channels first
+                    Self::drain_higher_priority_commands(
+                        &mut swarm,
+                        &mut response_rx,
+                        &mut critical_rx,
+                        &mut pending_response_channels,
+                        &mut pending_requests,
+                        &mut pending_direct_messages,
+                    ).await;
+
+                    // Also drain coordination
+                    for _ in 0..MAX_COMMANDS_PER_DRAIN {
+                        match coordination_rx.try_recv() {
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Err(_) => break,
+                        }
+                    }
+
+                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
+
+                    // Drain finalization commands
+                    for _ in 0..MAX_COMMANDS_PER_DRAIN {
+                        match finalization_rx.try_recv() {
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Err(_) => break,
+                        }
+                    }
+                }
+
+                // Propagation priority - Transaction gossip (mempool)
+                Some(cmd) = propagation_rx.recv() => {
+                    // Drain all higher priority channels first
+                    Self::drain_all_higher_priority_commands(
+                        &mut swarm,
+                        &mut response_rx,
+                        &mut critical_rx,
+                        &mut coordination_rx,
+                        &mut finalization_rx,
+                        &mut pending_response_channels,
+                        &mut pending_requests,
+                        &mut pending_direct_messages,
+                    ).await;
+
+                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
+
+                    // Drain propagation commands
+                    for _ in 0..MAX_COMMANDS_PER_DRAIN {
+                        match propagation_rx.try_recv() {
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Err(_) => break,
+                        }
+                    }
+                }
+
+                // Background priority - Sync operations (lowest priority)
+                Some(cmd) = background_rx.recv() => {
+                    // Drain all higher priority channels first
+                    Self::drain_all_higher_priority_commands(
+                        &mut swarm,
+                        &mut response_rx,
+                        &mut critical_rx,
+                        &mut coordination_rx,
+                        &mut finalization_rx,
+                        &mut pending_response_channels,
+                        &mut pending_requests,
+                        &mut pending_direct_messages,
+                    ).await;
+
+                    // Also drain propagation
+                    for _ in 0..MAX_COMMANDS_PER_DRAIN {
+                        match propagation_rx.try_recv() {
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Err(_) => break,
+                        }
+                    }
+
+                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
+
+                    // Drain background commands
+                    for _ in 0..MAX_COMMANDS_PER_DRAIN {
+                        match background_rx.try_recv() {
                             Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
                             Err(_) => break,
                         }
@@ -1440,7 +1696,7 @@ impl Libp2pAdapter {
                     info!("Subscribed to gossipsub topic: {}", topic);
                 }
             }
-            SwarmCommand::Broadcast { topic, data } => {
+            SwarmCommand::Broadcast { topic, data, .. } => {
                 let topic_ident = gossipsub::IdentTopic::new(topic);
                 let data_len = data.len();
 
@@ -1639,6 +1895,97 @@ impl Libp2pAdapter {
                 } else {
                     warn!(channel_id, "Unknown channel ID for certificate response");
                 }
+            }
+        }
+    }
+
+    /// Drain response and critical priority commands.
+    /// Used before processing coordination-level commands.
+    async fn drain_higher_priority_commands(
+        swarm: &mut Swarm<Behaviour>,
+        response_rx: &mut mpsc::UnboundedReceiver<ResponseCommand>,
+        critical_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
+        pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
+        pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
+        pending_direct_messages: &mut HashMap<
+            request_response::OutboundRequestId,
+            std::time::Instant,
+        >,
+    ) {
+        // Drain response commands
+        for _ in 0..MAX_COMMANDS_PER_DRAIN {
+            match response_rx.try_recv() {
+                Ok(cmd) => Self::handle_response_command(swarm, cmd, pending_response_channels),
+                Err(_) => break,
+            }
+        }
+
+        // Drain critical commands
+        for _ in 0..MAX_COMMANDS_PER_DRAIN {
+            match critical_rx.try_recv() {
+                Ok(cmd) => {
+                    Self::handle_command(swarm, cmd, pending_requests, pending_direct_messages)
+                        .await
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Drain all higher priority commands (response, critical, coordination, finalization).
+    /// Used before processing propagation and background level commands.
+    #[allow(clippy::too_many_arguments)]
+    async fn drain_all_higher_priority_commands(
+        swarm: &mut Swarm<Behaviour>,
+        response_rx: &mut mpsc::UnboundedReceiver<ResponseCommand>,
+        critical_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
+        coordination_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
+        finalization_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
+        pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
+        pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
+        pending_direct_messages: &mut HashMap<
+            request_response::OutboundRequestId,
+            std::time::Instant,
+        >,
+    ) {
+        // Drain response commands
+        for _ in 0..MAX_COMMANDS_PER_DRAIN {
+            match response_rx.try_recv() {
+                Ok(cmd) => Self::handle_response_command(swarm, cmd, pending_response_channels),
+                Err(_) => break,
+            }
+        }
+
+        // Drain critical commands
+        for _ in 0..MAX_COMMANDS_PER_DRAIN {
+            match critical_rx.try_recv() {
+                Ok(cmd) => {
+                    Self::handle_command(swarm, cmd, pending_requests, pending_direct_messages)
+                        .await
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Drain coordination commands
+        for _ in 0..MAX_COMMANDS_PER_DRAIN {
+            match coordination_rx.try_recv() {
+                Ok(cmd) => {
+                    Self::handle_command(swarm, cmd, pending_requests, pending_direct_messages)
+                        .await
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Drain finalization commands
+        for _ in 0..MAX_COMMANDS_PER_DRAIN {
+            match finalization_rx.try_recv() {
+                Ok(cmd) => {
+                    Self::handle_command(swarm, cmd, pending_requests, pending_direct_messages)
+                        .await
+                }
+                Err(_) => break,
             }
         }
     }

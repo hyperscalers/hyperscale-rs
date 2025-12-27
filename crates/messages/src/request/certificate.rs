@@ -1,7 +1,7 @@
 //! Certificate fetch request.
 
 use crate::response::GetCertificatesResponse;
-use hyperscale_types::{Hash, NetworkMessage, Request};
+use hyperscale_types::{Hash, MessagePriority, NetworkMessage, Request};
 use sbor::prelude::BasicSbor;
 
 /// Fetch type discriminator for request routing.
@@ -47,6 +47,10 @@ impl GetCertificatesRequest {
 impl NetworkMessage for GetCertificatesRequest {
     fn message_type_id() -> &'static str {
         "certificate.request"
+    }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Critical
     }
 }
 

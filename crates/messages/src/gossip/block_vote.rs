@@ -1,6 +1,6 @@
 //! BlockVote gossip message.
 
-use hyperscale_types::{BlockVote, NetworkMessage, ShardMessage};
+use hyperscale_types::{BlockVote, MessagePriority, NetworkMessage, ShardMessage};
 use sbor::prelude::BasicSbor;
 
 /// Vote on a block proposal. 2f+1 matching votes create a QuorumCertificate.
@@ -31,6 +31,10 @@ impl BlockVoteGossip {
 impl NetworkMessage for BlockVoteGossip {
     fn message_type_id() -> &'static str {
         "block.vote"
+    }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Critical
     }
 }
 

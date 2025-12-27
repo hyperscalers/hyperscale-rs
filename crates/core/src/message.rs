@@ -5,6 +5,7 @@ use hyperscale_messages::{
     BlockHeaderGossip, BlockVoteGossip, StateCertificateBatch, StateProvisionBatch, StateVoteBatch,
     TraceContext, TransactionCertificateGossip, TransactionGossip,
 };
+use hyperscale_types::{MessagePriority, NetworkMessage};
 use sbor::prelude::*;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -67,28 +68,23 @@ impl OutboundMessage {
         }
     }
 
-    /// Check if this is a BFT consensus message.
-    pub fn is_bft(&self) -> bool {
-        matches!(
-            self,
-            OutboundMessage::BlockHeader(_) | OutboundMessage::BlockVote(_)
-        )
-    }
-
-    /// Check if this is an execution message.
-    pub fn is_execution(&self) -> bool {
-        matches!(
-            self,
-            OutboundMessage::StateProvisionBatch(_)
-                | OutboundMessage::StateVoteBatch(_)
-                | OutboundMessage::StateCertificateBatch(_)
-                | OutboundMessage::TransactionCertificateGossip(_)
-        )
-    }
-
-    /// Check if this is a mempool message.
-    pub fn is_mempool(&self) -> bool {
-        matches!(self, OutboundMessage::TransactionGossip(_))
+    /// Get the network priority for this message.
+    ///
+    /// Priority is determined by the underlying message type's implementation
+    /// of [`NetworkMessage::priority()`]. This provides a unified interface
+    /// for the network layer to make QoS decisions.
+    pub fn priority(&self) -> MessagePriority {
+        match self {
+            OutboundMessage::BlockHeader(_) => BlockHeaderGossip::priority(),
+            OutboundMessage::BlockVote(_) => BlockVoteGossip::priority(),
+            OutboundMessage::StateProvisionBatch(_) => StateProvisionBatch::priority(),
+            OutboundMessage::StateVoteBatch(_) => StateVoteBatch::priority(),
+            OutboundMessage::StateCertificateBatch(_) => StateCertificateBatch::priority(),
+            OutboundMessage::TransactionCertificateGossip(_) => {
+                TransactionCertificateGossip::priority()
+            }
+            OutboundMessage::TransactionGossip(_) => TransactionGossip::priority(),
+        }
     }
 
     /// Inject trace context into cross-shard messages for distributed tracing.

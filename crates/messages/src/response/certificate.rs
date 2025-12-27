@@ -1,6 +1,6 @@
 //! Certificate fetch response.
 
-use hyperscale_types::{NetworkMessage, TransactionCertificate};
+use hyperscale_types::{MessagePriority, NetworkMessage, TransactionCertificate};
 use sbor::prelude::BasicSbor;
 
 /// Response to a certificate fetch request.
@@ -46,6 +46,10 @@ impl GetCertificatesResponse {
 impl NetworkMessage for GetCertificatesResponse {
     fn message_type_id() -> &'static str {
         "certificate.response"
+    }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Critical
     }
 }
 

@@ -1,6 +1,6 @@
 //! Block fetch response.
 
-use hyperscale_types::{Block, NetworkMessage, QuorumCertificate};
+use hyperscale_types::{Block, MessagePriority, NetworkMessage, QuorumCertificate};
 use sbor::prelude::BasicSbor;
 
 /// Response to a block fetch request containing the full Block and its QC.
@@ -57,6 +57,10 @@ impl GetBlockResponse {
 impl NetworkMessage for GetBlockResponse {
     fn message_type_id() -> &'static str {
         "block.response"
+    }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Background
     }
 }
 

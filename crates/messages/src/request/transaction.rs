@@ -1,7 +1,7 @@
 //! Transaction fetch request.
 
 use crate::response::GetTransactionsResponse;
-use hyperscale_types::{Hash, NetworkMessage, Request};
+use hyperscale_types::{Hash, MessagePriority, NetworkMessage, Request};
 use sbor::prelude::BasicSbor;
 
 /// Fetch type discriminator for request routing.
@@ -47,6 +47,10 @@ impl GetTransactionsRequest {
 impl NetworkMessage for GetTransactionsRequest {
     fn message_type_id() -> &'static str {
         "transaction.request"
+    }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Critical
     }
 }
 

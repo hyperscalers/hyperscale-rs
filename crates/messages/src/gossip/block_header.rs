@@ -1,8 +1,8 @@
 //! BlockHeader gossip message.
 
 use hyperscale_types::{
-    BlockHeader, CommitmentProof, Hash, NetworkMessage, ShardMessage, TransactionAbort,
-    TransactionDefer,
+    BlockHeader, CommitmentProof, Hash, MessagePriority, NetworkMessage, ShardMessage,
+    TransactionAbort, TransactionDefer,
 };
 use sbor::prelude::BasicSbor;
 use std::collections::HashMap;
@@ -215,6 +215,10 @@ impl BlockHeaderGossip {
 impl NetworkMessage for BlockHeaderGossip {
     fn message_type_id() -> &'static str {
         "block.header"
+    }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Critical
     }
 }
 
