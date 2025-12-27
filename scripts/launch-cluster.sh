@@ -478,9 +478,10 @@ cleanup() {
 
         if command -v docker &> /dev/null; then
             if docker ps --format '{{.Names}}' | grep -q "hyperscale-prometheus\|hyperscale-grafana\|hyperscale-jaeger"; then
+                DC=$(command -v docker-compose >/dev/null 2>&1 && echo "docker-compose" || echo "docker compose")
                 echo ""
                 echo "Stopping monitoring stack and removing volumes..."
-                (cd "$MONITORING_DIR" && docker-compose down -v 2>&1) | tail -2
+                (cd "$MONITORING_DIR" && $DC down -v 2>&1) | tail -2
                 echo "Monitoring stopped."
             fi
         fi
