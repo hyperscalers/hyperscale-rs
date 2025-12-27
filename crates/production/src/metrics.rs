@@ -93,6 +93,8 @@ pub struct Metrics {
     pub tx_ingress_rejected: Counter,
     /// Total transactions rejected because node is syncing.
     pub tx_ingress_rejected_syncing: Counter,
+    /// Total transactions rejected because pending count is too high.
+    pub tx_ingress_rejected_pending_limit: Counter,
 
     // === Storage ===
     pub rocksdb_read_latency: Histogram,
@@ -413,6 +415,12 @@ impl Metrics {
             tx_ingress_rejected_syncing: register_counter!(
                 "hyperscale_tx_ingress_rejected_syncing_total",
                 "Total transactions rejected because node is syncing"
+            )
+            .unwrap(),
+
+            tx_ingress_rejected_pending_limit: register_counter!(
+                "hyperscale_tx_ingress_rejected_pending_limit_total",
+                "Total transactions rejected because pending count is too high"
             )
             .unwrap(),
 
@@ -843,6 +851,11 @@ pub fn record_tx_ingress_rejected() {
 /// Record a rejected transaction because the node is syncing.
 pub fn record_tx_ingress_rejected_syncing() {
     metrics().tx_ingress_rejected_syncing.inc();
+}
+
+/// Record a rejected transaction because pending count is too high.
+pub fn record_tx_ingress_rejected_pending_limit() {
+    metrics().tx_ingress_rejected_pending_limit.inc();
 }
 
 /// Record RocksDB read latency.

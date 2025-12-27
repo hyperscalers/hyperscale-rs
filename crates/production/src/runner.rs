@@ -1176,6 +1176,9 @@ impl ProductionRunner {
                         // RPC back-pressure: reject when hard-limit is reached
                         let accepting = !mempool.at_in_flight_hard_limit();
 
+                        // RPC back-pressure: reject when pending count is too high
+                        let at_pending_limit = mempool.at_pending_limit();
+
                         // Update Prometheus metrics
                         crate::metrics::set_mempool_size(total);
                         crate::metrics::set_lock_contention_from_stats(&stats);
@@ -1193,6 +1196,7 @@ impl ProductionRunner {
                             snap.total_count = total;
                             snap.updated_at = Some(std::time::Instant::now());
                             snap.accepting_rpc_transactions = accepting;
+                            snap.at_pending_limit = at_pending_limit;
                         }
                     }
 

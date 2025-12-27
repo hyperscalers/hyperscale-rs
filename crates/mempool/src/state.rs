@@ -30,6 +30,14 @@ pub const DEFAULT_IN_FLIGHT_LIMIT: usize = 512;
 /// unbounded growth and controls execution/crypto verification pressure.
 pub const DEFAULT_IN_FLIGHT_HARD_LIMIT: usize = 1024;
 
+/// Default limit on pending transactions for RPC backpressure.
+///
+/// When the number of Pending transactions exceeds this limit, new RPC submissions
+/// are rejected. This is approximately 2 blocks worth of transactions (at 1024 TXs/block),
+/// preventing the mempool from growing unboundedly when transaction arrival rate
+/// exceeds processing capacity.
+pub const DEFAULT_MAX_PENDING: usize = 2048;
+
 /// Mempool configuration.
 #[derive(Debug, Clone)]
 pub struct MempoolConfig {
@@ -46,6 +54,13 @@ pub struct MempoolConfig {
     /// provisions). This prevents unbounded growth and controls execution/crypto pressure.
     /// RPC transaction submissions are also rejected when this limit is reached.
     pub max_in_flight_hard_limit: usize,
+
+    /// Maximum pending transactions before RPC backpressure kicks in.
+    ///
+    /// When the number of Pending transactions exceeds this limit, new RPC submissions
+    /// are rejected. This prevents unbounded mempool growth when arrival rate exceeds
+    /// processing capacity. Set to approximately a few blocks worth of transactions.
+    pub max_pending: usize,
 }
 
 impl Default for MempoolConfig {
@@ -53,6 +68,7 @@ impl Default for MempoolConfig {
         Self {
             max_in_flight: DEFAULT_IN_FLIGHT_LIMIT,
             max_in_flight_hard_limit: DEFAULT_IN_FLIGHT_HARD_LIMIT,
+            max_pending: DEFAULT_MAX_PENDING,
         }
     }
 }
@@ -1623,6 +1639,25 @@ impl MempoolState {
         self.in_flight() >= self.config.max_in_flight_hard_limit
     }
 
+    /// Get the number of pending transactions.
+    ///
+    /// Returns the count of transactions in Pending status (waiting to be
+    /// included in a block). This is O(n) as it counts pool entries.
+    pub fn pending_count(&self) -> usize {
+        self.pool
+            .values()
+            .filter(|e| matches!(e.status, TransactionStatus::Pending))
+            .count()
+    }
+
+    /// Check if we're at the pending transaction limit for RPC backpressure.
+    ///
+    /// When at this limit, new RPC transaction submissions are rejected to
+    /// prevent unbounded mempool growth when arrival rate exceeds processing.
+    pub fn at_pending_limit(&self) -> bool {
+        self.pending_count() >= self.config.max_pending
+    }
+
     /// Get the mempool configuration.
     pub fn config(&self) -> &MempoolConfig {
         &self.config
@@ -2717,6 +2752,7 @@ mod tests {
         MempoolConfig {
             max_in_flight: limit,
             max_in_flight_hard_limit: limit * 2, // Hard limit is 2x soft limit
+            max_pending: DEFAULT_MAX_PENDING,
         }
     }
 

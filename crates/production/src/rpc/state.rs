@@ -246,6 +246,14 @@ pub struct MempoolSnapshot {
     /// Defaults to `true` so that transactions can be accepted before the first
     /// snapshot update from the runner.
     pub accepting_rpc_transactions: bool,
+    /// Whether the pending transaction limit has been reached.
+    ///
+    /// When `true`, the pending transaction count exceeds the configured limit
+    /// and new RPC submissions should be rejected with a backpressure response.
+    ///
+    /// Defaults to `false` so transactions can be accepted before the first
+    /// snapshot update from the runner.
+    pub at_pending_limit: bool,
 }
 
 impl Default for MempoolSnapshot {
@@ -258,6 +266,7 @@ impl Default for MempoolSnapshot {
             blocked_count: 0,
             updated_at: None,
             accepting_rpc_transactions: true, // Default to accepting until we know otherwise
+            at_pending_limit: false,          // Default to not at limit until we know otherwise
         }
     }
 }

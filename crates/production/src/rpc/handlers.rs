@@ -192,6 +192,23 @@ pub async fn submit_transaction_handler(
         }
     }
 
+    // Check if pending transaction count is too high.
+    // This prevents unbounded mempool growth when arrival rate exceeds processing.
+    {
+        let snapshot = state.mempool_snapshot.read().await;
+        if snapshot.at_pending_limit {
+            crate::metrics::record_tx_ingress_rejected_pending_limit();
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(SubmitTransactionResponse {
+                    accepted: false,
+                    hash: String::new(),
+                    error: Some("Too many pending transactions. Try again later.".to_string()),
+                }),
+            );
+        }
+    }
+
     // Decode hex - structural validation, return error immediately
     let tx_bytes = match hex::decode(&request.transaction_hex) {
         Ok(bytes) => bytes,
