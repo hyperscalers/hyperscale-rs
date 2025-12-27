@@ -35,8 +35,6 @@ pub struct Metrics {
     // === Backpressure ===
     /// Number of transactions currently holding state locks (Committed or Executed status).
     pub in_flight: Gauge,
-    /// Deprecated: alias for in_flight. Use in_flight instead.
-    pub provisions_registered: Gauge,
     /// Whether backpressure limit is currently active (0 or 1).
     pub backpressure_active: Gauge,
     /// Number of TXs with commitment proofs attached in last proposal.
@@ -232,11 +230,6 @@ impl Metrics {
             in_flight: register_gauge!(
                 "hyperscale_in_flight",
                 "Number of transactions holding state locks (Committed or Executed)"
-            )
-            .unwrap(),
-            provisions_registered: register_gauge!(
-                "hyperscale_provisions_registered",
-                "Deprecated: same as in_flight"
             )
             .unwrap(),
             backpressure_active: register_gauge!(
@@ -754,8 +747,6 @@ pub fn set_mempool_size(size: usize) {
 /// Update in-flight transaction count (transactions holding state locks).
 pub fn set_in_flight(count: usize) {
     metrics().in_flight.set(count as f64);
-    // Also update deprecated metric for backwards compatibility
-    metrics().provisions_registered.set(count as f64);
 }
 
 /// Update backpressure active status.

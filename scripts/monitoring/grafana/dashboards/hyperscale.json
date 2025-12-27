@@ -3278,11 +3278,11 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max(hyperscale_provisions_registered)",
+          "expr": "max(hyperscale_in_flight)",
           "refId": "A"
         }
       ],
-      "title": "Provisions Registered",
+      "title": "In-Flight Transactions",
       "type": "stat"
     },
     {
@@ -3350,7 +3350,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Backpressure metrics over time: provisions registered vs the 1024 limit",
+      "description": "Backpressure metrics over time: in-flight transactions vs the 1024 limit",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3458,18 +3458,9 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "max by (shard) (hyperscale_provisions_registered)",
-          "legendFormat": "Shard {{shard}} Registered",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
           "expr": "max by (shard) (hyperscale_in_flight)",
           "legendFormat": "Shard {{shard}} In-Flight",
-          "refId": "B"
+          "refId": "A"
         },
         {
           "datasource": {
@@ -3567,21 +3558,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg by (shard) (hyperscale_provisions_registered)",
-          "legendFormat": "Shard {{shard}} Registered",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
           "expr": "avg by (shard) (hyperscale_in_flight)",
           "legendFormat": "Shard {{shard}} In-Flight",
-          "refId": "B"
+          "refId": "A"
         }
       ],
-      "title": "Cross-Shard State by Shard",
+      "title": "In-Flight by Shard",
       "type": "timeseries"
     },
     {
