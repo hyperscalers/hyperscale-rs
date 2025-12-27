@@ -32,9 +32,6 @@ jobs:
       (github.event_name == 'push' && github.ref == 'refs/heads/main')
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: swatinem/rust-cache@v2
-      
       - name: Free Disk Space
         run: |
           echo "Before cleanup:"
@@ -48,6 +45,9 @@ jobs:
           echo "After cleanup:"
           df -h /
           
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+      
       - name: Install lld
         run: sudo apt-get update && sudo apt-get install -y lld
       - name: Cargo Test
