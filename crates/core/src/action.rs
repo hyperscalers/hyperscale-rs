@@ -2,7 +2,7 @@
 
 use crate::{message::OutboundMessage, Event, TimerId};
 use hyperscale_types::{
-    Block, BlockHeight, BlockVote, EpochConfig, EpochId, ExecutionResult, Hash, NodeId, PublicKey,
+    Block, BlockHeight, BlockVote, EpochConfig, EpochId, Hash, NodeId, PublicKey,
     QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
     StateCertificate, StateEntry, StateProvision, StateVoteBlock, TransactionCertificate,
     ValidatorId, VotePower,
@@ -245,12 +245,11 @@ pub enum Action {
     /// Triggered when a block header is received, before the block commits via
     /// the 2-chain rule. This hides execution latency behind consensus latency.
     ///
-    /// Results are cached and used when the block commits, if no conflicting
-    /// writes have occurred. If a speculative result is invalidated (due to
-    /// committed writes to the read set), the transaction falls back to normal
-    /// execution on commit.
+    /// If a speculative result is invalidated (due to committed writes to the
+    /// read set), the cached vote is discarded and the transaction falls back
+    /// to normal execution on commit.
     ///
-    /// Returns `Event::SpeculativeExecutionComplete` when complete.
+    /// Returns `Event::SpeculativeExecutionComplete` when complete (for cache tracking).
     SpeculativeExecute {
         /// Block hash where these transactions appear.
         block_hash: Hash,
@@ -270,16 +269,6 @@ pub enum Action {
         transaction: Arc<RoutableTransaction>,
         /// State provisions from other shards.
         provisions: Vec<StateProvision>,
-    },
-
-    /// Sign execution results and broadcast votes.
-    ///
-    /// Used when execution results are already available (e.g., speculative execution cache hits).
-    /// The runner signs each result, broadcasts the vote, and sends `StateVoteReceived`
-    /// for local handling.
-    SignExecutionResults {
-        /// Execution results to sign and broadcast.
-        results: Vec<ExecutionResult>,
     },
 
     /// Compute a merkle root from state changes.
@@ -574,7 +563,6 @@ impl Action {
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
-                | Action::SignExecutionResults { .. }
                 | Action::ComputeMerkleRoot { .. }
                 | Action::FetchStateEntries { .. }
                 | Action::FetchBlock { .. }
@@ -638,7 +626,6 @@ impl Action {
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",
             Action::SpeculativeExecute { .. } => "SpeculativeExecute",
             Action::ExecuteCrossShardTransaction { .. } => "ExecuteCrossShardTransaction",
-            Action::SignExecutionResults { .. } => "SignExecutionResults",
             Action::ComputeMerkleRoot { .. } => "ComputeMerkleRoot",
 
             // External Notifications

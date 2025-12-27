@@ -24,10 +24,10 @@ use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_simulation::{NetworkTrafficAnalyzer, SimStorage, SimulatedNetwork};
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockVote, CommitmentProof, ExecutionResult, Hash, KeyPair,
-    NodeId, PublicKey, QuorumCertificate, RoutableTransaction, ShardGroupId, Signature,
-    SignerBitfield, StateCertificate, StateVoteBlock, StaticTopology, Topology,
-    TransactionDecision, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
+    Block, BlockHeader, BlockHeight, BlockVote, CommitmentProof, Hash, KeyPair, NodeId, PublicKey,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
+    StateCertificate, StateVoteBlock, StaticTopology, Topology, TransactionDecision,
+    TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -853,22 +853,53 @@ impl SimNode {
                 }
             }
 
-            // Speculative execution - same as ExecuteTransactions but returns different event
+            // Speculative execution - execute AND sign inline (same as ExecuteTransactions)
             Action::SpeculativeExecute {
                 block_hash,
                 transactions,
             } => {
                 let shard_id = self.state.shard().0;
+                let local_shard = self.state.shard();
+                let validator_id = self.state.topology().local_validator_id();
+
                 let execution_results = cache.execute_block(shard_id, block_hash, &transactions);
-                // Convert to (Hash, ExecutionResult) pairs
-                let results: Vec<(Hash, ExecutionResult)> = execution_results
-                    .into_iter()
-                    .map(|r| (r.transaction_hash, r))
-                    .collect();
+
+                // Sign and broadcast votes for each result (same as ExecuteTransactions)
+                let mut tx_hashes = Vec::new();
+                for result in execution_results {
+                    tx_hashes.push(result.transaction_hash);
+
+                    let message = hyperscale_types::exec_vote_message(
+                        &result.transaction_hash,
+                        &result.state_root,
+                        local_shard,
+                        result.success,
+                    );
+                    let signature = self.signing_key.sign(&message);
+
+                    let vote = StateVoteBlock {
+                        transaction_hash: result.transaction_hash,
+                        shard_group_id: local_shard,
+                        state_root: result.state_root,
+                        success: result.success,
+                        validator: validator_id,
+                        signature,
+                    };
+
+                    // Broadcast to shard peers
+                    self.outbound_events
+                        .push((local_shard, Event::StateVoteReceived { vote: vote.clone() }));
+
+                    // Handle locally
+                    self.internal_queue
+                        .push_back(Event::StateVoteReceived { vote });
+                }
+
+                // Notify state machine (for cache tracking)
                 self.internal_queue
                     .push_back(Event::SpeculativeExecutionComplete {
                         block_hash,
-                        results,
+                        tx_hashes,
                     });
             }
 
@@ -919,39 +950,6 @@ impl SimNode {
                 // Handle locally
                 self.internal_queue
                     .push_back(Event::StateVoteReceived { vote });
-            }
-
-            // Sign execution results (for speculative cache hits) - sign and broadcast votes
-            Action::SignExecutionResults { results } => {
-                let local_shard = self.state.shard();
-                let validator_id = self.state.topology().local_validator_id();
-
-                for result in results {
-                    let message = hyperscale_types::exec_vote_message(
-                        &result.transaction_hash,
-                        &result.state_root,
-                        local_shard,
-                        result.success,
-                    );
-                    let signature = self.signing_key.sign(&message);
-
-                    let vote = StateVoteBlock {
-                        transaction_hash: result.transaction_hash,
-                        shard_group_id: local_shard,
-                        state_root: result.state_root,
-                        success: result.success,
-                        validator: validator_id,
-                        signature,
-                    };
-
-                    // Broadcast to shard peers
-                    self.outbound_events
-                        .push((local_shard, Event::StateVoteReceived { vote: vote.clone() }));
-
-                    // Handle locally
-                    self.internal_queue
-                        .push_back(Event::StateVoteReceived { vote });
-                }
             }
 
             Action::ComputeMerkleRoot { tx_hash, .. } => {

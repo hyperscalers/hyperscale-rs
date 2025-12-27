@@ -2357,74 +2357,99 @@ impl ProductionRunner {
             }
 
             // Speculative execution of single-shard transactions before block commit.
-            // Uses the same execution path as ExecuteTransactions but returns a different event.
-            // Results are cached and used when the block commits (if still valid).
+            // Executes AND signs inline (same as normal execution) to reduce latency.
+            // Votes are sent immediately via StateVoteReceived, and tx_hashes are reported
+            // back so the execution state machine can track what was speculatively executed.
             Action::SpeculativeExecute {
                 block_hash,
                 transactions,
             } => {
                 let event_tx = self.callback_tx.clone();
+                let dispatch_tx = self.dispatch_tx.clone();
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
                 let thread_pools = self.thread_pools.clone();
+                let signing_key = self.signing_key.clone();
+                let local_shard = self.local_shard;
+                let validator_id = self.topology.local_validator_id();
 
                 self.thread_pools.spawn_execution(move || {
                     let start = std::time::Instant::now();
-                    // Execute transactions in parallel using all execution pool threads.
-                    let results: Vec<(hyperscale_types::Hash, hyperscale_types::ExecutionResult)> =
-                        thread_pools.execution_pool().install(|| {
-                            use rayon::prelude::*;
-                            transactions
-                                .par_iter()
-                                .map(|tx| {
-                                    let tx_hash = tx.hash();
-                                    let result =
-                                        match executor.execute_single_shard(&*storage, std::slice::from_ref(tx))
-                                        {
-                                            Ok(output) => {
-                                                if let Some(r) = output.results().first() {
-                                                    hyperscale_types::ExecutionResult {
-                                                        transaction_hash: r.tx_hash,
-                                                        success: r.success,
-                                                        state_root: r.outputs_merkle_root,
-                                                        writes: r.state_writes.clone(),
-                                                        error: r.error.clone(),
-                                                    }
-                                                } else {
-                                                    hyperscale_types::ExecutionResult {
-                                                        transaction_hash: tx_hash,
-                                                        success: false,
-                                                        state_root: hyperscale_types::Hash::ZERO,
-                                                        writes: vec![],
-                                                        error: Some(
-                                                            "No execution result".to_string(),
-                                                        ),
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(tx_hash = ?tx_hash, error = %e, "Speculative execution failed");
-                                                hyperscale_types::ExecutionResult {
-                                                    transaction_hash: tx_hash,
-                                                    success: false,
-                                                    state_root: hyperscale_types::Hash::ZERO,
-                                                    writes: vec![],
-                                                    error: Some(format!("{}", e)),
-                                                }
-                                            }
-                                        };
-                                    (tx_hash, result)
-                                })
-                                .collect()
-                        });
+                    // Execute transactions AND sign votes in parallel using the execution pool.
+                    // Same pattern as ExecuteTransactions - no deferred signing.
+                    let votes: Vec<StateVoteBlock> = thread_pools.execution_pool().install(|| {
+                        use rayon::prelude::*;
+                        transactions
+                            .par_iter()
+                            .map(|tx| {
+                                // Execute
+                                let result = match executor.execute_single_shard(&*storage, std::slice::from_ref(tx)) {
+                                    Ok(output) => {
+                                        if let Some(r) = output.results().first() {
+                                            (r.tx_hash, r.success, r.outputs_merkle_root)
+                                        } else {
+                                            (tx.hash(), false, hyperscale_types::Hash::ZERO)
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(tx_hash = ?tx.hash(), error = %e, "Speculative execution failed");
+                                        (tx.hash(), false, hyperscale_types::Hash::ZERO)
+                                    }
+                                };
+
+                                // Sign immediately after execution
+                                let (tx_hash, success, state_root) = result;
+                                let message = hyperscale_types::exec_vote_message(
+                                    &tx_hash,
+                                    &state_root,
+                                    local_shard,
+                                    success,
+                                );
+                                let signature = signing_key.sign(&message);
+
+                                StateVoteBlock {
+                                    transaction_hash: tx_hash,
+                                    shard_group_id: local_shard,
+                                    state_root,
+                                    success,
+                                    validator: validator_id,
+                                    signature,
+                                }
+                            })
+                            .collect()
+                    });
                     crate::metrics::record_speculative_execution_latency(
                         start.elapsed().as_secs_f64(),
                     );
 
+                    // Collect tx_hashes for the completion event
+                    let tx_hashes: Vec<hyperscale_types::Hash> = votes
+                        .iter()
+                        .map(|v| v.transaction_hash)
+                        .collect();
+
+                    // Dispatch all votes (channel sends are fast, no need to parallelize)
+                    for vote in votes {
+                        // Broadcast to shard peers via message batcher
+                        let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
+                            shard: local_shard,
+                            vote: vote.clone(),
+                        });
+
+                        // Send to state machine for local handling (skips verification for own votes)
+                        event_tx
+                            .send(Event::StateVoteReceived { vote })
+                            .expect(
+                                "callback channel closed - Loss of this event would cause a deadlock",
+                            );
+                    }
+
+                    // Notify state machine that speculative execution completed
+                    // (for cache tracking - to skip re-execution on block commit)
                     event_tx
                         .send(Event::SpeculativeExecutionComplete {
                             block_hash,
-                            results,
+                            tx_hashes,
                         })
                         .expect(
                             "callback channel closed - Loss of this event would cause a deadlock",
@@ -2439,59 +2464,6 @@ impl ProductionRunner {
                 // This should never be reached - the action is intercepted in the event loop
                 // and accumulated for batch execution.
                 tracing::error!("ExecuteCrossShardTransaction reached process_action - should be handled by event loop batching");
-            }
-
-            // Sign already-executed results (e.g., speculative execution cache hits).
-            // Signs votes IN PARALLEL and broadcasts + sends StateVoteReceived for local handling.
-            Action::SignExecutionResults { results } => {
-                let event_tx = self.callback_tx.clone();
-                let dispatch_tx = self.dispatch_tx.clone();
-                let signing_key = self.signing_key.clone();
-                let local_shard = self.local_shard;
-                let validator_id = self.topology.local_validator_id();
-                let thread_pools = self.thread_pools.clone();
-
-                self.thread_pools.spawn_crypto(move || {
-                    // Sign all votes in parallel on crypto pool - BLS signing is CPU-intensive
-                    let votes: Vec<StateVoteBlock> = thread_pools.crypto_pool().install(|| {
-                        use rayon::prelude::*;
-                        results
-                            .par_iter()
-                            .map(|result| {
-                                let message = hyperscale_types::exec_vote_message(
-                                    &result.transaction_hash,
-                                    &result.state_root,
-                                    local_shard,
-                                    result.success,
-                                );
-                                let signature = signing_key.sign(&message);
-
-                                StateVoteBlock {
-                                    transaction_hash: result.transaction_hash,
-                                    shard_group_id: local_shard,
-                                    state_root: result.state_root,
-                                    success: result.success,
-                                    validator: validator_id,
-                                    signature,
-                                }
-                            })
-                            .collect()
-                    });
-
-                    // Dispatch all votes (channel sends are fast)
-                    for vote in votes {
-                        // Broadcast to shard peers via message batcher
-                        let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
-                            shard: local_shard,
-                            vote: vote.clone(),
-                        });
-
-                        // Send to state machine for local handling
-                        event_tx
-                            .send(Event::StateVoteReceived { vote })
-                            .expect("callback channel closed");
-                    }
-                });
             }
 
             // Merkle computation on execution pool (can be parallelized internally)

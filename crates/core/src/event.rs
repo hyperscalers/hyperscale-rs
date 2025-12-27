@@ -262,13 +262,18 @@ pub enum Event {
 
     /// Speculative execution of single-shard transactions completed.
     ///
-    /// Callback from `Action::SpeculativeExecute`. Results are cached and used
-    /// when the block commits, if no conflicting writes have occurred.
+    /// Callback from `Action::SpeculativeExecute`. With inline signing, the votes
+    /// have already been sent via `StateVoteReceived` events. This event is used
+    /// to update cache tracking (remove from in-flight, mark as speculatively executed).
+    ///
+    /// The execution state machine uses this to know which transactions have been
+    /// speculatively executed, so it can skip re-execution when the block commits.
     SpeculativeExecutionComplete {
         /// Block hash where these transactions appear.
         block_hash: Hash,
-        /// Results paired with their transaction hashes.
-        results: Vec<(Hash, ExecutionResult)>,
+        /// Transaction hashes that were speculatively executed.
+        /// The votes have already been signed and sent.
+        tx_hashes: Vec<Hash>,
     },
 
     /// Cross-shard transaction execution completed (batch).
