@@ -346,7 +346,7 @@ for i in "${!HOST_IPS[@]}"; do
     echo "    3. Run nodes:"
 
     for v in $(seq 0 $((NODES_PER_HOST - 1))); do
-        echo "       ./hyperscale-validator --config distributed-cluster-data/host-$i/node-$v/config.toml &"
+        echo "       ./hyperscale-validator --config distributed-cluster-data/host-$i/node-$v/config.toml --clean &"
     done
 done
 

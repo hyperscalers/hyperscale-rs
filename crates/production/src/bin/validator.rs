@@ -109,6 +109,10 @@ struct Cli {
     /// Version interoperability mode (strict, relaxed, off)
     #[arg(long)]
     version_interop_mode: Option<VersionInteroperabilityMode>,
+
+    /// Clean the data directory on startup
+    #[arg(long)]
+    clean: bool,
 }
 
 /// Top-level validator configuration.
@@ -1099,6 +1103,27 @@ async fn main() -> Result<()> {
         num_shards = config.node.num_shards,
         "Node configuration loaded"
     );
+
+    // Clean data directory if requested via cli parameter
+    if cli.clean {
+        if config.node.data_dir.exists() {
+            info!(
+                "Cleaning data directory: {}",
+                config.node.data_dir.display()
+            );
+            fs::remove_dir_all(&config.node.data_dir).with_context(|| {
+                format!(
+                    "Failed to clean data directory: {}",
+                    config.node.data_dir.display()
+                )
+            })?;
+        } else {
+            info!(
+                "Skipping clean: Data directory does not exist: {}",
+                config.node.data_dir.display()
+            );
+        }
+    }
 
     // Ensure data directory exists
     fs::create_dir_all(&config.node.data_dir)?;
