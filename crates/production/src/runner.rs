@@ -859,7 +859,9 @@ pub struct ProductionRunner {
     /// Serves two purposes:
     /// 1. Skip verification of gossiped certificates we already built ourselves
     /// 2. Serve fetch requests before async storage write completes (race fix)
+    ///
     /// Shared with fetch handler via Arc for serving sync requests.
+    ///
     /// Capacity of 10,000 is sufficient - certificates older than this will have
     /// long since been included in blocks.
     recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,

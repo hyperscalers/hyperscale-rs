@@ -23,6 +23,9 @@ NODES_PER_HOST=1
 CRYPTO_THREADS=0
 EXECUTION_THREADS=0
 IO_THREADS=0
+COPY_TO_REMOTE=false
+REMOTE_PATH="~/git/hyperscale-rs/distributed-cluster-data/"
+REMOTE_USER="$(whoami)"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -66,9 +69,22 @@ while [[ $# -gt 0 ]]; do
             IO_THREADS="$2"
             shift 2
             ;;
+        --copy-to-remote)
+            COPY_TO_REMOTE=true
+            shift
+            ;;
+        --remote-path)
+            REMOTE_PATH="$2"
+            shift 2
+            ;;
+        --remote-user)
+            REMOTE_USER="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 --hosts \"IP1,IP2...\" [--nodes-per-host N] [--shards N] [--out-dir DIR] [--clean]"
             echo "       [--crypto-threads N] [--execution-threads N] [--io-threads N]"
+            echo "       [--copy-to-remote] [--remote-path DIR] [--remote-user USER]"
             exit 0
             ;;
         *)
@@ -328,10 +344,91 @@ for i in "${!HOST_IPS[@]}"; do
     echo "    2. Copy binary:"
     echo "       scp target/release/hyperscale-validator $IP:~/git/hyperscale-rs/"
     echo "    3. Run nodes:"
+
     for v in $(seq 0 $((NODES_PER_HOST - 1))); do
         echo "       ./hyperscale-validator --config distributed-cluster-data/host-$i/node-$v/config.toml &"
     done
 done
+
+# 7. Copy to Remote if requested
+if [ "$COPY_TO_REMOTE" = true ]; then
+    echo ""
+    echo "=== Copying to Remote Hosts ==="
+    
+    # Detect local IPs to skip
+    LOCAL_IPS=("127.0.0.1" "localhost" "::1")
+    if command -v ifconfig >/dev/null 2>&1; then
+        # BSD/macOS style
+        current_ips=$(ifconfig | grep "inet " | grep -v 127.0.0.1 | awk '{print $2}')
+        for ip in $current_ips; do LOCAL_IPS+=("$ip"); done
+    elif command -v hostname >/dev/null 2>&1; then
+        # Linux style
+        current_ips=$(hostname -I 2>/dev/null || hostname -i 2>/dev/null)
+        for ip in $current_ips; do LOCAL_IPS+=("$ip"); done
+    fi
+
+    echo "Local IPs detected: ${LOCAL_IPS[*]}"
+
+    for i in "${!HOST_IPS[@]}"; do
+        IP="${HOST_IPS[$i]}"
+        
+        # Check if IP is local
+        IS_LOCAL=false
+        for local_ip in "${LOCAL_IPS[@]}"; do
+            if [ "$IP" == "$local_ip" ]; then
+                IS_LOCAL=true
+                break
+            fi
+        done
+        
+        if [ "$IS_LOCAL" = true ]; then
+            echo "  Skipping remote copy for local host $IP"
+            continue
+        fi
+        
+        echo "  Copying to $REMOTE_USER@$IP..."
+        
+        # Ensure parent directory exists
+        ssh "$REMOTE_USER@$IP" "mkdir -p $REMOTE_PATH"
+        
+        # Copy config directory
+        # Using rsync if available might be better, but scp is requested/standard
+        scp -r "$OUT_DIR/host-$i" "$REMOTE_USER@$IP:$REMOTE_PATH/"
+        
+        # Copy binary (assuming it goes to parent of remote path or ~/git/hyperscale-rs based on printed instructions)
+        # Printed: scp target/release/hyperscale-validator $IP:~/git/hyperscale-rs/
+        # User default for REMOTE_PATH: ~/git/hyperscale-rs/distributed-cluster-data/
+        # So binary likely goes to ~/git/hyperscale-rs/ (parent of default REMOTE_PATH's parent? no, just base dir)
+        # Let's infer the binary path as the parent of the data directory if it ends in distributed-cluster-data, 
+        # or just use a fixed path derived from REMOTE_PATH if possible.
+        # Given the ambiguity, I will strictly follow the "one for the location on the remote host" for the DATA.
+        # But for the binary, I will try to be smart or just copy to the directory *containing* the distributed-cluster-data if possible,
+        # or just assume the user wants the binary in the same place?
+        # Re-reading prompt: "copy the files to remote host". Files = config + binary.
+        # Start instructions say: scp target/release/hyperscale-validator $IP:~/git/hyperscale-rs/
+        # I will use $(dirname $REMOTE_PATH) if REMOTE_PATH ends in distributed-cluster-data, otherwise just $REMOTE_PATH.
+        
+        # Actually safer: just put binary in the same REMOTE_PATH to avoid permissions issues in parent folders?
+        # No, the previous instructions were specific. 
+        # "scp -r $OUT_DIR/host-$i $IP:~/git/hyperscale-rs/distributed-cluster-data/"
+        # "scp target/release/hyperscale-validator $IP:~/git/hyperscale-rs/"
+        # I will assume the binary target is the parent of REMOTE_PATH if it looks like the default structure, 
+        # otherwise I'll put it IN REMOTE_PATH to be safe.
+        
+        REMOTE_BIN_DIR="$REMOTE_PATH"
+        if [[ "$REMOTE_PATH" == *"distributed-cluster-data/" ]] || [[ "$REMOTE_PATH" == *"distributed-cluster-data" ]]; then
+             # naive dirname
+             REMOTE_BIN_DIR="${REMOTE_PATH%/distributed-cluster-data*}"
+        fi
+        
+        echo "    - Configs to $REMOTE_PATH"
+        echo "    - Binary to $REMOTE_BIN_DIR"
+
+        scp -r "$OUT_DIR/host-$i" "$REMOTE_USER@$IP:$REMOTE_PATH/"
+        scp "target/release/hyperscale-validator" "$REMOTE_USER@$IP:$REMOTE_BIN_DIR/"
+    done
+fi
+
 
 # 7. Print Spammer Command
 echo ""
