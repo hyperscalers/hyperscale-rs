@@ -2663,8 +2663,26 @@ impl BftState {
     ///
     /// This is called when a new block is buffered to check if we already have
     /// the next needed block in the buffer.
+    ///
+    /// We submit up to `max_parallel_sync_verifications` blocks for parallel QC
+    /// verification. This allows sync to make progress on multiple blocks at once
+    /// instead of waiting for each block to verify sequentially.
     fn try_drain_buffered_synced_blocks(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
+
+        // How many blocks are already pending verification?
+        let pending_count = self.pending_synced_block_verifications.len();
+
+        // Limit parallel verifications to avoid overwhelming the crypto pool.
+        // This also bounds memory usage from buffered blocks.
+        const MAX_PARALLEL_SYNC_VERIFICATIONS: usize = 16;
+
+        if pending_count >= MAX_PARALLEL_SYNC_VERIFICATIONS {
+            // Already at max parallel verifications, wait for some to complete
+            return actions;
+        }
+
+        let slots_available = MAX_PARALLEL_SYNC_VERIFICATIONS - pending_count;
 
         // Find the next height we need - accounting for what's already pending verification
         let highest_pending_height = self
@@ -2675,12 +2693,19 @@ impl BftState {
             .unwrap_or(self.committed_height);
 
         let mut next_height = highest_pending_height.max(self.committed_height) + 1;
+        let mut submitted = 0;
 
         // Keep draining as long as we have the next sequential block buffered
-        while let Some((block, qc)) = self.buffered_synced_blocks.remove(&next_height) {
-            debug!(height = next_height, "Draining buffered synced block");
-            actions.extend(self.submit_synced_block_for_verification(block, qc));
-            next_height += 1;
+        // and haven't hit the parallel verification limit
+        while submitted < slots_available {
+            if let Some((block, qc)) = self.buffered_synced_blocks.remove(&next_height) {
+                debug!(height = next_height, "Draining buffered synced block");
+                actions.extend(self.submit_synced_block_for_verification(block, qc));
+                next_height += 1;
+                submitted += 1;
+            } else {
+                break;
+            }
         }
 
         actions
@@ -2849,25 +2874,8 @@ impl BftState {
             actions.extend(self.apply_synced_block(pending.block, pending.qc));
         }
 
-        // After applying blocks, check if we can drain buffered blocks
-        // Calculate what height we now expect
-        let highest_pending_height = self
-            .pending_synced_block_verifications
-            .values()
-            .map(|p| p.block.header.height.0)
-            .max()
-            .unwrap_or(self.committed_height);
-        let mut expected_height = highest_pending_height.max(self.committed_height) + 1;
-
-        // Drain consecutive buffered blocks and submit them for verification
-        while let Some((block, qc)) = self.buffered_synced_blocks.remove(&expected_height) {
-            debug!(
-                expected_height,
-                "Draining buffered synced block for verification"
-            );
-            actions.extend(self.submit_synced_block_for_verification(block, qc));
-            expected_height += 1;
-        }
+        // After applying blocks, drain more buffered blocks for parallel verification
+        actions.extend(self.try_drain_buffered_synced_blocks());
 
         actions
     }
