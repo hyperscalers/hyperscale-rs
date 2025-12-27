@@ -128,7 +128,6 @@ impl RpcServer {
             start_time: Instant::now(),
             tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
-            tx_ingress: None,
             sync_backpressure_threshold,
         };
 
@@ -157,7 +156,6 @@ impl RpcServer {
             start_time: Instant::now(),
             tx_status_cache,
             mempool_snapshot,
-            tx_ingress: None,
             sync_backpressure_threshold,
         };
 

@@ -85,12 +85,6 @@ pub struct Metrics {
     pub cert_request_channel_depth: Gauge,
 
     // === Transaction Ingress ===
-    /// Available permits in the transaction ingress semaphore.
-    pub tx_ingress_available_permits: Gauge,
-    /// Total transactions submitted through ingress.
-    pub tx_ingress_submitted: Counter,
-    /// Total transactions rejected due to backpressure.
-    pub tx_ingress_rejected: Counter,
     /// Total transactions rejected because node is syncing.
     pub tx_ingress_rejected_syncing: Counter,
     /// Total transactions rejected because pending count is too high.
@@ -394,24 +388,6 @@ impl Metrics {
             .unwrap(),
 
             // Transaction Ingress
-            tx_ingress_available_permits: register_gauge!(
-                "hyperscale_tx_ingress_available_permits",
-                "Available permits in transaction ingress semaphore"
-            )
-            .unwrap(),
-
-            tx_ingress_submitted: register_counter!(
-                "hyperscale_tx_ingress_submitted_total",
-                "Total transactions submitted through ingress"
-            )
-            .unwrap(),
-
-            tx_ingress_rejected: register_counter!(
-                "hyperscale_tx_ingress_rejected_total",
-                "Total transactions rejected due to backpressure"
-            )
-            .unwrap(),
-
             tx_ingress_rejected_syncing: register_counter!(
                 "hyperscale_tx_ingress_rejected_syncing_total",
                 "Total transactions rejected because node is syncing"
@@ -826,26 +802,11 @@ pub fn set_channel_depths(depths: &ChannelDepths) {
     m.cert_request_channel_depth.set(depths.cert_request as f64);
 }
 
-/// Update transaction ingress metrics.
-pub fn set_tx_ingress_available_permits(count: usize) {
-    metrics().tx_ingress_available_permits.set(count as f64);
-}
-
 /// Record direct messages sent.
 pub fn record_direct_message_sent(count: usize) {
     if count > 0 {
         metrics().direct_messages_sent.inc_by(count as f64);
     }
-}
-
-/// Record a successful transaction ingress submission.
-pub fn record_tx_ingress_submitted() {
-    metrics().tx_ingress_submitted.inc();
-}
-
-/// Record a rejected transaction due to backpressure.
-pub fn record_tx_ingress_rejected() {
-    metrics().tx_ingress_rejected.inc();
 }
 
 /// Record a rejected transaction because the node is syncing.

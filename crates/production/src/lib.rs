@@ -84,7 +84,6 @@ mod sync_error;
 mod telemetry;
 mod thread_pools;
 mod timers;
-mod tx_ingress;
 mod validation_batcher;
 
 pub use network::Libp2pConfig;

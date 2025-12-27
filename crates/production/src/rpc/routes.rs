@@ -64,7 +64,6 @@ mod tests {
             start_time: Instant::now(),
             tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
-            tx_ingress: None, // Tests use legacy path
             sync_backpressure_threshold: Some(10),
         }
     }
