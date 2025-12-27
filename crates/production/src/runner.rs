@@ -2667,7 +2667,7 @@ impl ProductionRunner {
 
             Action::PersistTransactionCertificate { certificate } => {
                 // Commit certificate + state writes atomically
-                // This is durability-critical: we await completion
+                // Fire-and-forget: RocksDB WAL ensures durability, no need to block event loop
                 let storage = self.storage.clone();
                 let local_shard = self.local_shard;
 
@@ -2683,9 +2683,7 @@ impl ProductionRunner {
                 let cert_for_persist = certificate.clone();
                 tokio::task::spawn_blocking(move || {
                     storage.commit_certificate_with_writes(&cert_for_persist, &writes);
-                })
-                .await
-                .ok();
+                });
 
                 // After persisting, gossip certificate to same-shard peers.
                 // This ensures other validators have the certificate before the proposer
