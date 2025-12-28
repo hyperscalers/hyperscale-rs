@@ -476,16 +476,16 @@ impl BftState {
     /// Check if we should advance the round due to timeout.
     ///
     /// Returns true if the leader has been inactive for longer than
-    /// `view_change_timeout` and we're not currently syncing.
+    /// `view_change_timeout`.
     ///
     /// View changes should only happen when the leader fails to propose,
     /// not just because vote aggregation is slow.
+    ///
+    /// Note: Syncing nodes DO participate in view changes. They receive headers
+    /// from the network at the current height/round and need to help advance
+    /// the view if the leader fails. When a syncing node becomes the proposer
+    /// after a view change, they propose an empty sync block.
     fn should_advance_round(&self) -> bool {
-        // Never trigger view changes while syncing - we're intentionally behind
-        // and catching up. This follows Tendermint/HotStuff best practices.
-        if self.syncing {
-            return false;
-        }
         let timeout = self.config.view_change_timeout;
         self.now.saturating_sub(self.last_leader_activity) >= timeout
     }
@@ -679,28 +679,42 @@ impl BftState {
             duration: self.config.proposal_interval,
         }];
 
+        // Check pipeline backpressure FIRST, before the should_propose check.
+        // This is important because ALL validators need to reset their leader activity
+        // timer when backpressure is active, not just the leader. Otherwise:
+        // 1. Leader has backpressure, doesn't propose
+        // 2. Non-leaders don't know, their view change timer expires
+        // 3. View change to new leader who also has backpressure
+        // 4. Cascading view changes until backpressure clears
+        //
+        // By checking backpressure for all validators and resetting activity,
+        // everyone agrees to wait for commits to catch up.
+        if self.pipeline_backpressure() {
+            let qc_height = self.latest_qc.as_ref().map(|qc| qc.height.0).unwrap_or(0);
+            // Only log for the actual proposer to reduce noise
+            if self.should_propose(next_height, round) {
+                info!(
+                    validator = ?self.validator_id(),
+                    qc_height = qc_height,
+                    committed_height = self.committed_height,
+                    gap = qc_height.saturating_sub(self.committed_height),
+                    limit = self.config.pipeline_backpressure_limit,
+                    "Pipeline backpressure - skipping proposal to let commits catch up"
+                );
+            }
+            // Reset leader activity to prevent view changes during backpressure.
+            // The leader isn't failing - they're intentionally pausing to let
+            // commits catch up.
+            self.record_leader_activity();
+            return actions;
+        }
+
         // Check if we should propose
         if !self.should_propose(next_height, round) {
             trace!(
                 validator = ?self.validator_id(),
                 expected = ?self.proposer_for(next_height, round),
                 "Not the proposer for this height/round"
-            );
-            return actions;
-        }
-
-        // Check pipeline backpressure - if QC is too far ahead of commits, wait.
-        // This prevents runaway pipelining that can cause slower validators to fall
-        // behind and eventually lose quorum.
-        if self.pipeline_backpressure() {
-            let qc_height = self.latest_qc.as_ref().map(|qc| qc.height.0).unwrap_or(0);
-            info!(
-                validator = ?self.validator_id(),
-                qc_height = qc_height,
-                committed_height = self.committed_height,
-                gap = qc_height.saturating_sub(self.committed_height),
-                limit = self.config.pipeline_backpressure_limit,
-                "Pipeline backpressure - skipping proposal to let commits catch up"
             );
             return actions;
         }
@@ -982,6 +996,9 @@ impl BftState {
         // Track proposal time for rate limiting
         self.last_proposal_time = self.now;
 
+        // Record leader activity - we are producing blocks
+        self.record_leader_activity();
+
         actions.push(Action::BroadcastToShard {
             shard: self.local_shard(),
             message: OutboundMessage::BlockHeader(Box::new(gossip)),
@@ -1242,6 +1259,9 @@ impl BftState {
             "Received block header"
         );
 
+        // Track whether we need to sync (will be added to actions at the end)
+        let mut sync_action = None;
+
         // Check if this header reveals we're missing blocks and need to sync.
         // The parent_qc certifies block at height N-1 for a block at height N.
         //
@@ -1251,15 +1271,14 @@ impl BftState {
         // - certified_blocks (has QC, waiting for 2-chain commit)
         // - pending_synced_block_verifications (received via sync, verifying QC)
         //
-        // Only trigger sync if we're genuinely missing the block, not just because
-        // commits are lagging behind due to the pipelined 2-chain commit rule.
+        // If missing, we trigger sync but CONTINUE processing the header. This allows
+        // syncing validators to still participate in consensus at the tip (building QCs,
+        // proposing empty sync blocks) while catching up on historical blocks in parallel.
         if !header.parent_qc.is_genesis() {
             let parent_height = header.parent_qc.height.0;
 
             // IMPORTANT: Update latest_qc from the header BEFORE checking if we need sync.
-            // This ensures that even when we return early for sync, our latest_qc reflects
-            // the highest QC we've seen from the network. Without this, a validator that
-            // falls behind would have a stale latest_qc and sync to outdated targets.
+            // This ensures our latest_qc reflects the highest QC we've seen from the network.
             let should_update_qc = self
                 .latest_qc
                 .as_ref()
@@ -1284,13 +1303,15 @@ impl BftState {
                     committed_height = self.committed_height,
                     parent_height = parent_height,
                     target_height = target_height,
-                    "Missing parent block, triggering sync"
+                    "Missing parent block, triggering sync (continuing to process header)"
                 );
 
-                return vec![Action::StartSync {
+                // Queue sync action but DON'T return - continue processing the header.
+                // This allows us to build QCs and propose sync blocks while syncing.
+                sync_action = Some(Action::StartSync {
                     target_height,
                     target_hash,
-                }];
+                });
             }
         }
 
@@ -1377,7 +1398,18 @@ impl BftState {
 
         // Check if we should trigger verification now that we have the header
         let mut actions = self.maybe_trigger_vote_verification(block_hash);
-        if !actions.is_empty() {
+
+        // Always include sync action if we need to sync
+        if let Some(sync) = sync_action.take() {
+            actions.push(sync);
+        }
+
+        // If vote verification was triggered, return those actions.
+        // But don't return early just for sync - we still want to vote on the block.
+        if actions
+            .iter()
+            .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
+        {
             return actions;
         }
 
@@ -2525,7 +2557,6 @@ impl BftState {
         // burst behavior under high load. If we proposed too recently, let the
         // regular proposal timer handle it.
         let next_height = height + 1;
-        let round = self.view;
 
         let has_content = !ready_txs.is_empty()
             || !deferred.is_empty()
@@ -2535,15 +2566,16 @@ impl BftState {
         let time_since_last_proposal = self.now.saturating_sub(self.last_proposal_time);
         let rate_limited = time_since_last_proposal < self.config.min_block_interval;
 
-        if has_content && self.should_propose(next_height, round) && !rate_limited {
-            debug!(
-                validator = ?self.validator_id(),
-                next_height = next_height,
-                round = round,
-                "Immediately proposing next block after QC formation"
-            );
+        // Attempt immediate proposal if:
+        // - We have content to include, OR
+        // - We're syncing (should propose empty sync blocks to keep chain advancing)
+        //
+        // All other checks (should_propose, backpressure, voted_heights)
+        // are handled inside on_proposal_timer to avoid duplication.
+        let should_try_proposal = has_content || self.syncing;
 
-            // Propose immediately with actual mempool contents
+        if should_try_proposal && !rate_limited {
+            // on_proposal_timer will check if we're the proposer, backpressure, etc.
             actions.extend(self.on_proposal_timer(
                 ready_txs,
                 deferred,
@@ -2551,7 +2583,7 @@ impl BftState {
                 certificates,
                 commitment_proofs,
             ));
-        } else if has_content && self.should_propose(next_height, round) && rate_limited {
+        } else if should_try_proposal && rate_limited {
             trace!(
                 validator = ?self.validator_id(),
                 next_height = next_height,
@@ -7496,5 +7528,521 @@ mod tests {
         // Verify aggregated signature against aggregated public key
         let valid = aggregated_pk.verify(&message, &aggregated_sig);
         assert!(valid, "Aggregated QC signature should verify");
+    }
+
+    // ========================================================================
+    // Sync Block Proposal Tests
+    // ========================================================================
+
+    #[test]
+    fn test_syncing_validator_proposes_empty_block() {
+        let mut state = make_test_state();
+        state.set_time(Duration::from_secs(100));
+
+        // Set up a QC so we propose for height 4 (validator 0's turn: (4+0)%4=0)
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 100_000,
+        };
+        state.latest_qc = Some(qc);
+
+        // Enter sync mode
+        assert!(!state.is_syncing());
+        state.set_syncing(true);
+        assert!(state.is_syncing());
+
+        // Trigger proposal timer with transactions (which should be ignored)
+        let ready_txs = ReadyTransactions {
+            retries: vec![],
+            priority: vec![],
+            others: vec![Arc::new(hyperscale_types::test_utils::test_transaction(1))],
+        };
+
+        let actions = state.on_proposal_timer(&ready_txs, vec![], vec![], vec![], HashMap::new());
+
+        // Should have broadcast a block header
+        let has_block_header = actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_block_header,
+            "Should broadcast a block header while syncing"
+        );
+
+        // Verify the block is empty (sync block)
+        let block_gossip = actions.iter().find_map(|a| {
+            if let Action::BroadcastToShard {
+                message: OutboundMessage::BlockHeader(gossip),
+                ..
+            } = a
+            {
+                Some(gossip)
+            } else {
+                None
+            }
+        });
+
+        let gossip = block_gossip.expect("Should have block header gossip");
+        assert!(
+            gossip.transaction_hashes.is_empty(),
+            "Sync block should have no transactions"
+        );
+        assert!(
+            gossip.retry_hashes.is_empty(),
+            "Sync block should have no retry transactions"
+        );
+        assert!(
+            gossip.priority_hashes.is_empty(),
+            "Sync block should have no priority transactions"
+        );
+        assert!(
+            gossip.certificate_hashes.is_empty(),
+            "Sync block should have no certificates"
+        );
+
+        // Verify is_fallback is false (sync blocks are not fallback blocks)
+        assert!(
+            !gossip.header.is_fallback,
+            "Sync block should not be marked as fallback"
+        );
+    }
+
+    #[test]
+    fn test_syncing_validator_uses_current_timestamp() {
+        let mut state = make_test_state();
+        let current_time = Duration::from_secs(12345);
+        state.set_time(current_time);
+
+        // Set up QC with old timestamp
+        let old_timestamp = 1000u64;
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: old_timestamp,
+        };
+        state.latest_qc = Some(qc);
+
+        // Enter sync mode
+        state.set_syncing(true);
+
+        let actions = state.on_proposal_timer(
+            &ReadyTransactions::default(),
+            vec![],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        // Extract the block header
+        let gossip = actions.iter().find_map(|a| {
+            if let Action::BroadcastToShard {
+                message: OutboundMessage::BlockHeader(gossip),
+                ..
+            } = a
+            {
+                Some(gossip)
+            } else {
+                None
+            }
+        });
+
+        let gossip = gossip.expect("Should have block header");
+
+        // Sync blocks use current time, NOT inherited timestamp
+        assert_eq!(
+            gossip.header.timestamp,
+            current_time.as_millis() as u64,
+            "Sync block should use current timestamp, not parent's"
+        );
+        assert_ne!(
+            gossip.header.timestamp, old_timestamp,
+            "Sync block should NOT inherit parent timestamp like fallback blocks"
+        );
+    }
+
+    #[test]
+    fn test_sync_complete_exits_sync_mode() {
+        let mut state = make_test_state();
+
+        // Enter sync mode
+        state.set_syncing(true);
+        assert!(state.is_syncing());
+
+        // Exit sync mode
+        let actions = state.on_sync_complete();
+        assert!(!state.is_syncing());
+
+        // Should return empty actions (just state change)
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn test_syncing_validator_can_vote_for_others_blocks() {
+        let (mut state, _keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        // Enter sync mode
+        state.set_syncing(true);
+
+        // Create a block from another proposer (validator 1 proposes height 1)
+        let block_hash = Hash::from_bytes(b"other_proposer_block");
+        let height = 1u64;
+        let round = 0u64;
+
+        // Directly call try_vote_on_block (simulating after QC verification)
+        let actions = state.try_vote_on_block(block_hash, height, round);
+
+        // Should have created a vote
+        let has_vote = actions
+            .iter()
+            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
+        assert!(
+            has_vote,
+            "Syncing validator should still be able to vote for others' blocks"
+        );
+
+        // Verify vote is recorded
+        assert!(
+            state.voted_heights.contains_key(&height),
+            "Vote should be recorded in voted_heights"
+        );
+    }
+
+    #[test]
+    fn test_view_changes_allowed_during_sync() {
+        let mut state = make_test_state();
+
+        // Set up time so that view change would trigger
+        state.set_time(Duration::from_secs(100));
+        state.last_leader_activity = Duration::from_secs(0); // Very old
+
+        // Without sync mode, should want to advance round
+        assert!(
+            state.should_advance_round(),
+            "Should want to advance round when not syncing"
+        );
+
+        // Enter sync mode
+        state.set_syncing(true);
+
+        // Syncing nodes SHOULD still participate in view changes.
+        // They receive headers at the current height/round and need to help
+        // advance the view if the leader fails. When selected as proposer
+        // after a view change, they propose an empty sync block.
+        assert!(
+            state.should_advance_round(),
+            "Should still advance round while syncing - syncing nodes participate in consensus"
+        );
+
+        // Verify check_round_timeout returns actions (view change)
+        let timeout_actions = state.check_round_timeout();
+        assert!(
+            timeout_actions.is_some(),
+            "check_round_timeout should trigger view change even while syncing"
+        );
+    }
+
+    #[test]
+    fn test_sync_mode_resets_leader_activity_on_exit() {
+        let mut state = make_test_state();
+
+        // Set up stale leader activity
+        state.set_time(Duration::from_secs(100));
+        state.last_leader_activity = Duration::from_secs(0);
+
+        // Enter and exit sync mode
+        state.set_syncing(true);
+        state.on_sync_complete();
+
+        // Leader activity should be reset to current time
+        assert_eq!(
+            state.last_leader_activity,
+            Duration::from_secs(100),
+            "Leader activity should be reset when exiting sync mode"
+        );
+    }
+
+    #[test]
+    fn test_syncing_validator_vote_locking_preserved() {
+        let (mut state, _keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        // Enter sync mode
+        state.set_syncing(true);
+
+        let height = 1u64;
+        let block_a = Hash::from_bytes(b"block_a");
+        let block_b = Hash::from_bytes(b"block_b");
+
+        // Vote for block A
+        let actions = state.try_vote_on_block(block_a, height, 0);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. })),
+            "Should vote for block A"
+        );
+
+        // Try to vote for block B at same height - should be blocked
+        let actions = state.try_vote_on_block(block_b, height, 1);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. })),
+            "Should NOT vote for block B (vote locked to A)"
+        );
+
+        // Verify still locked to A
+        assert_eq!(
+            state.voted_heights.get(&height).map(|(h, _)| *h),
+            Some(block_a),
+            "Should remain locked to block A"
+        );
+    }
+
+    #[test]
+    fn test_on_sync_block_ready_to_apply_enters_sync_mode() {
+        let mut state = make_test_state();
+        state.set_time(Duration::from_secs(100));
+
+        assert!(!state.is_syncing(), "Should not be syncing initially");
+
+        // Create a synced block
+        let block = Block {
+            header: BlockHeader {
+                height: BlockHeight(1),
+                parent_hash: Hash::ZERO,
+                parent_qc: QuorumCertificate::genesis(),
+                proposer: ValidatorId(1),
+                timestamp: 1000,
+                round: 0,
+                is_fallback: false,
+            },
+            retry_transactions: vec![],
+            priority_transactions: vec![],
+            transactions: vec![],
+            committed_certificates: vec![],
+            deferred: vec![],
+            aborted: vec![],
+            commitment_proofs: HashMap::new(),
+        };
+
+        let qc = QuorumCertificate {
+            block_hash: block.hash(),
+            height: BlockHeight(1),
+            parent_block_hash: Hash::ZERO,
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 1000,
+        };
+
+        // Call on_sync_block_ready_to_apply
+        let _actions = state.on_sync_block_ready_to_apply(block, qc);
+
+        assert!(
+            state.is_syncing(),
+            "Should be in sync mode after on_sync_block_ready_to_apply"
+        );
+    }
+
+    #[test]
+    fn test_sync_block_records_leader_activity() {
+        let mut state = make_test_state();
+        state.set_time(Duration::from_secs(100));
+        state.last_leader_activity = Duration::from_secs(0);
+
+        // Set up QC so we're the proposer for height 4
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 100_000,
+        };
+        state.latest_qc = Some(qc);
+
+        // Enter sync mode
+        state.set_syncing(true);
+
+        // Propose (which builds sync block)
+        let _actions = state.on_proposal_timer(
+            &ReadyTransactions::default(),
+            vec![],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        // Leader activity should be updated
+        assert_eq!(
+            state.last_leader_activity,
+            Duration::from_secs(100),
+            "Sync block proposal should record leader activity"
+        );
+    }
+
+    #[test]
+    fn test_sync_block_vs_fallback_block_differences() {
+        // This test verifies the key differences between sync blocks and fallback blocks
+        let mut state = make_test_state();
+        state.set_time(Duration::from_secs(100));
+
+        // Set up QC with specific timestamp
+        let parent_timestamp = 50_000u64;
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: parent_timestamp,
+        };
+        state.latest_qc = Some(qc);
+
+        // Test 1: Build sync block
+        state.set_syncing(true);
+        let sync_actions = state.build_and_broadcast_sync_block(4, 0);
+        state.set_syncing(false);
+
+        // Reset state for fallback test
+        state.pending_blocks.clear();
+        state.pending_block_created_at.clear();
+        state.certified_blocks.clear();
+        state.voted_heights.clear();
+
+        // Test 2: Build fallback block
+        let fallback_actions = state.build_and_broadcast_fallback_block(4, 1);
+
+        // Extract headers
+        let sync_header = sync_actions
+            .iter()
+            .find_map(|a| {
+                if let Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(gossip),
+                    ..
+                } = a
+                {
+                    Some(&gossip.header)
+                } else {
+                    None
+                }
+            })
+            .expect("Should have sync block header");
+
+        let fallback_header = fallback_actions
+            .iter()
+            .find_map(|a| {
+                if let Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(gossip),
+                    ..
+                } = a
+                {
+                    Some(&gossip.header)
+                } else {
+                    None
+                }
+            })
+            .expect("Should have fallback block header");
+
+        // Difference 1: is_fallback flag
+        assert!(
+            !sync_header.is_fallback,
+            "Sync block should have is_fallback=false"
+        );
+        assert!(
+            fallback_header.is_fallback,
+            "Fallback block should have is_fallback=true"
+        );
+
+        // Difference 2: timestamp handling
+        assert_eq!(
+            sync_header.timestamp,
+            Duration::from_secs(100).as_millis() as u64,
+            "Sync block uses current timestamp"
+        );
+        assert_eq!(
+            fallback_header.timestamp, parent_timestamp,
+            "Fallback block inherits parent timestamp"
+        );
+    }
+
+    #[test]
+    fn test_chain_advances_with_syncing_proposer() {
+        // Simulate a scenario where a syncing proposer keeps the chain advancing
+        let mut state = make_test_state();
+        state.set_time(Duration::from_secs(100));
+
+        // Set up initial QC
+        let qc = QuorumCertificate {
+            block_hash: Hash::from_bytes(b"block_3"),
+            height: BlockHeight(3),
+            parent_block_hash: Hash::from_bytes(b"block_2"),
+            round: 0,
+            signers: SignerBitfield::empty(),
+            aggregated_signature: Signature::zero(),
+            voting_power: VotePower(3),
+            weighted_timestamp_ms: 100_000,
+        };
+        state.latest_qc = Some(qc);
+
+        // Enter sync mode
+        state.set_syncing(true);
+
+        // Propose first sync block
+        let actions1 = state.on_proposal_timer(
+            &ReadyTransactions::default(),
+            vec![],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        // Verify we got a proposal (not skipped due to syncing)
+        let has_proposal = actions1.iter().any(|a| {
+            matches!(
+                a,
+                Action::BroadcastToShard {
+                    message: OutboundMessage::BlockHeader(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_proposal,
+            "Syncing validator should still propose (empty blocks)"
+        );
+
+        // Verify we also voted for our own block
+        let has_vote = actions1
+            .iter()
+            .any(|a| matches!(a, Action::PersistAndBroadcastVote { .. }));
+        assert!(
+            has_vote,
+            "Syncing validator should vote for their own sync block"
+        );
     }
 }
