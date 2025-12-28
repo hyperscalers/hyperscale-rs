@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry};
+use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Layer, Registry};
 
 /// Provider for sync status, used by the telemetry HTTP server.
 pub type SyncStatusProvider = Arc<ArcSwap<SyncStatus>>;
@@ -56,6 +56,8 @@ pub struct TelemetryConfig {
     pub prometheus_port: u16,
     /// Additional resource attributes.
     pub resource_attributes: Vec<(String, String)>,
+    /// Optional log file path. If provided, logs are written to this file instead of stdout.
+    pub log_file: Option<std::path::PathBuf>,
 }
 
 impl Default for TelemetryConfig {
@@ -67,6 +69,7 @@ impl Default for TelemetryConfig {
             prometheus_enabled: false,
             prometheus_port: 9090,
             resource_attributes: vec![],
+            log_file: None,
         }
     }
 }
@@ -102,10 +105,6 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,hyperscale=debug"));
 
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_target(true)
-        .with_thread_ids(true);
-
     // Optional OTLP tracing layer
     let (otel_layer, tracer_provider) = if let Some(endpoint) = &config.otlp_endpoint {
         // Note: build() validates URL format but connection is lazy
@@ -123,9 +122,49 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
 
         let tracer = tracer_provider.tracer("hyperscale");
 
-        (Some(OpenTelemetryLayer::new(tracer)), Some(tracer_provider))
+        (
+            Some(OpenTelemetryLayer::new(tracer).boxed()),
+            Some(tracer_provider),
+        )
     } else {
         (None, None)
+    };
+
+    // Initialize formatting layer (file or stdout)
+    let (fmt_layer, _appender_guard) = if let Some(log_file) = &config.log_file {
+        if let Some(parent) = log_file.parent() {
+            std::fs::create_dir_all(parent).map_err(TelemetryError::MetricsPort)?;
+        }
+        let file_name = log_file
+            .file_name()
+            .ok_or_else(|| {
+                TelemetryError::MetricsPort(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Invalid log file name",
+                ))
+            })?
+            .to_string_lossy()
+            .to_string();
+        let directory = log_file
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
+
+        let file_appender = tracing_appender::rolling::never(directory, file_name);
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(non_blocking)
+            .with_ansi(false) // Disable ANSI colors in file logs
+            .with_target(true)
+            .with_thread_ids(true);
+
+        (layer.boxed(), Some(guard))
+    } else {
+        let layer = tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_thread_ids(true);
+        (layer.boxed(), None)
     };
 
     // Initialize the subscriber
@@ -155,6 +194,7 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<TelemetryGuard, Teleme
         prometheus_handle,
         ready_flag,
         sync_status,
+        _appender_guard,
     })
 }
 
@@ -167,6 +207,7 @@ pub struct TelemetryGuard {
     prometheus_handle: Option<tokio::task::JoinHandle<()>>,
     ready_flag: Option<Arc<AtomicBool>>,
     sync_status: Option<SyncStatusProvider>,
+    _appender_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
 impl TelemetryGuard {
@@ -503,6 +544,7 @@ mod tests {
             prometheus_handle: None,
             ready_flag: Some(ready_flag.clone()),
             sync_status: None,
+            _appender_guard: None,
         };
 
         // Initially not ready

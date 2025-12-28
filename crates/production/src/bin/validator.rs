@@ -113,6 +113,10 @@ struct Cli {
     /// Clean the data directory on startup
     #[arg(long)]
     clean: bool,
+
+    /// Path to log file (redirects all logs to this file)
+    #[arg(long)]
+    logfile: Option<PathBuf>,
 }
 
 /// Top-level validator configuration.
@@ -510,6 +514,10 @@ pub struct TelemetryConfigToml {
     /// Service name for tracing
     #[serde(default = "default_service_name")]
     pub service_name: String,
+
+    /// Optional log file path. If provided, logs are written to this file.
+    #[serde(default)]
+    pub log_file: Option<PathBuf>,
 }
 
 fn default_service_name() -> String {
@@ -594,6 +602,10 @@ impl ValidatorConfig {
 
         if let Some(mode) = cli.version_interop_mode {
             self.network.version_interop_mode = Some(mode);
+        }
+
+        if let Some(ref logfile) = cli.logfile {
+            self.telemetry.log_file = Some(logfile.clone());
         }
     }
 }
@@ -1068,31 +1080,65 @@ async fn main() -> Result<()> {
     // Initialize telemetry/logging
     // If telemetry is enabled, init_telemetry sets up the global subscriber with OTLP export.
     // Otherwise, use basic fmt subscriber.
-    let _telemetry_guard = if config.telemetry.enabled {
+    #[allow(dead_code)]
+    enum UnifiedGuard {
+        Telemetry(hyperscale_production::TelemetryGuard),
+        Basic(Option<tracing_appender::non_blocking::WorkerGuard>),
+    }
+
+    let _log_guard = if config.telemetry.enabled {
         let telemetry_config = TelemetryConfig {
             service_name: config.telemetry.service_name.clone(),
             otlp_endpoint: config.telemetry.otlp_endpoint.clone(),
             sampling_ratio: 1.0,
             prometheus_enabled: false, // We handle metrics separately
             prometheus_port: 9090,
-            resource_attributes: vec![
-                (
-                    "validator_id".to_string(),
-                    config.node.validator_id.to_string(),
-                ),
-                ("shard".to_string(), config.node.shard.to_string()),
-            ],
+            resource_attributes: vec![("shard".to_string(), config.node.shard.to_string())],
+            log_file: config.telemetry.log_file.clone(),
         };
-        Some(init_telemetry(&telemetry_config)?)
+        UnifiedGuard::Telemetry(init_telemetry(&telemetry_config)?)
     } else {
         // Basic logging without OTLP export
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| EnvFilter::new(&cli.log_level)),
-            )
-            .init();
-        None
+        let builder = tracing_subscriber::fmt();
+
+        let inner_guard = if let Some(log_file) = &config.telemetry.log_file {
+            if let Some(parent) = log_file.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let file_name = log_file
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("Invalid log file name"))?
+                .to_string_lossy()
+                .to_string();
+            let directory = log_file
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf();
+
+            let file_appender = tracing_appender::rolling::never(directory, file_name);
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+            builder
+                .with_writer(non_blocking)
+                .with_ansi(false) // Disable ANSI colors in file logs
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new(&cli.log_level)),
+                )
+                .init();
+            Some(guard)
+        } else {
+            builder
+                .with_env_filter(
+                    EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| EnvFilter::new(&cli.log_level)),
+                )
+                .init();
+            None
+        };
+        UnifiedGuard::Basic(inner_guard)
     };
 
     info!("Hyperscale Validator starting...");

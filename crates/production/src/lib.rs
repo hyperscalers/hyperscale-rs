@@ -91,7 +91,7 @@ pub use runner::{ProductionRunner, RunnerError};
 pub use storage::{CompressionType, RocksDbConfig, RocksDbStorage, StorageError};
 pub use sync::SyncStatus;
 pub use sync_error::SyncResponseError;
-pub use telemetry::{init_telemetry, TelemetryConfig};
+pub use telemetry::{init_telemetry, TelemetryConfig, TelemetryGuard};
 pub use thread_pools::{ThreadPoolConfig, ThreadPoolManager};
 pub use validation_batcher::{
     spawn_tx_validation_batcher, ValidationBatcherConfig, ValidationBatcherHandle,
