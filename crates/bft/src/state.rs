@@ -1207,6 +1207,12 @@ impl BftState {
         // at this height. The vote is recorded in voted_heights and our original
         // vote should still be valid (votes are for block_hash + height, not round).
 
+        // Track proposal time for rate limiting
+        self.last_proposal_time = self.now;
+
+        // Record leader activity - we are producing blocks
+        self.record_leader_activity();
+
         // Set proposal timer in case this re-proposal also fails to gather quorum
         actions.push(Action::SetTimer {
             id: TimerId::Proposal,
