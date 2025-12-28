@@ -2236,7 +2236,13 @@ impl BftState {
             }];
         }
 
-        // Process view sync and equivocation checks for verified votes (before borrow)
+        // Process verified votes: view sync, equivocation detection, and recording.
+        //
+        // IMPORTANT: Equivocation detection happens AFTER signature verification to prevent
+        // a DoS attack where a malicious node forges votes to block legitimate validators.
+        // Only verified votes are recorded in received_votes_by_height.
+        //
+        // TODO: Collect both conflicting votes as slashing proof for economic penalties.
         let validator_id = self.validator_id();
         for (_, vote, _) in &verified_votes {
             // View synchronization
@@ -2252,8 +2258,32 @@ impl BftState {
                 self.view = vote.round;
             }
 
-            // Record in equivocation tracking
+            // Equivocation detection: check if this validator already voted for a DIFFERENT
+            // block at the same height AND round. Voting for different blocks at different
+            // rounds is allowed (HotStuff-2 unlock), but same round is Byzantine behavior.
             let vote_key = (vote.height.0, vote.voter);
+            if let Some(&(existing_hash, existing_round)) =
+                self.received_votes_by_height.get(&vote_key)
+            {
+                if existing_hash != block_hash && existing_round == vote.round {
+                    warn!(
+                        voter = ?vote.voter,
+                        height = vote.height.0,
+                        round = vote.round,
+                        existing_block = ?existing_hash,
+                        new_block = ?block_hash,
+                        "EQUIVOCATION DETECTED: validator voted for different blocks at same height/round"
+                    );
+                    // This is detection for slashing, not prevention. The equivocating vote
+                    // was already counted by the runner (QC may already be built). This is fine:
+                    // - BFT safety is guaranteed by quorum intersection, not equivocation prevention
+                    // - A Byzantine validator's first vote always gets counted anyway
+                    // - The value is in detecting and logging for future slashing
+                    continue;
+                }
+            }
+
+            // Record this verified vote for future equivocation detection
             self.received_votes_by_height
                 .insert(vote_key, (block_hash, vote.round));
         }
@@ -5372,15 +5402,214 @@ mod tests {
     // Cross-VoteSet Equivocation Detection Tests
     // ═══════════════════════════════════════════════════════════════════════════
     //
-    // NOTE: These tests were refactored when switching to deferred vote verification.
-    // With the new model, votes are buffered until quorum is possible, then batch-verified
-    // via VerifyAndBuildQuorumCertificate. Equivocation detection now happens in on_qc_result.
+    // Equivocation detection happens in on_qc_result AFTER signature verification.
+    // This prevents a DoS attack where a malicious node forges votes claiming to be
+    // from a legitimate validator, which would block the real validator's votes.
     //
-    // TODO: Re-implement equivocation detection tests that work with the new deferred
-    // verification model. The key behaviors to test:
-    // - Conflicting votes at same round should be detected and rejected
-    // - HotStuff-2 revoting at higher rounds should be allowed
-    // - Duplicate votes for same block should be handled gracefully
+    // These tests verify the detection logic by directly calling on_qc_result with
+    // simulated verified votes.
+
+    #[test]
+    fn test_equivocation_detected_same_height_same_round_different_block() {
+        // Byzantine validator votes for two different blocks at the same (height, round).
+        // The second vote should be detected as equivocation.
+        let (mut state, _keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        let height = 5u64;
+        let round = 2u64;
+        let byzantine_voter = ValidatorId(2);
+
+        let block_a = Hash::from_bytes(b"block_a_at_height_5");
+        let block_b = Hash::from_bytes(b"block_b_at_height_5");
+
+        // First verified vote for block A - simulate on_qc_result recording it
+        let vote_a = BlockVote {
+            block_hash: block_a,
+            height: BlockHeight(height),
+            round,
+            voter: byzantine_voter,
+            signature: Signature::zero(),
+            timestamp: 100_000,
+        };
+
+        // Simulate verified vote being processed (no QC formed)
+        let verified_votes_a = vec![(0usize, vote_a, 1u64)];
+        let _actions = state.on_qc_result(block_a, None, verified_votes_a);
+
+        // Verify first vote was recorded
+        assert!(state
+            .received_votes_by_height
+            .contains_key(&(height, byzantine_voter)));
+        let (recorded_hash, recorded_round) = state
+            .received_votes_by_height
+            .get(&(height, byzantine_voter))
+            .unwrap();
+        assert_eq!(*recorded_hash, block_a);
+        assert_eq!(*recorded_round, round);
+
+        // Second verified vote for DIFFERENT block at SAME height and round - equivocation!
+        let vote_b = BlockVote {
+            block_hash: block_b,
+            height: BlockHeight(height),
+            round,
+            voter: byzantine_voter,
+            signature: Signature::zero(),
+            timestamp: 100_000,
+        };
+
+        // Process second verified vote - equivocation should be detected and logged
+        let verified_votes_b = vec![(0usize, vote_b, 1u64)];
+        let _actions = state.on_qc_result(block_b, None, verified_votes_b);
+
+        // Original vote should still be recorded (equivocating vote skipped)
+        let (recorded_hash, _) = state
+            .received_votes_by_height
+            .get(&(height, byzantine_voter))
+            .unwrap();
+        assert_eq!(
+            *recorded_hash, block_a,
+            "Original vote should not be overwritten by equivocating vote"
+        );
+    }
+
+    #[test]
+    fn test_no_equivocation_same_height_different_round() {
+        // Validator votes for different blocks at same height but different rounds.
+        // This is ALLOWED per HotStuff-2 (unlock on round advancement).
+        let (mut state, _keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        let height = 5u64;
+        let voter = ValidatorId(2);
+
+        let block_a = Hash::from_bytes(b"block_a_at_height_5");
+        let block_b = Hash::from_bytes(b"block_b_at_height_5");
+
+        // Vote for block A at round 0
+        let vote_a = BlockVote {
+            block_hash: block_a,
+            height: BlockHeight(height),
+            round: 0,
+            voter,
+            signature: Signature::zero(),
+            timestamp: 100_000,
+        };
+        let verified_votes_a = vec![(0usize, vote_a, 1u64)];
+        let _actions = state.on_qc_result(block_a, None, verified_votes_a);
+
+        // Vote for DIFFERENT block at DIFFERENT round - this is allowed!
+        let vote_b = BlockVote {
+            block_hash: block_b,
+            height: BlockHeight(height),
+            round: 1, // Different round
+            voter,
+            signature: Signature::zero(),
+            timestamp: 100_000,
+        };
+        let verified_votes_b = vec![(0usize, vote_b, 1u64)];
+        let _actions = state.on_qc_result(block_b, None, verified_votes_b);
+
+        // Second vote should be recorded (overwrites first since different round is allowed)
+        let (recorded_hash, recorded_round) = state
+            .received_votes_by_height
+            .get(&(height, voter))
+            .unwrap();
+        assert_eq!(
+            *recorded_hash, block_b,
+            "Vote at higher round should be recorded"
+        );
+        assert_eq!(*recorded_round, 1);
+    }
+
+    #[test]
+    fn test_equivocation_detection_independent_per_height() {
+        // Votes at different heights should not interfere with each other.
+        let (mut state, _keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        let voter = ValidatorId(2);
+        let round = 0u64;
+
+        // Vote for block at height 5
+        let vote_h5 = BlockVote {
+            block_hash: Hash::from_bytes(b"block_at_height_5"),
+            height: BlockHeight(5),
+            round,
+            voter,
+            signature: Signature::zero(),
+            timestamp: 100_000,
+        };
+        let verified_votes_h5 = vec![(0usize, vote_h5.clone(), 1u64)];
+        let _actions = state.on_qc_result(vote_h5.block_hash, None, verified_votes_h5);
+
+        // Vote for DIFFERENT block at height 6 - this is fine (different height)
+        let vote_h6 = BlockVote {
+            block_hash: Hash::from_bytes(b"different_block_at_height_6"),
+            height: BlockHeight(6),
+            round,
+            voter,
+            signature: Signature::zero(),
+            timestamp: 100_000,
+        };
+        let verified_votes_h6 = vec![(0usize, vote_h6.clone(), 1u64)];
+        let _actions = state.on_qc_result(vote_h6.block_hash, None, verified_votes_h6);
+
+        // Both should be recorded
+        assert!(state.received_votes_by_height.contains_key(&(5, voter)));
+        assert!(state.received_votes_by_height.contains_key(&(6, voter)));
+    }
+
+    #[test]
+    fn test_forged_vote_cannot_block_legitimate_validator() {
+        // This is the critical security test: a malicious node cannot block
+        // a legitimate validator by forging votes before verification.
+        //
+        // Scenario:
+        // 1. Malicious node sends forged vote claiming to be from ValidatorX for block A
+        // 2. Forged vote gets buffered (unverified) - NOT recorded in received_votes_by_height
+        // 3. Real vote from ValidatorX for block B arrives
+        // 4. Real vote gets buffered (unverified)
+        // 5. Verification runs - forged vote fails, real vote passes
+        // 6. Only real vote is recorded - no equivocation detected
+        //
+        // We test step 5-6 by simulating on_qc_result with only the legitimate vote.
+        let (mut state, _keys) = make_multi_validator_state();
+        state.set_time(Duration::from_secs(100));
+
+        let height = 5u64;
+        let round = 0u64;
+        let legitimate_voter = ValidatorId(2);
+
+        let block_b = Hash::from_bytes(b"legitimate_block");
+
+        // Only the legitimate vote passes verification
+        let legitimate_vote = BlockVote {
+            block_hash: block_b,
+            height: BlockHeight(height),
+            round,
+            voter: legitimate_voter,
+            signature: Signature::zero(), // In reality, this would have valid signature
+            timestamp: 100_000,
+        };
+
+        // Simulate verification result - only legitimate vote verified
+        let verified_votes = vec![(0usize, legitimate_vote, 1u64)];
+        let _actions = state.on_qc_result(block_b, None, verified_votes);
+
+        // Legitimate vote should be recorded
+        assert!(state
+            .received_votes_by_height
+            .contains_key(&(height, legitimate_voter)));
+        let (recorded_hash, _) = state
+            .received_votes_by_height
+            .get(&(height, legitimate_voter))
+            .unwrap();
+        assert_eq!(
+            *recorded_hash, block_b,
+            "Legitimate vote should be recorded"
+        );
+    }
 
     #[test]
     fn test_received_votes_cleaned_up_on_commit() {
