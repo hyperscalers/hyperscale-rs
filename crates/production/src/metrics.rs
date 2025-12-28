@@ -98,6 +98,7 @@ pub struct Metrics {
     pub storage_votes_persisted: Counter,
     pub storage_certificates_persisted: Counter,
     pub storage_blocks_persisted: Counter,
+    pub storage_transactions_persisted: Counter,
 
     // === Network ===
     pub libp2p_peers_connected: Gauge,
@@ -445,6 +446,12 @@ impl Metrics {
             storage_blocks_persisted: register_counter!(
                 "hyperscale_storage_blocks_persisted_total",
                 "Total number of blocks persisted to storage"
+            )
+            .unwrap(),
+
+            storage_transactions_persisted: register_counter!(
+                "hyperscale_storage_transactions_persisted_total",
+                "Total number of transactions persisted to storage"
             )
             .unwrap(),
 
@@ -866,6 +873,13 @@ pub fn record_certificate_persisted() {
 /// Record a block persisted.
 pub fn record_block_persisted() {
     metrics().storage_blocks_persisted.inc();
+}
+
+/// Record transactions persisted (call once per transaction).
+pub fn record_transactions_persisted(count: usize) {
+    metrics()
+        .storage_transactions_persisted
+        .inc_by(count as f64);
 }
 
 /// Update libp2p peer count.

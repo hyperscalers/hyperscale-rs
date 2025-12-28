@@ -641,7 +641,8 @@ impl RocksDbStorage {
         batch.put_cf(blocks_cf, height_key, metadata_value);
 
         // 2. Store transactions (deduplicated - RocksDB overwrites are idempotent)
-        for tx in &block.transactions {
+        // Must store all transaction sections: retry, priority, and normal
+        for tx in block.all_transactions() {
             let tx_hash = tx.hash();
             let tx_value =
                 sbor::basic_encode(tx.as_ref()).expect("transaction encoding must succeed");
@@ -664,6 +665,7 @@ impl RocksDbStorage {
         metrics::record_rocksdb_write(elapsed);
         metrics::record_storage_operation("put_block_denormalized", elapsed);
         metrics::record_block_persisted();
+        metrics::record_transactions_persisted(block.transaction_count());
     }
 
     /// Get a committed block by height (reconstructs from denormalized storage).

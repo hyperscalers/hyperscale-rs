@@ -2235,6 +2235,15 @@
           "expr": "avg(rate(hyperscale_storage_votes_persisted_total[1m]))",
           "legendFormat": "Votes (avg/validator)",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "avg(rate(hyperscale_storage_transactions_persisted_total[1m]))",
+          "legendFormat": "Transactions (avg/validator)",
+          "refId": "D"
         }
       ],
       "title": "Avg Storage Write Rate per Validator",
