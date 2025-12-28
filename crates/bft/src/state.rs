@@ -2,6 +2,15 @@
 //!
 //! This module implements the BFT consensus state machine
 //! as a synchronous, event-driven model.
+//!
+//! # Data Availability Guarantee
+//!
+//! Validators only vote for blocks after receiving ALL transaction and certificate
+//! data. This is enforced in [`BftState::on_block_header`] which checks `is_complete()`
+//! before voting. Incomplete blocks wait for data via gossip or fetch.
+//!
+//! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
+//! the complete block data, making it recoverable from any honest validator in that set.
 
 use hyperscale_core::{Action, Event, OutboundMessage, TimerId};
 
@@ -3592,19 +3601,15 @@ impl BftState {
     /// Handle permanent fetch failure for a block.
     ///
     /// Called when the runner gives up on fetching transactions/certificates
-    /// after max retries. We remove the pending block and any associated buffered
-    /// commit to allow sync to be triggered.
+    /// after max retries.
     ///
-    /// IMPORTANT: If a QC has been formed for this block, we MUST NOT give up.
-    /// The block is committed in the consensus view and we need its data to make
-    /// progress. In this case, we restart the fetch instead of removing the block.
+    /// # Behavior
     ///
-    /// TODO: This is a quick fix for a data availability issue. We need to think
-    /// more carefully about DA guarantees:
-    /// - Should we require complete block data before voting?
-    /// - Should proposers persist block data before broadcasting?
-    /// - How do we handle the case where the proposer is the only one with the data
-    ///   and they crash/disappear?
+    /// - **Pre-QC**: Block is kept in `pending_blocks` (may complete via gossip later).
+    ///   Stale blocks are cleaned up by `stale_pending_block_timeout`.
+    /// - **Post-QC**: Fetch is restarted indefinitely. The block is committed in consensus
+    ///   and we MUST eventually get the data. Per our DA guarantee (see module docs),
+    ///   other validators who voted have the data and will serve it.
     #[instrument(skip(self), fields(block_hash = ?block_hash))]
     pub fn on_fetch_failed(&mut self, block_hash: Hash) -> Vec<Action> {
         // Check if this block has a QC - if so, we MUST get the data eventually
