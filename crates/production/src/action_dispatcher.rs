@@ -74,7 +74,7 @@ pub enum DispatchableAction {
     /// Queue a state certificate for batched broadcast.
     QueueStateCertificate {
         shard: ShardGroupId,
-        certificate: hyperscale_types::StateCertificate,
+        certificate: std::sync::Arc<hyperscale_types::StateCertificate>,
     },
 
     /// Queue a state provision for batched broadcast.
@@ -187,7 +187,7 @@ async fn process_dispatched_action(
         DispatchableAction::QueueStateCertificate { shard, certificate } => {
             context
                 .message_batcher
-                .queue_certificate(*shard, certificate.clone());
+                .queue_certificate(*shard, std::sync::Arc::unwrap_or_clone(certificate.clone()));
         }
 
         DispatchableAction::QueueStateProvision { shard, provision } => {

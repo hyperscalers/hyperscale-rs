@@ -676,7 +676,9 @@ impl SimulationRunner {
             }
 
             Action::BroadcastStateCertificate { shard, certificate } => {
-                let event = Event::StateCertificateReceived { cert: certificate };
+                let event = Event::StateCertificateReceived {
+                    cert: Arc::unwrap_or_clone(certificate),
+                };
                 let peers = self.network.peers_in_shard(shard);
                 for to in peers {
                     if to != from {

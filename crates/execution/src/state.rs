@@ -145,7 +145,7 @@ pub struct ExecutionState {
 
     /// State certificates from vote aggregation (local shard's certificate).
     /// Maps tx_hash -> StateCertificate
-    state_certificates: HashMap<Hash, StateCertificate>,
+    state_certificates: HashMap<Hash, Arc<StateCertificate>>,
 
     /// Pending certificate aggregations waiting for BLS aggregation callback.
     /// Maps tx_hash -> PendingCertificateAggregation
@@ -727,7 +727,7 @@ impl ExecutionState {
             .iter()
             .chain(tx.declared_writes.iter())
             .filter(|&node_id| self.shard_for_node(node_id) == local_shard)
-            .cloned()
+            .copied()
             .collect();
         owned_nodes.sort();
         owned_nodes.dedup();
@@ -865,7 +865,7 @@ impl ExecutionState {
 
         // Check if we're tracking this transaction
         if !self.vote_trackers.contains_key(&tx_hash) {
-            // Check if certificate already exists
+            // Not tracking - check if certificate already exists
             if self.state_certificates.contains_key(&tx_hash) {
                 return vec![];
             }
@@ -892,7 +892,6 @@ impl ExecutionState {
 
         // Check if we've already verified this exact vote (by tx_hash + validator).
         // This happens when votes are gossiped multiple times or during retries.
-        // Avoids redundant crypto work.
         if self
             .verified_state_votes
             .contains_key(&(tx_hash, validator_id))
@@ -1139,14 +1138,15 @@ impl ExecutionState {
             "State certificate aggregation complete"
         );
 
-        // Store certificate
-        self.state_certificates.insert(tx_hash, certificate.clone());
+        let certificate = Arc::new(certificate);
+        self.state_certificates
+            .insert(tx_hash, Arc::clone(&certificate));
 
-        // Broadcast certificate to all participating shards (runner handles batching)
+        // Broadcast certificate to all participating shards
         for target_shard in pending.participating_shards {
             actions.push(Action::BroadcastStateCertificate {
                 shard: target_shard,
-                certificate: certificate.clone(),
+                certificate: Arc::clone(&certificate),
             });
         }
 
@@ -1175,7 +1175,7 @@ impl ExecutionState {
 
         // Check if we're tracking this transaction
         if !self.certificate_trackers.contains_key(&tx_hash) {
-            // Check if already finalized
+            // Not tracking - check if already finalized
             if self.finalized_certificates.contains_key(&tx_hash) {
                 return vec![];
             }
@@ -1263,7 +1263,7 @@ impl ExecutionState {
             return vec![];
         }
 
-        self.handle_certificate_internal(certificate)
+        self.handle_certificate_internal(Arc::new(certificate))
     }
 
     /// Handle verification result for a fetched certificate's StateCertificate.
@@ -1404,7 +1404,7 @@ impl ExecutionState {
         tx_hash = %cert.transaction_hash,
         cert_shard = cert.shard_group_id.0,
     ))]
-    fn handle_certificate_internal(&mut self, cert: StateCertificate) -> Vec<Action> {
+    fn handle_certificate_internal(&mut self, cert: Arc<StateCertificate>) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = cert.transaction_hash;
         let cert_shard = cert.shard_group_id;
@@ -1420,7 +1420,7 @@ impl ExecutionState {
             return actions;
         };
 
-        let complete = tracker.add_certificate(cert);
+        let complete = tracker.add_certificate(Arc::unwrap_or_clone(cert));
 
         if complete {
             tracing::debug!(
@@ -1627,32 +1627,27 @@ impl ExecutionState {
             .committed_height
             .saturating_sub(VERIFIED_VOTE_RETENTION_BLOCKS);
 
-        // Collect tx_hashes that have all votes older than cutoff
-        let mut tx_hashes_to_clean = Vec::new();
-        for (tx_hash, validators) in &self.verified_votes_by_tx {
-            // Check if all votes for this tx are old
-            let all_old = validators.iter().all(|vid| {
-                self.verified_state_votes
-                    .get(&(*tx_hash, *vid))
-                    .map(|h| *h <= cutoff)
-                    .unwrap_or(true)
-            });
-            if all_old {
-                tx_hashes_to_clean.push(*tx_hash);
-            }
-        }
-
-        // Clean up old entries
+        // Single-pass: prune old votes directly from verified_state_votes,
+        // then clean up verified_votes_by_tx for entries with no remaining votes.
         let mut pruned_count = 0;
-        for tx_hash in tx_hashes_to_clean {
-            if let Some(validators) = self.verified_votes_by_tx.remove(&tx_hash) {
-                for vid in validators {
-                    if self.verified_state_votes.remove(&(tx_hash, vid)).is_some() {
-                        pruned_count += 1;
-                    }
+
+        // Remove old votes from verified_state_votes and track which tx_hashes need cleanup
+        self.verified_state_votes.retain(|(tx_hash, vid), height| {
+            if *height <= cutoff {
+                // Vote is old, remove it. Also remove from the by_tx index.
+                if let Some(validators) = self.verified_votes_by_tx.get_mut(tx_hash) {
+                    validators.remove(vid);
                 }
+                pruned_count += 1;
+                false
+            } else {
+                true
             }
-        }
+        });
+
+        // Clean up empty entries in verified_votes_by_tx
+        self.verified_votes_by_tx
+            .retain(|_, validators| !validators.is_empty());
 
         if pruned_count > 0 {
             tracing::debug!(
@@ -1798,13 +1793,11 @@ impl ExecutionState {
 
         // Clean up pending verifications using reverse index
         let mut removed_cert_count = 0;
-        if let Some(keys) = self.pending_verifications_by_tx.get_mut(tx_hash) {
-            let keys_to_remove: Vec<_> = keys.iter().cloned().collect();
-            for key in keys_to_remove {
+        if let Some(keys) = self.pending_verifications_by_tx.remove(tx_hash) {
+            for key in keys {
                 match key {
                     PendingVerificationKey::Certificate(shard) => {
                         self.pending_cert_verifications.remove(&(*tx_hash, shard));
-                        keys.remove(&key);
                         removed_cert_count += 1;
                     }
                 }
@@ -2084,7 +2077,7 @@ impl ExecutionState {
             // Get the read set from the transaction's declared_reads
             let read_set: HashSet<NodeId> = tx_map
                 .get(&tx_hash)
-                .map(|tx| tx.declared_reads.iter().cloned().collect())
+                .map(|tx| tx.declared_reads.iter().copied().collect())
                 .unwrap_or_default();
 
             // Index for fast invalidation
@@ -2132,22 +2125,30 @@ impl ExecutionState {
             return;
         }
 
-        // Find speculative txs that read from any written node
-        let mut to_invalidate = HashSet::new();
-        for node_id in &written_nodes {
-            if let Some(tx_hashes) = self.speculative_reads_index.get(node_id) {
-                to_invalidate.extend(tx_hashes.iter().cloned());
-            }
-        }
+        // Single-pass: collect tx_hashes to invalidate by iterating written nodes,
+        // then remove each speculative result. We avoid cloning by collecting
+        // into a Vec directly (HashSet dedup happens via speculative_results.remove).
+        //
+        // Note: We can't inline the removal because remove_speculative_result
+        // mutates speculative_reads_index, which we're reading from.
+        let to_invalidate: Vec<Hash> = written_nodes
+            .iter()
+            .filter_map(|node_id| self.speculative_reads_index.get(node_id))
+            .flatten()
+            .copied()
+            .collect();
 
-        // Remove invalidated results
+        // Remove invalidated results (speculative_results.remove handles dedup)
         for tx_hash in to_invalidate {
-            self.remove_speculative_result(&tx_hash);
-            self.speculative_invalidated_count += 1;
-            tracing::debug!(
-                tx_hash = ?tx_hash,
-                "Invalidated speculative execution due to state conflict"
-            );
+            // Only count and log if we actually removed something (handles duplicates)
+            if self.speculative_results.contains_key(&tx_hash) {
+                self.remove_speculative_result(&tx_hash);
+                self.speculative_invalidated_count += 1;
+                tracing::debug!(
+                    tx_hash = ?tx_hash,
+                    "Invalidated speculative execution due to state conflict"
+                );
+            }
         }
     }
 

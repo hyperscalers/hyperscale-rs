@@ -63,7 +63,7 @@ pub enum Action {
     /// for efficiency. State machines emit individual certificates.
     BroadcastStateCertificate {
         shard: ShardGroupId,
-        certificate: StateCertificate,
+        certificate: Arc<StateCertificate>,
     },
 
     /// Broadcast a state provision to a target shard.

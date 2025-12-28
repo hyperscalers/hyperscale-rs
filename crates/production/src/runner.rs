@@ -1801,7 +1801,7 @@ impl ProductionRunner {
                     .dispatch_tx
                     .send(DispatchableAction::QueueStateCertificate {
                         shard,
-                        certificate: certificate.clone(),
+                        certificate: Arc::clone(&certificate),
                     })
                     .is_err()
                 {

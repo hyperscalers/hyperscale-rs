@@ -435,7 +435,9 @@ impl SimNode {
             }
 
             Action::BroadcastStateCertificate { shard, certificate } => {
-                let batch = hyperscale_messages::StateCertificateBatch::single(certificate);
+                let batch = hyperscale_messages::StateCertificateBatch::single(
+                    Arc::unwrap_or_clone(certificate),
+                );
                 let message = OutboundMessage::StateCertificateBatch(batch);
                 self.outbound_messages
                     .push((Destination::Shard(shard), Arc::new(message)));
