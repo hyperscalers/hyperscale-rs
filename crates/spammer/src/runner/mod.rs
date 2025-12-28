@@ -346,9 +346,6 @@ impl Spammer {
                     }
                 } else {
                     self.stats.rejected.fetch_add(1, Ordering::SeqCst);
-                    if let Some(error) = result.error {
-                        warn!(error = %error, "Transaction rejected");
-                    }
                 }
             }
             Err(e) => {
