@@ -19,6 +19,25 @@ members = [
     "crates/test-helpers",
 ]
 
+default-members = [
+    "crates/types",
+    "crates/core",
+    "crates/messages",
+    "crates/bft",
+    "crates/engine",
+    "crates/execution",
+    "crates/livelock",
+    "crates/mempool",
+    "crates/provisions",
+    "crates/node",
+    "crates/simulation",
+    "crates/simulator",
+    "crates/production",
+    "crates/spammer",
+    "crates/parallel",
+    "crates/test-helpers",
+]
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
@@ -54,23 +73,23 @@ tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1.44"
 
 # Radix vendor dependencies (from vendor/radixdlt-scrypto submodule)
-radix-blueprint-schema-init = { path = "vendor/radixdlt-scrypto/radix-blueprint-schema-init", default-features = false }
-radix-common = { path = "vendor/radixdlt-scrypto/radix-common", default-features = false }
+radix-blueprint-schema-init = { path = "vendor/radixdlt-scrypto/radix-blueprint-schema-init", default-features = false, features = ["std"] }
+radix-common = { path = "vendor/radixdlt-scrypto/radix-common", default-features = false, features = ["std"] }
 radix-common-derive = { path = "vendor/radixdlt-scrypto/radix-common-derive", default-features = false }
-radix-engine = { path = "vendor/radixdlt-scrypto/radix-engine", default-features = false }
-radix-engine-interface = { path = "vendor/radixdlt-scrypto/radix-engine-interface", default-features = false }
+radix-engine = { path = "vendor/radixdlt-scrypto/radix-engine", default-features = false, features = ["std"] }
+radix-engine-interface = { path = "vendor/radixdlt-scrypto/radix-engine-interface", default-features = false, features = ["std"] }
 radix-engine-profiling = { path = "vendor/radixdlt-scrypto/radix-engine-profiling", default-features = false }
 radix-engine-profiling-derive = { path = "vendor/radixdlt-scrypto/radix-engine-profiling-derive", default-features = false }
-radix-native-sdk = { path = "vendor/radixdlt-scrypto/radix-native-sdk", default-features = false }
-radix-rust = { path = "vendor/radixdlt-scrypto/radix-rust", default-features = false }
+radix-native-sdk = { path = "vendor/radixdlt-scrypto/radix-native-sdk", default-features = false, features = ["std"] }
+radix-rust = { path = "vendor/radixdlt-scrypto/radix-rust", default-features = false, features = ["std"] }
 radix-sbor-derive = { path = "vendor/radixdlt-scrypto/radix-sbor-derive", default-features = false }
-radix-substate-store-impls = { path = "vendor/radixdlt-scrypto/radix-substate-store-impls", default-features = false }
-radix-substate-store-interface = { path = "vendor/radixdlt-scrypto/radix-substate-store-interface", default-features = false }
-radix-transactions = { path = "vendor/radixdlt-scrypto/radix-transactions", default-features = false }
-sbor = { path = "vendor/radixdlt-scrypto/sbor", default-features = false }
+radix-substate-store-impls = { path = "vendor/radixdlt-scrypto/radix-substate-store-impls", default-features = false, features = ["std"] }
+radix-substate-store-interface = { path = "vendor/radixdlt-scrypto/radix-substate-store-interface", default-features = false, features = ["std"] }
+radix-transactions = { path = "vendor/radixdlt-scrypto/radix-transactions", default-features = false, features = ["std"] }
+sbor = { path = "vendor/radixdlt-scrypto/sbor", default-features = false, features = ["std"] }
 sbor-derive = { path = "vendor/radixdlt-scrypto/sbor-derive", default-features = false }
 sbor-derive-common = { path = "vendor/radixdlt-scrypto/sbor-derive-common", default-features = false }
-scrypto = { path = "vendor/radixdlt-scrypto/scrypto", default-features = false }
+scrypto = { path = "vendor/radixdlt-scrypto/scrypto", default-features = false, features = ["std"] }
 scrypto-derive = { path = "vendor/radixdlt-scrypto/scrypto-derive", default-features = false }
 
 # Radix workspace dependencies (versions matching vendor/radixdlt-scrypto)
