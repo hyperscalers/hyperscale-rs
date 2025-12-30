@@ -31,13 +31,11 @@ pub fn generate_ed25519_keypair() -> Ed25519PrivateKey {
 
 /// Generate a new random BLS12-381 keypair.
 ///
-/// Uses a random u64 seed to generate a valid BLS private key.
+/// Uses a random 32-byte seed with blst's key_gen for proper key derivation.
 pub fn generate_bls_keypair() -> Bls12381G1PrivateKey {
-    let seed = rand::random::<u64>();
-    // Use from_u64 which always creates a valid BLS scalar
-    // Ensure seed is non-zero to avoid zero key issues
-    let seed = if seed == 0 { 1 } else { seed };
-    Bls12381G1PrivateKey::from_u64(seed).expect("non-zero u64 should produce valid key")
+    let mut ikm = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut ikm);
+    bls_keypair_from_seed(&ikm)
 }
 
 /// Generate an Ed25519 keypair from a seed (deterministic, for testing/simulation).
@@ -47,14 +45,16 @@ pub fn ed25519_keypair_from_seed(seed: &[u8; 32]) -> Ed25519PrivateKey {
 
 /// Generate a BLS12-381 keypair from a seed (deterministic, for testing/simulation).
 ///
-/// Uses the u64 representation of the first 8 bytes of the seed.
+/// Uses blst's key_gen which hashes the full seed to derive a valid BLS scalar.
+/// This is the proper way to deterministically generate BLS keys from arbitrary seeds.
 pub fn bls_keypair_from_seed(seed: &[u8; 32]) -> Bls12381G1PrivateKey {
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&seed[..8]);
-    let u64_seed = u64::from_le_bytes(bytes);
-    // Ensure seed is non-zero to avoid zero key issues
-    let u64_seed = if u64_seed == 0 { 1 } else { u64_seed };
-    Bls12381G1PrivateKey::from_u64(u64_seed).expect("non-zero u64 should produce valid key")
+    // Use blst's key_gen which properly hashes the seed to derive a valid scalar
+    let blst_sk = blst::min_pk::SecretKey::key_gen(seed, &[]).expect("key_gen should not fail");
+
+    // Convert to radix-common type
+    // blst secret key is a 32-byte scalar in big-endian format
+    let sk_bytes = blst_sk.to_bytes();
+    Bls12381G1PrivateKey::from_bytes(&sk_bytes).expect("valid BLS scalar bytes")
 }
 
 /// Create a zero/placeholder Ed25519 signature for testing.
@@ -304,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn test_keypair_from_seed() {
+    fn test_ed25519_keypair_from_seed() {
         let seed = [42u8; 32];
 
         let kp1 = ed25519_keypair_from_seed(&seed);
@@ -313,6 +313,39 @@ mod tests {
         let msg = b"test";
         assert_eq!(kp1.sign(msg).0, kp2.sign(msg).0);
         assert_eq!(kp1.public_key(), kp2.public_key());
+    }
+
+    #[test]
+    fn test_bls_keypair_from_seed() {
+        // Same seed should produce same key
+        let seed = [42u8; 32];
+        let kp1 = bls_keypair_from_seed(&seed);
+        let kp2 = bls_keypair_from_seed(&seed);
+        assert_eq!(kp1.public_key(), kp2.public_key());
+
+        // Different seeds should produce different keys
+        let mut seed2 = [0u8; 32];
+        seed2[31] = 1; // Only differ in last byte
+        let kp3 = bls_keypair_from_seed(&seed2);
+        assert_ne!(kp1.public_key(), kp3.public_key());
+
+        // Seeds with zeros in first 8 bytes but different later should still differ
+        // (This was the bug: only first 8 bytes were used)
+        let mut seed_a = [0u8; 32];
+        seed_a[30] = 0x30; // "09" at end (like validator 0)
+        seed_a[31] = 0x39;
+
+        let mut seed_b = [0u8; 32];
+        seed_b[30] = 0x30; // "0:" at end (like validator 1)
+        seed_b[31] = 0x3a;
+
+        let kp_a = bls_keypair_from_seed(&seed_a);
+        let kp_b = bls_keypair_from_seed(&seed_b);
+        assert_ne!(
+            kp_a.public_key(),
+            kp_b.public_key(),
+            "Keys should differ even when first 8 bytes are identical"
+        );
     }
 
     #[test]
