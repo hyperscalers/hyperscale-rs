@@ -12,14 +12,15 @@ use std::collections::HashMap;
 fn test_recovered_votes_prevent_equivocation() {
     use hyperscale_bft::{BftConfig, BftState};
     use hyperscale_types::{
-        BlockHeader, BlockHeight, KeyPair, QuorumCertificate, Signature, SignerBitfield,
-        StaticTopology, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
+        generate_bls_keypair, zero_bls_signature, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
+        QuorumCertificate, SignerBitfield, StaticTopology, ValidatorId, ValidatorInfo,
+        ValidatorSet, VotePower,
     };
     use std::sync::Arc;
     use std::time::Duration;
 
     // Create keys for 4 validators
-    let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+    let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
 
     let validators: Vec<ValidatorInfo> = keys
         .iter()
@@ -47,7 +48,10 @@ fn test_recovered_votes_prevent_equivocation() {
 
     let mut state = BftState::new(
         1,
-        keys[1].clone(),
+        {
+            let key_bytes = keys[1].to_bytes();
+            Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+        },
         topology,
         BftConfig::default(),
         recovered,
@@ -71,7 +75,7 @@ fn test_recovered_votes_prevent_equivocation() {
         parent_block_hash: Hash::from_bytes(b"grandparent_3_aaaaaaaaaaa"),
         round: 0,
         signers: signers.clone(),
-        aggregated_signature: Signature::zero(),
+        aggregated_signature: zero_bls_signature(),
         voting_power: VotePower(3),
         weighted_timestamp_ms: 99000,
     };
@@ -152,10 +156,13 @@ fn test_recovered_votes_prevent_equivocation() {
 #[test]
 fn test_stale_votes_pruned_on_recovery() {
     use hyperscale_bft::{BftConfig, BftState};
-    use hyperscale_types::{KeyPair, StaticTopology, ValidatorId, ValidatorInfo, ValidatorSet};
+    use hyperscale_types::{
+        generate_bls_keypair, Bls12381G1PrivateKey, StaticTopology, ValidatorId, ValidatorInfo,
+        ValidatorSet,
+    };
     use std::sync::Arc;
 
-    let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+    let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
 
     let validators: Vec<ValidatorInfo> = keys
         .iter()
@@ -186,7 +193,10 @@ fn test_stale_votes_pruned_on_recovery() {
 
     let state = BftState::new(
         0,
-        keys[0].clone(),
+        {
+            let key_bytes = keys[0].to_bytes();
+            Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+        },
         topology,
         BftConfig::default(),
         recovered,
@@ -225,12 +235,13 @@ fn test_stale_votes_pruned_on_recovery() {
 fn test_chain_metadata_recovery() {
     use hyperscale_bft::{BftConfig, BftState};
     use hyperscale_types::{
-        BlockHeight, KeyPair, QuorumCertificate, Signature, SignerBitfield, StaticTopology,
-        ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
+        generate_bls_keypair, zero_bls_signature, BlockHeight, Bls12381G1PrivateKey,
+        QuorumCertificate, SignerBitfield, StaticTopology, ValidatorId, ValidatorInfo,
+        ValidatorSet, VotePower,
     };
     use std::sync::Arc;
 
-    let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+    let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
 
     let validators: Vec<ValidatorInfo> = keys
         .iter()
@@ -256,7 +267,7 @@ fn test_chain_metadata_recovery() {
         parent_block_hash: Hash::from_bytes(b"parent_block_hash_aaaaaaaa"),
         round: 0,
         signers,
-        aggregated_signature: Signature::zero(),
+        aggregated_signature: zero_bls_signature(),
         voting_power: VotePower(3),
         weighted_timestamp_ms: 12345,
     };
@@ -270,7 +281,10 @@ fn test_chain_metadata_recovery() {
 
     let state = BftState::new(
         0,
-        keys[0].clone(),
+        {
+            let key_bytes = keys[0].to_bytes();
+            Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+        },
         topology,
         BftConfig::default(),
         recovered,
@@ -287,10 +301,13 @@ fn test_chain_metadata_recovery() {
 #[test]
 fn test_fresh_start_with_default_recovered_state() {
     use hyperscale_bft::{BftConfig, BftState};
-    use hyperscale_types::{KeyPair, StaticTopology, ValidatorId, ValidatorInfo, ValidatorSet};
+    use hyperscale_types::{
+        generate_bls_keypair, Bls12381G1PrivateKey, StaticTopology, ValidatorId, ValidatorInfo,
+        ValidatorSet,
+    };
     use std::sync::Arc;
 
-    let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+    let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
 
     let validators: Vec<ValidatorInfo> = keys
         .iter()
@@ -307,7 +324,10 @@ fn test_fresh_start_with_default_recovered_state() {
     // Fresh start - no recovered state
     let state = BftState::new(
         0,
-        keys[0].clone(),
+        {
+            let key_bytes = keys[0].to_bytes();
+            Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+        },
         topology,
         BftConfig::default(),
         RecoveredState::default(),

@@ -1,6 +1,8 @@
 //! Quorum certificate for BFT consensus.
 
-use crate::{BlockHeight, Hash, Signature, SignerBitfield, VotePower};
+use crate::{
+    zero_bls_signature, BlockHeight, Bls12381G2Signature, Hash, SignerBitfield, VotePower,
+};
 use sbor::prelude::*;
 
 /// A quorum certificate proving 2f+1 validators voted for a block.
@@ -24,7 +26,7 @@ pub struct QuorumCertificate {
     pub signers: SignerBitfield,
 
     /// Aggregated BLS signature from all signers.
-    pub aggregated_signature: Signature,
+    pub aggregated_signature: Bls12381G2Signature,
 
     /// Total voting power represented by this QC.
     pub voting_power: VotePower,
@@ -45,7 +47,7 @@ impl QuorumCertificate {
             parent_block_hash: Hash::ZERO,
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(0),
             weighted_timestamp_ms: 0,
         }
@@ -127,7 +129,7 @@ mod tests {
             parent_block_hash: parent_hash,
             round: 0,
             signers,
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 1000,
         };

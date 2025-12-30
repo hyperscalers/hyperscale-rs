@@ -306,7 +306,7 @@ pub fn decode_direct_message(data: &[u8]) -> Result<DecodedMessage, CodecError> 
 mod tests {
     use super::*;
     use hyperscale_types::{
-        BlockHeader, BlockHeight, BlockVote, Hash, QuorumCertificate, Signature, ValidatorId,
+        BlockHeader, BlockHeight, BlockVote, Hash, QuorumCertificate, ValidatorId,
     };
     use std::collections::HashMap;
 
@@ -369,7 +369,7 @@ mod tests {
             height: BlockHeight(1),
             voter: ValidatorId(0),
             round: 0,
-            signature: Signature::zero(),
+            signature: hyperscale_types::zero_bls_signature(),
             timestamp: 0,
         };
         let gossip = BlockVoteGossip { vote: vote.clone() };

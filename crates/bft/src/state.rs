@@ -29,9 +29,9 @@ pub struct BftStats {
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockVote, CommitmentProof, Hash, KeyPair, PublicKey,
-    QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, Topology,
-    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
+    Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    CommitmentProof, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
+    Topology, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
 };
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -108,7 +108,7 @@ pub struct BftState {
     node_index: NodeIndex,
 
     /// Signing key for votes and proposals.
-    signing_key: KeyPair,
+    signing_key: Bls12381G1PrivateKey,
 
     /// Network topology (single source of truth for committee/shard info).
     topology: Arc<dyn Topology>,
@@ -279,7 +279,7 @@ impl BftState {
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
     pub fn new(
         node_index: NodeIndex,
-        signing_key: KeyPair,
+        signing_key: Bls12381G1PrivateKey,
         topology: Arc<dyn Topology>,
         config: BftConfig,
         recovered: RecoveredState,
@@ -358,7 +358,7 @@ impl BftState {
     }
 
     /// Get public key for a validator.
-    fn public_key(&self, validator_id: ValidatorId) -> Option<PublicKey> {
+    fn public_key(&self, validator_id: ValidatorId) -> Option<Bls12381G1PublicKey> {
         self.topology.public_key(validator_id)
     }
 
@@ -1436,7 +1436,7 @@ impl BftState {
     /// Collect public keys for QC signers (helper for delegated verification).
     ///
     /// Returns the public keys for all signers in committee order, or None if any key is missing.
-    fn collect_qc_signer_keys(&self, _qc: &QuorumCertificate) -> Option<Vec<PublicKey>> {
+    fn collect_qc_signer_keys(&self, _qc: &QuorumCertificate) -> Option<Vec<Bls12381G1PublicKey>> {
         let committee_size = self.topology.local_committee_size();
         let mut pubkeys = Vec::with_capacity(committee_size);
 
@@ -1928,7 +1928,7 @@ impl BftState {
         let signing_message =
             Self::block_vote_message(self.shard_group, height, round, &block_hash);
         let sign_start = std::time::Instant::now();
-        let signature = self.signing_key.sign(&signing_message);
+        let signature = self.signing_key.sign_v1(&signing_message);
         tracing::Span::current().record("sign_us", sign_start.elapsed().as_micros() as u64);
         let timestamp = self.now.as_millis() as u64;
 
@@ -4296,11 +4296,13 @@ impl BftState {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        Signature, SignerBitfield, StaticTopology, ValidatorInfo, ValidatorSet,
+        batch_verify_bls_same_message, generate_bls_keypair, verify_bls12381_v1,
+        zero_bls_signature, Bls12381G2Signature, SignerBitfield, StaticTopology, ValidatorInfo,
+        ValidatorSet,
     };
 
     fn make_test_state() -> BftState {
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
 
         // Create validator set with ValidatorInfo
         let validators: Vec<ValidatorInfo> = keys
@@ -4317,9 +4319,13 @@ mod tests {
         // Create topology
         let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
 
+        // Clone key bytes to create a new keypair since Bls12381G1PrivateKey doesn't impl Clone
+        let key_bytes = keys[0].to_bytes();
+        let signing_key = Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
+
         BftState::new(
             0,
-            keys[0].clone(),
+            signing_key,
             topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -4502,7 +4508,7 @@ mod tests {
         use hyperscale_core::Action;
         use hyperscale_types::SignerBitfield;
 
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -4516,7 +4522,10 @@ mod tests {
         let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
         let mut state = BftState::new(
             1,
-            keys[1].clone(),
+            {
+                let key_bytes = keys[1].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
             topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -4541,7 +4550,7 @@ mod tests {
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
             round: 0,
-            aggregated_signature: Signature::zero(), // Dummy for test
+            aggregated_signature: zero_bls_signature(), // Dummy for test
             signers,
             voting_power: VotePower(3),
             weighted_timestamp_ms: 99_000,
@@ -4583,7 +4592,7 @@ mod tests {
         use hyperscale_core::Action;
         use hyperscale_types::SignerBitfield;
 
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -4597,7 +4606,10 @@ mod tests {
         let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
         let mut state = BftState::new(
             1,
-            keys[1].clone(),
+            {
+                let key_bytes = keys[1].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
             topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -4621,7 +4633,7 @@ mod tests {
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
             round: 0,
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             signers,
             voting_power: VotePower(3),
             weighted_timestamp_ms: 99_000,
@@ -4667,7 +4679,7 @@ mod tests {
     fn test_qc_signature_verified_failure_rejects_block() {
         use hyperscale_types::SignerBitfield;
 
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -4681,7 +4693,10 @@ mod tests {
         let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
         let mut state = BftState::new(
             1,
-            keys[1].clone(),
+            {
+                let key_bytes = keys[1].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
             topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -4705,7 +4720,7 @@ mod tests {
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
             round: 0,
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             signers,
             voting_power: VotePower(3),
             weighted_timestamp_ms: 99_000,
@@ -4760,7 +4775,7 @@ mod tests {
     fn test_genesis_qc_skips_verification() {
         use hyperscale_core::Action;
 
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -4774,7 +4789,10 @@ mod tests {
         let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
         let mut state = BftState::new(
             1,
-            keys[1].clone(),
+            {
+                let key_bytes = keys[1].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
             topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -4839,7 +4857,7 @@ mod tests {
     fn test_advance_round_proposer_broadcasts() {
         use hyperscale_core::Action;
 
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -4855,7 +4873,10 @@ mod tests {
         let topology = Arc::new(StaticTopology::new(ValidatorId(2), 1, validator_set));
         let mut state = BftState::new(
             2,
-            keys[2].clone(),
+            {
+                let key_bytes = keys[2].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
             topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -4916,7 +4937,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"parent"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 100_000,
         };
@@ -4951,7 +4972,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"parent"),
             round: 10,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 100_000,
         };
@@ -4975,7 +4996,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"parent"),
             round: 10,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 100_000,
         };
@@ -5208,8 +5229,8 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Helper to create a state with multiple validators for vote testing
-    fn make_multi_validator_state() -> (BftState, Vec<KeyPair>) {
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+    fn make_multi_validator_state() -> (BftState, Vec<Bls12381G1PrivateKey>) {
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -5223,7 +5244,10 @@ mod tests {
         let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
         let state = BftState::new(
             0,
-            keys[0].clone(),
+            {
+                let key_bytes = keys[0].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
             topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -5381,7 +5405,7 @@ mod tests {
             height: BlockHeight(height),
             round,
             voter: byzantine_voter,
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
             timestamp: 100_000,
         };
 
@@ -5406,7 +5430,7 @@ mod tests {
             height: BlockHeight(height),
             round,
             voter: byzantine_voter,
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
             timestamp: 100_000,
         };
 
@@ -5444,7 +5468,7 @@ mod tests {
             height: BlockHeight(height),
             round: 0,
             voter,
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
             timestamp: 100_000,
         };
         let verified_votes_a = vec![(0usize, vote_a, 1u64)];
@@ -5456,7 +5480,7 @@ mod tests {
             height: BlockHeight(height),
             round: 1, // Different round
             voter,
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
             timestamp: 100_000,
         };
         let verified_votes_b = vec![(0usize, vote_b, 1u64)];
@@ -5489,7 +5513,7 @@ mod tests {
             height: BlockHeight(5),
             round,
             voter,
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
             timestamp: 100_000,
         };
         let verified_votes_h5 = vec![(0usize, vote_h5.clone(), 1u64)];
@@ -5501,7 +5525,7 @@ mod tests {
             height: BlockHeight(6),
             round,
             voter,
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
             timestamp: 100_000,
         };
         let verified_votes_h6 = vec![(0usize, vote_h6.clone(), 1u64)];
@@ -5541,7 +5565,7 @@ mod tests {
             height: BlockHeight(height),
             round,
             voter: legitimate_voter,
-            signature: Signature::zero(), // In reality, this would have valid signature
+            signature: zero_bls_signature(), // In reality, this would have valid signature
             timestamp: 100_000,
         };
 
@@ -5858,7 +5882,7 @@ mod tests {
             parent_block_hash: Hash::ZERO,
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 100_000,
         };
@@ -5916,7 +5940,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"parent_1"),
             round: 3, // Different round from our votes
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 100_000,
         };
@@ -5959,7 +5983,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"parent"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 100_000,
         };
@@ -6037,7 +6061,7 @@ mod tests {
         // This is the correct HotStuff-2 behavior: on view change without QC,
         // validators are free to vote for new blocks. The new proposer creates
         // a fallback block to ensure liveness.
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -6053,7 +6077,10 @@ mod tests {
         let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
         let mut state = BftState::new(
             0,
-            keys[0].clone(),
+            {
+                let key_bytes = keys[0].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
             topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -6147,7 +6174,7 @@ mod tests {
     fn test_view_change_without_lock_creates_fallback() {
         // Scenario: View change when we haven't voted at this height yet.
         // Should create a fallback block (empty block).
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -6163,7 +6190,10 @@ mod tests {
         let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
         let mut state = BftState::new(
             0,
-            keys[0].clone(),
+            {
+                let key_bytes = keys[0].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
             topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -6234,7 +6264,7 @@ mod tests {
             parent_block_hash: Hash::ZERO,
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 100_000,
         };
@@ -6381,7 +6411,7 @@ mod tests {
                 height: BlockHeight(height),
                 round: 1,
                 voter: ValidatorId(0),
-                signature: keys[0].sign(block_hash_r1.as_bytes()),
+                signature: keys[0].sign_v1(block_hash_r1.as_bytes()),
                 timestamp: 100_000,
             },
             1,
@@ -6396,7 +6426,7 @@ mod tests {
                 height: BlockHeight(height),
                 round: 2,
                 voter: ValidatorId(1),
-                signature: keys[1].sign(block_hash_r2.as_bytes()),
+                signature: keys[1].sign_v1(block_hash_r2.as_bytes()),
                 timestamp: 100_001,
             },
             1,
@@ -6411,7 +6441,7 @@ mod tests {
                 height: BlockHeight(height),
                 round: 3,
                 voter: ValidatorId(2),
-                signature: keys[2].sign(block_hash_r3.as_bytes()),
+                signature: keys[2].sign_v1(block_hash_r3.as_bytes()),
                 timestamp: 100_002,
             },
             1,
@@ -6426,7 +6456,7 @@ mod tests {
                 height: BlockHeight(6),
                 round: 0,
                 voter: ValidatorId(3),
-                signature: keys[3].sign(block_hash_h6.as_bytes()),
+                signature: keys[3].sign_v1(block_hash_h6.as_bytes()),
                 timestamp: 100_003,
             },
             1,
@@ -6493,7 +6523,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 100_000,
         };
@@ -6540,7 +6570,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 100_000,
         };
@@ -6591,7 +6621,7 @@ mod tests {
         use hyperscale_core::Action;
         use hyperscale_types::SignerBitfield;
 
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -6605,7 +6635,10 @@ mod tests {
         let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
         let mut state = BftState::new(
             1,
-            keys[0].clone(),
+            {
+                let key_bytes = keys[0].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
             topology,
             BftConfig::default(),
             RecoveredState::default(),
@@ -6629,7 +6662,7 @@ mod tests {
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
             round: 0,
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             signers: signers.clone(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 99_000,
@@ -6792,7 +6825,7 @@ mod tests {
                 tx_arc.hash(),
                 ShardGroupId(1),
                 SignerBitfield::new(4),
-                Signature::zero(),
+                zero_bls_signature(),
                 BlockHeight(1),
                 vec![StateEntry::test_entry(node, 0, vec![], None)],
             ))
@@ -7079,7 +7112,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 1000,
         };
@@ -7142,7 +7175,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 1000,
         };
@@ -7189,7 +7222,7 @@ mod tests {
         // Test that the min_block_interval config is respected.
         use hyperscale_types::{DeferReason, TransactionDefer};
 
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -7210,7 +7243,10 @@ mod tests {
 
         let mut state = BftState::new(
             0,
-            keys[0].clone(),
+            {
+                let key_bytes = keys[0].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
             topology,
             config,
             RecoveredState::default(),
@@ -7228,7 +7264,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 1000,
         };
@@ -7273,7 +7309,7 @@ mod tests {
         // Test that setting min_block_interval to zero disables rate limiting.
         use hyperscale_types::{DeferReason, TransactionDefer};
 
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
             .enumerate()
@@ -7294,7 +7330,10 @@ mod tests {
 
         let mut state = BftState::new(
             0,
-            keys[0].clone(),
+            {
+                let key_bytes = keys[0].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
             topology,
             config,
             RecoveredState::default(),
@@ -7310,7 +7349,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 1000,
         };
@@ -7369,7 +7408,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 5000,
         });
@@ -7442,11 +7481,11 @@ mod tests {
             .collect();
 
         // Aggregate public keys (what the runner does)
-        let aggregated_pk = hyperscale_types::PublicKey::aggregate_bls(&signer_keys)
-            .expect("Aggregation should succeed");
+        let aggregated_pk =
+            Bls12381G1PublicKey::aggregate(&signer_keys, true).expect("Aggregation should succeed");
 
         // Verify the QC signature - THIS IS THE CRITICAL TEST
-        let valid = aggregated_pk.verify(&signing_message, &qc.aggregated_signature);
+        let valid = verify_bls12381_v1(&signing_message, &aggregated_pk, &qc.aggregated_signature);
         assert!(
             valid,
             "QC signature should verify successfully with real BLS signatures"
@@ -7454,15 +7493,11 @@ mod tests {
 
         // Also verify that batch verification works
         let signatures: Vec<_> = (0..3)
-            .map(|i| committee.keypair(i).sign(&signing_message))
+            .map(|i| committee.keypair(i).sign_v1(&signing_message))
             .collect();
         let pubkeys: Vec<_> = (0..3).map(|i| committee.public_key(i).clone()).collect();
 
-        let batch_valid = hyperscale_types::PublicKey::batch_verify_bls_same_message(
-            &signing_message,
-            &signatures,
-            &pubkeys,
-        );
+        let batch_valid = batch_verify_bls_same_message(&signing_message, &signatures, &pubkeys);
         assert!(batch_valid, "Batch verification should also succeed");
     }
 
@@ -7486,11 +7521,11 @@ mod tests {
 
         // Verify the signature manually
         let message = hyperscale_types::block_vote_message(shard, 1, 0, &block_hash);
-        let valid = committee.public_key(0).verify(&message, &vote.signature);
+        let valid = verify_bls12381_v1(&message, committee.public_key(0), &vote.signature);
         assert!(valid, "Block vote signature should verify");
 
         // Verify with wrong key fails
-        let invalid = committee.public_key(1).verify(&message, &vote.signature);
+        let invalid = verify_bls12381_v1(&message, committee.public_key(1), &vote.signature);
         assert!(!invalid, "Block vote should NOT verify with wrong key");
     }
 
@@ -7507,19 +7542,15 @@ mod tests {
         // All validators sign the same message
         let message = hyperscale_types::block_vote_message(shard, height, round, &block_hash);
 
-        let signatures: Vec<Signature> = (0..3)
-            .map(|i| committee.keypair(i).sign(&message))
+        let signatures: Vec<Bls12381G2Signature> = (0..3)
+            .map(|i| committee.keypair(i).sign_v1(&message))
             .collect();
 
-        let pubkeys: Vec<hyperscale_types::PublicKey> =
+        let pubkeys: Vec<Bls12381G1PublicKey> =
             (0..3).map(|i| committee.public_key(i).clone()).collect();
 
         // Batch verify all signatures at once (same message optimization)
-        let valid = hyperscale_types::PublicKey::batch_verify_bls_same_message(
-            &message,
-            &signatures,
-            &pubkeys,
-        );
+        let valid = batch_verify_bls_same_message(&message, &signatures, &pubkeys);
         assert!(
             valid,
             "Batch verification should succeed for valid signatures"
@@ -7539,24 +7570,20 @@ mod tests {
         let message = hyperscale_types::block_vote_message(shard, height, round, &block_hash);
 
         // First two are valid, third is signed with wrong key
-        let signatures: Vec<Signature> = vec![
-            committee.keypair(0).sign(&message),
-            committee.keypair(1).sign(&message),
-            committee.keypair(3).sign(&message), // Wrong key! (claims to be validator 2)
+        let signatures: Vec<Bls12381G2Signature> = vec![
+            committee.keypair(0).sign_v1(&message),
+            committee.keypair(1).sign_v1(&message),
+            committee.keypair(3).sign_v1(&message), // Wrong key! (claims to be validator 2)
         ];
 
-        let pubkeys: Vec<hyperscale_types::PublicKey> = vec![
+        let pubkeys: Vec<Bls12381G1PublicKey> = vec![
             committee.public_key(0).clone(),
             committee.public_key(1).clone(),
             committee.public_key(2).clone(), // But we're verifying with key 2
         ];
 
         // Batch verification should fail
-        let valid = hyperscale_types::PublicKey::batch_verify_bls_same_message(
-            &message,
-            &signatures,
-            &pubkeys,
-        );
+        let valid = batch_verify_bls_same_message(&message, &signatures, &pubkeys);
         assert!(
             !valid,
             "Batch verification should fail when one signature is invalid"
@@ -7578,25 +7605,25 @@ mod tests {
         // Simulate vote collection and aggregation (what vote_set.rs does)
         let voter_indices = [0, 1, 2];
 
-        let signatures: Vec<Signature> = voter_indices
+        let signatures: Vec<Bls12381G2Signature> = voter_indices
             .iter()
-            .map(|&i| committee.keypair(i).sign(&message))
+            .map(|&i| committee.keypair(i).sign_v1(&message))
             .collect();
 
         // Aggregate signatures (what happens when building QC)
         let aggregated_sig =
-            Signature::aggregate_bls(&signatures).expect("Aggregation should succeed");
+            Bls12381G2Signature::aggregate(&signatures, true).expect("Aggregation should succeed");
 
         // Aggregate public keys of signers
-        let signer_pks: Vec<hyperscale_types::PublicKey> = voter_indices
+        let signer_pks: Vec<Bls12381G1PublicKey> = voter_indices
             .iter()
             .map(|&i| committee.public_key(i).clone())
             .collect();
-        let aggregated_pk = hyperscale_types::PublicKey::aggregate_bls(&signer_pks)
+        let aggregated_pk = Bls12381G1PublicKey::aggregate(&signer_pks, true)
             .expect("PK aggregation should succeed");
 
         // Verify aggregated signature against aggregated public key
-        let valid = aggregated_pk.verify(&message, &aggregated_sig);
+        let valid = verify_bls12381_v1(&message, &aggregated_pk, &aggregated_sig);
         assert!(valid, "Aggregated QC signature should verify");
     }
 
@@ -7616,7 +7643,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 100_000,
         };
@@ -7703,7 +7730,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: old_timestamp,
         };
@@ -7920,7 +7947,7 @@ mod tests {
             parent_block_hash: Hash::ZERO,
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 1000,
         };
@@ -7947,7 +7974,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 100_000,
         };
@@ -7987,7 +8014,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: parent_timestamp,
         };
@@ -8073,7 +8100,7 @@ mod tests {
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
             signers: SignerBitfield::empty(),
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 100_000,
         };

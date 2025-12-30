@@ -18,8 +18,8 @@
 
 use hyperscale_core::{Action, Event};
 use hyperscale_types::{
-    BlockHeight, CommitmentProof, Hash, NodeId, PublicKey, ShardGroupId, Signature, SignerBitfield,
-    StateEntry, StateProvision, Topology, ValidatorId,
+    BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof, Hash, NodeId,
+    ShardGroupId, SignerBitfield, StateEntry, StateProvision, Topology, ValidatorId,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -78,9 +78,10 @@ pub struct ProvisionCoordinator {
     // Provision Lifecycle (Deferred Verification)
     // ═══════════════════════════════════════════════════════════════════
     /// Unverified provisions, buffered until we have enough for quorum.
-    /// Key: (tx_hash, source_shard) -> Vec<(StateProvision, PublicKey)>
+    /// Key: (tx_hash, source_shard) -> Vec<(StateProvision, Bls12381G1PublicKey)>
     /// We store the public key alongside to avoid re-lookup when verifying.
-    unverified_provisions: HashMap<(Hash, ShardGroupId), Vec<(StateProvision, PublicKey)>>,
+    unverified_provisions:
+        HashMap<(Hash, ShardGroupId), Vec<(StateProvision, Bls12381G1PublicKey)>>,
 
     /// Tracks which validators we've already received provisions from (for dedup).
     /// Key: (tx_hash, validator_id)
@@ -333,10 +334,7 @@ impl ProvisionCoordinator {
             .iter()
             .map(|(p, _)| p.clone())
             .collect();
-        let public_keys: Vec<_> = provisions_with_keys
-            .iter()
-            .map(|(_, pk)| pk.clone())
-            .collect();
+        let public_keys: Vec<_> = provisions_with_keys.iter().map(|(_, pk)| *pk).collect();
 
         // Get block height and entries from first provision (all should match)
         let block_height = provisions
@@ -643,8 +641,8 @@ impl ProvisionCoordinator {
         }
 
         // Aggregate BLS signatures from all provisions
-        let signatures: Vec<Signature> = provisions.iter().map(|p| p.signature.clone()).collect();
-        let aggregated_signature = Signature::aggregate_bls(&signatures)
+        let signatures: Vec<Bls12381G2Signature> = provisions.iter().map(|p| p.signature).collect();
+        let aggregated_signature = Bls12381G2Signature::aggregate(&signatures, true)
             .expect("BLS aggregation should succeed for valid provision signatures");
 
         Some(CommitmentProof::new(
@@ -769,17 +767,18 @@ impl ProvisionCoordinator {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        state_provision_message, KeyPair, KeyType, StaticTopology, ValidatorInfo, ValidatorSet,
+        bls_keypair_from_seed, state_provision_message, zero_bls_signature, Bls12381G1PrivateKey,
+        StaticTopology, ValidatorInfo, ValidatorSet,
     };
 
     fn make_test_topology(local_shard: ShardGroupId) -> Arc<dyn Topology> {
         // Create deterministic BLS keypairs for 6 validators (2 shards × 3 validators)
-        let keypairs: Vec<_> = (0..6)
+        let keypairs: Vec<Bls12381G1PrivateKey> = (0..6)
             .map(|i| {
                 let mut seed = [0u8; 32];
                 seed[0] = i as u8;
                 seed[1] = 42; // Fixed seed for determinism
-                KeyPair::from_seed(KeyType::Bls12381, &seed)
+                bls_keypair_from_seed(&seed)
             })
             .collect();
 
@@ -810,7 +809,7 @@ mod tests {
         let mut seed = [0u8; 32];
         seed[0] = validator_id.0 as u8;
         seed[1] = 42;
-        let keypair = KeyPair::from_seed(KeyType::Bls12381, &seed);
+        let keypair = bls_keypair_from_seed(&seed);
 
         let target_shard = ShardGroupId(0);
         let block_height = BlockHeight(1);
@@ -822,7 +821,7 @@ mod tests {
             block_height,
             &entry_hashes,
         );
-        let signature = keypair.sign(&message);
+        let signature = keypair.sign_v1(&message);
 
         StateProvision {
             transaction_hash: tx_hash,
@@ -845,7 +844,7 @@ mod tests {
         let mut seed = [0u8; 32];
         seed[0] = validator_id.0 as u8;
         seed[1] = 42;
-        let keypair = KeyPair::from_seed(KeyType::Bls12381, &seed);
+        let keypair = bls_keypair_from_seed(&seed);
 
         let entries: Vec<_> = node_ids
             .into_iter()
@@ -862,7 +861,7 @@ mod tests {
             block_height,
             &entry_hashes,
         );
-        let signature = keypair.sign(&message);
+        let signature = keypair.sign_v1(&message);
 
         StateProvision {
             transaction_hash: tx_hash,
@@ -1094,7 +1093,7 @@ mod tests {
             tx_hash,
             ShardGroupId(1),
             SignerBitfield::new(4),
-            Signature::zero(),
+            zero_bls_signature(),
             BlockHeight(1),
             vec![],
         );
@@ -1127,7 +1126,7 @@ mod tests {
             tx_hash,
             ShardGroupId(1),
             SignerBitfield::new(4),
-            Signature::zero(),
+            zero_bls_signature(),
             BlockHeight(1),
             vec![],
         );
@@ -1388,15 +1387,19 @@ mod tests {
 
         // Verify the signature using the signing_message method
         let message = provision.signing_message();
-        let valid = committee
-            .public_key(0)
-            .verify(&message, &provision.signature);
+        let valid = hyperscale_types::verify_bls12381_v1(
+            &message,
+            committee.public_key(0),
+            &provision.signature,
+        );
         assert!(valid, "Provision signature should verify");
 
         // Verify with wrong key fails
-        let invalid = committee
-            .public_key(1)
-            .verify(&message, &provision.signature);
+        let invalid = hyperscale_types::verify_bls12381_v1(
+            &message,
+            committee.public_key(1),
+            &provision.signature,
+        );
         assert!(!invalid, "Provision should NOT verify with wrong key");
     }
 
@@ -1424,32 +1427,29 @@ mod tests {
             &entry_hashes,
         );
 
-        let signatures: Vec<hyperscale_types::Signature> = (0..3)
-            .map(|i| committee.keypair(i).sign(&message))
+        let signatures: Vec<hyperscale_types::Bls12381G2Signature> = (0..3)
+            .map(|i| committee.keypair(i).sign_v1(&message))
             .collect();
 
-        let pubkeys: Vec<hyperscale_types::PublicKey> =
-            (0..3).map(|i| committee.public_key(i).clone()).collect();
+        let pubkeys: Vec<hyperscale_types::Bls12381G1PublicKey> =
+            (0..3).map(|i| *committee.public_key(i)).collect();
 
         // Batch verify (what VerifyAndAggregateProvisions does)
-        let valid = hyperscale_types::PublicKey::batch_verify_bls_same_message(
-            &message,
-            &signatures,
-            &pubkeys,
-        );
+        let valid =
+            hyperscale_types::batch_verify_bls_same_message(&message, &signatures, &pubkeys);
         assert!(
             valid,
             "Batch verification should succeed for valid signatures"
         );
 
         // Aggregate signatures to create CommitmentProof
-        let aggregated = hyperscale_types::Signature::aggregate_bls(&signatures)
+        let aggregated = hyperscale_types::Bls12381G2Signature::aggregate(&signatures, true)
             .expect("Aggregation should succeed");
 
         // Verify aggregated signature
-        let agg_pk = hyperscale_types::PublicKey::aggregate_bls(&pubkeys)
+        let agg_pk = hyperscale_types::Bls12381G1PublicKey::aggregate(&pubkeys, true)
             .expect("PK aggregation should succeed");
-        let agg_valid = agg_pk.verify(&message, &aggregated);
+        let agg_valid = hyperscale_types::verify_bls12381_v1(&message, &agg_pk, &aggregated);
         assert!(agg_valid, "Aggregated provision signature should verify");
     }
 
@@ -1477,24 +1477,21 @@ mod tests {
         );
 
         // Two valid signatures, one bad (signed with wrong key)
-        let signatures: Vec<hyperscale_types::Signature> = vec![
-            committee.keypair(0).sign(&message),
-            committee.keypair(1).sign(&message),
-            committee.keypair(3).sign(&message), // Wrong! Should be keypair 2
+        let signatures: Vec<hyperscale_types::Bls12381G2Signature> = vec![
+            committee.keypair(0).sign_v1(&message),
+            committee.keypair(1).sign_v1(&message),
+            committee.keypair(3).sign_v1(&message), // Wrong! Should be keypair 2
         ];
 
-        let pubkeys: Vec<hyperscale_types::PublicKey> = vec![
-            committee.public_key(0).clone(),
-            committee.public_key(1).clone(),
-            committee.public_key(2).clone(), // Verifying with key 2
+        let pubkeys: Vec<hyperscale_types::Bls12381G1PublicKey> = vec![
+            *committee.public_key(0),
+            *committee.public_key(1),
+            *committee.public_key(2), // Verifying with key 2
         ];
 
         // Batch verification should fail
-        let valid = hyperscale_types::PublicKey::batch_verify_bls_same_message(
-            &message,
-            &signatures,
-            &pubkeys,
-        );
+        let valid =
+            hyperscale_types::batch_verify_bls_same_message(&message, &signatures, &pubkeys);
         assert!(
             !valid,
             "Batch verification should fail with one bad signature"

@@ -21,9 +21,11 @@ use quick_cache::sync::Cache as QuickCache;
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
-    Block, BlockHeader, BlockMetadata, BlockVote, CommitmentProof, Hash, KeyPair, PublicKey,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
-    StateVoteBlock, Topology, TransactionCertificate, ValidatorId, VotePower,
+    batch_verify_bls_different_messages, batch_verify_bls_same_message, verify_bls12381_v1,
+    zero_bls_signature, Block, BlockHeader, BlockMetadata, BlockVote, Bls12381G1PrivateKey,
+    Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof, Hash, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, SignerBitfield, StateVoteBlock, Topology,
+    TransactionCertificate, ValidatorId, VotePower,
 };
 use libp2p::identity;
 use sbor::prelude::*;
@@ -99,7 +101,7 @@ impl PendingCrossShardExecutions {
 struct PendingStateCerts {
     /// State certificates waiting for verification.
     /// Each entry contains: (certificate, public_keys for the shard)
-    certs: Vec<(hyperscale_types::StateCertificate, Vec<PublicKey>)>,
+    certs: Vec<(hyperscale_types::StateCertificate, Vec<Bls12381G1PublicKey>)>,
 }
 
 impl PendingStateCerts {
@@ -107,7 +109,7 @@ impl PendingStateCerts {
         self.certs.is_empty()
     }
 
-    fn take(&mut self) -> Vec<(hyperscale_types::StateCertificate, Vec<PublicKey>)> {
+    fn take(&mut self) -> Vec<(hyperscale_types::StateCertificate, Vec<Bls12381G1PublicKey>)> {
         std::mem::take(&mut self.certs)
     }
 
@@ -127,7 +129,7 @@ impl PendingStateCerts {
 /// inherent network latency.
 ///
 /// Batched state votes: (tx_hash, votes) where each vote is (vote, public_key, voting_power).
-type BatchedStateVotes = Vec<(Hash, Vec<(StateVoteBlock, PublicKey, u64)>)>;
+type BatchedStateVotes = Vec<(Hash, Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>)>;
 
 #[derive(Default)]
 struct PendingStateVotes {
@@ -142,7 +144,7 @@ impl PendingStateVotes {
         self.items.is_empty()
     }
 
-    fn push(&mut self, tx_hash: Hash, votes: Vec<(StateVoteBlock, PublicKey, u64)>) {
+    fn push(&mut self, tx_hash: Hash, votes: Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>) {
         self.vote_count += votes.len();
         self.items.push((tx_hash, votes));
     }
@@ -191,7 +193,7 @@ struct PendingGossipedCertBatch {
         TransactionCertificate,
         ShardGroupId,
         hyperscale_types::StateCertificate,
-        Vec<PublicKey>,
+        Vec<Bls12381G1PublicKey>,
     )>,
 }
 
@@ -207,7 +209,7 @@ impl PendingGossipedCertBatch {
         TransactionCertificate,
         ShardGroupId,
         hyperscale_types::StateCertificate,
-        Vec<PublicKey>,
+        Vec<Bls12381G1PublicKey>,
     )> {
         std::mem::take(&mut self.items)
     }
@@ -271,14 +273,14 @@ impl Drop for ShutdownHandle {
 /// ```no_run
 /// use hyperscale_production::{ProductionRunner, Libp2pConfig, RocksDbStorage, RocksDbConfig};
 /// use hyperscale_bft::BftConfig;
-/// use hyperscale_types::KeyPair;
+/// use hyperscale_types::{generate_bls_keypair, Bls12381G1PrivateKey};
 /// use libp2p::identity;
 /// use std::sync::Arc;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// // Create required dependencies
 /// let topology = todo!("Create topology from genesis or config");
-/// let signing_key = KeyPair::generate_bls();
+/// let signing_key = generate_bls_keypair();
 /// let bft_config = BftConfig::default();
 /// let storage = RocksDbStorage::open_with_config(
 ///     "/tmp/hyperscale-db",
@@ -301,7 +303,7 @@ impl Drop for ShutdownHandle {
 /// ```
 pub struct ProductionRunnerBuilder {
     topology: Option<Arc<dyn Topology>>,
-    signing_key: Option<KeyPair>,
+    signing_key: Option<Bls12381G1PrivateKey>,
     bft_config: Option<BftConfig>,
     thread_pools: Option<Arc<ThreadPoolManager>>,
     storage: Option<Arc<RocksDbStorage>>,
@@ -369,7 +371,7 @@ impl ProductionRunnerBuilder {
     }
 
     /// Set the BLS signing key for votes and proposals.
-    pub fn signing_key(mut self, key: KeyPair) -> Self {
+    pub fn signing_key(mut self, key: Bls12381G1PrivateKey) -> Self {
         self.signing_key = Some(key);
         self
     }
@@ -518,8 +520,11 @@ impl ProductionRunnerBuilder {
         // Load RecoveredState from storage for crash recovery
         let recovered = storage.load_recovered_state();
 
-        // Clone signing key for runner's state vote signing (state machine also needs it)
-        let runner_signing_key = signing_key.clone();
+        // Clone signing key bytes for runner's state vote signing (state machine also needs it)
+        // Bls12381G1PrivateKey doesn't impl Clone
+        let key_bytes = signing_key.to_bytes();
+        let runner_signing_key =
+            Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
 
         // NodeIndex is a simulation concept - production uses 0
         let state = NodeStateMachine::with_speculative_config(
@@ -828,7 +833,7 @@ pub struct ProductionRunner {
     /// Deadline for flushing pending state votes. None if none pending.
     state_vote_deadline: Option<tokio::time::Instant>,
     /// Signing key for state vote signing (cloned from state machine).
-    signing_key: KeyPair,
+    signing_key: Bls12381G1PrivateKey,
     /// Message batcher for execution layer messages (votes, certificates, provisions).
     /// Accumulates items and flushes periodically to reduce network overhead.
     /// Note: Now primarily used by action dispatcher, kept here for direct access if needed.
@@ -1385,7 +1390,7 @@ impl ProductionRunner {
                                 // Add each shard's state cert to the batch for verification
                                 for (shard_id, state_cert) in &certificate.shard_proofs {
                                     let committee = self.topology.committee_for_shard(*shard_id);
-                                    let public_keys: Vec<PublicKey> = committee
+                                    let public_keys: Vec<Bls12381G1PublicKey> = committee
                                         .iter()
                                         .filter_map(|&vid| self.topology.public_key(vid))
                                         .collect();
@@ -1863,22 +1868,22 @@ impl ProductionRunner {
 
                     // Start with already-verified votes (e.g., our own vote)
                     let mut all_verified: Vec<(usize, BlockVote, u64)> = already_verified;
-                    let mut all_signatures: Vec<Signature> = all_verified
+                    let mut all_signatures: Vec<Bls12381G2Signature> = all_verified
                         .iter()
-                        .map(|(_, v, _)| v.signature.clone())
+                        .map(|(_, v, _)| v.signature)
                         .collect();
 
                     // Extract signatures and public keys from votes to verify
-                    let signatures: Vec<Signature> =
-                        votes_to_verify.iter().map(|(_, v, _, _)| v.signature.clone()).collect();
-                    let public_keys: Vec<PublicKey> =
-                        votes_to_verify.iter().map(|(_, _, pk, _)| pk.clone()).collect();
+                    let signatures: Vec<Bls12381G2Signature> =
+                        votes_to_verify.iter().map(|(_, v, _, _)| v.signature).collect();
+                    let public_keys: Vec<Bls12381G1PublicKey> =
+                        votes_to_verify.iter().map(|(_, _, pk, _)| *pk).collect();
 
                     // Batch verify all new signatures (same message optimization)
                     let batch_valid = if votes_to_verify.is_empty() {
                         true
                     } else {
-                        PublicKey::batch_verify_bls_same_message(
+                        batch_verify_bls_same_message(
                             &signing_message,
                             &signatures,
                             &public_keys,
@@ -1888,7 +1893,7 @@ impl ProductionRunner {
                     if batch_valid {
                         // Happy path: all new signatures valid, add them to verified set
                         for (idx, vote, _, power) in votes_to_verify {
-                            all_signatures.push(vote.signature.clone());
+                            all_signatures.push(vote.signature);
                             all_verified.push((idx, vote, power));
                         }
                     } else {
@@ -1900,8 +1905,8 @@ impl ProductionRunner {
                         );
 
                         for (idx, vote, pk, power) in &votes_to_verify {
-                            if pk.verify(&signing_message, &vote.signature) {
-                                all_signatures.push(vote.signature.clone());
+                            if verify_bls12381_v1(&signing_message, pk, &vote.signature) {
+                                all_signatures.push(vote.signature);
                                 all_verified.push((*idx, vote.clone(), *power));
                             } else {
                                 crate::metrics::record_signature_verification_failure();
@@ -1919,7 +1924,7 @@ impl ProductionRunner {
                     // Check if we have quorum with all verified votes
                     if VotePower::has_quorum(verified_power, total_voting_power) && !all_signatures.is_empty() {
                         // Build QC - aggregate signatures
-                        let qc = match Signature::aggregate_bls(&all_signatures) {
+                        let qc = match Bls12381G2Signature::aggregate(&all_signatures, true) {
                             Ok(aggregated_signature) => {
                                 // Sort votes by committee index for deterministic bitfield
                                 let mut sorted_votes = all_verified.clone();
@@ -2014,8 +2019,8 @@ impl ProductionRunner {
                     // We only fall back to individual verification if the aggregate fails
                     // (indicating a Byzantine validator submitted a bad signature).
 
-                    let signatures: Vec<Signature> =
-                        provisions.iter().map(|p| p.signature.clone()).collect();
+                    let signatures: Vec<Bls12381G2Signature> =
+                        provisions.iter().map(|p| p.signature).collect();
 
                     // Happy path: try aggregate verification first (single pairing)
                     let message = provisions
@@ -2023,11 +2028,8 @@ impl ProductionRunner {
                         .map(|p| p.signing_message())
                         .unwrap_or_default();
 
-                    let all_valid = PublicKey::batch_verify_bls_same_message(
-                        &message,
-                        &signatures,
-                        &public_keys,
-                    );
+                    let all_valid =
+                        batch_verify_bls_same_message(&message, &signatures, &public_keys);
 
                     let (verified_provisions, commitment_proof) = if all_valid {
                         // Fast path: all signatures valid, build proof directly
@@ -2040,8 +2042,9 @@ impl ProductionRunner {
                             }
                         }
 
-                        let aggregated_signature = Signature::aggregate_bls(&signatures)
-                            .unwrap_or_else(|_| Signature::zero());
+                        let aggregated_signature =
+                            Bls12381G2Signature::aggregate(&signatures, true)
+                                .unwrap_or_else(|_| zero_bls_signature());
 
                         let proof = CommitmentProof::new(
                             tx_hash,
@@ -2068,9 +2071,9 @@ impl ProductionRunner {
                         let mut signer_indices = Vec::new();
 
                         for (provision, pk) in provisions.iter().zip(public_keys.iter()) {
-                            if pk.verify(&message, &provision.signature) {
+                            if verify_bls12381_v1(&message, pk, &provision.signature) {
                                 verified.push(provision.clone());
-                                valid_sigs.push(provision.signature.clone());
+                                valid_sigs.push(provision.signature);
                                 if let Some(idx) = topology
                                     .committee_index_for_shard(source_shard, provision.validator_id)
                                 {
@@ -2092,8 +2095,9 @@ impl ProductionRunner {
                                 signers.set(*idx);
                             }
 
-                            let aggregated_signature = Signature::aggregate_bls(&valid_sigs)
-                                .unwrap_or_else(|_| Signature::zero());
+                            let aggregated_signature =
+                                Bls12381G2Signature::aggregate(&valid_sigs, true)
+                                    .unwrap_or_else(|_| zero_bls_signature());
 
                             Some(CommitmentProof::new(
                                 tx_hash,
@@ -2150,21 +2154,14 @@ impl ProductionRunner {
                         .collect();
 
                     // Aggregate BLS signatures from unique votes only
-                    let bls_signatures: Vec<_> = unique_votes
-                        .iter()
-                        .filter_map(|vote| match &vote.signature {
-                            hyperscale_types::Signature::Bls12381(_) => {
-                                Some(vote.signature.clone())
-                            }
-                            _ => None,
-                        })
-                        .collect();
+                    let bls_signatures: Vec<Bls12381G2Signature> =
+                        unique_votes.iter().map(|vote| vote.signature).collect();
 
                     let aggregated_signature = if !bls_signatures.is_empty() {
-                        Signature::aggregate_bls(&bls_signatures)
-                            .unwrap_or_else(|_| Signature::zero())
+                        Bls12381G2Signature::aggregate(&bls_signatures, true)
+                            .unwrap_or_else(|_| zero_bls_signature())
                     } else {
-                        Signature::zero()
+                        zero_bls_signature()
                     };
 
                     // Create signer bitfield
@@ -2267,7 +2264,7 @@ impl ProductionRunner {
                         .iter()
                         .enumerate()
                         .filter(|(i, _)| qc.signers.is_set(*i))
-                        .map(|(_, pk)| pk.clone())
+                        .map(|(_, pk)| *pk)
                         .collect();
 
                     let valid = if signer_keys.is_empty() {
@@ -2275,10 +2272,12 @@ impl ProductionRunner {
                         false
                     } else {
                         // Verify aggregated BLS signature against domain-separated message
-                        match hyperscale_types::PublicKey::aggregate_bls(&signer_keys) {
-                            Ok(aggregated_pk) => {
-                                aggregated_pk.verify(&signing_message, &qc.aggregated_signature)
-                            }
+                        match Bls12381G1PublicKey::aggregate(&signer_keys, true) {
+                            Ok(aggregated_pk) => verify_bls12381_v1(
+                                &signing_message,
+                                &aggregated_pk,
+                                &qc.aggregated_signature,
+                            ),
                             Err(_) => false,
                         }
                     };
@@ -2313,7 +2312,10 @@ impl ProductionRunner {
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
                 let thread_pools = self.thread_pools.clone();
-                let signing_key = self.signing_key.clone();
+                // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
+                let key_bytes = self.signing_key.to_bytes();
+                let signing_key =
+                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
                 let local_shard = self.local_shard;
                 let validator_id = self.topology.local_validator_id();
 
@@ -2352,7 +2354,7 @@ impl ProductionRunner {
                                     local_shard,
                                     success,
                                 );
-                                let signature = signing_key.sign(&message);
+                                let signature = signing_key.sign_v1(&message);
 
                                 StateVoteBlock {
                                     transaction_hash: tx_hash,
@@ -2398,7 +2400,10 @@ impl ProductionRunner {
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
                 let thread_pools = self.thread_pools.clone();
-                let signing_key = self.signing_key.clone();
+                // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
+                let key_bytes = self.signing_key.to_bytes();
+                let signing_key =
+                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
                 let local_shard = self.local_shard;
                 let validator_id = self.topology.local_validator_id();
 
@@ -2434,7 +2439,7 @@ impl ProductionRunner {
                                     local_shard,
                                     success,
                                 );
-                                let signature = signing_key.sign(&message);
+                                let signature = signing_key.sign_v1(&message);
 
                                 StateVoteBlock {
                                     transaction_hash: tx_hash,
@@ -2910,7 +2915,7 @@ impl ProductionRunner {
     /// 3. Send individual results back as events
     fn dispatch_state_cert_verifications(
         &self,
-        certs: Vec<(hyperscale_types::StateCertificate, Vec<PublicKey>)>,
+        certs: Vec<(hyperscale_types::StateCertificate, Vec<Bls12381G1PublicKey>)>,
     ) {
         if certs.is_empty() {
             return;
@@ -2938,14 +2943,14 @@ impl ProductionRunner {
                             .iter()
                             .enumerate()
                             .filter(|(i, _)| cert.signers.is_set(*i))
-                            .map(|(_, pk)| pk.clone())
+                            .map(|(_, pk)| *pk)
                             .collect();
 
                         // Pre-aggregate the public keys
                         let aggregated_pk = if signer_keys.is_empty() {
                             None // Will check for zero signature
                         } else {
-                            PublicKey::aggregate_bls(&signer_keys).ok()
+                            Bls12381G1PublicKey::aggregate(&signer_keys, true).ok()
                         };
 
                         (cert, msg, aggregated_pk)
@@ -2955,8 +2960,11 @@ impl ProductionRunner {
 
             // Step 2: Batch verify all signatures
             // Separate into verifiable (have aggregated_pk) and special cases (empty signers)
-            let mut verifiable: Vec<(hyperscale_types::StateCertificate, Vec<u8>, PublicKey)> =
-                Vec::new();
+            let mut verifiable: Vec<(
+                hyperscale_types::StateCertificate,
+                Vec<u8>,
+                Bls12381G1PublicKey,
+            )> = Vec::new();
             let mut zero_sig_certs: Vec<hyperscale_types::StateCertificate> = Vec::new();
             let mut failed_aggregation: Vec<hyperscale_types::StateCertificate> = Vec::new();
 
@@ -2965,7 +2973,7 @@ impl ProductionRunner {
                     Some(pk) => verifiable.push((cert, msg, pk)),
                     None => {
                         // No signers - check if it's a valid zero signature case
-                        if cert.aggregated_signature == Signature::zero() {
+                        if cert.aggregated_signature == zero_bls_signature() {
                             zero_sig_certs.push(cert);
                         } else {
                             failed_aggregation.push(cert);
@@ -2978,14 +2986,14 @@ impl ProductionRunner {
             let verification_results = if !verifiable.is_empty() {
                 let messages: Vec<&[u8]> =
                     verifiable.iter().map(|(_, m, _)| m.as_slice()).collect();
-                let signatures: Vec<Signature> = verifiable
+                let signatures: Vec<Bls12381G2Signature> = verifiable
                     .iter()
-                    .map(|(c, _, _)| c.aggregated_signature.clone())
+                    .map(|(c, _, _)| c.aggregated_signature)
                     .collect();
-                let pubkeys: Vec<PublicKey> =
-                    verifiable.iter().map(|(_, _, pk)| pk.clone()).collect();
+                let pubkeys: Vec<Bls12381G1PublicKey> =
+                    verifiable.iter().map(|(_, _, pk)| *pk).collect();
 
-                PublicKey::batch_verify_bls_different_messages(&messages, &signatures, &pubkeys)
+                batch_verify_bls_different_messages(&messages, &signatures, &pubkeys)
             } else {
                 vec![]
             };
@@ -3056,7 +3064,7 @@ impl ProductionRunner {
 
             // Flatten all votes into a single list for batch verification
             // Track which tx each vote belongs to for result correlation
-            let mut all_votes: Vec<(Hash, StateVoteBlock, PublicKey, u64)> = Vec::new();
+            let mut all_votes: Vec<(Hash, StateVoteBlock, Bls12381G1PublicKey, u64)> = Vec::new();
             for (tx_hash, votes) in batched_votes {
                 for (vote, pk, power) in votes {
                     all_votes.push((tx_hash, vote, pk, power));
@@ -3069,19 +3077,15 @@ impl ProductionRunner {
                 .map(|(_, vote, _, _)| vote.signing_message())
                 .collect();
             let message_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
-            let signatures: Vec<Signature> = all_votes
+            let signatures: Vec<Bls12381G2Signature> = all_votes
                 .iter()
-                .map(|(_, vote, _, _)| vote.signature.clone())
+                .map(|(_, vote, _, _)| vote.signature)
                 .collect();
-            let pubkeys: Vec<PublicKey> =
-                all_votes.iter().map(|(_, _, pk, _)| pk.clone()).collect();
+            let pubkeys: Vec<Bls12381G1PublicKey> =
+                all_votes.iter().map(|(_, _, pk, _)| *pk).collect();
 
             // Batch verify all signatures at once (~2 pairings regardless of count)
-            let results = PublicKey::batch_verify_bls_different_messages(
-                &message_refs,
-                &signatures,
-                &pubkeys,
-            );
+            let results = batch_verify_bls_different_messages(&message_refs, &signatures, &pubkeys);
 
             // Group verified votes by tx_hash for result events
             use std::collections::HashMap;
@@ -3135,7 +3139,7 @@ impl ProductionRunner {
             TransactionCertificate,
             ShardGroupId,
             hyperscale_types::StateCertificate,
-            Vec<PublicKey>,
+            Vec<Bls12381G1PublicKey>,
         )>,
     ) {
         if batch.is_empty() {
@@ -3166,14 +3170,14 @@ impl ProductionRunner {
                             .iter()
                             .enumerate()
                             .filter(|(i, _)| cert.signers.is_set(*i))
-                            .map(|(_, pk)| pk.clone())
+                            .map(|(_, pk)| *pk)
                             .collect();
 
                         // Pre-aggregate the public keys
                         let aggregated_pk = if signer_keys.is_empty() {
                             None // Will check for zero signature
                         } else {
-                            PublicKey::aggregate_bls(&signer_keys).ok()
+                            Bls12381G1PublicKey::aggregate(&signer_keys, true).ok()
                         };
 
                         (tx_hash, shard, cert, msg, aggregated_pk)
@@ -3188,7 +3192,7 @@ impl ProductionRunner {
                 ShardGroupId,
                 hyperscale_types::StateCertificate,
                 Vec<u8>,
-                PublicKey,
+                Bls12381G1PublicKey,
             )> = Vec::new();
             let mut zero_sig_certs: Vec<(Hash, ShardGroupId)> = Vec::new();
             let mut failed_aggregation: Vec<(Hash, ShardGroupId)> = Vec::new();
@@ -3198,7 +3202,7 @@ impl ProductionRunner {
                     Some(pk) => verifiable.push((tx_hash, shard, cert, msg, pk)),
                     None => {
                         // No signers - check if it's a valid zero signature case
-                        if cert.aggregated_signature == Signature::zero() {
+                        if cert.aggregated_signature == zero_bls_signature() {
                             zero_sig_certs.push((tx_hash, shard));
                         } else {
                             failed_aggregation.push((tx_hash, shard));
@@ -3213,16 +3217,14 @@ impl ProductionRunner {
                     .iter()
                     .map(|(_, _, _, m, _)| m.as_slice())
                     .collect();
-                let signatures: Vec<Signature> = verifiable
+                let signatures: Vec<Bls12381G2Signature> = verifiable
                     .iter()
-                    .map(|(_, _, c, _, _)| c.aggregated_signature.clone())
+                    .map(|(_, _, c, _, _)| c.aggregated_signature)
                     .collect();
-                let pubkeys: Vec<PublicKey> = verifiable
-                    .iter()
-                    .map(|(_, _, _, _, pk)| pk.clone())
-                    .collect();
+                let pubkeys: Vec<Bls12381G1PublicKey> =
+                    verifiable.iter().map(|(_, _, _, _, pk)| *pk).collect();
 
-                PublicKey::batch_verify_bls_different_messages(&messages, &signatures, &pubkeys)
+                batch_verify_bls_different_messages(&messages, &signatures, &pubkeys)
             } else {
                 vec![]
             };
@@ -3306,7 +3308,9 @@ impl ProductionRunner {
         let local_shard = self.local_shard;
         let thread_pools = self.thread_pools.clone();
         let batch_size = requests.len();
-        let signing_key = self.signing_key.clone();
+        // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
+        let key_bytes = self.signing_key.to_bytes();
+        let signing_key = Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
         let validator_id = topology.local_validator_id();
 
         self.thread_pools.spawn_execution(move || {
@@ -3354,7 +3358,7 @@ impl ProductionRunner {
                             local_shard,
                             success,
                         );
-                        let signature = signing_key.sign(&message);
+                        let signature = signing_key.sign_v1(&message);
 
                         StateVoteBlock {
                             transaction_hash: tx_hash,

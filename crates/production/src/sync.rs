@@ -2623,7 +2623,9 @@ mod tests {
     // Sync response validation tests
     // ═══════════════════════════════════════════════════════════════════════════
 
-    use hyperscale_types::{BlockHeader, Signature, SignerBitfield, ValidatorId, VotePower};
+    use hyperscale_types::{
+        zero_bls_signature, BlockHeader, SignerBitfield, ValidatorId, VotePower,
+    };
 
     fn make_test_block(height: u64) -> Block {
         Block {
@@ -2652,7 +2654,7 @@ mod tests {
             height: block.header.height,
             parent_block_hash: block.header.parent_hash,
             round: block.header.round,
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(0),
             voting_power: VotePower(u64::MAX),
             weighted_timestamp_ms: 0,

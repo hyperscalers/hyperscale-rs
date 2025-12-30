@@ -30,7 +30,29 @@ mod topology;
 mod transaction;
 mod validator;
 
-pub use crypto::{KeyPair, KeyType, PublicKey, Signature};
+// Re-export crypto types and helpers
+pub use crypto::{
+    // Helper functions
+    batch_verify_bls_different_messages,
+    batch_verify_bls_different_messages_all_or_nothing,
+    batch_verify_bls_same_message,
+    batch_verify_ed25519,
+    bls_keypair_from_seed,
+    ed25519_keypair_from_seed,
+    generate_bls_keypair,
+    generate_ed25519_keypair,
+    verify_bls12381_v1,
+    verify_ed25519,
+    zero_bls_signature,
+    zero_ed25519_signature,
+    // Vendor types
+    Bls12381G1PrivateKey,
+    Bls12381G1PublicKey,
+    Bls12381G2Signature,
+    Ed25519PrivateKey,
+    Ed25519PublicKey,
+    Ed25519Signature,
+};
 pub use epoch::{
     EpochConfig, EpochId, GlobalConsensusConfig, GlobalValidatorInfo, ShardCommitteeConfig,
     ShardHashRange, ValidatorRating, ValidatorShardState, DEFAULT_EPOCH_LENGTH,
@@ -72,8 +94,8 @@ pub struct BlockVote {
     pub round: u64,
     /// Validator who cast this vote
     pub voter: ValidatorId,
-    /// Signature on the block hash
-    pub signature: Signature,
+    /// Signature on the block hash (BLS for aggregatable consensus votes)
+    pub signature: Bls12381G2Signature,
     /// Timestamp when this vote was created (milliseconds since epoch)
     pub timestamp: u64,
 }
@@ -85,10 +107,10 @@ impl BlockVote {
         height: BlockHeight,
         round: u64,
         voter: ValidatorId,
-        signing_key: &KeyPair,
+        signing_key: &Bls12381G1PrivateKey,
         timestamp: u64,
     ) -> Self {
-        let signature = signing_key.sign(block_hash.as_bytes());
+        let signature = signing_key.sign_v1(block_hash.as_bytes());
         Self {
             block_hash,
             height,

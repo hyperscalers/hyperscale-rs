@@ -14,10 +14,11 @@ use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_engine::RadixExecutor;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
-    Block, BlockVote, CommitmentProof, Hash as TxHash, KeyPair, KeyType, PublicKey,
-    QuorumCertificate, ShardGroupId, Signature, SignerBitfield, StateCertificate, StateVoteBlock,
-    StaticTopology, Topology, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
-    VotePower,
+    batch_verify_bls_same_message, bls_keypair_from_seed, verify_bls12381_v1, zero_bls_signature,
+    Block, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
+    CommitmentProof, Hash as TxHash, QuorumCertificate, ShardGroupId, SignerBitfield,
+    StateCertificate, StateVoteBlock, StaticTopology, Topology, TransactionStatus, ValidatorId,
+    ValidatorInfo, ValidatorSet, VotePower,
 };
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
@@ -72,7 +73,7 @@ pub struct SimulationRunner {
 
     /// Per-node signing keys. Each node has its own key for signing votes.
     /// Index corresponds to node index.
-    node_keys: Vec<KeyPair>,
+    node_keys: Vec<Bls12381G1PrivateKey>,
 
     /// Whether genesis has been executed on each node's storage.
     /// Index corresponds to node index.
@@ -142,23 +143,23 @@ impl SimulationRunner {
 
         // Generate keys for all validators using deterministic seeding
         let total_validators = network_config.num_shards * network_config.validators_per_shard;
-        let keys: Vec<KeyPair> = (0..total_validators)
+        let keys: Vec<Bls12381G1PrivateKey> = (0..total_validators)
             .map(|i| {
                 // Use deterministic seed for each validator's key
                 let mut seed_bytes = [0u8; 32];
                 let key_seed = seed.wrapping_add(i as u64).wrapping_mul(0x517cc1b727220a95);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
                 seed_bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
-                KeyPair::from_seed(KeyType::Bls12381, &seed_bytes)
+                bls_keypair_from_seed(&seed_bytes)
             })
             .collect();
-        let public_keys: Vec<PublicKey> = keys.iter().map(|k| k.public_key()).collect();
+        let public_keys: Vec<Bls12381G1PublicKey> = keys.iter().map(|k| k.public_key()).collect();
 
         // Build global validator set for the entire network
         let global_validators: Vec<ValidatorInfo> = (0..total_validators)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId(i as u64),
-                public_key: public_keys[i as usize].clone(),
+                public_key: public_keys[i as usize],
                 voting_power: 1,
             })
             .collect();
@@ -196,10 +197,14 @@ impl SimulationRunner {
                 ));
 
                 // Fresh start - no recovered state
+                // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
+                let key_bytes = keys[node_index as usize].to_bytes();
+                let signing_key =
+                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
                 nodes.push(NodeStateMachine::new(
                     node_index as NodeIndex,
                     topology,
-                    keys[node_index as usize].clone(),
+                    signing_key,
                     BftConfig::default(),
                     RecoveredState::default(),
                 ));
@@ -758,42 +763,34 @@ impl SimulationRunner {
             } => {
                 // Start with already-verified votes (e.g., our own vote)
                 let mut all_verified: Vec<(usize, BlockVote, u64)> = already_verified;
-                let mut all_signatures: Vec<Signature> = all_verified
-                    .iter()
-                    .map(|(_, v, _)| v.signature.clone())
-                    .collect();
+                let mut all_signatures: Vec<Bls12381G2Signature> =
+                    all_verified.iter().map(|(_, v, _)| v.signature).collect();
 
                 // Batch verify all new signatures (same message optimization)
-                let signatures: Vec<Signature> = votes_to_verify
+                let signatures: Vec<Bls12381G2Signature> = votes_to_verify
                     .iter()
-                    .map(|(_, v, _, _)| v.signature.clone())
+                    .map(|(_, v, _, _)| v.signature)
                     .collect();
-                let public_keys: Vec<PublicKey> = votes_to_verify
-                    .iter()
-                    .map(|(_, _, pk, _)| pk.clone())
-                    .collect();
+                let public_keys: Vec<Bls12381G1PublicKey> =
+                    votes_to_verify.iter().map(|(_, _, pk, _)| *pk).collect();
 
                 let batch_valid = if votes_to_verify.is_empty() {
                     true
                 } else {
-                    PublicKey::batch_verify_bls_same_message(
-                        &signing_message,
-                        &signatures,
-                        &public_keys,
-                    )
+                    batch_verify_bls_same_message(&signing_message, &signatures, &public_keys)
                 };
 
                 if batch_valid {
                     // Happy path: all new signatures valid, add them to verified set
                     for (idx, vote, _, power) in votes_to_verify {
-                        all_signatures.push(vote.signature.clone());
+                        all_signatures.push(vote.signature);
                         all_verified.push((idx, vote, power));
                     }
                 } else {
                     // Some signatures invalid - verify individually
                     for (idx, vote, pk, power) in &votes_to_verify {
-                        if pk.verify(&signing_message, &vote.signature) {
-                            all_signatures.push(vote.signature.clone());
+                        if verify_bls12381_v1(&signing_message, pk, &vote.signature) {
+                            all_signatures.push(vote.signature);
                             all_verified.push((*idx, vote.clone(), *power));
                         }
                     }
@@ -806,7 +803,7 @@ impl SimulationRunner {
                     && !all_signatures.is_empty()
                 {
                     // Build QC - aggregate signatures
-                    let qc = match Signature::aggregate_bls(&all_signatures) {
+                    let qc = match Bls12381G2Signature::aggregate(&all_signatures, true) {
                         Ok(aggregated_signature) => {
                             let mut sorted_votes = all_verified.clone();
                             sorted_votes.sort_by_key(|(idx, _, _)| *idx);
@@ -880,16 +877,15 @@ impl SimulationRunner {
             } => {
                 // All provisions for the same (tx, source_shard) sign the SAME message.
                 // Happy path: aggregate verification with single pairing check.
-                let signatures: Vec<Signature> =
-                    provisions.iter().map(|p| p.signature.clone()).collect();
+                let signatures: Vec<Bls12381G2Signature> =
+                    provisions.iter().map(|p| p.signature).collect();
                 let message = provisions
                     .first()
                     .map(|p| p.signing_message())
                     .unwrap_or_default();
 
                 let topology = self.nodes[from as usize].topology();
-                let all_valid =
-                    PublicKey::batch_verify_bls_same_message(&message, &signatures, &public_keys);
+                let all_valid = batch_verify_bls_same_message(&message, &signatures, &public_keys);
 
                 let (verified_provisions, commitment_proof) = if all_valid {
                     // Fast path: all valid
@@ -902,8 +898,8 @@ impl SimulationRunner {
                         }
                     }
 
-                    let aggregated_signature =
-                        Signature::aggregate_bls(&signatures).unwrap_or_else(|_| Signature::zero());
+                    let aggregated_signature = Bls12381G2Signature::aggregate(&signatures, true)
+                        .unwrap_or_else(|_| zero_bls_signature());
 
                     let proof = CommitmentProof::new(
                         tx_hash,
@@ -922,9 +918,9 @@ impl SimulationRunner {
                     let mut signer_indices = Vec::new();
 
                     for (provision, pk) in provisions.iter().zip(public_keys.iter()) {
-                        if pk.verify(&message, &provision.signature) {
+                        if verify_bls12381_v1(&message, pk, &provision.signature) {
                             verified.push(provision.clone());
-                            valid_sigs.push(provision.signature.clone());
+                            valid_sigs.push(provision.signature);
                             if let Some(idx) = topology
                                 .committee_index_for_shard(source_shard, provision.validator_id)
                             {
@@ -939,8 +935,9 @@ impl SimulationRunner {
                             signers.set(*idx);
                         }
 
-                        let aggregated_signature = Signature::aggregate_bls(&valid_sigs)
-                            .unwrap_or_else(|_| Signature::zero());
+                        let aggregated_signature =
+                            Bls12381G2Signature::aggregate(&valid_sigs, true)
+                                .unwrap_or_else(|_| zero_bls_signature());
 
                         Some(CommitmentProof::new(
                             tx_hash,
@@ -986,18 +983,14 @@ impl SimulationRunner {
                     .collect();
 
                 // Aggregate BLS signatures
-                let bls_signatures: Vec<_> = unique_votes
-                    .iter()
-                    .filter_map(|vote| match &vote.signature {
-                        Signature::Bls12381(_) => Some(vote.signature.clone()),
-                        _ => None,
-                    })
-                    .collect();
+                let bls_signatures: Vec<Bls12381G2Signature> =
+                    unique_votes.iter().map(|vote| vote.signature).collect();
 
                 let aggregated_signature = if !bls_signatures.is_empty() {
-                    Signature::aggregate_bls(&bls_signatures).unwrap_or_else(|_| Signature::zero())
+                    Bls12381G2Signature::aggregate(&bls_signatures, true)
+                        .unwrap_or_else(|_| zero_bls_signature())
                 } else {
-                    Signature::zero()
+                    zero_bls_signature()
                 };
 
                 // Create signer bitfield
@@ -1047,8 +1040,10 @@ impl SimulationRunner {
                 // In simulation, we use the same logic as production for correctness,
                 // just without parallelism.
                 use std::collections::HashMap;
-                let mut by_message: HashMap<Vec<u8>, Vec<(StateVoteBlock, PublicKey, u64)>> =
-                    HashMap::new();
+                let mut by_message: HashMap<
+                    Vec<u8>,
+                    Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>,
+                > = HashMap::new();
                 for (vote, pk, power) in votes {
                     let msg = vote.signing_message();
                     by_message.entry(msg).or_default().push((vote, pk, power));
@@ -1059,18 +1054,13 @@ impl SimulationRunner {
                 for (message, votes_for_root) in by_message {
                     if votes_for_root.len() >= 2 {
                         // Use BLS same-message batch verification
-                        let signatures: Vec<Signature> = votes_for_root
-                            .iter()
-                            .map(|(v, _, _)| v.signature.clone())
-                            .collect();
-                        let pubkeys: Vec<PublicKey> =
-                            votes_for_root.iter().map(|(_, pk, _)| pk.clone()).collect();
+                        let signatures: Vec<Bls12381G2Signature> =
+                            votes_for_root.iter().map(|(v, _, _)| v.signature).collect();
+                        let pubkeys: Vec<Bls12381G1PublicKey> =
+                            votes_for_root.iter().map(|(_, pk, _)| *pk).collect();
 
-                        let batch_valid = PublicKey::batch_verify_bls_same_message(
-                            &message,
-                            &signatures,
-                            &pubkeys,
-                        );
+                        let batch_valid =
+                            batch_verify_bls_same_message(&message, &signatures, &pubkeys);
 
                         if batch_valid {
                             for (vote, _, power) in votes_for_root {
@@ -1079,7 +1069,7 @@ impl SimulationRunner {
                         } else {
                             // Fallback to individual verification
                             for (vote, pk, power) in votes_for_root {
-                                if pk.verify(&message, &vote.signature) {
+                                if verify_bls12381_v1(&message, &pk, &vote.signature) {
                                     verified_votes.push((vote, power));
                                 }
                             }
@@ -1087,7 +1077,7 @@ impl SimulationRunner {
                     } else {
                         // Single vote - verify individually
                         let (vote, pk, power) = votes_for_root.into_iter().next().unwrap();
-                        if pk.verify(&message, &vote.signature) {
+                        if verify_bls12381_v1(&message, &pk, &vote.signature) {
                             verified_votes.push((vote, power));
                         }
                     }
@@ -1119,19 +1109,21 @@ impl SimulationRunner {
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| certificate.signers.is_set(*i))
-                    .map(|(_, pk)| pk.clone())
+                    .map(|(_, pk)| *pk)
                     .collect();
 
                 // Verify aggregated signature
                 let valid = if signer_keys.is_empty() {
                     // No signers - valid only if it's a zero signature (single-shard case)
-                    certificate.aggregated_signature == hyperscale_types::Signature::zero()
+                    certificate.aggregated_signature == zero_bls_signature()
                 } else {
                     // Aggregate the public keys and verify
-                    match hyperscale_types::PublicKey::aggregate_bls(&signer_keys) {
-                        Ok(aggregated_pk) => {
-                            aggregated_pk.verify(&msg, &certificate.aggregated_signature)
-                        }
+                    match Bls12381G1PublicKey::aggregate(&signer_keys, true) {
+                        Ok(aggregated_pk) => verify_bls12381_v1(
+                            &msg,
+                            &aggregated_pk,
+                            &certificate.aggregated_signature,
+                        ),
                         Err(_) => false,
                     }
                 };
@@ -1165,7 +1157,7 @@ impl SimulationRunner {
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| qc.signers.is_set(*i))
-                    .map(|(_, pk)| pk.clone())
+                    .map(|(_, pk)| *pk)
                     .collect();
 
                 // Verify aggregated signature against domain-separated message
@@ -1174,10 +1166,12 @@ impl SimulationRunner {
                     false
                 } else {
                     // Aggregate the public keys and verify
-                    match hyperscale_types::PublicKey::aggregate_bls(&signer_keys) {
-                        Ok(aggregated_pk) => {
-                            aggregated_pk.verify(&signing_message, &qc.aggregated_signature)
-                        }
+                    match Bls12381G1PublicKey::aggregate(&signer_keys, true) {
+                        Ok(aggregated_pk) => verify_bls12381_v1(
+                            &signing_message,
+                            &aggregated_pk,
+                            &qc.aggregated_signature,
+                        ),
                         Err(_) => false,
                     }
                 };
@@ -1209,7 +1203,10 @@ impl SimulationRunner {
                 // (matches production runner pattern).
                 let storage = &self.node_storage[from as usize];
                 let executor = &self.node_executor[from as usize];
-                let signing_key = self.node_keys[from as usize].clone();
+                // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
+                let key_bytes = self.node_keys[from as usize].to_bytes();
+                let signing_key =
+                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
                 let local_shard = self.nodes[from as usize].shard();
                 let validator_id = self.nodes[from as usize].topology().local_validator_id();
 
@@ -1250,7 +1247,7 @@ impl SimulationRunner {
                         local_shard,
                         result.success,
                     );
-                    let signature = signing_key.sign(&message);
+                    let signature = signing_key.sign_v1(&message);
 
                     let vote = StateVoteBlock {
                         transaction_hash: result.transaction_hash,
@@ -1284,7 +1281,10 @@ impl SimulationRunner {
                 // SpeculativeExecutionComplete just reports tx_hashes for cache tracking.
                 let storage = &self.node_storage[from as usize];
                 let executor = &self.node_executor[from as usize];
-                let signing_key = self.node_keys[from as usize].clone();
+                // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
+                let key_bytes = self.node_keys[from as usize].to_bytes();
+                let signing_key =
+                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
                 let local_shard = self.nodes[from as usize].shard();
                 let validator_id = self.nodes[from as usize].topology().local_validator_id();
 
@@ -1302,7 +1302,7 @@ impl SimulationRunner {
                                 local_shard,
                                 r.success,
                             );
-                            let signature = signing_key.sign(&message);
+                            let signature = signing_key.sign_v1(&message);
 
                             let vote = StateVoteBlock {
                                 transaction_hash: r.tx_hash,
@@ -1339,7 +1339,7 @@ impl SimulationRunner {
                                 local_shard,
                                 false,
                             );
-                            let signature = signing_key.sign(&message);
+                            let signature = signing_key.sign_v1(&message);
 
                             let vote = StateVoteBlock {
                                 transaction_hash: tx_hash,
@@ -1391,7 +1391,10 @@ impl SimulationRunner {
                 // (matches production runner pattern).
                 let storage = &self.node_storage[from as usize];
                 let executor = &self.node_executor[from as usize];
-                let signing_key = self.node_keys[from as usize].clone();
+                // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
+                let key_bytes = self.node_keys[from as usize].to_bytes();
+                let signing_key =
+                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
                 let local_shard = self.nodes[from as usize].shard();
                 let validator_id = self.nodes[from as usize].topology().local_validator_id();
 
@@ -1447,7 +1450,7 @@ impl SimulationRunner {
                     local_shard,
                     result.success,
                 );
-                let signature = signing_key.sign(&message);
+                let signature = signing_key.sign_v1(&message);
 
                 let vote = StateVoteBlock {
                     transaction_hash: result.transaction_hash,

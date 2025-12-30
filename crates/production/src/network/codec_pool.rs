@@ -146,7 +146,7 @@ mod tests {
     #[test]
     fn test_encode_sync() {
         use hyperscale_messages::gossip::BlockVoteGossip;
-        use hyperscale_types::{BlockHeight, BlockVote, Hash, Signature, ValidatorId};
+        use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash, ValidatorId};
 
         let thread_pools = Arc::new(ThreadPoolManager::new(ThreadPoolConfig::minimal()).unwrap());
         let handle = CodecPoolHandle::new(thread_pools);
@@ -156,7 +156,7 @@ mod tests {
             height: BlockHeight(1),
             voter: ValidatorId(0),
             round: 0,
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
             timestamp: 0,
         };
         let gossip = BlockVoteGossip { vote };

@@ -3,7 +3,7 @@
 //! An epoch is a time period during which shard membership is stable.
 //! At epoch boundaries, validators may be shuffled between shards.
 
-use crate::{BlockHeight, Hash, PublicKey, ShardGroupId, ValidatorId, ValidatorSet};
+use crate::{BlockHeight, Bls12381G1PublicKey, Hash, ShardGroupId, ValidatorId, ValidatorSet};
 use sbor::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
@@ -128,7 +128,7 @@ impl ValidatorRating {
 #[derive(Debug, Clone, BasicSbor)]
 pub struct GlobalValidatorInfo {
     pub validator_id: ValidatorId,
-    pub public_key: PublicKey,
+    pub public_key: Bls12381G1PublicKey,
     pub voting_power: u64,
     pub rating: ValidatorRating,
     pub current_shard: ShardGroupId,
@@ -141,7 +141,7 @@ impl GlobalValidatorInfo {
     /// Create new global validator info.
     pub fn new(
         validator_id: ValidatorId,
-        public_key: PublicKey,
+        public_key: Bls12381G1PublicKey,
         voting_power: u64,
         shard: ShardGroupId,
     ) -> Self {
@@ -425,12 +425,12 @@ impl GlobalConsensusConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{KeyPair, ValidatorInfo};
+    use crate::{generate_bls_keypair, ValidatorInfo};
 
     fn make_test_validator(id: u64) -> ValidatorInfo {
         ValidatorInfo {
             validator_id: ValidatorId(id),
-            public_key: KeyPair::generate_ed25519().public_key(),
+            public_key: generate_bls_keypair().public_key(),
             voting_power: 1,
         }
     }

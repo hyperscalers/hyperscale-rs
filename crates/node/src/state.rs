@@ -6,7 +6,7 @@ use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
 use hyperscale_provisions::ProvisionCoordinator;
-use hyperscale_types::{Block, BlockHeight, KeyPair, ShardGroupId, Topology};
+use hyperscale_types::{Block, BlockHeight, Bls12381G1PrivateKey, ShardGroupId, Topology};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
@@ -72,7 +72,7 @@ impl NodeStateMachine {
     pub fn new(
         node_index: NodeIndex,
         topology: Arc<dyn Topology>,
-        signing_key: KeyPair,
+        signing_key: Bls12381G1PrivateKey,
         bft_config: BftConfig,
         recovered: RecoveredState,
     ) -> Self {
@@ -93,7 +93,7 @@ impl NodeStateMachine {
     pub fn with_speculative_config(
         node_index: NodeIndex,
         topology: Arc<dyn Topology>,
-        signing_key: KeyPair,
+        signing_key: Bls12381G1PrivateKey,
         bft_config: BftConfig,
         recovered: RecoveredState,
         speculative_max_txs: usize,
@@ -102,12 +102,17 @@ impl NodeStateMachine {
     ) -> Self {
         let local_shard = topology.local_shard();
 
+        // Clone key bytes to create a new keypair since Bls12381G1PrivateKey doesn't impl Clone
+        let key_bytes = signing_key.to_bytes();
+        let bft_signing_key =
+            Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
+
         Self {
             node_index,
             topology: topology.clone(),
             bft: BftState::new(
                 node_index,
-                signing_key.clone(),
+                bft_signing_key,
                 topology.clone(),
                 bft_config.clone(),
                 recovered,

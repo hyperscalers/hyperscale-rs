@@ -1475,13 +1475,14 @@ fn test_cross_shard_latency() {
 fn test_cross_shard_transaction_detection() {
     use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
     use hyperscale_types::{
-        KeyPair, ShardGroupId, StaticTopology, Topology, ValidatorId, ValidatorInfo, ValidatorSet,
+        generate_bls_keypair, Bls12381G1PrivateKey, ShardGroupId, StaticTopology, Topology,
+        ValidatorId, ValidatorInfo, ValidatorSet,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
 
     // Create a 2-shard network with 2 validators per shard
-    let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+    let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
     let validators: Vec<ValidatorInfo> = keys
         .iter()
         .enumerate()

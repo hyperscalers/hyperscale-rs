@@ -1,7 +1,7 @@
 //! Sync-related request messages.
 
 use hyperscale_types::{
-    BlockHeight, MessagePriority, NetworkMessage, ShardMessage, Signature, ValidatorId,
+    BlockHeight, Bls12381G2Signature, MessagePriority, NetworkMessage, ShardMessage, ValidatorId,
 };
 use sbor::prelude::BasicSbor;
 
@@ -14,13 +14,17 @@ pub struct SyncCompleteAnnouncement {
     /// Validator announcing sync completion
     pub validator: ValidatorId,
 
-    /// Signature proving this is authentic
-    pub signature: Signature,
+    /// Signature proving this is authentic (BLS for aggregatable consensus)
+    pub signature: Bls12381G2Signature,
 }
 
 impl SyncCompleteAnnouncement {
     /// Create a new sync complete announcement.
-    pub fn new(synced_height: BlockHeight, validator: ValidatorId, signature: Signature) -> Self {
+    pub fn new(
+        synced_height: BlockHeight,
+        validator: ValidatorId,
+        signature: Bls12381G2Signature,
+    ) -> Self {
         Self {
             synced_height,
             validator,
@@ -45,12 +49,12 @@ impl ShardMessage for SyncCompleteAnnouncement {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_types::zero_bls_signature;
 
     #[test]
     fn test_sync_complete_announcement() {
-        use hyperscale_types::Signature;
         let announcement =
-            SyncCompleteAnnouncement::new(BlockHeight(100), ValidatorId(1), Signature::zero());
+            SyncCompleteAnnouncement::new(BlockHeight(100), ValidatorId(1), zero_bls_signature());
         assert_eq!(announcement.synced_height, BlockHeight(100));
         assert_eq!(announcement.validator, ValidatorId(1));
     }

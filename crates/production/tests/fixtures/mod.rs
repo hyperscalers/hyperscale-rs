@@ -3,8 +3,8 @@
 //! Provides deterministic test setup including key generation and topology construction.
 
 use hyperscale_types::{
-    KeyPair, KeyType, PublicKey, ShardGroupId, StaticTopology, Topology, ValidatorId,
-    ValidatorInfo, ValidatorSet,
+    bls_keypair_from_seed, Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardGroupId, StaticTopology,
+    Topology, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use libp2p::{identity, Multiaddr};
 use std::collections::HashMap;
@@ -16,7 +16,7 @@ use std::sync::Arc;
 /// for libp2p networking, all derived from a seed for reproducibility.
 pub struct TestFixtures {
     /// BLS keypairs for consensus (one per validator).
-    pub bls_keys: Vec<KeyPair>,
+    pub bls_keys: Vec<Bls12381G1PrivateKey>,
 
     /// Ed25519 keypairs for libp2p (one per validator).
     pub ed25519_keys: Vec<identity::Keypair>,
@@ -48,13 +48,13 @@ impl TestFixtures {
         let num_validators = validators_per_shard * num_shards as u32;
 
         // Generate BLS keys deterministically
-        let bls_keys: Vec<KeyPair> = (0..num_validators)
+        let bls_keys: Vec<Bls12381G1PrivateKey> = (0..num_validators)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
                 let key_seed = seed.wrapping_add(i as u64).wrapping_mul(0x517cc1b727220a95);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
                 seed_bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
-                KeyPair::from_seed(KeyType::Bls12381, &seed_bytes)
+                bls_keypair_from_seed(&seed_bytes)
             })
             .collect();
 
@@ -75,7 +75,8 @@ impl TestFixtures {
             })
             .collect();
 
-        let public_keys: Vec<PublicKey> = bls_keys.iter().map(|k| k.public_key()).collect();
+        let public_keys: Vec<Bls12381G1PublicKey> =
+            bls_keys.iter().map(|k| k.public_key()).collect();
 
         // Build global validator set
         let global_validators: Vec<ValidatorInfo> = (0..num_validators)
@@ -132,8 +133,9 @@ impl TestFixtures {
     }
 
     /// Get the BLS signing key for a validator.
-    pub fn signing_key(&self, index: u32) -> KeyPair {
-        self.bls_keys[index as usize].clone()
+    pub fn signing_key(&self, index: u32) -> Bls12381G1PrivateKey {
+        let key_bytes = self.bls_keys[index as usize].to_bytes();
+        Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
     }
 
     /// Get the Ed25519 keypair for a validator.

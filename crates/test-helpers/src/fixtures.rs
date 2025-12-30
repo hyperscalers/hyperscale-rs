@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use crate::TestCommittee;
 use hyperscale_types::{
-    block_vote_message, exec_vote_message, state_provision_message, BlockHeight, BlockVote, Hash,
-    PublicKey, QuorumCertificate, ShardGroupId, Signature, SignerBitfield, StateCertificate,
-    StateEntry, StateProvision, StateVoteBlock, VotePower,
+    block_vote_message, exec_vote_message, state_provision_message, verify_bls12381_v1,
+    BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, Hash, QuorumCertificate,
+    ShardGroupId, SignerBitfield, StateCertificate, StateEntry, StateProvision, StateVoteBlock,
+    VotePower,
 };
 
 /// Create a properly-signed block vote.
@@ -20,7 +21,7 @@ use hyperscale_types::{
 ///
 /// ```rust
 /// use hyperscale_test_helpers::{TestCommittee, fixtures};
-/// use hyperscale_types::{Hash, BlockHeight, ShardGroupId};
+/// use hyperscale_types::{Hash, BlockHeight, ShardGroupId, verify_bls12381_v1};
 ///
 /// let committee = TestCommittee::new(4, 42);
 /// let vote = fixtures::make_signed_block_vote(
@@ -34,7 +35,7 @@ use hyperscale_types::{
 ///
 /// // Verify the signature is valid
 /// let msg = hyperscale_types::block_vote_message(ShardGroupId(0), 1, 0, &vote.block_hash);
-/// assert!(committee.public_key(0).verify(&msg, &vote.signature));
+/// assert!(verify_bls12381_v1(&msg, committee.public_key(0), &vote.signature));
 /// ```
 pub fn make_signed_block_vote(
     committee: &TestCommittee,
@@ -45,7 +46,7 @@ pub fn make_signed_block_vote(
     shard: ShardGroupId,
 ) -> BlockVote {
     let message = block_vote_message(shard, height.0, round, &block_hash);
-    let signature = committee.keypair(voter_idx).sign(&message);
+    let signature = committee.keypair(voter_idx).sign_v1(&message);
 
     BlockVote {
         block_hash,
@@ -66,7 +67,7 @@ pub fn make_signed_block_vote(
 ///
 /// ```rust
 /// use hyperscale_test_helpers::{TestCommittee, fixtures};
-/// use hyperscale_types::{Hash, BlockHeight, ShardGroupId, PublicKey};
+/// use hyperscale_types::{Hash, BlockHeight, ShardGroupId, Bls12381G1PublicKey, batch_verify_bls_same_message};
 ///
 /// let committee = TestCommittee::new(4, 42);
 /// let qc = fixtures::make_signed_qc(
@@ -82,10 +83,10 @@ pub fn make_signed_block_vote(
 /// // Verify the aggregated signature
 /// let msg = hyperscale_types::block_vote_message(ShardGroupId(0), 1, 0, &qc.block_hash);
 /// let signer_keys: Vec<_> = [0, 1, 2].iter()
-///     .map(|&i| committee.public_key(i).clone())
+///     .map(|&i| *committee.public_key(i))
 ///     .collect();
-/// let agg_pk = PublicKey::aggregate_bls(&signer_keys).unwrap();
-/// assert!(agg_pk.verify(&msg, &qc.aggregated_signature));
+/// let agg_pk = Bls12381G1PublicKey::aggregate(&signer_keys, true).unwrap();
+/// assert!(hyperscale_types::verify_bls12381_v1(&msg, &agg_pk, &qc.aggregated_signature));
 /// ```
 pub fn make_signed_qc(
     committee: &TestCommittee,
@@ -99,14 +100,14 @@ pub fn make_signed_qc(
     let message = block_vote_message(shard, height.0, round, &block_hash);
 
     // Collect individual signatures
-    let signatures: Vec<Signature> = voter_indices
+    let signatures: Vec<Bls12381G2Signature> = voter_indices
         .iter()
-        .map(|&idx| committee.keypair(idx).sign(&message))
+        .map(|&idx| committee.keypair(idx).sign_v1(&message))
         .collect();
 
     // Aggregate signatures
     let aggregated_signature =
-        Signature::aggregate_bls(&signatures).expect("BLS aggregation should succeed");
+        Bls12381G2Signature::aggregate(&signatures, true).expect("BLS aggregation should succeed");
 
     // Build signer bitfield
     let mut signers = SignerBitfield::new(committee.size());
@@ -148,7 +149,7 @@ pub fn make_signed_state_vote(
     success: bool,
 ) -> StateVoteBlock {
     let message = exec_vote_message(&tx_hash, &state_root, shard, success);
-    let signature = committee.keypair(voter_idx).sign(&message);
+    let signature = committee.keypair(voter_idx).sign_v1(&message);
 
     StateVoteBlock {
         transaction_hash: tx_hash,
@@ -174,14 +175,14 @@ pub fn make_signed_state_certificate(
     let message = exec_vote_message(&tx_hash, &merkle_root, shard, success);
 
     // Collect individual signatures
-    let signatures: Vec<Signature> = voter_indices
+    let signatures: Vec<Bls12381G2Signature> = voter_indices
         .iter()
-        .map(|&idx| committee.keypair(idx).sign(&message))
+        .map(|&idx| committee.keypair(idx).sign_v1(&message))
         .collect();
 
     // Aggregate signatures
     let aggregated_signature =
-        Signature::aggregate_bls(&signatures).expect("BLS aggregation should succeed");
+        Bls12381G2Signature::aggregate(&signatures, true).expect("BLS aggregation should succeed");
 
     // Build signer bitfield
     let mut signers = SignerBitfield::new(committee.size());
@@ -224,7 +225,7 @@ pub fn make_signed_provision(
         block_height,
         &entry_hashes,
     );
-    let signature = committee.keypair(validator_idx).sign(&message);
+    let signature = committee.keypair(validator_idx).sign_v1(&message);
 
     StateProvision {
         transaction_hash: tx_hash,
@@ -240,9 +241,13 @@ pub fn make_signed_provision(
 /// Verify a block vote signature.
 ///
 /// Convenience function for tests.
-pub fn verify_block_vote(vote: &BlockVote, public_key: &PublicKey, shard: ShardGroupId) -> bool {
+pub fn verify_block_vote(
+    vote: &BlockVote,
+    public_key: &Bls12381G1PublicKey,
+    shard: ShardGroupId,
+) -> bool {
     let message = block_vote_message(shard, vote.height.0, vote.round, &vote.block_hash);
-    public_key.verify(&message, &vote.signature)
+    verify_bls12381_v1(&message, public_key, &vote.signature)
 }
 
 /// Verify a QC's aggregated signature.
@@ -252,10 +257,10 @@ pub fn verify_qc(qc: &QuorumCertificate, committee: &TestCommittee, shard: Shard
     let message = block_vote_message(shard, qc.height.0, qc.round, &qc.block_hash);
 
     // Collect signer public keys
-    let signer_keys: Vec<PublicKey> = qc
+    let signer_keys: Vec<Bls12381G1PublicKey> = qc
         .signers
         .set_indices()
-        .map(|idx| committee.public_key(idx).clone())
+        .map(|idx| *committee.public_key(idx))
         .collect();
 
     if signer_keys.is_empty() {
@@ -263,16 +268,16 @@ pub fn verify_qc(qc: &QuorumCertificate, committee: &TestCommittee, shard: Shard
     }
 
     // Aggregate and verify
-    match PublicKey::aggregate_bls(&signer_keys) {
-        Ok(agg_pk) => agg_pk.verify(&message, &qc.aggregated_signature),
+    match Bls12381G1PublicKey::aggregate(&signer_keys, true) {
+        Ok(agg_pk) => verify_bls12381_v1(&message, &agg_pk, &qc.aggregated_signature),
         Err(_) => false,
     }
 }
 
 /// Verify a state vote signature.
-pub fn verify_state_vote(vote: &StateVoteBlock, public_key: &PublicKey) -> bool {
+pub fn verify_state_vote(vote: &StateVoteBlock, public_key: &Bls12381G1PublicKey) -> bool {
     let message = vote.signing_message();
-    public_key.verify(&message, &vote.signature)
+    verify_bls12381_v1(&message, public_key, &vote.signature)
 }
 
 /// Verify a state certificate's aggregated signature.
@@ -280,10 +285,10 @@ pub fn verify_state_certificate(cert: &StateCertificate, committee: &TestCommitt
     let message = cert.signing_message();
 
     // Collect signer public keys
-    let signer_keys: Vec<PublicKey> = cert
+    let signer_keys: Vec<Bls12381G1PublicKey> = cert
         .signers
         .set_indices()
-        .map(|idx| committee.public_key(idx).clone())
+        .map(|idx| *committee.public_key(idx))
         .collect();
 
     if signer_keys.is_empty() {
@@ -291,16 +296,16 @@ pub fn verify_state_certificate(cert: &StateCertificate, committee: &TestCommitt
     }
 
     // Aggregate and verify
-    match PublicKey::aggregate_bls(&signer_keys) {
-        Ok(agg_pk) => agg_pk.verify(&message, &cert.aggregated_signature),
+    match Bls12381G1PublicKey::aggregate(&signer_keys, true) {
+        Ok(agg_pk) => verify_bls12381_v1(&message, &agg_pk, &cert.aggregated_signature),
         Err(_) => false,
     }
 }
 
 /// Verify a state provision signature.
-pub fn verify_provision(provision: &StateProvision, public_key: &PublicKey) -> bool {
+pub fn verify_provision(provision: &StateProvision, public_key: &Bls12381G1PublicKey) -> bool {
     let message = provision.signing_message();
-    public_key.verify(&message, &provision.signature)
+    verify_bls12381_v1(&message, public_key, &provision.signature)
 }
 
 #[cfg(test)]

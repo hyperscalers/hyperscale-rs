@@ -1,6 +1,6 @@
 //! Validator set types.
 
-use crate::{PublicKey, ValidatorId};
+use crate::{Bls12381G1PublicKey, ValidatorId};
 use sbor::prelude::*;
 
 /// Information about a validator.
@@ -9,8 +9,8 @@ pub struct ValidatorInfo {
     /// Unique identifier for this validator.
     pub validator_id: ValidatorId,
 
-    /// Public key for signature verification.
-    pub public_key: PublicKey,
+    /// Public key for signature verification (BLS for aggregatable consensus).
+    pub public_key: Bls12381G1PublicKey,
 
     /// Voting power (stake weight).
     pub voting_power: u64,
@@ -65,23 +65,20 @@ impl ValidatorSet {
     }
 
     /// Get all public keys.
-    pub fn public_keys(&self) -> Vec<PublicKey> {
-        self.validators
-            .iter()
-            .map(|v| v.public_key.clone())
-            .collect()
+    pub fn public_keys(&self) -> Vec<Bls12381G1PublicKey> {
+        self.validators.iter().map(|v| v.public_key).collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::KeyPair;
+    use crate::generate_bls_keypair;
 
     fn make_validator(id: u64, power: u64) -> ValidatorInfo {
         ValidatorInfo {
             validator_id: ValidatorId(id),
-            public_key: KeyPair::generate_ed25519().public_key(),
+            public_key: generate_bls_keypair().public_key(),
             voting_power: power,
         }
     }

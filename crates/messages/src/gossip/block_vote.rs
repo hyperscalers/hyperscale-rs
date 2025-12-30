@@ -42,7 +42,7 @@ impl ShardMessage for BlockVoteGossip {}
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{BlockHeight, Hash, Signature, ValidatorId};
+    use hyperscale_types::{zero_bls_signature, BlockHeight, Hash, ValidatorId};
 
     use super::*;
 
@@ -53,7 +53,7 @@ mod tests {
             height: BlockHeight(10),
             round: 0,
             voter: ValidatorId(2),
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
             timestamp: 1000000000000,
         };
 
@@ -68,7 +68,7 @@ mod tests {
             height: BlockHeight(5),
             round: 0,
             voter: ValidatorId(1),
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
             timestamp: 1000000000000,
         };
 

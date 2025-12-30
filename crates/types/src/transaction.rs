@@ -1588,12 +1588,14 @@ fn is_system_resource(node_id: &NodeId) -> bool {
 /// * `manifest` - The transaction manifest built using `ManifestBuilder`
 /// * `network` - The network definition
 /// * `nonce` - Transaction nonce for replay protection
-/// * `signer` - The keypair to sign with (acts as both signer and notary)
+/// * `signer` - The Ed25519 private key to sign with (acts as both signer and notary)
+///
+/// Note: Only Ed25519 keys are supported for Radix transactions (not BLS).
 pub fn sign_and_notarize(
     manifest: TransactionManifestV1,
     network: &NetworkDefinition,
     nonce: u32,
-    signer: &crate::KeyPair,
+    signer: &crate::Ed25519PrivateKey,
 ) -> Result<NotarizedTransactionV1, TransactionError> {
     sign_and_notarize_with_options(
         manifest,
@@ -1609,6 +1611,8 @@ pub fn sign_and_notarize(
 /// Sign and notarize a transaction manifest with full options.
 ///
 /// This provides full control over transaction header parameters.
+///
+/// Note: Only Ed25519 keys are supported for Radix transactions (not BLS).
 pub fn sign_and_notarize_with_options(
     manifest: TransactionManifestV1,
     network: &NetworkDefinition,
@@ -1616,10 +1620,10 @@ pub fn sign_and_notarize_with_options(
     tip_percentage: u16,
     start_epoch: Epoch,
     end_epoch: Epoch,
-    signer: &crate::KeyPair,
+    signer: &crate::Ed25519PrivateKey,
 ) -> Result<NotarizedTransactionV1, TransactionError> {
     let (instructions, blobs) = manifest.for_intent();
-    let notary_public_key = convert_public_key(signer.public_key());
+    let notary_public_key = radix_common::crypto::PublicKey::Ed25519(signer.public_key());
 
     let intent = IntentV1 {
         header: TransactionHeaderV1 {
@@ -1645,7 +1649,11 @@ pub fn sign_and_notarize_with_options(
         .transaction_intent_hash()
         .as_hash()
         .as_bytes();
-    let intent_signature = sign_hash(signer, &intent_hash);
+    let intent_sig = signer.sign(intent_hash);
+    let intent_signature = SignatureWithPublicKeyV1::Ed25519 {
+        public_key: signer.public_key(),
+        signature: intent_sig,
+    };
 
     let signed_intent = SignedIntentV1 {
         intent,
@@ -1663,65 +1671,13 @@ pub fn sign_and_notarize_with_options(
         .signed_transaction_intent_hash()
         .as_hash()
         .as_bytes();
-    let notary_signature = sign_hash_as_notary(signer, &signed_intent_hash);
+    let notary_sig = signer.sign(signed_intent_hash);
+    let notary_signature = SignatureV1::Ed25519(notary_sig);
 
     Ok(NotarizedTransactionV1 {
         signed_intent,
         notary_signature: NotarySignatureV1(notary_signature),
     })
-}
-
-/// Convert our PublicKey to Radix PublicKey.
-fn convert_public_key(pk: crate::PublicKey) -> radix_common::crypto::PublicKey {
-    match pk {
-        crate::PublicKey::Ed25519(bytes) => {
-            radix_common::crypto::PublicKey::Ed25519(radix_common::crypto::Ed25519PublicKey(bytes))
-        }
-        crate::PublicKey::Bls12381(_) => {
-            panic!("BLS12-381 keys are not supported for Radix transactions")
-        }
-    }
-}
-
-/// Sign a hash and return a signature with public key.
-fn sign_hash(signer: &crate::KeyPair, hash: &[u8; 32]) -> SignatureWithPublicKeyV1 {
-    let sig = signer.sign(hash);
-    let sig_bytes = sig.to_bytes();
-
-    match signer.public_key() {
-        crate::PublicKey::Ed25519(pk_bytes) => {
-            let mut sig_array = [0u8; 64];
-            let len = sig_bytes.len().min(64);
-            sig_array[..len].copy_from_slice(&sig_bytes[..len]);
-
-            SignatureWithPublicKeyV1::Ed25519 {
-                public_key: radix_common::crypto::Ed25519PublicKey(pk_bytes),
-                signature: radix_common::crypto::Ed25519Signature(sig_array),
-            }
-        }
-        crate::PublicKey::Bls12381(_) => {
-            panic!("BLS12-381 keys are not supported for Radix transactions")
-        }
-    }
-}
-
-/// Sign a hash for notarization (returns just the signature).
-fn sign_hash_as_notary(signer: &crate::KeyPair, hash: &[u8; 32]) -> SignatureV1 {
-    let sig = signer.sign(hash);
-    let sig_bytes = sig.to_bytes();
-
-    match signer.public_key() {
-        crate::PublicKey::Ed25519(_) => {
-            let mut sig_array = [0u8; 64];
-            let len = sig_bytes.len().min(64);
-            sig_array[..len].copy_from_slice(&sig_bytes[..len]);
-
-            SignatureV1::Ed25519(radix_common::crypto::Ed25519Signature(sig_array))
-        }
-        crate::PublicKey::Bls12381(_) => {
-            panic!("BLS12-381 keys are not supported for Radix transactions")
-        }
-    }
 }
 
 /// Ready transactions organized by priority section.

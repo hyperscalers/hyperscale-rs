@@ -738,7 +738,7 @@ mod tests {
             state_root: hyperscale_types::Hash::from_bytes(b"root"),
             success: true,
             validator: hyperscale_types::ValidatorId(0),
-            signature: hyperscale_types::Signature::zero(),
+            signature: hyperscale_types::zero_bls_signature(),
         });
 
         assert!(!batch.is_empty());

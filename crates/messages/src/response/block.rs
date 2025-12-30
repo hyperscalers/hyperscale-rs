@@ -68,8 +68,8 @@ impl NetworkMessage for GetBlockResponse {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        test_utils::test_transaction, BlockHeader, BlockHeight, Hash, Signature, SignerBitfield,
-        ValidatorId, VotePower,
+        test_utils::test_transaction, zero_bls_signature, BlockHeader, BlockHeight, Hash,
+        SignerBitfield, ValidatorId, VotePower,
     };
 
     fn create_test_block() -> Block {
@@ -101,7 +101,7 @@ mod tests {
             height: block.header.height,
             parent_block_hash: block.header.parent_hash,
             round: block.header.round,
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(0),
             voting_power: VotePower(u64::MAX),
             weighted_timestamp_ms: 0,

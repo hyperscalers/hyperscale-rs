@@ -17,7 +17,9 @@
 //! Without proofs, validators might reject valid blocks simply because they haven't
 //! received provisions yet, causing expensive view changes.
 
-use crate::{BlockHeight, Hash, NodeId, ShardGroupId, Signature, SignerBitfield, StateEntry};
+use crate::{
+    BlockHeight, Bls12381G2Signature, Hash, NodeId, ShardGroupId, SignerBitfield, StateEntry,
+};
 use sbor::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -51,7 +53,7 @@ pub struct CommitmentProof {
     pub signers: SignerBitfield,
 
     /// Aggregated BLS signature from all signers.
-    pub aggregated_signature: Signature,
+    pub aggregated_signature: Bls12381G2Signature,
 
     /// Block height at which the tx was committed on the source shard.
     pub block_height: BlockHeight,
@@ -120,7 +122,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let tx_hash: Hash = decoder.decode()?;
         let source_shard: ShardGroupId = decoder.decode()?;
         let signers: SignerBitfield = decoder.decode()?;
-        let aggregated_signature: Signature = decoder.decode()?;
+        let aggregated_signature: Bls12381G2Signature = decoder.decode()?;
         let block_height: BlockHeight = decoder.decode()?;
         // Entries: decode Vec and wrap in Arc
         let entries: Vec<StateEntry> = decoder.decode()?;
@@ -157,7 +159,7 @@ impl CommitmentProof {
         tx_hash: Hash,
         source_shard: ShardGroupId,
         signers: SignerBitfield,
-        aggregated_signature: Signature,
+        aggregated_signature: Bls12381G2Signature,
         block_height: BlockHeight,
         entries: Vec<StateEntry>,
     ) -> Self {
@@ -343,6 +345,7 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for CycleProof {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zero_bls_signature;
 
     /// Create a test StateEntry with a valid storage key format.
     ///
@@ -367,7 +370,7 @@ mod tests {
             Hash::from_bytes(b"tx_hash"),
             ShardGroupId(0),
             SignerBitfield::new(10),
-            Signature::zero(),
+            zero_bls_signature(),
             BlockHeight(100),
             entries,
         );
@@ -386,7 +389,7 @@ mod tests {
             Hash::from_bytes(b"tx_hash"),
             ShardGroupId(0),
             SignerBitfield::new(10),
-            Signature::zero(),
+            zero_bls_signature(),
             BlockHeight(100),
             entries,
         );
@@ -404,7 +407,7 @@ mod tests {
             Hash::from_bytes(b"tx_hash"),
             ShardGroupId(1),
             SignerBitfield::new(5),
-            Signature::zero(),
+            zero_bls_signature(),
             BlockHeight(50),
             entries,
         );
@@ -425,7 +428,7 @@ mod tests {
             Hash::from_bytes(b"winner"),
             ShardGroupId(1),
             SignerBitfield::new(10),
-            Signature::zero(),
+            zero_bls_signature(),
             BlockHeight(100),
             entries,
         );
@@ -445,7 +448,7 @@ mod tests {
             Hash::from_bytes(b"winner"),
             ShardGroupId(0),
             SignerBitfield::new(5),
-            Signature::zero(),
+            zero_bls_signature(),
             BlockHeight(100),
             entries,
         );
@@ -472,7 +475,7 @@ mod tests {
             Hash::from_bytes(b"tx"),
             ShardGroupId(0),
             signers,
-            Signature::zero(),
+            zero_bls_signature(),
             BlockHeight(1),
             vec![],
         );
@@ -488,7 +491,7 @@ mod tests {
             Hash::from_bytes(b"tx"),
             ShardGroupId(0),
             SignerBitfield::new(10),
-            Signature::zero(),
+            zero_bls_signature(),
             BlockHeight(1),
             entries,
         );

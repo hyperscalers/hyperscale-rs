@@ -158,7 +158,7 @@ impl CertificateTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{Signature, SignerBitfield};
+    use hyperscale_types::{zero_bls_signature, SignerBitfield};
 
     fn make_certificate(tx_hash: Hash, shard: ShardGroupId, merkle_root: Hash) -> StateCertificate {
         StateCertificate {
@@ -168,7 +168,7 @@ mod tests {
             state_writes: vec![],
             outputs_merkle_root: merkle_root,
             success: true,
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(4),
             voting_power: 3,
         }

@@ -424,7 +424,7 @@ pub enum Event {
         /// The shard casting this vote.
         shard: ShardGroupId,
         /// Aggregated signature from 2f+1 validators in the shard.
-        shard_signature: hyperscale_types::Signature,
+        shard_signature: hyperscale_types::Bls12381G2Signature,
         /// Which validators in the shard signed.
         signers: hyperscale_types::SignerBitfield,
         /// Total voting power represented.

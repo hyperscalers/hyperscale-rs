@@ -1,8 +1,8 @@
 //! Topology trait and static implementation.
 
 use crate::{
-    EpochId, NodeId, PublicKey, RoutableTransaction, ShardGroupId, ValidatorId, ValidatorSet,
-    VotePower,
+    Bls12381G1PublicKey, EpochId, NodeId, RoutableTransaction, ShardGroupId, ValidatorId,
+    ValidatorSet, VotePower,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
@@ -43,7 +43,7 @@ pub trait Topology: Send + Sync {
     fn voting_power(&self, validator_id: ValidatorId) -> Option<u64>;
 
     /// Get the public key for a validator.
-    fn public_key(&self, validator_id: ValidatorId) -> Option<PublicKey>;
+    fn public_key(&self, validator_id: ValidatorId) -> Option<Bls12381G1PublicKey>;
 
     /// Get the global validator set.
     fn global_validator_set(&self) -> &ValidatorSet;
@@ -264,7 +264,7 @@ struct ShardCommittee {
 #[derive(Debug, Clone)]
 struct ValidatorInfoInternal {
     voting_power: u64,
-    public_key: PublicKey,
+    public_key: Bls12381G1PublicKey,
 }
 
 /// A static topology implementation.
@@ -295,7 +295,7 @@ impl StaticTopology {
                     v.validator_id,
                     ValidatorInfoInternal {
                         voting_power: v.voting_power,
-                        public_key: v.public_key.clone(),
+                        public_key: v.public_key,
                     },
                 )
             })
@@ -351,7 +351,7 @@ impl StaticTopology {
                     v.validator_id,
                     ValidatorInfoInternal {
                         voting_power: v.voting_power,
-                        public_key: v.public_key.clone(),
+                        public_key: v.public_key,
                     },
                 )
             })
@@ -403,7 +403,7 @@ impl StaticTopology {
                     v.validator_id,
                     ValidatorInfoInternal {
                         voting_power: v.voting_power,
-                        public_key: v.public_key.clone(),
+                        public_key: v.public_key,
                     },
                 )
             })
@@ -480,10 +480,8 @@ impl Topology for StaticTopology {
             .map(|v| v.voting_power)
     }
 
-    fn public_key(&self, validator_id: ValidatorId) -> Option<PublicKey> {
-        self.validator_info
-            .get(&validator_id)
-            .map(|v| v.public_key.clone())
+    fn public_key(&self, validator_id: ValidatorId) -> Option<Bls12381G1PublicKey> {
+        self.validator_info.get(&validator_id).map(|v| v.public_key)
     }
 
     fn global_validator_set(&self) -> &ValidatorSet {
@@ -576,7 +574,7 @@ impl DynamicTopology {
                     v.validator_id,
                     ValidatorInfoInternal {
                         voting_power: v.voting_power,
-                        public_key: v.public_key.clone(),
+                        public_key: v.public_key,
                     },
                 )
             })
@@ -638,7 +636,7 @@ impl DynamicTopology {
                     v.validator_id,
                     ValidatorInfoInternal {
                         voting_power: v.voting_power,
-                        public_key: v.public_key.clone(),
+                        public_key: v.public_key,
                     },
                 )
             })
@@ -729,12 +727,12 @@ impl Topology for DynamicTopology {
             .map(|v| v.voting_power)
     }
 
-    fn public_key(&self, validator_id: ValidatorId) -> Option<PublicKey> {
+    fn public_key(&self, validator_id: ValidatorId) -> Option<Bls12381G1PublicKey> {
         let inner = self.inner.read().expect("RwLock poisoned");
         inner
             .validator_info
             .get(&validator_id)
-            .map(|v| v.public_key.clone())
+            .map(|v| v.public_key)
     }
 
     fn global_validator_set(&self) -> &ValidatorSet {
@@ -812,12 +810,12 @@ impl std::fmt::Debug for DynamicTopology {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{KeyPair, ValidatorInfo};
+    use crate::{generate_bls_keypair, ValidatorInfo};
 
     fn make_test_validator(id: u64, power: u64) -> ValidatorInfo {
         ValidatorInfo {
             validator_id: ValidatorId(id),
-            public_key: KeyPair::generate_ed25519().public_key(),
+            public_key: generate_bls_keypair().public_key(),
             voting_power: power,
         }
     }

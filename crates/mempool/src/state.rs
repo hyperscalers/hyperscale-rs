@@ -1901,9 +1901,9 @@ impl MempoolState {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        test_utils::test_transaction, Block, BlockHeader, DeferReason, KeyPair, QuorumCertificate,
-        ShardGroupId, StaticTopology, TransactionCertificate, TransactionDefer, ValidatorId,
-        ValidatorInfo, ValidatorSet,
+        generate_bls_keypair, test_utils::test_transaction, Block, BlockHeader, DeferReason,
+        QuorumCertificate, ShardGroupId, StaticTopology, TransactionCertificate, TransactionDefer,
+        ValidatorId, ValidatorInfo, ValidatorSet,
     };
     use std::collections::BTreeMap;
 
@@ -1911,7 +1911,7 @@ mod tests {
         let validators: Vec<_> = (0..4)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId(i),
-                public_key: KeyPair::generate_ed25519().public_key(),
+                public_key: generate_bls_keypair().public_key(),
                 voting_power: 1,
             })
             .collect();
@@ -2760,7 +2760,7 @@ mod tests {
         let validators: Vec<_> = (0..8)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId(i),
-                public_key: KeyPair::generate_ed25519().public_key(),
+                public_key: generate_bls_keypair().public_key(),
                 voting_power: 1,
             })
             .collect();

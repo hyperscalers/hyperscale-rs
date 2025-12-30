@@ -7,7 +7,10 @@
 use dashmap::DashMap;
 use hyperscale_engine::{CommittableSubstateDatabase, RadixExecutor, RADIX_PREFIX};
 use hyperscale_simulation::SimStorage;
-use hyperscale_types::{Hash, NodeId, PublicKey, RoutableTransaction, Signature, StateEntry};
+use hyperscale_types::{
+    verify_bls12381_v1, zero_bls_signature, Bls12381G1PublicKey, Bls12381G2Signature, Hash, NodeId,
+    RoutableTransaction, StateEntry,
+};
 use radix_common::network::NetworkDefinition;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 use std::sync::{Arc, Mutex};
@@ -178,15 +181,15 @@ impl SimulationCache {
     /// Compute a cache key from verification inputs.
     fn sig_cache_key(
         signing_message: &[u8],
-        signature: &Signature,
-        signer_keys: &[PublicKey],
+        signature: &Bls12381G2Signature,
+        signer_keys: &[Bls12381G1PublicKey],
     ) -> Hash {
         use std::hash::{Hash as StdHash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         signing_message.hash(&mut hasher);
-        signature.as_bytes().hash(&mut hasher);
+        signature.0.hash(&mut hasher);
         for pk in signer_keys {
-            pk.as_bytes().hash(&mut hasher);
+            pk.to_vec().hash(&mut hasher);
         }
         let h = hasher.finish();
         Hash::from_bytes(&{
@@ -199,9 +202,9 @@ impl SimulationCache {
     /// Verify an aggregated signature, using cache if available.
     pub fn verify_aggregated(
         &self,
-        signer_keys: &[PublicKey],
+        signer_keys: &[Bls12381G1PublicKey],
         message: &[u8],
-        signature: &Signature,
+        signature: &Bls12381G2Signature,
     ) -> bool {
         let key = Self::sig_cache_key(message, signature, signer_keys);
 
@@ -214,10 +217,10 @@ impl SimulationCache {
         // Note: or_insert_with holds write lock during computation, preventing TOCTOU races
         *self.aggregated_sigs.entry(key).or_insert_with(|| {
             if signer_keys.is_empty() {
-                *signature == Signature::zero()
+                *signature == zero_bls_signature()
             } else {
-                match PublicKey::aggregate_bls(signer_keys) {
-                    Ok(aggregated_pk) => aggregated_pk.verify(message, signature),
+                match Bls12381G1PublicKey::aggregate(signer_keys, true) {
+                    Ok(aggregated_pk) => verify_bls12381_v1(message, &aggregated_pk, signature),
                     Err(_) => false,
                 }
             }

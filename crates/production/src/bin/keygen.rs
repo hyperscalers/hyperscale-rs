@@ -4,20 +4,20 @@
 //!   keygen <seed_hex>      - Print BLS public key for given 32-byte seed (hex)
 //!   keygen --generate      - Generate new random BLS keypair and print
 
-use hyperscale_types::{KeyPair, KeyType, PublicKey};
+use hyperscale_types::{bls_keypair_from_seed, generate_bls_keypair, Bls12381G1PublicKey};
 use sha2::{Digest, Sha256};
 use std::env;
 
 const LIBP2P_IDENTITY_DOMAIN: &[u8] = b"hyperscale-libp2p-identity-v1:";
 
 /// Derive a libp2p Ed25519 keypair deterministically from a validator's public key.
-fn derive_libp2p_keypair(public_key: &PublicKey) -> libp2p::identity::Keypair {
-    let public_bytes = public_key.as_bytes();
+fn derive_libp2p_keypair(public_key: &Bls12381G1PublicKey) -> libp2p::identity::Keypair {
+    let public_bytes = public_key.to_vec();
 
     // Domain-separated hash to derive a seed
     let mut hasher = Sha256::new();
     hasher.update(LIBP2P_IDENTITY_DOMAIN);
-    hasher.update(public_bytes);
+    hasher.update(&public_bytes);
     let derived_seed: [u8; 32] = hasher.finalize().into();
 
     // Create an Ed25519 keypair from the derived seed using libp2p's SecretKey type
@@ -37,12 +37,10 @@ fn main() {
 
     if args[1] == "--generate" {
         // Generate random BLS keypair
-        let keypair = KeyPair::generate_bls();
+        let keypair = generate_bls_keypair();
         let public_key = keypair.public_key();
-
-        if let PublicKey::Bls12381(bytes) = public_key {
-            println!("{}", hex::encode(bytes));
-        }
+        let bytes = public_key.to_vec();
+        println!("{}", hex::encode(&bytes));
     } else {
         // Derive BLS keypair from seed
         let seed_hex = &args[1];
@@ -54,7 +52,7 @@ fn main() {
         }
 
         let seed: [u8; 32] = seed_bytes.try_into().unwrap();
-        let keypair = KeyPair::from_seed(KeyType::Bls12381, &seed);
+        let keypair = bls_keypair_from_seed(&seed);
         let public_key = keypair.public_key();
 
         // Derive PeerId
@@ -62,8 +60,7 @@ fn main() {
         let peer_id = libp2p::PeerId::from_public_key(&libp2p_keypair.public());
 
         // Print: public_key_hex peer_id_string
-        if let PublicKey::Bls12381(bytes) = public_key {
-            println!("{} {}", hex::encode(bytes), peer_id.to_base58());
-        }
+        let bytes = public_key.to_vec();
+        println!("{} {}", hex::encode(&bytes), peer_id.to_base58());
     }
 }

@@ -1596,8 +1596,8 @@ mod tests {
     #[test]
     fn test_atomic_certificate_persistence() {
         use hyperscale_types::{
-            NodeId, PartitionNumber, ShardGroupId, Signature, StateCertificate, SubstateWrite,
-            TransactionCertificate, TransactionDecision,
+            zero_bls_signature, NodeId, PartitionNumber, ShardGroupId, StateCertificate,
+            SubstateWrite, TransactionCertificate, TransactionDecision,
         };
         use std::collections::BTreeMap;
 
@@ -1621,7 +1621,7 @@ mod tests {
             state_writes: writes.clone(),
             outputs_merkle_root: Hash::from_bytes(&[0; 32]),
             success: true,
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             signers: hyperscale_types::SignerBitfield::new(4),
             voting_power: 0,
         };
@@ -1674,7 +1674,7 @@ mod tests {
     #[test]
     fn test_block_storage_and_retrieval() {
         use hyperscale_types::{
-            Block, BlockHeader, Signature, SignerBitfield, ValidatorId, VotePower,
+            zero_bls_signature, Block, BlockHeader, SignerBitfield, ValidatorId, VotePower,
         };
 
         let temp_dir = TempDir::new().unwrap();
@@ -1705,7 +1705,7 @@ mod tests {
             height: BlockHeight(42),
             parent_block_hash: Hash::from_bytes(&[1; 32]),
             round: 0,
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(4),
             voting_power: VotePower(4),
             weighted_timestamp_ms: 12345,
@@ -1727,7 +1727,7 @@ mod tests {
     #[test]
     fn test_block_range_retrieval() {
         use hyperscale_types::{
-            Block, BlockHeader, Signature, SignerBitfield, ValidatorId, VotePower,
+            zero_bls_signature, Block, BlockHeader, SignerBitfield, ValidatorId, VotePower,
         };
 
         let temp_dir = TempDir::new().unwrap();
@@ -1758,7 +1758,7 @@ mod tests {
                 height: BlockHeight(h),
                 parent_block_hash: Hash::from_bytes(&[h as u8; 32]),
                 round: 0,
-                aggregated_signature: Signature::zero(),
+                aggregated_signature: zero_bls_signature(),
                 signers: SignerBitfield::new(4),
                 voting_power: VotePower(4),
                 weighted_timestamp_ms: h * 1000,
@@ -1776,7 +1776,7 @@ mod tests {
 
     #[test]
     fn test_recovery_with_qc() {
-        use hyperscale_types::{Signature, SignerBitfield, VotePower};
+        use hyperscale_types::{zero_bls_signature, SignerBitfield, VotePower};
 
         let temp_dir = TempDir::new().unwrap();
         let expected_hash = Hash::from_hash_bytes(&[99; 32]);
@@ -1789,7 +1789,7 @@ mod tests {
                 height: BlockHeight(100),
                 parent_block_hash: Hash::from_bytes(&[98; 32]),
                 round: 5,
-                aggregated_signature: Signature::zero(),
+                aggregated_signature: zero_bls_signature(),
                 signers: SignerBitfield::new(4),
                 voting_power: VotePower(4),
                 weighted_timestamp_ms: 100_000,
@@ -1816,8 +1816,8 @@ mod tests {
     #[test]
     fn test_certificate_idempotency() {
         use hyperscale_types::{
-            NodeId, PartitionNumber, ShardGroupId, Signature, StateCertificate, SubstateWrite,
-            TransactionCertificate, TransactionDecision,
+            zero_bls_signature, NodeId, PartitionNumber, ShardGroupId, StateCertificate,
+            SubstateWrite, TransactionCertificate, TransactionDecision,
         };
         use std::collections::BTreeMap;
 
@@ -1840,7 +1840,7 @@ mod tests {
             state_writes: writes.clone(),
             outputs_merkle_root: Hash::from_bytes(&[0; 32]),
             success: true,
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             signers: hyperscale_types::SignerBitfield::new(4),
             voting_power: 0,
         };

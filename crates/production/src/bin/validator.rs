@@ -56,8 +56,8 @@ use hyperscale_production::{
     ThreadPoolConfig, ThreadPoolManager,
 };
 use hyperscale_types::{
-    KeyPair, KeyType, PublicKey, ShardGroupId, StaticTopology, ValidatorId, ValidatorInfo,
-    ValidatorSet,
+    bls_keypair_from_seed, generate_bls_keypair, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    ShardGroupId, StaticTopology, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use radix_common::network::NetworkDefinition;
 use radix_common::prelude::AddressBech32Decoder;
@@ -611,18 +611,15 @@ impl ValidatorConfig {
 }
 
 /// Format a public key as a hex string.
-fn format_public_key(pk: &PublicKey) -> String {
-    match pk {
-        PublicKey::Ed25519(bytes) => hex::encode(bytes),
-        PublicKey::Bls12381(bytes) => hex::encode(bytes),
-    }
+fn format_public_key(pk: &Bls12381G1PublicKey) -> String {
+    hex::encode(pk.to_vec())
 }
 
 /// Load or generate a signing keypair.
 ///
 /// The key file stores a 32-byte seed that deterministically generates the keypair.
 /// This seed can be stored as raw bytes or hex-encoded.
-fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<KeyPair> {
+fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1PrivateKey> {
     match key_path {
         Some(path) => {
             if path.exists() {
@@ -649,7 +646,7 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<KeyPair> {
                     .map_err(|_| anyhow::anyhow!("Key must be exactly 32 bytes"))?;
 
                 // Use BLS12-381 for consensus (supports signature aggregation)
-                Ok(KeyPair::from_seed(KeyType::Bls12381, &seed))
+                Ok(bls_keypair_from_seed(&seed))
             } else {
                 info!("Key file not found, generating new keypair");
 
@@ -658,7 +655,7 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<KeyPair> {
                 use rand::RngCore;
                 rand::rngs::OsRng.fill_bytes(&mut seed);
 
-                let keypair = KeyPair::from_seed(KeyType::Bls12381, &seed);
+                let keypair = bls_keypair_from_seed(&seed);
 
                 // Save the seed
                 if let Some(parent) = path.parent() {
@@ -672,7 +669,7 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<KeyPair> {
         }
         None => {
             warn!("No key path specified, generating ephemeral keypair");
-            Ok(KeyPair::generate_bls())
+            Ok(generate_bls_keypair())
         }
     }
 }
@@ -680,7 +677,7 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<KeyPair> {
 /// Build the topology from genesis configuration.
 fn build_topology(
     config: &ValidatorConfig,
-    local_keypair: &KeyPair,
+    local_keypair: &Bls12381G1PrivateKey,
 ) -> Result<Arc<dyn hyperscale_types::Topology>> {
     use std::collections::HashMap;
 
@@ -707,26 +704,22 @@ fn build_topology(
                     // Use our own key for our validator ID
                     local_keypair.public_key()
                 } else {
-                    // Parse hex-encoded public key
-                    let key_bytes = hex::decode(&v.public_key)
-                        .with_context(|| format!("Invalid hex public key for validator {}", v.id))?;
+                    // Parse hex-encoded public key (BLS12-381 only)
+                    let key_bytes = hex::decode(&v.public_key).with_context(|| {
+                        format!("Invalid hex public key for validator {}", v.id)
+                    })?;
 
-                    // Ed25519 public keys are 32 bytes
-                    if key_bytes.len() == 32 {
-                        let bytes: [u8; 32] = key_bytes
-                            .try_into()
-                            .map_err(|_| anyhow::anyhow!("Invalid public key length"))?;
-                        PublicKey::Ed25519(bytes)
-                    } else if key_bytes.len() == 48 {
-                        // BLS12-381 public key (compressed)
-                        PublicKey::Bls12381(key_bytes)
-                    } else {
+                    // BLS12-381 public key (compressed, 48 bytes)
+                    if key_bytes.len() != 48 {
                         bail!(
-                            "Invalid public key length for validator {}: expected 32 (Ed25519) or 48 (BLS), got {}",
+                            "Invalid public key length for validator {}: expected 48 (BLS), got {}",
                             v.id,
                             key_bytes.len()
                         );
                     }
+                    Bls12381G1PublicKey::try_from(key_bytes.as_slice()).map_err(|_| {
+                        anyhow::anyhow!("Invalid BLS public key for validator {}", v.id)
+                    })?
                 };
 
                 Ok(ValidatorInfo {

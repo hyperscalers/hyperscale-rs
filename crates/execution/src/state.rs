@@ -31,9 +31,9 @@
 
 use hyperscale_core::{Action, Event};
 use hyperscale_types::{
-    BlockHeight, Hash, KeyPair, NodeId, PublicKey, RoutableTransaction, ShardGroupId, Signature,
-    StateCertificate, StateEntry, StateProvision, StateVoteBlock, Topology, TransactionCertificate,
-    TransactionDecision, ValidatorId, VotePower,
+    BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Hash, NodeId,
+    RoutableTransaction, ShardGroupId, StateCertificate, StateEntry, StateProvision,
+    StateVoteBlock, Topology, TransactionCertificate, TransactionDecision, ValidatorId, VotePower,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -102,7 +102,7 @@ pub struct ExecutionState {
     topology: Arc<dyn Topology>,
 
     /// Signing key for creating votes.
-    signing_key: KeyPair,
+    signing_key: Bls12381G1PrivateKey,
 
     /// Current time.
     now: Duration,
@@ -265,7 +265,7 @@ pub const DEFAULT_SPECULATIVE_MAX_TXS: usize = 500;
 pub const DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS: u64 = 3;
 impl ExecutionState {
     /// Create a new execution state machine with default settings.
-    pub fn new(topology: Arc<dyn Topology>, signing_key: KeyPair) -> Self {
+    pub fn new(topology: Arc<dyn Topology>, signing_key: Bls12381G1PrivateKey) -> Self {
         Self::with_speculative_config(
             topology,
             signing_key,
@@ -281,7 +281,7 @@ impl ExecutionState {
     /// * `view_change_cooldown_rounds` - Rounds to pause speculation after a view change
     pub fn with_speculative_config(
         topology: Arc<dyn Topology>,
-        signing_key: KeyPair,
+        signing_key: Bls12381G1PrivateKey,
         speculative_max_txs: usize,
         view_change_cooldown_rounds: u64,
     ) -> Self {
@@ -362,7 +362,7 @@ impl ExecutionState {
     }
 
     /// Get public key for a validator.
-    fn public_key(&self, validator_id: ValidatorId) -> Option<PublicKey> {
+    fn public_key(&self, validator_id: ValidatorId) -> Option<Bls12381G1PublicKey> {
         self.topology.public_key(validator_id)
     }
 
@@ -780,7 +780,7 @@ impl ExecutionState {
         source_shard: ShardGroupId,
         block_height: BlockHeight,
         entries: &[StateEntry],
-    ) -> Signature {
+    ) -> Bls12381G2Signature {
         let entry_hashes: Vec<Hash> = entries.iter().map(|e| e.hash()).collect();
         let msg = hyperscale_types::state_provision_message(
             tx_hash,
@@ -789,7 +789,7 @@ impl ExecutionState {
             block_height,
             &entry_hashes,
         );
-        self.signing_key.sign(&msg)
+        self.signing_key.sign_v1(&msg)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1191,7 +1191,7 @@ impl ExecutionState {
 
         // Get public keys for the signers in the certificate's source shard
         let committee = self.topology.committee_for_shard(shard);
-        let public_keys: Vec<PublicKey> = committee
+        let public_keys: Vec<Bls12381G1PublicKey> = committee
             .iter()
             .filter_map(|&vid| self.topology.public_key(vid))
             .collect();
@@ -1371,7 +1371,7 @@ impl ExecutionState {
         for (shard_id, state_cert) in &certificate.shard_proofs {
             // Get public keys for this shard's committee
             let committee = self.topology.committee_for_shard(*shard_id);
-            let public_keys: Vec<PublicKey> = committee
+            let public_keys: Vec<Bls12381G1PublicKey> = committee
                 .iter()
                 .filter_map(|&vid| self.topology.public_key(vid))
                 .collect();
@@ -2315,10 +2315,12 @@ impl std::fmt::Debug for ExecutionState {
 mod tests {
     use super::*;
     use hyperscale_types::test_utils::test_transaction;
-    use hyperscale_types::{StaticTopology, ValidatorInfo, ValidatorSet};
+    use hyperscale_types::{
+        generate_bls_keypair, verify_bls12381_v1, StaticTopology, ValidatorInfo, ValidatorSet,
+    };
 
     fn make_test_topology() -> Arc<dyn Topology> {
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
 
         let validators: Vec<ValidatorInfo> = keys
             .iter()
@@ -2336,7 +2338,7 @@ mod tests {
 
     fn make_test_state() -> ExecutionState {
         let topology = make_test_topology();
-        let signing_key = KeyPair::generate_bls();
+        let signing_key = generate_bls_keypair();
         ExecutionState::new(topology, signing_key)
     }
 
@@ -2380,7 +2382,7 @@ mod tests {
         // Create a signed vote (simulating what the runner does)
         let message =
             hyperscale_types::exec_vote_message(&tx_hash, &state_root, local_shard, success);
-        let signature = state.signing_key.sign(&message);
+        let signature = state.signing_key.sign_v1(&message);
 
         let vote = StateVoteBlock {
             transaction_hash: tx_hash,
@@ -2546,11 +2548,11 @@ mod tests {
 
         // Verify the signature using the signing_message method
         let message = vote.signing_message();
-        let valid = committee.public_key(0).verify(&message, &vote.signature);
+        let valid = verify_bls12381_v1(&message, committee.public_key(0), &vote.signature);
         assert!(valid, "State vote signature should verify");
 
         // Verify with wrong key fails
-        let invalid = committee.public_key(1).verify(&message, &vote.signature);
+        let invalid = verify_bls12381_v1(&message, committee.public_key(1), &vote.signature);
         assert!(!invalid, "State vote should NOT verify with wrong key");
     }
 
@@ -2584,11 +2586,15 @@ mod tests {
             .collect();
 
         // Aggregate public keys (what the runner does)
-        let aggregated_pk = hyperscale_types::PublicKey::aggregate_bls(&signer_keys)
-            .expect("Aggregation should succeed");
+        let aggregated_pk =
+            Bls12381G1PublicKey::aggregate(&signer_keys, true).expect("Aggregation should succeed");
 
         // Verify the aggregated signature
-        let valid = aggregated_pk.verify(&message, &cert.aggregated_signature);
+        let valid = hyperscale_types::verify_bls12381_v1(
+            &message,
+            &aggregated_pk,
+            &cert.aggregated_signature,
+        );
         assert!(valid, "State certificate signature should verify");
     }
 
@@ -2609,20 +2615,17 @@ mod tests {
         let msg2 = hyperscale_types::exec_vote_message(&tx2, &root, shard, true);
         let msg3 = hyperscale_types::exec_vote_message(&tx3, &root, shard, true);
 
-        let sig1 = committee.keypair(0).sign(&msg1);
-        let sig2 = committee.keypair(1).sign(&msg2);
-        let sig3 = committee.keypair(2).sign(&msg3);
+        let sig1 = committee.keypair(0).sign_v1(&msg1);
+        let sig2 = committee.keypair(1).sign_v1(&msg2);
+        let sig3 = committee.keypair(2).sign_v1(&msg3);
 
         let messages: Vec<&[u8]> = vec![&msg1, &msg2, &msg3];
         let signatures = vec![sig1, sig2, sig3];
         let pubkeys: Vec<_> = (0..3).map(|i| committee.public_key(i).clone()).collect();
 
         // Batch verify with different messages (what dispatch_state_vote_verifications does)
-        let results = hyperscale_types::PublicKey::batch_verify_bls_different_messages(
-            &messages,
-            &signatures,
-            &pubkeys,
-        );
+        let results =
+            hyperscale_types::batch_verify_bls_different_messages(&messages, &signatures, &pubkeys);
 
         assert_eq!(
             results,
@@ -2646,8 +2649,8 @@ mod tests {
         let msg2 = hyperscale_types::exec_vote_message(&tx2, &root, shard, true);
 
         // First is valid, second is signed with wrong key
-        let sig1 = committee.keypair(0).sign(&msg1);
-        let sig2 = committee.keypair(3).sign(&msg2); // Wrong key! Should be keypair 1
+        let sig1 = committee.keypair(0).sign_v1(&msg1);
+        let sig2 = committee.keypair(3).sign_v1(&msg2); // Wrong key! Should be keypair 1
 
         let messages: Vec<&[u8]> = vec![&msg1, &msg2];
         let signatures = vec![sig1, sig2];
@@ -2656,11 +2659,8 @@ mod tests {
             committee.public_key(1).clone(), // Verifying with key 1
         ];
 
-        let results = hyperscale_types::PublicKey::batch_verify_bls_different_messages(
-            &messages,
-            &signatures,
-            &pubkeys,
-        );
+        let results =
+            hyperscale_types::batch_verify_bls_different_messages(&messages, &signatures, &pubkeys);
 
         assert_eq!(
             results,

@@ -3,8 +3,9 @@
 //! Provides a `FundedAccount` type and `AccountPool` for managing accounts
 //! distributed across shards. Accounts are funded at genesis time.
 
-use hyperscale_types::{shard_for_node, KeyPair, KeyType, NodeId, ShardGroupId};
-use radix_common::crypto::Ed25519PublicKey;
+use hyperscale_types::{
+    ed25519_keypair_from_seed, shard_for_node, Ed25519PrivateKey, NodeId, ShardGroupId,
+};
 use radix_common::math::Decimal;
 use radix_common::types::ComponentAddress;
 use std::collections::HashMap;
@@ -16,8 +17,8 @@ use tracing::info;
 /// Uses atomic nonce for thread-safe concurrent transaction generation.
 /// The nonce is wrapped in Arc so it can be shared across partitions.
 pub struct FundedAccount {
-    /// The keypair for signing transactions.
-    pub keypair: KeyPair,
+    /// The Ed25519 keypair for signing transactions.
+    pub keypair: Ed25519PrivateKey,
 
     /// The Radix component address for this account.
     pub address: ComponentAddress,
@@ -31,8 +32,13 @@ pub struct FundedAccount {
 
 impl Clone for FundedAccount {
     fn clone(&self) -> Self {
+        // Ed25519PrivateKey doesn't implement Clone, so we need to reconstruct from bytes
+        // This is safe because we're just copying the key material
+        let key_bytes = self.keypair.to_bytes();
+        let keypair = Ed25519PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
+
         Self {
-            keypair: self.keypair.clone(),
+            keypair,
             address: self.address,
             shard: self.shard,
             // Share the same nonce across clones (important for partitioning)
@@ -57,7 +63,7 @@ impl FundedAccount {
         }
         // Also incorporate the original seed directly for uniqueness
         seed_bytes[0..8].copy_from_slice(&seed_le);
-        let keypair = KeyPair::from_seed(KeyType::Ed25519, &seed_bytes);
+        let keypair = ed25519_keypair_from_seed(&seed_bytes);
         let address = Self::address_from_keypair(&keypair);
         let shard = Self::shard_for_address(&address, num_shards);
 
@@ -87,14 +93,9 @@ impl FundedAccount {
     }
 
     /// Derive account address from keypair.
-    fn address_from_keypair(keypair: &KeyPair) -> ComponentAddress {
-        match keypair.public_key() {
-            hyperscale_types::PublicKey::Ed25519(bytes) => {
-                let radix_pk = Ed25519PublicKey(bytes);
-                ComponentAddress::preallocated_account_from_public_key(&radix_pk)
-            }
-            _ => panic!("Only Ed25519 keypairs are supported for accounts"),
-        }
+    fn address_from_keypair(keypair: &Ed25519PrivateKey) -> ComponentAddress {
+        let radix_pk = keypair.public_key();
+        ComponentAddress::preallocated_account_from_public_key(&radix_pk)
     }
 
     /// Determine which shard an address belongs to.

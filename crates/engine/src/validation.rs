@@ -163,7 +163,7 @@ impl TransactionValidation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::KeyPair;
+    use hyperscale_types::generate_ed25519_keypair;
     use radix_common::network::NetworkDefinition;
     use radix_transactions::builder::ManifestBuilder;
 
@@ -189,7 +189,7 @@ mod tests {
     fn test_validate_properly_signed_transaction() {
         // Create a properly signed transaction
         let network = NetworkDefinition::simulator();
-        let signer = KeyPair::generate_ed25519();
+        let signer = generate_ed25519_keypair();
 
         // Build a simple manifest
         let manifest = ManifestBuilder::new().drop_all_proofs().build();
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn test_validate_with_hash() {
         let network = NetworkDefinition::simulator();
-        let signer = KeyPair::generate_ed25519();
+        let signer = generate_ed25519_keypair();
 
         let manifest = ManifestBuilder::new().drop_all_proofs().build();
         let notarized =
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn test_batch_validation() {
         let network = NetworkDefinition::simulator();
-        let signer = KeyPair::generate_ed25519();
+        let signer = generate_ed25519_keypair();
 
         // Create two valid transactions
         let manifest1 = ManifestBuilder::new().drop_all_proofs().build();

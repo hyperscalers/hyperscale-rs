@@ -2,8 +2,8 @@
 
 use crate::{message::OutboundMessage, Event, TimerId};
 use hyperscale_types::{
-    Block, BlockHeight, BlockVote, EpochConfig, EpochId, Hash, NodeId, PublicKey,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
+    Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, EpochConfig, EpochId,
+    Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield,
     StateCertificate, StateEntry, StateProvision, StateVoteBlock, TransactionCertificate,
     ValidatorId, VotePower,
 };
@@ -123,7 +123,7 @@ pub enum Action {
         signing_message: Vec<u8>,
         /// Votes to verify and potentially aggregate.
         /// Each tuple is (committee_index, vote, public_key, voting_power).
-        votes_to_verify: Vec<(usize, BlockVote, PublicKey, u64)>,
+        votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, u64)>,
         /// Already-verified votes (e.g., our own vote).
         /// Each tuple is (committee_index, vote, voting_power).
         verified_votes: Vec<(usize, BlockVote, u64)>,
@@ -151,7 +151,7 @@ pub enum Action {
         /// Provisions to verify and aggregate.
         provisions: Vec<StateProvision>,
         /// Public keys for each provision (same order as provisions).
-        public_keys: Vec<PublicKey>,
+        public_keys: Vec<Bls12381G1PublicKey>,
         /// Committee size (for SignerBitfield capacity).
         committee_size: usize,
     },
@@ -195,7 +195,7 @@ pub enum Action {
         tx_hash: Hash,
         /// Votes to verify with their public keys and voting power.
         /// Each tuple is (vote, public_key, voting_power).
-        votes: Vec<(StateVoteBlock, PublicKey, u64)>,
+        votes: Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>,
     },
 
     /// Verify a state certificate's aggregated signature (cross-shard Phase 5).
@@ -206,7 +206,7 @@ pub enum Action {
         /// The certificate to verify.
         certificate: StateCertificate,
         /// Public keys of the signers (in committee order, pre-resolved by state machine).
-        public_keys: Vec<PublicKey>,
+        public_keys: Vec<Bls12381G1PublicKey>,
     },
 
     /// Verify a Quorum Certificate's aggregated BLS signature.
@@ -221,7 +221,7 @@ pub enum Action {
         /// The QC to verify.
         qc: QuorumCertificate,
         /// Public keys of the signers (pre-resolved by state machine from QC's signer bitfield).
-        public_keys: Vec<PublicKey>,
+        public_keys: Vec<Bls12381G1PublicKey>,
         /// The block hash this QC verification is associated with (for correlation).
         /// This is the hash of the block whose header contains this QC as parent_qc.
         block_hash: Hash,
@@ -382,7 +382,7 @@ pub enum Action {
         /// This shard's ID.
         shard: ShardGroupId,
         /// Aggregated BLS signature from 2f+1 local validators.
-        shard_signature: Signature,
+        shard_signature: Bls12381G2Signature,
         /// Which validators in this shard signed.
         signers: SignerBitfield,
         /// Total voting power in the shard signature.

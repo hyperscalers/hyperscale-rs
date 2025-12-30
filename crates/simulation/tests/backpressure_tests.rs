@@ -13,7 +13,9 @@
 
 use hyperscale_core::{Event, TransactionStatus};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
-use hyperscale_types::{sign_and_notarize, KeyPair, KeyType, RoutableTransaction};
+use hyperscale_types::{
+    ed25519_keypair_from_seed, sign_and_notarize, Ed25519PrivateKey, RoutableTransaction,
+};
 use radix_common::constants::XRD;
 use radix_common::crypto::Ed25519PublicKey;
 use radix_common::math::Decimal;
@@ -47,10 +49,10 @@ fn single_shard_config() -> NetworkConfig {
     }
 }
 
-/// Helper to create a deterministic keypair for signing transactions.
-fn test_keypair_from_seed(seed: u8) -> KeyPair {
+/// Helper to create a deterministic Ed25519 keypair for signing transactions.
+fn test_keypair_from_seed(seed: u8) -> Ed25519PrivateKey {
     let seed_bytes = [seed; 32];
-    KeyPair::from_seed(KeyType::Ed25519, &seed_bytes)
+    ed25519_keypair_from_seed(&seed_bytes)
 }
 
 /// Helper to create a deterministic Radix account address from a seed.

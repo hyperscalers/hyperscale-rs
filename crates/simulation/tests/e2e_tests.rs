@@ -13,8 +13,8 @@
 use hyperscale_core::{Event, TransactionStatus};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
 use hyperscale_types::{
-    shard_for_node, sign_and_notarize, KeyPair, KeyType, NodeId, PublicKey, RoutableTransaction,
-    ShardGroupId,
+    ed25519_keypair_from_seed, shard_for_node, sign_and_notarize, Ed25519PrivateKey, NodeId,
+    RoutableTransaction, ShardGroupId,
 };
 use radix_common::constants::XRD;
 use radix_common::crypto::Ed25519PublicKey;
@@ -50,10 +50,10 @@ fn multi_shard_config() -> NetworkConfig {
     }
 }
 
-/// Helper to create a deterministic keypair for signing transactions.
-fn test_keypair_from_seed(seed: u8) -> KeyPair {
+/// Helper to create a deterministic Ed25519 keypair for signing transactions.
+fn test_keypair_from_seed(seed: u8) -> Ed25519PrivateKey {
     let seed_bytes = [seed; 32];
-    KeyPair::from_seed(KeyType::Ed25519, &seed_bytes)
+    ed25519_keypair_from_seed(&seed_bytes)
 }
 
 /// Helper to create a deterministic Radix account address from a seed.
@@ -64,17 +64,12 @@ fn test_account(seed: u8) -> ComponentAddress {
     ComponentAddress::preallocated_account_from_public_key(&pk)
 }
 
-/// Helper to create an account that can be controlled by the given keypair.
+/// Helper to create an account that can be controlled by the given Ed25519 keypair.
 /// This derives the account address from the keypair's actual public key,
 /// so withdrawals can be authorized by signing with the keypair.
-fn account_from_keypair(keypair: &KeyPair) -> ComponentAddress {
-    match keypair.public_key() {
-        PublicKey::Ed25519(bytes) => {
-            let radix_pk = Ed25519PublicKey(bytes);
-            ComponentAddress::preallocated_account_from_public_key(&radix_pk)
-        }
-        _ => panic!("Only Ed25519 keypairs are supported for Radix accounts"),
-    }
+fn account_from_keypair(keypair: &Ed25519PrivateKey) -> ComponentAddress {
+    let radix_pk = keypair.public_key();
+    ComponentAddress::preallocated_account_from_public_key(&radix_pk)
 }
 
 /// Get the simulator network definition.

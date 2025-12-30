@@ -76,7 +76,7 @@ tracing = "0.1.44"
 radix-blueprint-schema-init = { path = "vendor/radixdlt-scrypto/radix-blueprint-schema-init", default-features = false, features = ["std"] }
 radix-common = { path = "vendor/radixdlt-scrypto/radix-common", default-features = false, features = ["std"] }
 radix-common-derive = { path = "vendor/radixdlt-scrypto/radix-common-derive", default-features = false }
-radix-engine = { path = "vendor/radixdlt-scrypto/radix-engine", default-features = false, features = ["std"] }
+radix-engine = { path = "vendor/radixdlt-scrypto/radix-engine", default-features = false, features = ["std", "moka"] }
 radix-engine-interface = { path = "vendor/radixdlt-scrypto/radix-engine-interface", default-features = false, features = ["std"] }
 radix-engine-profiling = { path = "vendor/radixdlt-scrypto/radix-engine-profiling", default-features = false }
 radix-engine-profiling-derive = { path = "vendor/radixdlt-scrypto/radix-engine-profiling-derive", default-features = false }

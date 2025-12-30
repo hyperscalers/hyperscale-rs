@@ -24,10 +24,11 @@ use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_simulation::{NetworkTrafficAnalyzer, SimStorage, SimulatedNetwork};
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockVote, CommitmentProof, Hash, KeyPair, NodeId, PublicKey,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, Signature, SignerBitfield,
-    StateCertificate, StateVoteBlock, StaticTopology, Topology, TransactionDecision,
-    TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
+    batch_verify_bls_same_message, bls_keypair_from_seed, verify_bls12381_v1, zero_bls_signature,
+    Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    Bls12381G2Signature, CommitmentProof, Hash, NodeId, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, SignerBitfield, StateCertificate, StateVoteBlock, StaticTopology, Topology,
+    TransactionDecision, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet, VotePower,
 };
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -217,7 +218,7 @@ pub struct SimNode {
     state: NodeStateMachine,
     storage: SimStorage,
     /// Signing key for state vote signing (cloned from state machine).
-    signing_key: KeyPair,
+    signing_key: Bls12381G1PrivateKey,
     /// Pending inbound messages from other nodes.
     inbound_queue: VecDeque<Arc<OutboundMessage>>,
     /// Pending internal events (timer fires, crypto results, etc.)
@@ -244,7 +245,7 @@ impl SimNode {
         index: u32,
         state: NodeStateMachine,
         storage: SimStorage,
-        signing_key: KeyPair,
+        signing_key: Bls12381G1PrivateKey,
     ) -> Self {
         Self {
             index,
@@ -485,42 +486,34 @@ impl SimNode {
             } => {
                 // Start with already-verified votes (e.g., our own vote)
                 let mut all_verified: Vec<(usize, BlockVote, u64)> = already_verified;
-                let mut all_signatures: Vec<Signature> = all_verified
-                    .iter()
-                    .map(|(_, v, _)| v.signature.clone())
-                    .collect();
+                let mut all_signatures: Vec<Bls12381G2Signature> =
+                    all_verified.iter().map(|(_, v, _)| v.signature).collect();
 
                 // Batch verify all new signatures (same message optimization)
-                let signatures: Vec<Signature> = votes_to_verify
+                let signatures: Vec<Bls12381G2Signature> = votes_to_verify
                     .iter()
-                    .map(|(_, v, _, _)| v.signature.clone())
+                    .map(|(_, v, _, _)| v.signature)
                     .collect();
-                let public_keys: Vec<PublicKey> = votes_to_verify
-                    .iter()
-                    .map(|(_, _, pk, _)| pk.clone())
-                    .collect();
+                let public_keys: Vec<Bls12381G1PublicKey> =
+                    votes_to_verify.iter().map(|(_, _, pk, _)| *pk).collect();
 
                 let batch_valid = if votes_to_verify.is_empty() {
                     true
                 } else {
-                    PublicKey::batch_verify_bls_same_message(
-                        &signing_message,
-                        &signatures,
-                        &public_keys,
-                    )
+                    batch_verify_bls_same_message(&signing_message, &signatures, &public_keys)
                 };
 
                 if batch_valid {
                     // Happy path: all new signatures valid, add them to verified set
                     for (idx, vote, _, power) in votes_to_verify {
-                        all_signatures.push(vote.signature.clone());
+                        all_signatures.push(vote.signature);
                         all_verified.push((idx, vote, power));
                     }
                 } else {
                     // Some invalid - verify individually
                     for (idx, vote, pk, power) in &votes_to_verify {
-                        if pk.verify(&signing_message, &vote.signature) {
-                            all_signatures.push(vote.signature.clone());
+                        if verify_bls12381_v1(&signing_message, pk, &vote.signature) {
+                            all_signatures.push(vote.signature);
                             all_verified.push((*idx, vote.clone(), *power));
                         }
                     }
@@ -532,8 +525,9 @@ impl SimNode {
                 if VotePower::has_quorum(verified_power, total_voting_power)
                     && !all_signatures.is_empty()
                 {
-                    let qc = Signature::aggregate_bls(&all_signatures).ok().map(
-                        |aggregated_signature| {
+                    let qc = Bls12381G2Signature::aggregate(&all_signatures, true)
+                        .ok()
+                        .map(|aggregated_signature| {
                             let mut sorted_votes = all_verified.clone();
                             sorted_votes.sort_by_key(|(idx, _, _)| *idx);
 
@@ -566,8 +560,7 @@ impl SimNode {
                                 voting_power: VotePower(verified_power),
                                 weighted_timestamp_ms,
                             }
-                        },
-                    );
+                        });
 
                     let return_votes = if qc.is_none() { all_verified } else { vec![] };
                     self.internal_queue
@@ -598,16 +591,15 @@ impl SimNode {
             } => {
                 // All provisions for the same (tx, source_shard) sign the SAME message.
                 // Happy path: aggregate verification with single pairing check.
-                let signatures: Vec<Signature> =
-                    provisions.iter().map(|p| p.signature.clone()).collect();
+                let signatures: Vec<Bls12381G2Signature> =
+                    provisions.iter().map(|p| p.signature).collect();
                 let message = provisions
                     .first()
                     .map(|p| p.signing_message())
                     .unwrap_or_default();
 
                 let topology = self.state.topology();
-                let all_valid =
-                    PublicKey::batch_verify_bls_same_message(&message, &signatures, &public_keys);
+                let all_valid = batch_verify_bls_same_message(&message, &signatures, &public_keys);
 
                 let (verified_provisions, commitment_proof) = if all_valid {
                     // Fast path: all valid
@@ -620,8 +612,8 @@ impl SimNode {
                         }
                     }
 
-                    let aggregated_signature =
-                        Signature::aggregate_bls(&signatures).unwrap_or_else(|_| Signature::zero());
+                    let aggregated_signature = Bls12381G2Signature::aggregate(&signatures, true)
+                        .unwrap_or_else(|_| zero_bls_signature());
 
                     let proof = CommitmentProof::new(
                         tx_hash,
@@ -640,9 +632,9 @@ impl SimNode {
                     let mut signer_indices = Vec::new();
 
                     for (provision, pk) in provisions.iter().zip(public_keys.iter()) {
-                        if pk.verify(&message, &provision.signature) {
+                        if verify_bls12381_v1(&message, pk, &provision.signature) {
                             verified.push(provision.clone());
-                            valid_sigs.push(provision.signature.clone());
+                            valid_sigs.push(provision.signature);
                             if let Some(idx) = topology
                                 .committee_index_for_shard(source_shard, provision.validator_id)
                             {
@@ -657,8 +649,9 @@ impl SimNode {
                             signers.set(*idx);
                         }
 
-                        let aggregated_signature = Signature::aggregate_bls(&valid_sigs)
-                            .unwrap_or_else(|_| Signature::zero());
+                        let aggregated_signature =
+                            Bls12381G2Signature::aggregate(&valid_sigs, true)
+                                .unwrap_or_else(|_| zero_bls_signature());
 
                         Some(CommitmentProof::new(
                             tx_hash,
@@ -701,18 +694,14 @@ impl SimNode {
                     .collect();
 
                 // Aggregate BLS signatures
-                let bls_signatures: Vec<_> = unique_votes
-                    .iter()
-                    .filter_map(|vote| match &vote.signature {
-                        Signature::Bls12381(_) => Some(vote.signature.clone()),
-                        _ => None,
-                    })
-                    .collect();
+                let bls_signatures: Vec<Bls12381G2Signature> =
+                    unique_votes.iter().map(|vote| vote.signature).collect();
 
                 let aggregated_signature = if !bls_signatures.is_empty() {
-                    Signature::aggregate_bls(&bls_signatures).unwrap_or_else(|_| Signature::zero())
+                    Bls12381G2Signature::aggregate(&bls_signatures, true)
+                        .unwrap_or_else(|_| zero_bls_signature())
                 } else {
-                    Signature::zero()
+                    zero_bls_signature()
                 };
 
                 // Create signer bitfield
@@ -752,7 +741,7 @@ impl SimNode {
                     .into_iter()
                     .filter_map(|(vote, public_key, voting_power)| {
                         let msg = vote.signing_message();
-                        let valid = public_key.verify(&msg, &vote.signature);
+                        let valid = verify_bls12381_v1(&msg, &public_key, &vote.signature);
                         if valid {
                             Some((vote, voting_power))
                         } else {
@@ -776,7 +765,7 @@ impl SimNode {
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| certificate.signers.is_set(*i))
-                    .map(|(_, pk)| pk.clone())
+                    .map(|(_, pk)| *pk)
                     .collect();
                 let valid =
                     cache.verify_aggregated(&signer_keys, &msg, &certificate.aggregated_signature);
@@ -794,7 +783,7 @@ impl SimNode {
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| qc.signers.is_set(*i))
-                    .map(|(_, pk)| pk.clone())
+                    .map(|(_, pk)| *pk)
                     .collect();
                 let valid = if signer_keys.is_empty() {
                     false
@@ -834,7 +823,7 @@ impl SimNode {
                         local_shard,
                         result.success,
                     );
-                    let signature = self.signing_key.sign(&message);
+                    let signature = self.signing_key.sign_v1(&message);
 
                     let vote = StateVoteBlock {
                         transaction_hash: result.transaction_hash,
@@ -877,7 +866,7 @@ impl SimNode {
                         local_shard,
                         result.success,
                     );
-                    let signature = self.signing_key.sign(&message);
+                    let signature = self.signing_key.sign_v1(&message);
 
                     let vote = StateVoteBlock {
                         transaction_hash: result.transaction_hash,
@@ -934,7 +923,7 @@ impl SimNode {
                     local_shard,
                     result.success,
                 );
-                let signature = self.signing_key.sign(&message);
+                let signature = self.signing_key.sign_v1(&message);
 
                 let vote = StateVoteBlock {
                     transaction_hash: result.transaction_hash,
@@ -1192,22 +1181,22 @@ impl ParallelSimulator {
 
         // Generate keys deterministically
         let seed = self.config.seed;
-        let keys: Vec<KeyPair> = (0..total_nodes)
+        let keys: Vec<Bls12381G1PrivateKey> = (0..total_nodes)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
                 let key_seed = seed.wrapping_add(i as u64).wrapping_mul(0x517cc1b727220a95);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
                 seed_bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
-                KeyPair::from_seed(hyperscale_types::KeyType::Bls12381, &seed_bytes)
+                bls_keypair_from_seed(&seed_bytes)
             })
             .collect();
-        let public_keys: Vec<PublicKey> = keys.iter().map(|k| k.public_key()).collect();
+        let public_keys: Vec<Bls12381G1PublicKey> = keys.iter().map(|k| k.public_key()).collect();
 
         // Build global validator set
         let global_validators: Vec<ValidatorInfo> = (0..total_nodes)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId(i as u64),
-                public_key: public_keys[i].clone(),
+                public_key: public_keys[i],
                 voting_power: 1,
             })
             .collect();
@@ -1244,17 +1233,22 @@ impl ParallelSimulator {
                     shard_committees.clone(),
                 ));
 
-                let signing_key = keys[node_index].clone();
+                // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
+                let key_bytes = keys[node_index].to_bytes();
+                let signing_key =
+                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
+                let signing_key2 =
+                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
                 let state = NodeStateMachine::new(
                     node_index as u32,
                     topology,
-                    signing_key.clone(),
+                    signing_key,
                     BftConfig::default(),
                     RecoveredState::default(),
                 );
 
                 let storage = SimStorage::new();
-                let node = SimNode::new(node_index as u32, state, storage, signing_key);
+                let node = SimNode::new(node_index as u32, state, storage, signing_key2);
                 self.nodes.push(node);
             }
         }
@@ -1333,22 +1327,22 @@ impl ParallelSimulator {
 
         // Generate keys deterministically
         let seed = self.config.seed;
-        let keys: Vec<KeyPair> = (0..total_nodes)
+        let keys: Vec<Bls12381G1PrivateKey> = (0..total_nodes)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
                 let key_seed = seed.wrapping_add(i as u64).wrapping_mul(0x517cc1b727220a95);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
                 seed_bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
-                KeyPair::from_seed(hyperscale_types::KeyType::Bls12381, &seed_bytes)
+                bls_keypair_from_seed(&seed_bytes)
             })
             .collect();
-        let public_keys: Vec<PublicKey> = keys.iter().map(|k| k.public_key()).collect();
+        let public_keys: Vec<Bls12381G1PublicKey> = keys.iter().map(|k| k.public_key()).collect();
 
         // Build global validator set
         let global_validators: Vec<ValidatorInfo> = (0..total_nodes)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId(i as u64),
-                public_key: public_keys[i].clone(),
+                public_key: public_keys[i],
                 voting_power: 1,
             })
             .collect();
@@ -1385,17 +1379,22 @@ impl ParallelSimulator {
                     shard_committees.clone(),
                 ));
 
-                let signing_key = keys[node_index].clone();
+                // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
+                let key_bytes = keys[node_index].to_bytes();
+                let signing_key =
+                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
+                let signing_key2 =
+                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
                 let state = NodeStateMachine::new(
                     node_index as u32,
                     topology,
-                    signing_key.clone(),
+                    signing_key,
                     BftConfig::default(),
                     RecoveredState::default(),
                 );
 
                 let storage = SimStorage::new();
-                let node = SimNode::new(node_index as u32, state, storage, signing_key);
+                let node = SimNode::new(node_index as u32, state, storage, signing_key2);
                 self.nodes.push(node);
             }
         }

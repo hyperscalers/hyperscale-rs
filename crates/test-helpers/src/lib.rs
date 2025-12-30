@@ -2,13 +2,13 @@
 //!
 //! This crate provides utilities for creating test fixtures with real BLS signatures,
 //! enabling tests to exercise the actual cryptographic verification paths rather than
-//! bypassing them with `Signature::zero()`.
+//! bypassing them with `zero_bls_signature()`.
 //!
 //! # Example
 //!
 //! ```rust
 //! use hyperscale_test_helpers::{TestCommittee, fixtures};
-//! use hyperscale_types::{Hash, BlockHeight, ShardGroupId};
+//! use hyperscale_types::{Hash, BlockHeight, ShardGroupId, verify_bls12381_v1};
 //!
 //! // Create a committee of 4 validators with deterministic keys
 //! let committee = TestCommittee::new(4, 42);
@@ -27,21 +27,23 @@
 //! // The vote has a real BLS signature that can be verified
 //! let pk = committee.public_key(0);
 //! let msg = hyperscale_types::block_vote_message(ShardGroupId(0), 1, 0, &block_hash);
-//! assert!(pk.verify(&msg, &vote.signature));
+//! assert!(verify_bls12381_v1(&msg, pk, &vote.signature));
 //! ```
 
 pub mod byzantine;
 pub mod fixtures;
 
-use hyperscale_types::{KeyPair, KeyType, PublicKey, ValidatorId};
+use hyperscale_types::{
+    bls_keypair_from_seed, Bls12381G1PrivateKey, Bls12381G1PublicKey, ValidatorId,
+};
 
 /// A test committee of validators with deterministic BLS keypairs.
 ///
 /// Provides easy access to keypairs, public keys, and validator IDs
 /// for creating signed test fixtures.
 pub struct TestCommittee {
-    keypairs: Vec<KeyPair>,
-    public_keys: Vec<PublicKey>,
+    keypairs: Vec<Bls12381G1PrivateKey>,
+    public_keys: Vec<Bls12381G1PublicKey>,
     validator_ids: Vec<ValidatorId>,
 }
 
@@ -81,7 +83,7 @@ impl TestCommittee {
             seed_bytes[8..16].copy_from_slice(&(i as u64).to_le_bytes());
             seed_bytes[16..24].copy_from_slice(&seed.to_le_bytes());
 
-            let kp = KeyPair::from_seed(KeyType::Bls12381, &seed_bytes);
+            let kp = bls_keypair_from_seed(&seed_bytes);
             let pk = kp.public_key();
 
             keypairs.push(kp);
@@ -135,7 +137,7 @@ impl TestCommittee {
     /// # Panics
     ///
     /// Panics if `idx >= size()`.
-    pub fn keypair(&self, idx: usize) -> &KeyPair {
+    pub fn keypair(&self, idx: usize) -> &Bls12381G1PrivateKey {
         &self.keypairs[idx]
     }
 
@@ -144,7 +146,7 @@ impl TestCommittee {
     /// # Panics
     ///
     /// Panics if `idx >= size()`.
-    pub fn public_key(&self, idx: usize) -> &PublicKey {
+    pub fn public_key(&self, idx: usize) -> &Bls12381G1PublicKey {
         &self.public_keys[idx]
     }
 
@@ -158,7 +160,7 @@ impl TestCommittee {
     }
 
     /// Get all public keys.
-    pub fn public_keys(&self) -> &[PublicKey] {
+    pub fn public_keys(&self) -> &[Bls12381G1PublicKey] {
         &self.public_keys
     }
 
@@ -185,6 +187,7 @@ impl TestCommittee {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_types::verify_bls12381_v1;
 
     #[test]
     fn test_committee_creation() {
@@ -202,7 +205,7 @@ mod tests {
 
         // Same seed should produce same keys
         for i in 0..4 {
-            assert_eq!(c1.public_key(i).as_bytes(), c2.public_key(i).as_bytes());
+            assert_eq!(c1.public_key(i).0, c2.public_key(i).0);
         }
     }
 
@@ -212,7 +215,7 @@ mod tests {
         let c2 = TestCommittee::new(4, 43);
 
         // Different seeds should produce different keys
-        assert_ne!(c1.public_key(0).as_bytes(), c2.public_key(0).as_bytes());
+        assert_ne!(c1.public_key(0).0, c2.public_key(0).0);
     }
 
     #[test]
@@ -246,12 +249,20 @@ mod tests {
         let committee = TestCommittee::new(4, 42);
 
         let message = b"test message";
-        let signature = committee.keypair(0).sign(message);
+        let signature = committee.keypair(0).sign_v1(message);
 
         // Verify with the corresponding public key
-        assert!(committee.public_key(0).verify(message, &signature));
+        assert!(verify_bls12381_v1(
+            message,
+            committee.public_key(0),
+            &signature
+        ));
 
         // Should not verify with different public key
-        assert!(!committee.public_key(1).verify(message, &signature));
+        assert!(!verify_bls12381_v1(
+            message,
+            committee.public_key(1),
+            &signature
+        ));
     }
 }

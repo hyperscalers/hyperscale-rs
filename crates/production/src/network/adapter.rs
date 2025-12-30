@@ -20,7 +20,7 @@ use dashmap::DashMap;
 use futures::future::Either;
 use futures::{FutureExt, StreamExt};
 use hyperscale_core::{Event, OutboundMessage};
-use hyperscale_types::{MessagePriority, PublicKey, ShardGroupId, ValidatorId};
+use hyperscale_types::{Bls12381G1PublicKey, MessagePriority, ShardGroupId, ValidatorId};
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::{OrTransport, Transport};
 use libp2p::core::upgrade::Version;
@@ -57,10 +57,10 @@ const LIBP2P_IDENTITY_DOMAIN: &[u8] = b"hyperscale-libp2p-identity-v1:";
 /// IMPORTANT: The derivation is based on the PUBLIC key, not the secret key.
 /// This allows other validators to compute any validator's PeerId from their
 /// known public key.
-pub fn derive_libp2p_keypair(public_key: &PublicKey) -> identity::Keypair {
+pub fn derive_libp2p_keypair(public_key: &Bls12381G1PublicKey) -> identity::Keypair {
     use sha2::{Digest, Sha256};
 
-    let public_bytes = public_key.as_bytes();
+    let public_bytes = public_key.to_vec();
 
     // Domain-separated hash to derive a seed
     let mut hasher = Sha256::new();
@@ -79,7 +79,7 @@ pub fn derive_libp2p_keypair(public_key: &PublicKey) -> identity::Keypair {
 ///
 /// This is a convenience wrapper around `derive_libp2p_keypair` that returns
 /// just the PeerId.
-pub fn compute_peer_id_for_validator(public_key: &PublicKey) -> Libp2pPeerId {
+pub fn compute_peer_id_for_validator(public_key: &Bls12381G1PublicKey) -> Libp2pPeerId {
     derive_libp2p_keypair(public_key).public().to_peer_id()
 }
 

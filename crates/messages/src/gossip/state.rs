@@ -255,7 +255,7 @@ impl ShardMessage for TransactionCertificateGossip {}
 mod tests {
     use super::*;
     use hyperscale_types::{
-        BlockHeight, Hash, ShardGroupId, Signature, SignerBitfield, ValidatorId,
+        zero_bls_signature, BlockHeight, Hash, ShardGroupId, SignerBitfield, ValidatorId,
     };
     use std::sync::Arc;
 
@@ -268,7 +268,7 @@ mod tests {
             block_height: BlockHeight(10),
             entries: Arc::new(vec![]),
             validator_id: ValidatorId(0),
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
         };
 
         let batch = StateProvisionBatch::single(provision.clone());
@@ -289,7 +289,7 @@ mod tests {
             state_root: Hash::from_bytes(b"root"),
             success: true,
             validator: ValidatorId(0),
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
         };
 
         let batch = StateVoteBatch::single(vote.clone());
@@ -316,7 +316,7 @@ mod tests {
             state_writes: vec![],
             outputs_merkle_root: Hash::from_bytes(b"root"),
             success: true,
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             signers,
             voting_power: 3,
         };
@@ -368,7 +368,7 @@ mod tests {
             block_height: BlockHeight(10),
             entries: Arc::new(vec![]),
             validator_id: ValidatorId(0),
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
         };
 
         // new() should have empty trace context
@@ -394,7 +394,7 @@ mod tests {
             state_writes: vec![],
             outputs_merkle_root: Hash::from_bytes(b"root"),
             success: true,
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             signers,
             voting_power: 3,
         };

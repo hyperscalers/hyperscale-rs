@@ -12,7 +12,7 @@
 
 #[cfg(test)]
 use hyperscale_types::QuorumCertificate;
-use hyperscale_types::{BlockHeader, BlockHeight, BlockVote, Hash, PublicKey, VotePower};
+use hyperscale_types::{BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Hash, VotePower};
 
 /// Votes for a specific block.
 ///
@@ -50,7 +50,7 @@ pub struct VoteSet {
     // ═══════════════════════════════════════════════════════════════════════
     /// Unverified votes buffered for batch verification.
     /// Each tuple is (committee_index, vote, public_key, voting_power).
-    unverified_votes: Vec<(usize, BlockVote, PublicKey, u64)>,
+    unverified_votes: Vec<(usize, BlockVote, Bls12381G1PublicKey, u64)>,
 
     /// Total voting power of unverified votes.
     unverified_power: u64,
@@ -152,7 +152,7 @@ impl VoteSet {
         &mut self,
         committee_index: usize,
         vote: BlockVote,
-        public_key: PublicKey,
+        public_key: Bls12381G1PublicKey,
         voting_power: u64,
     ) -> bool {
         // Check for duplicate
@@ -201,7 +201,7 @@ impl VoteSet {
     ///
     /// Returns the votes and marks the vote set as pending verification.
     /// Each tuple is (committee_index, vote, public_key, voting_power).
-    pub fn take_unverified_votes(&mut self) -> Vec<(usize, BlockVote, PublicKey, u64)> {
+    pub fn take_unverified_votes(&mut self) -> Vec<(usize, BlockVote, Bls12381G1PublicKey, u64)> {
         self.pending_verification = true;
         self.unverified_power = 0;
         std::mem::take(&mut self.unverified_votes)
@@ -305,7 +305,7 @@ impl VoteSet {
     /// Returns error if called before reaching quorum or with no votes.
     #[cfg(test)]
     pub fn build_qc(&mut self, block_hash: Hash) -> Result<QuorumCertificate, String> {
-        use hyperscale_types::{Signature, SignerBitfield};
+        use hyperscale_types::{Bls12381G2Signature, SignerBitfield};
 
         if self.verified_votes.is_empty() {
             return Err("cannot build QC with no votes".to_string());
@@ -333,15 +333,15 @@ impl VoteSet {
         }
 
         // Extract signatures in sorted order
-        let signatures: Vec<Signature> = self
+        let signatures: Vec<Bls12381G2Signature> = self
             .verified_votes
             .iter()
             .map(|(_, v, _)| v.signature.clone())
             .collect();
 
         // Aggregate BLS signatures
-        let aggregated_signature = Signature::aggregate_bls(&signatures)
-            .map_err(|e| format!("failed to aggregate signatures: {}", e))?;
+        let aggregated_signature = Bls12381G2Signature::aggregate(&signatures, true)
+            .map_err(|e| format!("failed to aggregate signatures: {:?}", e))?;
 
         // Compute stake-weighted timestamp: sum(timestamp * stake) / sum(stake)
         let weighted_timestamp_ms = if self.verified_power == 0 {
@@ -374,7 +374,9 @@ impl VoteSet {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{KeyPair, QuorumCertificate, ShardGroupId, ValidatorId};
+    use hyperscale_types::{
+        generate_bls_keypair, Bls12381G1PrivateKey, QuorumCertificate, ShardGroupId, ValidatorId,
+    };
 
     /// Test shard group.
     fn test_shard_group() -> ShardGroupId {
@@ -393,13 +395,18 @@ mod tests {
         }
     }
 
-    fn make_vote(keys: &[KeyPair], voter_index: usize, block_hash: Hash, height: u64) -> BlockVote {
+    fn make_vote(
+        keys: &[Bls12381G1PrivateKey],
+        voter_index: usize,
+        block_hash: Hash,
+        height: u64,
+    ) -> BlockVote {
         // Use centralized domain-separated signing message
         let shard_group = test_shard_group();
         let round = 0u64;
         let signing_message =
             hyperscale_types::block_vote_message(shard_group, height, round, &block_hash);
-        let signature = keys[voter_index].sign(&signing_message);
+        let signature = keys[voter_index].sign_v1(&signing_message);
         BlockVote {
             block_hash,
             height: BlockHeight(height),
@@ -421,7 +428,7 @@ mod tests {
 
     #[test]
     fn test_buffer_unverified_votes() {
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let header = make_header(1);
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(header), 4);
@@ -449,7 +456,7 @@ mod tests {
 
     #[test]
     fn test_should_trigger_verification() {
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let header = make_header(1);
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(header), 4);
@@ -474,7 +481,7 @@ mod tests {
 
     #[test]
     fn test_add_verified_votes() {
-        let keys: Vec<KeyPair> = (0..4).map(|_| KeyPair::generate_bls()).collect();
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let header = make_header(1);
         let block_hash = header.hash();
         let mut vote_set = VoteSet::new(Some(header), 4);

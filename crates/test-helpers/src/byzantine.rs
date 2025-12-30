@@ -5,8 +5,9 @@
 
 use crate::TestCommittee;
 use hyperscale_types::{
-    block_vote_message, exec_vote_message, BlockHeight, BlockVote, Hash, PublicKey,
-    QuorumCertificate, ShardGroupId, Signature, SignerBitfield, StateVoteBlock, VotePower,
+    batch_verify_bls_same_message, block_vote_message, exec_vote_message, BlockHeight, BlockVote,
+    Bls12381G1PublicKey, Bls12381G2Signature, Hash, QuorumCertificate, ShardGroupId,
+    SignerBitfield, StateVoteBlock, VotePower,
 };
 
 /// Create a block vote with an invalid signature (signed with wrong key).
@@ -24,7 +25,7 @@ pub fn make_wrong_key_block_vote(
 ) -> BlockVote {
     let message = block_vote_message(shard, height.0, round, &block_hash);
     // Sign with wrong key
-    let signature = committee.keypair(actual_signer_idx).sign(&message);
+    let signature = committee.keypair(actual_signer_idx).sign_v1(&message);
 
     BlockVote {
         block_hash,
@@ -51,7 +52,7 @@ pub fn make_wrong_message_block_vote(
 ) -> BlockVote {
     // Sign for different block
     let message = block_vote_message(shard, height.0, round, &actual_signed_hash);
-    let signature = committee.keypair(voter_idx).sign(&message);
+    let signature = committee.keypair(voter_idx).sign_v1(&message);
 
     BlockVote {
         block_hash: claimed_block_hash, // Claims this block
@@ -86,21 +87,21 @@ pub fn make_partially_invalid_qc(
     all_indices.sort();
 
     // Collect signatures - one is signed with wrong key
-    let signatures: Vec<Signature> = all_indices
+    let signatures: Vec<Bls12381G2Signature> = all_indices
         .iter()
         .map(|&idx| {
             if idx == bad_voter_idx {
                 // Sign with wrong key
-                committee.keypair(wrong_signer_idx).sign(&message)
+                committee.keypair(wrong_signer_idx).sign_v1(&message)
             } else {
-                committee.keypair(idx).sign(&message)
+                committee.keypair(idx).sign_v1(&message)
             }
         })
         .collect();
 
     // Aggregate all signatures (including the bad one)
     let aggregated_signature =
-        Signature::aggregate_bls(&signatures).expect("BLS aggregation should succeed");
+        Bls12381G2Signature::aggregate(&signatures, true).expect("BLS aggregation should succeed");
 
     // Build signer bitfield
     let mut signers = SignerBitfield::new(committee.size());
@@ -135,7 +136,7 @@ pub fn make_wrong_key_state_vote(
     success: bool,
 ) -> StateVoteBlock {
     let message = exec_vote_message(&tx_hash, &state_root, shard, success);
-    let signature = committee.keypair(actual_signer_idx).sign(&message);
+    let signature = committee.keypair(actual_signer_idx).sign_v1(&message);
 
     StateVoteBlock {
         transaction_hash: tx_hash,
@@ -158,7 +159,7 @@ pub fn make_wrong_state_root_vote(
     success: bool,
 ) -> StateVoteBlock {
     let message = exec_vote_message(&tx_hash, &actual_signed_root, shard, success);
-    let signature = committee.keypair(voter_idx).sign(&message);
+    let signature = committee.keypair(voter_idx).sign_v1(&message);
 
     StateVoteBlock {
         transaction_hash: tx_hash,
@@ -173,15 +174,9 @@ pub fn make_wrong_state_root_vote(
 /// Create a completely random/garbage signature.
 ///
 /// This tests that verification handles malformed signatures gracefully.
-pub fn make_garbage_signature() -> Signature {
-    // Create a signature with random-looking bytes that isn't a valid BLS signature
-    let garbage_bytes = vec![
-        0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde,
-        0xf0, 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc,
-        0xde, 0xf0, 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0x12, 0x34, 0x56, 0x78, 0x9a,
-        0xbc, 0xde, 0xf0,
-    ];
-    Signature::Bls12381(garbage_bytes)
+pub fn make_garbage_signature() -> Bls12381G2Signature {
+    // Create a signature with zero bytes (not a valid BLS signature point)
+    Bls12381G2Signature([0u8; 96])
 }
 
 /// Create a vote with a garbage signature.
@@ -206,11 +201,11 @@ pub fn make_garbage_signature_vote(
 ///
 /// Returns true if batch verification rejects the set (as expected).
 pub fn batch_verification_rejects(
-    messages: &[&[u8]],
-    signatures: &[Signature],
-    pubkeys: &[PublicKey],
+    message: &[u8],
+    signatures: &[Bls12381G2Signature],
+    pubkeys: &[Bls12381G1PublicKey],
 ) -> bool {
-    !PublicKey::batch_verify_bls_same_message(messages[0], signatures, pubkeys)
+    !batch_verify_bls_same_message(message, signatures, pubkeys)
 }
 
 #[cfg(test)]

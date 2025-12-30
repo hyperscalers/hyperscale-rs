@@ -12,7 +12,9 @@
 //! This avoids wasting CPU on votes we'll never use (e.g., if we only
 //! receive 2 of 3 needed votes, we don't verify any).
 
-use hyperscale_types::{Hash, NodeId, PublicKey, ShardGroupId, StateVoteBlock, ValidatorId};
+use hyperscale_types::{
+    Bls12381G1PublicKey, Hash, NodeId, ShardGroupId, StateVoteBlock, ValidatorId,
+};
 use std::collections::{BTreeMap, HashSet};
 use tracing::instrument;
 
@@ -48,7 +50,7 @@ pub struct VoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
     /// Unverified votes buffered for batch verification.
     /// Each entry is (vote, public_key, voting_power).
-    unverified_votes: Vec<(StateVoteBlock, PublicKey, u64)>,
+    unverified_votes: Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>,
     /// Total voting power of unverified votes.
     unverified_power: u64,
     /// Validators we've already seen votes from (for deduplication).
@@ -111,7 +113,7 @@ impl VoteTracker {
     pub fn buffer_unverified_vote(
         &mut self,
         vote: StateVoteBlock,
-        public_key: PublicKey,
+        public_key: Bls12381G1PublicKey,
         voting_power: u64,
     ) -> bool {
         let validator_id = vote.validator;
@@ -150,7 +152,7 @@ impl VoteTracker {
     /// Take unverified votes for batch verification.
     ///
     /// Marks verification as pending. Call `on_verification_complete` when done.
-    pub fn take_unverified_votes(&mut self) -> Vec<(StateVoteBlock, PublicKey, u64)> {
+    pub fn take_unverified_votes(&mut self) -> Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)> {
         self.pending_verification = true;
         self.unverified_power = 0;
         std::mem::take(&mut self.unverified_votes)
@@ -217,10 +219,10 @@ impl VoteTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{KeyPair, Signature, ValidatorId};
+    use hyperscale_types::{generate_bls_keypair, zero_bls_signature, ValidatorId};
 
-    fn make_test_public_key() -> PublicKey {
-        KeyPair::generate_ed25519().public_key()
+    fn make_test_public_key() -> Bls12381G1PublicKey {
+        generate_bls_keypair().public_key()
     }
 
     #[test]
@@ -241,7 +243,7 @@ mod tests {
             state_root: merkle_root,
             success: true,
             validator: ValidatorId(0),
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
         };
 
         // Not quorum yet
@@ -276,7 +278,7 @@ mod tests {
             state_root: root_a,
             success: true,
             validator: ValidatorId(0),
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
         };
 
         let vote_b = StateVoteBlock {
@@ -285,7 +287,7 @@ mod tests {
             state_root: root_b,
             success: true,
             validator: ValidatorId(1),
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
         };
 
         // Split votes - no quorum
@@ -320,7 +322,7 @@ mod tests {
             state_root: merkle_root,
             success: true,
             validator: ValidatorId(0),
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
         };
 
         // First buffer should succeed
@@ -351,7 +353,7 @@ mod tests {
             state_root: merkle_root,
             success: true,
             validator: ValidatorId(0),
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
         };
 
         // Only 1 vote with power 1, quorum is 3 - should not trigger
@@ -375,7 +377,7 @@ mod tests {
                 state_root: merkle_root,
                 success: true,
                 validator: ValidatorId(i),
-                signature: Signature::zero(),
+                signature: zero_bls_signature(),
             };
             tracker.buffer_unverified_vote(vote, pk.clone(), 1);
         }
@@ -399,7 +401,7 @@ mod tests {
                 state_root: merkle_root,
                 success: true,
                 validator: ValidatorId(i),
-                signature: Signature::zero(),
+                signature: zero_bls_signature(),
             };
             tracker.buffer_unverified_vote(vote, pk.clone(), 1);
         }
@@ -432,7 +434,7 @@ mod tests {
             state_root: merkle_root,
             success: true,
             validator: ValidatorId(0),
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
         };
         tracker.add_verified_vote(vote1, 1);
 
@@ -451,7 +453,7 @@ mod tests {
             state_root: merkle_root,
             success: true,
             validator: ValidatorId(2),
-            signature: Signature::zero(),
+            signature: zero_bls_signature(),
         };
         tracker.buffer_unverified_vote(vote3, pk, 1);
         assert!(tracker.should_trigger_verification());

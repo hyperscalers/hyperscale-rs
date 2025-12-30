@@ -479,8 +479,8 @@ pub struct LivelockStats {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        KeyPair, Signature, SignerBitfield, StateEntry, StaticTopology, ValidatorId, ValidatorInfo,
-        ValidatorSet,
+        generate_bls_keypair, zero_bls_signature, SignerBitfield, StateEntry, StaticTopology,
+        ValidatorId, ValidatorInfo, ValidatorSet,
     };
 
     fn make_test_topology(local_shard: ShardGroupId) -> Arc<dyn Topology> {
@@ -488,7 +488,7 @@ mod tests {
         let validators: Vec<_> = (0..6)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId(i),
-                public_key: KeyPair::generate_ed25519().public_key(),
+                public_key: generate_bls_keypair().public_key(),
                 voting_power: 1,
             })
             .collect();
@@ -514,7 +514,7 @@ mod tests {
             tx_hash,
             source_shard,
             SignerBitfield::new(3),
-            Signature::zero(),
+            zero_bls_signature(),
             BlockHeight(1),
             vec![],
         )
@@ -534,7 +534,7 @@ mod tests {
             tx_hash,
             source_shard,
             SignerBitfield::new(3),
-            Signature::zero(),
+            zero_bls_signature(),
             BlockHeight(1),
             entries,
         )

@@ -1,8 +1,8 @@
 //! State-related types for cross-shard execution.
 
 use crate::{
-    exec_vote_message, state_provision_message, BlockHeight, Hash, NodeId, PartitionNumber,
-    ShardGroupId, Signature, SignerBitfield, ValidatorId,
+    exec_vote_message, state_provision_message, zero_bls_signature, BlockHeight,
+    Bls12381G2Signature, Hash, NodeId, PartitionNumber, ShardGroupId, SignerBitfield, ValidatorId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -165,7 +165,7 @@ pub struct StateProvision {
     pub validator_id: ValidatorId,
 
     /// Signature from the source shard validator.
-    pub signature: Signature,
+    pub signature: Bls12381G2Signature,
 }
 
 // Manual PartialEq (compare Arc contents, not pointer identity)
@@ -233,7 +233,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         // Entries: decode Vec and wrap in Arc
         let entries: Vec<StateEntry> = decoder.decode()?;
         let validator_id: ValidatorId = decoder.decode()?;
-        let signature: Signature = decoder.decode()?;
+        let signature: Bls12381G2Signature = decoder.decode()?;
 
         Ok(Self {
             transaction_hash,
@@ -306,7 +306,7 @@ pub struct StateVoteBlock {
     pub validator: ValidatorId,
 
     /// Signature from the voting validator.
-    pub signature: Signature,
+    pub signature: Bls12381G2Signature,
 }
 
 impl StateVoteBlock {
@@ -360,7 +360,7 @@ pub struct StateCertificate {
     pub success: bool,
 
     /// Aggregated signature.
-    pub aggregated_signature: Signature,
+    pub aggregated_signature: Bls12381G2Signature,
 
     /// Which validators signed.
     pub signers: SignerBitfield,
@@ -419,7 +419,7 @@ impl StateCertificate {
             state_writes: vec![],
             outputs_merkle_root,
             success,
-            aggregated_signature: Signature::zero(),
+            aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::empty(),
             voting_power: 0,
         }
@@ -495,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_state_provision_sbor_roundtrip_preserves_signature() {
-        use crate::{state_provision_message, KeyPair, KeyType};
+        use crate::{bls_keypair_from_seed, state_provision_message, verify_bls12381_v1};
         use std::sync::Arc;
 
         // Create test entries using StateEntry::test_entry
@@ -505,7 +505,7 @@ mod tests {
         ];
 
         // Create keypair
-        let keypair = KeyPair::from_seed(KeyType::Bls12381, &[42u8; 32]);
+        let keypair = bls_keypair_from_seed(&[42u8; 32]);
         let public_key = keypair.public_key();
 
         let tx_hash = Hash::from_bytes(&[1u8; 32]);
@@ -522,7 +522,7 @@ mod tests {
             block_height,
             &entry_hashes,
         );
-        let signature = keypair.sign(&msg);
+        let signature = keypair.sign_v1(&msg);
 
         // Create provision
         let provision = StateProvision {
@@ -538,7 +538,7 @@ mod tests {
         // Verify original
         let original_msg = provision.signing_message();
         assert!(
-            public_key.verify(&original_msg, &provision.signature),
+            verify_bls12381_v1(&original_msg, &public_key, &provision.signature),
             "Original should verify"
         );
 
@@ -555,7 +555,7 @@ mod tests {
             "Signing messages should match after roundtrip"
         );
         assert!(
-            public_key.verify(&decoded_msg, &decoded.signature),
+            verify_bls12381_v1(&decoded_msg, &public_key, &decoded.signature),
             "Decoded should verify"
         );
     }
