@@ -12,7 +12,7 @@ hyperscale-messages.workspace = true
 hyperscale-node.workspace = true
 hyperscale-types.workspace = true
 # Radix dependencies for real execution
-radix-common = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
+radix-common.workspace = true
 
 # In-memory storage with O(1) snapshots
 im.workspace = true
@@ -26,7 +26,6 @@ rand_chacha.workspace = true
 hyperscale-execution.workspace = true
 
 # Radix dependencies for e2e tests
-radix-common = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
-radix-transactions = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
+radix-transactions.workspace = true
 
 tracing-test = "0.2.5"

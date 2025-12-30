@@ -98,6 +98,20 @@ sudo usermod -aG docker $USER
 newgrp docker
 ```
 
+## Cloning with Submodules
+
+This repository uses git submodules for vendor dependencies. When cloning, use:
+
+```bash
+git clone --recurse-submodules https://github.com/flightofthefox/hyperscale-rs.git
+```
+
+If you've already cloned the repository without submodules, initialize them with:
+
+```bash
+git submodule update --init --recursive
+```
+
 ## Building
 
 ```bash

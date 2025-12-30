@@ -1,0 +1,3 @@
+[submodule "vendor/radixdlt-scrypto"]
+	path = vendor/radixdlt-scrypto
+	url = https://github.com/flightofthefox/radixdlt-scrypto

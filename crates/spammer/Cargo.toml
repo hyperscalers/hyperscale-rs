@@ -13,22 +13,22 @@ path = "src/bin/spammer.rs"
 
 [dependencies]
 # Workspace dependencies
-hyperscale-types = { workspace = true }
+hyperscale-types.workspace = true
 
 # Radix dependencies
-radix-common = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
-radix-transactions = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
-sbor = { workspace = true }
+radix-common.workspace = true
+radix-transactions.workspace = true
+sbor.workspace = true
 
 # Async runtime
-tokio = { workspace = true }
+tokio.workspace = true
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 
 # Serialization
-serde = { workspace = true }
+serde.workspace = true
 serde_json = "1"
 toml = "0.8"
 hex = "0.4"
@@ -38,11 +38,11 @@ clap = { version = "4", features = ["derive"] }
 humantime = "2"
 
 # Utils
-thiserror = { workspace = true }
-tracing = { workspace = true }
+thiserror.workspace = true
+tracing.workspace = true
 tracing-subscriber = "0.3"
-rand = { workspace = true }
-rand_chacha = { workspace = true }
+rand.workspace = true
+rand_chacha.workspace = true
 hdrhistogram = "7"
 dashmap = "6"
 parking_lot = "0.12"

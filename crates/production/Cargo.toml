@@ -28,8 +28,8 @@ hyperscale-node.workspace = true
 hyperscale-types.workspace = true
 hyperscale-messages.workspace = true
 
-# RocksDB for production persistence
-rocksdb = "0.24"
+# RocksDB for production persistence (version must match radix-substate-store-impls)
+rocksdb.workspace = true
 
 # Networking - libp2p with QUIC transport
 libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "request-response", "quic", "tcp", "noise", "yamux", "tokio", "macros", "identify"] }
@@ -85,7 +85,7 @@ hex = "0.4"
 rand = "0.8"
 
 # Radix types for genesis configuration parsing
-radix-common = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
+radix-common.workspace = true
 
 # Cryptographic primitives for deterministic PeerId derivation
 sha2 = "0.10"

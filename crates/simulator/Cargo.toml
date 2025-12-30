@@ -17,8 +17,8 @@ hyperscale-engine.workspace = true
 tokio = { workspace = true, features = ["full"] }
 
 # Radix dependencies for transaction building
-radix-common = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
-radix-transactions = { git = "https://github.com/radixdlt/radixdlt-scrypto", rev = "92c7db3" }
+radix-common.workspace = true
+radix-transactions.workspace = true
 
 # Metrics
 hdrhistogram = "7.5"
