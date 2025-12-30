@@ -611,8 +611,8 @@ impl ProvisionCoordinator {
     /// The proof is built from the first source shard that has provisions.
     /// This is sufficient for backpressure purposes - it proves another shard committed.
     ///
-    /// Note: Currently uses a placeholder signature since we need BLS aggregation.
-    /// The signature verification is deferred to Phase 5c BFT validation.
+    /// The aggregated BLS signature can be verified against the aggregated public keys
+    /// of the validators indicated in the signer bitfield.
     pub fn build_commitment_proof(&self, tx_hash: &Hash) -> Option<CommitmentProof> {
         let by_shard = self.verified_provisions.get(tx_hash)?;
 
@@ -642,10 +642,10 @@ impl ProvisionCoordinator {
             }
         }
 
-        // TODO: Implement actual BLS signature aggregation
-        // For now, we use a placeholder signature. The BFT validation
-        // in Phase 5d will verify individual provision signatures.
-        let aggregated_signature = Signature::zero();
+        // Aggregate BLS signatures from all provisions
+        let signatures: Vec<Signature> = provisions.iter().map(|p| p.signature.clone()).collect();
+        let aggregated_signature = Signature::aggregate_bls(&signatures)
+            .expect("BLS aggregation should succeed for valid provision signatures");
 
         Some(CommitmentProof::new(
             *tx_hash,
@@ -768,14 +768,27 @@ impl ProvisionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{KeyPair, Signature, StaticTopology, ValidatorInfo, ValidatorSet};
+    use hyperscale_types::{
+        state_provision_message, KeyPair, KeyType, StaticTopology, ValidatorInfo, ValidatorSet,
+    };
 
     fn make_test_topology(local_shard: ShardGroupId) -> Arc<dyn Topology> {
-        // Create a simple topology with 3 validators per shard (2 shards)
-        let validators: Vec<_> = (0..6)
-            .map(|i| ValidatorInfo {
-                validator_id: ValidatorId(i),
-                public_key: KeyPair::generate_ed25519().public_key(),
+        // Create deterministic BLS keypairs for 6 validators (2 shards × 3 validators)
+        let keypairs: Vec<_> = (0..6)
+            .map(|i| {
+                let mut seed = [0u8; 32];
+                seed[0] = i as u8;
+                seed[1] = 42; // Fixed seed for determinism
+                KeyPair::from_seed(KeyType::Bls12381, &seed)
+            })
+            .collect();
+
+        let validators: Vec<_> = keypairs
+            .iter()
+            .enumerate()
+            .map(|(i, kp)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: kp.public_key(),
                 voting_power: 1,
             })
             .collect();
@@ -793,14 +806,32 @@ mod tests {
         source_shard: ShardGroupId,
         validator_id: ValidatorId,
     ) -> StateProvision {
+        // Create a BLS signature for tests that don't need aggregation
+        let mut seed = [0u8; 32];
+        seed[0] = validator_id.0 as u8;
+        seed[1] = 42;
+        let keypair = KeyPair::from_seed(KeyType::Bls12381, &seed);
+
+        let target_shard = ShardGroupId(0);
+        let block_height = BlockHeight(1);
+        let entry_hashes: Vec<Hash> = vec![];
+        let message = state_provision_message(
+            &tx_hash,
+            target_shard,
+            source_shard,
+            block_height,
+            &entry_hashes,
+        );
+        let signature = keypair.sign(&message);
+
         StateProvision {
             transaction_hash: tx_hash,
-            target_shard: ShardGroupId(0),
+            target_shard,
             source_shard,
-            block_height: BlockHeight(1),
+            block_height,
             entries: Arc::new(vec![]),
             validator_id,
-            signature: Signature::zero(),
+            signature,
         }
     }
 
@@ -810,18 +841,37 @@ mod tests {
         validator_id: ValidatorId,
         node_ids: Vec<NodeId>,
     ) -> StateProvision {
+        // Create a BLS signature for tests that don't need aggregation
+        let mut seed = [0u8; 32];
+        seed[0] = validator_id.0 as u8;
+        seed[1] = 42;
+        let keypair = KeyPair::from_seed(KeyType::Bls12381, &seed);
+
         let entries: Vec<_> = node_ids
             .into_iter()
             .map(|node_id| StateEntry::test_entry(node_id, 0, vec![], None))
             .collect();
+
+        let target_shard = ShardGroupId(0);
+        let block_height = BlockHeight(1);
+        let entry_hashes: Vec<Hash> = entries.iter().map(|e| e.hash()).collect();
+        let message = state_provision_message(
+            &tx_hash,
+            target_shard,
+            source_shard,
+            block_height,
+            &entry_hashes,
+        );
+        let signature = keypair.sign(&message);
+
         StateProvision {
             transaction_hash: tx_hash,
-            target_shard: ShardGroupId(0),
+            target_shard,
             source_shard,
-            block_height: BlockHeight(1),
+            block_height,
             entries: Arc::new(entries),
             validator_id,
-            signature: Signature::zero(),
+            signature,
         }
     }
 
