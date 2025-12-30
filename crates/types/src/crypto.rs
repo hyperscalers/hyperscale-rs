@@ -22,6 +22,9 @@ pub use radix_common::crypto::{
 // Re-export verification functions
 pub use radix_common::crypto::{verify_bls12381_v1, verify_ed25519};
 
+// Re-export the BLS ciphersuite constant for batch verification
+use radix_common::crypto::BLS12381_CIPHERSITE_V1;
+
 /// Generate a new random Ed25519 keypair.
 pub fn generate_ed25519_keypair() -> Ed25519PrivateKey {
     let mut csprng = rand::rngs::OsRng;
@@ -198,7 +201,7 @@ pub fn batch_verify_bls_different_messages_all_or_nothing(
     // Use blst's batch verification with random linear combination
     let result = blst::min_pk::Signature::verify_multiple_aggregate_signatures(
         messages,
-        &[], // DST - empty since we use the ciphersuite in signing
+        BLS12381_CIPHERSITE_V1, // DST must match sign_v1/verify_bls12381_v1
         &pk_refs,
         false, // pks_validate - already validated above
         &sig_refs,
