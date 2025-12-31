@@ -8,7 +8,7 @@ if [ $? -ne 0 ]; then
 fi
 
 echo "Running cargo clippy..."
-cargo clippy -- -D warnings
+cargo clippy --no-deps -- -D warnings
 if [ $? -ne 0 ]; then
     echo "Cargo clippy failed. Please fix the warnings."
     exit 1
