@@ -111,6 +111,13 @@ fi
 
 NODES_PER_SHARD=$((TOTAL_NODES / NUM_SHARDS))
 
+if [ "$NODES_PER_SHARD" -lt 4 ]; then
+    echo "ERROR: Minimum 4 validators per shard required for BFT consensus."
+    echo "       Current configuration results in $NODES_PER_SHARD validators per shard."
+    echo "       Please increase --nodes-per-host or add more --hosts."
+    exit 1
+fi
+
 echo "=== Generating Distributed Cluster Config ==="
 echo "Hosts: ${HOST_IPS[*]}"
 echo "Nodes per Host: $NODES_PER_HOST"

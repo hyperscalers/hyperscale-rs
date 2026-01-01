@@ -66,7 +66,17 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+
 TOTAL_VALIDATORS=$((NUM_SHARDS * VALIDATORS_PER_SHARD))
+
+# Validate minimum validators per shard
+if [ "$VALIDATORS_PER_SHARD" -lt 4 ]; then
+    echo "ERROR: Minimum 4 validators per shard required for BFT consensus."
+    echo "       With 3 or less validators, the cluster will not work."
+    echo "       Use --validators-per-shard 4 or higher."
+    exit 1
+fi
+
 SPAM_BIN="$ROOT_DIR/target/release/hyperscale-spammer"
 KEY_BIN="$ROOT_DIR/target/release/hyperscale-keygen"
 

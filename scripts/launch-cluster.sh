@@ -142,7 +142,7 @@ TOTAL_VALIDATORS=$((NUM_SHARDS * VALIDATORS_PER_SHARD))
 # Validate minimum validators per shard
 if [ "$VALIDATORS_PER_SHARD" -lt 4 ]; then
     echo "ERROR: Minimum 4 validators per shard required for BFT consensus."
-    echo "       With 3 validators, timing delays can cause permanent stalls."
+    echo "       With 3 or less validators, the cluster will not work."
     echo "       Use --validators-per-shard 4 or higher."
     exit 1
 fi
