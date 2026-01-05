@@ -53,6 +53,7 @@ mod codec_pool;
 mod config;
 pub mod direct;
 mod rate_limiter;
+mod rtt_tracker;
 mod topic;
 
 pub use adapter::{
@@ -62,4 +63,5 @@ pub use adapter::{
 pub use codec_pool::CodecPoolHandle;
 pub use config::{Libp2pConfig, VersionInteroperabilityMode};
 pub use rate_limiter::{RateLimitConfig, SyncRateLimiter};
+pub use rtt_tracker::{PeerRttTracker, RttConfig, SharedRttTracker};
 pub use topic::{ProtocolVersion, Topic};

@@ -82,6 +82,17 @@ pub struct Libp2pConfig {
     ///
     /// Default: 10 seconds
     pub direct_connection_timeout: Duration,
+
+    /// Maximum number of retries for request-response operations on timeout.
+    ///
+    /// When a request times out (likely due to packet loss), it will be
+    /// automatically retried up to this many times. The per-attempt timeout
+    /// is `request_timeout / (max_request_retries + 1)`.
+    ///
+    /// Set to 0 to disable automatic retries.
+    ///
+    /// Default: 2 (3 total attempts)
+    pub max_request_retries: u32,
 }
 
 /// Mode for version interoperability checks.
@@ -149,11 +160,20 @@ impl Default for Libp2pConfig {
             version_interop_mode: VersionInteroperabilityMode::Relaxed,
             direct_connection_limit: 50,
             direct_connection_timeout: Duration::from_secs(10),
+            max_request_retries: 2,
         }
     }
 }
 
 impl Libp2pConfig {
+    /// Calculate the per-attempt timeout based on total timeout and retries.
+    ///
+    /// This ensures the total time spent on all attempts doesn't exceed
+    /// the configured `request_timeout`.
+    pub fn per_attempt_timeout(&self) -> Duration {
+        self.request_timeout / (self.max_request_retries + 1)
+    }
+
     /// Set the listen addresses.
     pub fn with_listen_addresses(mut self, addrs: Vec<Multiaddr>) -> Self {
         self.listen_addresses = addrs;
@@ -220,6 +240,7 @@ impl Libp2pConfig {
             version_interop_mode: VersionInteroperabilityMode::Relaxed,
             direct_connection_limit: 50,
             direct_connection_timeout: Duration::from_secs(5),
+            max_request_retries: 2,
         }
     }
 
@@ -238,6 +259,12 @@ impl Libp2pConfig {
     /// Set the direct connection timeout.
     pub fn with_direct_connection_timeout(mut self, timeout: Duration) -> Self {
         self.direct_connection_timeout = timeout;
+        self
+    }
+
+    /// Set the maximum number of request retries.
+    pub fn with_max_request_retries(mut self, retries: u32) -> Self {
+        self.max_request_retries = retries;
         self
     }
 }

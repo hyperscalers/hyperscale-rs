@@ -11,6 +11,7 @@ use super::codec_pool::CodecPoolHandle;
 use super::config::Libp2pConfig;
 use super::direct::DirectValidatorNetwork;
 use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
+use super::rtt_tracker::{RttConfig, SharedRttTracker};
 use super::topic::Topic;
 use crate::metrics;
 use crate::network::config::VersionInteroperabilityMode;
@@ -222,8 +223,12 @@ struct PendingResponseChannel {
 
 /// A pending outbound request with its creation time for timeout cleanup.
 struct PendingRequest {
+    /// The response channel for the request.
     response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
+    /// Creation time of the request.
     created_at: std::time::Instant,
+    /// The peer this request was sent to (for RTT tracking).
+    peer: Libp2pPeerId,
 }
 
 /// Interval for periodic maintenance tasks in the event loop.
@@ -517,8 +522,8 @@ pub struct Libp2pAdapter {
     /// Reverse mapping (PeerId -> ValidatorId) for inbound message validation.
     peer_validators: Arc<DashMap<Libp2pPeerId, ValidatorId>>,
 
-    /// Request timeout.
-    request_timeout: Duration,
+    /// Maximum number of retries on timeout.
+    max_request_retries: u32,
 
     /// Shutdown signal sender.
     shutdown_tx: Option<mpsc::Sender<()>>,
@@ -547,6 +552,10 @@ pub struct Libp2pAdapter {
 
     /// Codec pool handle for async encoding (encoding happens on caller thread for broadcast).
     codec_pool: CodecPoolHandle,
+
+    /// Shared RTT tracker for adaptive per-peer timeouts.
+    /// Updated by the event loop, read by request methods.
+    rtt_tracker: SharedRttTracker,
 }
 
 impl Libp2pAdapter {
@@ -827,6 +836,9 @@ impl Libp2pAdapter {
             config.clone(),
         ));
 
+        // Create shared RTT tracker for adaptive timeouts
+        let rtt_tracker = SharedRttTracker::new(RttConfig::default());
+
         let adapter = Arc::new(Self {
             local_peer_id,
             local_validator_id: validator_id,
@@ -836,7 +848,7 @@ impl Libp2pAdapter {
             consensus_tx: consensus_tx.clone(),
             validator_peers: validator_peers.clone(),
             peer_validators: peer_validators.clone(),
-            request_timeout: config.request_timeout,
+            max_request_retries: config.max_request_retries,
             shutdown_tx: Some(shutdown_tx),
             sync_request_tx: sync_request_tx.clone(),
             tx_request_tx: tx_request_tx.clone(),
@@ -844,6 +856,7 @@ impl Libp2pAdapter {
             cached_peer_count: cached_peer_count.clone(),
             direct_network: direct_network.clone(),
             codec_pool: codec_pool.clone(),
+            rtt_tracker: rtt_tracker.clone(),
         });
 
         // Spawn event loop (takes ownership of swarm)
@@ -873,6 +886,7 @@ impl Libp2pAdapter {
                 tx_validation_handle,
                 config.version_interop_mode,
                 codec_pool,
+                rtt_tracker,
             ))
             .catch_unwind()
             .await;
@@ -1064,27 +1078,51 @@ impl Libp2pAdapter {
     /// Request a block from a peer for sync.
     ///
     /// Returns the raw response bytes. The caller is responsible for decoding.
+    /// Automatically retries on timeout (likely packet loss) up to `max_request_retries` times.
+    /// Uses adaptive per-peer timeouts based on observed RTT.
     pub async fn request_block(
         &self,
         peer: Libp2pPeerId,
         height: hyperscale_types::BlockHeight,
     ) -> Result<Vec<u8>, NetworkError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Use adaptive timeout based on observed RTT for this peer
+        let adaptive_timeout = self.rtt_tracker.get_timeout(&peer);
+        let mut last_error = NetworkError::Timeout;
 
-        self.priority_channels
-            .send(SwarmCommand::RequestBlock {
-                peer,
-                height: height.0,
-                response_tx: tx,
-            })
-            .map_err(|_| NetworkError::NetworkShutdown)?;
+        for attempt in 0..=self.max_request_retries {
+            let (tx, rx) = tokio::sync::oneshot::channel();
 
-        // Wait for response with timeout
-        match tokio::time::timeout(self.request_timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(NetworkError::NetworkShutdown),
-            Err(_) => Err(NetworkError::Timeout),
+            self.priority_channels
+                .send(SwarmCommand::RequestBlock {
+                    peer,
+                    height: height.0,
+                    response_tx: tx,
+                })
+                .map_err(|_| NetworkError::NetworkShutdown)?;
+
+            // Wait for response with adaptive timeout
+            match tokio::time::timeout(adaptive_timeout, rx).await {
+                Ok(Ok(result)) => return result,
+                Ok(Err(_)) => return Err(NetworkError::NetworkShutdown),
+                Err(_) => {
+                    // Timeout - likely packet loss, retry
+                    last_error = NetworkError::Timeout;
+                    if attempt < self.max_request_retries {
+                        trace!(
+                            ?peer,
+                            height = height.0,
+                            attempt = attempt + 1,
+                            max_retries = self.max_request_retries,
+                            timeout_ms = adaptive_timeout.as_millis(),
+                            "Block request timeout, retrying"
+                        );
+                        metrics::record_request_retry("block");
+                    }
+                }
+            }
         }
+
+        Err(last_error)
     }
 
     /// Get the peer ID for a validator (if known).
@@ -1113,29 +1151,54 @@ impl Libp2pAdapter {
     ///
     /// Returns the raw response bytes. The caller is responsible for decoding.
     /// Uses Critical priority since pending block completion is liveness-critical.
+    /// Automatically retries on timeout (likely packet loss) up to `max_request_retries` times.
+    /// Uses adaptive per-peer timeouts based on observed RTT.
     pub async fn request_transactions(
         &self,
         peer: Libp2pPeerId,
         block_hash: hyperscale_types::Hash,
         tx_hashes: Vec<hyperscale_types::Hash>,
     ) -> Result<Vec<u8>, NetworkError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Use adaptive timeout based on observed RTT for this peer
+        let adaptive_timeout = self.rtt_tracker.get_timeout(&peer);
+        let mut last_error = NetworkError::Timeout;
 
-        self.priority_channels
-            .send(SwarmCommand::RequestTransactions {
-                peer,
-                block_hash,
-                tx_hashes,
-                response_tx: tx,
-            })
-            .map_err(|_| NetworkError::NetworkShutdown)?;
+        for attempt in 0..=self.max_request_retries {
+            let (tx, rx) = tokio::sync::oneshot::channel();
 
-        // Wait for response with timeout
-        match tokio::time::timeout(self.request_timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(NetworkError::NetworkShutdown),
-            Err(_) => Err(NetworkError::Timeout),
+            self.priority_channels
+                .send(SwarmCommand::RequestTransactions {
+                    peer,
+                    block_hash,
+                    tx_hashes: tx_hashes.clone(),
+                    response_tx: tx,
+                })
+                .map_err(|_| NetworkError::NetworkShutdown)?;
+
+            // Wait for response with adaptive timeout
+            match tokio::time::timeout(adaptive_timeout, rx).await {
+                Ok(Ok(result)) => return result,
+                Ok(Err(_)) => return Err(NetworkError::NetworkShutdown),
+                Err(_) => {
+                    // Timeout - likely packet loss, retry
+                    last_error = NetworkError::Timeout;
+                    if attempt < self.max_request_retries {
+                        trace!(
+                            ?peer,
+                            ?block_hash,
+                            tx_count = tx_hashes.len(),
+                            attempt = attempt + 1,
+                            max_retries = self.max_request_retries,
+                            timeout_ms = adaptive_timeout.as_millis(),
+                            "Transaction request timeout, retrying"
+                        );
+                        metrics::record_request_retry("transaction");
+                    }
+                }
+            }
         }
+
+        Err(last_error)
     }
 
     /// Send a transaction response for an inbound request.
@@ -1159,29 +1222,54 @@ impl Libp2pAdapter {
     ///
     /// Returns the raw response bytes. The caller is responsible for decoding.
     /// Uses Critical priority since pending block completion is liveness-critical.
+    /// Automatically retries on timeout (likely packet loss) up to `max_request_retries` times.
+    /// Uses adaptive per-peer timeouts based on observed RTT.
     pub async fn request_certificates(
         &self,
         peer: Libp2pPeerId,
         block_hash: hyperscale_types::Hash,
         cert_hashes: Vec<hyperscale_types::Hash>,
     ) -> Result<Vec<u8>, NetworkError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Use adaptive timeout based on observed RTT for this peer
+        let adaptive_timeout = self.rtt_tracker.get_timeout(&peer);
+        let mut last_error = NetworkError::Timeout;
 
-        self.priority_channels
-            .send(SwarmCommand::RequestCertificates {
-                peer,
-                block_hash,
-                cert_hashes,
-                response_tx: tx,
-            })
-            .map_err(|_| NetworkError::NetworkShutdown)?;
+        for attempt in 0..=self.max_request_retries {
+            let (tx, rx) = tokio::sync::oneshot::channel();
 
-        // Wait for response with timeout
-        match tokio::time::timeout(self.request_timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(NetworkError::NetworkShutdown),
-            Err(_) => Err(NetworkError::Timeout),
+            self.priority_channels
+                .send(SwarmCommand::RequestCertificates {
+                    peer,
+                    block_hash,
+                    cert_hashes: cert_hashes.clone(),
+                    response_tx: tx,
+                })
+                .map_err(|_| NetworkError::NetworkShutdown)?;
+
+            // Wait for response with adaptive timeout
+            match tokio::time::timeout(adaptive_timeout, rx).await {
+                Ok(Ok(result)) => return result,
+                Ok(Err(_)) => return Err(NetworkError::NetworkShutdown),
+                Err(_) => {
+                    // Timeout - likely packet loss, retry
+                    last_error = NetworkError::Timeout;
+                    if attempt < self.max_request_retries {
+                        trace!(
+                            ?peer,
+                            ?block_hash,
+                            cert_count = cert_hashes.len(),
+                            attempt = attempt + 1,
+                            max_retries = self.max_request_retries,
+                            timeout_ms = adaptive_timeout.as_millis(),
+                            "Certificate request timeout, retrying"
+                        );
+                        metrics::record_request_retry("certificate");
+                    }
+                }
+            }
         }
+
+        Err(last_error)
     }
 
     /// Send a certificate response for an inbound request.
@@ -1231,6 +1319,7 @@ impl Libp2pAdapter {
         tx_validation_handle: ValidationBatcherHandle,
         version_interop_mode: VersionInteroperabilityMode,
         codec_pool: CodecPoolHandle,
+        rtt_tracker: SharedRttTracker,
     ) {
         // Track pending sync requests (outbound) with creation time for TTL cleanup
         let mut pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest> =
@@ -1342,7 +1431,10 @@ impl Libp2pAdapter {
                     // 4. Record metrics for pending response channels
                     metrics::record_pending_response_channels(pending_response_channels.len());
 
-                    // 4. Process pending reconnections
+                    // 5. Clean up stale RTT data
+                    rtt_tracker.cleanup_stale();
+
+                    // 6. Process pending reconnections
                     let reconnects_due: Vec<_> = pending_reconnects
                         .iter()
                         .filter(|(_, scheduled)| now >= **scheduled)
@@ -1660,6 +1752,7 @@ impl Libp2pAdapter {
                         &tx_request_tx,
                         &cert_request_tx,
                         &mut rate_limiter,
+                        &rtt_tracker,
                         local_shard,
                         &tx_validation_handle,
                         &codec_pool,
@@ -1773,6 +1866,7 @@ impl Libp2pAdapter {
                         PendingRequest {
                             response_tx,
                             created_at: std::time::Instant::now(),
+                            peer,
                         },
                     );
                     debug!("Sent block request to {:?} for height {}", peer, height);
@@ -1805,6 +1899,7 @@ impl Libp2pAdapter {
                         PendingRequest {
                             response_tx,
                             created_at: std::time::Instant::now(),
+                            peer,
                         },
                     );
                     debug!(
@@ -1840,6 +1935,7 @@ impl Libp2pAdapter {
                         PendingRequest {
                             response_tx,
                             created_at: std::time::Instant::now(),
+                            peer,
                         },
                     );
                     debug!(
@@ -2057,6 +2153,7 @@ impl Libp2pAdapter {
         tx_request_tx: &mpsc::UnboundedSender<InboundTransactionRequest>,
         cert_request_tx: &mpsc::UnboundedSender<InboundCertificateRequest>,
         rate_limiter: &mut SyncRateLimiter,
+        rtt_tracker: &SharedRttTracker,
         local_shard: ShardGroupId,
         tx_validation_handle: &ValidationBatcherHandle,
         codec_pool: &CodecPoolHandle,
@@ -2166,6 +2263,15 @@ impl Libp2pAdapter {
             )) => {
                 // Route response to waiting requester
                 if let Some(pending) = pending_requests.remove(&request_id) {
+                    // Record RTT for this peer (time from request to response)
+                    let rtt = pending.created_at.elapsed();
+                    rtt_tracker.record_rtt(pending.peer, rtt);
+                    trace!(
+                        peer = %pending.peer,
+                        rtt_ms = rtt.as_millis(),
+                        "Recorded RTT sample"
+                    );
+
                     let _ = pending.response_tx.send(Ok(response));
                 } else if pending_direct_messages.remove(&request_id).is_some() {
                     // Direct message acknowledged (empty response received)

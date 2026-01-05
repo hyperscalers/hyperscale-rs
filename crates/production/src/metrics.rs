@@ -154,6 +154,8 @@ pub struct Metrics {
     pub broadcast_retry_queue_size: Gauge,
     /// Gossipsub publish failures by topic.
     pub gossipsub_publish_failures: CounterVec,
+    /// Network request retries by request type (block, transaction, certificate).
+    pub network_request_retries: CounterVec,
     /// Early arrival buffer evictions.
     pub early_arrival_evictions: Counter,
     /// Backpressure events by source (e.g., "gossiped_cert_verification").
@@ -684,6 +686,13 @@ impl Metrics {
                 "hyperscale_gossipsub_publish_failures_total",
                 "Gossipsub publish failures by topic type",
                 &["topic_type"]
+            )
+            .unwrap(),
+
+            network_request_retries: register_counter_vec!(
+                "hyperscale_network_request_retries_total",
+                "Network request retries due to timeout (likely packet loss)",
+                &["request_type"]
             )
             .unwrap(),
 
@@ -1244,6 +1253,17 @@ pub fn record_gossipsub_publish_failure(topic: &str) {
     metrics()
         .gossipsub_publish_failures
         .with_label_values(&[topic_type])
+        .inc();
+}
+
+/// Record a network request retry.
+///
+/// Called when a request times out (likely due to packet loss) and is automatically retried.
+/// Request types: "block", "transaction", "certificate"
+pub fn record_request_retry(request_type: &str) {
+    metrics()
+        .network_request_retries
+        .with_label_values(&[request_type])
         .inc();
 }
 
