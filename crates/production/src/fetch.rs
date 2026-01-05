@@ -428,6 +428,25 @@ impl FetchManager {
         }
     }
 
+    /// Cancel all pending fetches.
+    ///
+    /// Called when sync starts to free up request slots. Sync delivers complete
+    /// blocks that will supersede the pending gossip blocks we were fetching for.
+    pub fn cancel_all(&mut self) {
+        let tx_count = self.tx_fetches.len();
+        let cert_count = self.cert_fetches.len();
+
+        if tx_count > 0 || cert_count > 0 {
+            info!(
+                tx_fetches = tx_count,
+                cert_fetches = cert_count,
+                "Cancelling all fetches for sync"
+            );
+            self.tx_fetches.clear();
+            self.cert_fetches.clear();
+        }
+    }
+
     /// Tick the fetch manager - called periodically to drive progress.
     pub async fn tick(&mut self) {
         // Process completed fetch results

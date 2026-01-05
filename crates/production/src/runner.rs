@@ -2859,6 +2859,10 @@ impl ProductionRunner {
                 target_height,
                 target_hash,
             } => {
+                // Cancel pending fetches to free up request slots for sync.
+                // Sync delivers complete blocks that supersede the gossip blocks
+                // we were fetching for, so there's no point continuing those fetches.
+                self.fetch_manager.cancel_all();
                 self.sync_manager.start_sync(target_height, target_hash);
             }
 

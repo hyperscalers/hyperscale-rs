@@ -3900,6 +3900,13 @@ impl BftState {
     /// - `transaction_fetch_timeout`: How long to wait before fetching missing txs
     /// - `certificate_fetch_timeout`: How long to wait before fetching missing certs
     pub fn check_pending_block_fetches(&self) -> Vec<Action> {
+        // Don't fetch for gossip blocks while syncing.
+        // Sync delivers complete blocks that will supersede these pending blocks.
+        // This prevents FetchManager from consuming all request slots and starving sync.
+        if self.syncing {
+            return vec![];
+        }
+
         let now = self.now;
         let tx_timeout = self.config.transaction_fetch_timeout;
         let cert_timeout = self.config.certificate_fetch_timeout;
