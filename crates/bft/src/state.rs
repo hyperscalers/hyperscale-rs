@@ -3900,13 +3900,6 @@ impl BftState {
     /// - `transaction_fetch_timeout`: How long to wait before fetching missing txs
     /// - `certificate_fetch_timeout`: How long to wait before fetching missing certs
     pub fn check_pending_block_fetches(&self) -> Vec<Action> {
-        // Don't fetch for gossip blocks while syncing.
-        // Sync delivers complete blocks that will supersede these pending blocks.
-        // This prevents FetchManager from consuming all request slots and starving sync.
-        if self.syncing {
-            return vec![];
-        }
-
         let now = self.now;
         let tx_timeout = self.config.transaction_fetch_timeout;
         let cert_timeout = self.config.certificate_fetch_timeout;
@@ -3963,6 +3956,67 @@ impl BftState {
         }
 
         actions
+    }
+
+    /// Clean up stale incomplete pending blocks.
+    ///
+    /// Removes pending blocks that:
+    /// 1. Are incomplete (still waiting for transactions/certificates)
+    /// 2. Have been pending longer than `stale_pending_block_timeout`
+    ///
+    /// This prevents a node from getting stuck when transaction/certificate
+    /// fetches fail permanently. By removing stale incomplete blocks, we allow
+    /// sync to be triggered when a later block header arrives.
+    ///
+    /// Returns the number of blocks removed.
+    pub fn cleanup_stale_pending_blocks(&mut self) -> usize {
+        let timeout = self.config.stale_pending_block_timeout;
+        let now = self.now;
+        let mut removed = 0;
+
+        // Collect hashes of stale incomplete blocks
+        let stale_hashes: Vec<Hash> = self
+            .pending_blocks
+            .iter()
+            .filter(|(hash, pending)| {
+                // Only remove incomplete blocks
+                if pending.is_complete() {
+                    return false;
+                }
+                // Check if it's been pending too long
+                if let Some(&created_at) = self.pending_block_created_at.get(*hash) {
+                    now.saturating_sub(created_at) >= timeout
+                } else {
+                    // No creation time tracked - shouldn't happen, but remove anyway
+                    true
+                }
+            })
+            .map(|(hash, _)| *hash)
+            .collect();
+
+        // Remove stale blocks and their associated buffered commits
+        for hash in stale_hashes {
+            if let Some(pending) = self.pending_blocks.remove(&hash) {
+                let height = pending.header().height.0;
+                warn!(
+                    validator = ?self.validator_id(),
+                    block_hash = ?hash,
+                    height = height,
+                    missing_txs = pending.missing_transaction_count(),
+                    missing_certs = pending.missing_certificate_count(),
+                    "Removing stale incomplete pending block to allow sync"
+                );
+                self.pending_block_created_at.remove(&hash);
+
+                // Also clean up any buffered commit that was waiting for this block's data.
+                // Without this, the entry would stay in pending_commits_awaiting_data forever.
+                self.pending_commits_awaiting_data.remove(&hash);
+
+                removed += 1;
+            }
+        }
+
+        removed
     }
 
     /// Check if we're behind and need to catch up via sync.
@@ -4121,9 +4175,9 @@ impl BftState {
     /// This is used to determine if we need to sync for a block.
     ///
     /// Note: We include ALL pending_blocks (even incomplete ones) because:
-    /// 1. Incomplete blocks will complete via FetchManager or be superseded by sync
-    /// 2. Being too aggressive about triggering sync causes performance issues
-    /// 3. Sync handles stuck nodes via `check_sync_health()` detecting height gaps
+    /// 1. Incomplete blocks will eventually be cleaned up by `cleanup_stale_pending_blocks()`
+    /// 2. The cleanup timer runs every second, so stale blocks won't prevent sync for long
+    /// 3. Being too aggressive about triggering sync causes performance issues
     fn has_block_at_height(&self, height: u64) -> bool {
         // Already committed
         if height <= self.committed_height {
