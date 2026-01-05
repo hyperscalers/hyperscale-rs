@@ -56,8 +56,13 @@ pub struct FetchConfig {
     /// Maximum timeout for fetch requests (after exponential backoff).
     pub max_timeout: Duration,
 
-    /// Maximum retries before giving up on a fetch request.
-    pub max_retries: u32,
+    /// Initial backoff delay after a failed retry round.
+    /// Doubles with each consecutive failure up to `max_retry_backoff`.
+    pub initial_retry_backoff: Duration,
+
+    /// Maximum backoff delay between retry rounds.
+    /// The fetch manager retries indefinitely with this cap.
+    pub max_retry_backoff: Duration,
 
     /// Cooldown period before retrying a failed peer.
     pub peer_cooldown: Duration,
@@ -85,7 +90,9 @@ impl Default for FetchConfig {
             max_total_concurrent: 32,
             initial_timeout: Duration::from_millis(500),
             max_timeout: Duration::from_secs(5),
-            max_retries: 3,
+            // Exponential backoff: 500ms -> 1s -> 2s -> 4s -> 5s (capped)
+            initial_retry_backoff: Duration::from_millis(500),
+            max_retry_backoff: Duration::from_secs(5),
             // Short cooldown allows quick recovery from transient failures.
             // Failed peers can be retried quickly while still avoiding
             // hammering a truly unavailable peer.
@@ -216,8 +223,11 @@ struct BlockFetchState {
     tried_peers: HashSet<PeerId>,
     /// When this fetch was started.
     created: Instant,
-    /// Total retry count across all peers.
-    total_retries: u32,
+    /// Total retry round count (for backoff calculation).
+    retry_rounds: u32,
+    /// When the next retry is allowed (for exponential backoff).
+    /// None means ready to retry immediately.
+    next_retry_at: Option<Instant>,
 }
 
 impl BlockFetchState {
@@ -231,7 +241,8 @@ impl BlockFetchState {
             in_flight: HashMap::new(),
             tried_peers: HashSet::new(),
             created: Instant::now(),
-            total_retries: 0,
+            retry_rounds: 0,
+            next_retry_at: None,
         }
     }
 
@@ -243,6 +254,14 @@ impl BlockFetchState {
     /// Check if this fetch is stale (too old).
     fn is_stale(&self, timeout: Duration) -> bool {
         self.created.elapsed() > timeout
+    }
+
+    /// Check if this fetch is ready to retry (backoff expired).
+    fn is_ready_to_retry(&self) -> bool {
+        match self.next_retry_at {
+            None => true,
+            Some(at) => Instant::now() >= at,
+        }
     }
 
     /// Mark hashes as received.
@@ -257,6 +276,14 @@ impl BlockFetchState {
     /// Get hashes that are still missing and not currently being fetched.
     fn unfetched_hashes(&self) -> Vec<Hash> {
         self.missing_hashes.iter().copied().collect()
+    }
+
+    /// Calculate backoff delay for the next retry round.
+    fn calculate_backoff(&self, initial: Duration, max: Duration) -> Duration {
+        // Exponential backoff: initial * 2^retry_rounds, capped at max
+        let multiplier = 2u32.saturating_pow(self.retry_rounds.min(10));
+        let backoff = initial.saturating_mul(multiplier);
+        backoff.min(max)
     }
 }
 
@@ -667,10 +694,10 @@ impl FetchManager {
                 "Partial transaction response, re-queuing for remaining"
             );
             // Clear tried_peers to allow retrying with all peers for the remaining hashes.
-            // Don't reset total_retries - we track retries per fetch attempt, not per hash.
-            // But we do reset it partially since we made progress (received some data).
+            // Reset backoff since we made progress (received some data).
             state.tried_peers.clear();
-            state.total_retries = state.total_retries.saturating_sub(1);
+            state.retry_rounds = state.retry_rounds.saturating_sub(1);
+            state.next_retry_at = None; // Clear backoff - we made progress
             self.pending_queue.push_back(FetchId {
                 block_hash,
                 kind: FetchKind::Transaction,
@@ -766,10 +793,10 @@ impl FetchManager {
                 "Partial certificate response, re-queuing for remaining"
             );
             // Clear tried_peers to allow retrying with all peers for the remaining hashes.
-            // Don't reset total_retries - we track retries per fetch attempt, not per hash.
-            // But we do reset it partially since we made progress (received some data).
+            // Reset backoff since we made progress (received some data).
             state.tried_peers.clear();
-            state.total_retries = state.total_retries.saturating_sub(1);
+            state.retry_rounds = state.retry_rounds.saturating_sub(1);
+            state.next_retry_at = None; // Clear backoff - we made progress
             self.pending_queue.push_back(FetchId {
                 block_hash,
                 kind: FetchKind::Certificate,
@@ -841,48 +868,43 @@ impl FetchManager {
         }
 
         // All in-flight requests have completed (either succeeded or failed).
-        // If we still have missing hashes, increment retry counter and re-queue.
+        // If we still have missing hashes, apply exponential backoff and re-queue.
         if !state.missing_hashes.is_empty() {
-            state.total_retries += 1;
+            state.retry_rounds += 1;
 
-            // Check if we should give up
-            if state.total_retries >= self.config.max_retries {
+            // Calculate backoff delay for next retry
+            let backoff = state.calculate_backoff(
+                self.config.initial_retry_backoff,
+                self.config.max_retry_backoff,
+            );
+            state.next_retry_at = Some(Instant::now() + backoff);
+
+            // Log with appropriate level based on retry count
+            if state.retry_rounds <= 3 {
+                info!(
+                    ?block_hash,
+                    ?kind,
+                    retry_round = state.retry_rounds,
+                    remaining = state.missing_hashes.len(),
+                    backoff_ms = backoff.as_millis(),
+                    "Re-queuing fetch after round failure (with backoff)"
+                );
+            } else {
+                // After several retries, this is concerning but we keep trying
                 warn!(
                     ?block_hash,
                     ?kind,
-                    retries = state.total_retries,
-                    "Giving up on fetch after max retries"
+                    retry_round = state.retry_rounds,
+                    remaining = state.missing_hashes.len(),
+                    backoff_ms = backoff.as_millis(),
+                    elapsed_secs = state.created.elapsed().as_secs(),
+                    "Fetch still incomplete after multiple retries - continuing with backoff"
                 );
-                match kind {
-                    FetchKind::Transaction => {
-                        self.tx_fetches.remove(&block_hash);
-                        let event = Event::TransactionFetchFailed { block_hash };
-                        if let Err(e) = self.event_tx.send(event).await {
-                            warn!(?block_hash, error = ?e, "Failed to send TransactionFetchFailed event");
-                            metrics::record_fetch_event_send_failed("TransactionFetchFailed");
-                        }
-                    }
-                    FetchKind::Certificate => {
-                        self.cert_fetches.remove(&block_hash);
-                        let event = Event::CertificateFetchFailed { block_hash };
-                        if let Err(e) = self.event_tx.send(event).await {
-                            warn!(?block_hash, error = ?e, "Failed to send CertificateFetchFailed event");
-                            metrics::record_fetch_event_send_failed("CertificateFetchFailed");
-                        }
-                    }
-                }
-                return;
             }
 
-            // Re-queue for retry with fresh peers
-            info!(
-                ?block_hash,
-                ?kind,
-                retries = state.total_retries,
-                remaining = state.missing_hashes.len(),
-                "Re-queuing fetch after round failure"
-            );
+            // Clear tried peers to allow fresh rotation
             state.tried_peers.clear();
+            // Re-queue - will be skipped in process_pending_queue until backoff expires
             self.pending_queue.push_back(FetchId { block_hash, kind });
         }
     }
@@ -922,6 +944,13 @@ impl FetchManager {
                     // Fetch was cancelled or completed
                     continue;
                 };
+
+                // Check if we're in backoff period
+                if !state.is_ready_to_retry() {
+                    // Still in backoff - put back in queue for later
+                    self.pending_queue.push_back(fetch_id);
+                    continue;
+                }
 
                 // Check if we're already at max concurrent for this block
                 if state.in_flight.len() >= max_per_block {
@@ -1356,7 +1385,9 @@ mod tests {
         let config = FetchConfig::default();
         assert_eq!(config.max_concurrent_per_block, 8);
         assert_eq!(config.max_total_concurrent, 32);
-        assert_eq!(config.max_retries, 3);
+        // Exponential backoff instead of max_retries
+        assert_eq!(config.initial_retry_backoff, Duration::from_millis(500));
+        assert_eq!(config.max_retry_backoff, Duration::from_secs(5));
         // Proactive parallel fetching with 4 peers for chunked distribution
         assert_eq!(config.proactive_parallel_peers, 4);
         assert_eq!(config.max_hashes_per_request, 50);
