@@ -52,16 +52,22 @@ mod codec;
 mod codec_pool;
 mod config;
 pub mod direct;
+mod inbound_router;
+mod peer_health;
 mod rate_limiter;
-mod rtt_tracker;
+mod request_manager;
 mod topic;
 
 pub use adapter::{
-    compute_peer_id_for_validator, derive_libp2p_keypair, InboundCertificateRequest,
-    InboundSyncRequest, InboundTransactionRequest, Libp2pAdapter, NetworkError,
+    compute_peer_id_for_validator, derive_libp2p_keypair, Libp2pAdapter, NetworkError,
 };
 pub use codec_pool::CodecPoolHandle;
 pub use config::{Libp2pConfig, VersionInteroperabilityMode};
+pub use inbound_router::{InboundRequest, InboundRouter, InboundRouterConfig, InboundRouterHandle};
+pub use peer_health::{PeerHealth, PeerHealthConfig, PeerHealthStats, PeerHealthTracker};
 pub use rate_limiter::{RateLimitConfig, SyncRateLimiter};
-pub use rtt_tracker::{PeerRttTracker, RttConfig, SharedRttTracker};
+pub use request_manager::{
+    Request, RequestError, RequestManager, RequestManagerConfig, RequestManagerStats,
+    RequestPriority,
+};
 pub use topic::{ProtocolVersion, Topic};

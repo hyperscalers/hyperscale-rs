@@ -72,7 +72,6 @@
 
 mod action_dispatcher;
 mod fetch;
-mod fetch_handler;
 mod message_batcher;
 pub(crate) mod metrics;
 pub mod network;

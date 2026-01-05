@@ -1,35 +1,47 @@
 //! Fetch manager for retrieving missing transactions and certificates from peers.
 //!
-//! The fetch manager handles all aspects of transaction and certificate fetching:
-//! - Peer selection with fallback (proposer first, then other committee members)
-//! - Parallel fetch requests for improved throughput
-//! - Automatic retries with exponential backoff
-//! - Request deduplication to avoid redundant network traffic
-//! - Peer reputation tracking for reliability
+//! The fetch manager handles transaction and certificate fetching by delegating
+//! retry logic and peer selection to the `RequestManager`. This module focuses on:
+//! - Tracking what data is missing for each pending block
+//! - Chunking large requests for parallel fetching
+//! - Delivering fetched data to BFT via events
+//! - Persisting fetched data to storage
 //!
 //! # Architecture
 //!
-//! When a block header arrives but transactions/certificates are missing, the BFT
-//! layer emits `Action::FetchTransactions` or `Action::FetchCertificates`. The
-//! `FetchManager` handles these by:
+//! ```text
+//! ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
+//! │  BFT Actions    │────▶│  FetchManager    │────▶│ RequestManager  │
+//! │ FetchTx/Certs   │     │ (orchestration)  │     │ (retry/peers)   │
+//! └─────────────────┘     └──────────────────┘     └─────────────────┘
+//!                                │                         │
+//!                                ▼                         ▼
+//!                         ┌──────────────┐          ┌─────────────┐
+//!                         │   Storage    │          │  Network    │
+//!                         │  (persist)   │          │  Adapter    │
+//!                         └──────────────┘          └─────────────┘
+//! ```
 //!
-//! 1. Checking if we already have an in-flight request for this block
-//! 2. Selecting peers to request from (proposer + fallback peers)
-//! 3. Spawning concurrent fetch tasks
-//! 4. Processing responses and delivering data via events
-//! 5. Retrying failed requests with different peers
+//! The key insight is that `RequestManager` handles:
+//! - Intelligent retry (same peer first, then rotate)
+//! - Peer health tracking and weighted selection
+//! - Adaptive concurrency control
+//! - Exponential backoff
 //!
-//! This mirrors the `SyncManager` pattern but optimized for smaller, more frequent
-//! requests that need low latency.
+//! While `FetchManager` handles:
+//! - What hashes are missing for each block
+//! - Chunking requests across multiple parallel fetches
+//! - Delivering results to BFT
+//! - Persisting to storage
 
 use crate::metrics;
-use crate::network::Libp2pAdapter;
+use crate::network::{RequestManager, RequestPriority};
 use crate::storage::RocksDbStorage;
 use hyperscale_core::Event;
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
 use hyperscale_types::{Hash, RoutableTransaction, TransactionCertificate, ValidatorId};
 use libp2p::PeerId;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -42,28 +54,10 @@ use tracing::{debug, info, trace, warn};
 /// Configuration for the fetch manager.
 #[derive(Debug, Clone)]
 pub struct FetchConfig {
-    /// Maximum number of concurrent fetch requests per block.
-    /// Higher values increase parallelism but also network load.
+    /// Maximum number of concurrent fetch operations per block.
+    /// Each operation fetches a chunk of hashes.
+    /// This provides fairness across blocks, not global limiting.
     pub max_concurrent_per_block: usize,
-
-    /// Maximum total concurrent fetch requests across all blocks.
-    /// Prevents overwhelming the network during many pending blocks.
-    pub max_total_concurrent: usize,
-
-    /// Maximum timeout for fetch requests.
-    /// Used as a cap on adaptive RTT-based timeouts and for stale request detection.
-    pub max_timeout: Duration,
-
-    /// Initial backoff delay after a failed retry round.
-    /// Doubles with each consecutive failure up to `max_retry_backoff`.
-    pub initial_retry_backoff: Duration,
-
-    /// Maximum backoff delay between retry rounds.
-    /// The fetch manager retries indefinitely with this cap.
-    pub max_retry_backoff: Duration,
-
-    /// Cooldown period before retrying a failed peer.
-    pub peer_cooldown: Duration,
 
     /// How long to wait before considering a fetch stale (for cleanup).
     pub stale_fetch_timeout: Duration,
@@ -72,35 +66,18 @@ pub struct FetchConfig {
     /// Larger batches are chunked into multiple requests.
     pub max_hashes_per_request: usize,
 
-    /// Number of peers to fetch from immediately in parallel.
-    /// When a fetch request arrives, we spawn requests to this many peers
-    /// simultaneously instead of waiting for the first peer to time out.
-    /// This reduces latency under CPU pressure at the cost of redundant requests.
-    /// Set to 1 to disable proactive parallel fetching.
-    pub proactive_parallel_peers: usize,
+    /// Number of parallel fetch operations to spawn for new requests.
+    /// Chunks are distributed across this many parallel fetches.
+    pub parallel_fetches: usize,
 }
 
 impl Default for FetchConfig {
     fn default() -> Self {
         Self {
-            // Increased to allow parallel chunked fetching across more peers
             max_concurrent_per_block: 8,
-            max_total_concurrent: 32,
-            // Max timeout caps adaptive RTT-based timeouts
-            max_timeout: Duration::from_secs(5),
-            // Exponential backoff: 500ms -> 1s -> 2s -> 4s -> 5s (capped)
-            initial_retry_backoff: Duration::from_millis(500),
-            max_retry_backoff: Duration::from_secs(5),
-            // Short cooldown allows quick recovery from transient failures.
-            // Failed peers can be retried quickly while still avoiding
-            // hammering a truly unavailable peer.
-            peer_cooldown: Duration::from_secs(3),
             stale_fetch_timeout: Duration::from_secs(30),
-            // Smaller chunks for better parallelization across peers
             max_hashes_per_request: 50,
-            // Fetch from 4 peers in parallel by default to enable chunked
-            // parallel fetching for large requests (e.g., 335 certs across 4 peers)
-            proactive_parallel_peers: 4,
+            parallel_fetches: 4,
         }
     }
 }
@@ -110,8 +87,7 @@ impl FetchConfig {
     #[cfg(test)]
     pub fn for_local() -> Self {
         Self {
-            max_timeout: Duration::from_secs(1),
-            peer_cooldown: Duration::from_secs(2),
+            stale_fetch_timeout: Duration::from_secs(10),
             ..Default::default()
         }
     }
@@ -120,8 +96,7 @@ impl FetchConfig {
     #[cfg(test)]
     pub fn for_wan() -> Self {
         Self {
-            max_timeout: Duration::from_secs(15),
-            peer_cooldown: Duration::from_secs(30),
+            stale_fetch_timeout: Duration::from_secs(60),
             ..Default::default()
         }
     }
@@ -150,170 +125,112 @@ impl FetchKind {
     }
 }
 
-/// Unique identifier for a fetch request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FetchId {
-    /// The block hash this fetch is for.
-    pub block_hash: Hash,
-    /// The type of fetch.
-    pub kind: FetchKind,
-}
-
 /// Result of an async fetch operation.
 #[derive(Debug)]
 pub enum FetchResult {
     /// Successfully fetched transactions.
     TransactionsReceived {
         block_hash: Hash,
-        peer: PeerId,
         transactions: Vec<Arc<RoutableTransaction>>,
     },
     /// Successfully fetched certificates.
     CertificatesReceived {
         block_hash: Hash,
-        peer: PeerId,
         certificates: Vec<TransactionCertificate>,
     },
-    /// Failed to fetch.
+    /// Failed to fetch after all retries.
     Failed {
         block_hash: Hash,
         kind: FetchKind,
-        peer: PeerId,
+        hashes: Vec<Hash>,
         error: String,
-        /// True if the failure was due to network backpressure.
-        is_backpressure: bool,
     },
 }
 
-/// A pending fetch request (tracking in-flight requests).
-#[derive(Debug)]
-struct PendingFetchRequest {
-    /// The peer we're fetching from.
-    #[allow(dead_code)]
-    peer: PeerId,
-    /// When the request was sent.
-    started: Instant,
-    /// Current retry count for this peer.
-    #[allow(dead_code)]
-    retries: u32,
-}
-
-/// State for a block's fetch operation (may have multiple in-flight requests).
+/// State for a block's fetch operation.
 #[derive(Debug)]
 struct BlockFetchState {
-    /// The block hash.
+    /// The block hash (for debugging).
     #[allow(dead_code)]
     block_hash: Hash,
-    /// The type of fetch (transaction or certificate).
+    /// The type of fetch (for debugging).
     #[allow(dead_code)]
     kind: FetchKind,
-    /// The original proposer (preferred peer).
-    proposer: ValidatorId,
     /// Hashes we still need to fetch.
     missing_hashes: HashSet<Hash>,
-    /// Hashes we've received.
-    received_hashes: HashSet<Hash>,
-    /// Currently in-flight requests (peer -> request state).
-    in_flight: HashMap<PeerId, PendingFetchRequest>,
-    /// Peers we've already tried (for rotation).
-    tried_peers: HashSet<PeerId>,
+    /// Hashes currently being fetched (in-flight).
+    in_flight_hashes: HashSet<Hash>,
     /// When this fetch was started.
     created: Instant,
-    /// Total retry round count (for backoff calculation).
-    retry_rounds: u32,
-    /// When the next retry is allowed (for exponential backoff).
-    /// None means ready to retry immediately.
-    next_retry_at: Option<Instant>,
+    /// Number of in-flight fetch operations for this block.
+    in_flight_count: usize,
 }
 
 impl BlockFetchState {
-    fn new(block_hash: Hash, kind: FetchKind, proposer: ValidatorId, hashes: Vec<Hash>) -> Self {
+    fn new(block_hash: Hash, kind: FetchKind, hashes: Vec<Hash>) -> Self {
         Self {
             block_hash,
             kind,
-            proposer,
             missing_hashes: hashes.into_iter().collect(),
-            received_hashes: HashSet::new(),
-            in_flight: HashMap::new(),
-            tried_peers: HashSet::new(),
+            in_flight_hashes: HashSet::new(),
             created: Instant::now(),
-            retry_rounds: 0,
-            next_retry_at: None,
+            in_flight_count: 0,
         }
     }
 
     /// Check if this fetch is complete (all hashes received).
     fn is_complete(&self) -> bool {
-        self.missing_hashes.is_empty()
+        self.missing_hashes.is_empty() && self.in_flight_hashes.is_empty()
     }
 
-    /// Check if this fetch is stale (too old).
+    /// Check if this fetch is stale (too old and no active operations).
+    ///
+    /// A fetch is only considered stale if:
+    /// 1. It's older than the timeout, AND
+    /// 2. There are no in-flight operations (nothing actively being fetched)
+    ///
+    /// This prevents cleaning up fetches that are still making progress through
+    /// RequestManager's retry logic under packet loss conditions.
     fn is_stale(&self, timeout: Duration) -> bool {
-        self.created.elapsed() > timeout
+        self.created.elapsed() > timeout && self.in_flight_count == 0
     }
 
-    /// Check if this fetch is ready to retry (backoff expired).
-    fn is_ready_to_retry(&self) -> bool {
-        match self.next_retry_at {
-            None => true,
-            Some(at) => Instant::now() >= at,
+    /// Get hashes that need fetching (not in-flight).
+    fn hashes_to_fetch(&self) -> Vec<Hash> {
+        self.missing_hashes
+            .difference(&self.in_flight_hashes)
+            .copied()
+            .collect()
+    }
+
+    /// Mark hashes as in-flight.
+    fn mark_in_flight(&mut self, hashes: &[Hash]) {
+        for hash in hashes {
+            self.in_flight_hashes.insert(*hash);
         }
+        self.in_flight_count += 1;
     }
 
-    /// Mark hashes as received.
+    /// Mark hashes as received (removes from both missing and in-flight).
     fn mark_received(&mut self, hashes: impl IntoIterator<Item = Hash>) {
         for hash in hashes {
-            if self.missing_hashes.remove(&hash) {
-                self.received_hashes.insert(hash);
-            }
+            self.missing_hashes.remove(&hash);
+            self.in_flight_hashes.remove(&hash);
         }
     }
 
-    /// Get hashes that are still missing and not currently being fetched.
-    fn unfetched_hashes(&self) -> Vec<Hash> {
-        self.missing_hashes.iter().copied().collect()
+    /// Mark a fetch operation as failed (return hashes to missing pool).
+    fn mark_fetch_failed(&mut self, hashes: &[Hash]) {
+        for hash in hashes {
+            self.in_flight_hashes.remove(hash);
+            // Hash stays in missing_hashes for retry
+        }
+        self.in_flight_count = self.in_flight_count.saturating_sub(1);
     }
 
-    /// Calculate backoff delay for the next retry round.
-    fn calculate_backoff(&self, initial: Duration, max: Duration) -> Duration {
-        // Exponential backoff: initial * 2^retry_rounds, capped at max
-        let multiplier = 2u32.saturating_pow(self.retry_rounds.min(10));
-        let backoff = initial.saturating_mul(multiplier);
-        backoff.min(max)
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Peer Reputation
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Peer reputation for fetch operations.
-#[derive(Debug, Clone, Default)]
-pub struct FetchPeerReputation {
-    /// Number of successful fetch responses.
-    pub successes: u32,
-    /// Number of failed fetch attempts.
-    pub failures: u32,
-    /// Number of currently in-flight requests to this peer.
-    pub in_flight: u32,
-    /// Time of last failure (for cooldown calculation).
-    pub last_failure: Option<Instant>,
-}
-
-impl FetchPeerReputation {
-    /// Check if this peer is in cooldown.
-    fn is_in_cooldown(&self, cooldown: Duration) -> bool {
-        self.last_failure
-            .map(|t| t.elapsed() < cooldown)
-            .unwrap_or(false)
-    }
-
-    /// Calculate a score for peer selection (higher is better).
-    fn score(&self) -> i32 {
-        let success_score = self.successes as i32 * 10;
-        let failure_penalty = self.failures as i32 * 5;
-        let in_flight_penalty = self.in_flight as i32 * 2;
-        success_score - failure_penalty - in_flight_penalty
+    /// Mark a fetch operation as complete (decrement in-flight count).
+    fn mark_fetch_complete(&mut self) {
+        self.in_flight_count = self.in_flight_count.saturating_sub(1);
     }
 }
 
@@ -328,10 +245,8 @@ pub struct FetchStatus {
     pub pending_tx_blocks: usize,
     /// Number of blocks with pending certificate fetches.
     pub pending_cert_blocks: usize,
-    /// Total in-flight requests.
-    pub in_flight_requests: usize,
-    /// Number of tracked peers.
-    pub tracked_peers: usize,
+    /// Total in-flight fetch operations.
+    pub in_flight_operations: usize,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -340,20 +255,15 @@ pub struct FetchStatus {
 
 /// Manages fetching of transactions and certificates from peers.
 ///
-/// The FetchManager coordinates all aspects of data fetching:
-/// - Receives fetch requests from BFT actions
-/// - Selects appropriate peers (proposer first, then fallbacks)
-/// - Spawns concurrent fetch tasks
-/// - Processes responses and delivers data
-/// - Handles retries and failures
+/// Delegates retry logic and peer selection to `RequestManager`.
+/// Focuses on tracking missing data and orchestrating parallel fetches.
+/// Global concurrency is managed by RequestManager; this only tracks per-block fairness.
 pub struct FetchManager {
     /// Configuration.
     config: FetchConfig,
-    /// Network adapter for sending requests.
-    network: Arc<Libp2pAdapter>,
+    /// Request manager for network requests with retry.
+    request_manager: Arc<RequestManager>,
     /// Storage for persisting fetched data.
-    /// Fetched transactions and certificates are eagerly persisted to ensure
-    /// they're available for sync requests from peers.
     storage: Arc<RocksDbStorage>,
     /// Event sender for delivering fetched data.
     event_tx: mpsc::Sender<Event>,
@@ -361,59 +271,41 @@ pub struct FetchManager {
     tx_fetches: HashMap<Hash, BlockFetchState>,
     /// Pending certificate fetches by block hash.
     cert_fetches: HashMap<Hash, BlockFetchState>,
-    /// Peer reputations for fetch operations.
-    peer_reputations: HashMap<PeerId, FetchPeerReputation>,
     /// Known committee members (ValidatorId -> PeerId).
-    /// Used for fallback peer selection.
     committee_peers: HashMap<ValidatorId, PeerId>,
-    /// Queue of pending fetch tasks (block_hash, kind).
-    /// Used when we're at max concurrent and need to wait.
-    pending_queue: VecDeque<FetchId>,
     /// Channel for receiving results from spawned fetch tasks.
     result_rx: mpsc::Receiver<FetchResult>,
     /// Sender for spawned fetch tasks to report results.
     result_tx: mpsc::Sender<FetchResult>,
-    /// Total in-flight requests (for limiting).
-    total_in_flight: usize,
-    /// Global backpressure cooldown - don't spawn any fetches until this time.
-    /// Set when we receive a Backpressure error from the network adapter.
-    backpressure_until: Option<Instant>,
 }
 
 impl FetchManager {
     /// Create a new fetch manager.
     pub fn new(
         config: FetchConfig,
-        network: Arc<Libp2pAdapter>,
+        request_manager: Arc<RequestManager>,
         storage: Arc<RocksDbStorage>,
         event_tx: mpsc::Sender<Event>,
     ) -> Self {
-        // Channel for fetch results - buffer size matches max concurrent
-        let (result_tx, result_rx) = mpsc::channel(config.max_total_concurrent.max(32));
+        // Buffer size for result channel - enough for reasonable parallelism
+        let (result_tx, result_rx) = mpsc::channel(64);
 
         Self {
             config,
-            network,
+            request_manager,
             storage,
             event_tx,
             tx_fetches: HashMap::new(),
             cert_fetches: HashMap::new(),
-            peer_reputations: HashMap::new(),
             committee_peers: HashMap::new(),
-            pending_queue: VecDeque::new(),
             result_rx,
             result_tx,
-            total_in_flight: 0,
-            backpressure_until: None,
         }
     }
 
     /// Register a committee member's peer ID.
-    ///
-    /// Called during initialization to build the peer map for fallback selection.
     pub fn register_committee_member(&mut self, validator_id: ValidatorId, peer_id: PeerId) {
         self.committee_peers.insert(validator_id, peer_id);
-        self.peer_reputations.entry(peer_id).or_default();
         debug!(
             validator_id = validator_id.0,
             ?peer_id,
@@ -423,21 +315,31 @@ impl FetchManager {
 
     /// Get the current fetch status for external APIs.
     pub fn status(&self) -> FetchStatus {
+        // Count in-flight operations across all blocks
+        let in_flight: usize = self
+            .tx_fetches
+            .values()
+            .chain(self.cert_fetches.values())
+            .map(|s| s.in_flight_count)
+            .sum();
+
         FetchStatus {
             pending_tx_blocks: self.tx_fetches.len(),
             pending_cert_blocks: self.cert_fetches.len(),
-            in_flight_requests: self.total_in_flight,
-            tracked_peers: self.peer_reputations.len(),
+            in_flight_operations: in_flight,
         }
     }
 
+    /// Get all registered peer IDs.
+    fn get_peers(&self) -> Vec<PeerId> {
+        self.committee_peers.values().copied().collect()
+    }
+
     /// Request transactions for a pending block.
-    ///
-    /// Called when BFT emits `Action::FetchTransactions`.
     pub fn request_transactions(
         &mut self,
         block_hash: Hash,
-        proposer: ValidatorId,
+        _proposer: ValidatorId,
         tx_hashes: Vec<Hash>,
     ) {
         if tx_hashes.is_empty() {
@@ -446,16 +348,17 @@ impl FetchManager {
 
         // Check if we already have a fetch for this block
         if let Some(state) = self.tx_fetches.get_mut(&block_hash) {
-            // Update missing hashes (BFT may have received some via gossip)
-            let new_missing: HashSet<Hash> = tx_hashes.into_iter().collect();
-            state.missing_hashes = state
-                .missing_hashes
-                .intersection(&new_missing)
-                .copied()
-                .collect();
+            // Add any new hashes
+            let count_before = state.missing_hashes.len();
+            for hash in tx_hashes {
+                if !state.in_flight_hashes.contains(&hash) {
+                    state.missing_hashes.insert(hash);
+                }
+            }
             debug!(
                 ?block_hash,
-                remaining = state.missing_hashes.len(),
+                before = count_before,
+                after = state.missing_hashes.len(),
                 "Updated existing transaction fetch"
             );
             return;
@@ -463,31 +366,20 @@ impl FetchManager {
 
         info!(
             ?block_hash,
-            proposer = proposer.0,
             count = tx_hashes.len(),
             "Starting transaction fetch"
         );
 
-        // Create new fetch state
-        let state = BlockFetchState::new(block_hash, FetchKind::Transaction, proposer, tx_hashes);
+        let state = BlockFetchState::new(block_hash, FetchKind::Transaction, tx_hashes);
         self.tx_fetches.insert(block_hash, state);
-
-        // Queue for processing
-        self.pending_queue.push_back(FetchId {
-            block_hash,
-            kind: FetchKind::Transaction,
-        });
-
         metrics::record_fetch_started(FetchKind::Transaction);
     }
 
     /// Request certificates for a pending block.
-    ///
-    /// Called when BFT emits `Action::FetchCertificates`.
     pub fn request_certificates(
         &mut self,
         block_hash: Hash,
-        proposer: ValidatorId,
+        _proposer: ValidatorId,
         cert_hashes: Vec<Hash>,
     ) {
         if cert_hashes.is_empty() {
@@ -496,16 +388,17 @@ impl FetchManager {
 
         // Check if we already have a fetch for this block
         if let Some(state) = self.cert_fetches.get_mut(&block_hash) {
-            // Update missing hashes
-            let new_missing: HashSet<Hash> = cert_hashes.into_iter().collect();
-            state.missing_hashes = state
-                .missing_hashes
-                .intersection(&new_missing)
-                .copied()
-                .collect();
+            // Add any new hashes
+            let count_before = state.missing_hashes.len();
+            for hash in cert_hashes {
+                if !state.in_flight_hashes.contains(&hash) {
+                    state.missing_hashes.insert(hash);
+                }
+            }
             debug!(
                 ?block_hash,
-                remaining = state.missing_hashes.len(),
+                before = count_before,
+                after = state.missing_hashes.len(),
                 "Updated existing certificate fetch"
             );
             return;
@@ -513,25 +406,16 @@ impl FetchManager {
 
         info!(
             ?block_hash,
-            proposer = proposer.0,
             count = cert_hashes.len(),
             "Starting certificate fetch"
         );
 
-        // Create new fetch state
-        let state = BlockFetchState::new(block_hash, FetchKind::Certificate, proposer, cert_hashes);
+        let state = BlockFetchState::new(block_hash, FetchKind::Certificate, cert_hashes);
         self.cert_fetches.insert(block_hash, state);
-
-        // Queue for processing
-        self.pending_queue.push_back(FetchId {
-            block_hash,
-            kind: FetchKind::Certificate,
-        });
-
         metrics::record_fetch_started(FetchKind::Certificate);
     }
 
-    /// Cancel a fetch for a block (e.g., block completed via gossip).
+    /// Cancel a fetch for a block.
     #[allow(dead_code)]
     pub fn cancel_fetch(&mut self, block_hash: Hash, kind: FetchKind) {
         let removed = match kind {
@@ -541,64 +425,46 @@ impl FetchManager {
 
         if removed {
             debug!(?block_hash, ?kind, "Cancelled fetch");
-            // Remove from pending queue
-            self.pending_queue
-                .retain(|id| !(id.block_hash == block_hash && id.kind == kind));
         }
     }
 
-    /// Tick the fetch manager - called periodically to drive fetch progress.
-    ///
-    /// This should be called regularly (e.g., every 50-100ms) to:
-    /// - Process completed fetch results
-    /// - Start new fetch requests
-    /// - Check for timed out requests
-    /// - Clean up stale fetches
+    /// Tick the fetch manager - called periodically to drive progress.
     pub async fn tick(&mut self) {
-        // Process any completed fetch results
+        // Process completed fetch results
         self.process_results().await;
 
-        // Clean up stale fetches (and notify BFT of failures)
+        // Spawn new fetch operations for pending blocks
+        self.spawn_pending_fetches().await;
+
+        // Clean up stale fetches
         self.cleanup_stale().await;
-
-        // Process pending queue - spawn new fetches
-        self.process_pending_queue().await;
-
-        // Check for timed out requests
-        self.check_timeouts().await;
     }
 
-    /// Process completed fetch results from spawned tasks.
+    /// Process completed fetch results.
     async fn process_results(&mut self) {
         while let Ok(result) = self.result_rx.try_recv() {
             match result {
                 FetchResult::TransactionsReceived {
                     block_hash,
-                    peer,
                     transactions,
                 } => {
-                    self.handle_transactions_received(block_hash, peer, transactions)
+                    self.handle_transactions_received(block_hash, transactions)
                         .await;
                 }
                 FetchResult::CertificatesReceived {
                     block_hash,
-                    peer,
                     certificates,
                 } => {
-                    self.handle_certificates_received(block_hash, peer, certificates)
+                    self.handle_certificates_received(block_hash, certificates)
                         .await;
                 }
                 FetchResult::Failed {
                     block_hash,
                     kind,
-                    peer,
+                    hashes,
                     error,
-                    is_backpressure,
                 } => {
-                    if is_backpressure {
-                        self.on_backpressure();
-                    }
-                    self.handle_fetch_failed(block_hash, kind, peer, &error)
+                    self.handle_fetch_failed(block_hash, kind, &hashes, &error)
                         .await;
                 }
             }
@@ -609,17 +475,8 @@ impl FetchManager {
     async fn handle_transactions_received(
         &mut self,
         block_hash: Hash,
-        peer: PeerId,
         transactions: Vec<Arc<RoutableTransaction>>,
     ) {
-        self.total_in_flight = self.total_in_flight.saturating_sub(1);
-
-        // Update peer reputation
-        if let Some(rep) = self.peer_reputations.get_mut(&peer) {
-            rep.successes += 1;
-            rep.in_flight = rep.in_flight.saturating_sub(1);
-        }
-
         let Some(state) = self.tx_fetches.get_mut(&block_hash) else {
             trace!(
                 ?block_hash,
@@ -628,8 +485,7 @@ impl FetchManager {
             return;
         };
 
-        // Mark in-flight request as complete
-        state.in_flight.remove(&peer);
+        state.mark_fetch_complete();
 
         // Mark received hashes
         let received_hashes: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
@@ -640,25 +496,17 @@ impl FetchManager {
             ?block_hash,
             received = received_count,
             remaining = state.missing_hashes.len(),
-            "Received transactions from peer"
+            "Received transactions"
         );
 
         metrics::record_fetch_items_received(FetchKind::Transaction, received_count);
 
-        // Eagerly persist fetched transactions to storage.
-        // This ensures they're available for sync requests from peers, preventing
-        // the scenario where all validators have data in memory but can't serve
-        // sync requests because storage is empty.
-        //
-        // Note: We persist before BFT validation. This is safe because:
-        // 1. Transactions are stored by hash (content-addressable)
-        // 2. Blocks reference specific hashes - invalid data won't be used
-        // 3. Worst case is wasted disk space from Byzantine peers
+        // Persist to storage
         if !transactions.is_empty() {
             let storage = self.storage.clone();
-            let txs_to_persist = transactions.clone();
+            let txs = transactions.clone();
             tokio::spawn(async move {
-                for tx in &txs_to_persist {
+                for tx in &txs {
                     storage.put_transaction(tx);
                 }
             });
@@ -672,7 +520,6 @@ impl FetchManager {
             };
             if let Err(e) = self.event_tx.send(event).await {
                 warn!(?block_hash, error = ?e, "Failed to deliver transactions to BFT");
-                metrics::record_fetch_event_send_failed("TransactionReceived");
             }
         }
 
@@ -681,23 +528,6 @@ impl FetchManager {
             info!(?block_hash, "Transaction fetch complete");
             self.tx_fetches.remove(&block_hash);
             metrics::record_fetch_completed(FetchKind::Transaction);
-        } else if state.in_flight.is_empty() && !state.missing_hashes.is_empty() {
-            // Partial response - some txs were not returned by the peer.
-            // Re-queue to fetch remaining from other peers.
-            info!(
-                ?block_hash,
-                remaining = state.missing_hashes.len(),
-                "Partial transaction response, re-queuing for remaining"
-            );
-            // Clear tried_peers to allow retrying with all peers for the remaining hashes.
-            // Reset backoff since we made progress (received some data).
-            state.tried_peers.clear();
-            state.retry_rounds = state.retry_rounds.saturating_sub(1);
-            state.next_retry_at = None; // Clear backoff - we made progress
-            self.pending_queue.push_back(FetchId {
-                block_hash,
-                kind: FetchKind::Transaction,
-            });
         }
     }
 
@@ -705,17 +535,8 @@ impl FetchManager {
     async fn handle_certificates_received(
         &mut self,
         block_hash: Hash,
-        peer: PeerId,
         certificates: Vec<TransactionCertificate>,
     ) {
-        self.total_in_flight = self.total_in_flight.saturating_sub(1);
-
-        // Update peer reputation
-        if let Some(rep) = self.peer_reputations.get_mut(&peer) {
-            rep.successes += 1;
-            rep.in_flight = rep.in_flight.saturating_sub(1);
-        }
-
         let Some(state) = self.cert_fetches.get_mut(&block_hash) else {
             trace!(
                 ?block_hash,
@@ -724,14 +545,10 @@ impl FetchManager {
             return;
         };
 
-        // Mark in-flight request as complete
-        state.in_flight.remove(&peer);
+        state.mark_fetch_complete();
 
         // Mark received hashes
-        let received_hashes: Vec<Hash> = certificates
-            .iter()
-            .map(|cert| cert.transaction_hash)
-            .collect();
+        let received_hashes: Vec<Hash> = certificates.iter().map(|c| c.transaction_hash).collect();
         let received_count = received_hashes.len();
         state.mark_received(received_hashes);
 
@@ -739,25 +556,17 @@ impl FetchManager {
             ?block_hash,
             received = received_count,
             remaining = state.missing_hashes.len(),
-            "Received certificates from peer"
+            "Received certificates"
         );
 
         metrics::record_fetch_items_received(FetchKind::Certificate, received_count);
 
-        // Eagerly persist fetched certificates to storage.
-        // This ensures they're available for sync requests from peers, preventing
-        // the scenario where all validators have data in memory but can't serve
-        // sync requests because storage is empty.
-        //
-        // Note: We persist before BFT signature verification. This is safe because:
-        // 1. Certificates are stored by transaction hash (content-addressable)
-        // 2. Blocks reference specific hashes - invalid data won't be used
-        // 3. Worst case is wasted disk space from Byzantine peers
+        // Persist to storage
         if !certificates.is_empty() {
             let storage = self.storage.clone();
-            let certs_to_persist = certificates.clone();
+            let certs = certificates.clone();
             tokio::spawn(async move {
-                for cert in &certs_to_persist {
+                for cert in &certs {
                     storage.put_certificate(&cert.transaction_hash, cert);
                 }
             });
@@ -771,7 +580,6 @@ impl FetchManager {
             };
             if let Err(e) = self.event_tx.send(event).await {
                 warn!(?block_hash, error = ?e, "Failed to deliver certificates to BFT");
-                metrics::record_fetch_event_send_failed("CertificateReceived");
             }
         }
 
@@ -780,593 +588,283 @@ impl FetchManager {
             info!(?block_hash, "Certificate fetch complete");
             self.cert_fetches.remove(&block_hash);
             metrics::record_fetch_completed(FetchKind::Certificate);
-        } else if state.in_flight.is_empty() && !state.missing_hashes.is_empty() {
-            // Partial response - some certs were not returned by the peer.
-            // Re-queue to fetch remaining from other peers.
-            info!(
-                ?block_hash,
-                remaining = state.missing_hashes.len(),
-                "Partial certificate response, re-queuing for remaining"
-            );
-            // Clear tried_peers to allow retrying with all peers for the remaining hashes.
-            // Reset backoff since we made progress (received some data).
-            state.tried_peers.clear();
-            state.retry_rounds = state.retry_rounds.saturating_sub(1);
-            state.next_retry_at = None; // Clear backoff - we made progress
-            self.pending_queue.push_back(FetchId {
-                block_hash,
-                kind: FetchKind::Certificate,
-            });
         }
     }
 
-    /// Handle network backpressure by applying a global cooldown.
-    ///
-    /// When the network adapter reports backpressure (too many pending requests),
-    /// we pause ALL fetch activity for a short period to let the network drain.
-    fn on_backpressure(&mut self) {
-        const BACKPRESSURE_COOLDOWN: Duration = Duration::from_millis(500);
-
-        let until = Instant::now() + BACKPRESSURE_COOLDOWN;
-        info!(
-            cooldown_ms = BACKPRESSURE_COOLDOWN.as_millis(),
-            "Network backpressure detected, pausing fetches"
-        );
-        self.backpressure_until = Some(until);
-    }
-
-    /// Handle a failed fetch request.
+    /// Handle a failed fetch.
     async fn handle_fetch_failed(
         &mut self,
         block_hash: Hash,
         kind: FetchKind,
-        peer: PeerId,
+        hashes: &[Hash],
         error: &str,
     ) {
-        self.total_in_flight = self.total_in_flight.saturating_sub(1);
+        warn!(
+            ?block_hash,
+            ?kind,
+            hash_count = hashes.len(),
+            error,
+            "Fetch operation failed"
+        );
+        metrics::record_fetch_failed(kind);
 
-        // Update peer reputation
-        if let Some(rep) = self.peer_reputations.get_mut(&peer) {
-            rep.failures += 1;
-            rep.in_flight = rep.in_flight.saturating_sub(1);
-            rep.last_failure = Some(Instant::now());
-        }
-
+        // Mark the hashes as no longer in-flight so they can be retried
         let state = match kind {
             FetchKind::Transaction => self.tx_fetches.get_mut(&block_hash),
             FetchKind::Certificate => self.cert_fetches.get_mut(&block_hash),
         };
 
-        let Some(state) = state else {
-            return;
-        };
-
-        // Mark in-flight request as complete
-        state.in_flight.remove(&peer);
-
-        warn!(
-            ?block_hash,
-            ?kind,
-            ?peer,
-            error,
-            in_flight_remaining = state.in_flight.len(),
-            "Fetch request failed"
-        );
-
-        metrics::record_fetch_failed(kind);
-
-        // Only increment retry counter when ALL in-flight requests have completed.
-        // This prevents parallel requests from exhausting retries prematurely.
-        // We count a "retry round" as one full attempt across all peers.
-        if !state.in_flight.is_empty() {
-            // Other requests still in flight - wait for them
-            return;
-        }
-
-        // All in-flight requests have completed (either succeeded or failed).
-        // If we still have missing hashes, apply exponential backoff and re-queue.
-        if !state.missing_hashes.is_empty() {
-            state.retry_rounds += 1;
-
-            // Calculate backoff delay for next retry
-            let backoff = state.calculate_backoff(
-                self.config.initial_retry_backoff,
-                self.config.max_retry_backoff,
-            );
-            state.next_retry_at = Some(Instant::now() + backoff);
-
-            // Log with appropriate level based on retry count
-            if state.retry_rounds <= 3 {
-                info!(
-                    ?block_hash,
-                    ?kind,
-                    retry_round = state.retry_rounds,
-                    remaining = state.missing_hashes.len(),
-                    backoff_ms = backoff.as_millis(),
-                    "Re-queuing fetch after round failure (with backoff)"
-                );
-            } else {
-                // After several retries, this is concerning but we keep trying
-                warn!(
-                    ?block_hash,
-                    ?kind,
-                    retry_round = state.retry_rounds,
-                    remaining = state.missing_hashes.len(),
-                    backoff_ms = backoff.as_millis(),
-                    elapsed_secs = state.created.elapsed().as_secs(),
-                    "Fetch still incomplete after multiple retries - continuing with backoff"
-                );
-            }
-
-            // Clear tried peers to allow fresh rotation
-            state.tried_peers.clear();
-            // Re-queue - will be skipped in process_pending_queue until backoff expires
-            self.pending_queue.push_back(FetchId { block_hash, kind });
+        if let Some(state) = state {
+            state.mark_fetch_failed(hashes);
         }
     }
 
-    /// Process the pending queue and spawn new fetch tasks.
-    async fn process_pending_queue(&mut self) {
-        // Check global backpressure cooldown
-        if let Some(until) = self.backpressure_until {
-            if Instant::now() < until {
-                trace!("Fetch processing paused due to backpressure cooldown");
-                return;
-            }
-            // Cooldown expired, clear it
-            self.backpressure_until = None;
+    /// Spawn fetch operations for pending blocks.
+    ///
+    /// Global concurrency is managed by RequestManager. This method only enforces
+    /// per-block fairness limits to prevent one block from starving others.
+    async fn spawn_pending_fetches(&mut self) {
+        let peers = self.get_peers();
+        if peers.is_empty() {
+            return;
         }
 
-        // Collect fetch tasks to spawn (to avoid borrow issues)
-        let mut to_spawn: Vec<(Hash, FetchKind, PeerId, Vec<Hash>)> = Vec::new();
-        let max_hashes = self.config.max_hashes_per_request;
-        let max_per_block = self.config.max_concurrent_per_block;
-        let peer_cooldown = self.config.peer_cooldown;
-        let proactive_peers = self.config.proactive_parallel_peers;
+        // Collect fetches to spawn (block_hash, kind, hashes)
+        let mut to_spawn: Vec<(Hash, FetchKind, Vec<Hash>)> = Vec::new();
 
-        while self.total_in_flight + to_spawn.len() < self.config.max_total_concurrent {
-            let Some(fetch_id) = self.pending_queue.pop_front() else {
-                break;
-            };
-
-            // First, get immutable info we need for peer selection
-            let peer_selection_info = {
-                let state = match fetch_id.kind {
-                    FetchKind::Transaction => self.tx_fetches.get(&fetch_id.block_hash),
-                    FetchKind::Certificate => self.cert_fetches.get(&fetch_id.block_hash),
-                };
-
-                let Some(state) = state else {
-                    // Fetch was cancelled or completed
-                    continue;
-                };
-
-                // Check if we're in backoff period
-                if !state.is_ready_to_retry() {
-                    // Still in backoff - put back in queue for later
-                    self.pending_queue.push_back(fetch_id);
-                    continue;
-                }
-
-                // Check if we're already at max concurrent for this block
-                if state.in_flight.len() >= max_per_block {
-                    // Put back in queue for later
-                    self.pending_queue.push_back(fetch_id);
-                    continue;
-                }
-
-                // Extract info for peer selection
-                Some((
-                    state.proposer,
-                    state.tried_peers.clone(),
-                    state.in_flight.keys().copied().collect::<HashSet<PeerId>>(),
-                    state.unfetched_hashes(),
-                    state.in_flight.len(),
-                ))
-            };
-
-            let Some((proposer, tried_peers, in_flight_peers, hashes, current_in_flight)) =
-                peer_selection_info
-            else {
+        // Check transaction fetches
+        for (block_hash, state) in &mut self.tx_fetches {
+            if state.in_flight_count >= self.config.max_concurrent_per_block {
                 continue;
-            };
+            }
 
+            let hashes = state.hashes_to_fetch();
             if hashes.is_empty() {
                 continue;
             }
 
-            // Determine how many peers to fetch from in parallel.
-            // For new fetches (no in-flight), use proactive_parallel_peers.
-            // For retries (already have in-flight), just add one more peer.
-            let peers_to_add = if current_in_flight == 0 {
-                // New fetch: proactively request from multiple peers
-                proactive_peers.min(max_per_block)
-            } else {
-                // Retry/continuation: add one peer at a time
-                1
-            };
+            // Calculate how many chunks we can spawn (limited by per-block fairness)
+            let available_slots = (self.config.max_concurrent_per_block - state.in_flight_count)
+                .min(self.config.parallel_fetches);
 
-            // Select multiple peers for parallel fetching
-            let selected_peers = self.select_multiple_peers(
-                proposer,
-                &tried_peers,
-                &in_flight_peers,
-                peer_cooldown,
-                peers_to_add,
-            );
-
-            if selected_peers.is_empty() {
-                // No available peers, put back in queue
-                self.pending_queue.push_back(fetch_id);
-                break;
+            for chunk in hashes
+                .chunks(self.config.max_hashes_per_request)
+                .take(available_slots)
+            {
+                let chunk_vec = chunk.to_vec();
+                state.mark_in_flight(&chunk_vec);
+                to_spawn.push((*block_hash, FetchKind::Transaction, chunk_vec));
             }
+        }
 
-            // Now get mutable access to update state
-            let state = match fetch_id.kind {
-                FetchKind::Transaction => self.tx_fetches.get_mut(&fetch_id.block_hash),
-                FetchKind::Certificate => self.cert_fetches.get_mut(&fetch_id.block_hash),
-            };
-
-            let Some(state) = state else {
+        // Check certificate fetches
+        for (block_hash, state) in &mut self.cert_fetches {
+            if state.in_flight_count >= self.config.max_concurrent_per_block {
                 continue;
-            };
+            }
 
-            // Chunk the hashes and distribute across peers for parallel fetching.
-            // Each peer gets a different chunk to maximize throughput.
-            let chunks: Vec<Vec<Hash>> = hashes.chunks(max_hashes).map(|c| c.to_vec()).collect();
+            let hashes = state.hashes_to_fetch();
+            if hashes.is_empty() {
+                continue;
+            }
 
-            // Distribute chunks across selected peers (round-robin if more chunks than peers)
-            for (i, peer) in selected_peers.iter().enumerate() {
-                // Each peer gets chunks at positions: i, i+num_peers, i+2*num_peers, ...
-                let peer_chunks: Vec<Hash> = chunks
-                    .iter()
-                    .enumerate()
-                    .filter(|(j, _)| j % selected_peers.len() == i)
-                    .flat_map(|(_, chunk)| chunk.iter().copied())
-                    .collect();
+            // Calculate how many chunks we can spawn (limited by per-block fairness)
+            let available_slots = (self.config.max_concurrent_per_block - state.in_flight_count)
+                .min(self.config.parallel_fetches);
 
-                if peer_chunks.is_empty() {
-                    continue;
-                }
-
-                // Mark peer as tried
-                state.tried_peers.insert(*peer);
-
-                // Record in-flight request
-                state.in_flight.insert(
-                    *peer,
-                    PendingFetchRequest {
-                        peer: *peer,
-                        started: Instant::now(),
-                        retries: 0,
-                    },
-                );
-
-                // Queue for spawning
-                to_spawn.push((fetch_id.block_hash, fetch_id.kind, *peer, peer_chunks));
+            for chunk in hashes
+                .chunks(self.config.max_hashes_per_request)
+                .take(available_slots)
+            {
+                let chunk_vec = chunk.to_vec();
+                state.mark_in_flight(&chunk_vec);
+                to_spawn.push((*block_hash, FetchKind::Certificate, chunk_vec));
             }
         }
 
-        // Now spawn all the fetch tasks
-        for (block_hash, kind, peer, hashes) in to_spawn {
-            // Update reputation
-            if let Some(rep) = self.peer_reputations.get_mut(&peer) {
-                rep.in_flight += 1;
-            }
-
-            self.total_in_flight += 1;
-
-            // Spawn the fetch task
-            self.spawn_fetch(block_hash, kind, peer, hashes);
+        // Spawn the fetch tasks
+        for (block_hash, kind, hashes) in to_spawn {
+            self.spawn_fetch(block_hash, kind, hashes, peers.clone());
         }
     }
 
-    /// Select multiple peers for parallel fetching.
-    ///
-    /// Returns up to `count` peers, always including the proposer first if available.
-    /// This enables proactive parallel fetching to reduce latency under CPU pressure.
-    fn select_multiple_peers(
+    /// Spawn a single fetch operation.
+    fn spawn_fetch(
         &self,
-        proposer: ValidatorId,
-        tried_peers: &HashSet<PeerId>,
-        in_flight_peers: &HashSet<PeerId>,
-        peer_cooldown: Duration,
-        count: usize,
-    ) -> Vec<PeerId> {
-        let mut selected = Vec::with_capacity(count);
-
-        // First, try the proposer if we haven't already
-        if let Some(&proposer_peer) = self.committee_peers.get(&proposer) {
-            if !tried_peers.contains(&proposer_peer) && !in_flight_peers.contains(&proposer_peer) {
-                let is_available = self
-                    .peer_reputations
-                    .get(&proposer_peer)
-                    .map(|rep| !rep.is_in_cooldown(peer_cooldown) && rep.in_flight < 3)
-                    .unwrap_or(true);
-
-                if is_available {
-                    selected.push(proposer_peer);
-                }
-            }
-        }
-
-        if selected.len() >= count {
-            return selected;
-        }
-
-        // Build a set of already-selected peers to avoid duplicates
-        let mut already_selected: HashSet<PeerId> = selected.iter().copied().collect();
-
-        // Collect other committee members, sorted by reputation
-        let mut candidates: Vec<_> = self
-            .committee_peers
-            .iter()
-            .filter(|(_, &peer)| {
-                !tried_peers.contains(&peer)
-                    && !in_flight_peers.contains(&peer)
-                    && !already_selected.contains(&peer)
-            })
-            .filter_map(|(_, &peer)| {
-                let rep = self.peer_reputations.get(&peer)?;
-                if rep.is_in_cooldown(peer_cooldown) || rep.in_flight >= 3 {
-                    return None;
-                }
-                Some((peer, rep.score()))
-            })
-            .collect();
-
-        // Sort by score (highest first)
-        candidates.sort_by(|a, b| b.1.cmp(&a.1));
-
-        // Take up to (count - already selected) more peers
-        for (peer, _score) in candidates {
-            if selected.len() >= count {
-                break;
-            }
-            if already_selected.insert(peer) {
-                selected.push(peer);
-            }
-        }
-
-        selected
-    }
-
-    /// Spawn a fetch task.
-    fn spawn_fetch(&self, block_hash: Hash, kind: FetchKind, peer: PeerId, hashes: Vec<Hash>) {
+        block_hash: Hash,
+        kind: FetchKind,
+        hashes: Vec<Hash>,
+        peers: Vec<PeerId>,
+    ) {
         trace!(
             ?block_hash,
             ?kind,
-            ?peer,
             count = hashes.len(),
             "Spawning fetch task"
         );
 
-        let network = self.network.clone();
+        let request_manager = self.request_manager.clone();
         let result_tx = self.result_tx.clone();
 
         tokio::spawn(async move {
-            let result = match kind {
+            let fetch_result = match kind {
                 FetchKind::Transaction => {
-                    Self::fetch_transactions(network, peer, block_hash, hashes).await
+                    Self::fetch_transactions(request_manager, &peers, block_hash, hashes).await
                 }
                 FetchKind::Certificate => {
-                    Self::fetch_certificates(network, peer, block_hash, hashes).await
+                    Self::fetch_certificates(request_manager, &peers, block_hash, hashes).await
                 }
             };
 
-            // Send result back to manager (ignore send errors - manager may have shut down)
-            let _ = result_tx.send(result).await;
+            let _ = result_tx.send(fetch_result).await;
         });
     }
 
-    /// Fetch transactions from a peer.
-    ///
-    /// Uses adaptive per-peer timeout from the network adapter's RTT tracker.
+    /// Fetch transactions using RequestManager.
     async fn fetch_transactions(
-        network: Arc<Libp2pAdapter>,
-        peer: PeerId,
+        request_manager: Arc<RequestManager>,
+        peers: &[PeerId],
         block_hash: Hash,
         tx_hashes: Vec<Hash>,
     ) -> FetchResult {
         let start = Instant::now();
 
-        // Network adapter uses adaptive RTT-based timeout internally
-        let result = network
-            .request_transactions(peer, block_hash, tx_hashes)
+        // RequestManager handles retry, peer selection, and backoff
+        let response = request_manager
+            .request_transactions(
+                peers,
+                block_hash,
+                tx_hashes.clone(),
+                RequestPriority::Critical,
+            )
             .await;
+
+        let (_peer, response_bytes) = match response {
+            Ok(r) => r,
+            Err(e) => {
+                return FetchResult::Failed {
+                    block_hash,
+                    kind: FetchKind::Transaction,
+                    hashes: tx_hashes,
+                    error: format!("{}", e),
+                };
+            }
+        };
 
         let elapsed = start.elapsed();
         metrics::record_fetch_latency(FetchKind::Transaction, elapsed);
 
-        match result {
-            Ok(response_bytes) => {
-                match sbor::basic_decode::<GetTransactionsResponse>(&response_bytes) {
-                    Ok(response) => FetchResult::TransactionsReceived {
-                        block_hash,
-                        peer,
-                        transactions: response.into_transactions(),
-                    },
-                    Err(e) => FetchResult::Failed {
-                        block_hash,
-                        kind: FetchKind::Transaction,
-                        peer,
-                        error: format!("decode error: {:?}", e),
-                        is_backpressure: false,
-                    },
-                }
-            }
-            Err(ref e) => {
-                let is_backpressure = matches!(e, crate::network::NetworkError::Backpressure);
-                let is_timeout = matches!(e, crate::network::NetworkError::Timeout);
-                FetchResult::Failed {
-                    block_hash,
-                    kind: FetchKind::Transaction,
-                    peer,
-                    error: if is_timeout {
-                        "timeout".to_string()
-                    } else {
-                        format!("network error: {}", e)
-                    },
-                    is_backpressure,
-                }
-            }
+        // Decode response
+        match sbor::basic_decode::<GetTransactionsResponse>(&response_bytes) {
+            Ok(response) => FetchResult::TransactionsReceived {
+                block_hash,
+                transactions: response.into_transactions(),
+            },
+            Err(e) => FetchResult::Failed {
+                block_hash,
+                kind: FetchKind::Transaction,
+                hashes: tx_hashes,
+                error: format!("decode error: {:?}", e),
+            },
         }
     }
 
-    /// Fetch certificates from a peer.
-    ///
-    /// Uses adaptive per-peer timeout from the network adapter's RTT tracker.
+    /// Fetch certificates using RequestManager.
     async fn fetch_certificates(
-        network: Arc<Libp2pAdapter>,
-        peer: PeerId,
+        request_manager: Arc<RequestManager>,
+        peers: &[PeerId],
         block_hash: Hash,
         cert_hashes: Vec<Hash>,
     ) -> FetchResult {
         let start = Instant::now();
 
-        // Network adapter uses adaptive RTT-based timeout internally
-        let result = network
-            .request_certificates(peer, block_hash, cert_hashes)
+        // RequestManager handles retry, peer selection, and backoff
+        let response = request_manager
+            .request_certificates(
+                peers,
+                block_hash,
+                cert_hashes.clone(),
+                RequestPriority::Critical,
+            )
             .await;
+
+        let (_peer, response_bytes) = match response {
+            Ok(r) => r,
+            Err(e) => {
+                return FetchResult::Failed {
+                    block_hash,
+                    kind: FetchKind::Certificate,
+                    hashes: cert_hashes,
+                    error: format!("{}", e),
+                };
+            }
+        };
 
         let elapsed = start.elapsed();
         metrics::record_fetch_latency(FetchKind::Certificate, elapsed);
 
-        match result {
-            Ok(response_bytes) => {
-                match sbor::basic_decode::<GetCertificatesResponse>(&response_bytes) {
-                    Ok(response) => FetchResult::CertificatesReceived {
-                        block_hash,
-                        peer,
-                        certificates: response.into_certificates(),
-                    },
-                    Err(e) => FetchResult::Failed {
-                        block_hash,
-                        kind: FetchKind::Certificate,
-                        peer,
-                        error: format!("decode error: {:?}", e),
-                        is_backpressure: false,
-                    },
-                }
-            }
-            Err(ref e) => {
-                let is_backpressure = matches!(e, crate::network::NetworkError::Backpressure);
-                let is_timeout = matches!(e, crate::network::NetworkError::Timeout);
-                FetchResult::Failed {
-                    block_hash,
-                    kind: FetchKind::Certificate,
-                    peer,
-                    error: if is_timeout {
-                        "timeout".to_string()
-                    } else {
-                        format!("network error: {}", e)
-                    },
-                    is_backpressure,
-                }
-            }
+        // Decode response
+        match sbor::basic_decode::<GetCertificatesResponse>(&response_bytes) {
+            Ok(response) => FetchResult::CertificatesReceived {
+                block_hash,
+                certificates: response.into_certificates(),
+            },
+            Err(e) => FetchResult::Failed {
+                block_hash,
+                kind: FetchKind::Certificate,
+                hashes: cert_hashes,
+                error: format!("decode error: {:?}", e),
+            },
         }
     }
 
-    /// Check for timed out requests and retry them.
-    ///
-    /// Uses adaptive per-peer timeouts based on RTT, capped at max_timeout.
-    async fn check_timeouts(&mut self) {
-        let max_timeout = self.config.max_timeout;
-        let rtt_tracker = self.network.rtt_tracker().clone();
-
-        // Check transaction fetches
-        let mut timed_out: Vec<(Hash, PeerId)> = Vec::new();
-        for (block_hash, state) in &self.tx_fetches {
-            for (peer, req) in &state.in_flight {
-                let adaptive_timeout = rtt_tracker.get_timeout(peer).min(max_timeout);
-                if req.started.elapsed() > adaptive_timeout {
-                    timed_out.push((*block_hash, *peer));
-                }
-            }
-        }
-
-        for (block_hash, peer) in timed_out {
-            metrics::record_fetch_timeout(FetchKind::Transaction);
-            self.handle_fetch_failed(block_hash, FetchKind::Transaction, peer, "timeout")
-                .await;
-        }
-
-        // Check certificate fetches
-        let mut timed_out: Vec<(Hash, PeerId)> = Vec::new();
-        for (block_hash, state) in &self.cert_fetches {
-            for (peer, req) in &state.in_flight {
-                let adaptive_timeout = rtt_tracker.get_timeout(peer).min(max_timeout);
-                if req.started.elapsed() > adaptive_timeout {
-                    timed_out.push((*block_hash, *peer));
-                }
-            }
-        }
-
-        for (block_hash, peer) in timed_out {
-            metrics::record_fetch_timeout(FetchKind::Certificate);
-            self.handle_fetch_failed(block_hash, FetchKind::Certificate, peer, "timeout")
-                .await;
-        }
-    }
-
-    /// Clean up stale fetches (that have been pending too long).
-    ///
-    /// Sends failure events to BFT for any stale fetches so blocks don't get
-    /// stuck in pending state indefinitely.
+    /// Clean up stale fetches.
     async fn cleanup_stale(&mut self) {
         let stale_timeout = self.config.stale_fetch_timeout;
 
         // Collect stale transaction fetches
-        let stale_tx_hashes: Vec<Hash> = self
+        let stale_tx: Vec<Hash> = self
             .tx_fetches
             .iter()
-            .filter(|(_, state)| state.is_stale(stale_timeout))
-            .map(|(hash, _)| *hash)
+            .filter(|(_, s)| s.is_stale(stale_timeout))
+            .map(|(h, _)| *h)
             .collect();
 
-        // Remove and notify for each stale transaction fetch
-        for hash in stale_tx_hashes {
+        for hash in stale_tx {
             if let Some(state) = self.tx_fetches.remove(&hash) {
                 warn!(
                     ?hash,
                     missing = state.missing_hashes.len(),
+                    in_flight = state.in_flight_count,
                     age_secs = state.created.elapsed().as_secs(),
-                    "Cleaning up stale transaction fetch - notifying BFT"
+                    "Cleaning up stale transaction fetch"
                 );
                 metrics::record_fetch_stale_cleanup(FetchKind::Transaction);
-                // Notify BFT so it can handle the failure (e.g., remove pending block)
                 let event = Event::TransactionFetchFailed { block_hash: hash };
-                if let Err(e) = self.event_tx.send(event).await {
-                    warn!(?hash, error = ?e, "Failed to send TransactionFetchFailed for stale fetch");
-                    metrics::record_fetch_event_send_failed("TransactionFetchFailed");
-                }
+                let _ = self.event_tx.send(event).await;
             }
         }
 
         // Collect stale certificate fetches
-        let stale_cert_hashes: Vec<Hash> = self
+        let stale_cert: Vec<Hash> = self
             .cert_fetches
             .iter()
-            .filter(|(_, state)| state.is_stale(stale_timeout))
-            .map(|(hash, _)| *hash)
+            .filter(|(_, s)| s.is_stale(stale_timeout))
+            .map(|(h, _)| *h)
             .collect();
 
-        // Remove and notify for each stale certificate fetch
-        for hash in stale_cert_hashes {
+        for hash in stale_cert {
             if let Some(state) = self.cert_fetches.remove(&hash) {
                 warn!(
                     ?hash,
                     missing = state.missing_hashes.len(),
+                    in_flight = state.in_flight_count,
                     age_secs = state.created.elapsed().as_secs(),
-                    "Cleaning up stale certificate fetch - notifying BFT"
+                    "Cleaning up stale certificate fetch"
                 );
                 metrics::record_fetch_stale_cleanup(FetchKind::Certificate);
-                // Notify BFT so it can handle the failure
                 let event = Event::CertificateFetchFailed { block_hash: hash };
-                if let Err(e) = self.event_tx.send(event).await {
-                    warn!(?hash, error = ?e, "Failed to send CertificateFetchFailed for stale fetch");
-                    metrics::record_fetch_event_send_failed("CertificateFetchFailed");
-                }
+                let _ = self.event_tx.send(event).await;
             }
         }
     }
@@ -1380,77 +878,43 @@ mod tests {
     fn test_fetch_config_defaults() {
         let config = FetchConfig::default();
         assert_eq!(config.max_concurrent_per_block, 8);
-        assert_eq!(config.max_total_concurrent, 32);
-        // Exponential backoff instead of max_retries
-        assert_eq!(config.initial_retry_backoff, Duration::from_millis(500));
-        assert_eq!(config.max_retry_backoff, Duration::from_secs(5));
-        // Proactive parallel fetching with 4 peers for chunked distribution
-        assert_eq!(config.proactive_parallel_peers, 4);
+        assert_eq!(config.parallel_fetches, 4);
         assert_eq!(config.max_hashes_per_request, 50);
-    }
-
-    #[test]
-    fn test_fetch_config_proactive_parallel() {
-        // Default enables proactive parallel fetching with 4 peers
-        let default_config = FetchConfig::default();
-        assert_eq!(default_config.proactive_parallel_peers, 4);
-
-        // for_local and for_wan inherit the default
-        let local_config = FetchConfig::for_local();
-        assert_eq!(local_config.proactive_parallel_peers, 4);
-
-        let wan_config = FetchConfig::for_wan();
-        assert_eq!(wan_config.proactive_parallel_peers, 4);
-    }
-
-    #[test]
-    fn test_peer_reputation_cooldown() {
-        let mut rep = FetchPeerReputation::default();
-        assert!(!rep.is_in_cooldown(Duration::from_secs(10)));
-
-        rep.last_failure = Some(Instant::now());
-        assert!(rep.is_in_cooldown(Duration::from_secs(10)));
-    }
-
-    #[test]
-    fn test_peer_reputation_score() {
-        let mut rep = FetchPeerReputation::default();
-        assert_eq!(rep.score(), 0);
-
-        rep.successes = 5;
-        assert_eq!(rep.score(), 50);
-
-        rep.failures = 2;
-        assert_eq!(rep.score(), 40);
-
-        rep.in_flight = 3;
-        assert_eq!(rep.score(), 34);
     }
 
     #[test]
     fn test_block_fetch_state() {
         let block_hash = Hash::from_bytes(b"test_block");
         let hashes = vec![
-            Hash::from_bytes(b"tx1"),
-            Hash::from_bytes(b"tx2"),
-            Hash::from_bytes(b"tx3"),
+            Hash::from_bytes(b"tx1_hash_data_here"),
+            Hash::from_bytes(b"tx2_hash_data_here"),
+            Hash::from_bytes(b"tx3_hash_data_here"),
         ];
 
-        let mut state = BlockFetchState::new(
-            block_hash,
-            FetchKind::Transaction,
-            ValidatorId(0),
-            hashes.clone(),
-        );
+        let mut state = BlockFetchState::new(block_hash, FetchKind::Transaction, hashes.clone());
 
         assert!(!state.is_complete());
-        assert_eq!(state.unfetched_hashes().len(), 3);
+        assert_eq!(state.hashes_to_fetch().len(), 3);
 
-        state.mark_received(vec![hashes[0], hashes[1]]);
+        // Mark some as in-flight
+        state.mark_in_flight(&[hashes[0], hashes[1]]);
+        assert_eq!(state.hashes_to_fetch().len(), 1); // Only tx3 available
+
+        // Receive one
+        state.mark_received(vec![hashes[0]]);
         assert!(!state.is_complete());
-        assert_eq!(state.unfetched_hashes().len(), 1);
+        assert_eq!(state.missing_hashes.len(), 2); // tx2, tx3 still missing
+        assert_eq!(state.in_flight_hashes.len(), 1); // tx2 still in-flight
 
-        state.mark_received(vec![hashes[2]]);
+        // Complete the fetch operation and receive remaining
+        state.mark_fetch_complete();
+        state.mark_received(vec![hashes[1], hashes[2]]);
         assert!(state.is_complete());
+    }
+
+    #[test]
+    fn test_fetch_kind_str() {
+        assert_eq!(FetchKind::Transaction.as_str(), "transaction");
+        assert_eq!(FetchKind::Certificate.as_str(), "certificate");
     }
 }

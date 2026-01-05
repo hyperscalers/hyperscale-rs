@@ -3,9 +3,9 @@
 use crate::action_dispatcher::{
     spawn_action_dispatcher, ActionDispatcherContext, ActionDispatcherHandle, DispatchableAction,
 };
-use crate::fetch_handler::{spawn_fetch_handler, FetchHandlerConfig, FetchHandlerHandle};
 use crate::network::{
-    compute_peer_id_for_validator, InboundSyncRequest, Libp2pAdapter, Libp2pConfig, NetworkError,
+    compute_peer_id_for_validator, InboundRouter, InboundRouterConfig, InboundRouterHandle,
+    Libp2pAdapter, Libp2pConfig, NetworkError,
 };
 use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
 use crate::storage::RocksDbStorage;
@@ -22,10 +22,10 @@ use hyperscale_core::{Action, Event, OutboundMessage, StateMachine};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     batch_verify_bls_different_messages, batch_verify_bls_same_message, verify_bls12381_v1,
-    zero_bls_signature, Block, BlockHeader, BlockMetadata, BlockVote, Bls12381G1PrivateKey,
-    Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof, Hash, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, SignerBitfield, StateVoteBlock, Topology,
-    TransactionCertificate, ValidatorId, VotePower,
+    zero_bls_signature, Block, BlockHeader, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    Bls12381G2Signature, CommitmentProof, Hash, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, SignerBitfield, StateVoteBlock, Topology, TransactionCertificate, ValidatorId,
+    VotePower,
 };
 use libp2p::identity;
 use sbor::prelude::*;
@@ -567,7 +567,7 @@ impl ProductionRunnerBuilder {
         let codec_pool_handle = crate::network::CodecPoolHandle::new(thread_pools.clone());
 
         // Create network adapter with shared transaction validation batcher
-        let (network, sync_request_rx, tx_request_rx, cert_request_rx) = Libp2pAdapter::new(
+        let (network, inbound_request_rx) = Libp2pAdapter::new(
             network_config,
             ed25519_keypair,
             validator_id,
@@ -602,20 +602,30 @@ impl ProductionRunnerBuilder {
             network.update_committee(shard_id, committee);
         }
 
+        // Create request manager for intelligent retry and peer selection.
+        // This handles request-centric retry (same peer first, then rotate),
+        // weighted peer selection based on health, and adaptive concurrency.
+        let request_manager = Arc::new(crate::network::RequestManager::new(
+            network.clone(),
+            crate::network::RequestManagerConfig::default(),
+        ));
+
         // Create sync manager (uses consensus channel for sync events)
         // The topology is passed directly - SyncManager queries it for committee members
+        // SyncManager delegates retry logic to RequestManager.
         let sync_manager = SyncManager::new(
             SyncConfig::default(),
-            network.clone(),
+            request_manager.clone(),
             storage.clone(),
             consensus_tx.clone(),
             topology.clone(),
         );
 
-        // Create fetch manager for transactions and certificates
+        // Create fetch manager for transactions and certificates.
+        // FetchManager delegates retry logic to RequestManager.
         let mut fetch_manager = crate::fetch::FetchManager::new(
             crate::fetch::FetchConfig::default(),
-            network.clone(),
+            request_manager.clone(),
             storage.clone(),
             consensus_tx.clone(),
         );
@@ -652,18 +662,20 @@ impl ProductionRunnerBuilder {
         let recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>> =
             Arc::new(QuickCache::new(10_000));
 
-        // Spawn dedicated fetch handler task.
-        // This handles all inbound fetch requests (transactions/certificates) by
-        // reading directly from RocksDB storage. Hot data is served from RocksDB's
-        // block cache for performance. Also checks recently_built_certs cache first
-        // to handle the race between cert creation and storage write completion.
-        let fetch_handler = spawn_fetch_handler(
-            FetchHandlerConfig::default(),
-            storage.clone(),
+        // Spawn InboundRouter to handle all inbound requests.
+        // This replaces the old fetch_handler and handles:
+        // - Block sync requests (block data)
+        // - Transaction fetch requests (tx data by hash)
+        // - Certificate fetch requests (cert data by hash)
+        // Hot data is served from RocksDB's block cache for performance.
+        // Also checks recently_built_certs cache first to handle the race
+        // between cert creation and storage write completion.
+        let inbound_router = InboundRouter::spawn(
+            InboundRouterConfig::default(),
             network.clone(),
-            tx_request_rx,
-            cert_request_rx,
+            storage.clone(),
             recently_built_certs.clone(),
+            inbound_request_rx,
         );
 
         // Spawn action dispatcher task for fire-and-forget network I/O.
@@ -705,7 +717,6 @@ impl ProductionRunnerBuilder {
             tx_status_cache: self.tx_status_cache,
             mempool_snapshot: self.mempool_snapshot,
             genesis_config: self.genesis_config,
-            sync_request_rx,
             shutdown_rx,
             shutdown_tx: Some(shutdown_tx),
             pending_cross_shard_executions: PendingCrossShardExecutions::default(),
@@ -716,7 +727,7 @@ impl ProductionRunnerBuilder {
             state_vote_deadline: None,
             signing_key: runner_signing_key,
             message_batcher,
-            fetch_handler,
+            inbound_router,
             dispatch_tx,
             action_dispatcher,
             rpc_submitted_txs: std::collections::HashMap::new(),
@@ -810,8 +821,6 @@ pub struct ProductionRunner {
     mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
     /// Optional genesis configuration for initial state.
     genesis_config: Option<hyperscale_engine::GenesisConfig>,
-    /// Inbound sync request channel (from network adapter).
-    sync_request_rx: mpsc::UnboundedReceiver<InboundSyncRequest>,
     /// Shutdown signal receiver.
     shutdown_rx: oneshot::Receiver<()>,
     /// Shutdown handle sender (stored to return to caller).
@@ -839,10 +848,10 @@ pub struct ProductionRunner {
     /// Note: Now primarily used by action dispatcher, kept here for direct access if needed.
     #[allow(dead_code)]
     message_batcher: crate::message_batcher::MessageBatcherHandle,
-    /// Handle for the dedicated fetch handler task.
-    /// Processes inbound fetch requests from other validators.
+    /// Handle for the InboundRouter task.
+    /// Processes all inbound requests (block sync, tx fetch, cert fetch) from other validators.
     #[allow(dead_code)]
-    fetch_handler: FetchHandlerHandle,
+    inbound_router: InboundRouterHandle,
     /// Sender for dispatching fire-and-forget actions to the action dispatcher task.
     /// Network broadcasts, timer management, and non-critical writes go through this.
     /// Unbounded to prevent dropping critical consensus messages under load.
@@ -1139,16 +1148,16 @@ impl ProductionRunner {
                     );
 
                     // Update event channel depths (non-blocking)
-                    // Note: tx_request and cert_request channels are now owned by fetch handler task
+                    // Note: inbound requests are handled by InboundRouter task
                     crate::metrics::set_channel_depths(&crate::metrics::ChannelDepths {
                         callback: self.callback_rx.len(),
                         consensus: self.consensus_rx.len(),
                         validated_tx: self.validated_tx_rx.len(),
                         rpc_tx: self.rpc_tx_rx.len(),
                         status: self.status_rx.len(),
-                        sync_request: self.sync_request_rx.len(),
-                        tx_request: 0, // Handled by dedicated fetch handler task
-                        cert_request: 0, // Handled by dedicated fetch handler task
+                        sync_request: 0, // Handled by InboundRouter
+                        tx_request: 0,   // Handled by InboundRouter
+                        cert_request: 0, // Handled by InboundRouter
                     });
 
                     // Update sync status (non-blocking)
@@ -1159,7 +1168,7 @@ impl ProductionRunner {
 
                     // Update fetch status (non-blocking)
                     let fetch_status = self.fetch_manager.status();
-                    crate::metrics::set_fetch_in_flight(fetch_status.in_flight_requests);
+                    crate::metrics::set_fetch_in_flight(fetch_status.in_flight_operations);
 
                     // Update peer count using cached value (non-blocking)
                     let peer_count = self.network.cached_peer_count();
@@ -1691,18 +1700,6 @@ impl ProductionRunner {
                     // and get dispatched to the state machine
                     if !self.tx_validation_handle.submit(tx) {
                         tracing::debug!("RPC transaction deduplicated or batcher closed");
-                    }
-                }
-
-                // Handle inbound sync requests from peers
-                // Drain all pending requests to minimize response latency.
-                Some(request) = self.sync_request_rx.recv() => {
-                    // Handle the first request
-                    self.handle_inbound_sync_request(request);
-
-                    // Drain any additional pending requests
-                    while let Ok(request) = self.sync_request_rx.try_recv() {
-                        self.handle_inbound_sync_request(request);
                     }
                 }
 
@@ -3453,106 +3450,8 @@ impl ProductionRunner {
         Ok(())
     }
 
-    /// Handle an inbound sync request from a peer.
-    ///
-    /// Looks up the requested block from denormalized storage (reconstructing from
-    /// block metadata + transactions + certificates) and sends the response.
-    ///
-    /// The storage read is performed on a blocking thread pool to avoid blocking
-    /// the main event loop. RocksDB reads for large blocks can take several ms.
-    ///
-    /// Response format: `(Option<Block>, Option<QC>, Option<BlockMetadata>)`
-    /// - `(Some(block), Some(qc), None)` = complete block with all data
-    /// - `(None, None, Some(metadata))` = metadata only (txs/certs must be fetched)
-    /// - `(None, None, None)` = block not found at this height
-    fn handle_inbound_sync_request(&self, request: InboundSyncRequest) {
-        let storage = self.storage.clone();
-        let network = self.network.clone();
-
-        // Spawn on blocking thread pool to avoid blocking the main event loop.
-        // RocksDB reads are synchronous I/O that can take ms for large blocks.
-        tokio::task::spawn_blocking(move || {
-            use crate::storage::SyncBlockData;
-
-            let height = BlockHeight(request.height);
-            let channel_id = request.channel_id;
-
-            tracing::debug!(
-                peer = %request.peer,
-                height = request.height,
-                channel_id = channel_id,
-                "Handling inbound sync request"
-            );
-
-            // Look up block from storage - returns Complete, MetadataOnly, or None
-            let response = match storage.get_block_for_sync(height) {
-                Some(SyncBlockData::Complete(block, qc)) => {
-                    // Full block available - encode as (Some(block), Some(qc), None)
-                    match sbor::basic_encode(&(Some(&block), Some(&qc), None::<BlockMetadata>)) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            tracing::warn!(height = request.height, error = ?e, "Failed to encode block response");
-                            sbor::basic_encode(&(
-                                None::<Block>,
-                                None::<QuorumCertificate>,
-                                None::<BlockMetadata>,
-                            ))
-                            .unwrap_or_default()
-                        }
-                    }
-                }
-                Some(SyncBlockData::MetadataOnly(metadata)) => {
-                    // Metadata only - encode as (None, None, Some(metadata))
-                    tracing::debug!(
-                        height = request.height,
-                        tx_count = metadata.tx_hashes.len(),
-                        cert_count = metadata.cert_hashes.len(),
-                        "Returning metadata-only sync response"
-                    );
-                    match sbor::basic_encode(&(
-                        None::<Block>,
-                        None::<QuorumCertificate>,
-                        Some(&metadata),
-                    )) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            tracing::warn!(height = request.height, error = ?e, "Failed to encode metadata response");
-                            sbor::basic_encode(&(
-                                None::<Block>,
-                                None::<QuorumCertificate>,
-                                None::<BlockMetadata>,
-                            ))
-                            .unwrap_or_default()
-                        }
-                    }
-                }
-                None => {
-                    tracing::trace!(height = request.height, "Block not found for sync request");
-                    // Not found - encode as (None, None, None)
-                    sbor::basic_encode(&(
-                        None::<Block>,
-                        None::<QuorumCertificate>,
-                        None::<BlockMetadata>,
-                    ))
-                    .unwrap_or_default()
-                }
-            };
-
-            // Send response via network adapter
-            if let Err(e) = network.send_block_response(channel_id, response) {
-                tracing::warn!(
-                    height = request.height,
-                    channel_id = channel_id,
-                    error = ?e,
-                    "Failed to send block response"
-                );
-            }
-        });
-    }
-
-    // NOTE: handle_inbound_transaction_request and handle_inbound_certificate_request
-    // are now handled by the dedicated fetch handler task in fetch_handler.rs,
-    // which reads directly from RocksDB storage for reliable access to historical data.
+    // NOTE: All inbound request handling (sync, transactions, certificates) is now
+    // handled by the InboundRouter task in network/inbound_router.rs.
 
     /// Dispatch an event to the state machine.
     ///

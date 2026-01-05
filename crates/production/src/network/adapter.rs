@@ -10,8 +10,8 @@ use super::codec::CodecError;
 use super::codec_pool::CodecPoolHandle;
 use super::config::Libp2pConfig;
 use super::direct::DirectValidatorNetwork;
+use super::inbound_router::InboundRequest;
 use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
-use super::rtt_tracker::{RttConfig, SharedRttTracker};
 use super::topic::Topic;
 use crate::metrics;
 use crate::network::config::VersionInteroperabilityMode;
@@ -84,68 +84,16 @@ pub fn compute_peer_id_for_validator(public_key: &Bls12381G1PublicKey) -> Libp2p
     derive_libp2p_keypair(public_key).public().to_peer_id()
 }
 
-/// An inbound sync request from a peer.
-///
-/// The runner receives these, looks up the block from storage,
-/// and sends the response via `Libp2pAdapter::send_block_response()`.
-#[derive(Debug)]
-pub struct InboundSyncRequest {
-    /// The requesting peer.
-    pub peer: Libp2pPeerId,
-    /// The requested block height.
-    pub height: u64,
-    /// Opaque response channel ID (used to send the response).
-    pub channel_id: u64,
-}
-
-/// An inbound transaction fetch request from a peer.
-///
-/// The runner receives these, looks up transactions from mempool,
-/// and sends the response via `Libp2pAdapter::send_transaction_response()`.
-#[derive(Debug)]
-pub struct InboundTransactionRequest {
-    /// The requesting peer.
-    pub peer: Libp2pPeerId,
-    /// The block hash the transactions are for.
-    pub block_hash: hyperscale_types::Hash,
-    /// The transaction hashes being requested.
-    pub tx_hashes: Vec<hyperscale_types::Hash>,
-    /// Opaque response channel ID (used to send the response).
-    pub channel_id: u64,
-}
-
-/// An inbound certificate fetch request from another peer.
-///
-/// The runner receives this, looks up the requested certificates from execution state,
-/// and sends the response via `Libp2pAdapter::send_certificate_response()`.
-#[derive(Debug)]
-pub struct InboundCertificateRequest {
-    /// The requesting peer.
-    pub peer: Libp2pPeerId,
-    /// The block hash the certificates are for.
-    pub block_hash: hyperscale_types::Hash,
-    /// The certificate hashes being requested (transaction hashes).
-    pub cert_hashes: Vec<hyperscale_types::Hash>,
-    /// Opaque response channel ID (used to send the response).
-    pub channel_id: u64,
-}
-
 /// High-priority response commands sent to the swarm task.
 ///
 /// These commands are processed before normal commands because they unblock
 /// other validators waiting for data. Using a separate channel ensures
 /// response commands don't get queued behind broadcasts/requests.
 #[derive(Debug)]
-#[allow(clippy::enum_variant_names)]
 pub enum ResponseCommand {
-    /// Send a response to a block request (by channel ID).
-    SendBlockResponse { channel_id: u64, response: Vec<u8> },
-
-    /// Send a response to a transaction request (by channel ID).
-    SendTransactionResponse { channel_id: u64, response: Vec<u8> },
-
-    /// Send a response to a certificate request (by channel ID).
-    SendCertificateResponse { channel_id: u64, response: Vec<u8> },
+    /// Send a response (by channel ID).
+    /// Used by InboundRouter to send responses for all request types.
+    SendResponse { channel_id: u64, response: Vec<u8> },
 }
 
 /// Commands sent to the swarm task.
@@ -181,26 +129,14 @@ pub enum SwarmCommand {
         response_tx: tokio::sync::oneshot::Sender<Vec<Libp2pPeerId>>,
     },
 
-    /// Request a block from a peer (for sync).
-    RequestBlock {
+    /// Send a request to a peer and wait for response (generic).
+    ///
+    /// The caller is responsible for encoding the request data.
+    /// Priority determines queue ordering.
+    Request {
         peer: Libp2pPeerId,
-        height: u64,
-        response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
-    },
-
-    /// Request transactions from a peer (for pending block completion).
-    RequestTransactions {
-        peer: Libp2pPeerId,
-        block_hash: hyperscale_types::Hash,
-        tx_hashes: Vec<hyperscale_types::Hash>,
-        response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
-    },
-
-    /// Request certificates from a peer (for pending block completion).
-    RequestCertificates {
-        peer: Libp2pPeerId,
-        block_hash: hyperscale_types::Hash,
-        cert_hashes: Vec<hyperscale_types::Hash>,
+        data: Bytes,
+        priority: MessagePriority,
         response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
     },
 
@@ -221,26 +157,22 @@ struct PendingResponseChannel {
     created_at: std::time::Instant,
 }
 
-/// A pending outbound request with its creation time for timeout cleanup.
+/// A pending outbound request awaiting response.
 struct PendingRequest {
     /// The response channel for the request.
     response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
-    /// Creation time of the request.
-    created_at: std::time::Instant,
-    /// The peer this request was sent to (for RTT tracking).
-    peer: Libp2pPeerId,
 }
 
 /// Interval for periodic maintenance tasks in the event loop.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Timeout for pending response channels (after which they are cleaned up).
-/// This should be slightly longer than the request_timeout to allow for processing.
-const RESPONSE_CHANNEL_TIMEOUT: Duration = Duration::from_secs(15);
+/// This should be slightly longer than the request_timeout (5s) to allow for processing.
+const RESPONSE_CHANNEL_TIMEOUT: Duration = Duration::from_secs(7);
 
-/// Timeout for pending outbound requests (after which they are cleaned up).
-/// If a peer doesn't respond within this time, the request is considered failed.
-const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for pending direct messages (fire-and-forget, no response expected).
+/// These are cleaned up periodically since we don't strictly need acknowledgement.
+const DIRECT_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum number of pending outbound requests before applying backpressure.
 /// When exceeded, new requests are rejected with `NetworkError::Backpressure`.
@@ -340,11 +272,8 @@ impl PriorityCommandChannels {
             | SwarmCommand::GetConnectedPeers { .. }
             | SwarmCommand::SendDirectMessage { .. }
             | SwarmCommand::DirectBroadcast { .. } => MessagePriority::Critical,
-            // Requests use their inherent priority
-            SwarmCommand::RequestBlock { .. } => MessagePriority::Background,
-            SwarmCommand::RequestTransactions { .. } | SwarmCommand::RequestCertificates { .. } => {
-                MessagePriority::Critical
-            }
+            // Requests use their inherent priority from the caller
+            SwarmCommand::Request { priority, .. } => *priority,
         };
 
         match priority {
@@ -525,20 +454,11 @@ pub struct Libp2pAdapter {
     /// Shutdown signal sender.
     shutdown_tx: Option<mpsc::Sender<()>>,
 
-    /// Channel for inbound sync requests (sent to runner for processing).
+    /// Channel for inbound requests (sent to InboundRouter for processing).
     /// Unbounded to avoid blocking the network event loop.
+    /// The InboundRouter discriminates request types and handles them appropriately.
     #[allow(dead_code)]
-    sync_request_tx: mpsc::UnboundedSender<InboundSyncRequest>,
-
-    /// Channel for inbound transaction fetch requests (sent to runner for processing).
-    /// Unbounded to avoid blocking the network event loop.
-    #[allow(dead_code)]
-    tx_request_tx: mpsc::UnboundedSender<InboundTransactionRequest>,
-
-    /// Channel for inbound certificate fetch requests (sent to runner for processing).
-    /// Unbounded to avoid blocking the network event loop.
-    #[allow(dead_code)]
-    cert_request_tx: mpsc::UnboundedSender<InboundCertificateRequest>,
+    inbound_request_tx: mpsc::UnboundedSender<InboundRequest>,
 
     /// Cached connected peer count (updated by background task).
     /// This avoids blocking the consensus loop to query peer count.
@@ -549,10 +469,6 @@ pub struct Libp2pAdapter {
 
     /// Codec pool handle for async encoding (encoding happens on caller thread for broadcast).
     codec_pool: CodecPoolHandle,
-
-    /// Shared RTT tracker for adaptive per-peer timeouts.
-    /// Updated by the event loop, read by request methods.
-    rtt_tracker: SharedRttTracker,
 }
 
 impl Libp2pAdapter {
@@ -570,10 +486,8 @@ impl Libp2pAdapter {
     ///
     /// # Returns
     ///
-    /// A tuple of (adapter, sync_request_rx, tx_request_rx, cert_request_rx) where:
-    /// - sync_request_rx receives inbound sync block requests
-    /// - tx_request_rx receives inbound transaction fetch requests
-    /// - cert_request_rx receives inbound certificate fetch requests
+    /// A tuple of (adapter, inbound_request_rx) where:
+    /// - inbound_request_rx receives all inbound requests for the InboundRouter
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: Libp2pConfig,
@@ -583,15 +497,7 @@ impl Libp2pAdapter {
         consensus_tx: mpsc::Sender<Event>,
         tx_validation_handle: ValidationBatcherHandle,
         codec_pool: CodecPoolHandle,
-    ) -> Result<
-        (
-            Arc<Self>,
-            mpsc::UnboundedReceiver<InboundSyncRequest>,
-            mpsc::UnboundedReceiver<InboundTransactionRequest>,
-            mpsc::UnboundedReceiver<InboundCertificateRequest>,
-        ),
-        NetworkError,
-    > {
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<InboundRequest>), NetworkError> {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
 
         info!(
@@ -815,15 +721,14 @@ impl Libp2pAdapter {
         // High-priority channel for response commands - processed before normal commands
         // to minimize latency for validators waiting for sync data.
         let (response_tx, response_rx) = mpsc::unbounded_channel();
-        // Inbound request channels are unbounded to avoid blocking the network event loop.
+        // Unified inbound request channel - unbounded to avoid blocking the network event loop.
+        // The InboundRouter discriminates request types and handles them appropriately.
         // Protection against unbounded growth:
         // 1. Rate limiter limits requests per peer (validators get higher limit)
         // 2. Response channel timeout cleanup prevents leaked channels
         // 3. Peer reputation tracking penalizes misbehaving peers
         // If memory growth is observed, consider bounded channels with try_send + drop.
-        let (sync_request_tx, sync_request_rx) = mpsc::unbounded_channel();
-        let (tx_request_tx, tx_request_rx) = mpsc::unbounded_channel();
-        let (cert_request_tx, cert_request_rx) = mpsc::unbounded_channel();
+        let (inbound_request_tx, inbound_request_rx) = mpsc::unbounded_channel();
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
         let direct_network = Arc::new(DirectValidatorNetwork::new(
@@ -832,9 +737,6 @@ impl Libp2pAdapter {
             validator_peers.clone(),
             config.clone(),
         ));
-
-        // Create shared RTT tracker for adaptive timeouts
-        let rtt_tracker = SharedRttTracker::new(RttConfig::default());
 
         let adapter = Arc::new(Self {
             local_peer_id,
@@ -846,13 +748,10 @@ impl Libp2pAdapter {
             validator_peers: validator_peers.clone(),
             peer_validators: peer_validators.clone(),
             shutdown_tx: Some(shutdown_tx),
-            sync_request_tx: sync_request_tx.clone(),
-            tx_request_tx: tx_request_tx.clone(),
-            cert_request_tx: cert_request_tx.clone(),
+            inbound_request_tx: inbound_request_tx.clone(),
             cached_peer_count: cached_peer_count.clone(),
             direct_network: direct_network.clone(),
             codec_pool: codec_pool.clone(),
-            rtt_tracker: rtt_tracker.clone(),
         });
 
         // Spawn event loop (takes ownership of swarm)
@@ -873,16 +772,13 @@ impl Libp2pAdapter {
                 consensus_tx,
                 peer_validators,
                 shutdown_rx,
-                sync_request_tx,
-                tx_request_tx,
-                cert_request_tx,
+                inbound_request_tx,
                 rate_limit_config,
                 cached_peer_count,
                 shard,
                 tx_validation_handle,
                 config.version_interop_mode,
                 codec_pool,
-                rtt_tracker,
             ))
             .catch_unwind()
             .await;
@@ -913,7 +809,7 @@ impl Libp2pAdapter {
             }
         });
 
-        Ok((adapter, sync_request_rx, tx_request_rx, cert_request_rx))
+        Ok((adapter, inbound_request_rx))
     }
 
     /// Register a validator's peer ID mapping.
@@ -1071,42 +967,35 @@ impl Libp2pAdapter {
         rx.await.unwrap_or_default()
     }
 
-    /// Request a block from a peer for sync.
+    /// Send a request to a peer and wait for response.
     ///
-    /// Returns the raw response bytes. The caller is responsible for decoding.
-    /// Uses adaptive per-peer timeouts based on observed RTT.
-    /// Retries are handled by higher layers (sync/fetch managers) to avoid orphaned requests.
-    pub async fn request_block(
+    /// This is the generic request method. The caller is responsible for:
+    /// - Encoding the request data
+    /// - Specifying the priority
+    /// - Decoding the response
+    ///
+    /// Timeout is handled by libp2p's request_timeout (configured in Libp2pConfig).
+    /// Higher-level retry logic should be handled by RequestManager.
+    pub async fn request(
         &self,
         peer: Libp2pPeerId,
-        height: hyperscale_types::BlockHeight,
+        data: Bytes,
+        priority: MessagePriority,
     ) -> Result<Vec<u8>, NetworkError> {
-        // Use adaptive timeout based on observed RTT for this peer
-        let adaptive_timeout = self.rtt_tracker.get_timeout(&peer);
-
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         self.priority_channels
-            .send(SwarmCommand::RequestBlock {
+            .send(SwarmCommand::Request {
                 peer,
-                height: height.0,
+                data,
+                priority,
                 response_tx: tx,
             })
             .map_err(|_| NetworkError::NetworkShutdown)?;
 
-        // Wait for response with adaptive timeout
-        match tokio::time::timeout(adaptive_timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(NetworkError::NetworkShutdown),
-            Err(_) => {
-                trace!(
-                    ?peer,
-                    height = height.0,
-                    timeout_ms = adaptive_timeout.as_millis(),
-                    "Block request timeout"
-                );
-                Err(NetworkError::Timeout)
-            }
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(NetworkError::NetworkShutdown),
         }
     }
 
@@ -1115,144 +1004,14 @@ impl Libp2pAdapter {
         self.validator_peers.get(&validator_id).map(|r| *r)
     }
 
-    /// Get the shared RTT tracker for adaptive timeout calculations.
+    /// Send a generic response for an inbound request.
     ///
-    /// This allows higher-level components (sync/fetch managers) to query
-    /// per-peer RTT data for their retry decisions. The tracker is updated
-    /// by the network event loop when responses arrive.
-    pub fn rtt_tracker(&self) -> &SharedRttTracker {
-        &self.rtt_tracker
-    }
-
-    /// Send a block response for an inbound sync request.
-    ///
-    /// The `channel_id` comes from the `InboundSyncRequest` received via the sync request channel.
+    /// This is the unified response method used by `InboundRouter`.
+    /// The `channel_id` comes from the `InboundRequest` received via the request channel.
     /// Uses the high-priority response channel to minimize latency.
-    pub fn send_block_response(
-        &self,
-        channel_id: u64,
-        response: Vec<u8>,
-    ) -> Result<(), NetworkError> {
+    pub fn respond(&self, channel_id: u64, response: Vec<u8>) -> Result<(), NetworkError> {
         self.response_tx
-            .send(ResponseCommand::SendBlockResponse {
-                channel_id,
-                response,
-            })
-            .map_err(|_| NetworkError::NetworkShutdown)
-    }
-
-    /// Request transactions from a peer for pending block completion.
-    ///
-    /// Returns the raw response bytes. The caller is responsible for decoding.
-    /// Uses Critical priority since pending block completion is liveness-critical.
-    /// Uses adaptive per-peer timeouts based on observed RTT.
-    /// Retries are handled by higher layers (fetch manager) to avoid orphaned requests.
-    pub async fn request_transactions(
-        &self,
-        peer: Libp2pPeerId,
-        block_hash: hyperscale_types::Hash,
-        tx_hashes: Vec<hyperscale_types::Hash>,
-    ) -> Result<Vec<u8>, NetworkError> {
-        // Use adaptive timeout based on observed RTT for this peer
-        let adaptive_timeout = self.rtt_tracker.get_timeout(&peer);
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        self.priority_channels
-            .send(SwarmCommand::RequestTransactions {
-                peer,
-                block_hash,
-                tx_hashes,
-                response_tx: tx,
-            })
-            .map_err(|_| NetworkError::NetworkShutdown)?;
-
-        // Wait for response with adaptive timeout
-        match tokio::time::timeout(adaptive_timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(NetworkError::NetworkShutdown),
-            Err(_) => {
-                trace!(
-                    ?peer,
-                    ?block_hash,
-                    timeout_ms = adaptive_timeout.as_millis(),
-                    "Transaction request timeout"
-                );
-                Err(NetworkError::Timeout)
-            }
-        }
-    }
-
-    /// Send a transaction response for an inbound request.
-    ///
-    /// The `channel_id` comes from the inbound request.
-    /// Uses the high-priority response channel to minimize latency.
-    pub fn send_transaction_response(
-        &self,
-        channel_id: u64,
-        response: Vec<u8>,
-    ) -> Result<(), NetworkError> {
-        self.response_tx
-            .send(ResponseCommand::SendTransactionResponse {
-                channel_id,
-                response,
-            })
-            .map_err(|_| NetworkError::NetworkShutdown)
-    }
-
-    /// Request certificates from a peer for pending block completion.
-    ///
-    /// Returns the raw response bytes. The caller is responsible for decoding.
-    /// Uses Critical priority since pending block completion is liveness-critical.
-    /// Uses adaptive per-peer timeouts based on observed RTT.
-    /// Retries are handled by higher layers (fetch manager) to avoid orphaned requests.
-    pub async fn request_certificates(
-        &self,
-        peer: Libp2pPeerId,
-        block_hash: hyperscale_types::Hash,
-        cert_hashes: Vec<hyperscale_types::Hash>,
-    ) -> Result<Vec<u8>, NetworkError> {
-        // Use adaptive timeout based on observed RTT for this peer
-        let adaptive_timeout = self.rtt_tracker.get_timeout(&peer);
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        self.priority_channels
-            .send(SwarmCommand::RequestCertificates {
-                peer,
-                block_hash,
-                cert_hashes,
-                response_tx: tx,
-            })
-            .map_err(|_| NetworkError::NetworkShutdown)?;
-
-        // Wait for response with adaptive timeout
-        match tokio::time::timeout(adaptive_timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(NetworkError::NetworkShutdown),
-            Err(_) => {
-                trace!(
-                    ?peer,
-                    ?block_hash,
-                    timeout_ms = adaptive_timeout.as_millis(),
-                    "Certificate request timeout"
-                );
-                Err(NetworkError::Timeout)
-            }
-        }
-    }
-
-    /// Send a certificate response for an inbound request.
-    ///
-    /// The `channel_id` comes from the inbound request.
-    /// Uses the high-priority response channel to minimize latency.
-    pub fn send_certificate_response(
-        &self,
-        channel_id: u64,
-        response: Vec<u8>,
-    ) -> Result<(), NetworkError> {
-        self.response_tx
-            .send(ResponseCommand::SendCertificateResponse {
+            .send(ResponseCommand::SendResponse {
                 channel_id,
                 response,
             })
@@ -1280,16 +1039,13 @@ impl Libp2pAdapter {
         consensus_tx: mpsc::Sender<Event>,
         peer_validators: Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         mut shutdown_rx: mpsc::Receiver<()>,
-        sync_request_tx: mpsc::UnboundedSender<InboundSyncRequest>,
-        tx_request_tx: mpsc::UnboundedSender<InboundTransactionRequest>,
-        cert_request_tx: mpsc::UnboundedSender<InboundCertificateRequest>,
+        inbound_request_tx: mpsc::UnboundedSender<InboundRequest>,
         rate_limit_config: RateLimitConfig,
         cached_peer_count: Arc<AtomicUsize>,
         local_shard: ShardGroupId,
         tx_validation_handle: ValidationBatcherHandle,
         version_interop_mode: VersionInteroperabilityMode,
         codec_pool: CodecPoolHandle,
-        rtt_tracker: SharedRttTracker,
     ) {
         // Track pending sync requests (outbound) with creation time for TTL cleanup
         let mut pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest> =
@@ -1356,55 +1112,25 @@ impl Libp2pAdapter {
                         info!(cleaned, remaining = pending_response_channels.len(), "Cleaned up timed-out response channels");
                     }
 
-                    // 2. Clean up timed-out pending outbound requests
-                    // Collect expired request IDs first, then remove and notify
-                    let expired_requests: Vec<_> = pending_requests
-                        .iter()
-                        .filter(|(_, pending)| now.duration_since(pending.created_at) > PENDING_REQUEST_TIMEOUT)
-                        .map(|(req_id, pending)| (*req_id, now.duration_since(pending.created_at).as_secs()))
-                        .collect();
-
-                    for (req_id, age_secs) in &expired_requests {
-                        warn!(
-                            ?req_id,
-                            age_secs,
-                            "Cleaning up timed-out outbound request"
-                        );
-                        if let Some(pending) = pending_requests.remove(req_id) {
-                            // Send timeout error to the waiting caller
-                            let _ = pending.response_tx.send(Err(NetworkError::Timeout));
-                        }
-                    }
-
-                    if !expired_requests.is_empty() {
-                        info!(
-                            cleaned_requests = expired_requests.len(),
-                            remaining = pending_requests.len(),
-                            "Cleaned up timed-out outbound requests"
-                        );
-                    }
-
-                    // 3. Clean up timed-out direct messages using retain (single pass)
+                    // 2. Clean up timed-out direct messages (fire-and-forget, no response expected)
+                    // These don't need the same urgency as request-response since we don't wait for them.
                     let before_direct = pending_direct_messages.len();
-                    pending_direct_messages.retain(|req_id, &mut created_at| {
-                        let expired = now.duration_since(created_at) > PENDING_REQUEST_TIMEOUT;
-                        if expired {
-                            warn!(?req_id, "Timed out waiting for direct message acknowledgement");
-                        }
-                        !expired
+                    pending_direct_messages.retain(|_req_id, &mut created_at| {
+                        now.duration_since(created_at) <= DIRECT_MESSAGE_TIMEOUT
                     });
                     let cleaned_direct = before_direct - pending_direct_messages.len();
                     if cleaned_direct > 0 {
-                        debug!(cleaned_direct, "Cleaned up timed-out direct messages");
+                        trace!(cleaned_direct, "Cleaned up old direct message tracking entries");
                     }
+
+                    // Note: pending_requests cleanup is handled by libp2p's OutboundFailure events.
+                    // The request_timeout (5s) triggers OutboundFailure::Timeout which we handle
+                    // in the event loop, sending NetworkError::Timeout to the caller.
 
                     // 4. Record metrics for pending response channels
                     metrics::record_pending_response_channels(pending_response_channels.len());
 
-                    // 5. Clean up stale RTT data
-                    rtt_tracker.cleanup_stale();
-
-                    // 6. Process pending reconnections
+                    // 5. Process pending reconnections
                     let reconnects_due: Vec<_> = pending_reconnects
                         .iter()
                         .filter(|(_, scheduled)| now >= **scheduled)
@@ -1718,11 +1444,8 @@ impl Libp2pAdapter {
                         &mut pending_direct_messages,
                         &mut pending_response_channels,
                         &mut next_channel_id,
-                        &sync_request_tx,
-                        &tx_request_tx,
-                        &cert_request_tx,
+                        &inbound_request_tx,
                         &mut rate_limiter,
-                        &rtt_tracker,
                         local_shard,
                         &tx_validation_handle,
                         &codec_pool,
@@ -1812,106 +1535,26 @@ impl Libp2pAdapter {
                 let peers: Vec<Libp2pPeerId> = swarm.connected_peers().cloned().collect();
                 let _ = response_tx.send(peers);
             }
-            SwarmCommand::RequestBlock {
+            SwarmCommand::Request {
                 peer,
-                height,
+                data,
+                priority: _,
                 response_tx,
             } => {
                 // Apply backpressure if too many pending requests
                 if pending_requests.len() >= MAX_PENDING_REQUESTS {
                     debug!(
                         pending = pending_requests.len(),
-                        "Backpressure: rejecting block request"
+                        "Backpressure: rejecting request"
                     );
                     let _ = response_tx.send(Err(NetworkError::Backpressure));
                 } else {
-                    // Encode block request as simple height bytes
-                    let data = Bytes::copy_from_slice(&height.to_le_bytes());
                     let req_id = swarm
                         .behaviour_mut()
                         .request_response
                         .send_request(&peer, data);
-                    pending_requests.insert(
-                        req_id,
-                        PendingRequest {
-                            response_tx,
-                            created_at: std::time::Instant::now(),
-                            peer,
-                        },
-                    );
-                    debug!("Sent block request to {:?} for height {}", peer, height);
-                }
-            }
-            SwarmCommand::RequestTransactions {
-                peer,
-                block_hash,
-                tx_hashes,
-                response_tx,
-            } => {
-                // Apply backpressure if too many pending requests
-                if pending_requests.len() >= MAX_PENDING_REQUESTS {
-                    debug!(
-                        pending = pending_requests.len(),
-                        "Backpressure: rejecting transaction request"
-                    );
-                    let _ = response_tx.send(Err(NetworkError::Backpressure));
-                } else {
-                    // Encode transaction request using SBOR
-                    use hyperscale_messages::request::GetTransactionsRequest;
-                    let request = GetTransactionsRequest::new(block_hash, tx_hashes);
-                    let data = Bytes::from(sbor::basic_encode(&request).unwrap_or_default());
-                    let req_id = swarm
-                        .behaviour_mut()
-                        .request_response
-                        .send_request(&peer, data);
-                    pending_requests.insert(
-                        req_id,
-                        PendingRequest {
-                            response_tx,
-                            created_at: std::time::Instant::now(),
-                            peer,
-                        },
-                    );
-                    debug!(
-                        "Sent transaction request to {:?} for block {:?}",
-                        peer, block_hash
-                    );
-                }
-            }
-            SwarmCommand::RequestCertificates {
-                peer,
-                block_hash,
-                cert_hashes,
-                response_tx,
-            } => {
-                // Apply backpressure if too many pending requests
-                if pending_requests.len() >= MAX_PENDING_REQUESTS {
-                    debug!(
-                        pending = pending_requests.len(),
-                        "Backpressure: rejecting certificate request"
-                    );
-                    let _ = response_tx.send(Err(NetworkError::Backpressure));
-                } else {
-                    // Encode certificate request using SBOR
-                    use hyperscale_messages::request::GetCertificatesRequest;
-                    let request = GetCertificatesRequest::new(block_hash, cert_hashes);
-                    let data = Bytes::from(sbor::basic_encode(&request).unwrap_or_default());
-                    let req_id = swarm
-                        .behaviour_mut()
-                        .request_response
-                        .send_request(&peer, data);
-                    pending_requests.insert(
-                        req_id,
-                        PendingRequest {
-                            response_tx,
-                            created_at: std::time::Instant::now(),
-                            peer,
-                        },
-                    );
-                    debug!(
-                        "Sent certificate request to {:?} for block {:?}",
-                        peer, block_hash
-                    );
+                    pending_requests.insert(req_id, PendingRequest { response_tx });
+                    trace!(?peer, "Sent request");
                 }
             }
             SwarmCommand::SendDirectMessage { peer, data } => {
@@ -1952,55 +1595,21 @@ impl Libp2pAdapter {
         cmd: ResponseCommand,
         pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
     ) {
-        match cmd {
-            ResponseCommand::SendBlockResponse {
-                channel_id,
-                response,
-            } => {
-                if let Some(pending) = pending_response_channels.remove(&channel_id) {
-                    if let Err(e) = swarm
-                        .behaviour_mut()
-                        .request_response
-                        .send_response(pending.channel, response)
-                    {
-                        warn!("Failed to send block response: {:?}", e);
-                    }
-                } else {
-                    warn!(channel_id, "Unknown channel ID for block response");
-                }
+        let ResponseCommand::SendResponse {
+            channel_id,
+            response,
+        } = cmd;
+
+        if let Some(pending) = pending_response_channels.remove(&channel_id) {
+            if let Err(e) = swarm
+                .behaviour_mut()
+                .request_response
+                .send_response(pending.channel, response)
+            {
+                warn!("Failed to send response: {:?}", e);
             }
-            ResponseCommand::SendTransactionResponse {
-                channel_id,
-                response,
-            } => {
-                if let Some(pending) = pending_response_channels.remove(&channel_id) {
-                    if let Err(e) = swarm
-                        .behaviour_mut()
-                        .request_response
-                        .send_response(pending.channel, response)
-                    {
-                        warn!("Failed to send transaction response: {:?}", e);
-                    }
-                } else {
-                    warn!(channel_id, "Unknown channel ID for transaction response");
-                }
-            }
-            ResponseCommand::SendCertificateResponse {
-                channel_id,
-                response,
-            } => {
-                if let Some(pending) = pending_response_channels.remove(&channel_id) {
-                    if let Err(e) = swarm
-                        .behaviour_mut()
-                        .request_response
-                        .send_response(pending.channel, response)
-                    {
-                        warn!("Failed to send certificate response: {:?}", e);
-                    }
-                } else {
-                    warn!(channel_id, "Unknown channel ID for certificate response");
-                }
-            }
+        } else {
+            warn!(channel_id, "Unknown channel ID for response");
         }
     }
 
@@ -2119,11 +1728,8 @@ impl Libp2pAdapter {
         >,
         pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
         next_channel_id: &mut u64,
-        sync_request_tx: &mpsc::UnboundedSender<InboundSyncRequest>,
-        tx_request_tx: &mpsc::UnboundedSender<InboundTransactionRequest>,
-        cert_request_tx: &mpsc::UnboundedSender<InboundCertificateRequest>,
+        inbound_request_tx: &mpsc::UnboundedSender<InboundRequest>,
         rate_limiter: &mut SyncRateLimiter,
-        rtt_tracker: &SharedRttTracker,
         local_shard: ShardGroupId,
         tx_validation_handle: &ValidationBatcherHandle,
         codec_pool: &CodecPoolHandle,
@@ -2233,15 +1839,6 @@ impl Libp2pAdapter {
             )) => {
                 // Route response to waiting requester
                 if let Some(pending) = pending_requests.remove(&request_id) {
-                    // Record RTT for this peer (time from request to response)
-                    let rtt = pending.created_at.elapsed();
-                    rtt_tracker.record_rtt(pending.peer, rtt);
-                    trace!(
-                        peer = %pending.peer,
-                        rtt_ms = rtt.as_millis(),
-                        "Recorded RTT sample"
-                    );
-
                     let _ = pending.response_tx.send(Ok(response));
                 } else if pending_direct_messages.remove(&request_id).is_some() {
                     // Direct message acknowledged (empty response received)
@@ -2267,12 +1864,13 @@ impl Libp2pAdapter {
                     "Request-response outbound failure"
                 );
                 if let Some(pending) = pending_requests.remove(&request_id) {
-                    let _ = pending
-                        .response_tx
-                        .send(Err(NetworkError::NetworkError(format!(
-                            "Request failed: {:?}",
-                            error
-                        ))));
+                    // Map libp2p error to appropriate NetworkError
+                    // Timeout is special - RequestManager uses it for retry-same-peer logic
+                    let network_error = match error {
+                        request_response::OutboundFailure::Timeout => NetworkError::Timeout,
+                        other => NetworkError::NetworkError(format!("Request failed: {:?}", other)),
+                    };
+                    let _ = pending.response_tx.send(Err(network_error));
                 } else if pending_direct_messages.remove(&request_id).is_some() {
                     warn!(
                         peer = %peer,
@@ -2311,49 +1909,8 @@ impl Libp2pAdapter {
                     return SwarmAction::None;
                 }
 
-                // Determine request type:
-                // - Block sync request: exactly 8 bytes (height as little-endian u64)
-                // - Transaction request: > 8 bytes, SBOR encoded GetTransactionsRequest
-                if request.len() == 8 {
-                    // Block sync request
-                    let height = u64::from_le_bytes(request[..8].try_into().unwrap());
-
-                    // Allocate a channel ID and store the response channel with timestamp
-                    let channel_id = *next_channel_id;
-                    *next_channel_id = next_channel_id.wrapping_add(1);
-                    pending_response_channels.insert(
-                        channel_id,
-                        PendingResponseChannel {
-                            channel,
-                            created_at: std::time::Instant::now(),
-                        },
-                    );
-
-                    debug!(
-                        peer = %peer,
-                        height = height,
-                        channel_id = channel_id,
-                        is_validator = is_validator,
-                        "Received sync block request"
-                    );
-
-                    // Send to runner for processing
-                    let sync_request = InboundSyncRequest {
-                        peer,
-                        height,
-                        channel_id,
-                    };
-
-                    if sync_request_tx.send(sync_request).is_err() {
-                        warn!(
-                            height,
-                            "Failed to send sync request to runner (channel closed)"
-                        );
-                        // Remove the channel since we can't process this request
-                        pending_response_channels.remove(&channel_id);
-                    }
-                    SwarmAction::None
-                } else if let Ok(decoded) = super::codec::decode_direct_message(&request) {
+                // Try to decode as a direct consensus message first
+                if let Ok(decoded) = super::codec::decode_direct_message(&request) {
                     // Direct consensus message (Block/Vote)
                     // We cannot send a response here because we don't have access to the swarm behavior.
                     // Instead, we drop the channel which will close the stream (implicit done).
@@ -2407,111 +1964,41 @@ impl Libp2pAdapter {
                         channel,
                         data: vec![],
                     }
-                } else if request.len() > 8 {
-                    // Decode as transaction or certificate fetch request based on fetch_type tag.
-                    // The fetch_type is the first field (u8) after the SBOR tuple header.
-                    // Basic SBOR encoding: [0x5b (prefix), 0x21 (Tuple), 0x03 (field count), 0x07 (u8 type), value, ...]
-                    // So the fetch_type value is at byte index 4.
-                    use hyperscale_messages::request::{
-                        GetCertificatesRequest, GetTransactionsRequest, FETCH_TYPE_CERTIFICATE,
-                        FETCH_TYPE_TRANSACTION,
+                } else {
+                    // Not a direct consensus message - send to InboundRouter for handling.
+                    // The router will discriminate between block sync, transaction fetch,
+                    // and certificate fetch requests based on the payload structure.
+                    let channel_id = *next_channel_id;
+                    *next_channel_id = next_channel_id.wrapping_add(1);
+                    pending_response_channels.insert(
+                        channel_id,
+                        PendingResponseChannel {
+                            channel,
+                            created_at: std::time::Instant::now(),
+                        },
+                    );
+
+                    trace!(
+                        peer = %peer,
+                        len = request.len(),
+                        channel_id = channel_id,
+                        is_validator = is_validator,
+                        "Received inbound request, forwarding to router"
+                    );
+
+                    let inbound_request = InboundRequest {
+                        peer,
+                        payload: request,
+                        channel_id,
                     };
 
-                    // Extract fetch_type from SBOR encoding (byte 4 after prefix and tuple header)
-                    let fetch_type = request.get(4).copied();
-
-                    match fetch_type {
-                        Some(FETCH_TYPE_TRANSACTION) => {
-                            if let Ok(tx_request) =
-                                sbor::basic_decode::<GetTransactionsRequest>(&request)
-                            {
-                                // Transaction fetch request
-                                let channel_id = *next_channel_id;
-                                *next_channel_id = next_channel_id.wrapping_add(1);
-                                pending_response_channels.insert(
-                                    channel_id,
-                                    PendingResponseChannel {
-                                        channel,
-                                        created_at: std::time::Instant::now(),
-                                    },
-                                );
-
-                                debug!(
-                                    peer = %peer,
-                                    block_hash = ?tx_request.block_hash,
-                                    tx_count = tx_request.tx_hashes.len(),
-                                    channel_id = channel_id,
-                                    is_validator = is_validator,
-                                    "Received transaction fetch request"
-                                );
-
-                                let inbound_request = InboundTransactionRequest {
-                                    peer,
-                                    block_hash: tx_request.block_hash,
-                                    tx_hashes: tx_request.tx_hashes,
-                                    channel_id,
-                                };
-
-                                if tx_request_tx.send(inbound_request).is_err() {
-                                    warn!(
-                                        channel_id,
-                                        "Failed to send transaction request to fetch handler (channel closed)"
-                                    );
-                                    pending_response_channels.remove(&channel_id);
-                                }
-                            } else {
-                                warn!(peer = %peer, "Failed to decode transaction fetch request");
-                            }
-                        }
-                        Some(FETCH_TYPE_CERTIFICATE) => {
-                            if let Ok(cert_request) =
-                                sbor::basic_decode::<GetCertificatesRequest>(&request)
-                            {
-                                // Certificate fetch request
-                                let channel_id = *next_channel_id;
-                                *next_channel_id = next_channel_id.wrapping_add(1);
-                                pending_response_channels.insert(
-                                    channel_id,
-                                    PendingResponseChannel {
-                                        channel,
-                                        created_at: std::time::Instant::now(),
-                                    },
-                                );
-
-                                debug!(
-                                    peer = %peer,
-                                    block_hash = ?cert_request.block_hash,
-                                    cert_count = cert_request.cert_hashes.len(),
-                                    channel_id = channel_id,
-                                    is_validator = is_validator,
-                                    "Received certificate fetch request"
-                                );
-
-                                let inbound_request = InboundCertificateRequest {
-                                    peer,
-                                    block_hash: cert_request.block_hash,
-                                    cert_hashes: cert_request.cert_hashes,
-                                    channel_id,
-                                };
-
-                                if cert_request_tx.send(inbound_request).is_err() {
-                                    warn!(
-                                        channel_id,
-                                        "Failed to send certificate request to fetch handler (channel closed)"
-                                    );
-                                    pending_response_channels.remove(&channel_id);
-                                }
-                            } else {
-                                warn!(peer = %peer, "Failed to decode certificate fetch request");
-                            }
-                        }
-                        _ => {
-                            warn!(peer = %peer, len = request.len(), ?fetch_type, "Unknown fetch request type");
-                        }
+                    if inbound_request_tx.send(inbound_request).is_err() {
+                        warn!(
+                            channel_id,
+                            "Failed to send request to InboundRouter (channel closed)"
+                        );
+                        pending_response_channels.remove(&channel_id);
                     }
-                    SwarmAction::None
-                } else {
-                    warn!(peer = %peer, len = request.len(), "Invalid request (too short)");
                     SwarmAction::None
                 }
             }

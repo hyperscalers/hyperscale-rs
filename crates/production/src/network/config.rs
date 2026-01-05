@@ -82,17 +82,6 @@ pub struct Libp2pConfig {
     ///
     /// Default: 10 seconds
     pub direct_connection_timeout: Duration,
-
-    /// Maximum number of retries for request-response operations on timeout.
-    ///
-    /// When a request times out (likely due to packet loss), it will be
-    /// automatically retried up to this many times. The per-attempt timeout
-    /// is `request_timeout / (max_request_retries + 1)`.
-    ///
-    /// Set to 0 to disable automatic retries.
-    ///
-    /// Default: 2 (3 total attempts)
-    pub max_request_retries: u32,
 }
 
 /// Mode for version interoperability checks.
@@ -147,9 +136,7 @@ impl Default for Libp2pConfig {
             listen_addresses: vec!["/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap()],
             bootstrap_peers: vec![],
             // 5 second timeout for request-response operations.
-            // This matches SyncConfig::fetch_timeout and FetchConfig::max_timeout so that
-            // libp2p times out around the same time as our higher-level timeouts.
-            // This prevents orphaned requests from accumulating when our timeouts fire first.
+            // This is the hard backstop - RequestManager handles retry logic above this layer.
             request_timeout: Duration::from_secs(5),
             max_message_size: 1024 * 1024 * 10, // 10MB
             gossipsub_heartbeat: Duration::from_millis(100),
@@ -160,20 +147,11 @@ impl Default for Libp2pConfig {
             version_interop_mode: VersionInteroperabilityMode::Relaxed,
             direct_connection_limit: 50,
             direct_connection_timeout: Duration::from_secs(10),
-            max_request_retries: 2,
         }
     }
 }
 
 impl Libp2pConfig {
-    /// Calculate the per-attempt timeout based on total timeout and retries.
-    ///
-    /// This ensures the total time spent on all attempts doesn't exceed
-    /// the configured `request_timeout`.
-    pub fn per_attempt_timeout(&self) -> Duration {
-        self.request_timeout / (self.max_request_retries + 1)
-    }
-
     /// Set the listen addresses.
     pub fn with_listen_addresses(mut self, addrs: Vec<Multiaddr>) -> Self {
         self.listen_addresses = addrs;
@@ -240,7 +218,6 @@ impl Libp2pConfig {
             version_interop_mode: VersionInteroperabilityMode::Relaxed,
             direct_connection_limit: 50,
             direct_connection_timeout: Duration::from_secs(5),
-            max_request_retries: 2,
         }
     }
 
@@ -259,12 +236,6 @@ impl Libp2pConfig {
     /// Set the direct connection timeout.
     pub fn with_direct_connection_timeout(mut self, timeout: Duration) -> Self {
         self.direct_connection_timeout = timeout;
-        self
-    }
-
-    /// Set the maximum number of request retries.
-    pub fn with_max_request_retries(mut self, retries: u32) -> Self {
-        self.max_request_retries = retries;
         self
     }
 }
