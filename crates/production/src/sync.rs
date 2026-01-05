@@ -963,6 +963,36 @@ impl SyncManager {
         let all_at_max_inflight =
             at_max_inflight == same_shard_count && banned == 0 && in_cooldown_count == 0;
 
+        // Count how many peers we've already tried for this height
+        let tried_count = tried_peers.map(|t| t.len()).unwrap_or(0);
+        // Available peers = total - cooldown - banned - at_max_inflight
+        let potentially_available = same_shard_count
+            .saturating_sub(in_cooldown_count)
+            .saturating_sub(banned)
+            .saturating_sub(at_max_inflight);
+        // If we've tried all potentially available peers, that's also a desperation condition
+        let all_tried =
+            tried_count > 0 && tried_count >= potentially_available && potentially_available > 0;
+
+        // Desperation mode for tried peers: if we've tried all available peers and we're far behind,
+        // clear the tried set and retry. This handles the case where some peers are in cooldown,
+        // and we've already tried all the non-cooldown peers for this height.
+        if all_tried && blocks_behind >= self.config.desperation_threshold_blocks {
+            warn!(
+                same_shard_peers = same_shard_count,
+                blocks_behind,
+                tried_count,
+                in_cooldown = in_cooldown_count,
+                banned,
+                at_max_inflight,
+                "DESPERATION MODE: All available peers tried for height but {} blocks behind - retrying with fresh peer set",
+                blocks_behind
+            );
+
+            // Retry without the tried_peers filter (give all available peers another chance)
+            return self.select_peer_inner(now, None);
+        }
+
         if all_in_cooldown && blocks_behind >= self.config.desperation_threshold_blocks {
             warn!(
                 same_shard_peers = same_shard_count,
@@ -1038,6 +1068,8 @@ impl SyncManager {
             in_cooldown = in_cooldown_count,
             banned,
             at_max_inflight,
+            tried = tried_count,
+            blocks_behind,
             "No sync peers available - all peers filtered out"
         );
 
