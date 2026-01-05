@@ -2287,11 +2287,12 @@ impl BftState {
     #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
     pub fn on_qc_signature_verified(&mut self, block_hash: Hash, valid: bool) -> Vec<Action> {
         // Check if this is a synced block verification
-        debug!(
+        info!(
             block_hash = ?block_hash,
-            pending_count = self.pending_synced_block_verifications.len(),
-            pending_keys = ?self.pending_synced_block_verifications.keys().collect::<Vec<_>>(),
-            "on_qc_signature_verified: checking pending_synced_block_verifications"
+            valid,
+            pending_sync_count = self.pending_synced_block_verifications.len(),
+            pending_consensus_count = self.pending_qc_verifications.len(),
+            "on_qc_signature_verified: received callback"
         );
         if let Some(mut pending_sync) = self.pending_synced_block_verifications.remove(&block_hash)
         {
@@ -2306,7 +2307,7 @@ impl BftState {
                 return vec![];
             }
 
-            debug!(
+            info!(
                 block_hash = ?block_hash,
                 height = pending_sync.block.header.height.0,
                 "Synced block QC verified successfully"
@@ -2834,9 +2835,22 @@ impl BftState {
         let block_hash = block.hash();
         let height = block.header.height.0;
 
+        info!(
+            height,
+            block_hash = ?block_hash,
+            committed_height = self.committed_height,
+            pending_verifications = self.pending_synced_block_verifications.len(),
+            buffered_blocks = self.buffered_synced_blocks.len(),
+            "Received synced block"
+        );
+
         // Check if we've already committed this or higher
         if height <= self.committed_height {
-            trace!("Synced block at height {} already committed", height);
+            info!(
+                height,
+                committed = self.committed_height,
+                "Synced block already committed - filtering"
+            );
             return vec![];
         }
 
@@ -2854,14 +2868,14 @@ impl BftState {
             .pending_synced_block_verifications
             .contains_key(&block_hash)
         {
-            trace!(
-                "Synced block at height {} already pending verification",
-                height
+            info!(
+                height,
+                "Synced block already pending verification - filtering"
             );
             return vec![];
         }
         if self.buffered_synced_blocks.contains_key(&height) {
-            trace!("Synced block at height {} already buffered", height);
+            info!(height, "Synced block already buffered - filtering");
             return vec![];
         }
 

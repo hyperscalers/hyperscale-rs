@@ -111,6 +111,12 @@ pub struct Metrics {
     // === Sync ===
     pub sync_blocks_behind: Gauge,
     pub sync_blocks_downloaded: Counter,
+    pub sync_blocks_received_by_bft: Counter,
+    pub sync_blocks_submitted_for_verification: Counter,
+    pub sync_blocks_buffered: Counter,
+    pub sync_blocks_filtered: CounterVec,
+    pub sync_blocks_verified: Counter,
+    pub sync_blocks_applied: Counter,
     pub sync_in_progress: Gauge,
     pub sync_response_errors: CounterVec,
     pub sync_peers_banned: Counter,
@@ -505,6 +511,43 @@ impl Metrics {
             sync_blocks_downloaded: register_counter!(
                 "hyperscale_sync_blocks_downloaded_total",
                 "Total blocks downloaded during sync"
+            )
+            .unwrap(),
+
+            sync_blocks_received_by_bft: register_counter!(
+                "hyperscale_sync_blocks_received_by_bft_total",
+                "Total sync blocks received by BFT state machine"
+            )
+            .unwrap(),
+
+            sync_blocks_submitted_for_verification: register_counter!(
+                "hyperscale_sync_blocks_submitted_for_verification_total",
+                "Total sync blocks submitted for QC verification"
+            )
+            .unwrap(),
+
+            sync_blocks_buffered: register_counter!(
+                "hyperscale_sync_blocks_buffered_total",
+                "Total sync blocks buffered (out of order)"
+            )
+            .unwrap(),
+
+            sync_blocks_filtered: register_counter_vec!(
+                "hyperscale_sync_blocks_filtered_total",
+                "Total sync blocks filtered out by reason",
+                &["reason"]
+            )
+            .unwrap(),
+
+            sync_blocks_verified: register_counter!(
+                "hyperscale_sync_blocks_verified_total",
+                "Total sync blocks with verified QC signatures"
+            )
+            .unwrap(),
+
+            sync_blocks_applied: register_counter!(
+                "hyperscale_sync_blocks_applied_total",
+                "Total sync blocks applied (committed)"
             )
             .unwrap(),
 
@@ -933,6 +976,41 @@ pub fn set_sync_status(blocks_behind: u64, in_progress: bool) {
 /// Record a block downloaded during sync.
 pub fn record_sync_block_downloaded() {
     metrics().sync_blocks_downloaded.inc();
+}
+
+/// Record a sync block received by BFT state machine.
+pub fn record_sync_block_received_by_bft() {
+    metrics().sync_blocks_received_by_bft.inc();
+}
+
+/// Record a sync block submitted for QC verification.
+pub fn record_sync_block_submitted_for_verification() {
+    metrics().sync_blocks_submitted_for_verification.inc();
+}
+
+/// Record a sync block buffered (out of order).
+pub fn record_sync_block_buffered() {
+    metrics().sync_blocks_buffered.inc();
+}
+
+/// Record a sync block filtered out.
+///
+/// Valid reasons: "already_committed", "qc_mismatch", "already_pending", "already_buffered"
+pub fn record_sync_block_filtered(reason: &str) {
+    metrics()
+        .sync_blocks_filtered
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record a sync block QC verified.
+pub fn record_sync_block_verified() {
+    metrics().sync_blocks_verified.inc();
+}
+
+/// Record a sync block applied (committed).
+pub fn record_sync_block_applied() {
+    metrics().sync_blocks_applied.inc();
 }
 
 /// Record a sync response error by type.

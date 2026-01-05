@@ -460,6 +460,15 @@ impl SyncManager {
             (self.committed_height + self.config.sync_window_size).min(target_height)
         };
 
+        // Log what's currently in flight to help debug stuck fetches
+        if !self.heights_in_flight.is_empty() {
+            let in_flight: Vec<_> = self.heights_in_flight.iter().copied().collect();
+            debug!(
+                ?in_flight,
+                first_height, window_end, "Heights currently in flight"
+            );
+        }
+
         for height in first_height..=window_end {
             if !self.heights_in_flight.contains(&height) {
                 self.queue_height(height);
@@ -531,7 +540,7 @@ impl SyncManager {
 
     /// Spawn a fetch request as a background task.
     fn spawn_fetch(&self, height: u64, peers: Vec<PeerId>) {
-        trace!(height, "Spawning sync fetch");
+        info!(height, peer_count = peers.len(), "Spawning sync fetch");
 
         let request_manager = self.request_manager.clone();
         let result_tx = self.fetch_result_tx.clone();
@@ -584,7 +593,10 @@ impl SyncManager {
             }
             Ok(None) => {
                 // Peer doesn't have the block - try another peer
-                debug!(height, "Empty sync response - re-queuing");
+                warn!(
+                    height,
+                    "Empty sync response - peer doesn't have block, re-queuing"
+                );
                 metrics::record_sync_response_error("empty");
                 self.queue_height(height);
             }
