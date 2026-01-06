@@ -595,13 +595,6 @@ impl ProductionRunnerBuilder {
                 .await;
         }
 
-        // Initialize shard committees in DirectValidatorNetwork to enable direct messaging
-        for shard_idx in 0..topology.num_shards() {
-            let shard_id = hyperscale_types::ShardGroupId(shard_idx);
-            let committee = topology.committee_for_shard(shard_id).into_owned();
-            network.update_committee(shard_id, committee);
-        }
-
         // Create request manager for intelligent retry and peer selection.
         // This handles request-centric retry (same peer first, then rotate),
         // weighted peer selection based on health, and adaptive concurrency.

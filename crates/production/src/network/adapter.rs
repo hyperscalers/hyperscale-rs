@@ -9,7 +9,6 @@
 use super::codec::CodecError;
 use super::codec_pool::CodecPoolHandle;
 use super::config::Libp2pConfig;
-use super::direct::DirectValidatorNetwork;
 use super::inbound_router::InboundRequest;
 use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
 use super::topic::Topic;
@@ -139,16 +138,6 @@ pub enum SwarmCommand {
         priority: MessagePriority,
         response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
     },
-
-    /// Send a direct message to a peer (unicast).
-    SendDirectMessage { peer: Libp2pPeerId, data: Vec<u8> },
-
-    /// Broadcast a direct message to multiple peers in parallel (fire-and-forget).
-    /// Used for consensus messages where we don't need ACK tracking.
-    DirectBroadcast {
-        peers: Vec<Libp2pPeerId>,
-        data: Bytes,
-    },
 }
 
 /// A pending response channel with its creation time for timeout cleanup.
@@ -172,14 +161,11 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 /// This should be slightly longer than the request_timeout (5s) to allow for processing.
 const RESPONSE_CHANNEL_TIMEOUT: Duration = Duration::from_secs(7);
 
-/// Timeout for pending direct messages (fire-and-forget, no response expected).
-/// These are cleaned up periodically since we don't strictly need acknowledgement.
-const DIRECT_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Timeout for pending outbound requests (after which they are cleaned up).
 /// This is a safety net for when libp2p's OutboundFailure::Timeout doesn't fire.
-/// Set to 10s (2x request_timeout of 5s) to give libp2p ample time to handle normally.
-const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Set to 30s as an emergency backstop - RequestManager handles RTT-based timeouts
+/// much faster (500ms-5s), so this should rarely fire in practice.
+const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum number of pending outbound requests before applying backpressure.
 /// When exceeded, new requests are rejected with `NetworkError::Backpressure`.
@@ -276,9 +262,7 @@ impl PriorityCommandChannels {
             SwarmCommand::Subscribe { .. }
             | SwarmCommand::Dial { .. }
             | SwarmCommand::GetListenAddresses { .. }
-            | SwarmCommand::GetConnectedPeers { .. }
-            | SwarmCommand::SendDirectMessage { .. }
-            | SwarmCommand::DirectBroadcast { .. } => MessagePriority::Critical,
+            | SwarmCommand::GetConnectedPeers { .. } => MessagePriority::Critical,
             // Requests use their inherent priority from the caller
             SwarmCommand::Request { priority, .. } => *priority,
         };
@@ -470,9 +454,6 @@ pub struct Libp2pAdapter {
     /// Cached connected peer count (updated by background task).
     /// This avoids blocking the consensus loop to query peer count.
     cached_peer_count: Arc<AtomicUsize>,
-
-    /// Direct validator network for high-performance consensus messaging.
-    direct_network: Arc<DirectValidatorNetwork>,
 
     /// Codec pool handle for async encoding (encoding happens on caller thread for broadcast).
     codec_pool: CodecPoolHandle,
@@ -741,13 +722,6 @@ impl Libp2pAdapter {
         let (inbound_request_tx, inbound_request_rx) = mpsc::unbounded_channel();
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
-        let direct_network = Arc::new(DirectValidatorNetwork::new(
-            validator_id,
-            priority_channels.clone(),
-            validator_peers.clone(),
-            config.clone(),
-        ));
-
         let adapter = Arc::new(Self {
             local_peer_id,
             local_validator_id: validator_id,
@@ -760,7 +734,6 @@ impl Libp2pAdapter {
             shutdown_tx: Some(shutdown_tx),
             inbound_request_tx: inbound_request_tx.clone(),
             cached_peer_count: cached_peer_count.clone(),
-            direct_network: direct_network.clone(),
             codec_pool: codec_pool.clone(),
             request_timeout: config.request_timeout,
         });
@@ -835,11 +808,6 @@ impl Libp2pAdapter {
             peer_id = %peer_id,
             "Registered validator peer"
         );
-    }
-
-    /// Update the committee for a shard (delegates to direct network).
-    pub fn update_committee(&self, shard: ShardGroupId, validators: Vec<ValidatorId>) {
-        self.direct_network.update_committee(shard, validators);
     }
 
     /// Subscribe to all message types for a shard.
@@ -1072,12 +1040,6 @@ impl Libp2pAdapter {
         let mut pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest> =
             HashMap::new();
 
-        // Track pending direct messages (outbound) for debugging delivery
-        let mut pending_direct_messages: HashMap<
-            request_response::OutboundRequestId,
-            std::time::Instant,
-        > = HashMap::new();
-
         // Track pending response channels (inbound) - keyed by channel_id
         // Uses PendingResponseChannel to track creation time for timeout cleanup
         let mut pending_response_channels: HashMap<u64, PendingResponseChannel> = HashMap::new();
@@ -1133,18 +1095,7 @@ impl Libp2pAdapter {
                         info!(cleaned, remaining = pending_response_channels.len(), "Cleaned up timed-out response channels");
                     }
 
-                    // 2. Clean up timed-out direct messages (fire-and-forget, no response expected)
-                    // These don't need the same urgency as request-response since we don't wait for them.
-                    let before_direct = pending_direct_messages.len();
-                    pending_direct_messages.retain(|_req_id, &mut created_at| {
-                        now.duration_since(created_at) <= DIRECT_MESSAGE_TIMEOUT
-                    });
-                    let cleaned_direct = before_direct - pending_direct_messages.len();
-                    if cleaned_direct > 0 {
-                        trace!(cleaned_direct, "Cleaned up old direct message tracking entries");
-                    }
-
-                    // 3. Clean up timed-out pending requests (safety net for libp2p failures).
+                    // 2. Clean up timed-out pending requests (safety net for libp2p failures).
                     // Normally libp2p's OutboundFailure::Timeout handles this, but if that
                     // doesn't fire for some reason, we clean up here to prevent memory leaks.
                     let expired_requests: Vec<_> = pending_requests
@@ -1264,12 +1215,12 @@ impl Libp2pAdapter {
                         }
                     }
 
-                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
+                    Self::handle_command(&mut swarm, cmd, &mut pending_requests).await;
 
                     // Drain critical commands
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match critical_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
                             Err(_) => break,
                         }
                     }
@@ -1284,15 +1235,14 @@ impl Libp2pAdapter {
                         &mut critical_rx,
                         &mut pending_response_channels,
                         &mut pending_requests,
-                        &mut pending_direct_messages,
                     ).await;
 
-                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
+                    Self::handle_command(&mut swarm, cmd, &mut pending_requests).await;
 
                     // Drain coordination commands
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match coordination_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
                             Err(_) => break,
                         }
                     }
@@ -1307,23 +1257,22 @@ impl Libp2pAdapter {
                         &mut critical_rx,
                         &mut pending_response_channels,
                         &mut pending_requests,
-                        &mut pending_direct_messages,
                     ).await;
 
                     // Also drain coordination
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match coordination_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
                             Err(_) => break,
                         }
                     }
 
-                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
+                    Self::handle_command(&mut swarm, cmd, &mut pending_requests).await;
 
                     // Drain finalization commands
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match finalization_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
                             Err(_) => break,
                         }
                     }
@@ -1340,15 +1289,14 @@ impl Libp2pAdapter {
                         &mut finalization_rx,
                         &mut pending_response_channels,
                         &mut pending_requests,
-                        &mut pending_direct_messages,
                     ).await;
 
-                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
+                    Self::handle_command(&mut swarm, cmd, &mut pending_requests).await;
 
                     // Drain propagation commands
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match propagation_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
                             Err(_) => break,
                         }
                     }
@@ -1365,23 +1313,22 @@ impl Libp2pAdapter {
                         &mut finalization_rx,
                         &mut pending_response_channels,
                         &mut pending_requests,
-                        &mut pending_direct_messages,
                     ).await;
 
                     // Also drain propagation
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match propagation_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
                             Err(_) => break,
                         }
                     }
 
-                    Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await;
+                    Self::handle_command(&mut swarm, cmd, &mut pending_requests).await;
 
                     // Drain background commands
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match background_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests, &mut pending_direct_messages).await,
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
                             Err(_) => break,
                         }
                     }
@@ -1483,12 +1430,11 @@ impl Libp2pAdapter {
                         }
                     }
 
-                    let action = Self::handle_swarm_event(
+                    Self::handle_swarm_event(
                         event,
                         &consensus_tx,
                         &peer_validators,
                         &mut pending_requests,
-                        &mut pending_direct_messages,
                         &mut pending_response_channels,
                         &mut next_channel_id,
                         &inbound_request_tx,
@@ -1497,20 +1443,6 @@ impl Libp2pAdapter {
                         &tx_validation_handle,
                         &codec_pool,
                     ).await;
-
-                    // Execute any action returned by the event handler
-                    match action {
-                        SwarmAction::SendResponse { channel, data } => {
-                            if let Err(e) = swarm
-                                .behaviour_mut()
-                                .request_response
-                                .send_response(channel, data)
-                            {
-                                warn!("Failed to send direct response: {:?}", e);
-                            }
-                        }
-                        SwarmAction::None => {}
-                    }
 
                     // Update cached peer count after connection changes
                     if is_connection_event {
@@ -1527,10 +1459,6 @@ impl Libp2pAdapter {
         swarm: &mut Swarm<Behaviour>,
         cmd: SwarmCommand,
         pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
-        pending_direct_messages: &mut HashMap<
-            request_response::OutboundRequestId,
-            std::time::Instant,
-        >,
     ) {
         match cmd {
             SwarmCommand::Subscribe { topic } => {
@@ -1610,34 +1538,6 @@ impl Libp2pAdapter {
                     trace!(?peer, "Sent request");
                 }
             }
-            SwarmCommand::SendDirectMessage { peer, data } => {
-                // Send as a request, reusing the existing request-response protocol.
-                let req_id = swarm
-                    .behaviour_mut()
-                    .request_response
-                    .send_request(&peer, Bytes::from(data));
-
-                pending_direct_messages.insert(req_id, std::time::Instant::now());
-            }
-            SwarmCommand::DirectBroadcast { peers, data } => {
-                // Send to all peers in a single event loop iteration (fire-and-forget).
-                // No ACK tracking - consensus messages don't need delivery confirmation.
-                // Bytes::clone() is O(1) - just increments a refcount, no data copy.
-                let peer_count = peers.len();
-                for peer in peers {
-                    // send_request returns immediately, queuing the message internally
-                    let _req_id = swarm
-                        .behaviour_mut()
-                        .request_response
-                        .send_request(&peer, data.clone());
-                    // Intentionally not tracking req_id for ACK - fire and forget
-                }
-                trace!(
-                    sent = peer_count,
-                    total = peer_count,
-                    "Direct broadcast sent to all peers"
-                );
-            }
         }
     }
 
@@ -1674,10 +1574,6 @@ impl Libp2pAdapter {
         critical_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
         pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
         pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
-        pending_direct_messages: &mut HashMap<
-            request_response::OutboundRequestId,
-            std::time::Instant,
-        >,
     ) {
         // Drain response commands
         for _ in 0..MAX_COMMANDS_PER_DRAIN {
@@ -1690,10 +1586,7 @@ impl Libp2pAdapter {
         // Drain critical commands
         for _ in 0..MAX_COMMANDS_PER_DRAIN {
             match critical_rx.try_recv() {
-                Ok(cmd) => {
-                    Self::handle_command(swarm, cmd, pending_requests, pending_direct_messages)
-                        .await
-                }
+                Ok(cmd) => Self::handle_command(swarm, cmd, pending_requests).await,
                 Err(_) => break,
             }
         }
@@ -1710,10 +1603,6 @@ impl Libp2pAdapter {
         finalization_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
         pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
         pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
-        pending_direct_messages: &mut HashMap<
-            request_response::OutboundRequestId,
-            std::time::Instant,
-        >,
     ) {
         // Drain response commands
         for _ in 0..MAX_COMMANDS_PER_DRAIN {
@@ -1726,10 +1615,7 @@ impl Libp2pAdapter {
         // Drain critical commands
         for _ in 0..MAX_COMMANDS_PER_DRAIN {
             match critical_rx.try_recv() {
-                Ok(cmd) => {
-                    Self::handle_command(swarm, cmd, pending_requests, pending_direct_messages)
-                        .await
-                }
+                Ok(cmd) => Self::handle_command(swarm, cmd, pending_requests).await,
                 Err(_) => break,
             }
         }
@@ -1737,10 +1623,7 @@ impl Libp2pAdapter {
         // Drain coordination commands
         for _ in 0..MAX_COMMANDS_PER_DRAIN {
             match coordination_rx.try_recv() {
-                Ok(cmd) => {
-                    Self::handle_command(swarm, cmd, pending_requests, pending_direct_messages)
-                        .await
-                }
+                Ok(cmd) => Self::handle_command(swarm, cmd, pending_requests).await,
                 Err(_) => break,
             }
         }
@@ -1748,23 +1631,11 @@ impl Libp2pAdapter {
         // Drain finalization commands
         for _ in 0..MAX_COMMANDS_PER_DRAIN {
             match finalization_rx.try_recv() {
-                Ok(cmd) => {
-                    Self::handle_command(swarm, cmd, pending_requests, pending_direct_messages)
-                        .await
-                }
+                Ok(cmd) => Self::handle_command(swarm, cmd, pending_requests).await,
                 Err(_) => break,
             }
         }
     }
-}
-
-/// Internal action to take after handling a swarm event
-enum SwarmAction {
-    None,
-    SendResponse {
-        channel: request_response::ResponseChannel<Vec<u8>>,
-        data: Vec<u8>,
-    },
 }
 
 impl Libp2pAdapter {
@@ -1775,10 +1646,6 @@ impl Libp2pAdapter {
         consensus_tx: &mpsc::Sender<Event>,
         peer_validators: &Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
-        pending_direct_messages: &mut HashMap<
-            request_response::OutboundRequestId,
-            std::time::Instant,
-        >,
         pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
         next_channel_id: &mut u64,
         inbound_request_tx: &mpsc::UnboundedSender<InboundRequest>,
@@ -1786,7 +1653,7 @@ impl Libp2pAdapter {
         local_shard: ShardGroupId,
         tx_validation_handle: &ValidationBatcherHandle,
         codec_pool: &CodecPoolHandle,
-    ) -> SwarmAction {
+    ) {
         match event {
             // Handle gossipsub messages
             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
@@ -1806,7 +1673,7 @@ impl Libp2pAdapter {
                             "Received message with invalid topic format"
                         );
                         metrics::record_invalid_message();
-                        return SwarmAction::None;
+                        return;
                     }
                 };
 
@@ -1826,7 +1693,7 @@ impl Libp2pAdapter {
                         "Ignoring message from unknown peer (not in validator set)"
                     );
                     metrics::record_invalid_message();
-                    return SwarmAction::None;
+                    return;
                 }
                 //
                 // Cross-shard messages (allowed from any shard):
@@ -1849,7 +1716,7 @@ impl Libp2pAdapter {
                                 "Dropping shard-local message from wrong shard (cross-shard contamination attempt)"
                             );
                             metrics::record_invalid_message();
-                            return SwarmAction::None;
+                            return;
                         }
                     }
                 }
@@ -1865,8 +1732,6 @@ impl Libp2pAdapter {
                     consensus_tx.clone(),
                     tx_validation_handle.clone(),
                 );
-
-                SwarmAction::None
             }
 
             // Handle subscription events
@@ -1875,7 +1740,6 @@ impl Libp2pAdapter {
                 topic,
             })) => {
                 debug!("Peer {:?} subscribed to topic: {}", peer_id, topic);
-                SwarmAction::None
             }
 
             // Handle request-response messages
@@ -1893,11 +1757,7 @@ impl Libp2pAdapter {
                 // Route response to waiting requester
                 if let Some(pending) = pending_requests.remove(&request_id) {
                     let _ = pending.response_tx.send(Ok(response));
-                } else if pending_direct_messages.remove(&request_id).is_some() {
-                    // Direct message acknowledged (empty response received)
-                    trace!("Direct message acknowledged {:?}", request_id);
                 }
-                SwarmAction::None
             }
 
             // Handle request failures
@@ -1924,15 +1784,7 @@ impl Libp2pAdapter {
                         other => NetworkError::NetworkError(format!("Request failed: {:?}", other)),
                     };
                     let _ = pending.response_tx.send(Err(network_error));
-                } else if pending_direct_messages.remove(&request_id).is_some() {
-                    warn!(
-                        peer = %peer,
-                        request_id = ?request_id,
-                        error = ?error,
-                        "Direct message failed (fire-and-forget, no ACK expected)"
-                    );
                 }
-                SwarmAction::None
             }
 
             // Handle inbound requests (sync blocks or transaction fetch)
@@ -1959,68 +1811,13 @@ impl Libp2pAdapter {
                     metrics::record_request_rate_limited(is_validator);
                     // Drop the request by not processing it
                     // The channel will be dropped, which signals failure to the requester
-                    return SwarmAction::None;
+                    return;
                 }
 
-                // Try to decode as a direct consensus message first
-                if let Ok(decoded) = super::codec::decode_direct_message(&request) {
-                    // Direct consensus message (Block/Vote)
-                    // We cannot send a response here because we don't have access to the swarm behavior.
-                    // Instead, we drop the channel which will close the stream (implicit done).
-
-                    // Process events
-                    for event in decoded.events {
-                        match &event {
-                            Event::BlockHeaderReceived { header, .. } => {
-                                info!(
-                                    peer = %peer,
-                                    is_validator = is_validator,
-                                    msg_type = "BlockHeader",
-                                    round = header.round,
-                                    height = header.height.0,
-                                    hash = %header.hash(),
-                                    "Received direct consensus message"
-                                );
-                            }
-                            Event::BlockVoteReceived { vote } => {
-                                info!(
-                                    peer = %peer,
-                                    is_validator = is_validator,
-                                    msg_type = "BlockVote",
-                                    round = vote.round,
-                                    height = vote.height.0,
-                                    block_hash = %vote.block_hash,
-                                    "Received direct consensus message"
-                                );
-                            }
-                            _ => {
-                                info!(
-                                    peer = %peer,
-                                    is_validator = is_validator,
-                                    msg_type = "Other",
-                                    "Received direct consensus message"
-                                );
-                            }
-                        }
-
-                        // Direct messages are time critical, send to consensus immediately
-                        // We spawn this to avoid blocking the swarm loop waiting for channel capacity.
-                        // Blocking here prevents sending the Response, causing timeouts on the sender side.
-                        let tx = consensus_tx.clone();
-                        tokio::spawn(async move {
-                            if tx.send(event).await.is_err() {
-                                warn!("Consensus channel closed during direct message dispatch");
-                            }
-                        });
-                    }
-                    SwarmAction::SendResponse {
-                        channel,
-                        data: vec![],
-                    }
-                } else {
-                    // Not a direct consensus message - send to InboundRouter for handling.
-                    // The router will discriminate between block sync, transaction fetch,
-                    // and certificate fetch requests based on the payload structure.
+                // Send to InboundRouter for handling.
+                // The router will discriminate between block sync, transaction fetch,
+                // and certificate fetch requests based on the payload structure.
+                {
                     let channel_id = *next_channel_id;
                     *next_channel_id = next_channel_id.wrapping_add(1);
                     pending_response_channels.insert(
@@ -2052,7 +1849,6 @@ impl Libp2pAdapter {
                         );
                         pending_response_channels.remove(&channel_id);
                     }
-                    SwarmAction::None
                 }
             }
 
@@ -2069,7 +1865,6 @@ impl Libp2pAdapter {
                     protocols = ?info.protocols,
                     "Identified peer"
                 );
-                SwarmAction::None
             }
 
             // Connection events
@@ -2089,7 +1884,6 @@ impl Libp2pAdapter {
                 // Note: num_established is connections to this peer, not total peers
                 // We would need swarm.connected_peers().count() for total, but we don't have access here
                 // The metrics tick in runner.rs can poll connected_peers() periodically instead
-                SwarmAction::None
             }
 
             SwarmEvent::ConnectionClosed {
@@ -2111,17 +1905,14 @@ impl Libp2pAdapter {
                     remaining_connections = num_established,
                     "Connection closed - investigating timeout cause"
                 );
-                SwarmAction::None
             }
 
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!("Listening on new address: {}", address);
-                SwarmAction::None
             }
 
             _ => {
                 // Ignore other events
-                SwarmAction::None
             }
         }
     }

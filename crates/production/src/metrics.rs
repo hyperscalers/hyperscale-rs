@@ -42,7 +42,6 @@ pub struct Metrics {
 
     // === Infrastructure ===
     pub network_messages_sent: Counter,
-    pub direct_messages_sent: Counter,
     pub network_messages_received: Counter,
     pub signature_verification_latency: HistogramVec,
     pub execution_latency: Histogram,
@@ -254,12 +253,6 @@ impl Metrics {
             network_messages_sent: register_counter!(
                 "hyperscale_network_messages_sent_total",
                 "Total network messages sent"
-            )
-            .unwrap(),
-
-            direct_messages_sent: register_counter!(
-                "hyperscale_direct_messages_sent_total",
-                "Total direct network messages sent (bypassing gossip)"
             )
             .unwrap(),
 
@@ -859,13 +852,6 @@ pub fn set_channel_depths(depths: &ChannelDepths) {
     m.sync_request_channel_depth.set(depths.sync_request as f64);
     m.tx_request_channel_depth.set(depths.tx_request as f64);
     m.cert_request_channel_depth.set(depths.cert_request as f64);
-}
-
-/// Record direct messages sent.
-pub fn record_direct_message_sent(count: usize) {
-    if count > 0 {
-        metrics().direct_messages_sent.inc_by(count as f64);
-    }
 }
 
 /// Record a rejected transaction because the node is syncing.

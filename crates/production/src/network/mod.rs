@@ -51,7 +51,6 @@ mod adapter;
 mod codec;
 mod codec_pool;
 mod config;
-pub mod direct;
 mod inbound_router;
 mod peer_health;
 mod rate_limiter;

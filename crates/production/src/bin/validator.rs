@@ -222,14 +222,6 @@ pub struct NetworkConfig {
     /// Version interoperability mode
     pub version_interop_mode: Option<VersionInteroperabilityMode>,
 
-    /// Maximum number of direct validator connections
-    #[serde(default = "default_direct_connection_limit")]
-    pub direct_connection_limit: usize,
-
-    /// Direct connection timeout in milliseconds
-    #[serde(default = "default_direct_connection_timeout_ms")]
-    pub direct_connection_timeout_ms: u64,
-
     /// Idle connection timeout in milliseconds
     #[serde(default = "default_idle_connection_timeout_ms")]
     pub idle_connection_timeout_ms: u64,
@@ -261,14 +253,6 @@ fn default_gossipsub_heartbeat_ms() -> u64 {
 
 fn default_upnp_enabled() -> bool {
     true
-}
-
-fn default_direct_connection_limit() -> usize {
-    50
-}
-
-fn default_direct_connection_timeout_ms() -> u64 {
-    10_000
 }
 
 fn default_idle_connection_timeout_ms() -> u64 {
@@ -919,9 +903,7 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
             config
                 .version_interop_mode
                 .unwrap_or(VersionInteroperabilityMode::Strict),
-        )
-        .with_direct_connection_limit(config.direct_connection_limit)
-        .with_direct_connection_timeout(Duration::from_millis(config.direct_connection_timeout_ms)))
+        ))
 }
 
 /// Build RocksDB configuration from TOML config.
