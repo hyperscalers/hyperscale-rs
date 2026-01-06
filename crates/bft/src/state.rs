@@ -2886,6 +2886,11 @@ impl BftState {
             }
         }
 
+        // After consensus commits, try to drain buffered synced blocks.
+        // Consensus may have committed blocks that sync was waiting for,
+        // so now those buffered synced blocks may be ready for verification.
+        actions.extend(self.try_drain_buffered_synced_blocks());
+
         actions
     }
 
@@ -3889,6 +3894,12 @@ impl BftState {
         // Remove buffered synced blocks at or below committed height
         self.buffered_synced_blocks
             .retain(|height, _| *height > committed_height);
+
+        // Remove pending synced block verifications at or below committed height.
+        // These are synced blocks awaiting QC verification that are now stale because
+        // consensus has already committed past their height.
+        self.pending_synced_block_verifications
+            .retain(|_, pending| pending.block.header.height.0 > committed_height);
 
         // Remove pending QC verifications for blocks at or below committed height.
         // We look up the block hash in pending_blocks to get the height - if the block
