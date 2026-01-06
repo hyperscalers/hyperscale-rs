@@ -515,26 +515,51 @@ impl RequestManager {
         let request_clone2 = request.clone();
         let peer_clone2 = *peer;
 
-        let second_handle = tokio::spawn(async move {
+        let mut second_handle = tokio::spawn(async move {
             Self::send_request_static(&adapter_clone2, &peer_clone2, &request_clone2, priority)
                 .await
         });
 
-        // Race both requests - first success wins
-        tokio::select! {
-            result = first_handle => {
-                match result {
-                    Ok(Ok(response)) => Ok((response, start.elapsed())),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(NetworkError::NetworkShutdown),
+        // Race both requests - first SUCCESS wins.
+        // If one fails, wait for the other. Only return error if both fail.
+        let mut first_done = false;
+        let mut second_done = false;
+        #[allow(unused_assignments)] // False positive: always assigned before loop exit
+        let mut last_error: Option<NetworkError> = None;
+
+        loop {
+            tokio::select! {
+                result = &mut first_handle, if !first_done => {
+                    match result {
+                        Ok(Ok(response)) => return Ok((response, start.elapsed())),
+                        Ok(Err(e)) => {
+                            first_done = true;
+                            last_error = Some(e);
+                        }
+                        Err(_) => {
+                            first_done = true;
+                            last_error = Some(NetworkError::NetworkShutdown);
+                        }
+                    }
+                }
+                result = &mut second_handle, if !second_done => {
+                    match result {
+                        Ok(Ok(response)) => return Ok((response, start.elapsed())),
+                        Ok(Err(e)) => {
+                            second_done = true;
+                            last_error = Some(e);
+                        }
+                        Err(_) => {
+                            second_done = true;
+                            last_error = Some(NetworkError::NetworkShutdown);
+                        }
+                    }
                 }
             }
-            result = second_handle => {
-                match result {
-                    Ok(Ok(response)) => Ok((response, start.elapsed())),
-                    Ok(Err(e)) => Err(e),
-                    Err(_) => Err(NetworkError::NetworkShutdown),
-                }
+
+            // Both requests failed - return the last error
+            if first_done && second_done {
+                return Err(last_error.unwrap_or(NetworkError::Timeout));
             }
         }
     }
