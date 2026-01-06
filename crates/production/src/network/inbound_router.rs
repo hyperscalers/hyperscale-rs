@@ -1,7 +1,7 @@
 //! Routes inbound network requests to appropriate handlers.
 //!
-//! This component receives raw request bytes from the transport layer and routes them
-//! to the appropriate handler based on request type. It unifies the handling of:
+//! This component accepts incoming streams from peers and routes them to the
+//! appropriate handler based on request type. It unifies the handling of:
 //! - Block sync requests
 //! - Transaction fetch requests
 //! - Certificate fetch requests
@@ -10,10 +10,10 @@
 //!
 //! ```text
 //! ┌────────────────────────────────────────────────────────────────────────────┐
-//! │                         Libp2pAdapter                                      │
+//! │                         libp2p_stream                                      │
 //! │  ┌─────────────────────────────────────────────────────────────────────┐   │
-//! │  │  Inbound Request                                                    │   │
-//! │  │  (raw bytes + channel_id)                                           │   │
+//! │  │  Incoming Stream                                                    │   │
+//! │  │  (bidirectional raw stream)                                         │   │
 //! │  └───────────────────────────────┬─────────────────────────────────────┘   │
 //! └──────────────────────────────────┼─────────────────────────────────────────┘
 //!                                    │
@@ -21,57 +21,40 @@
 //! ┌────────────────────────────────────────────────────────────────────────────┐
 //! │                         InboundRouter                                      │
 //! │                                                                            │
-//! │  ┌─────────────────┐  ┌──────────────────┐  ┌─────────────────────────┐    │
-//! │  │  Block Request  │  │ Transaction Req  │  │ Certificate Request     │    │
-//! │  │  (8 bytes)      │  │ (SBOR encoded)   │  │ (SBOR encoded)          │    │
-//! │  └────────┬────────┘  └────────┬─────────┘  └───────────┬─────────────┘    │
-//! │           │                    │                        │                  │
-//! │           ▼                    ▼                        ▼                  │
-//! │  ┌─────────────────────────────────────────────────────────────────────┐   │
-//! │  │                    Storage / Handler                                │   │
-//! │  │                    (reads data, encodes response)                   │   │
-//! │  └─────────────────────────────────────────────────────────────────────┘   │
-//! │                                    │                                       │
-//! │                                    ▼                                       │
-//! │  ┌─────────────────────────────────────────────────────────────────────┐   │
-//! │  │                adapter.respond(channel_id, bytes)                   │   │
-//! │  └─────────────────────────────────────────────────────────────────────┘   │
+//! │  1. Read length-prefixed request from stream                              │
+//! │  2. Discriminate request type based on payload                            │
+//! │  3. Look up data from storage                                             │
+//! │  4. Write length-prefixed response to stream                              │
+//! │  5. Close stream                                                          │
+//! │                                                                            │
 //! └────────────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! # Design Goals
 //!
-//! 1. **Separation of Concerns**: The Libp2pAdapter knows nothing about blocks/transactions/certificates
-//! 2. **Unified Response Path**: All responses go through adapter's `respond()` method
-//! 3. **Request Type Discrimination**: Moved out of the adapter into this router
+//! 1. **Separation of Concerns**: Transport layer knows nothing about blocks/transactions/certificates
+//! 2. **Request-Response via Streams**: Uses raw libp2p streams with length-prefixed framing
+//! 3. **Request Type Discrimination**: Determines type from payload structure
 
-use super::adapter::Libp2pAdapter;
+use super::adapter::{Libp2pAdapter, STREAM_PROTOCOL};
 use crate::storage::RocksDbStorage;
-use bytes::Bytes;
+use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
 use hyperscale_messages::request::{
     GetCertificatesRequest, GetTransactionsRequest, FETCH_TYPE_CERTIFICATE, FETCH_TYPE_TRANSACTION,
 };
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
 use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, TransactionCertificate};
-use libp2p::PeerId;
+use libp2p::{PeerId, Stream};
 use quick_cache::sync::Cache as QuickCache;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Duration;
 use tracing::{debug, trace, warn};
 
-/// A generic inbound request from a peer.
-///
-/// This unified type replaces the separate `InboundSyncRequest`, `InboundTransactionRequest`,
-/// and `InboundCertificateRequest` types. The router discriminates request types internally.
-#[derive(Debug)]
-pub struct InboundRequest {
-    /// The requesting peer.
-    pub peer: PeerId,
-    /// Raw request payload.
-    pub payload: Bytes,
-    /// Opaque response channel ID (used to send the response).
-    pub channel_id: u64,
-}
+/// Timeout for reading requests and writing responses on streams.
+const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Maximum request size (10MB).
+const MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024;
 
 /// Configuration for the inbound router.
 #[derive(Debug, Clone)]
@@ -108,15 +91,14 @@ impl InboundRouterHandle {
 
 /// Routes inbound requests to appropriate handlers.
 ///
-/// The router receives raw request bytes and:
-/// 1. Discriminates request type based on payload structure
-/// 2. Decodes the request
+/// The router accepts incoming streams and for each:
+/// 1. Reads the length-prefixed request
+/// 2. Discriminates request type based on payload structure
 /// 3. Looks up data from storage
-/// 4. Encodes and sends the response via adapter.respond()
+/// 4. Writes the length-prefixed response
+/// 5. Closes the stream
 pub struct InboundRouter {
     config: InboundRouterConfig,
-    /// Network adapter for sending responses.
-    adapter: Arc<Libp2pAdapter>,
     /// Storage for reading blocks, transactions, and certificates.
     storage: Arc<RocksDbStorage>,
     /// Cache for recently built certificates (not yet persisted to storage).
@@ -127,13 +109,11 @@ impl InboundRouter {
     /// Create a new inbound router.
     pub fn new(
         config: InboundRouterConfig,
-        adapter: Arc<Libp2pAdapter>,
         storage: Arc<RocksDbStorage>,
         recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
     ) -> Self {
         Self {
             config,
-            adapter,
             storage,
             recently_built_certs,
         }
@@ -141,144 +121,172 @@ impl InboundRouter {
 
     /// Spawn the inbound router as a background task.
     ///
-    /// The router will process requests from the given channel until it closes.
+    /// The router will accept incoming streams until the stream control is dropped.
     pub fn spawn(
         config: InboundRouterConfig,
         adapter: Arc<Libp2pAdapter>,
         storage: Arc<RocksDbStorage>,
         recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
-        mut request_rx: mpsc::UnboundedReceiver<InboundRequest>,
     ) -> InboundRouterHandle {
         let join_handle = tokio::spawn(async move {
-            let router = Self::new(config, adapter, storage, recently_built_certs);
+            let router = Arc::new(Self::new(config, storage, recently_built_certs));
+            let mut control = adapter.stream_control();
 
-            tracing::info!("InboundRouter started");
-
-            while let Some(request) = request_rx.recv().await {
-                router.handle_request(request);
-
-                // Drain any additional pending requests for batch efficiency
-                while let Ok(request) = request_rx.try_recv() {
-                    router.handle_request(request);
+            // Register to accept incoming streams for our protocol
+            let mut incoming = match control.accept(STREAM_PROTOCOL) {
+                Ok(incoming) => incoming,
+                Err(e) => {
+                    tracing::error!(error = ?e, "Failed to register stream protocol");
+                    return;
                 }
+            };
+
+            tracing::info!("InboundRouter started, accepting incoming streams");
+
+            // Accept incoming streams
+            while let Some((peer_id, stream)) = incoming.next().await {
+                let router_clone = router.clone();
+
+                // Spawn a task to handle each stream concurrently
+                tokio::spawn(async move {
+                    if let Err(e) = router_clone.handle_stream(peer_id, stream).await {
+                        debug!(peer = %peer_id, error = ?e, "Stream handling failed");
+                    }
+                });
             }
 
-            tracing::info!("InboundRouter shutting down (channel closed)");
+            tracing::info!("InboundRouter shutting down (incoming streams closed)");
         });
 
         InboundRouterHandle { join_handle }
     }
 
-    /// Handle an inbound request by routing to the appropriate handler.
-    fn handle_request(&self, request: InboundRequest) {
-        let payload = &request.payload;
+    /// Handle a single incoming stream.
+    async fn handle_stream(&self, peer: PeerId, mut stream: Stream) -> Result<(), StreamError> {
+        // Read length-prefixed request with timeout
+        let request_data = tokio::time::timeout(STREAM_IO_TIMEOUT, async {
+            let mut len_bytes = [0u8; 4];
+            stream.read_exact(&mut len_bytes).await?;
+            let len = u32::from_be_bytes(len_bytes) as usize;
 
+            if len > MAX_REQUEST_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "request too large",
+                ));
+            }
+
+            let mut data = vec![0u8; len];
+            stream.read_exact(&mut data).await?;
+            Ok::<Vec<u8>, std::io::Error>(data)
+        })
+        .await
+        .map_err(|_| StreamError::Timeout)?
+        .map_err(StreamError::Io)?;
+
+        // Process the request and get response
+        let response_data = self.process_request(peer, &request_data);
+
+        // Write length-prefixed response with timeout
+        tokio::time::timeout(STREAM_IO_TIMEOUT, async {
+            let len = response_data.len() as u32;
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(&response_data).await?;
+            stream.flush().await?;
+            stream.close().await?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|_| StreamError::Timeout)?
+        .map_err(StreamError::Io)?;
+
+        Ok(())
+    }
+
+    /// Process a request and return the response bytes.
+    fn process_request(&self, peer: PeerId, payload: &[u8]) -> Vec<u8> {
         // Discriminate request type based on payload structure:
         // 1. Block sync request: exactly 8 bytes (u64 height in little-endian)
         // 2. Transaction/Certificate fetch: SBOR-encoded with fetch_type tag at byte 4
-        // 3. Direct consensus message: handled elsewhere (decoded as direct message)
 
         if payload.len() == 8 {
             // Block sync request (8-byte height)
-            self.handle_block_request(request);
+            self.handle_block_request(peer, payload)
         } else if payload.len() > 8 {
             // SBOR-encoded fetch request - check fetch_type at byte 4
-            // Basic SBOR encoding: [0x5b (prefix), 0x21 (Tuple), 0x03 (field count), 0x07 (u8 type), value, ...]
             let fetch_type = payload.get(4).copied();
 
             match fetch_type {
-                Some(FETCH_TYPE_TRANSACTION) => {
-                    self.handle_transaction_request(request);
-                }
-                Some(FETCH_TYPE_CERTIFICATE) => {
-                    self.handle_certificate_request(request);
-                }
+                Some(FETCH_TYPE_TRANSACTION) => self.handle_transaction_request(peer, payload),
+                Some(FETCH_TYPE_CERTIFICATE) => self.handle_certificate_request(peer, payload),
                 _ => {
                     warn!(
-                        peer = %request.peer,
+                        peer = %peer,
                         len = payload.len(),
                         fetch_type = ?fetch_type,
                         "Unknown fetch request type"
                     );
+                    vec![]
                 }
             }
         } else {
             warn!(
-                peer = %request.peer,
+                peer = %peer,
                 len = payload.len(),
                 "Invalid request (too short)"
             );
+            vec![]
         }
     }
 
     /// Handle a block sync request.
-    fn handle_block_request(&self, request: InboundRequest) {
+    fn handle_block_request(&self, peer: PeerId, payload: &[u8]) -> Vec<u8> {
         // Decode height from 8 bytes (little-endian u64)
-        let height_bytes: [u8; 8] = match request.payload.as_ref().try_into() {
+        let height_bytes: [u8; 8] = match payload.try_into() {
             Ok(bytes) => bytes,
             Err(_) => {
-                warn!(peer = %request.peer, "Invalid block request (not 8 bytes)");
-                return;
+                warn!(peer = %peer, "Invalid block request (not 8 bytes)");
+                return sbor::basic_encode(&None::<(Block, QuorumCertificate)>).unwrap_or_default();
             }
         };
         let height = u64::from_le_bytes(height_bytes);
         let block_height = BlockHeight(height);
-        let channel_id = request.channel_id;
 
         trace!(
-            peer = %request.peer,
+            peer = %peer,
             height = height,
-            channel_id = channel_id,
             "Handling block sync request"
         );
 
-        // Clone for the blocking task
-        let storage = self.storage.clone();
-        let adapter = self.adapter.clone();
+        // Wire format: Option<(Block, QuorumCertificate)>
+        let sync_response: Option<(Block, QuorumCertificate)> =
+            self.storage.get_block_for_sync(block_height);
 
-        // Spawn on blocking thread pool to avoid blocking the router.
-        // RocksDB reads are synchronous I/O that can take ms for large blocks.
-        tokio::task::spawn_blocking(move || {
-            // Wire format: Option<(Block, QuorumCertificate)>
-            // Some = complete block available, None = not available
-            let sync_response: Option<(Block, QuorumCertificate)> =
-                storage.get_block_for_sync(block_height);
-
-            let response = match sbor::basic_encode(&sync_response) {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!(height, error = ?e, "Failed to encode block response");
-                    // Encode None as fallback
-                    sbor::basic_encode(&None::<(Block, QuorumCertificate)>).unwrap_or_default()
-                }
-            };
-
-            // Send response via adapter
-            if let Err(e) = adapter.respond(channel_id, response) {
-                warn!(height, channel_id, error = ?e, "Failed to send block response");
+        match sbor::basic_encode(&sync_response) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(height, error = ?e, "Failed to encode block response");
+                sbor::basic_encode(&None::<(Block, QuorumCertificate)>).unwrap_or_default()
             }
-        });
+        }
     }
 
     /// Handle a transaction fetch request.
-    fn handle_transaction_request(&self, request: InboundRequest) {
-        let channel_id = request.channel_id;
-
+    fn handle_transaction_request(&self, peer: PeerId, payload: &[u8]) -> Vec<u8> {
         // Decode the request
-        let tx_request = match sbor::basic_decode::<GetTransactionsRequest>(&request.payload) {
+        let tx_request = match sbor::basic_decode::<GetTransactionsRequest>(payload) {
             Ok(req) => req,
             Err(e) => {
-                warn!(peer = %request.peer, error = ?e, "Failed to decode transaction request");
-                return;
+                warn!(peer = %peer, error = ?e, "Failed to decode transaction request");
+                return sbor::basic_encode(&GetTransactionsResponse::empty()).unwrap_or_default();
             }
         };
 
         let requested_count = tx_request.tx_hashes.len();
         trace!(
-            peer = %request.peer,
+            peer = %peer,
             block_hash = ?tx_request.block_hash,
             tx_count = requested_count,
-            channel_id = channel_id,
             "Handling transaction fetch request"
         );
 
@@ -289,7 +297,7 @@ impl InboundRouter {
             &tx_request.tx_hashes
         };
 
-        // Read directly from RocksDB storage (block cache handles hot data)
+        // Read directly from RocksDB storage
         let found_transactions: Vec<Arc<_>> = self
             .storage
             .get_transactions_batch(hashes_to_fetch)
@@ -307,42 +315,34 @@ impl InboundRouter {
 
         // Encode the response
         let response = GetTransactionsResponse::new(found_transactions);
-        let response_bytes = match sbor::basic_encode(&response) {
-            Ok(data) => data,
+        match sbor::basic_encode(&response) {
+            Ok(data) => {
+                crate::metrics::record_fetch_response_sent("transaction", found_count);
+                data
+            }
             Err(e) => {
                 warn!(error = ?e, "Failed to encode transaction response");
                 sbor::basic_encode(&GetTransactionsResponse::empty()).unwrap_or_default()
             }
-        };
-
-        // Send response via adapter
-        if let Err(e) = self.adapter.respond(channel_id, response_bytes) {
-            warn!(channel_id, error = ?e, "Failed to send transaction response");
         }
-
-        // Update metrics
-        crate::metrics::record_fetch_response_sent("transaction", found_count);
     }
 
     /// Handle a certificate fetch request.
-    fn handle_certificate_request(&self, request: InboundRequest) {
-        let channel_id = request.channel_id;
-
+    fn handle_certificate_request(&self, peer: PeerId, payload: &[u8]) -> Vec<u8> {
         // Decode the request
-        let cert_request = match sbor::basic_decode::<GetCertificatesRequest>(&request.payload) {
+        let cert_request = match sbor::basic_decode::<GetCertificatesRequest>(payload) {
             Ok(req) => req,
             Err(e) => {
-                warn!(peer = %request.peer, error = ?e, "Failed to decode certificate request");
-                return;
+                warn!(peer = %peer, error = ?e, "Failed to decode certificate request");
+                return sbor::basic_encode(&GetCertificatesResponse::empty()).unwrap_or_default();
             }
         };
 
         let requested_count = cert_request.cert_hashes.len();
         trace!(
-            peer = %request.peer,
+            peer = %peer,
             block_hash = ?cert_request.block_hash,
             cert_count = requested_count,
-            channel_id = channel_id,
             "Handling certificate fetch request"
         );
 
@@ -353,9 +353,7 @@ impl InboundRouter {
             &cert_request.cert_hashes
         };
 
-        // First check the in-memory cache for recently built certificates.
-        // This handles the race where we built a cert and included it in a block,
-        // but the async storage write hasn't completed yet.
+        // First check the in-memory cache for recently built certificates
         let mut found_certificates = Vec::with_capacity(hashes_to_fetch.len());
         let mut missing_hashes = Vec::new();
 
@@ -386,21 +384,32 @@ impl InboundRouter {
 
         // Encode the response
         let response = GetCertificatesResponse::new(found_certificates);
-        let response_bytes = match sbor::basic_encode(&response) {
-            Ok(data) => data,
+        match sbor::basic_encode(&response) {
+            Ok(data) => {
+                crate::metrics::record_fetch_response_sent("certificate", found_count);
+                data
+            }
             Err(e) => {
                 warn!(error = ?e, "Failed to encode certificate response");
                 sbor::basic_encode(&GetCertificatesResponse::empty()).unwrap_or_default()
             }
-        };
-
-        // Send response via adapter
-        if let Err(e) = self.adapter.respond(channel_id, response_bytes) {
-            warn!(channel_id, error = ?e, "Failed to send certificate response");
         }
+    }
+}
 
-        // Update metrics
-        crate::metrics::record_fetch_response_sent("certificate", found_count);
+/// Errors that can occur during stream handling.
+#[derive(Debug)]
+enum StreamError {
+    Timeout,
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StreamError::Timeout => write!(f, "stream timeout"),
+            StreamError::Io(e) => write!(f, "stream I/O error: {}", e),
+        }
     }
 }
 

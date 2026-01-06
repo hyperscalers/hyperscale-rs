@@ -567,7 +567,7 @@ impl ProductionRunnerBuilder {
         let codec_pool_handle = crate::network::CodecPoolHandle::new(thread_pools.clone());
 
         // Create network adapter with shared transaction validation batcher
-        let (network, inbound_request_rx) = Libp2pAdapter::new(
+        let network = Libp2pAdapter::new(
             network_config,
             ed25519_keypair,
             validator_id,
@@ -668,7 +668,6 @@ impl ProductionRunnerBuilder {
             network.clone(),
             storage.clone(),
             recently_built_certs.clone(),
-            inbound_request_rx,
         );
 
         // Spawn action dispatcher task for fire-and-forget network I/O.

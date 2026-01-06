@@ -33,6 +33,7 @@
 use super::adapter::{Libp2pAdapter, NetworkError};
 use super::peer_health::{PeerHealthConfig, PeerHealthTracker};
 use bytes::Bytes;
+use futures::{AsyncReadExt, AsyncWriteExt};
 use hyperscale_types::{BlockHeight, Hash};
 use libp2p::PeerId;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,6 +41,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
+
+/// Default timeout for stream operations.
+/// This is the hard timeout - speculative retry happens before this.
+const DEFAULT_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Errors from request operations.
 #[derive(Debug, Error)]
@@ -389,23 +394,6 @@ impl RequestManager {
                     );
                 }
 
-                Err(NetworkError::Backpressure) => {
-                    // Network overloaded—back off globally.
-                    self.health.record_failure(&current_peer, false);
-                    self.reduce_concurrency();
-
-                    // Count backpressure as an attempt to avoid infinite loops.
-                    // While backpressure is a local resource issue, we can't spin forever.
-                    attempts += 1;
-
-                    info!(
-                        request = %request_desc,
-                        attempts,
-                        "Backpressure detected, reducing concurrency and backing off"
-                    );
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-
                 Err(NetworkError::NetworkShutdown) => {
                     // Network is shutting down, don't retry
                     self.health.record_request_cancelled(&current_peer);
@@ -445,50 +433,18 @@ impl RequestManager {
         }
     }
 
-    /// Send the actual request through the adapter.
+    /// Send the actual request through the adapter using raw streams.
     ///
-    /// Encodes the request and uses the provided priority for network scheduling.
+    /// Opens a stream, writes the length-prefixed request, reads the length-prefixed
+    /// response, all wrapped in timeouts. The adapter is a "dumb pipe" - all timeout
+    /// logic is here in RequestManager.
     async fn send_request(
         &self,
         peer: &PeerId,
         request: &Request,
-        priority: RequestPriority,
+        _priority: RequestPriority,
     ) -> Result<Vec<u8>, NetworkError> {
-        use hyperscale_messages::request::{GetCertificatesRequest, GetTransactionsRequest};
-        use hyperscale_types::MessagePriority;
-
-        // Map RequestPriority to MessagePriority for network layer
-        // Normal maps to Coordination (mid-priority, not liveness-critical but important)
-        let msg_priority = match priority {
-            RequestPriority::Critical => MessagePriority::Critical,
-            RequestPriority::Normal => MessagePriority::Coordination,
-            RequestPriority::Background => MessagePriority::Background,
-        };
-
-        let data = match request {
-            Request::Block { height } => {
-                // Block requests are encoded as simple height bytes
-                Bytes::copy_from_slice(&height.0.to_le_bytes())
-            }
-            Request::Transactions {
-                block_hash,
-                tx_hashes,
-            } => {
-                // Transaction requests use SBOR encoding
-                let req = GetTransactionsRequest::new(*block_hash, tx_hashes.clone());
-                Bytes::from(sbor::basic_encode(&req).unwrap_or_default())
-            }
-            Request::Certificates {
-                block_hash,
-                cert_hashes,
-            } => {
-                // Certificate requests use SBOR encoding
-                let req = GetCertificatesRequest::new(*block_hash, cert_hashes.clone());
-                Bytes::from(sbor::basic_encode(&req).unwrap_or_default())
-            }
-        };
-
-        self.adapter.request(*peer, data, msg_priority).await
+        Self::send_request_static(&self.adapter, peer, request, _priority).await
     }
 
     /// Send a request with speculative retry based on RTT.
@@ -584,40 +540,90 @@ impl RequestManager {
     }
 
     /// Static version of send_request for use in spawned tasks.
+    ///
+    /// Uses raw streams with length-prefixed framing:
+    /// 1. Open stream to peer
+    /// 2. Write [4-byte big-endian length][request data]
+    /// 3. Read [4-byte big-endian length][response data]
+    /// 4. Close stream
+    ///
+    /// All I/O operations are wrapped with timeouts.
     async fn send_request_static(
         adapter: &Arc<Libp2pAdapter>,
         peer: &PeerId,
         request: &Request,
-        priority: RequestPriority,
+        _priority: RequestPriority,
     ) -> Result<Vec<u8>, NetworkError> {
         use hyperscale_messages::request::{GetCertificatesRequest, GetTransactionsRequest};
-        use hyperscale_types::MessagePriority;
 
-        let msg_priority = match priority {
-            RequestPriority::Critical => MessagePriority::Critical,
-            RequestPriority::Normal => MessagePriority::Coordination,
-            RequestPriority::Background => MessagePriority::Background,
-        };
-
-        let data = match request {
-            Request::Block { height } => Bytes::copy_from_slice(&height.0.to_le_bytes()),
+        // Encode request data
+        let data: Vec<u8> = match request {
+            Request::Block { height } => height.0.to_le_bytes().to_vec(),
             Request::Transactions {
                 block_hash,
                 tx_hashes,
             } => {
                 let req = GetTransactionsRequest::new(*block_hash, tx_hashes.clone());
-                Bytes::from(sbor::basic_encode(&req).unwrap_or_default())
+                sbor::basic_encode(&req).unwrap_or_default()
             }
             Request::Certificates {
                 block_hash,
                 cert_hashes,
             } => {
                 let req = GetCertificatesRequest::new(*block_hash, cert_hashes.clone());
-                Bytes::from(sbor::basic_encode(&req).unwrap_or_default())
+                sbor::basic_encode(&req).unwrap_or_default()
             }
         };
 
-        adapter.request(*peer, data, msg_priority).await
+        // Open stream with timeout
+        let mut stream = tokio::time::timeout(DEFAULT_STREAM_TIMEOUT, adapter.open_stream(*peer))
+            .await
+            .map_err(|_| NetworkError::Timeout)?
+            .map_err(|e| NetworkError::StreamOpenFailed(format!("{:?}", e)))?;
+
+        // Write length-prefixed request with timeout
+        let len = data.len() as u32;
+        let write_result = tokio::time::timeout(DEFAULT_STREAM_TIMEOUT, async {
+            stream.write_all(&len.to_be_bytes()).await?;
+            stream.write_all(&data).await?;
+            stream.flush().await?;
+            // Close write side to signal end of request
+            stream.close().await?;
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(NetworkError::StreamIo(format!("write failed: {}", e))),
+            Err(_) => return Err(NetworkError::Timeout),
+        }
+
+        // Read length-prefixed response with timeout
+        let read_result = tokio::time::timeout(DEFAULT_STREAM_TIMEOUT, async {
+            let mut len_bytes = [0u8; 4];
+            stream.read_exact(&mut len_bytes).await?;
+            let response_len = u32::from_be_bytes(len_bytes) as usize;
+
+            // Sanity check response size (max 10MB)
+            if response_len > 10 * 1024 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "response too large",
+                ));
+            }
+
+            let mut response = vec![0u8; response_len];
+            stream.read_exact(&mut response).await?;
+            Ok::<Vec<u8>, std::io::Error>(response)
+        })
+        .await;
+
+        match read_result {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(e)) => Err(NetworkError::StreamIo(format!("read failed: {}", e))),
+            Err(_) => Err(NetworkError::Timeout),
+        }
     }
 
     /// Compute the speculative retry timeout based on peer's RTT history.
@@ -693,6 +699,8 @@ impl RequestManager {
     }
 
     /// Reduce effective concurrency due to poor network conditions.
+    /// Currently unused but kept for future adaptive concurrency control.
+    #[allow(dead_code)]
     fn reduce_concurrency(&self) {
         let current = self.effective_concurrent.load(Ordering::Relaxed);
         let new = (current / 2).max(self.config.min_concurrent);

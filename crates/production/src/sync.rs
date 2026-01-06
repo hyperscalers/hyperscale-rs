@@ -238,9 +238,8 @@ pub struct SyncManager {
     heights_to_fetch: BinaryHeap<Reverse<u64>>,
     /// Set of heights currently in the queue (for O(1) duplicate checking).
     heights_queued: HashSet<u64>,
-    /// Heights currently being fetched, with the time they were spawned.
-    /// Used to detect and timeout stuck fetches.
-    heights_in_flight: HashMap<u64, Instant>,
+    /// Heights currently being fetched.
+    heights_in_flight: HashSet<u64>,
     /// Our current committed height (updated by state machine).
     committed_height: u64,
     /// Channel for receiving results from spawned fetch tasks.
@@ -271,7 +270,7 @@ impl SyncManager {
             sync_target: None,
             heights_to_fetch: BinaryHeap::new(),
             heights_queued: HashSet::new(),
-            heights_in_flight: HashMap::new(),
+            heights_in_flight: HashSet::new(),
             committed_height: 0,
             fetch_result_rx,
             fetch_result_tx,
@@ -285,7 +284,7 @@ impl SyncManager {
 
     /// Queue a height for fetching (no-op if already queued or in-flight).
     fn queue_height(&mut self, height: u64) {
-        if !self.heights_in_flight.contains_key(&height) && self.heights_queued.insert(height) {
+        if !self.heights_in_flight.contains(&height) && self.heights_queued.insert(height) {
             self.heights_to_fetch.push(Reverse(height));
         }
     }
@@ -293,8 +292,7 @@ impl SyncManager {
     /// Pop the next height to fetch (lowest height first).
     fn pop_next_height(&mut self) -> Option<u64> {
         while let Some(Reverse(height)) = self.heights_to_fetch.pop() {
-            if self.heights_queued.remove(&height) && !self.heights_in_flight.contains_key(&height)
-            {
+            if self.heights_queued.remove(&height) && !self.heights_in_flight.contains(&height) {
                 return Some(height);
             }
         }
@@ -310,7 +308,7 @@ impl SyncManager {
     /// Remove heights at or below a threshold.
     fn remove_heights_at_or_below(&mut self, threshold: u64) {
         self.heights_queued.retain(|&h| h > threshold);
-        self.heights_in_flight.retain(|&h, _| h > threshold);
+        self.heights_in_flight.retain(|&h| h > threshold);
     }
 
     /// Get the count of same-shard peers available for sync (excluding self and banned).
@@ -464,7 +462,7 @@ impl SyncManager {
 
         // Log what's currently in flight to help debug stuck fetches
         if !self.heights_in_flight.is_empty() {
-            let in_flight: Vec<_> = self.heights_in_flight.keys().copied().collect();
+            let in_flight: Vec<_> = self.heights_in_flight.iter().copied().collect();
             debug!(
                 ?in_flight,
                 first_height, window_end, "Heights currently in flight"
@@ -472,7 +470,7 @@ impl SyncManager {
         }
 
         for height in first_height..=window_end {
-            if !self.heights_in_flight.contains_key(&height) {
+            if !self.heights_in_flight.contains(&height) {
                 self.queue_height(height);
             }
         }
@@ -489,46 +487,12 @@ impl SyncManager {
     /// Tick the sync manager - called periodically to drive fetch progress.
     pub async fn tick(&mut self) {
         self.process_fetch_results().await;
-        self.timeout_stuck_fetches();
 
         if self.sync_target.is_none() {
             return;
         }
 
         self.spawn_pending_fetches();
-    }
-
-    /// Timeout and re-queue fetches that have been in-flight too long.
-    ///
-    /// This is a safety mechanism for when spawned fetch tasks hang indefinitely
-    /// (e.g., due to bugs, network issues, or resource exhaustion). Without this,
-    /// a stuck height would block sync progress forever since it's never removed
-    /// from heights_in_flight.
-    fn timeout_stuck_fetches(&mut self) {
-        // Timeout after 2 minutes - this is generous since RequestManager has its
-        // own retry logic with up to 15 attempts. If a fetch takes longer than this,
-        // something is seriously wrong.
-        const FETCH_TIMEOUT: Duration = Duration::from_secs(120);
-
-        let now = Instant::now();
-        let mut timed_out = Vec::new();
-
-        for (&height, &started) in &self.heights_in_flight {
-            if now.duration_since(started) > FETCH_TIMEOUT {
-                timed_out.push(height);
-            }
-        }
-
-        for height in timed_out {
-            self.heights_in_flight.remove(&height);
-            warn!(
-                height,
-                timeout_secs = FETCH_TIMEOUT.as_secs(),
-                "Sync fetch timed out - re-queuing"
-            );
-            metrics::record_sync_response_error("fetch_timeout");
-            self.queue_height(height);
-        }
     }
 
     /// Spawn pending fetches up to the configured limit.
@@ -544,7 +508,7 @@ impl SyncManager {
 
         while self.heights_in_flight.len() < self.config.max_spawned_fetches {
             if let Some(height) = self.pop_next_height() {
-                self.heights_in_flight.insert(height, Instant::now());
+                self.heights_in_flight.insert(height);
                 self.spawn_fetch(height, peers.clone());
             } else {
                 break;

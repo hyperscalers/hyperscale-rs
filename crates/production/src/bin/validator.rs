@@ -203,10 +203,6 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
 
-    /// Request timeout in milliseconds
-    #[serde(default = "default_request_timeout_ms")]
-    pub request_timeout_ms: u64,
-
     /// Maximum message size in bytes
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
@@ -237,10 +233,6 @@ fn default_listen_addr() -> String {
 
 fn default_tcp_fallback_enabled() -> bool {
     true
-}
-
-fn default_request_timeout_ms() -> u64 {
-    30_000
 }
 
 fn default_max_message_size() -> usize {
@@ -893,7 +885,6 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
     Ok(Libp2pConfig::default()
         .with_listen_addresses(listen_addresses)
         .with_bootstrap_peers(bootstrap_peers)
-        .with_request_timeout(Duration::from_millis(config.request_timeout_ms))
         .with_max_message_size(config.max_message_size)
         .with_gossipsub_heartbeat(Duration::from_millis(config.gossipsub_heartbeat_ms))
         .with_idle_connection_timeout(Duration::from_millis(config.idle_connection_timeout_ms))

@@ -53,7 +53,6 @@ mod codec_pool;
 mod config;
 mod inbound_router;
 mod peer_health;
-mod rate_limiter;
 mod request_manager;
 mod topic;
 
@@ -62,9 +61,8 @@ pub use adapter::{
 };
 pub use codec_pool::CodecPoolHandle;
 pub use config::{Libp2pConfig, VersionInteroperabilityMode};
-pub use inbound_router::{InboundRequest, InboundRouter, InboundRouterConfig, InboundRouterHandle};
+pub use inbound_router::{InboundRouter, InboundRouterConfig, InboundRouterHandle};
 pub use peer_health::{PeerHealth, PeerHealthConfig, PeerHealthStats, PeerHealthTracker};
-pub use rate_limiter::{RateLimitConfig, SyncRateLimiter};
 pub use request_manager::{
     Request, RequestError, RequestManager, RequestManagerConfig, RequestManagerStats,
     RequestPriority,

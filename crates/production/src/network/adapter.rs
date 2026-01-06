@@ -9,13 +9,10 @@
 use super::codec::CodecError;
 use super::codec_pool::CodecPoolHandle;
 use super::config::Libp2pConfig;
-use super::inbound_router::InboundRequest;
-use super::rate_limiter::{RateLimitConfig, SyncRateLimiter};
 use super::topic::Topic;
 use crate::metrics;
 use crate::network::config::VersionInteroperabilityMode;
 use crate::validation_batcher::ValidationBatcherHandle;
-use bytes::Bytes;
 use dashmap::DashMap;
 use futures::future::Either;
 use futures::{FutureExt, StreamExt};
@@ -26,10 +23,10 @@ use libp2p::core::transport::{OrTransport, Transport};
 use libp2p::core::upgrade::Version;
 use libp2p::{
     gossipsub, identify, identity, kad,
-    request_response::{self, ProtocolSupport, ResponseChannel},
     swarm::{NetworkBehaviour, SwarmEvent},
-    Multiaddr, PeerId as Libp2pPeerId, StreamProtocol, Swarm, SwarmBuilder,
+    Multiaddr, PeerId as Libp2pPeerId, Stream, StreamProtocol, Swarm, SwarmBuilder,
 };
+use libp2p_stream as stream;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -83,23 +80,14 @@ pub fn compute_peer_id_for_validator(public_key: &Bls12381G1PublicKey) -> Libp2p
     derive_libp2p_keypair(public_key).public().to_peer_id()
 }
 
-/// High-priority response commands sent to the swarm task.
-///
-/// These commands are processed before normal commands because they unblock
-/// other validators waiting for data. Using a separate channel ensures
-/// response commands don't get queued behind broadcasts/requests.
-#[derive(Debug)]
-pub enum ResponseCommand {
-    /// Send a response (by channel ID).
-    /// Used by InboundRouter to send responses for all request types.
-    SendResponse { channel_id: u64, response: Vec<u8> },
-}
-
 /// Commands sent to the swarm task.
 ///
 /// Commands are processed in priority order when using priority channels.
 /// Non-broadcast commands (Subscribe, Dial, etc.) are always processed
 /// with high priority since they're control operations.
+///
+/// NOTE: Request/response is now handled via raw streams (libp2p_stream).
+/// The adapter is a "dumb pipe" - RequestManager owns all timeout logic.
 #[derive(Debug)]
 pub enum SwarmCommand {
     /// Subscribe to a gossipsub topic.
@@ -127,54 +115,10 @@ pub enum SwarmCommand {
     GetConnectedPeers {
         response_tx: tokio::sync::oneshot::Sender<Vec<Libp2pPeerId>>,
     },
-
-    /// Send a request to a peer and wait for response (generic).
-    ///
-    /// The caller is responsible for encoding the request data.
-    /// Priority determines queue ordering.
-    Request {
-        peer: Libp2pPeerId,
-        data: Bytes,
-        priority: MessagePriority,
-        response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
-    },
-}
-
-/// A pending response channel with its creation time for timeout cleanup.
-struct PendingResponseChannel {
-    channel: ResponseChannel<Vec<u8>>,
-    created_at: std::time::Instant,
-}
-
-/// A pending outbound request awaiting response.
-struct PendingRequest {
-    /// The response channel for the request.
-    response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
-    /// When the request was created (for timeout cleanup).
-    created_at: std::time::Instant,
 }
 
 /// Interval for periodic maintenance tasks in the event loop.
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Timeout for pending response channels (after which they are cleaned up).
-/// This should be slightly longer than the request_timeout (5s) to allow for processing.
-const RESPONSE_CHANNEL_TIMEOUT: Duration = Duration::from_secs(7);
-
-/// Timeout for pending outbound requests (after which they are cleaned up).
-/// This is a safety net for when libp2p's OutboundFailure::Timeout doesn't fire.
-/// Set to 30s as an emergency backstop - RequestManager handles RTT-based timeouts
-/// much faster (500ms-5s), so this should rarely fire in practice.
-const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Maximum number of pending outbound requests before applying backpressure.
-/// When exceeded, new requests are rejected with `NetworkError::Backpressure`.
-/// This prevents runaway request accumulation when the network is saturated
-/// (e.g., when libp2p hits max sub-streams and requests fail fast, triggering
-/// rapid retries that accumulate in pending_requests).
-/// Set to ~1000 to allow healthy concurrency while preventing pathological cases
-/// where 5000+ requests accumulate.
-const MAX_PENDING_REQUESTS: usize = 1000;
 
 /// Delay before attempting to reconnect to a disconnected validator.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -263,8 +207,6 @@ impl PriorityCommandChannels {
             | SwarmCommand::Dial { .. }
             | SwarmCommand::GetListenAddresses { .. }
             | SwarmCommand::GetConnectedPeers { .. } => MessagePriority::Critical,
-            // Requests use their inherent priority from the caller
-            SwarmCommand::Request { priority, .. } => *priority,
         };
 
         match priority {
@@ -298,98 +240,18 @@ pub enum NetworkError {
     #[error("Invalid peer ID")]
     InvalidPeerId,
 
-    #[error("Network backpressure - too many pending requests")]
-    Backpressure,
+    #[error("Stream I/O error: {0}")]
+    StreamIo(String),
+
+    #[error("Stream open failed: {0}")]
+    StreamOpenFailed(String),
 }
 
-/// Codec for request-response protocol with length-prefixed messages.
-#[derive(Debug, Clone, Default)]
-struct HyperscaleCodec;
+/// Protocol identifier for raw stream requests.
+/// Version 2.0.0 indicates the switch from request-response to raw streams.
+pub const STREAM_PROTOCOL: StreamProtocol = StreamProtocol::new("/hyperscale/req/2.0.0");
 
-#[async_trait::async_trait]
-impl request_response::Codec for HyperscaleCodec {
-    type Protocol = StreamProtocol;
-    type Request = Bytes;
-    type Response = Vec<u8>;
-
-    async fn read_request<T>(
-        &mut self,
-        _protocol: &Self::Protocol,
-        io: &mut T,
-    ) -> std::io::Result<Self::Request>
-    where
-        T: futures::AsyncRead + Unpin + Send,
-    {
-        use futures::AsyncReadExt;
-
-        // Read 4-byte length prefix
-        let mut len_bytes = [0u8; 4];
-        io.read_exact(&mut len_bytes).await?;
-        let len = u32::from_be_bytes(len_bytes) as usize;
-
-        // Read message body
-        let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
-        Ok(Bytes::from(buf))
-    }
-
-    async fn read_response<T>(
-        &mut self,
-        _protocol: &Self::Protocol,
-        io: &mut T,
-    ) -> std::io::Result<Self::Response>
-    where
-        T: futures::AsyncRead + Unpin + Send,
-    {
-        use futures::AsyncReadExt;
-
-        let mut len_bytes = [0u8; 4];
-        io.read_exact(&mut len_bytes).await?;
-        let len = u32::from_be_bytes(len_bytes) as usize;
-
-        let mut buf = vec![0u8; len];
-        io.read_exact(&mut buf).await?;
-        Ok(buf)
-    }
-
-    async fn write_request<T>(
-        &mut self,
-        _protocol: &Self::Protocol,
-        io: &mut T,
-        req: Self::Request,
-    ) -> std::io::Result<()>
-    where
-        T: futures::AsyncWrite + Unpin + Send,
-    {
-        use futures::AsyncWriteExt;
-
-        let len = req.len() as u32;
-        io.write_all(&len.to_be_bytes()).await?;
-        io.write_all(&req).await?;
-        io.close().await?;
-        Ok(())
-    }
-
-    async fn write_response<T>(
-        &mut self,
-        _protocol: &Self::Protocol,
-        io: &mut T,
-        res: Self::Response,
-    ) -> std::io::Result<()>
-    where
-        T: futures::AsyncWrite + Unpin + Send,
-    {
-        use futures::AsyncWriteExt;
-
-        let len = res.len() as u32;
-        io.write_all(&len.to_be_bytes()).await?;
-        io.write_all(&res).await?;
-        io.close().await?;
-        Ok(())
-    }
-}
-
-/// libp2p network behaviour combining gossipsub, Kademlia, and request-response.
+/// libp2p network behaviour combining gossipsub, Kademlia, and raw streams.
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     /// Gossipsub for efficient broadcast.
@@ -398,8 +260,9 @@ struct Behaviour {
     /// Kademlia DHT for peer discovery.
     kademlia: kad::Behaviour<kad::store::MemoryStore>,
 
-    /// Request-response for sync block fetching.
-    request_response: request_response::Behaviour<HyperscaleCodec>,
+    /// Raw streams for request/response (replaces request_response).
+    /// RequestManager owns all timeout logic; this is just a "dumb pipe".
+    stream: stream::Behaviour,
 
     /// Identify protocol for peer versioning.
     identify: identify::Behaviour,
@@ -412,6 +275,9 @@ struct Behaviour {
 ///
 /// Uses gossipsub for efficient broadcast and Kademlia DHT for peer discovery.
 /// Commands are processed in priority order via [`PriorityCommandChannels`].
+///
+/// Request/response uses raw streams via libp2p_stream. The adapter is a "dumb pipe" -
+/// all timeout logic is owned by RequestManager.
 pub struct Libp2pAdapter {
     /// Local peer ID.
     local_peer_id: Libp2pPeerId,
@@ -427,10 +293,6 @@ pub struct Libp2pAdapter {
     /// Commands are routed to the appropriate channel based on message priority.
     priority_channels: PriorityCommandChannels,
 
-    /// High-priority response command channel.
-    /// Responses are processed first to unblock waiting validators.
-    response_tx: mpsc::UnboundedSender<ResponseCommand>,
-
     /// Consensus event channel for high-priority BFT messages (sent to runner).
     #[allow(dead_code)]
     consensus_tx: mpsc::Sender<Event>,
@@ -445,12 +307,6 @@ pub struct Libp2pAdapter {
     /// Shutdown signal sender.
     shutdown_tx: Option<mpsc::Sender<()>>,
 
-    /// Channel for inbound requests (sent to InboundRouter for processing).
-    /// Unbounded to avoid blocking the network event loop.
-    /// The InboundRouter discriminates request types and handles them appropriately.
-    #[allow(dead_code)]
-    inbound_request_tx: mpsc::UnboundedSender<InboundRequest>,
-
     /// Cached connected peer count (updated by background task).
     /// This avoids blocking the consensus loop to query peer count.
     cached_peer_count: Arc<AtomicUsize>,
@@ -458,8 +314,9 @@ pub struct Libp2pAdapter {
     /// Codec pool handle for async encoding (encoding happens on caller thread for broadcast).
     codec_pool: CodecPoolHandle,
 
-    /// Request timeout (from config) - used as safety timeout for requests.
-    request_timeout: Duration,
+    /// Stream control handle for opening outbound streams.
+    /// Cloneable and thread-safe.
+    stream_control: stream::Control,
 }
 
 impl Libp2pAdapter {
@@ -477,8 +334,7 @@ impl Libp2pAdapter {
     ///
     /// # Returns
     ///
-    /// A tuple of (adapter, inbound_request_rx) where:
-    /// - inbound_request_rx receives all inbound requests for the InboundRouter
+    /// The adapter wrapped in an Arc for shared ownership.
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: Libp2pConfig,
@@ -488,7 +344,7 @@ impl Libp2pAdapter {
         consensus_tx: mpsc::Sender<Event>,
         tx_validation_handle: ValidationBatcherHandle,
         codec_pool: CodecPoolHandle,
-    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<InboundRequest>), NetworkError> {
+    ) -> Result<Arc<Self>, NetworkError> {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
 
         info!(
@@ -529,17 +385,10 @@ impl Libp2pAdapter {
         // Set to server mode so we can serve routing information to peers
         kademlia.set_mode(Some(kad::Mode::Server));
 
-        // Set up request-response protocol with configured timeout.
-        // This timeout is the ultimate backstop for request-response operations.
-        // Higher-level timeouts (sync, fetch) should be shorter to enable retries.
-        let req_resp_config =
-            request_response::Config::default().with_request_timeout(config.request_timeout);
-        let protocols = std::iter::once((
-            StreamProtocol::new("/hyperscale/sync/1.0.0"),
-            ProtocolSupport::Full,
-        ));
-        let request_response =
-            request_response::Behaviour::with_codec(HyperscaleCodec, protocols, req_resp_config);
+        // Set up raw stream behaviour for request/response.
+        // This replaces request_response - RequestManager owns all timeout logic.
+        let stream_behaviour = stream::Behaviour::new();
+        let stream_control = stream_behaviour.new_control();
 
         // Connection limits
         let limits = libp2p::connection_limits::Behaviour::new(
@@ -565,7 +414,7 @@ impl Libp2pAdapter {
         let behaviour = Behaviour {
             gossipsub,
             kademlia,
-            request_response,
+            stream: stream_behaviour,
             identify,
             limits,
         };
@@ -709,17 +558,6 @@ impl Libp2pAdapter {
             (critical_rx, coordination_rx, finalization_rx, propagation_rx, background_rx),
         ) = PriorityCommandChannels::new();
 
-        // High-priority channel for response commands - processed before normal commands
-        // to minimize latency for validators waiting for sync data.
-        let (response_tx, response_rx) = mpsc::unbounded_channel();
-        // Unified inbound request channel - unbounded to avoid blocking the network event loop.
-        // The InboundRouter discriminates request types and handles them appropriately.
-        // Protection against unbounded growth:
-        // 1. Rate limiter limits requests per peer (validators get higher limit)
-        // 2. Response channel timeout cleanup prevents leaked channels
-        // 3. Peer reputation tracking penalizes misbehaving peers
-        // If memory growth is observed, consider bounded channels with try_send + drop.
-        let (inbound_request_tx, inbound_request_rx) = mpsc::unbounded_channel();
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
         let adapter = Arc::new(Self {
@@ -727,20 +565,14 @@ impl Libp2pAdapter {
             local_validator_id: validator_id,
             local_shard: shard,
             priority_channels,
-            response_tx,
             consensus_tx: consensus_tx.clone(),
             validator_peers: validator_peers.clone(),
             peer_validators: peer_validators.clone(),
             shutdown_tx: Some(shutdown_tx),
-            inbound_request_tx: inbound_request_tx.clone(),
             cached_peer_count: cached_peer_count.clone(),
             codec_pool: codec_pool.clone(),
-            request_timeout: config.request_timeout,
+            stream_control,
         });
-
-        // Spawn event loop (takes ownership of swarm)
-        // Use default rate limit config for now
-        let rate_limit_config = RateLimitConfig::default();
 
         // Spawn with panic catching - network loop panics are critical but shouldn't
         // crash the entire node. The process supervisor (systemd/k8s) should restart.
@@ -752,12 +584,9 @@ impl Libp2pAdapter {
                 finalization_rx,
                 propagation_rx,
                 background_rx,
-                response_rx,
                 consensus_tx,
                 peer_validators,
                 shutdown_rx,
-                inbound_request_tx,
-                rate_limit_config,
                 cached_peer_count,
                 shard,
                 tx_validation_handle,
@@ -793,7 +622,7 @@ impl Libp2pAdapter {
             }
         });
 
-        Ok((adapter, inbound_request_rx))
+        Ok(adapter)
     }
 
     /// Register a validator's peer ID mapping.
@@ -946,46 +775,21 @@ impl Libp2pAdapter {
         rx.await.unwrap_or_default()
     }
 
-    /// Send a request to a peer and wait for response.
+    /// Open a bidirectional stream to a peer.
     ///
-    /// This is the generic request method. The caller is responsible for:
-    /// - Encoding the request data
-    /// - Specifying the priority
-    /// - Decoding the response
+    /// This is the low-level stream API. The caller is responsible for:
+    /// - All timeout logic (via tokio::time::timeout wrapping read/write)
+    /// - Framing (length-prefixed messages)
+    /// - Closing the stream when done
     ///
-    /// Timeout is handled by libp2p's request_timeout (configured in Libp2pConfig).
-    /// Higher-level retry logic should be handled by RequestManager.
-    pub async fn request(
-        &self,
-        peer: Libp2pPeerId,
-        data: Bytes,
-        priority: MessagePriority,
-    ) -> Result<Vec<u8>, NetworkError> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        self.priority_channels
-            .send(SwarmCommand::Request {
-                peer,
-                data,
-                priority,
-                response_tx: tx,
-            })
-            .map_err(|_| NetworkError::NetworkShutdown)?;
-
-        // Safety timeout: if libp2p's request_timeout doesn't fire for some reason,
-        // we still need to return. This is a backstop for edge cases where the
-        // request gets "lost" in the swarm without triggering OutboundFailure.
-        match tokio::time::timeout(self.request_timeout, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(NetworkError::NetworkShutdown),
-            Err(_elapsed) => {
-                warn!(
-                    ?peer,
-                    "Request safety timeout - libp2p timeout may not have fired"
-                );
-                Err(NetworkError::Timeout)
-            }
-        }
+    /// RequestManager should be used for request/response patterns - it wraps
+    /// this method with proper timeout, retry, and peer selection logic.
+    pub async fn open_stream(&self, peer: Libp2pPeerId) -> Result<Stream, NetworkError> {
+        self.stream_control
+            .clone()
+            .open_stream(peer, STREAM_PROTOCOL)
+            .await
+            .map_err(|e| NetworkError::StreamOpenFailed(format!("{:?}", e)))
     }
 
     /// Get the peer ID for a validator (if known).
@@ -993,29 +797,25 @@ impl Libp2pAdapter {
         self.validator_peers.get(&validator_id).map(|r| *r)
     }
 
-    /// Send a generic response for an inbound request.
+    /// Get a clone of the stream control handle.
     ///
-    /// This is the unified response method used by `InboundRouter`.
-    /// The `channel_id` comes from the `InboundRequest` received via the request channel.
-    /// Uses the high-priority response channel to minimize latency.
-    pub fn respond(&self, channel_id: u64, response: Vec<u8>) -> Result<(), NetworkError> {
-        self.response_tx
-            .send(ResponseCommand::SendResponse {
-                channel_id,
-                response,
-            })
-            .map_err(|_| NetworkError::NetworkShutdown)
+    /// This allows external components (like InboundRouter) to accept incoming streams.
+    pub fn stream_control(&self) -> stream::Control {
+        self.stream_control.clone()
     }
 
     /// Background event loop that processes swarm events and routes messages.
     ///
     /// Commands are processed in priority order:
-    /// 1. Response commands (highest - unblock waiting validators)
-    /// 2. Critical priority (BFT consensus)
-    /// 3. Coordination priority (cross-shard 2PC)
-    /// 4. Finalization priority (certificate gossip)
-    /// 5. Propagation priority (transaction gossip)
-    /// 6. Background priority (sync operations)
+    /// 1. Critical priority (BFT consensus)
+    /// 2. Coordination priority (cross-shard 2PC)
+    /// 3. Finalization priority (certificate gossip)
+    /// 4. Propagation priority (transaction gossip)
+    /// 5. Background priority (sync operations)
+    ///
+    /// NOTE: Request/response is now handled via raw streams (libp2p_stream).
+    /// Inbound streams are accepted by InboundRouter, not this event loop.
+    /// Outbound streams are opened via open_stream() by RequestManager.
     #[allow(clippy::too_many_arguments)]
     async fn event_loop(
         mut swarm: Swarm<Behaviour>,
@@ -1024,34 +824,19 @@ impl Libp2pAdapter {
         mut finalization_rx: mpsc::UnboundedReceiver<SwarmCommand>,
         mut propagation_rx: mpsc::UnboundedReceiver<SwarmCommand>,
         mut background_rx: mpsc::UnboundedReceiver<SwarmCommand>,
-        mut response_rx: mpsc::UnboundedReceiver<ResponseCommand>,
         consensus_tx: mpsc::Sender<Event>,
         peer_validators: Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         mut shutdown_rx: mpsc::Receiver<()>,
-        inbound_request_tx: mpsc::UnboundedSender<InboundRequest>,
-        rate_limit_config: RateLimitConfig,
         cached_peer_count: Arc<AtomicUsize>,
         local_shard: ShardGroupId,
         tx_validation_handle: ValidationBatcherHandle,
         version_interop_mode: VersionInteroperabilityMode,
         codec_pool: CodecPoolHandle,
     ) {
-        // Track pending sync requests (outbound) with creation time for TTL cleanup
-        let mut pending_requests: HashMap<request_response::OutboundRequestId, PendingRequest> =
-            HashMap::new();
-
-        // Track pending response channels (inbound) - keyed by channel_id
-        // Uses PendingResponseChannel to track creation time for timeout cleanup
-        let mut pending_response_channels: HashMap<u64, PendingResponseChannel> = HashMap::new();
-        let mut next_channel_id: u64 = 0;
-
-        // Rate limiter for inbound sync requests
-        let mut rate_limiter = SyncRateLimiter::new(rate_limit_config);
-
         // Track whether we've bootstrapped Kademlia (do it once after first connection)
         let mut kademlia_bootstrapped = false;
 
-        // Maintenance timer for periodic tasks (cleanup, reconnection, Kademlia refresh)
+        // Maintenance timer for periodic tasks (reconnection, Kademlia refresh)
         let mut maintenance_interval = tokio::time::interval(MAINTENANCE_INTERVAL);
         maintenance_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1077,58 +862,7 @@ impl Libp2pAdapter {
                 _ = maintenance_interval.tick() => {
                     let now = std::time::Instant::now();
 
-                    // 1. Clean up timed-out pending response channels
-                    let before_count = pending_response_channels.len();
-                    pending_response_channels.retain(|channel_id, pending| {
-                        let expired = now.duration_since(pending.created_at) > RESPONSE_CHANNEL_TIMEOUT;
-                        if expired {
-                            warn!(
-                                channel_id,
-                                age_secs = now.duration_since(pending.created_at).as_secs(),
-                                "Cleaning up timed-out response channel"
-                            );
-                        }
-                        !expired
-                    });
-                    let cleaned = before_count - pending_response_channels.len();
-                    if cleaned > 0 {
-                        info!(cleaned, remaining = pending_response_channels.len(), "Cleaned up timed-out response channels");
-                    }
-
-                    // 2. Clean up timed-out pending requests (safety net for libp2p failures).
-                    // Normally libp2p's OutboundFailure::Timeout handles this, but if that
-                    // doesn't fire for some reason, we clean up here to prevent memory leaks.
-                    let expired_requests: Vec<_> = pending_requests
-                        .iter()
-                        .filter(|(_, pending)| {
-                            now.duration_since(pending.created_at) > PENDING_REQUEST_TIMEOUT
-                        })
-                        .map(|(req_id, _)| *req_id)
-                        .collect();
-
-                    for req_id in &expired_requests {
-                        if let Some(pending) = pending_requests.remove(req_id) {
-                            warn!(
-                                ?req_id,
-                                age_secs = now.duration_since(pending.created_at).as_secs(),
-                                "Cleaning up timed-out pending request (libp2p timeout may not have fired)"
-                            );
-                            // Send timeout error to the caller so they're not left waiting forever
-                            let _ = pending.response_tx.send(Err(NetworkError::Timeout));
-                        }
-                    }
-                    if !expired_requests.is_empty() {
-                        info!(
-                            cleaned_requests = expired_requests.len(),
-                            remaining = pending_requests.len(),
-                            "Cleaned up timed-out pending requests"
-                        );
-                    }
-
-                    // 4. Record metrics for pending response channels
-                    metrics::record_pending_response_channels(pending_response_channels.len());
-
-                    // 5. Process pending reconnections
+                    // Process pending reconnections
                     let reconnects_due: Vec<_> = pending_reconnects
                         .iter()
                         .filter(|(_, scheduled)| now >= **scheduled)
@@ -1162,7 +896,7 @@ impl Libp2pAdapter {
                         }
                     }
 
-                    // 4. Periodic Kademlia refresh for peer discovery
+                    // Periodic Kademlia refresh for peer discovery
                     if kademlia_bootstrapped && now.duration_since(last_kademlia_refresh) > KADEMLIA_REFRESH_INTERVAL {
                         // Trigger a random walk to discover new peers
                         let random_peer = Libp2pPeerId::random();
@@ -1171,7 +905,7 @@ impl Libp2pAdapter {
                         debug!("Triggered Kademlia refresh for peer discovery");
                     }
 
-                    // 5. Check connection health - ensure we're connected to validators
+                    // Check connection health - ensure we're connected to validators
                     let connected_count = swarm.connected_peers().count();
                     let validator_count = peer_validators.len();
                     if connected_count < validator_count / 2 {
@@ -1187,40 +921,18 @@ impl Libp2pAdapter {
                     }
                 }
 
-                // Handle high-priority response commands first.
-                // These unblock other validators waiting for sync data.
-                Some(cmd) = response_rx.recv() => {
-                    Self::handle_response_command(&mut swarm, cmd, &mut pending_response_channels);
-
-                    // Drain pending response commands (bounded to prevent tight loops)
-                    for _ in 0..MAX_COMMANDS_PER_DRAIN {
-                        match response_rx.try_recv() {
-                            Ok(cmd) => Self::handle_response_command(&mut swarm, cmd, &mut pending_response_channels),
-                            Err(_) => break,
-                        }
-                    }
-                }
-
                 // Priority-ordered command processing.
                 // Each priority level is checked in order, with higher priorities processed first.
                 // Within each branch, we also drain higher-priority channels to maintain ordering.
 
                 // Critical priority - BFT consensus messages (highest command priority)
                 Some(cmd) = critical_rx.recv() => {
-                    // Drain response commands first (even higher priority)
-                    for _ in 0..MAX_COMMANDS_PER_DRAIN {
-                        match response_rx.try_recv() {
-                            Ok(resp_cmd) => Self::handle_response_command(&mut swarm, resp_cmd, &mut pending_response_channels),
-                            Err(_) => break,
-                        }
-                    }
-
-                    Self::handle_command(&mut swarm, cmd, &mut pending_requests).await;
+                    Self::handle_command(&mut swarm, cmd);
 
                     // Drain critical commands
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match critical_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd),
                             Err(_) => break,
                         }
                     }
@@ -1228,21 +940,20 @@ impl Libp2pAdapter {
 
                 // Coordination priority - Cross-shard 2PC messages
                 Some(cmd) = coordination_rx.recv() => {
-                    // Drain higher priority channels first
-                    Self::drain_higher_priority_commands(
-                        &mut swarm,
-                        &mut response_rx,
-                        &mut critical_rx,
-                        &mut pending_response_channels,
-                        &mut pending_requests,
-                    ).await;
+                    // Drain critical commands first
+                    for _ in 0..MAX_COMMANDS_PER_DRAIN {
+                        match critical_rx.try_recv() {
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd),
+                            Err(_) => break,
+                        }
+                    }
 
-                    Self::handle_command(&mut swarm, cmd, &mut pending_requests).await;
+                    Self::handle_command(&mut swarm, cmd);
 
                     // Drain coordination commands
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match coordination_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd),
                             Err(_) => break,
                         }
                     }
@@ -1253,26 +964,16 @@ impl Libp2pAdapter {
                     // Drain higher priority channels first
                     Self::drain_higher_priority_commands(
                         &mut swarm,
-                        &mut response_rx,
                         &mut critical_rx,
-                        &mut pending_response_channels,
-                        &mut pending_requests,
-                    ).await;
+                        &mut coordination_rx,
+                    );
 
-                    // Also drain coordination
-                    for _ in 0..MAX_COMMANDS_PER_DRAIN {
-                        match coordination_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
-                            Err(_) => break,
-                        }
-                    }
-
-                    Self::handle_command(&mut swarm, cmd, &mut pending_requests).await;
+                    Self::handle_command(&mut swarm, cmd);
 
                     // Drain finalization commands
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match finalization_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd),
                             Err(_) => break,
                         }
                     }
@@ -1283,20 +984,17 @@ impl Libp2pAdapter {
                     // Drain all higher priority channels first
                     Self::drain_all_higher_priority_commands(
                         &mut swarm,
-                        &mut response_rx,
                         &mut critical_rx,
                         &mut coordination_rx,
                         &mut finalization_rx,
-                        &mut pending_response_channels,
-                        &mut pending_requests,
-                    ).await;
+                    );
 
-                    Self::handle_command(&mut swarm, cmd, &mut pending_requests).await;
+                    Self::handle_command(&mut swarm, cmd);
 
                     // Drain propagation commands
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match propagation_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd),
                             Err(_) => break,
                         }
                     }
@@ -1307,28 +1005,25 @@ impl Libp2pAdapter {
                     // Drain all higher priority channels first
                     Self::drain_all_higher_priority_commands(
                         &mut swarm,
-                        &mut response_rx,
                         &mut critical_rx,
                         &mut coordination_rx,
                         &mut finalization_rx,
-                        &mut pending_response_channels,
-                        &mut pending_requests,
-                    ).await;
+                    );
 
                     // Also drain propagation
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match propagation_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd),
                             Err(_) => break,
                         }
                     }
 
-                    Self::handle_command(&mut swarm, cmd, &mut pending_requests).await;
+                    Self::handle_command(&mut swarm, cmd);
 
                     // Drain background commands
                     for _ in 0..MAX_COMMANDS_PER_DRAIN {
                         match background_rx.try_recv() {
-                            Ok(cmd) => Self::handle_command(&mut swarm, cmd, &mut pending_requests).await,
+                            Ok(cmd) => Self::handle_command(&mut swarm, cmd),
                             Err(_) => break,
                         }
                     }
@@ -1434,11 +1129,6 @@ impl Libp2pAdapter {
                         event,
                         &consensus_tx,
                         &peer_validators,
-                        &mut pending_requests,
-                        &mut pending_response_channels,
-                        &mut next_channel_id,
-                        &inbound_request_tx,
-                        &mut rate_limiter,
                         local_shard,
                         &tx_validation_handle,
                         &codec_pool,
@@ -1455,11 +1145,7 @@ impl Libp2pAdapter {
     }
 
     /// Handle a normal-priority command from the adapter.
-    async fn handle_command(
-        swarm: &mut Swarm<Behaviour>,
-        cmd: SwarmCommand,
-        pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
-    ) {
+    fn handle_command(swarm: &mut Swarm<Behaviour>, cmd: SwarmCommand) {
         match cmd {
             SwarmCommand::Subscribe { topic } => {
                 let topic = gossipsub::IdentTopic::new(topic);
@@ -1510,112 +1196,20 @@ impl Libp2pAdapter {
                 let peers: Vec<Libp2pPeerId> = swarm.connected_peers().cloned().collect();
                 let _ = response_tx.send(peers);
             }
-            SwarmCommand::Request {
-                peer,
-                data,
-                priority: _,
-                response_tx,
-            } => {
-                // Apply backpressure if too many pending requests
-                if pending_requests.len() >= MAX_PENDING_REQUESTS {
-                    debug!(
-                        pending = pending_requests.len(),
-                        "Backpressure: rejecting request"
-                    );
-                    let _ = response_tx.send(Err(NetworkError::Backpressure));
-                } else {
-                    let req_id = swarm
-                        .behaviour_mut()
-                        .request_response
-                        .send_request(&peer, data);
-                    pending_requests.insert(
-                        req_id,
-                        PendingRequest {
-                            response_tx,
-                            created_at: std::time::Instant::now(),
-                        },
-                    );
-                    trace!(?peer, "Sent request");
-                }
-            }
         }
     }
 
-    /// Handle a high-priority response command.
-    /// These are processed before normal commands to minimize latency for waiting validators.
-    fn handle_response_command(
+    /// Drain critical and coordination priority commands.
+    /// Used before processing finalization-level commands.
+    fn drain_higher_priority_commands(
         swarm: &mut Swarm<Behaviour>,
-        cmd: ResponseCommand,
-        pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
-    ) {
-        let ResponseCommand::SendResponse {
-            channel_id,
-            response,
-        } = cmd;
-
-        if let Some(pending) = pending_response_channels.remove(&channel_id) {
-            if let Err(e) = swarm
-                .behaviour_mut()
-                .request_response
-                .send_response(pending.channel, response)
-            {
-                warn!("Failed to send response: {:?}", e);
-            }
-        } else {
-            warn!(channel_id, "Unknown channel ID for response");
-        }
-    }
-
-    /// Drain response and critical priority commands.
-    /// Used before processing coordination-level commands.
-    async fn drain_higher_priority_commands(
-        swarm: &mut Swarm<Behaviour>,
-        response_rx: &mut mpsc::UnboundedReceiver<ResponseCommand>,
-        critical_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
-        pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
-        pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
-    ) {
-        // Drain response commands
-        for _ in 0..MAX_COMMANDS_PER_DRAIN {
-            match response_rx.try_recv() {
-                Ok(cmd) => Self::handle_response_command(swarm, cmd, pending_response_channels),
-                Err(_) => break,
-            }
-        }
-
-        // Drain critical commands
-        for _ in 0..MAX_COMMANDS_PER_DRAIN {
-            match critical_rx.try_recv() {
-                Ok(cmd) => Self::handle_command(swarm, cmd, pending_requests).await,
-                Err(_) => break,
-            }
-        }
-    }
-
-    /// Drain all higher priority commands (response, critical, coordination, finalization).
-    /// Used before processing propagation and background level commands.
-    #[allow(clippy::too_many_arguments)]
-    async fn drain_all_higher_priority_commands(
-        swarm: &mut Swarm<Behaviour>,
-        response_rx: &mut mpsc::UnboundedReceiver<ResponseCommand>,
         critical_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
         coordination_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
-        finalization_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
-        pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
-        pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
     ) {
-        // Drain response commands
-        for _ in 0..MAX_COMMANDS_PER_DRAIN {
-            match response_rx.try_recv() {
-                Ok(cmd) => Self::handle_response_command(swarm, cmd, pending_response_channels),
-                Err(_) => break,
-            }
-        }
-
         // Drain critical commands
         for _ in 0..MAX_COMMANDS_PER_DRAIN {
             match critical_rx.try_recv() {
-                Ok(cmd) => Self::handle_command(swarm, cmd, pending_requests).await,
+                Ok(cmd) => Self::handle_command(swarm, cmd),
                 Err(_) => break,
             }
         }
@@ -1623,7 +1217,32 @@ impl Libp2pAdapter {
         // Drain coordination commands
         for _ in 0..MAX_COMMANDS_PER_DRAIN {
             match coordination_rx.try_recv() {
-                Ok(cmd) => Self::handle_command(swarm, cmd, pending_requests).await,
+                Ok(cmd) => Self::handle_command(swarm, cmd),
+                Err(_) => break,
+            }
+        }
+    }
+
+    /// Drain all higher priority commands (critical, coordination, finalization).
+    /// Used before processing propagation and background level commands.
+    fn drain_all_higher_priority_commands(
+        swarm: &mut Swarm<Behaviour>,
+        critical_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
+        coordination_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
+        finalization_rx: &mut mpsc::UnboundedReceiver<SwarmCommand>,
+    ) {
+        // Drain critical commands
+        for _ in 0..MAX_COMMANDS_PER_DRAIN {
+            match critical_rx.try_recv() {
+                Ok(cmd) => Self::handle_command(swarm, cmd),
+                Err(_) => break,
+            }
+        }
+
+        // Drain coordination commands
+        for _ in 0..MAX_COMMANDS_PER_DRAIN {
+            match coordination_rx.try_recv() {
+                Ok(cmd) => Self::handle_command(swarm, cmd),
                 Err(_) => break,
             }
         }
@@ -1631,7 +1250,7 @@ impl Libp2pAdapter {
         // Drain finalization commands
         for _ in 0..MAX_COMMANDS_PER_DRAIN {
             match finalization_rx.try_recv() {
-                Ok(cmd) => Self::handle_command(swarm, cmd, pending_requests).await,
+                Ok(cmd) => Self::handle_command(swarm, cmd),
                 Err(_) => break,
             }
         }
@@ -1640,16 +1259,14 @@ impl Libp2pAdapter {
 
 impl Libp2pAdapter {
     /// Handle a single swarm event.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// NOTE: Request/response handling has been removed from this event loop.
+    /// Inbound requests are now handled via raw streams by InboundRouter.
+    /// Outbound requests are handled via raw streams by RequestManager.
     async fn handle_swarm_event(
         event: SwarmEvent<BehaviourEvent>,
         consensus_tx: &mpsc::Sender<Event>,
         peer_validators: &Arc<DashMap<Libp2pPeerId, ValidatorId>>,
-        pending_requests: &mut HashMap<request_response::OutboundRequestId, PendingRequest>,
-        pending_response_channels: &mut HashMap<u64, PendingResponseChannel>,
-        next_channel_id: &mut u64,
-        inbound_request_tx: &mpsc::UnboundedSender<InboundRequest>,
-        rate_limiter: &mut SyncRateLimiter,
         local_shard: ShardGroupId,
         tx_validation_handle: &ValidationBatcherHandle,
         codec_pool: &CodecPoolHandle,
@@ -1742,116 +1359,6 @@ impl Libp2pAdapter {
                 debug!("Peer {:?} subscribed to topic: {}", peer_id, topic);
             }
 
-            // Handle request-response messages
-            SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(
-                request_response::Event::Message {
-                    peer: _,
-                    message:
-                        request_response::Message::Response {
-                            request_id,
-                            response,
-                        },
-                    ..
-                },
-            )) => {
-                // Route response to waiting requester
-                if let Some(pending) = pending_requests.remove(&request_id) {
-                    let _ = pending.response_tx.send(Ok(response));
-                }
-            }
-
-            // Handle request failures
-            SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(
-                request_response::Event::OutboundFailure {
-                    request_id,
-                    error,
-                    peer,
-                    ..
-                },
-            )) => {
-                // Log detailed failure info to understand connection timeouts
-                warn!(
-                    peer = %peer,
-                    request_id = ?request_id,
-                    error = ?error,
-                    "Request-response outbound failure"
-                );
-                if let Some(pending) = pending_requests.remove(&request_id) {
-                    // Map libp2p error to appropriate NetworkError
-                    // Timeout is special - RequestManager uses it for retry-same-peer logic
-                    let network_error = match error {
-                        request_response::OutboundFailure::Timeout => NetworkError::Timeout,
-                        other => NetworkError::NetworkError(format!("Request failed: {:?}", other)),
-                    };
-                    let _ = pending.response_tx.send(Err(network_error));
-                }
-            }
-
-            // Handle inbound requests (sync blocks or transaction fetch)
-            SwarmEvent::Behaviour(BehaviourEvent::RequestResponse(
-                request_response::Event::Message {
-                    peer,
-                    message:
-                        request_response::Message::Request {
-                            request, channel, ..
-                        },
-                    ..
-                },
-            )) => {
-                // Check if sender is a known validator
-                let is_validator = peer_validators.contains_key(&peer);
-
-                // Apply rate limiting
-                if !rate_limiter.check_request(&peer, is_validator) {
-                    warn!(
-                        peer = %peer,
-                        is_validator = is_validator,
-                        "Rate limited request from peer"
-                    );
-                    metrics::record_request_rate_limited(is_validator);
-                    // Drop the request by not processing it
-                    // The channel will be dropped, which signals failure to the requester
-                    return;
-                }
-
-                // Send to InboundRouter for handling.
-                // The router will discriminate between block sync, transaction fetch,
-                // and certificate fetch requests based on the payload structure.
-                {
-                    let channel_id = *next_channel_id;
-                    *next_channel_id = next_channel_id.wrapping_add(1);
-                    pending_response_channels.insert(
-                        channel_id,
-                        PendingResponseChannel {
-                            channel,
-                            created_at: std::time::Instant::now(),
-                        },
-                    );
-
-                    trace!(
-                        peer = %peer,
-                        len = request.len(),
-                        channel_id = channel_id,
-                        is_validator = is_validator,
-                        "Received inbound request, forwarding to router"
-                    );
-
-                    let inbound_request = InboundRequest {
-                        peer,
-                        payload: request,
-                        channel_id,
-                    };
-
-                    if inbound_request_tx.send(inbound_request).is_err() {
-                        warn!(
-                            channel_id,
-                            "Failed to send request to InboundRouter (channel closed)"
-                        );
-                        pending_response_channels.remove(&channel_id);
-                    }
-                }
-            }
-
             // Handle Identify events
             SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
                 peer_id,
@@ -1912,7 +1419,7 @@ impl Libp2pAdapter {
             }
 
             _ => {
-                // Ignore other events
+                // Ignore other events (including stream events which are handled via Control)
             }
         }
     }
@@ -1934,7 +1441,7 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let config = Libp2pConfig::default();
-        assert_eq!(config.request_timeout, Duration::from_secs(5));
         assert!(!config.listen_addresses.is_empty());
+        assert_eq!(config.max_message_size, 1024 * 1024 * 10); // 10MB
     }
 }

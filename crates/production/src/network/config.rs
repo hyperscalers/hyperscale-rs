@@ -12,7 +12,6 @@ use std::time::Duration;
 /// use std::time::Duration;
 ///
 /// let config = Libp2pConfig::default()
-///     .with_request_timeout(Duration::from_secs(60))
 ///     .with_gossipsub_heartbeat(Duration::from_millis(500));
 /// ```
 #[derive(Debug, Clone)]
@@ -27,14 +26,9 @@ pub struct Libp2pConfig {
     /// Default: empty (no bootstrap peers)
     pub bootstrap_peers: Vec<Multiaddr>,
 
-    /// Timeout for request-response operations (e.g., sync block fetch).
-    ///
-    /// Default: 30 seconds
-    pub request_timeout: Duration,
-
     /// Maximum message size in bytes.
     ///
-    /// Default: 1MB
+    /// Default: 10MB
     pub max_message_size: usize,
 
     /// Gossipsub heartbeat interval.
@@ -125,9 +119,6 @@ impl Default for Libp2pConfig {
             // Use QUIC by default with random port
             listen_addresses: vec!["/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap()],
             bootstrap_peers: vec![],
-            // 5 second timeout for request-response operations.
-            // This is the hard backstop - RequestManager handles retry logic above this layer.
-            request_timeout: Duration::from_secs(5),
             max_message_size: 1024 * 1024 * 10, // 10MB
             gossipsub_heartbeat: Duration::from_millis(100),
             idle_connection_timeout: Duration::from_secs(60),
@@ -149,12 +140,6 @@ impl Libp2pConfig {
     /// Set the bootstrap peers.
     pub fn with_bootstrap_peers(mut self, peers: Vec<Multiaddr>) -> Self {
         self.bootstrap_peers = peers;
-        self
-    }
-
-    /// Set the request timeout.
-    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
         self
     }
 
@@ -196,7 +181,6 @@ impl Libp2pConfig {
                 .parse()
                 .unwrap()],
             bootstrap_peers: vec![],
-            request_timeout: Duration::from_secs(5),
             max_message_size: 1024 * 1024, // 1MB
             gossipsub_heartbeat: Duration::from_millis(500),
             idle_connection_timeout: Duration::from_secs(30),
@@ -221,7 +205,6 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Libp2pConfig::default();
-        assert_eq!(config.request_timeout, Duration::from_secs(5));
         assert_eq!(config.max_message_size, 1024 * 1024 * 10); // 10MB
         assert_eq!(config.gossipsub_heartbeat, Duration::from_millis(100));
         assert!(!config.listen_addresses.is_empty());
@@ -231,11 +214,9 @@ mod tests {
     #[test]
     fn test_builder_methods() {
         let config = Libp2pConfig::default()
-            .with_request_timeout(Duration::from_secs(60))
             .with_max_message_size(128 * 1024)
             .with_gossipsub_heartbeat(Duration::from_millis(500));
 
-        assert_eq!(config.request_timeout, Duration::from_secs(60));
         assert_eq!(config.max_message_size, 128 * 1024);
         assert_eq!(config.gossipsub_heartbeat, Duration::from_millis(500));
     }
@@ -247,7 +228,6 @@ mod tests {
             config.listen_addresses[0].to_string(),
             "/ip4/127.0.0.1/udp/9000/quic-v1"
         );
-        assert_eq!(config.request_timeout, Duration::from_secs(5));
     }
 
     #[test]
