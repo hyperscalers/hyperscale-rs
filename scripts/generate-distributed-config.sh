@@ -286,8 +286,6 @@ upnp_enabled = false
 request_timeout_ms = 5000
 max_message_size = 16_777_216
 gossipsub_heartbeat_ms = 100
-direct_connection_limit = 200
-direct_connection_timeout_ms = 2000
 idle_connection_timeout_ms = 30000
 keep_alive_interval_ms = 5000
 
