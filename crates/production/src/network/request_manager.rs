@@ -42,9 +42,19 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
-/// Default timeout for stream operations.
-/// This is the hard timeout - speculative retry happens before this.
-const DEFAULT_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// Maximum timeout for stream operations.
+const MAX_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Minimum timeout for stream operations (floor for RTT-based calculation).
+const MIN_STREAM_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Default timeout for stream operations when no RTT data is available.
+/// Based on default RTT of 100ms × 5 = 500ms, but we use 1s to be safe for cold start.
+const DEFAULT_STREAM_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Multiplier for RTT to compute stream timeout.
+/// Timeout = RTT * multiplier, clamped to [MIN, MAX].
+const STREAM_TIMEOUT_RTT_MULTIPLIER: f64 = 5.0;
 
 /// Errors from request operations.
 #[derive(Debug, Error)]
@@ -138,9 +148,9 @@ impl Default for RequestManagerConfig {
             max_per_peer: 8,
             retries_before_rotation: 3, // Retry same peer 3x before rotating (good for packet loss)
             max_total_attempts: 15,     // More attempts to handle lossy networks
-            initial_backoff: Duration::from_millis(150),
-            max_backoff: Duration::from_secs(5),
-            backoff_multiplier: 1.5, // Slower backoff growth for packet loss scenarios
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_millis(500), // Cap backoff to match stream timeout
+            backoff_multiplier: 1.5,
             target_success_rate: 0.5,
             min_concurrent: 4,
             speculative_retry_multiplier: 2.0, // Speculative retry after 2× RTT
@@ -444,7 +454,8 @@ impl RequestManager {
         request: &Request,
         _priority: RequestPriority,
     ) -> Result<Vec<u8>, NetworkError> {
-        Self::send_request_static(&self.adapter, peer, request, _priority).await
+        let timeout = self.compute_stream_timeout(peer);
+        Self::send_request_static(&self.adapter, peer, request, timeout).await
     }
 
     /// Send a request with speculative retry based on RTT.
@@ -474,15 +485,23 @@ impl RequestManager {
             return Ok((result, start.elapsed()));
         }
 
+        // Compute stream timeout based on peer RTT (do this before spawning)
+        let stream_timeout = self.compute_stream_timeout(peer);
+        debug!(
+            ?peer,
+            stream_timeout_ms = stream_timeout.as_millis(),
+            speculative_timeout_ms = speculative_timeout.as_millis(),
+            "Computed timeouts for request"
+        );
+
         // Send initial request (as a spawned task so it keeps running even if we move on)
         let adapter_clone = self.adapter.clone();
         let request_clone = request.clone();
         let peer_clone = *peer;
-        let priority_clone = priority;
 
         // Spawn the first request so it continues running independently
         let mut first_handle = tokio::spawn(async move {
-            Self::send_request_static(&adapter_clone, &peer_clone, &request_clone, priority_clone)
+            Self::send_request_static(&adapter_clone, &peer_clone, &request_clone, stream_timeout)
                 .await
         });
 
@@ -516,8 +535,13 @@ impl RequestManager {
         let peer_clone2 = *peer;
 
         let mut second_handle = tokio::spawn(async move {
-            Self::send_request_static(&adapter_clone2, &peer_clone2, &request_clone2, priority)
-                .await
+            Self::send_request_static(
+                &adapter_clone2,
+                &peer_clone2,
+                &request_clone2,
+                stream_timeout,
+            )
+            .await
         });
 
         // Race both requests - first SUCCESS wins.
@@ -572,12 +596,12 @@ impl RequestManager {
     /// 3. Read [4-byte big-endian length][response data]
     /// 4. Close stream
     ///
-    /// All I/O operations are wrapped with timeouts.
+    /// All I/O operations are wrapped with the provided timeout (RTT-based).
     async fn send_request_static(
         adapter: &Arc<Libp2pAdapter>,
         peer: &PeerId,
         request: &Request,
-        _priority: RequestPriority,
+        timeout: Duration,
     ) -> Result<Vec<u8>, NetworkError> {
         use hyperscale_messages::request::{GetCertificatesRequest, GetTransactionsRequest};
 
@@ -601,14 +625,14 @@ impl RequestManager {
         };
 
         // Open stream with timeout
-        let mut stream = tokio::time::timeout(DEFAULT_STREAM_TIMEOUT, adapter.open_stream(*peer))
+        let mut stream = tokio::time::timeout(timeout, adapter.open_stream(*peer))
             .await
             .map_err(|_| NetworkError::Timeout)?
             .map_err(|e| NetworkError::StreamOpenFailed(format!("{:?}", e)))?;
 
         // Write length-prefixed request with timeout
         let len = data.len() as u32;
-        let write_result = tokio::time::timeout(DEFAULT_STREAM_TIMEOUT, async {
+        let write_result = tokio::time::timeout(timeout, async {
             stream.write_all(&len.to_be_bytes()).await?;
             stream.write_all(&data).await?;
             stream.flush().await?;
@@ -625,7 +649,7 @@ impl RequestManager {
         }
 
         // Read length-prefixed response with timeout
-        let read_result = tokio::time::timeout(DEFAULT_STREAM_TIMEOUT, async {
+        let read_result = tokio::time::timeout(timeout, async {
             let mut len_bytes = [0u8; 4];
             stream.read_exact(&mut len_bytes).await?;
             let response_len = u32::from_be_bytes(len_bytes) as usize;
@@ -665,6 +689,21 @@ impl RequestManager {
                 )
             })
             .unwrap_or(self.config.speculative_retry_max) // No RTT data = no speculative retry
+    }
+
+    /// Compute the stream timeout based on peer's RTT history.
+    ///
+    /// Uses 5× RTT as the timeout, clamped to reasonable bounds.
+    /// This ensures we don't wait 5 seconds for a peer with 100ms RTT.
+    fn compute_stream_timeout(&self, peer: &PeerId) -> Duration {
+        self.health
+            .get_health(peer)
+            .map(|h| {
+                let rtt_based =
+                    Duration::from_secs_f64(h.rtt_ema_secs * STREAM_TIMEOUT_RTT_MULTIPLIER);
+                rtt_based.clamp(MIN_STREAM_TIMEOUT, MAX_STREAM_TIMEOUT)
+            })
+            .unwrap_or(DEFAULT_STREAM_TIMEOUT) // No RTT data = use 1s default (not 5s)
     }
 
     /// Compute initial backoff based on peer RTT and priority.
@@ -827,7 +866,7 @@ mod tests {
         assert_eq!(config.max_concurrent, 64);
         assert_eq!(config.retries_before_rotation, 3); // Good for packet loss
         assert_eq!(config.max_total_attempts, 15); // More attempts for lossy networks
-        assert_eq!(config.initial_backoff, Duration::from_millis(150));
+        assert_eq!(config.initial_backoff, Duration::from_millis(100));
     }
 
     #[test]
