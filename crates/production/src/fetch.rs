@@ -136,6 +136,9 @@ struct BlockFetchState {
     missing_hashes: HashSet<Hash>,
     /// Hashes currently being fetched (in-flight).
     in_flight_hashes: HashSet<Hash>,
+    /// Hashes that have been successfully received.
+    /// Prevents re-adding hashes when BFT re-requests.
+    received_hashes: HashSet<Hash>,
     /// Number of in-flight fetch operations for this block.
     in_flight_count: usize,
 }
@@ -147,6 +150,7 @@ impl BlockFetchState {
             kind,
             missing_hashes: hashes.into_iter().collect(),
             in_flight_hashes: HashSet::new(),
+            received_hashes: HashSet::new(),
             in_flight_count: 0,
         }
     }
@@ -172,12 +176,18 @@ impl BlockFetchState {
         self.in_flight_count += 1;
     }
 
-    /// Mark hashes as received (removes from both missing and in-flight).
+    /// Mark hashes as received (removes from both missing and in-flight, adds to received).
     fn mark_received(&mut self, hashes: impl IntoIterator<Item = Hash>) {
         for hash in hashes {
             self.missing_hashes.remove(&hash);
             self.in_flight_hashes.remove(&hash);
+            self.received_hashes.insert(hash);
         }
+    }
+
+    /// Check if a hash has already been received.
+    fn was_received(&self, hash: &Hash) -> bool {
+        self.received_hashes.contains(hash)
     }
 
     /// Mark a fetch operation as failed (return hashes to missing pool).
@@ -309,10 +319,11 @@ impl FetchManager {
 
         // Check if we already have a fetch for this block
         if let Some(state) = self.tx_fetches.get_mut(&block_hash) {
-            // Add any new hashes
+            // Add any new hashes (but skip already-received or in-flight)
             let count_before = state.missing_hashes.len();
             for hash in tx_hashes {
-                if !state.in_flight_hashes.contains(&hash) {
+                // Don't re-add hashes that are already received or in-flight
+                if !state.was_received(&hash) && !state.in_flight_hashes.contains(&hash) {
                     state.missing_hashes.insert(hash);
                 }
             }
@@ -349,10 +360,11 @@ impl FetchManager {
 
         // Check if we already have a fetch for this block
         if let Some(state) = self.cert_fetches.get_mut(&block_hash) {
-            // Add any new hashes
+            // Add any new hashes (but skip already-received or in-flight)
             let count_before = state.missing_hashes.len();
             for hash in cert_hashes {
-                if !state.in_flight_hashes.contains(&hash) {
+                // Don't re-add hashes that are already received or in-flight
+                if !state.was_received(&hash) && !state.in_flight_hashes.contains(&hash) {
                     state.missing_hashes.insert(hash);
                 }
             }
@@ -842,5 +854,37 @@ mod tests {
     fn test_fetch_kind_str() {
         assert_eq!(FetchKind::Transaction.as_str(), "transaction");
         assert_eq!(FetchKind::Certificate.as_str(), "certificate");
+    }
+
+    #[test]
+    fn test_received_hashes_prevents_readd() {
+        let block_hash = Hash::from_bytes(b"test_block");
+        let hashes = vec![
+            Hash::from_bytes(b"tx1_hash_data_here"),
+            Hash::from_bytes(b"tx2_hash_data_here"),
+        ];
+
+        let mut state = BlockFetchState::new(block_hash, FetchKind::Transaction, hashes.clone());
+
+        // Receive first hash
+        state.mark_received(vec![hashes[0]]);
+        assert!(state.was_received(&hashes[0]));
+        assert!(!state.was_received(&hashes[1]));
+
+        // Verify the received hash is no longer in missing_hashes
+        assert!(!state.missing_hashes.contains(&hashes[0]));
+        assert!(state.missing_hashes.contains(&hashes[1]));
+
+        // Try to "re-add" via the check used in request_transactions/request_certificates
+        // This simulates BFT re-requesting hashes after they were already received
+        let should_add =
+            !state.was_received(&hashes[0]) && !state.in_flight_hashes.contains(&hashes[0]);
+        assert!(!should_add, "Should not re-add already received hash");
+
+        // But a new hash should be addable
+        let new_hash = Hash::from_bytes(b"tx3_hash_data_here");
+        let should_add_new =
+            !state.was_received(&new_hash) && !state.in_flight_hashes.contains(&new_hash);
+        assert!(should_add_new, "Should allow adding new hash");
     }
 }
