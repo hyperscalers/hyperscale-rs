@@ -161,6 +161,8 @@ struct PendingResponseChannel {
 struct PendingRequest {
     /// The response channel for the request.
     response_tx: tokio::sync::oneshot::Sender<Result<Vec<u8>, NetworkError>>,
+    /// When the request was created (for timeout cleanup).
+    created_at: std::time::Instant,
 }
 
 /// Interval for periodic maintenance tasks in the event loop.
@@ -173,6 +175,11 @@ const RESPONSE_CHANNEL_TIMEOUT: Duration = Duration::from_secs(7);
 /// Timeout for pending direct messages (fire-and-forget, no response expected).
 /// These are cleaned up periodically since we don't strictly need acknowledgement.
 const DIRECT_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for pending outbound requests (after which they are cleaned up).
+/// This is a safety net for when libp2p's OutboundFailure::Timeout doesn't fire.
+/// Set to 10s (2x request_timeout of 5s) to give libp2p ample time to handle normally.
+const PENDING_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum number of pending outbound requests before applying backpressure.
 /// When exceeded, new requests are rejected with `NetworkError::Backpressure`.
@@ -469,6 +476,9 @@ pub struct Libp2pAdapter {
 
     /// Codec pool handle for async encoding (encoding happens on caller thread for broadcast).
     codec_pool: CodecPoolHandle,
+
+    /// Request timeout (from config) - used as safety timeout for requests.
+    request_timeout: Duration,
 }
 
 impl Libp2pAdapter {
@@ -752,6 +762,7 @@ impl Libp2pAdapter {
             cached_peer_count: cached_peer_count.clone(),
             direct_network: direct_network.clone(),
             codec_pool: codec_pool.clone(),
+            request_timeout: config.request_timeout,
         });
 
         // Spawn event loop (takes ownership of swarm)
@@ -993,9 +1004,19 @@ impl Libp2pAdapter {
             })
             .map_err(|_| NetworkError::NetworkShutdown)?;
 
-        match rx.await {
-            Ok(result) => result,
-            Err(_) => Err(NetworkError::NetworkShutdown),
+        // Safety timeout: if libp2p's request_timeout doesn't fire for some reason,
+        // we still need to return. This is a backstop for edge cases where the
+        // request gets "lost" in the swarm without triggering OutboundFailure.
+        match tokio::time::timeout(self.request_timeout, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(NetworkError::NetworkShutdown),
+            Err(_elapsed) => {
+                warn!(
+                    ?peer,
+                    "Request safety timeout - libp2p timeout may not have fired"
+                );
+                Err(NetworkError::Timeout)
+            }
         }
     }
 
@@ -1123,9 +1144,35 @@ impl Libp2pAdapter {
                         trace!(cleaned_direct, "Cleaned up old direct message tracking entries");
                     }
 
-                    // Note: pending_requests cleanup is handled by libp2p's OutboundFailure events.
-                    // The request_timeout (5s) triggers OutboundFailure::Timeout which we handle
-                    // in the event loop, sending NetworkError::Timeout to the caller.
+                    // 3. Clean up timed-out pending requests (safety net for libp2p failures).
+                    // Normally libp2p's OutboundFailure::Timeout handles this, but if that
+                    // doesn't fire for some reason, we clean up here to prevent memory leaks.
+                    let expired_requests: Vec<_> = pending_requests
+                        .iter()
+                        .filter(|(_, pending)| {
+                            now.duration_since(pending.created_at) > PENDING_REQUEST_TIMEOUT
+                        })
+                        .map(|(req_id, _)| *req_id)
+                        .collect();
+
+                    for req_id in &expired_requests {
+                        if let Some(pending) = pending_requests.remove(req_id) {
+                            warn!(
+                                ?req_id,
+                                age_secs = now.duration_since(pending.created_at).as_secs(),
+                                "Cleaning up timed-out pending request (libp2p timeout may not have fired)"
+                            );
+                            // Send timeout error to the caller so they're not left waiting forever
+                            let _ = pending.response_tx.send(Err(NetworkError::Timeout));
+                        }
+                    }
+                    if !expired_requests.is_empty() {
+                        info!(
+                            cleaned_requests = expired_requests.len(),
+                            remaining = pending_requests.len(),
+                            "Cleaned up timed-out pending requests"
+                        );
+                    }
 
                     // 4. Record metrics for pending response channels
                     metrics::record_pending_response_channels(pending_response_channels.len());
@@ -1553,7 +1600,13 @@ impl Libp2pAdapter {
                         .behaviour_mut()
                         .request_response
                         .send_request(&peer, data);
-                    pending_requests.insert(req_id, PendingRequest { response_tx });
+                    pending_requests.insert(
+                        req_id,
+                        PendingRequest {
+                            response_tx,
+                            created_at: std::time::Instant::now(),
+                        },
+                    );
                     trace!(?peer, "Sent request");
                 }
             }

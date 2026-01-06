@@ -309,10 +309,25 @@ impl RequestManager {
             // Record request start
             self.health.record_request_started(&current_peer);
 
+            debug!(
+                peer = ?current_peer,
+                attempts,
+                request = %request_desc,
+                "Starting request attempt"
+            );
+
             // Use speculative retry to race against packet loss
             let result = self
                 .send_request_with_speculative_retry(&current_peer, &request, priority)
                 .await;
+
+            debug!(
+                peer = ?current_peer,
+                attempts,
+                request = %request_desc,
+                result_ok = result.is_ok(),
+                "Request attempt completed"
+            );
 
             match result {
                 Ok((response, elapsed)) => {
@@ -379,12 +394,16 @@ impl RequestManager {
                     self.health.record_failure(&current_peer, false);
                     self.reduce_concurrency();
 
+                    // Count backpressure as an attempt to avoid infinite loops.
+                    // While backpressure is a local resource issue, we can't spin forever.
+                    attempts += 1;
+
                     info!(
                         request = %request_desc,
+                        attempts,
                         "Backpressure detected, reducing concurrency and backing off"
                     );
                     tokio::time::sleep(Duration::from_millis(200)).await;
-                    // Don't count as attempt—this is a local resource issue
                 }
 
                 Err(NetworkError::NetworkShutdown) => {
