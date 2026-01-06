@@ -782,7 +782,16 @@ impl StateMachine for NodeStateMachine {
                     .on_sync_block_ready_to_apply(block.clone(), qc.clone());
             }
             Event::SyncComplete { .. } => {
-                return self.bft.on_sync_complete();
+                let mut actions = self.bft.on_sync_complete();
+                // Reschedule the cleanup timer. During sync, the cleanup timer
+                // fires StartSync actions which don't reschedule the timer.
+                // Now that sync is complete, we need to restart the cleanup timer
+                // to resume periodic fetch checks and sync health monitoring.
+                actions.push(Action::SetTimer {
+                    id: TimerId::Cleanup,
+                    duration: self.bft.config().cleanup_interval,
+                });
+                return actions;
             }
             Event::ChainMetadataFetched { height, hash, qc } => {
                 return self
