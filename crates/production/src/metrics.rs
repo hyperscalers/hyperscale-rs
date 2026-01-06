@@ -105,7 +105,6 @@ pub struct Metrics {
     pub libp2p_bandwidth_out_bytes: Counter,
     pub libp2p_pending_response_channels: Gauge,
     pub libp2p_event_loop_panics: Counter,
-    pub libp2p_requests_rate_limited: CounterVec,
 
     // === Sync ===
     pub sync_blocks_behind: Gauge,
@@ -124,9 +123,6 @@ pub struct Metrics {
     pub fetch_started: CounterVec,
     pub fetch_completed: CounterVec,
     pub fetch_failed: CounterVec,
-    pub fetch_timeouts: CounterVec,
-    pub fetch_stale_cleanups: CounterVec,
-    pub fetch_event_send_failed: CounterVec,
     pub fetch_items_received: CounterVec,
     pub fetch_items_sent: CounterVec,
     pub fetch_latency: HistogramVec,
@@ -487,13 +483,6 @@ impl Metrics {
             )
             .unwrap(),
 
-            libp2p_requests_rate_limited: register_counter_vec!(
-                "hyperscale_libp2p_requests_rate_limited_total",
-                "Inbound requests dropped due to rate limiting",
-                &["peer_type"] // "validator" or "unknown"
-            )
-            .unwrap(),
-
             // Sync
             sync_blocks_behind: register_gauge!(
                 "hyperscale_sync_blocks_behind",
@@ -582,27 +571,6 @@ impl Metrics {
                 "hyperscale_fetch_failed_total",
                 "Total fetch operations failed",
                 &["kind"]
-            )
-            .unwrap(),
-
-            fetch_timeouts: register_counter_vec!(
-                "hyperscale_fetch_timeouts_total",
-                "Fetch operations that timed out (subset of failed)",
-                &["kind"]
-            )
-            .unwrap(),
-
-            fetch_stale_cleanups: register_counter_vec!(
-                "hyperscale_fetch_stale_cleanups_total",
-                "Fetch operations cleaned up as stale (exceeded stale_fetch_timeout)",
-                &["kind"]
-            )
-            .unwrap(),
-
-            fetch_event_send_failed: register_counter_vec!(
-                "hyperscale_fetch_event_send_failed_total",
-                "Failed to send fetch result event to BFT (critical)",
-                &["event_type"]
             )
             .unwrap(),
 
@@ -937,16 +905,6 @@ pub fn record_pending_response_channels(count: usize) {
     metrics().libp2p_pending_response_channels.set(count as f64);
 }
 
-/// Record a rate-limited request.
-/// `is_validator` indicates whether the peer was a known validator.
-pub fn record_request_rate_limited(is_validator: bool) {
-    let peer_type = if is_validator { "validator" } else { "unknown" };
-    metrics()
-        .libp2p_requests_rate_limited
-        .with_label_values(&[peer_type])
-        .inc();
-}
-
 /// Record a network event loop panic (critical error).
 pub fn record_network_event_loop_panic() {
     metrics().libp2p_event_loop_panics.inc();
@@ -1208,31 +1166,6 @@ pub fn record_fetch_failed(kind: crate::fetch::FetchKind) {
     metrics()
         .fetch_failed
         .with_label_values(&[kind.as_str()])
-        .inc();
-}
-
-/// Record a fetch operation timeout (also counts as failed).
-pub fn record_fetch_timeout(kind: crate::fetch::FetchKind) {
-    metrics()
-        .fetch_timeouts
-        .with_label_values(&[kind.as_str()])
-        .inc();
-}
-
-/// Record a stale fetch cleanup (fetch exceeded stale_fetch_timeout).
-pub fn record_fetch_stale_cleanup(kind: crate::fetch::FetchKind) {
-    metrics()
-        .fetch_stale_cleanups
-        .with_label_values(&[kind.as_str()])
-        .inc();
-}
-
-/// Record a failed attempt to send fetch result event to BFT.
-/// This is a critical error - the data was fetched but BFT won't receive it.
-pub fn record_fetch_event_send_failed(event_type: &str) {
-    metrics()
-        .fetch_event_send_failed
-        .with_label_values(&[event_type])
         .inc();
 }
 

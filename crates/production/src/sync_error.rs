@@ -29,7 +29,6 @@ use std::fmt;
 /// - [`PeerMismatch`](Self::PeerMismatch) - Response from wrong peer (routing issue)
 /// - [`RequestIdMismatch`](Self::RequestIdMismatch) - Response for different request
 /// - [`StateMismatch`](Self::StateMismatch) - Block doesn't extend current state
-/// - [`Timeout`](Self::Timeout) - Request timed out
 /// - [`NetworkError`](Self::NetworkError) - Network-level failure
 /// - [`EmptyResponse`](Self::EmptyResponse) - Peer doesn't have the requested block
 /// - [`Backpressure`](Self::Backpressure) - Network adapter is overloaded
@@ -59,12 +58,6 @@ pub enum SyncResponseError {
         height: u64,
         /// Current committed height.
         current: u64,
-    },
-
-    /// Request timed out waiting for response.
-    Timeout {
-        /// Height that was being requested.
-        height: u64,
     },
 
     /// Network-level error (connection lost, send failed, etc.).
@@ -144,8 +137,8 @@ impl SyncResponseError {
     /// let err = SyncResponseError::QcSignatureInvalid { height: 100 };
     /// assert!(err.is_malicious());
     ///
-    /// // Non-malicious: network timeout
-    /// let err = SyncResponseError::Timeout { height: 100 };
+    /// // Non-malicious: network error
+    /// let err = SyncResponseError::NetworkError { reason: "connection lost".into() };
     /// assert!(!err.is_malicious());
     /// ```
     pub fn is_malicious(&self) -> bool {
@@ -186,7 +179,6 @@ impl SyncResponseError {
             Self::PeerMismatch => "peer_mismatch",
             Self::RequestIdMismatch { .. } => "request_id_mismatch",
             Self::StateMismatch { .. } => "state_mismatch",
-            Self::Timeout { .. } => "timeout",
             Self::NetworkError { .. } => "network_error",
             Self::EmptyResponse { .. } => "empty_response",
             Self::Backpressure => "backpressure",
@@ -218,9 +210,6 @@ impl fmt::Display for SyncResponseError {
                     "block at height {} doesn't extend current state at {}",
                     height, current
                 )
-            }
-            Self::Timeout { height } => {
-                write!(f, "sync request timed out for height {}", height)
             }
             Self::NetworkError { reason } => {
                 write!(f, "network error: {}", reason)
@@ -312,7 +301,6 @@ mod tests {
                 height: 10,
                 current: 20,
             },
-            SyncResponseError::Timeout { height: 5 },
             SyncResponseError::NetworkError {
                 reason: "connection lost".to_string(),
             },
@@ -331,7 +319,6 @@ mod tests {
     #[test]
     fn test_backpressure_detection() {
         assert!(SyncResponseError::Backpressure.is_backpressure());
-        assert!(!SyncResponseError::Timeout { height: 1 }.is_backpressure());
         assert!(!SyncResponseError::NetworkError {
             reason: "test".to_string()
         }
@@ -351,7 +338,6 @@ mod tests {
                 height: 1,
                 current: 2,
             },
-            SyncResponseError::Timeout { height: 1 },
             SyncResponseError::NetworkError {
                 reason: "test".to_string(),
             },

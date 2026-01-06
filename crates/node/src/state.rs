@@ -960,19 +960,6 @@ impl StateMachine for NodeStateMachine {
                 );
             }
 
-            // ═══════════════════════════════════════════════════════════════════════
-            // Fetch Failure Events
-            // When transaction/certificate fetch fails permanently, remove the pending
-            // block so sync can be triggered when a later block header arrives.
-            // ═══════════════════════════════════════════════════════════════════════
-            Event::TransactionFetchFailed { block_hash } => {
-                return self.bft.on_fetch_failed(*block_hash);
-            }
-
-            Event::CertificateFetchFailed { block_hash } => {
-                return self.bft.on_fetch_failed(*block_hash);
-            }
-
             // TransactionCertificateReceived is handled directly by the production runner
             // (verified and persisted to storage without going through the state machine).
             // In simulation, we handle it in the simulator's runner, not here.

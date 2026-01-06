@@ -126,7 +126,6 @@ tcp_fallback_port = $TCP_BASE_PORT
 version_interop_mode = "relaxed"
 bootstrap_peers = []
 upnp_enabled = true
-request_timeout_ms = 10000
 max_message_size = 10485760
 gossipsub_heartbeat_ms = 100
 

@@ -597,26 +597,6 @@ pub enum Event {
         certificate: TransactionCertificate,
     },
 
-    /// Transaction fetch permanently failed (priority: Internal).
-    ///
-    /// Emitted by the runner when it gives up on fetching transactions after
-    /// max retries. BFT should remove the pending block to allow sync to be
-    /// triggered when a later block header arrives.
-    TransactionFetchFailed {
-        /// Hash of the block whose transactions failed to fetch.
-        block_hash: Hash,
-    },
-
-    /// Certificate fetch permanently failed (priority: Internal).
-    ///
-    /// Emitted by the runner when it gives up on fetching certificates after
-    /// max retries. BFT should remove the pending block to allow sync to be
-    /// triggered when a later block header arrives.
-    CertificateFetchFailed {
-        /// Hash of the block whose certificates failed to fetch.
-        block_hash: Hash,
-    },
-
     // ═══════════════════════════════════════════════════════════════════════
     // Gossiped Certificate Verification (priority: Internal)
     // Runner verifies gossiped TransactionCertificates before persisting.
@@ -713,13 +693,9 @@ impl Event {
 
             Event::SyncBlockReceived { .. } => EventPriority::Network,
 
-            // Transaction fetch events (runner handles retries)
+            // Transaction/certificate fetch events (runner handles retries)
             Event::TransactionReceived { .. } => EventPriority::Network,
-            Event::TransactionFetchFailed { .. } => EventPriority::Internal,
-
-            // Certificate fetch events (runner handles retries)
             Event::CertificateReceived { .. } => EventPriority::Network,
-            Event::CertificateFetchFailed { .. } => EventPriority::Internal,
             Event::FetchedCertificateVerified { .. } => EventPriority::Internal,
 
             // BLS aggregation callbacks
@@ -823,13 +799,9 @@ impl Event {
             Event::SyncBlockReadyToApply { .. } => "SyncBlockReadyToApply",
             Event::SyncComplete { .. } => "SyncComplete",
 
-            // Transaction Fetch Protocol (runner handles retries)
+            // Transaction/Certificate Fetch Protocol (runner handles retries)
             Event::TransactionReceived { .. } => "TransactionReceived",
-            Event::TransactionFetchFailed { .. } => "TransactionFetchFailed",
-
-            // Certificate Fetch Protocol (runner handles retries)
             Event::CertificateReceived { .. } => "CertificateReceived",
-            Event::CertificateFetchFailed { .. } => "CertificateFetchFailed",
             Event::FetchedCertificateVerified { .. } => "FetchedCertificateVerified",
 
             // BLS aggregation callbacks

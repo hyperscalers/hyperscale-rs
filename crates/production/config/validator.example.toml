@@ -41,9 +41,6 @@ bootstrap_peers = [
     # "/ip4/10.0.0.1/udp/9000/quic-v1/p2p/12D3KooW...",
 ]
 
-# Request-response timeout (milliseconds)
-request_timeout_ms = 30000
-
 # Maximum message size (bytes)
 max_message_size = 65536
 
