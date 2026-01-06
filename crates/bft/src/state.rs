@@ -440,13 +440,20 @@ impl BftState {
     /// Handle sync complete (from runner via Event::SyncComplete).
     ///
     /// Re-enables normal block proposals and view changes.
+    /// Also triggers fetch requests for any pending blocks that still need data,
+    /// since fetching was suppressed during sync.
     pub fn on_sync_complete(&mut self) -> Vec<Action> {
         info!(
             validator = ?self.validator_id(),
             "Sync complete, resuming normal consensus"
         );
         self.set_syncing(false);
-        vec![]
+
+        // Resume fetching for any pending blocks that still need data.
+        // During sync, check_pending_block_fetches() returns empty because we
+        // don't want to compete with sync for network resources. Now that sync
+        // is done, we need to fetch any missing transactions/certificates.
+        self.check_pending_block_fetches()
     }
 
     /// Record leader activity (resets the view change timeout).
@@ -7754,8 +7761,13 @@ mod tests {
         let actions = state.on_sync_complete();
         assert!(!state.is_syncing());
 
-        // Should return empty actions (just state change)
-        assert!(actions.is_empty());
+        // May return fetch actions for pending blocks (or empty if no pending blocks)
+        // The main assertion is that syncing is now false
+        // In this test state there are no pending blocks, so actions should be empty
+        assert!(
+            actions.is_empty(),
+            "Fresh test state has no pending blocks, so no fetch actions expected"
+        );
     }
 
     #[test]
