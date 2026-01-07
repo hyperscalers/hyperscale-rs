@@ -123,6 +123,16 @@ pub struct BftState {
     /// Current view/round number.
     view: u64,
 
+    /// View number at the start of the current height.
+    ///
+    /// Used for linear backoff calculation: `rounds_at_height = view - view_at_height_start`.
+    /// Reset to `view` when `committed_height` advances (height transition).
+    ///
+    /// This enables Tendermint-style timeout backoff where the view change timeout
+    /// increases linearly with each failed round at the same height, preventing
+    /// synchronized timeout storms across validators.
+    view_at_height_start: u64,
+
     /// Latest committed block height.
     committed_height: u64,
 
@@ -300,6 +310,7 @@ impl BftState {
             shard_group,
             topology,
             view: 0,
+            view_at_height_start: 0,
             committed_height: recovered.committed_height,
             committed_hash: recovered
                 .committed_hash
@@ -533,10 +544,41 @@ impl BftState {
         }
     }
 
+    /// Compute the current view change timeout with linear backoff.
+    ///
+    /// The timeout increases linearly with each round at the current height:
+    /// `timeout = min(base + increment * rounds_at_height, max_timeout)`
+    ///
+    /// # Global Agreement
+    ///
+    /// Validators implicitly agree on the backoff because:
+    /// 1. Round numbers are embedded in block headers and QCs
+    /// 2. View sync keeps validators aligned on round numbers
+    /// 3. All validators use the same formula to compute timeout
+    ///
+    /// When a validator receives a header or QC at round R, they know R rounds
+    /// have been attempted, and can compute the same timeout as the proposer.
+    fn current_view_change_timeout(&self) -> Duration {
+        let base = self.config.view_change_timeout;
+        let increment = self.config.view_change_timeout_increment;
+
+        // Rounds attempted at current height (saturating to handle edge cases)
+        let rounds_at_height = self.view.saturating_sub(self.view_at_height_start);
+
+        // Linear backoff: base + increment * rounds
+        let timeout = base + increment * rounds_at_height as u32;
+
+        // Apply optional cap
+        match self.config.view_change_timeout_max {
+            Some(max) => timeout.min(max),
+            None => timeout,
+        }
+    }
+
     /// Check if we should advance the round due to timeout.
     ///
-    /// Returns true if the leader has been inactive for longer than
-    /// `view_change_timeout`.
+    /// Returns true if the leader has been inactive for longer than the
+    /// current timeout (which increases with each failed round at this height).
     ///
     /// View changes should only happen when the leader fails to propose,
     /// not just because vote aggregation is slow.
@@ -546,7 +588,7 @@ impl BftState {
     /// the view if the leader fails. When a syncing node becomes the proposer
     /// after a view change, they propose an empty sync block.
     fn should_advance_round(&self) -> bool {
-        let timeout = self.config.view_change_timeout;
+        let timeout = self.current_view_change_timeout();
         self.now.saturating_sub(self.last_leader_activity) >= timeout
     }
 
@@ -567,9 +609,14 @@ impl BftState {
         // Clear the header reset tracker since we're changing rounds
         self.last_header_reset = None;
 
+        let timeout = self.current_view_change_timeout();
+        let rounds_at_height = self.view.saturating_sub(self.view_at_height_start);
+
         info!(
             validator = ?self.validator_id(),
             view = self.view,
+            rounds_at_height = rounds_at_height,
+            timeout_ms = timeout.as_millis(),
             "Round timeout - advancing round (implicit view change)"
         );
 
@@ -667,6 +714,9 @@ impl BftState {
             self.committed_hash = h;
         }
         self.latest_qc = qc.clone();
+
+        // Reset backoff tracking - we're starting fresh at this height
+        self.view_at_height_start = self.view;
 
         // Clean up any votes for heights at or below the committed height.
         // This handles the case where we loaded votes from storage that are now stale.
@@ -2820,6 +2870,9 @@ impl BftState {
             self.committed_height = height;
             self.committed_hash = current_hash;
 
+            // Reset backoff tracking - new height means fresh round counting
+            self.view_at_height_start = self.view;
+
             // Record leader activity - block committing indicates progress
             self.record_leader_activity();
 
@@ -3114,6 +3167,9 @@ impl BftState {
         // Update committed state
         self.committed_height = height;
         self.committed_hash = block_hash;
+
+        // Reset backoff tracking - new height means fresh round counting
+        self.view_at_height_start = self.view;
 
         // Update latest QC (this may help us catch up further)
         if self
@@ -8245,6 +8301,310 @@ mod tests {
         assert!(
             has_vote,
             "Syncing validator should vote for their own sync block"
+        );
+    }
+
+    #[test]
+    fn test_linear_backoff_timeout() {
+        let mut state = make_test_state();
+        state.set_time(Duration::from_secs(100));
+
+        // Default config: base = 3s, increment = 500ms
+        let base_timeout = Duration::from_secs(3);
+        let increment = Duration::from_millis(500);
+
+        // At round 0 (same as view_at_height_start), timeout should be base
+        assert_eq!(state.view, 0);
+        assert_eq!(state.view_at_height_start, 0);
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout,
+            "Round 0: timeout should equal base timeout"
+        );
+
+        // Advance round (view change)
+        state.view = 1;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout + increment,
+            "Round 1: timeout should be base + 1*increment"
+        );
+
+        // Advance round again
+        state.view = 2;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout + increment * 2,
+            "Round 2: timeout should be base + 2*increment"
+        );
+
+        // Advance round to 5
+        state.view = 5;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout + increment * 5,
+            "Round 5: timeout should be base + 5*increment"
+        );
+    }
+
+    #[test]
+    fn test_linear_backoff_resets_on_height_advance() {
+        let mut state = make_test_state();
+        state.set_time(Duration::from_secs(100));
+
+        let base_timeout = Duration::from_secs(3);
+        let increment = Duration::from_millis(500);
+
+        // Simulate several view changes at height 0
+        state.view = 5;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout + increment * 5,
+            "After 5 view changes: timeout should include backoff"
+        );
+
+        // Simulate height advance (commit)
+        // This should reset view_at_height_start to current view
+        state.committed_height = 1;
+        state.view_at_height_start = state.view; // This is what happens in commit
+
+        // Now timeout should be back to base (0 rounds at new height)
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout,
+            "After height advance: timeout should reset to base"
+        );
+
+        // Another view change at new height
+        state.view = 6;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout + increment,
+            "After 1 view change at new height: timeout should be base + increment"
+        );
+    }
+
+    #[test]
+    fn test_linear_backoff_zero_increment_disables_backoff() {
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+
+        let config = BftConfig::default().with_view_change_timeout_increment(Duration::ZERO);
+
+        let mut state = BftState::new(
+            0,
+            {
+                let key_bytes = keys[0].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
+            topology,
+            config,
+            RecoveredState::default(),
+        );
+
+        state.set_time(Duration::from_secs(100));
+        let base_timeout = Duration::from_secs(3);
+
+        // With zero increment, timeout should always be base regardless of round
+        assert_eq!(state.current_view_change_timeout(), base_timeout);
+
+        state.view = 10;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout,
+            "With zero increment, timeout should remain constant"
+        );
+
+        state.view = 100;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout,
+            "Even at high round numbers, timeout should remain constant"
+        );
+    }
+
+    #[test]
+    fn test_linear_backoff_affects_should_advance_round() {
+        let mut state = make_test_state();
+
+        // Set up: we're at round 0, last_leader_activity = 0
+        state.view = 0;
+        state.view_at_height_start = 0;
+        state.last_leader_activity = Duration::ZERO;
+
+        // Base timeout is 3s
+        // At exactly 3s, should trigger (rounds_at_height = 0)
+        state.set_time(Duration::from_secs(3));
+        assert!(
+            state.should_advance_round(),
+            "At base timeout, should trigger view change"
+        );
+
+        // Now at round 1, timeout should be 3.5s
+        // Reset and simulate we're at round 1
+        state.view = 1;
+        state.last_leader_activity = Duration::from_secs(10);
+
+        // At 3s after last activity, should NOT trigger (need 3.5s)
+        state.set_time(Duration::from_secs(13));
+        assert!(
+            !state.should_advance_round(),
+            "At round 1, 3s is not enough (need 3.5s)"
+        );
+
+        // At 3.5s after last activity, should trigger
+        state.set_time(Duration::from_millis(13500));
+        assert!(
+            state.should_advance_round(),
+            "At round 1, 3.5s should trigger view change"
+        );
+
+        // At round 5, timeout should be 5.5s
+        state.view = 5;
+        state.last_leader_activity = Duration::from_secs(20);
+
+        // At 5s after last activity, should NOT trigger
+        state.set_time(Duration::from_secs(25));
+        assert!(
+            !state.should_advance_round(),
+            "At round 5, 5s is not enough (need 5.5s)"
+        );
+
+        // At 5.5s after last activity, should trigger
+        state.set_time(Duration::from_millis(25500));
+        assert!(
+            state.should_advance_round(),
+            "At round 5, 5.5s should trigger view change"
+        );
+    }
+
+    #[test]
+    fn test_linear_backoff_respects_max_cap() {
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+
+        // Configure with a 10s max cap (default is 30s)
+        let config =
+            BftConfig::default().with_view_change_timeout_max(Some(Duration::from_secs(10)));
+
+        let mut state = BftState::new(
+            0,
+            {
+                let key_bytes = keys[0].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
+            topology,
+            config,
+            RecoveredState::default(),
+        );
+
+        state.set_time(Duration::from_secs(100));
+
+        let base_timeout = Duration::from_secs(3);
+        let increment = Duration::from_millis(500);
+        let max_timeout = Duration::from_secs(10);
+
+        // At low rounds, timeout follows linear formula
+        state.view = 5;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout + increment * 5,
+            "At round 5: should be 5.5s (below cap)"
+        );
+
+        // At round 14: 3s + 14*0.5s = 10s (exactly at cap)
+        state.view = 14;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            max_timeout,
+            "At round 14: should be exactly at cap (10s)"
+        );
+
+        // At round 20: would be 13s, but capped at 10s
+        state.view = 20;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            max_timeout,
+            "At round 20: should be capped at 10s"
+        );
+
+        // At round 100: would be 53s, but capped at 10s
+        state.view = 100;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            max_timeout,
+            "At round 100: should still be capped at 10s"
+        );
+    }
+
+    #[test]
+    fn test_linear_backoff_no_cap_tendermint_style() {
+        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ValidatorInfo {
+                validator_id: ValidatorId(i as u64),
+                public_key: k.public_key(),
+                voting_power: 1,
+            })
+            .collect();
+        let validator_set = ValidatorSet::new(validators);
+        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+
+        // Configure with no cap (Tendermint behavior)
+        let config = BftConfig::default().with_view_change_timeout_max(None);
+
+        let mut state = BftState::new(
+            0,
+            {
+                let key_bytes = keys[0].to_bytes();
+                Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
+            },
+            topology,
+            config,
+            RecoveredState::default(),
+        );
+
+        state.set_time(Duration::from_secs(100));
+
+        let base_timeout = Duration::from_secs(3);
+        let increment = Duration::from_millis(500);
+
+        // At round 100: 3s + 100*0.5s = 53s (no cap)
+        state.view = 100;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout + increment * 100,
+            "At round 100 with no cap: should be 53s"
+        );
+
+        // At round 1000: 3s + 1000*0.5s = 503s (no cap)
+        state.view = 1000;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout + increment * 1000,
+            "At round 1000 with no cap: should be 503s (~8.4 minutes)"
         );
     }
 }

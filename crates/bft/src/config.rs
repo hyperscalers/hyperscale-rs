@@ -8,8 +8,29 @@ pub struct BftConfig {
     /// Interval between proposal attempts.
     pub proposal_interval: Duration,
 
-    /// Timeout for view change.
+    /// Base timeout for view change (before backoff).
     pub view_change_timeout: Duration,
+
+    /// Linear backoff increment per round at the same height.
+    ///
+    /// When view changes occur, the timeout increases linearly:
+    /// `effective_timeout = view_change_timeout + view_change_timeout_increment * rounds_at_height`
+    ///
+    /// This prevents "thundering herd" problems where all validators timeout
+    /// simultaneously under network stress, causing cascading view changes.
+    ///
+    /// Set to `Duration::ZERO` to disable backoff (constant timeout).
+    pub view_change_timeout_increment: Duration,
+
+    /// Maximum view change timeout (caps the linear backoff).
+    ///
+    /// If set, the effective timeout is capped at this value regardless of
+    /// how many rounds have elapsed. This provides operational predictability
+    /// at the cost of potentially slower convergence in extreme network conditions.
+    ///
+    /// Set to `None` to disable the cap.
+    /// Default: 30 seconds (reasonable upper bound for most networks).
+    pub view_change_timeout_max: Option<Duration>,
 
     /// Maximum transactions per block.
     pub max_transactions_per_block: usize,
@@ -67,6 +88,8 @@ impl Default for BftConfig {
         Self {
             proposal_interval: Duration::from_millis(300),
             view_change_timeout: Duration::from_secs(3),
+            view_change_timeout_increment: Duration::from_millis(500),
+            view_change_timeout_max: Some(Duration::from_secs(30)),
             max_transactions_per_block: 1024,
             max_certificates_per_block: 4096,
             max_timestamp_delay_ms: 30_000,
@@ -95,6 +118,20 @@ impl BftConfig {
     /// Set the view change timeout.
     pub fn with_view_change_timeout(mut self, timeout: Duration) -> Self {
         self.view_change_timeout = timeout;
+        self
+    }
+
+    /// Set the view change timeout increment (linear backoff per round).
+    pub fn with_view_change_timeout_increment(mut self, increment: Duration) -> Self {
+        self.view_change_timeout_increment = increment;
+        self
+    }
+
+    /// Set the maximum view change timeout (caps the linear backoff).
+    ///
+    /// Pass `None` to disable the cap.
+    pub fn with_view_change_timeout_max(mut self, max: Option<Duration>) -> Self {
+        self.view_change_timeout_max = max;
         self
     }
 
