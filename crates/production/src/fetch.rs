@@ -495,17 +495,6 @@ impl FetchManager {
 
         metrics::record_fetch_items_received(FetchKind::Transaction, received_count);
 
-        // Persist to storage
-        if !transactions.is_empty() {
-            let storage = self.storage.clone();
-            let txs = transactions.clone();
-            tokio::spawn(async move {
-                for tx in &txs {
-                    storage.put_transaction(tx);
-                }
-            });
-        }
-
         // Deliver to BFT
         if !transactions.is_empty() {
             let event = Event::TransactionReceived {

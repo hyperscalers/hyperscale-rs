@@ -655,18 +655,25 @@ impl ProductionRunnerBuilder {
         let recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>> =
             Arc::new(QuickCache::new(10_000));
 
+        // Create shared transaction cache to avoid redundant RocksDB writes.
+        // Transactions are inserted on gossip reception and served to fetch requests.
+        // Final persistence happens atomically in put_block_denormalized on block commit.
+        let recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>> =
+            Arc::new(QuickCache::new(50_000));
+
         // Spawn InboundRouter to handle all inbound requests.
         // This replaces the old fetch_handler and handles:
         // - Block sync requests (block data)
         // - Transaction fetch requests (tx data by hash)
         // - Certificate fetch requests (cert data by hash)
-        // Hot data is served from RocksDB's block cache for performance.
-        // Also checks recently_built_certs cache first to handle the race
-        // between cert creation and storage write completion.
+        // Hot data is served from in-memory caches first, falling back to RocksDB.
+        // - recently_received_txs: transactions received via gossip (not yet committed)
+        // - recently_built_certs: certificates built locally (not yet committed)
         let inbound_router = InboundRouter::spawn(
             InboundRouterConfig::default(),
             network.clone(),
             storage.clone(),
+            recently_received_txs.clone(),
             recently_built_certs.clone(),
         );
 
@@ -725,6 +732,7 @@ impl ProductionRunnerBuilder {
             rpc_submitted_txs: std::collections::HashMap::new(),
             pending_gossip_cert_verifications: std::collections::HashMap::new(),
             recently_built_certs,
+            recently_received_txs,
             pending_gossiped_cert_batch: PendingGossipedCertBatch::default(),
             gossiped_cert_batch_deadline: None,
         })
@@ -871,6 +879,9 @@ pub struct ProductionRunner {
     /// Capacity of 10,000 is sufficient - certificates older than this will have
     /// long since been included in blocks.
     recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
+    /// LRU cache of recently received transactions (via gossip or RPC).
+    /// Serves fetch requests before block commit, avoiding redundant RocksDB writes.
+    recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
     /// Pending gossiped certificates accumulated for batch signature verification.
     /// Uses a 15ms batching window with backpressure to prevent crypto pool saturation.
     pending_gossiped_cert_batch: PendingGossipedCertBatch,
@@ -1632,13 +1643,11 @@ impl ProductionRunner {
                             }
                         }
 
-                        // Eagerly store transaction in RocksDB so peers can fetch it
-                        // before block commit. This is idempotent - storing twice is safe.
-                        let storage = self.storage.clone();
-                        let tx_clone = Arc::clone(tx);
-                        tokio::spawn(async move {
-                            storage.put_transaction(&tx_clone);
-                        });
+                        // Cache the transaction so peers can fetch it before block commit.
+                        // Previously this eagerly wrote to RocksDB, causing 2-3x write
+                        // amplification (gossip + block commit). Now we cache in memory
+                        // and let put_block_denormalized handle the single atomic write.
+                        self.recently_received_txs.insert(tx.hash(), Arc::clone(tx));
                     }
 
                     let now = self.wall_clock_time();

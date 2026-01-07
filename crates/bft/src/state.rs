@@ -2609,12 +2609,6 @@ impl BftState {
         // (which happens when block N+1 gets certified). If we only persist on commit,
         // there's a window where the QC exists but the block isn't in storage,
         // causing sync failures when other validators try to fetch it.
-        //
-        // TODO: This creates duplicate persistence - blocks are persisted here on QC
-        // formation AND again on commit (in on_block_ready_to_commit). RocksDB handles
-        // this efficiently (idempotent overwrite), but we should consider either:
-        // (a) tracking persisted blocks to skip duplicates, or
-        // (b) removing PersistBlock from the commit path for non-synced blocks.
         let block = if let Some(pending) = self.pending_blocks.get(&block_hash) {
             pending.block().map(|b| (*b).clone())
         } else if let Some((block, _)) = self.certified_blocks.get(&block_hash) {
@@ -2795,7 +2789,7 @@ impl BftState {
         }
 
         // Commit this block and any buffered subsequent blocks
-        self.commit_block_and_buffered(block_hash, qc)
+        self.commit_block_and_buffered(block_hash)
     }
 
     /// Check if a block that just became complete has a pending commit waiting for it.
@@ -2822,14 +2816,9 @@ impl BftState {
     /// This is called when we have a block at the expected height (committed_height + 1).
     /// After committing, we check for buffered commits at the next height and process
     /// them in order.
-    fn commit_block_and_buffered(
-        &mut self,
-        block_hash: Hash,
-        qc: QuorumCertificate,
-    ) -> Vec<Action> {
+    fn commit_block_and_buffered(&mut self, block_hash: Hash) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut current_hash = block_hash;
-        let mut current_qc = qc;
 
         loop {
             // Get the block to commit
@@ -2884,35 +2873,6 @@ impl BftState {
                 actions.push(Action::CancelFetch { block_hash });
             }
 
-            // For sync protocol: we need to store the QC that certifies THIS block.
-            //
-            // The `current_qc` parameter is the QC for the child block (block N+1) that triggered
-            // this commit via the 2-chain rule. Its `aggregated_signature` contains signatures
-            // over block N+1's hash, NOT this block's hash.
-            //
-            // The QC that certifies THIS block (block N) contains signatures over block N's hash.
-            // This QC is embedded in the child block's header as `parent_qc`.
-            //
-            // We look up the child block using `current_qc.block_hash` and extract its `parent_qc`.
-            let child_block_hash = current_qc.block_hash;
-            let commit_qc = if let Some(pending) = self.pending_blocks.get(&child_block_hash) {
-                pending.header().parent_qc.clone()
-            } else if let Some((child_block, _)) = self.certified_blocks.get(&child_block_hash) {
-                child_block.header.parent_qc.clone()
-            } else {
-                // Fallback: shouldn't happen in normal operation, but log a warning
-                warn!(
-                    "Child block {} not found when committing block {}, using block's own parent_qc",
-                    child_block_hash, current_hash
-                );
-                block.header.parent_qc.clone()
-            };
-
-            // Emit actions for this block
-            actions.push(Action::PersistBlock {
-                block: block.clone(),
-                qc: commit_qc,
-            });
             actions.push(Action::EmitCommittedBlock {
                 block: block.clone(),
             });
@@ -2926,13 +2886,12 @@ impl BftState {
 
             // Check if the next height is buffered
             let next_height = height + 1;
-            if let Some((next_hash, next_qc)) = self.pending_commits.remove(&next_height) {
+            if let Some((next_hash, _next_qc)) = self.pending_commits.remove(&next_height) {
                 debug!(
                     "Processing buffered commit for height {} after committing {}",
                     next_height, height
                 );
                 current_hash = next_hash;
-                current_qc = next_qc;
             } else {
                 // No more buffered commits
                 break;

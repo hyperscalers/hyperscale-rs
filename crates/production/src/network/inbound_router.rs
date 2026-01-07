@@ -44,7 +44,9 @@ use hyperscale_messages::request::{
     GetCertificatesRequest, GetTransactionsRequest, FETCH_TYPE_CERTIFICATE, FETCH_TYPE_TRANSACTION,
 };
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
-use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, TransactionCertificate};
+use hyperscale_types::{
+    Block, BlockHeight, Hash, QuorumCertificate, RoutableTransaction, TransactionCertificate,
+};
 use libp2p::{PeerId, Stream};
 use quick_cache::sync::Cache as QuickCache;
 use std::sync::Arc;
@@ -102,6 +104,9 @@ pub struct InboundRouter {
     config: InboundRouterConfig,
     /// Storage for reading blocks, transactions, and certificates.
     storage: Arc<RocksDbStorage>,
+    /// Cache for recently received transactions (not yet committed to storage).
+    /// Checked before RocksDB to serve fetch requests for transactions received via gossip.
+    recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
     /// Cache for recently built certificates (not yet persisted to storage).
     recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
 }
@@ -111,11 +116,13 @@ impl InboundRouter {
     pub fn new(
         config: InboundRouterConfig,
         storage: Arc<RocksDbStorage>,
+        recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
         recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
     ) -> Self {
         Self {
             config,
             storage,
+            recently_received_txs,
             recently_built_certs,
         }
     }
@@ -127,10 +134,16 @@ impl InboundRouter {
         config: InboundRouterConfig,
         adapter: Arc<Libp2pAdapter>,
         storage: Arc<RocksDbStorage>,
+        recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
         recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
     ) -> InboundRouterHandle {
         let join_handle = tokio::spawn(async move {
-            let router = Arc::new(Self::new(config, storage, recently_built_certs));
+            let router = Arc::new(Self::new(
+                config,
+                storage,
+                recently_received_txs,
+                recently_built_certs,
+            ));
             let mut control = adapter.stream_control();
 
             // Register to accept incoming streams for our protocol
@@ -309,19 +322,39 @@ impl InboundRouter {
             &tx_request.tx_hashes
         };
 
-        // Read directly from RocksDB storage
-        let found_transactions: Vec<Arc<_>> = self
-            .storage
-            .get_transactions_batch(hashes_to_fetch)
-            .into_iter()
-            .map(Arc::new)
-            .collect();
+        // First check the in-memory cache for recently received transactions.
+        // This serves transactions that were received via gossip but not yet
+        // committed to storage (avoiding redundant RocksDB writes).
+        let mut found_transactions = Vec::with_capacity(hashes_to_fetch.len());
+        let mut missing_hashes = Vec::new();
+
+        for hash in hashes_to_fetch {
+            if let Some(tx) = self.recently_received_txs.get(hash) {
+                found_transactions.push(tx);
+            } else {
+                missing_hashes.push(*hash);
+            }
+        }
+
+        // Fall back to RocksDB for any not found in cache
+        if !missing_hashes.is_empty() {
+            let from_storage: Vec<Arc<_>> = self
+                .storage
+                .get_transactions_batch(&missing_hashes)
+                .into_iter()
+                .map(Arc::new)
+                .collect();
+            found_transactions.extend(from_storage);
+        }
+
         let found_count = found_transactions.len();
+        let from_cache = hashes_to_fetch.len() - missing_hashes.len();
 
         debug!(
             block_hash = ?tx_request.block_hash,
             requested = requested_count,
             found = found_count,
+            from_cache = from_cache,
             "Responding to transaction fetch request"
         );
 
