@@ -38,7 +38,11 @@ pub struct Libp2pConfig {
 
     /// Idle connection timeout.
     ///
-    /// Default: 60 seconds
+    /// Connections are closed after this duration of inactivity. Reduced from 60s
+    /// to enable faster dead peer detection - important for BFT consensus where
+    /// view change timeout is 3-30s and we need quick peer rotation on failure.
+    ///
+    /// Default: 30 seconds
     pub idle_connection_timeout: Duration,
 
     /// QUIC keep-alive interval.
@@ -121,7 +125,7 @@ impl Default for Libp2pConfig {
             bootstrap_peers: vec![],
             max_message_size: 1024 * 1024 * 10, // 10MB
             gossipsub_heartbeat: Duration::from_millis(100),
-            idle_connection_timeout: Duration::from_secs(60),
+            idle_connection_timeout: Duration::from_secs(30),
             keep_alive_interval: Duration::from_secs(15),
             tcp_fallback_enabled: true,
             tcp_fallback_port: None,

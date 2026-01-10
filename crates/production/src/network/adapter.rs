@@ -423,9 +423,21 @@ impl Libp2pAdapter {
         let mut swarm = if config.tcp_fallback_enabled {
             info!("Building swarm with QUIC (primary) + TCP (fallback)");
 
-            // QUIC configuration
+            // QUIC configuration optimized for BFT consensus workloads:
+            // - High stream concurrency for parallel sync and cross-shard coordination
+            // - Large flow control windows for block transfers
+            // - Fast handshake timeout to match our stream timeout ceiling
+            // - Aggressive keep-alive for rapid failure detection
             let mut quic_config = libp2p::quic::Config::new(&keypair);
             quic_config.max_concurrent_stream_limit = 4096;
+            // Handshake timeout: fail fast on unreachable peers during connection setup.
+            // Matches our max stream timeout (5s) for consistent timeout behavior.
+            quic_config.handshake_timeout = Duration::from_secs(5);
+            // Flow control: large windows to avoid stalls during block sync.
+            // max_stream_data: 2MB per stream handles large block transfers without WINDOW_UPDATE round-trips.
+            quic_config.max_stream_data = 2 * 1024 * 1024;
+            // max_connection_data: 8MB aggregate across all streams for burst sync scenarios.
+            quic_config.max_connection_data = 8 * 1024 * 1024;
             // QUIC keep-alive: sends PING frames at this interval to keep connections alive
             quic_config.keep_alive_interval = config.keep_alive_interval;
             // QUIC idle timeout: connections are closed after this duration of inactivity
@@ -484,10 +496,20 @@ impl Libp2pAdapter {
             SwarmBuilder::with_existing_identity(keypair)
                 .with_tokio()
                 .with_quic_config(|mut quic_config| {
-                    // Increase QUIC stream limit to match TCP yamux config (4096).
-                    // Default is 256 which causes "max sub-streams reached" errors
-                    // during burst sync traffic when catching up.
+                    // QUIC configuration optimized for BFT consensus workloads:
+                    // - High stream concurrency for parallel sync and cross-shard coordination
+                    // - Large flow control windows for block transfers
+                    // - Fast handshake timeout to match our stream timeout ceiling
+                    // - Aggressive keep-alive for rapid failure detection
                     quic_config.max_concurrent_stream_limit = 4096;
+                    // Handshake timeout: fail fast on unreachable peers during connection setup.
+                    // Matches our max stream timeout (5s) for consistent timeout behavior.
+                    quic_config.handshake_timeout = Duration::from_secs(5);
+                    // Flow control: large windows to avoid stalls during block sync.
+                    // max_stream_data: 2MB per stream handles large block transfers without WINDOW_UPDATE round-trips.
+                    quic_config.max_stream_data = 2 * 1024 * 1024;
+                    // max_connection_data: 8MB aggregate across all streams for burst sync scenarios.
+                    quic_config.max_connection_data = 8 * 1024 * 1024;
                     // QUIC keep-alive: sends PING frames at this interval to keep connections alive
                     quic_config.keep_alive_interval = config.keep_alive_interval;
                     // QUIC idle timeout: connections are closed after this duration of inactivity
