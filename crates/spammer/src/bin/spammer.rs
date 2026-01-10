@@ -37,7 +37,7 @@ enum Commands {
         num_shards: u64,
 
         /// Accounts per shard
-        #[arg(long, default_value = "100")]
+        #[arg(long, default_value = "16000")]
         accounts_per_shard: usize,
 
         /// Initial balance per account
