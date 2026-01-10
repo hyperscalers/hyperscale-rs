@@ -27,6 +27,11 @@ COPY_TO_REMOTE=false
 REMOTE_PATH="~/git/hyperscale-rs/distributed-cluster-data/"
 REMOTE_USER="$(whoami)"
 
+# Mempool configuration
+MEMPOOL_MAX_IN_FLIGHT=512
+MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT=1024
+MEMPOOL_MAX_PENDING=2048
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --hosts)
@@ -81,10 +86,23 @@ while [[ $# -gt 0 ]]; do
             REMOTE_USER="$2"
             shift 2
             ;;
+        --mempool-max-in-flight)
+            MEMPOOL_MAX_IN_FLIGHT="$2"
+            shift 2
+            ;;
+        --mempool-max-in-flight-hard-limit)
+            MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT="$2"
+            shift 2
+            ;;
+        --mempool-max-pending)
+            MEMPOOL_MAX_PENDING="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 --hosts \"IP1,IP2...\" [--nodes-per-host N] [--shards N] [--out-dir DIR] [--clean]"
             echo "       [--crypto-threads N] [--execution-threads N] [--io-threads N]"
             echo "       [--copy-to-remote] [--remote-path DIR] [--remote-user USER]"
+            echo "       [--mempool-max-in-flight N] [--mempool-max-in-flight-hard-limit N] [--mempool-max-pending N]"
             exit 0
             ;;
         *)
@@ -311,6 +329,11 @@ block_cache_mb = 1024
 compression = "zstd"
 bloom_filter_bits = 10.0
 bytes_per_sync_mb = 4
+
+[mempool]
+max_in_flight = $MEMPOOL_MAX_IN_FLIGHT
+max_in_flight_hard_limit = $MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT
+max_pending = $MEMPOOL_MAX_PENDING
 
 [metrics]
 enabled = true

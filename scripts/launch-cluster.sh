@@ -40,6 +40,11 @@ TCP_FALLBACK_ENABLED="${TCP_FALLBACK_ENABLED:-false}" # Enable TCP fallback tran
 NETWORK_LATENCY_MS=""                           # Network latency in milliseconds (empty = disabled)
 PACKET_LOSS_PERCENT=""                          # Packet loss percentage (empty = disabled)
 
+# Mempool configuration
+MEMPOOL_MAX_IN_FLIGHT=512                       # Soft limit on in-flight transactions
+MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT=1024           # Hard limit on in-flight transactions
+MEMPOOL_MAX_PENDING=2048                        # Max pending before RPC backpressure
+
 # Define explicit port ranges for Docker and firewall whitelisting
 # let's give a range of 500 ports which should be ok for local testing
 QUIC_PORT_RANGE="${BASE_PORT}-$((BASE_PORT + 500))"
@@ -108,6 +113,18 @@ while [[ $# -gt 0 ]]; do
             PACKET_LOSS_PERCENT="$2"
             shift 2
             ;;
+        --mempool-max-in-flight)
+            MEMPOOL_MAX_IN_FLIGHT="$2"
+            shift 2
+            ;;
+        --mempool-max-in-flight-hard-limit)
+            MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT="$2"
+            shift 2
+            ;;
+        --mempool-max-pending)
+            MEMPOOL_MAX_PENDING="$2"
+            shift 2
+            ;;
         --help|-h)
             echo "Usage: $0 [--shards N] [--validators-per-shard M] [--clean] [--monitoring] [--log-level LEVEL] [--smoke-timeout DURATION] [--node-hostname HOST] [--no-tcp-fallback]"
             echo ""
@@ -127,6 +144,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --tcp-fallback           Enable TCP fallback transport (QUIC only)"
             echo "  --latency MS             Add network latency between validators (requires sudo)"
             echo "  --packet-loss PERCENT    Add packet loss between validators (requires sudo)"
+            echo "  --mempool-max-in-flight N          Soft limit on in-flight transactions (default: 512)"
+            echo "  --mempool-max-in-flight-hard-limit N  Hard limit on in-flight transactions (default: 1024)"
+            echo "  --mempool-max-pending N  Max pending transactions before RPC backpressure (default: 2048)"
             echo ""
             echo "Environment Variables:"
             echo "  VALIDATOR_BIN            Path to validator binary (default: ./target/release/hyperscale-validator)"
@@ -420,6 +440,11 @@ pin_cores = false
 max_background_jobs = 2
 write_buffer_mb = 64
 block_cache_mb = 256
+
+[mempool]
+max_in_flight = $MEMPOOL_MAX_IN_FLIGHT
+max_in_flight_hard_limit = $MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT
+max_pending = $MEMPOOL_MAX_PENDING
 
 [metrics]
 enabled = true

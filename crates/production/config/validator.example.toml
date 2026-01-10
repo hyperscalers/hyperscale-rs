@@ -121,6 +121,28 @@ bytes_per_sync_mb = 1
 keep_log_file_num = 10
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Mempool Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+[mempool]
+# Maximum transactions allowed in-flight (soft limit).
+# When at this limit, new transactions without provisions are delayed.
+# Cross-shard TXs WITH provisions can still be proposed.
+max_in_flight = 512
+
+# Hard limit on transactions in-flight.
+# When at this limit, NO new transactions are proposed (even cross-shard TXs
+# with provisions). This prevents unbounded growth and controls execution/crypto
+# pressure. RPC submissions are also rejected when this limit is reached.
+max_in_flight_hard_limit = 1024
+
+# Maximum pending transactions before RPC backpressure kicks in.
+# When the number of Pending transactions exceeds this limit, new RPC submissions
+# are rejected. This prevents unbounded mempool growth when arrival rate exceeds
+# processing capacity. Set to approximately a few blocks worth of transactions.
+max_pending = 2048
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Metrics Configuration
 # ═══════════════════════════════════════════════════════════════════════════════
 

@@ -5,6 +5,7 @@ use hyperscale_types::{
     AbortReason, Block, BlockHeight, DeferReason, Hash, NodeId, ReadyTransactions,
     RoutableTransaction, Topology, TransactionAbort, TransactionDecision,
 };
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,13 +40,14 @@ pub const DEFAULT_IN_FLIGHT_HARD_LIMIT: usize = 1024;
 pub const DEFAULT_MAX_PENDING: usize = 2048;
 
 /// Mempool configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MempoolConfig {
     /// Maximum transactions allowed in-flight (soft limit).
     ///
     /// When at this limit, new transactions without provisions are delayed.
     /// Cross-shard TXs WITH provisions (committed on another shard) can still be proposed,
     /// ensuring we don't block transactions that other shards are waiting on.
+    #[serde(default = "default_max_in_flight")]
     pub max_in_flight: usize,
 
     /// Hard limit on transactions in-flight.
@@ -53,6 +55,7 @@ pub struct MempoolConfig {
     /// When at this limit, NO new transactions are proposed (even cross-shard TXs with
     /// provisions). This prevents unbounded growth and controls execution/crypto pressure.
     /// RPC transaction submissions are also rejected when this limit is reached.
+    #[serde(default = "default_max_in_flight_hard_limit")]
     pub max_in_flight_hard_limit: usize,
 
     /// Maximum pending transactions before RPC backpressure kicks in.
@@ -60,7 +63,20 @@ pub struct MempoolConfig {
     /// When the number of Pending transactions exceeds this limit, new RPC submissions
     /// are rejected. This prevents unbounded mempool growth when arrival rate exceeds
     /// processing capacity. Set to approximately a few blocks worth of transactions.
+    #[serde(default = "default_max_pending")]
     pub max_pending: usize,
+}
+
+fn default_max_in_flight() -> usize {
+    DEFAULT_IN_FLIGHT_LIMIT
+}
+
+fn default_max_in_flight_hard_limit() -> usize {
+    DEFAULT_IN_FLIGHT_HARD_LIMIT
+}
+
+fn default_max_pending() -> usize {
+    DEFAULT_MAX_PENDING
 }
 
 impl Default for MempoolConfig {

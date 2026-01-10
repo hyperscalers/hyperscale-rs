@@ -47,6 +47,7 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use hyperscale_bft::BftConfig;
+use hyperscale_mempool::MempoolConfig;
 use hyperscale_production::network::{
     derive_libp2p_keypair, Libp2pConfig, VersionInteroperabilityMode,
 };
@@ -152,6 +153,10 @@ pub struct ValidatorConfig {
     /// Genesis configuration (validators in the network)
     #[serde(default)]
     pub genesis: GenesisConfig,
+
+    /// Mempool configuration
+    #[serde(default)]
+    pub mempool: MempoolConfig,
 }
 
 /// Node identity configuration.
@@ -1219,7 +1224,8 @@ async fn main() -> Result<()> {
         .tx_status_cache(rpc_tx_status_cache.clone())
         .mempool_snapshot(rpc_mempool_snapshot.clone())
         .speculative_max_txs(config.consensus.speculative_max_txs)
-        .view_change_cooldown_rounds(config.consensus.view_change_cooldown_rounds);
+        .view_change_cooldown_rounds(config.consensus.view_change_cooldown_rounds)
+        .mempool_config(config.mempool.clone());
 
     // Wire up genesis configuration if XRD balances are specified
     if !config.genesis.xrd_balances.is_empty() {

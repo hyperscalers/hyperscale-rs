@@ -325,6 +325,8 @@ pub struct ProductionRunnerBuilder {
     speculative_max_txs: usize,
     /// Rounds to pause speculation after a view change.
     view_change_cooldown_rounds: u64,
+    /// Mempool configuration.
+    mempool_config: MempoolConfig,
 }
 
 impl Default for ProductionRunnerBuilder {
@@ -352,6 +354,7 @@ impl ProductionRunnerBuilder {
             network_definition: None,
             speculative_max_txs: 500, // Default, matches hyperscale_execution::DEFAULT_SPECULATIVE_MAX_TXS
             view_change_cooldown_rounds: 3, // Default, matches hyperscale_execution::DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS
+            mempool_config: MempoolConfig::default(),
         }
     }
 
@@ -424,6 +427,15 @@ impl ProductionRunnerBuilder {
     /// Default: 3
     pub fn view_change_cooldown_rounds(mut self, rounds: u64) -> Self {
         self.view_change_cooldown_rounds = rounds;
+        self
+    }
+
+    /// Set the mempool configuration.
+    ///
+    /// Controls in-flight transaction limits and backpressure thresholds.
+    /// Default: `MempoolConfig::default()`
+    pub fn mempool_config(mut self, config: MempoolConfig) -> Self {
+        self.mempool_config = config;
         self
     }
 
@@ -535,7 +547,7 @@ impl ProductionRunnerBuilder {
             recovered,
             self.speculative_max_txs,
             self.view_change_cooldown_rounds,
-            MempoolConfig::default(),
+            self.mempool_config,
         );
         let timer_manager = TimerManager::new(timer_tx);
 
