@@ -73,6 +73,9 @@ pub struct LivelockState {
     /// Kept until they appear in a committed block.
     pending_deferrals: Vec<TransactionDefer>,
 
+    /// Hash set tracking queued deferral tx_hashes for deduplication.
+    pending_deferral_hashes: HashSet<Hash>,
+
     /// Current time.
     now: Duration,
 
@@ -112,6 +115,7 @@ impl LivelockState {
             deferred_tombstones: HashMap::new(),
             commitment_proofs: HashMap::new(),
             pending_deferrals: Vec::new(),
+            pending_deferral_hashes: HashSet::new(),
             now: Duration::ZERO,
             config,
         }
@@ -245,19 +249,16 @@ impl LivelockState {
         remote_tx_nodes: &HashSet<NodeId>,
     ) {
         // Get all our committed TXs that need provisions from the remote shard
-        // Clone to avoid borrow issues when we need to call queue_deferral
-        let local_txs_needing_source: Vec<Hash> = self
-            .committed_tracker
-            .txs_needing_shard(source_shard)
-            .map(|set| set.iter().copied().collect())
-            .unwrap_or_default();
-
-        if local_txs_needing_source.is_empty() {
+        let Some(local_txs_needing_source) = self.committed_tracker.txs_needing_shard(source_shard)
+        else {
             return;
-        }
+        };
+
+        // Collect deferrals to queue
+        let mut deferrals_to_queue: Vec<(Hash, Hash)> = Vec::new();
 
         // For each local TX that needs the source shard...
-        for local_tx_hash in local_txs_needing_source {
+        for &local_tx_hash in local_txs_needing_source {
             // Get the specific nodes our local TX needs from the remote shard
             let local_nodes_needed = match self
                 .committed_tracker
@@ -269,9 +270,7 @@ impl LivelockState {
 
             // Check if there's actual node-level overlap
             // A true cycle only exists if the remote TX's nodes overlap with our local TX's needs
-            let has_overlap = local_nodes_needed
-                .iter()
-                .any(|node| remote_tx_nodes.contains(node));
+            let has_overlap = !local_nodes_needed.is_disjoint(remote_tx_nodes);
 
             if !has_overlap {
                 // No actual state conflict - these TXs can proceed independently
@@ -303,7 +302,7 @@ impl LivelockState {
                     "TRUE cycle detected with overlapping nodes - our TX loses, queuing deferral"
                 );
 
-                self.queue_deferral(local_tx_hash, winner);
+                deferrals_to_queue.push((local_tx_hash, winner));
             } else {
                 debug!(
                     local_tx = %local_tx_hash,
@@ -313,6 +312,11 @@ impl LivelockState {
                 );
             }
         }
+
+        // Queue all collected deferrals
+        for (loser, winner) in deferrals_to_queue {
+            self.queue_deferral(loser, winner);
+        }
     }
 
     /// Queue a deferral for inclusion in the next block.
@@ -321,7 +325,7 @@ impl LivelockState {
     /// This is required for BFT safety - blocks with proof-less deferrals are rejected.
     fn queue_deferral(&mut self, loser_tx: Hash, winner_tx: Hash) {
         // Check if already queued
-        if self.pending_deferrals.iter().any(|d| d.tx_hash == loser_tx) {
+        if self.pending_deferral_hashes.contains(&loser_tx) {
             trace!(tx = %loser_tx, "Deferral already queued");
             return;
         }
@@ -357,15 +361,16 @@ impl LivelockState {
             "Queuing deferral with cycle proof"
         );
 
+        self.pending_deferral_hashes.insert(loser_tx);
         self.pending_deferrals.push(deferral);
     }
 
     /// Get pending deferrals for block inclusion.
     ///
-    /// Returns a clone of the pending deferrals. Deferrals are only removed
+    /// Returns a reference to the pending deferrals. Deferrals are only removed
     /// when they appear in a committed block.
-    pub fn get_pending_deferrals(&self) -> Vec<TransactionDefer> {
-        self.pending_deferrals.clone()
+    pub fn get_pending_deferrals(&self) -> &[TransactionDefer] {
+        &self.pending_deferrals
     }
 
     /// Called when a block is committed.
@@ -389,11 +394,13 @@ impl LivelockState {
             self.on_certificate_committed(&cert.transaction_hash);
         }
 
-        // Remove deferrals that were included in this block
-        let deferred_hashes: std::collections::HashSet<_> =
-            block.deferred.iter().map(|d| d.tx_hash).collect();
+        // Remove deferrals that were included in this block from both Vec and HashSet
+        for deferral in &block.deferred {
+            self.pending_deferral_hashes.remove(&deferral.tx_hash);
+        }
+        // Keep only deferrals still in our hash set (those not in this block)
         self.pending_deferrals
-            .retain(|d| !deferred_hashes.contains(&d.tx_hash));
+            .retain(|d| self.pending_deferral_hashes.contains(&d.tx_hash));
 
         trace!(
             height = height.0,
