@@ -1298,6 +1298,7 @@ impl SimulationRunner {
                         shard_group_id: local_shard,
                         state_root: result.state_root,
                         success: result.success,
+                        state_writes: result.writes.clone(),
                         validator: validator_id,
                         signature,
                     };
@@ -1353,6 +1354,7 @@ impl SimulationRunner {
                                 shard_group_id: local_shard,
                                 state_root: r.outputs_merkle_root,
                                 success: r.success,
+                                state_writes: r.state_writes.clone(),
                                 validator: validator_id,
                                 signature,
                             };
@@ -1390,6 +1392,7 @@ impl SimulationRunner {
                                 shard_group_id: local_shard,
                                 state_root: hyperscale_types::Hash::ZERO,
                                 success: false,
+                                state_writes: vec![],
                                 validator: validator_id,
                                 signature,
                             };
@@ -1501,6 +1504,7 @@ impl SimulationRunner {
                     shard_group_id: local_shard,
                     state_root: result.state_root,
                     success: result.success,
+                    state_writes: result.writes.clone(),
                     validator: validator_id,
                     signature,
                 };

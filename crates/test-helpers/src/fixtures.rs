@@ -156,6 +156,7 @@ pub fn make_signed_state_vote(
         shard_group_id: shard,
         state_root,
         success,
+        state_writes: vec![],
         validator: committee.validator_id(voter_idx),
         signature,
     }

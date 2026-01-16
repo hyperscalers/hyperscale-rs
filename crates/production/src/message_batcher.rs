@@ -737,6 +737,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             state_root: hyperscale_types::Hash::from_bytes(b"root"),
             success: true,
+            state_writes: vec![],
             validator: hyperscale_types::ValidatorId(0),
             signature: hyperscale_types::zero_bls_signature(),
         });

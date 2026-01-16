@@ -242,6 +242,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             state_root: merkle_root,
             success: true,
+            state_writes: vec![],
             validator: ValidatorId(0),
             signature: zero_bls_signature(),
         };
@@ -277,6 +278,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             state_root: root_a,
             success: true,
+            state_writes: vec![],
             validator: ValidatorId(0),
             signature: zero_bls_signature(),
         };
@@ -286,6 +288,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             state_root: root_b,
             success: true,
+            state_writes: vec![],
             validator: ValidatorId(1),
             signature: zero_bls_signature(),
         };
@@ -321,6 +324,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             state_root: merkle_root,
             success: true,
+            state_writes: vec![],
             validator: ValidatorId(0),
             signature: zero_bls_signature(),
         };
@@ -352,6 +356,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             state_root: merkle_root,
             success: true,
+            state_writes: vec![],
             validator: ValidatorId(0),
             signature: zero_bls_signature(),
         };
@@ -376,6 +381,7 @@ mod tests {
                 shard_group_id: ShardGroupId(0),
                 state_root: merkle_root,
                 success: true,
+                state_writes: vec![],
                 validator: ValidatorId(i),
                 signature: zero_bls_signature(),
             };
@@ -400,6 +406,7 @@ mod tests {
                 shard_group_id: ShardGroupId(0),
                 state_root: merkle_root,
                 success: true,
+                state_writes: vec![],
                 validator: ValidatorId(i),
                 signature: zero_bls_signature(),
             };
@@ -433,6 +440,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             state_root: merkle_root,
             success: true,
+            state_writes: vec![],
             validator: ValidatorId(0),
             signature: zero_bls_signature(),
         };
@@ -452,6 +460,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             state_root: merkle_root,
             success: true,
+            state_writes: vec![],
             validator: ValidatorId(2),
             signature: zero_bls_signature(),
         };

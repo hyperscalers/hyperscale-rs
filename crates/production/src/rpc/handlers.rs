@@ -94,6 +94,8 @@ pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse 
         version: option_env!("HYPERSCALE_VERSION")
             .unwrap_or("localdev")
             .to_string(),
+        state_version: node_status.state_version,
+        state_root_hash: node_status.state_root_hash.clone(),
         mempool: MempoolStatusResponse {
             pending_count: mempool_snapshot.pending_count,
             committed_count: mempool_snapshot.committed_count,

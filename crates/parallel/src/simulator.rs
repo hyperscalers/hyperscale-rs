@@ -859,6 +859,7 @@ impl SimNode {
                         shard_group_id: local_shard,
                         state_root: result.state_root,
                         success: result.success,
+                        state_writes: result.writes.clone(),
                         validator: validator_id,
                         signature,
                     };
@@ -902,6 +903,7 @@ impl SimNode {
                         shard_group_id: local_shard,
                         state_root: result.state_root,
                         success: result.success,
+                        state_writes: result.writes.clone(),
                         validator: validator_id,
                         signature,
                     };
@@ -959,6 +961,7 @@ impl SimNode {
                     shard_group_id: local_shard,
                     state_root: result.state_root,
                     success: result.success,
+                    state_writes: result.writes.clone(),
                     validator: validator_id,
                     signature,
                 };

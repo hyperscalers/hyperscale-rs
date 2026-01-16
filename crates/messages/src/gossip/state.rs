@@ -289,6 +289,7 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             state_root: Hash::from_bytes(b"root"),
             success: true,
+            state_writes: vec![],
             validator: ValidatorId(0),
             signature: zero_bls_signature(),
         };

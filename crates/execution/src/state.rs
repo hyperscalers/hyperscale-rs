@@ -2401,6 +2401,7 @@ mod tests {
             shard_group_id: local_shard,
             state_root,
             success,
+            state_writes: vec![],
             validator: validator_id,
             signature,
         };

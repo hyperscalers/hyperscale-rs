@@ -274,6 +274,10 @@ pub struct NodeStatusState {
     pub block_height: u64,
     pub view: u64,
     pub connected_peers: usize,
+    /// Current JMT state version (increments with each committed certificate).
+    pub state_version: u64,
+    /// Current JMT state root hash (hex-encoded).
+    pub state_root_hash: String,
 }
 
 #[cfg(test)]

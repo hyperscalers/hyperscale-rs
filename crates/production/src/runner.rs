@@ -2175,12 +2175,17 @@ impl ProductionRunner {
                     }
 
                     let success = votes.first().map(|v| v.success).unwrap_or(false);
+                    // All votes for the same tx should have identical state_writes
+                    let state_writes = votes
+                        .first()
+                        .map(|v| v.state_writes.clone())
+                        .unwrap_or_default();
 
                     let certificate = hyperscale_types::StateCertificate {
                         transaction_hash: tx_hash,
                         shard_group_id: shard,
                         read_nodes,
-                        state_writes: vec![],
+                        state_writes,
                         outputs_merkle_root: merkle_root,
                         success,
                         aggregated_signature,
@@ -2384,22 +2389,21 @@ impl ProductionRunner {
                             .par_iter()
                             .map(|tx| {
                                 // Execute
-                                let result = match executor.execute_single_shard(&*storage, std::slice::from_ref(tx)) {
+                                let (tx_hash, success, state_root, state_writes) = match executor.execute_single_shard(&*storage, std::slice::from_ref(tx)) {
                                     Ok(output) => {
                                         if let Some(r) = output.results().first() {
-                                            (r.tx_hash, r.success, r.outputs_merkle_root)
+                                            (r.tx_hash, r.success, r.outputs_merkle_root, r.state_writes.clone())
                                         } else {
-                                            (tx.hash(), false, hyperscale_types::Hash::ZERO)
+                                            (tx.hash(), false, hyperscale_types::Hash::ZERO, vec![])
                                         }
                                     }
                                     Err(e) => {
                                         tracing::warn!(tx_hash = ?tx.hash(), error = %e, "Transaction execution failed");
-                                        (tx.hash(), false, hyperscale_types::Hash::ZERO)
+                                        (tx.hash(), false, hyperscale_types::Hash::ZERO, vec![])
                                     }
                                 };
 
                                 // Sign immediately after execution
-                                let (tx_hash, success, state_root) = result;
                                 let message = hyperscale_types::exec_vote_message(
                                     &tx_hash,
                                     &state_root,
@@ -2413,6 +2417,7 @@ impl ProductionRunner {
                                     shard_group_id: local_shard,
                                     state_root,
                                     success,
+                                    state_writes,
                                     validator: validator_id,
                                     signature,
                                 }
@@ -2469,22 +2474,21 @@ impl ProductionRunner {
                             .par_iter()
                             .map(|tx| {
                                 // Execute
-                                let result = match executor.execute_single_shard(&*storage, std::slice::from_ref(tx)) {
+                                let (tx_hash, success, state_root, state_writes) = match executor.execute_single_shard(&*storage, std::slice::from_ref(tx)) {
                                     Ok(output) => {
                                         if let Some(r) = output.results().first() {
-                                            (r.tx_hash, r.success, r.outputs_merkle_root)
+                                            (r.tx_hash, r.success, r.outputs_merkle_root, r.state_writes.clone())
                                         } else {
-                                            (tx.hash(), false, hyperscale_types::Hash::ZERO)
+                                            (tx.hash(), false, hyperscale_types::Hash::ZERO, vec![])
                                         }
                                     }
                                     Err(e) => {
                                         tracing::warn!(tx_hash = ?tx.hash(), error = %e, "Speculative execution failed");
-                                        (tx.hash(), false, hyperscale_types::Hash::ZERO)
+                                        (tx.hash(), false, hyperscale_types::Hash::ZERO, vec![])
                                     }
                                 };
 
                                 // Sign immediately after execution
-                                let (tx_hash, success, state_root) = result;
                                 let message = hyperscale_types::exec_vote_message(
                                     &tx_hash,
                                     &state_root,
@@ -2498,6 +2502,7 @@ impl ProductionRunner {
                                     shard_group_id: local_shard,
                                     state_root,
                                     success,
+                                    state_writes,
                                     validator: validator_id,
                                     signature,
                                 }
@@ -2657,6 +2662,7 @@ impl ProductionRunner {
                     block_hash = ?block.hash(),
                     height = height,
                     view = current_view,
+                    certificates = block.committed_certificates.len(),
                     "Block committed"
                 );
 
@@ -2704,6 +2710,70 @@ impl ProductionRunner {
                         status.view = current_view;
                     });
                 }
+
+                // IMPORTANT: Apply state writes for committed certificates IN ORDER.
+                // This is the canonical point where state is committed - not when
+                // certificates are built, gossiped, or the block is certified.
+                // This ensures deterministic JMT state across all nodes.
+                //
+                // EmitCommittedBlock is emitted when a block commits (not when certified),
+                // so this is the correct place for state application.
+                if !block.committed_certificates.is_empty() {
+                    let storage = self.storage.clone();
+                    let local_shard = self.local_shard;
+                    let rpc_status = self.rpc_status.clone();
+                    let block_for_commit = block.clone();
+                    let block_height = height;
+
+                    tokio::task::spawn_blocking(move || {
+                        let mut applied_count = 0u32;
+                        let mut empty_count = 0u32;
+                        let mut no_shard_count = 0u32;
+                        for cert in &block_for_commit.committed_certificates {
+                            // Check if local shard exists in the cert
+                            if let Some(shard_proof) = cert.shard_proofs.get(&local_shard) {
+                                let writes = &shard_proof.state_writes;
+                                if !writes.is_empty() {
+                                    storage.commit_certificate_with_writes(cert, writes);
+                                    applied_count += 1;
+                                } else {
+                                    empty_count += 1;
+                                }
+                            } else {
+                                // Log what shards ARE in the cert
+                                let cert_shards: Vec<_> = cert.shard_proofs.keys().collect();
+                                tracing::debug!(
+                                    tx_hash = %cert.transaction_hash,
+                                    ?cert_shards,
+                                    local_shard = local_shard.0,
+                                    "Certificate missing local shard"
+                                );
+                                no_shard_count += 1;
+                            }
+                        }
+                        tracing::info!(
+                            block_height,
+                            total_certs = block_for_commit.committed_certificates.len(),
+                            applied_count,
+                            empty_count,
+                            no_shard_count,
+                            local_shard = local_shard.0,
+                            "Applied certificate state writes"
+                        );
+
+                        // Update RPC status with new JMT state version and root hash
+                        if let Some(rpc_status) = rpc_status {
+                            use hyperscale_engine::SubstateStore;
+                            let state_version = storage.state_version();
+                            let state_root_hash = hex::encode(storage.state_root_hash().0);
+                            tokio::spawn(async move {
+                                let mut status = rpc_status.write().await;
+                                status.state_version = state_version;
+                                status.state_root_hash = state_root_hash;
+                            });
+                        }
+                    });
+                }
             }
 
             // ═══════════════════════════════════════════════════════════════════════
@@ -2716,6 +2786,10 @@ impl ProductionRunner {
                 // Uses denormalized storage: block metadata stored separately from
                 // transactions and certificates. This eliminates duplication and
                 // enables storage-backed fetch requests.
+                //
+                // NOTE: State writes are NOT applied here. This action is emitted when
+                // a block is certified (has QC), but state should only be applied when
+                // the block commits. State application happens in EmitCommittedBlock.
                 let storage = self.storage.clone();
                 let height = block.height();
                 tokio::task::spawn_blocking(move || {
@@ -2728,17 +2802,12 @@ impl ProductionRunner {
             }
 
             Action::PersistTransactionCertificate { certificate } => {
-                // Commit certificate + state writes atomically
-                // Fire-and-forget: RocksDB WAL ensures durability, no need to block event loop
+                // Persist certificate bytes for peer fetching.
+                // NOTE: State writes are NOT applied here - they are applied in PersistBlock
+                // when the certificate is included in a committed block. This ensures
+                // deterministic state ordering across all nodes.
                 let storage = self.storage.clone();
                 let local_shard = self.local_shard;
-
-                // Extract writes for local shard from the certificate's shard_proofs
-                let writes: Vec<_> = certificate
-                    .shard_proofs
-                    .get(&local_shard)
-                    .map(|cert| cert.state_writes.clone())
-                    .unwrap_or_default();
 
                 // Cache the certificate BEFORE spawning the storage write.
                 // This fixes a race condition where:
@@ -2751,11 +2820,11 @@ impl ProductionRunner {
                 let cert_arc = Arc::new(certificate.clone());
                 self.recently_built_certs.insert(tx_hash, cert_arc);
 
-                // Run on blocking thread since RocksDB write is sync I/O
-                // RocksDB is internally thread-safe, no lock needed
+                // Persist certificate bytes only (no state writes)
+                // Fire-and-forget: RocksDB WAL ensures durability
                 let cert_for_persist = certificate.clone();
                 tokio::task::spawn_blocking(move || {
-                    storage.commit_certificate_with_writes(&cert_for_persist, &writes);
+                    storage.put_certificate(&cert_for_persist.transaction_hash, &cert_for_persist);
                 });
 
                 // Only gossip cross-shard certificates where it provides more value.
@@ -3398,7 +3467,7 @@ impl ProductionRunner {
                         };
 
                         // Execute
-                        let (tx_hash, success, state_root) = match executor.execute_cross_shard(
+                        let (tx_hash, success, state_root, state_writes) = match executor.execute_cross_shard(
                             &*storage,
                             std::slice::from_ref(&req.transaction),
                             &req.provisions,
@@ -3406,14 +3475,14 @@ impl ProductionRunner {
                         ) {
                             Ok(output) => {
                                 if let Some(r) = output.results().first() {
-                                    (r.tx_hash, r.success, r.outputs_merkle_root)
+                                    (r.tx_hash, r.success, r.outputs_merkle_root, r.state_writes.clone())
                                 } else {
-                                    (req.tx_hash, false, hyperscale_types::Hash::ZERO)
+                                    (req.tx_hash, false, hyperscale_types::Hash::ZERO, vec![])
                                 }
                             }
                             Err(e) => {
                                 tracing::warn!(tx_hash = ?req.tx_hash, error = %e, "Cross-shard execution failed");
-                                (req.tx_hash, false, hyperscale_types::Hash::ZERO)
+                                (req.tx_hash, false, hyperscale_types::Hash::ZERO, vec![])
                             }
                         };
 
@@ -3431,6 +3500,7 @@ impl ProductionRunner {
                             shard_group_id: local_shard,
                             state_root,
                             success,
+                            state_writes,
                             validator: validator_id,
                             signature,
                         }
@@ -3466,25 +3536,21 @@ impl ProductionRunner {
     /// Persist a verified gossiped certificate and notify the state machine.
     ///
     /// Called after all StateCertificate signatures in a gossiped TransactionCertificate
-    /// have been verified. Persists to storage and sends GossipedCertificateVerified
-    /// to the state machine to cancel local certificate building.
+    /// have been verified. Persists certificate bytes to storage and sends
+    /// GossipedCertificateVerified to the state machine to cancel local certificate building.
+    ///
+    /// NOTE: State writes are NOT applied here - they are applied in PersistBlock
+    /// when the certificate is included in a committed block. This ensures
+    /// deterministic state ordering across all nodes.
     fn persist_and_notify_gossiped_certificate(&self, certificate: TransactionCertificate) {
         let storage = self.storage.clone();
-        let local_shard = self.local_shard;
         let callback_tx = self.callback_tx.clone();
-
-        // Extract writes for local shard
-        let writes: Vec<_> = certificate
-            .shard_proofs
-            .get(&local_shard)
-            .map(|c| c.state_writes.clone())
-            .unwrap_or_default();
 
         let cert_for_persist = certificate.clone();
 
-        // Fire-and-forget persist (don't block event loop)
+        // Fire-and-forget persist of certificate bytes only (no state writes)
         tokio::task::spawn_blocking(move || {
-            storage.commit_certificate_with_writes(&cert_for_persist, &writes);
+            storage.put_certificate(&cert_for_persist.transaction_hash, &cert_for_persist);
         });
 
         // Notify state machine to cancel local building and add to finalized

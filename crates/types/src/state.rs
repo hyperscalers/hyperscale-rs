@@ -8,7 +8,7 @@ use sbor::prelude::*;
 use std::sync::Arc;
 
 /// A write to a substate.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
 pub struct SubstateWrite {
     /// The node being written to.
     pub node_id: NodeId,
@@ -309,6 +309,12 @@ pub struct StateVoteBlock {
 
     /// Whether execution succeeded.
     pub success: bool,
+
+    /// State writes produced by execution.
+    ///
+    /// Used to populate StateCertificate.state_writes for speculative
+    /// execution invalidation.
+    pub state_writes: Vec<SubstateWrite>,
 
     /// Validator that executed and voted.
     pub validator: ValidatorId,

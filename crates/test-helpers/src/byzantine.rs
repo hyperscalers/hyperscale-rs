@@ -143,6 +143,7 @@ pub fn make_wrong_key_state_vote(
         shard_group_id: shard,
         state_root,
         success,
+        state_writes: vec![],
         validator: committee.validator_id(claimed_voter_idx),
         signature,
     }
@@ -166,6 +167,7 @@ pub fn make_wrong_state_root_vote(
         shard_group_id: shard,
         state_root: claimed_state_root,
         success,
+        state_writes: vec![],
         validator: committee.validator_id(voter_idx),
         signature,
     }

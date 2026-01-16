@@ -26,6 +26,19 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{instrument, Level};
 
+/// JMT state bundled together for atomic updates.
+///
+/// All JMT operations must hold this lock to prevent race conditions where
+/// concurrent commits could read stale versions or access pruned nodes.
+struct JmtState {
+    /// In-memory JMT tree store.
+    tree_store: TypedInMemoryTreeStore,
+    /// Current state version (persisted to DB).
+    current_version: u64,
+    /// Current JMT state root hash (persisted to DB).
+    current_root_hash: StateRootHash,
+}
+
 /// RocksDB-based storage for production use.
 ///
 /// Features:
@@ -46,13 +59,11 @@ use tracing::{instrument, Level};
 pub struct RocksDbStorage {
     db: Arc<DB>,
 
-    // JMT state tracking
-    /// In-memory JMT tree store. Uses Mutex for thread safety.
-    tree_store: Mutex<TypedInMemoryTreeStore>,
-    /// Current state version (persisted to DB).
-    current_version: Mutex<u64>,
-    /// Current JMT state root hash (persisted to DB).
-    current_root_hash: Mutex<StateRootHash>,
+    /// JMT state protected by a single lock for atomic updates.
+    ///
+    /// This prevents race conditions where concurrent `commit_certificate_with_writes`
+    /// calls could read stale versions and attempt to update from pruned parent nodes.
+    jmt: Mutex<JmtState>,
 }
 
 /// Error type for storage operations.
@@ -119,9 +130,11 @@ impl RocksDbStorage {
 
         Ok(Self {
             db: Arc::new(db),
-            tree_store: Mutex::new(TypedInMemoryTreeStore::new().with_pruning_enabled()),
-            current_version: Mutex::new(version),
-            current_root_hash: Mutex::new(root_hash),
+            jmt: Mutex::new(JmtState {
+                tree_store: TypedInMemoryTreeStore::new().with_pruning_enabled(),
+                current_version: version,
+                current_root_hash: root_hash,
+            }),
         })
     }
 
@@ -341,19 +354,26 @@ impl RocksDbStorage {
             .write(batch)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
-        // Update JMT and compute new root hash
-        let version = *self.current_version.lock().unwrap();
-        let parent_version = if version == 0 { None } else { Some(version) };
-        let new_root =
-            put_at_next_version(&*self.tree_store.lock().unwrap(), parent_version, updates);
-        let new_version = version + 1;
+        // Update JMT and compute new root hash (single lock for atomicity)
+        let (new_version, new_root) = {
+            let mut jmt = self.jmt.lock().unwrap();
+            let parent_version = if jmt.current_version == 0 {
+                None
+            } else {
+                Some(jmt.current_version)
+            };
+            let new_root = put_at_next_version(&jmt.tree_store, parent_version, updates);
+            let new_version = jmt.current_version + 1;
 
-        // Persist JMT state
+            // Update in-memory state while still holding the lock
+            jmt.current_version = new_version;
+            jmt.current_root_hash = new_root;
+
+            (new_version, new_root)
+        };
+
+        // Persist JMT state (outside lock - RocksDB is thread-safe)
         self.persist_jmt_state(new_version, new_root);
-
-        // Update in-memory state
-        *self.current_version.lock().unwrap() = new_version;
-        *self.current_root_hash.lock().unwrap() = new_root;
 
         let elapsed = start.elapsed();
         metrics::record_rocksdb_write(elapsed.as_secs_f64());
@@ -425,11 +445,11 @@ impl SubstateStore for RocksDbStorage {
     }
 
     fn state_version(&self) -> u64 {
-        *self.current_version.lock().unwrap()
+        self.jmt.lock().unwrap().current_version
     }
 
     fn state_root_hash(&self) -> StateRootHash {
-        *self.current_root_hash.lock().unwrap()
+        self.jmt.lock().unwrap().current_root_hash
     }
 }
 
@@ -1245,6 +1265,35 @@ impl RocksDbStorage {
 
         self.db.write_opt(batch, &write_opts).expect(
             "BFT SAFETY CRITICAL: certificate commit failed - node state would diverge from network",
+        );
+
+        // 4. Update JMT and compute new root hash (single lock for atomicity)
+        let (new_version, new_root) = {
+            let mut jmt = self.jmt.lock().unwrap();
+            let parent_version = if jmt.current_version == 0 {
+                None
+            } else {
+                Some(jmt.current_version)
+            };
+            let new_root = put_at_next_version(&jmt.tree_store, parent_version, &updates);
+            let new_version = jmt.current_version + 1;
+
+            // Update in-memory state while still holding the lock
+            jmt.current_version = new_version;
+            jmt.current_root_hash = new_root;
+
+            (new_version, new_root)
+        };
+
+        // 5. Persist JMT state (outside lock - RocksDB is thread-safe)
+        self.persist_jmt_state(new_version, new_root);
+
+        tracing::debug!(
+            tx_hash = %certificate.transaction_hash,
+            write_count = writes.len(),
+            new_version,
+            new_root = %hex::encode(new_root.0),
+            "JMT updated after certificate commit"
         );
 
         let elapsed = start.elapsed();
