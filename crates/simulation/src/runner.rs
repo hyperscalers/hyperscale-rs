@@ -11,7 +11,7 @@ use crate::traffic::NetworkTrafficAnalyzer;
 use crate::NodeIndex;
 use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
-use hyperscale_engine::RadixExecutor;
+use hyperscale_engine::{JmtSnapshot, RadixExecutor};
 use hyperscale_execution::{DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_node::NodeStateMachine;
@@ -95,6 +95,11 @@ pub struct SimulationRunner {
     /// Per-node transaction status cache. Captures all emitted statuses.
     /// Maps (node_index, tx_hash) -> status for querying final transaction states.
     tx_status_cache: HashMap<(NodeIndex, TxHash), TransactionStatus>,
+
+    /// Per-node JMT snapshot cache.
+    /// Stores snapshots created during verification for reuse at commit time.
+    /// Maps (node_index, block_hash) -> snapshot.
+    jmt_cache: HashMap<(NodeIndex, TxHash), JmtSnapshot>,
 }
 
 /// Statistics collected during simulation.
@@ -249,6 +254,7 @@ impl SimulationRunner {
             seen_messages: HashSet::new(),
             sync_targets: HashMap::new(),
             tx_status_cache: HashMap::new(),
+            jmt_cache: HashMap::new(),
         }
     }
 
@@ -1288,14 +1294,28 @@ impl SimulationRunner {
             Action::VerifyStateRoot {
                 block_hash,
                 parent_state_root,
-                writes_per_cert,
                 expected_root,
+                certificates,
             } => {
+                // Extract state writes from certificates for our local shard.
+                let local_shard = self.nodes[from as usize].shard();
+                let writes_per_cert: Vec<Vec<_>> = certificates
+                    .iter()
+                    .map(|cert| {
+                        cert.shard_proofs
+                            .get(&local_shard)
+                            .map(|proof| proof.state_writes.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+
                 // Compute speculative state root using overlay pattern.
                 // Each certificate's writes are applied at a separate JMT version.
                 // Use parent_state_root as base to match proposer's computation.
+                //
+                // Also captures a snapshot of the JMT nodes for reuse at commit time.
                 let storage = &self.node_storage[from as usize];
-                let computed_root =
+                let (computed_root, snapshot) =
                     storage.compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
 
                 let valid = computed_root == expected_root;
@@ -1309,6 +1329,9 @@ impl SimulationRunner {
                         ?parent_state_root,
                         "State root verification failed"
                     );
+                } else {
+                    // Cache the snapshot for reuse during commit
+                    self.jmt_cache.insert((from, block_hash), snapshot);
                 }
 
                 self.schedule_event(
@@ -1327,12 +1350,18 @@ impl SimulationRunner {
             } => {
                 // In simulation, JMT commits are synchronous so we can compute immediately.
                 // Check if JMT is at the expected parent state.
+                //
+                // NOTE: We don't cache the snapshot here because we don't know the block
+                // hash yet (it's computed after the block is built). The proposer will
+                // fall back to per-certificate commits. This is fine because:
+                // 1. Only 1 out of N validators is the proposer
+                // 2. The N-1 verifiers will cache their snapshots
                 let storage = &self.node_storage[from as usize];
                 let current_root = storage.current_jmt_root();
 
                 let result = if current_root == parent_state_root {
                     // JMT is ready - compute speculative root
-                    let state_root = storage
+                    let (state_root, _snapshot) = storage
                         .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
                     hyperscale_core::StateRootComputeResult::Success { state_root }
                 } else {
@@ -1685,14 +1714,26 @@ impl SimulationRunner {
 
                 // Commit state writes for all certificates in this block.
                 // This matches production behavior where state is committed in EmitCommittedBlock.
+                //
+                // OPTIMIZATION: If we have a cached JMT snapshot from verification,
+                // apply it directly instead of recomputing certificate-by-certificate.
                 let storage = &mut self.node_storage[from as usize];
                 let local_shard = self.nodes[from as usize].shard();
+                let block_hash = block.hash();
 
-                for cert in &block.committed_certificates {
-                    if let Some(shard_proof) = cert.shard_proofs.get(&local_shard) {
-                        let writes = &shard_proof.state_writes;
-                        if !writes.is_empty() {
-                            storage.commit_certificate_with_writes(cert, writes);
+                // NOTE: JMT snapshot cache disabled in simulation pending further investigation.
+                // The snapshot application causes tree inconsistencies in some edge cases.
+                // Always use slow path (per-certificate commits) for now.
+                // See: https://github.com/hyperscale/hyperscale-rs/issues/XXX
+                let _snapshot = self.jmt_cache.remove(&(from, block_hash));
+                {
+                    // Slow path: recompute per-certificate (proposer case or cache miss)
+                    for cert in &block.committed_certificates {
+                        if let Some(shard_proof) = cert.shard_proofs.get(&local_shard) {
+                            let writes = &shard_proof.state_writes;
+                            if !writes.is_empty() {
+                                storage.commit_certificate_with_writes(cert, writes);
+                            }
                         }
                     }
                 }

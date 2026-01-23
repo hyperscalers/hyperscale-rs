@@ -266,8 +266,9 @@ pub enum Action {
     ///
     /// The verification flow:
     /// 1. Runner checks if local JMT root matches `parent_state_root`
-    /// 2. If match, applies `writes_per_cert` to compute new root
+    /// 2. If match, extracts writes from certificates and computes new root
     /// 3. Compares computed root against `expected_root`
+    /// 4. If valid, builds and caches a WriteBatch for efficient commit later
     ///
     /// This ensures proposer and verifier compute from the same base state.
     VerifyStateRoot {
@@ -276,11 +277,12 @@ pub enum Action {
         /// to reach this root before computing. This ensures all validators
         /// compute from the same base state regardless of commit timing.
         parent_state_root: Hash,
-        /// State writes grouped by certificate. Each certificate's writes are applied
-        /// at a separate JMT version.
-        writes_per_cert: Vec<Vec<SubstateWrite>>,
         /// The expected state root after applying all certificate writes.
         expected_root: Hash,
+        /// The certificates to commit. State writes are extracted from these.
+        /// Also used to pre-build the RocksDB WriteBatch during verification
+        /// for efficient single-fsync commit later.
+        certificates: Vec<Arc<TransactionCertificate>>,
     },
 
     /// Compute state root for a block proposal.

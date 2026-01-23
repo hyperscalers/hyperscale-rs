@@ -3,13 +3,53 @@
 //! This module provides `OverlayTreeStore`, which wraps a base tree store and
 //! captures all writes without modifying the underlying storage. This enables
 //! speculative state root computation for block validation.
+//!
+//! The overlay can be converted into a [`JmtSnapshot`] which captures the computed
+//! nodes for later application to the real JMT during block commit. This avoids
+//! recomputing the same JMT updates twice (once during verification, once during commit).
 
 use crate::{
     AssociatedSubstateValue, DbPartitionKey, DbSortKey, ReadableTreeStore, StaleTreePart,
-    StoredTreeNodeKey, TreeNode, TypedInMemoryTreeStore, WriteableTreeStore,
+    StateRootHash, StoredTreeNodeKey, TreeNode, TypedInMemoryTreeStore, WriteableTreeStore,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+
+/// A snapshot of JMT nodes computed during speculative execution.
+///
+/// Created from an [`OverlayTreeStore`] after computing a speculative state root.
+/// Can be applied to the real JMT during block commit, avoiding redundant computation.
+///
+/// # Usage
+///
+/// ```ignore
+/// // During verification
+/// let overlay = OverlayTreeStore::new(&jmt);
+/// let root = compute_root(&overlay, writes);
+/// let snapshot = overlay.into_snapshot(base_root, root, num_certs);
+/// cache.insert(block_hash, snapshot);
+///
+/// // During commit
+/// let snapshot = cache.remove(&block_hash);
+/// jmt.apply_snapshot(snapshot);
+/// ```
+#[derive(Debug, Clone)]
+pub struct JmtSnapshot {
+    /// The JMT root this snapshot was computed from.
+    /// Used to verify the JMT is in the expected state before applying.
+    pub base_root: StateRootHash,
+
+    /// The resulting state root after applying all certificate writes.
+    pub result_root: StateRootHash,
+
+    /// Number of JMT versions this snapshot advances.
+    /// Equal to the number of certificates processed.
+    pub num_versions: u64,
+
+    /// Nodes created during speculative computation.
+    /// These are inserted directly into the real JMT on apply.
+    pub nodes: HashMap<StoredTreeNodeKey, TreeNode>,
+}
 
 /// An overlay tree store that captures writes without modifying the underlying store.
 ///
@@ -53,6 +93,31 @@ impl<'a> OverlayTreeStore<'a> {
             base,
             inserted_nodes: RefCell::new(HashMap::new()),
             stale_keys: RefCell::new(HashSet::new()),
+        }
+    }
+
+    /// Convert this overlay into a snapshot that can be applied later.
+    ///
+    /// Consumes the overlay and extracts the captured nodes into a [`JmtSnapshot`].
+    /// The snapshot can be cached and applied to the real JMT during block commit,
+    /// avoiding redundant recomputation of the same tree updates.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_root` - The JMT root this computation started from
+    /// * `result_root` - The computed state root after applying all writes
+    /// * `num_versions` - Number of JMT versions advanced (typically = number of certificates)
+    pub fn into_snapshot(
+        self,
+        base_root: StateRootHash,
+        result_root: StateRootHash,
+        num_versions: u64,
+    ) -> JmtSnapshot {
+        JmtSnapshot {
+            base_root,
+            result_root,
+            num_versions,
+            nodes: self.inserted_nodes.into_inner(),
         }
     }
 }

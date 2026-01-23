@@ -2395,22 +2395,38 @@ impl ProductionRunner {
             Action::VerifyStateRoot {
                 block_hash,
                 parent_state_root,
-                writes_per_cert,
                 expected_root,
+                certificates,
             } => {
                 let event_tx = self.callback_tx.clone();
                 let storage = self.storage.clone();
+                let local_shard = self.local_shard;
 
                 // State root verification can be expensive for large blocks.
                 // Use consensus crypto pool since this is on the critical voting path.
                 self.thread_pools.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
 
+                    // Extract state writes from certificates for our local shard.
+                    // Each certificate's writes are kept separate for incremental JMT application.
+                    let writes_per_cert: Vec<Vec<_>> = certificates
+                        .iter()
+                        .map(|cert| {
+                            cert.shard_proofs
+                                .get(&local_shard)
+                                .map(|proof| proof.state_writes.clone())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+
                     // Compute what the root would be after applying writes incrementally.
                     // Each certificate's writes are applied at a separate JMT version.
                     // We verify from parent_state_root to ensure proposer and verifier
                     // compute from the same base state.
-                    let computed_root = storage
+                    //
+                    // This also returns a snapshot of the JMT nodes created, which we
+                    // cache for reuse during block commit.
+                    let (computed_root, jmt_snapshot) = storage
                         .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
 
                     let valid = computed_root == expected_root;
@@ -2426,10 +2442,23 @@ impl ProductionRunner {
                             "State root verification FAILED"
                         );
                     } else {
+                        // Build and cache the BlockCommitCache for efficient commit later.
+                        // Pre-serialize certificates and state writes so commit only needs
+                        // to build a WriteBatch and do 1 fsync.
+                        let (cert_data, state_writes) =
+                            storage.build_commit_cache_data(&certificates, local_shard);
+                        let cache = crate::storage::BlockCommitCache {
+                            cert_data,
+                            state_writes,
+                            jmt_snapshot,
+                        };
+                        storage.cache_block_commit(block_hash, cache);
+
                         tracing::debug!(
                             block_hash = ?block_hash,
                             elapsed_ms = elapsed * 1000.0,
-                            "State root verified"
+                            cert_count = certificates.len(),
+                            "State root verified and commit cache built"
                         );
                     }
 
@@ -2453,6 +2482,12 @@ impl ProductionRunner {
 
                 // State root computation for proposals. Need to wait for JMT to catch up
                 // to parent_state_root before computing. Uses condvar for efficient waiting.
+                //
+                // NOTE: We don't cache the snapshot here because we don't know the block
+                // hash yet (it's computed after the block is built). The proposer will
+                // fall back to per-certificate commits. This is fine because:
+                // 1. Only 1 out of N validators is the proposer
+                // 2. The N-1 verifiers will cache their snapshots
                 self.thread_pools.spawn_consensus_crypto(move || {
                     use hyperscale_core::StateRootComputeResult;
 
@@ -2464,10 +2499,11 @@ impl ProductionRunner {
 
                         if current_root == parent_state_root {
                             // JMT is ready - compute the speculative root
-                            let state_root = storage.compute_speculative_root_from_base(
-                                parent_state_root,
-                                &writes_per_cert,
-                            );
+                            let (state_root, _snapshot) = storage
+                                .compute_speculative_root_from_base(
+                                    parent_state_root,
+                                    &writes_per_cert,
+                                );
 
                             let elapsed = start.elapsed().as_secs_f64();
                             tracing::debug!(
@@ -2911,6 +2947,10 @@ impl ProductionRunner {
                 // EmitCommittedBlock is emitted when a block commits (not when certified),
                 // so this is the correct place for state application.
                 //
+                // OPTIMIZATION: If we have a cached JMT snapshot from verification,
+                // apply it directly instead of recomputing certificate-by-certificate.
+                // This avoids redundant JMT computation (verification already did it).
+                //
                 // After commit completes, we send StateCommitComplete so the state machine
                 // knows it's safe to compute speculative roots for the next proposal.
                 if !block.committed_certificates.is_empty() {
@@ -2919,42 +2959,64 @@ impl ProductionRunner {
                     let rpc_status = self.rpc_status.clone();
                     let block_for_commit = block.clone();
                     let block_height = height;
+                    let block_hash = block.hash();
                     let callback_tx = self.callback_tx.clone();
 
                     tokio::task::spawn_blocking(move || {
-                        let mut applied_count = 0u32;
-                        let mut empty_count = 0u32;
-                        for cert in &block_for_commit.committed_certificates {
-                            // Always commit every certificate to advance JMT version.
-                            // This ensures JMT version matches certificates.len() used in state_version.
-                            // Get writes for local shard, or empty vec if no writes for this shard.
-                            let writes = cert
-                                .shard_proofs
-                                .get(&local_shard)
-                                .map(|proof| proof.state_writes.as_slice())
-                                .unwrap_or(&[]);
+                        // Try to use cached BlockCommitCache from verification (fast path).
+                        // Falls back to per-certificate commits if no cache present
+                        // (proposer case, cache eviction, or sync).
+                        if let Some(cache) = storage.take_block_commit_cache(block_hash) {
+                            // FAST PATH: Apply the pre-built WriteBatch with a single fsync,
+                            // then apply the precomputed JMT snapshot (in-memory).
+                            let num_certs = block_for_commit.committed_certificates.len();
+                            storage.apply_block_commit_cache(cache);
 
-                            storage.commit_certificate_with_writes(cert, writes);
-                            if writes.is_empty() {
-                                empty_count += 1;
-                            } else {
-                                applied_count += 1;
+                            tracing::info!(
+                                block_height,
+                                total_certs = num_certs,
+                                local_shard = local_shard.0,
+                                "Applied block commit cache (fast path, 1 fsync)"
+                            );
+                        } else {
+                            // SLOW PATH: recompute per-certificate (N fsyncs)
+                            // This happens for proposers (who don't verify their own blocks)
+                            // or when cache is evicted.
+                            let mut applied_count = 0u32;
+                            let mut empty_count = 0u32;
+                            for cert in &block_for_commit.committed_certificates {
+                                // Always commit every certificate to advance JMT version.
+                                // This ensures JMT version matches certificates.len() used in state_version.
+                                // Get writes for local shard, or empty vec if no writes for this shard.
+                                let writes = cert
+                                    .shard_proofs
+                                    .get(&local_shard)
+                                    .map(|proof| proof.state_writes.as_slice())
+                                    .unwrap_or(&[]);
+
+                                storage.commit_certificate_with_writes(cert, writes);
+                                if writes.is_empty() {
+                                    empty_count += 1;
+                                } else {
+                                    applied_count += 1;
+                                }
                             }
+
+                            tracing::info!(
+                                block_height,
+                                total_certs = block_for_commit.committed_certificates.len(),
+                                applied_count,
+                                empty_count,
+                                local_shard = local_shard.0,
+                                "Applied certificate state writes (slow path, {} fsyncs)",
+                                block_for_commit.committed_certificates.len()
+                            );
                         }
 
                         // Get the resulting state root after all commits
                         use hyperscale_engine::SubstateStore;
                         let state_root_hash = storage.state_root_hash();
                         let state_version = storage.state_version();
-
-                        tracing::info!(
-                            block_height,
-                            total_certs = block_for_commit.committed_certificates.len(),
-                            applied_count,
-                            empty_count,
-                            local_shard = local_shard.0,
-                            "Applied certificate state writes"
-                        );
 
                         // Update RPC status with new JMT state version and root hash
                         if let Some(rpc_status) = rpc_status {

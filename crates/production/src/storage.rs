@@ -14,8 +14,9 @@
 use crate::metrics;
 use hyperscale_engine::{
     keys, put_at_next_version, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates,
-    DbPartitionKey, DbSortKey, DbSubstateValue, OverlayTreeStore, PartitionDatabaseUpdates,
-    PartitionEntry, StateRootHash, SubstateDatabase, SubstateStore, TypedInMemoryTreeStore,
+    DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot, OverlayTreeStore,
+    PartitionDatabaseUpdates, PartitionEntry, StateRootHash, SubstateDatabase, SubstateStore,
+    TypedInMemoryTreeStore, WriteableTreeStore,
 };
 use hyperscale_types::NodeId;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, Snapshot, WriteBatch, DB};
@@ -26,19 +27,60 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{instrument, Level};
 
-/// Size of the speculative state root cache.
+/// Size of the block commit cache.
 ///
-/// This cache avoids redundant JMT computation when the same block is verified
-/// multiple times (e.g., proposer computes root, then validator verifies).
+/// This cache stores [`BlockCommitCache`] entries built during verification.
+/// When a block commits, the cached WriteBatch is applied with a single fsync,
+/// avoiding the N-fsync overhead of per-certificate commits.
 ///
 /// The cache only needs to hold entries for:
-/// - The current round's proposed block
+/// - The current round's verified block
 /// - A few competing blocks during view changes
-/// - Recently committed blocks (brief window)
+/// - Recently verified blocks waiting to commit
 ///
 /// 32 entries is generous for typical operation. The cache uses LRU eviction,
 /// so older entries are automatically evicted under pressure.
-const SPECULATIVE_CACHE_SIZE: usize = 32;
+const BLOCK_COMMIT_CACHE_SIZE: usize = 32;
+
+/// Cached data for efficient block commit.
+///
+/// Built during state root verification and applied during block commit.
+/// This enables batching all RocksDB writes into a single atomic write operation
+/// with one fsync, instead of N fsyncs for N certificates.
+///
+/// # Performance
+///
+/// Without batching: 40 certificates × ~5ms fsync = ~200ms per block commit
+/// With batching: 1 fsync = ~5ms per block commit
+///
+/// # Why not cache the WriteBatch directly?
+///
+/// `rocksdb::WriteBatch` contains a raw pointer that isn't `Sync`, preventing it
+/// from being stored in a concurrent cache. Instead, we store the pre-serialized
+/// certificate bytes and state writes, then build the WriteBatch at commit time.
+/// This is still fast since building the batch is cheap - it's the fsync that's
+/// expensive.
+#[derive(Clone)]
+pub struct BlockCommitCache {
+    /// Pre-serialized certificate data: (tx_hash_bytes, cert_sbor_bytes).
+    /// We serialize during verification so commit doesn't need to re-serialize.
+    pub cert_data: CertData,
+
+    /// Pre-processed state writes: (storage_key, value_or_delete).
+    /// None means delete, Some(bytes) means put.
+    pub state_writes: StateWriteData,
+
+    /// JMT snapshot containing precomputed tree nodes.
+    /// Applied after the WriteBatch to update the in-memory Merkle tree.
+    pub jmt_snapshot: JmtSnapshot,
+}
+
+/// Pre-serialized certificate data: Vec of (tx_hash_bytes, cert_sbor_bytes).
+pub type CertData = Vec<(Vec<u8>, Vec<u8>)>;
+
+/// Pre-processed state writes: Vec of (storage_key, value_or_delete).
+/// None means delete, Some(bytes) means put.
+pub type StateWriteData = Vec<(Vec<u8>, Option<Vec<u8>>)>;
 
 /// JMT state bundled together for atomic updates.
 ///
@@ -85,11 +127,17 @@ pub struct RocksDbStorage {
     /// computing state roots. Notified whenever JMT state is committed.
     jmt_changed: std::sync::Condvar,
 
-    /// Cache of speculative root computations, keyed by block hash.
-    /// Avoids recomputing JMT roots when the same block is verified multiple times.
+    /// Cache of block commit data, keyed by block hash.
+    ///
+    /// When a block is verified, we build a [`BlockCommitCache`] containing:
+    /// - A pre-built RocksDB WriteBatch with all certificate + state writes
+    /// - A JMT snapshot with precomputed Merkle tree nodes
+    ///
+    /// When the block commits, the cached WriteBatch is applied with a single
+    /// fsync instead of N fsyncs for N certificates.
+    ///
     /// Uses quick_cache for O(1) concurrent LRU eviction.
-    speculative_cache:
-        quick_cache::sync::Cache<hyperscale_types::Hash, (hyperscale_types::Hash, u64)>,
+    block_commit_cache: quick_cache::sync::Cache<hyperscale_types::Hash, BlockCommitCache>,
 }
 
 /// Error type for storage operations.
@@ -162,7 +210,7 @@ impl RocksDbStorage {
                 current_root_hash: root_hash,
             }),
             jmt_changed: std::sync::Condvar::new(),
-            speculative_cache: quick_cache::sync::Cache::new(SPECULATIVE_CACHE_SIZE),
+            block_commit_cache: quick_cache::sync::Cache::new(BLOCK_COMMIT_CACHE_SIZE),
         })
     }
 
@@ -506,16 +554,15 @@ impl RocksDbStorage {
         (root, timed_out)
     }
 
-    /// Compute speculative state root after applying writes from multiple certificates.
+    /// Compute speculative state root and capture a snapshot for later application.
     ///
-    /// Compute speculative state root from a specific base root.
+    /// This is used for state root verification and proposal. The caller specifies
+    /// the expected base root (parent block's state_root), and we verify the JMT
+    /// matches before computing the new root after applying certificate writes.
     ///
-    /// This is used for state root verification. The caller specifies the expected
-    /// base root (parent block's state_root), and we verify the JMT matches before
-    /// computing the new root after applying certificate writes.
-    ///
-    /// This ensures proposer and verifier compute from the same base state,
-    /// regardless of async commit timing differences.
+    /// Returns both the computed state root AND a [`JmtSnapshot`] containing the
+    /// tree nodes created during computation. The snapshot can be cached and applied
+    /// during block commit, avoiding redundant recomputation.
     ///
     /// # Arguments
     /// * `expected_base_root` - The state root we expect the JMT to have. If the
@@ -523,19 +570,27 @@ impl RocksDbStorage {
     /// * `writes_per_cert` - State writes grouped by certificate.
     ///
     /// # Returns
-    /// The state root after applying all certificate writes.
+    /// A tuple of (computed_state_root, snapshot). The snapshot can be applied
+    /// to the real JMT during commit via [`apply_jmt_snapshot`].
     pub fn compute_speculative_root_from_base(
         &self,
         expected_base_root: hyperscale_types::Hash,
         writes_per_cert: &[Vec<hyperscale_types::SubstateWrite>],
-    ) -> hyperscale_types::Hash {
+    ) -> (hyperscale_types::Hash, JmtSnapshot) {
         let jmt = self.jmt.lock().unwrap();
 
-        let current_root = hyperscale_types::Hash::from_bytes(&jmt.current_root_hash.0);
+        let base_root = jmt.current_root_hash;
+        let current_root = hyperscale_types::Hash::from_bytes(&base_root.0);
 
-        // If no certificates with writes, return current root.
+        // If no certificates, return current root with empty snapshot.
         if writes_per_cert.is_empty() {
-            return current_root;
+            let snapshot = JmtSnapshot {
+                base_root,
+                result_root: base_root,
+                num_versions: 0,
+                nodes: std::collections::HashMap::new(),
+            };
+            return (current_root, snapshot);
         }
 
         // Verify the JMT root matches the expected base root.
@@ -555,13 +610,9 @@ impl RocksDbStorage {
 
         let mut current_version = jmt.current_version;
         let mut root = jmt.current_root_hash;
+        let num_versions = writes_per_cert.len() as u64;
 
         for cert_writes in writes_per_cert {
-            if cert_writes.is_empty() {
-                current_version += 1;
-                continue;
-            }
-
             let updates = hyperscale_engine::substate_writes_to_database_updates(cert_writes);
             let parent_version = if current_version == 0 {
                 None
@@ -573,7 +624,195 @@ impl RocksDbStorage {
             current_version += 1;
         }
 
-        hyperscale_types::Hash::from_bytes(&root.0)
+        let result_root = hyperscale_types::Hash::from_bytes(&root.0);
+        let snapshot = overlay.into_snapshot(base_root, root, num_versions);
+
+        (result_root, snapshot)
+    }
+
+    /// Cache a block commit for later application.
+    ///
+    /// Called after verification to store the pre-built WriteBatch and JMT snapshot.
+    /// When the block commits, [`take_block_commit_cache`] retrieves it.
+    pub fn cache_block_commit(&self, block_hash: hyperscale_types::Hash, cache: BlockCommitCache) {
+        self.block_commit_cache.insert(block_hash, cache);
+    }
+
+    /// Take a cached block commit, removing it from the cache.
+    ///
+    /// Called during block commit to retrieve and apply the precomputed data.
+    /// Returns `None` if no cache was present (proposer case, or cache eviction).
+    pub fn take_block_commit_cache(
+        &self,
+        block_hash: hyperscale_types::Hash,
+    ) -> Option<BlockCommitCache> {
+        self.block_commit_cache
+            .remove(&block_hash)
+            .map(|(_, cache)| cache)
+    }
+
+    /// Build pre-serialized data for a block commit cache.
+    ///
+    /// This pre-serializes all certificates and processes state writes so that
+    /// at commit time we only need to build a WriteBatch and apply it with one fsync.
+    ///
+    /// # Arguments
+    ///
+    /// * `certificates` - The certificates to include
+    /// * `local_shard` - The local shard to extract writes from
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (cert_data, state_writes) ready for BlockCommitCache.
+    pub fn build_commit_cache_data(
+        &self,
+        certificates: &[std::sync::Arc<hyperscale_types::TransactionCertificate>],
+        local_shard: hyperscale_types::ShardGroupId,
+    ) -> (CertData, StateWriteData) {
+        let mut cert_data = Vec::with_capacity(certificates.len());
+        let mut state_writes = Vec::new();
+
+        for cert in certificates {
+            // Serialize certificate
+            let cert_bytes =
+                sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
+            cert_data.push((cert.transaction_hash.as_bytes().to_vec(), cert_bytes));
+
+            // Process state writes for local shard
+            if let Some(shard_proof) = cert.shard_proofs.get(&local_shard) {
+                let updates = hyperscale_engine::substate_writes_to_database_updates(
+                    &shard_proof.state_writes,
+                );
+                for (db_node_key, node_updates) in &updates.node_updates {
+                    for (partition_num, partition_updates) in &node_updates.partition_updates {
+                        if let hyperscale_engine::PartitionDatabaseUpdates::Delta {
+                            substate_updates,
+                        } = partition_updates
+                        {
+                            for (db_sort_key, update) in substate_updates {
+                                let partition_key = hyperscale_engine::DbPartitionKey {
+                                    node_key: db_node_key.clone(),
+                                    partition_num: *partition_num,
+                                };
+                                let storage_key = hyperscale_engine::keys::to_storage_key(
+                                    &partition_key,
+                                    db_sort_key,
+                                );
+
+                                match update {
+                                    hyperscale_engine::DatabaseUpdate::Set(value) => {
+                                        state_writes.push((storage_key, Some(value.clone())));
+                                    }
+                                    hyperscale_engine::DatabaseUpdate::Delete => {
+                                        state_writes.push((storage_key, None));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        (cert_data, state_writes)
+    }
+
+    /// Apply a cached block commit with a single fsync.
+    ///
+    /// This is the fast path for block commit when we have a cached BlockCommitCache
+    /// from verification. Builds a WriteBatch from the pre-serialized data and applies
+    /// it atomically with one fsync, then applies the JMT snapshot to update the
+    /// in-memory Merkle tree.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the current JMT root doesn't match the snapshot's base_root,
+    /// or if the RocksDB write fails.
+    pub fn apply_block_commit_cache(&self, cache: BlockCommitCache) {
+        let start = Instant::now();
+
+        // 1. Build WriteBatch from pre-serialized data
+        let mut batch = rocksdb::WriteBatch::default();
+
+        let cert_cf = self
+            .db
+            .cf_handle("certificates")
+            .expect("certificates column family must exist");
+        let state_cf = self
+            .db
+            .cf_handle("state")
+            .expect("state column family must exist");
+
+        // Add certificates
+        for (tx_hash, cert_bytes) in &cache.cert_data {
+            batch.put_cf(cert_cf, tx_hash, cert_bytes);
+        }
+
+        // Add state writes
+        for (key, value) in &cache.state_writes {
+            match value {
+                Some(v) => batch.put_cf(state_cf, key, v),
+                None => batch.delete_cf(state_cf, key),
+            }
+        }
+
+        // 2. Apply the WriteBatch with a single fsync
+        let mut write_opts = rocksdb::WriteOptions::default();
+        write_opts.set_sync(true);
+
+        self.db.write_opt(batch, &write_opts).expect(
+            "BFT SAFETY CRITICAL: block commit failed - node state would diverge from network",
+        );
+
+        let rocksdb_elapsed = start.elapsed();
+
+        // 3. Apply the JMT snapshot (in-memory, fast)
+        let mut jmt = self.jmt.lock().unwrap();
+
+        // Verify we're applying to the expected base state
+        if jmt.current_root_hash != cache.jmt_snapshot.base_root {
+            panic!(
+                "JMT snapshot base mismatch: expected {:?}, got {:?}. \
+                 This is a bug - snapshot was computed from different JMT state.",
+                cache.jmt_snapshot.base_root, jmt.current_root_hash
+            );
+        }
+
+        // Insert all captured nodes directly into the tree store
+        let nodes_count = cache.jmt_snapshot.nodes.len();
+        for (key, node) in cache.jmt_snapshot.nodes {
+            jmt.tree_store.insert_node(key, node);
+        }
+
+        // Advance version and update root
+        jmt.current_version += cache.jmt_snapshot.num_versions;
+        jmt.current_root_hash = cache.jmt_snapshot.result_root;
+
+        let new_version = jmt.current_version;
+        let new_root = jmt.current_root_hash;
+        drop(jmt); // Release lock before I/O
+
+        // 4. Persist the new JMT state
+        self.persist_jmt_state(new_version, new_root);
+
+        // 5. Notify any waiters that JMT state has changed
+        self.jmt_changed.notify_all();
+
+        let total_elapsed = start.elapsed();
+        metrics::record_rocksdb_write(rocksdb_elapsed.as_secs_f64());
+        metrics::record_storage_operation("apply_block_commit_cache", total_elapsed.as_secs_f64());
+        metrics::record_storage_batch_size(cache.cert_data.len() + cache.state_writes.len());
+
+        tracing::debug!(
+            new_version,
+            new_root = %hex::encode(new_root.0),
+            nodes_count,
+            certs = cache.cert_data.len(),
+            state_writes = cache.state_writes.len(),
+            rocksdb_ms = rocksdb_elapsed.as_millis(),
+            total_ms = total_elapsed.as_millis(),
+            "Applied block commit cache (single fsync)"
+        );
     }
 }
 
@@ -1414,9 +1653,6 @@ impl RocksDbStorage {
 
         // 6. Notify any waiters that JMT state has changed
         self.jmt_changed.notify_all();
-
-        // 7. Invalidate speculative cache (stale after JMT update).
-        self.speculative_cache.clear();
 
         tracing::debug!(
             tx_hash = %certificate.transaction_hash,

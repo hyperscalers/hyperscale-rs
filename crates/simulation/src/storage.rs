@@ -14,8 +14,9 @@
 
 use hyperscale_engine::{
     keys, put_at_next_version, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates,
-    DbPartitionKey, DbSortKey, DbSubstateValue, OverlayTreeStore, PartitionDatabaseUpdates,
-    PartitionEntry, StateRootHash, SubstateDatabase, SubstateStore, TypedInMemoryTreeStore,
+    DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot, OverlayTreeStore,
+    PartitionDatabaseUpdates, PartitionEntry, StateRootHash, SubstateDatabase, SubstateStore,
+    TypedInMemoryTreeStore, WriteableTreeStore,
 };
 use hyperscale_types::{
     Block, BlockHeight, Hash, NodeId, QuorumCertificate, SubstateWrite, TransactionCertificate,
@@ -59,16 +60,25 @@ impl SharedJmtState {
     /// This verifies the JMT root matches expected_base_root before computing.
     /// Used for state root verification to ensure proposer and verifier compute
     /// from the same base state.
+    ///
+    /// Returns both the computed state root AND a snapshot of the JMT nodes
+    /// created during computation, which can be applied during commit.
     fn compute_speculative_root_from_base(
         &self,
         expected_base_root: Hash,
         writes_per_cert: &[Vec<SubstateWrite>],
-    ) -> Hash {
-        let current_root = *self.current_root_hash.lock().unwrap();
-        let current_root_hash = Hash::from_bytes(&current_root.0);
+    ) -> (Hash, JmtSnapshot) {
+        let base_root = *self.current_root_hash.lock().unwrap();
+        let current_root_hash = Hash::from_bytes(&base_root.0);
 
         if writes_per_cert.is_empty() {
-            return current_root_hash;
+            let snapshot = JmtSnapshot {
+                base_root,
+                result_root: base_root,
+                num_versions: 0,
+                nodes: std::collections::HashMap::new(),
+            };
+            return (current_root_hash, snapshot);
         }
 
         // Verify the JMT root matches expected base root
@@ -84,15 +94,11 @@ impl SharedJmtState {
         let overlay = OverlayTreeStore::new(&tree_store);
 
         let mut current_version = *self.current_version.lock().unwrap();
-        let mut result_root = current_root;
+        let mut result_root = base_root;
+        let num_versions = writes_per_cert.len() as u64;
 
         // Apply each certificate's writes at a separate version
         for cert_writes in writes_per_cert {
-            if cert_writes.is_empty() {
-                current_version += 1;
-                continue;
-            }
-
             let updates = hyperscale_engine::substate_writes_to_database_updates(cert_writes);
             let parent_version = if current_version == 0 {
                 None
@@ -104,7 +110,34 @@ impl SharedJmtState {
             current_version += 1;
         }
 
-        Hash::from_bytes(&result_root.0)
+        let result_hash = Hash::from_bytes(&result_root.0);
+        let snapshot = overlay.into_snapshot(base_root, result_root, num_versions);
+
+        (result_hash, snapshot)
+    }
+
+    /// Apply a JMT snapshot directly, inserting precomputed nodes.
+    fn apply_snapshot(&self, snapshot: JmtSnapshot) {
+        let tree_store = self.tree_store.lock().unwrap();
+        let mut current_version = self.current_version.lock().unwrap();
+        let mut current_root_hash = self.current_root_hash.lock().unwrap();
+
+        // Verify we're applying to the expected base state
+        if *current_root_hash != snapshot.base_root {
+            panic!(
+                "JMT snapshot base mismatch: expected {:?}, got {:?}",
+                snapshot.base_root, *current_root_hash
+            );
+        }
+
+        // Insert all captured nodes
+        for (key, node) in snapshot.nodes {
+            tree_store.insert_node(key, node);
+        }
+
+        // Advance version and update root
+        *current_version += snapshot.num_versions;
+        *current_root_hash = snapshot.result_root;
     }
 
     fn commit(&self, updates: &DatabaseUpdates) {
@@ -315,6 +348,79 @@ impl SimStorage {
             .insert(certificate.transaction_hash, certificate.clone());
     }
 
+    /// Commit substate data and certificate WITHOUT updating the JMT.
+    ///
+    /// Used when applying a cached JMT snapshot - the JMT is updated via
+    /// `apply_jmt_snapshot()` instead of being recomputed per-certificate.
+    pub fn commit_substate_data_only(
+        &mut self,
+        certificate: &TransactionCertificate,
+        writes: &[hyperscale_types::SubstateWrite],
+    ) {
+        // 1. Commit substate data only (no JMT update)
+        let updates = hyperscale_engine::substate_writes_to_database_updates(writes);
+        self.commit_data_only(&updates);
+
+        // 2. Store certificate
+        self.certificates
+            .insert(certificate.transaction_hash, certificate.clone());
+    }
+
+    /// Commit substate data without updating JMT.
+    fn commit_data_only(&mut self, updates: &DatabaseUpdates) {
+        let mut data = self.data.write().unwrap();
+
+        for (node_key, node_updates) in &updates.node_updates {
+            for (partition_num, partition_updates) in &node_updates.partition_updates {
+                let partition_key = DbPartitionKey {
+                    node_key: node_key.clone(),
+                    partition_num: *partition_num,
+                };
+
+                match partition_updates {
+                    PartitionDatabaseUpdates::Delta { substate_updates } => {
+                        for (sort_key, update) in substate_updates {
+                            let key = keys::to_storage_key(&partition_key, sort_key);
+                            match update {
+                                DatabaseUpdate::Set(value) => {
+                                    data.insert(key, value.clone());
+                                }
+                                DatabaseUpdate::Delete => {
+                                    data.remove(&key);
+                                }
+                            }
+                        }
+                    }
+                    PartitionDatabaseUpdates::Reset {
+                        new_substate_values,
+                    } => {
+                        // Delete all existing in partition
+                        let prefix = keys::partition_prefix(&partition_key);
+                        let end = keys::next_prefix(&prefix);
+
+                        let existing_keys: Vec<Vec<u8>> = data
+                            .iter()
+                            .filter(|(k, _)| {
+                                k.as_slice() >= prefix.as_slice() && k.as_slice() < end.as_slice()
+                            })
+                            .map(|(k, _)| k.clone())
+                            .collect();
+
+                        for key in existing_keys {
+                            data.remove(&key);
+                        }
+
+                        // Insert new values
+                        for (sort_key, value) in new_substate_values {
+                            let key = keys::to_storage_key(&partition_key, sort_key);
+                            data.insert(key, value.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Store a certificate without committing state writes.
     ///
     /// Used for gossiped certificates. State writes are applied later during block commit.
@@ -514,13 +620,24 @@ impl SimStorage {
     ///
     /// Used for state root verification to ensure proposer and verifier compute
     /// from the same base state.
+    ///
+    /// Returns both the computed state root AND a snapshot of the JMT nodes
+    /// created during computation, which can be applied during commit.
     pub fn compute_speculative_root_from_base(
         &self,
         expected_base_root: Hash,
         writes_per_cert: &[Vec<SubstateWrite>],
-    ) -> Hash {
+    ) -> (Hash, JmtSnapshot) {
         self.jmt
             .compute_speculative_root_from_base(expected_base_root, writes_per_cert)
+    }
+
+    /// Apply a JMT snapshot directly, inserting precomputed nodes.
+    ///
+    /// This is the fast path for block commit when we have a cached snapshot
+    /// from verification.
+    pub fn apply_jmt_snapshot(&self, snapshot: JmtSnapshot) {
+        self.jmt.apply_snapshot(snapshot);
     }
 }
 

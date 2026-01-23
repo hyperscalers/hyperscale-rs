@@ -830,12 +830,26 @@ impl SimNode {
             Action::VerifyStateRoot {
                 block_hash,
                 parent_state_root,
-                writes_per_cert,
                 expected_root,
+                certificates,
             } => {
+                // Extract state writes from certificates for our local shard.
+                let local_shard = self.state.shard();
+                let writes_per_cert: Vec<Vec<_>> = certificates
+                    .iter()
+                    .map(|cert| {
+                        cert.shard_proofs
+                            .get(&local_shard)
+                            .map(|proof| proof.state_writes.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+
                 // Verify root hash by computing from the parent's state root.
                 // This ensures proposer and verifier compute from the same base.
-                let computed_root = self
+                // NOTE: In parallel simulation we don't cache snapshots since each
+                // shard runs independently and there's no commit-time reuse benefit.
+                let (computed_root, _snapshot) = self
                     .storage
                     .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
 
@@ -857,7 +871,7 @@ impl SimNode {
 
                 let result = if current_root == parent_state_root {
                     // JMT is ready - compute speculative root
-                    let state_root = self
+                    let (state_root, _snapshot) = self
                         .storage
                         .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
                     hyperscale_core::StateRootComputeResult::Success { state_root }

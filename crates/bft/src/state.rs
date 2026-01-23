@@ -123,10 +123,12 @@ struct PendingStateRootVerification {
     /// The state root of the parent block. Verification waits until local JMT
     /// reaches this root, ensuring proposer and verifier compute from same base.
     required_root: Hash,
-    /// State writes grouped by certificate (for incremental JMT application).
-    writes_per_cert: Vec<Vec<hyperscale_types::SubstateWrite>>,
     /// The state root claimed by the proposer (to verify against).
     expected_root: Hash,
+    /// The certificates to commit. State writes are extracted from these.
+    /// Also used to pre-build the RocksDB WriteBatch during verification
+    /// for efficient single-fsync commit later.
+    certificates: Vec<std::sync::Arc<hyperscale_types::TransactionCertificate>>,
 }
 
 /// Pending proposal waiting for state root computation.
@@ -2410,21 +2412,6 @@ impl BftState {
             .map(|parent| parent.header.state_root)
             .unwrap_or(Hash::ZERO); // Genesis parent has zero root
 
-        // Collect state writes from committed certificates for our local shard only.
-        // Each certificate's writes are kept separate so they can be applied
-        // incrementally (one JMT version per cert) to match commit-time behavior.
-        let local_shard = self.local_shard();
-        let writes_per_cert: Vec<Vec<_>> = block
-            .committed_certificates
-            .iter()
-            .map(|cert| {
-                cert.shard_proofs
-                    .get(&local_shard)
-                    .map(|proof| proof.state_writes.clone())
-                    .unwrap_or_default()
-            })
-            .collect();
-
         // Check if our local JMT root matches the parent's state_root.
         // This ensures we're computing from the same base state as the proposer.
         let (_, current_root) = self.get_local_jmt_state();
@@ -2445,8 +2432,8 @@ impl BftState {
             vec![Action::VerifyStateRoot {
                 block_hash,
                 parent_state_root,
-                writes_per_cert,
                 expected_root: block.header.state_root,
+                certificates: block.committed_certificates.clone(),
             }]
         } else {
             // JMT not ready - queue for later
@@ -2463,8 +2450,8 @@ impl BftState {
                 block_hash,
                 PendingStateRootVerification {
                     required_root: parent_state_root,
-                    writes_per_cert,
                     expected_root: block.header.state_root,
+                    certificates: block.committed_certificates.clone(),
                 },
             );
 
@@ -3635,8 +3622,8 @@ impl BftState {
                 actions.push(Action::VerifyStateRoot {
                     block_hash,
                     parent_state_root: pv.required_root,
-                    writes_per_cert: pv.writes_per_cert,
                     expected_root: pv.expected_root,
+                    certificates: pv.certificates,
                 });
             }
         }
