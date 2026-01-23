@@ -3117,14 +3117,6 @@ impl BftState {
         }
 
         let has_certificates = !block.committed_certificates.is_empty();
-        info!(
-            validator = ?self.validator_id(),
-            height = height.0,
-            round = round,
-            block_hash = ?block_hash,
-            certificates = block.committed_certificates.len(),
-            "Broadcasting proposal"
-        );
 
         // Build hashes for gossip and pending block
         let retry_hashes: Vec<Hash> = block
