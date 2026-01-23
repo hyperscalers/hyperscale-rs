@@ -2040,15 +2040,25 @@ impl BftState {
                     return vec![];
                 }
 
-                // If block has deferrals with CycleProofs, initiate async verification
-                // before voting. This is CRITICAL for BFT safety.
+                // Initiate all async verifications in parallel.
+                // Both CycleProof and StateRoot verification can run concurrently.
+                let mut verification_actions = Vec::new();
+
+                // If block has deferrals with CycleProofs, initiate async verification.
                 if self.block_needs_cycle_proof_verification(&block) {
-                    return self.initiate_cycle_proof_verification(block_hash, &block);
+                    verification_actions
+                        .extend(self.initiate_cycle_proof_verification(block_hash, &block));
                 }
 
-                // Verify state root before voting if block has committed certificates.
+                // Verify state root if block has committed certificates.
                 if self.block_needs_state_root_verification(&block) {
-                    return self.initiate_state_root_verification(block_hash, &block);
+                    verification_actions
+                        .extend(self.initiate_state_root_verification(block_hash, &block));
+                }
+
+                // If any verifications were initiated, wait for them to complete.
+                if !verification_actions.is_empty() {
+                    return verification_actions;
                 }
             }
         }
@@ -2186,6 +2196,37 @@ impl BftState {
                     .and_then(|vid| self.topology.public_key(*vid))
             })
             .collect()
+    }
+
+    /// Check if all async verifications are complete for a block.
+    ///
+    /// Returns true if:
+    /// - CycleProof verification is done (or not needed)
+    /// - State root verification is done (or not needed)
+    ///
+    /// Used by verification callbacks to determine if it's safe to vote.
+    fn block_verifications_complete(&self, block: &Block) -> bool {
+        let block_hash = block.hash();
+
+        // Check CycleProof verification status
+        let cycle_proof_ok = if block.deferred.is_empty() {
+            // No deferrals - no verification needed
+            true
+        } else {
+            // Has deferrals - must be in verified set
+            self.verified_cycle_proofs.contains(&block_hash)
+        };
+
+        // Check state root verification status
+        let state_root_ok = if block.committed_certificates.is_empty() {
+            // No certificates - no verification needed
+            true
+        } else {
+            // Has certificates - must be in verified set
+            self.verified_state_roots.contains(&block_hash)
+        };
+
+        cycle_proof_ok && state_root_ok
     }
 
     /// Check if a block needs state root verification before voting.
@@ -3012,7 +3053,7 @@ impl BftState {
             return vec![];
         }
 
-        // Mark as verified so we don't re-verify when try_vote_on_block is called
+        // Mark as verified
         self.verified_cycle_proofs.insert(block_hash);
 
         debug!(
@@ -3020,7 +3061,7 @@ impl BftState {
             "All CycleProofs verified successfully"
         );
 
-        // Get block info for voting
+        // Get block for checking if all verifications complete
         let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
             warn!(
                 block_hash = ?block_hash,
@@ -3029,11 +3070,25 @@ impl BftState {
             return vec![];
         };
 
+        let block = match pending_block.block() {
+            Some(b) => b,
+            None => return vec![],
+        };
+
+        // Check if all verifications are complete (state root may still be pending)
+        if !self.block_verifications_complete(&block) {
+            debug!(
+                block_hash = ?block_hash,
+                "CycleProofs done, waiting for other verifications"
+            );
+            return vec![];
+        }
+
         let height = pending_block.header().height.0;
         let round = pending_block.header().round;
 
-        // CycleProofs verified - continue voting flow which may need state root verification
-        self.try_vote_on_block(block_hash, height, round)
+        // All verifications complete - vote
+        self.create_vote(block_hash, height, round)
     }
 
     /// Handle state root verification result.
@@ -3056,7 +3111,7 @@ impl BftState {
             return vec![];
         }
 
-        // Mark as verified so we don't re-verify when try_vote_on_block is called
+        // Mark as verified
         self.verified_state_roots.insert(block_hash);
 
         debug!(
@@ -3064,7 +3119,7 @@ impl BftState {
             "State root verified successfully"
         );
 
-        // Get block info for voting
+        // Get block for checking if all verifications complete
         let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
             warn!(
                 block_hash = ?block_hash,
@@ -3073,11 +3128,25 @@ impl BftState {
             return vec![];
         };
 
+        let block = match pending_block.block() {
+            Some(b) => b,
+            None => return vec![],
+        };
+
+        // Check if all verifications are complete (cycle proofs may still be pending)
+        if !self.block_verifications_complete(&block) {
+            debug!(
+                block_hash = ?block_hash,
+                "State root done, waiting for other verifications"
+            );
+            return vec![];
+        }
+
         let height = pending_block.header().height.0;
         let round = pending_block.header().round;
 
-        // State root verified - continue voting flow (all verifications should be done now)
-        self.try_vote_on_block(block_hash, height, round)
+        // All verifications complete - vote
+        self.create_vote(block_hash, height, round)
     }
 
     /// Handle proposal built by the runner.
