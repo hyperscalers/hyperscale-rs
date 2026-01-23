@@ -24,7 +24,7 @@ use sbor::prelude::*;
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tracing::{instrument, Level};
 
@@ -106,12 +106,9 @@ impl BlockCommitCacheLru {
 }
 
 /// JMT state bundled together for atomic updates.
-///
-/// All JMT operations must hold this lock to prevent race conditions where
-/// concurrent commits could read stale versions or access pruned nodes.
 struct JmtState {
     /// In-memory JMT tree store.
-    tree_store: TypedInMemoryTreeStore,
+    tree_store: Arc<TypedInMemoryTreeStore>,
     /// Current state version (persisted to DB).
     current_version: u64,
     /// Current JMT state root hash (persisted to DB).
@@ -138,11 +135,8 @@ struct JmtState {
 pub struct RocksDbStorage {
     db: Arc<DB>,
 
-    /// JMT state protected by a single lock for atomic updates.
-    ///
-    /// This prevents race conditions where concurrent `commit_certificate_with_writes`
-    /// calls could read stale versions and attempt to update from pruned parent nodes.
-    jmt: Mutex<JmtState>,
+    /// JMT state protected by RwLock for concurrent reads during verification.
+    jmt: RwLock<JmtState>,
 
     /// Cache of block commit data, keyed by block hash.
     ///
@@ -222,8 +216,8 @@ impl RocksDbStorage {
 
         Ok(Self {
             db: Arc::new(db),
-            jmt: Mutex::new(JmtState {
-                tree_store: TypedInMemoryTreeStore::new().with_pruning_enabled(),
+            jmt: RwLock::new(JmtState {
+                tree_store: Arc::new(TypedInMemoryTreeStore::new().with_pruning_enabled()),
                 current_version: version,
                 current_root_hash: root_hash,
             }),
@@ -447,25 +441,25 @@ impl RocksDbStorage {
             .write(batch)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
-        // Update JMT and compute new root hash (single lock for atomicity)
+        // Update JMT and compute new root hash
         let (new_version, new_root) = {
-            let mut jmt = self.jmt.lock().unwrap();
+            let mut jmt = self.jmt.write().unwrap();
             let parent_version = if jmt.current_version == 0 {
                 None
             } else {
                 Some(jmt.current_version)
             };
-            let new_root = put_at_next_version(&jmt.tree_store, parent_version, updates);
+            let new_root = put_at_next_version(&*jmt.tree_store, parent_version, updates);
             let new_version = jmt.current_version + 1;
 
-            // Update in-memory state while still holding the lock
+            // Update in-memory state
             jmt.current_version = new_version;
             jmt.current_root_hash = new_root;
 
             (new_version, new_root)
         };
 
-        // Persist JMT state (outside lock - RocksDB is thread-safe)
+        // Persist JMT state
         self.persist_jmt_state(new_version, new_root);
 
         let elapsed = start.elapsed();
@@ -538,18 +532,18 @@ impl SubstateStore for RocksDbStorage {
     }
 
     fn state_version(&self) -> u64 {
-        self.jmt.lock().unwrap().current_version
+        self.jmt.read().unwrap().current_version
     }
 
     fn state_root_hash(&self) -> StateRootHash {
-        self.jmt.lock().unwrap().current_root_hash
+        self.jmt.read().unwrap().current_root_hash
     }
 }
 
 impl RocksDbStorage {
     /// Get the current JMT root hash.
     pub fn current_jmt_root(&self) -> hyperscale_types::Hash {
-        let jmt = self.jmt.lock().unwrap();
+        let jmt = self.jmt.read().unwrap();
         hyperscale_types::Hash::from_bytes(&jmt.current_root_hash.0)
     }
 
@@ -576,16 +570,22 @@ impl RocksDbStorage {
         expected_base_root: hyperscale_types::Hash,
         writes_per_cert: &[Vec<hyperscale_types::SubstateWrite>],
     ) -> (hyperscale_types::Hash, JmtSnapshot) {
-        let jmt = self.jmt.lock().unwrap();
+        let (tree_store, base_version, base_root) = {
+            let jmt = self.jmt.read().unwrap();
+            (
+                jmt.tree_store.clone(),
+                jmt.current_version,
+                jmt.current_root_hash,
+            )
+        };
 
-        let base_root = jmt.current_root_hash;
         let current_root = hyperscale_types::Hash::from_bytes(&base_root.0);
 
         // If no certificates, return current root with empty snapshot.
         if writes_per_cert.is_empty() {
             let snapshot = JmtSnapshot {
                 base_root,
-                base_version: jmt.current_version,
+                base_version,
                 result_root: base_root,
                 num_versions: 0,
                 nodes: std::collections::HashMap::new(),
@@ -594,23 +594,20 @@ impl RocksDbStorage {
         }
 
         // Verify the JMT root matches the expected base root.
-        // This is the key guarantee: both proposer and verifier must compute from
-        // the same base state for verification to succeed.
         if current_root != expected_base_root {
             tracing::warn!(
                 current_root = ?current_root,
                 expected_base_root = ?expected_base_root,
                 "JMT root mismatch - verification will likely fail"
             );
-            // Continue anyway - the computed root won't match and verification will fail
         }
 
-        // Apply each certificate's writes at a separate version using the overlay.
-        let overlay = OverlayTreeStore::new(&jmt.tree_store);
+        // Expensive computation runs without holding the outer lock.
+        // The tree_store has internal RwLocks for thread-safe access.
+        let overlay = OverlayTreeStore::new(&tree_store);
 
-        let base_version = jmt.current_version;
         let mut current_version = base_version;
-        let mut root = jmt.current_root_hash;
+        let mut root = base_root;
         let num_versions = writes_per_cert.len() as u64;
 
         for cert_writes in writes_per_cert {
@@ -752,8 +749,8 @@ impl RocksDbStorage {
 
         let rocksdb_elapsed = start.elapsed();
 
-        // 2. Apply the JMT snapshot (in-memory, fast)
-        let mut jmt = self.jmt.lock().unwrap();
+        // 2. Apply the JMT snapshot
+        let mut jmt = self.jmt.write().unwrap();
 
         // Verify we're applying to the expected base state.
         // Must check BOTH root AND version. Root can be unchanged with empty commits
@@ -1620,25 +1617,25 @@ impl RocksDbStorage {
             "BFT SAFETY CRITICAL: certificate commit failed - node state would diverge from network",
         );
 
-        // 4. Update JMT and compute new root hash (single lock for atomicity)
+        // 4. Update JMT and compute new root hash
         let (new_version, new_root) = {
-            let mut jmt = self.jmt.lock().unwrap();
+            let mut jmt = self.jmt.write().unwrap();
             let parent_version = if jmt.current_version == 0 {
                 None
             } else {
                 Some(jmt.current_version)
             };
-            let new_root = put_at_next_version(&jmt.tree_store, parent_version, &updates);
+            let new_root = put_at_next_version(&*jmt.tree_store, parent_version, &updates);
             let new_version = jmt.current_version + 1;
 
-            // Update in-memory state while still holding the lock
+            // Update in-memory state
             jmt.current_version = new_version;
             jmt.current_root_hash = new_root;
 
             (new_version, new_root)
         };
 
-        // 5. Persist JMT state (outside lock - RocksDB is thread-safe)
+        // 5. Persist JMT state
         self.persist_jmt_state(new_version, new_root);
 
         tracing::debug!(
