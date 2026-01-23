@@ -1358,9 +1358,7 @@ impl SimulationRunner {
                 commitment_proofs,
                 deferred,
                 aborted,
-                timeout: _, // Timeout ignored in simulation - everything is synchronous
             } => {
-                use hyperscale_core::ProposalBuildResult;
                 use hyperscale_types::{Block, BlockHeader};
 
                 // In simulation, JMT commits are synchronous so we can compute immediately.
@@ -1368,116 +1366,72 @@ impl SimulationRunner {
                 let local_shard = self.nodes[from as usize].shard();
                 let current_root = storage.current_jmt_root();
 
-                // Check if we can include certificates (JMT must be at parent state)
-                let can_include_certs =
-                    current_root == parent_state_root || committed_certificates.is_empty();
+                // Check if JMT is ready for certificates
+                let jmt_ready = current_root == parent_state_root;
+                let include_certs = jmt_ready && !committed_certificates.is_empty();
 
-                let result = if can_include_certs {
-                    // Either JMT is ready for certificates, or there are no certificates.
-                    // Build block with whatever certificates we have.
+                let (state_root, state_version, certs_to_include, jmt_snapshot) = if include_certs {
+                    // JMT ready - compute speculative root from certificates
+                    let writes_per_cert: Vec<Vec<_>> = committed_certificates
+                        .iter()
+                        .map(|cert| {
+                            cert.shard_proofs
+                                .get(&local_shard)
+                                .map(|proof| proof.state_writes.clone())
+                                .unwrap_or_default()
+                        })
+                        .collect();
 
-                    let (state_root, state_version, jmt_snapshot) = if !committed_certificates
-                        .is_empty()
-                    {
-                        // Extract writes from certificates for local shard
-                        let writes_per_cert: Vec<Vec<_>> = committed_certificates
-                            .iter()
-                            .map(|cert| {
-                                cert.shard_proofs
-                                    .get(&local_shard)
-                                    .map(|proof| proof.state_writes.clone())
-                                    .unwrap_or_default()
-                            })
-                            .collect();
-
-                        let (root, snapshot) = storage.compute_speculative_root_from_base(
-                            parent_state_root,
-                            &writes_per_cert,
-                        );
-                        let version = parent_state_version + committed_certificates.len() as u64;
-                        (root, version, Some(snapshot))
-                    } else {
-                        // No certificates - inherit parent state
-                        (parent_state_root, parent_state_version, None)
-                    };
-
-                    // Build the block
-                    let header = BlockHeader {
-                        height,
-                        parent_hash,
-                        parent_qc,
-                        proposer,
-                        timestamp,
-                        round,
-                        is_fallback,
-                        state_root,
-                        state_version,
-                    };
-
-                    let block = Block {
-                        header,
-                        retry_transactions,
-                        priority_transactions,
-                        transactions,
-                        committed_certificates: committed_certificates.clone(),
-                        deferred,
-                        aborted,
-                        commitment_proofs,
-                    };
-
-                    let block_hash = block.hash();
-
-                    // Cache the JMT snapshot for efficient commit (if we computed one)
-                    if let Some(snapshot) = jmt_snapshot {
-                        self.jmt_cache.insert((from, block_hash), snapshot);
-                    }
-
-                    ProposalBuildResult::Success {
-                        block: std::sync::Arc::new(block),
-                        block_hash,
-                    }
+                    let (root, snapshot) = storage
+                        .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
+                    let version = parent_state_version + committed_certificates.len() as u64;
+                    (root, version, committed_certificates, Some(snapshot))
                 } else {
-                    // JMT not ready but we have certificates - drop certificates (timeout)
-                    tracing::warn!(
-                        node = from,
-                        height = height.0,
-                        round = round,
-                        ?current_root,
-                        ?parent_state_root,
-                        dropped_certs = committed_certificates.len(),
-                        "JMT not at expected parent state - building block without certificates"
-                    );
-
-                    let header = BlockHeader {
-                        height,
-                        parent_hash,
-                        parent_qc,
-                        proposer,
-                        timestamp,
-                        round,
-                        is_fallback,
-                        state_root: parent_state_root,
-                        state_version: parent_state_version,
-                    };
-
-                    let block = Block {
-                        header,
-                        retry_transactions,
-                        priority_transactions,
-                        transactions,
-                        committed_certificates: vec![],
-                        deferred,
-                        aborted,
-                        commitment_proofs: std::collections::HashMap::new(),
-                    };
-
-                    let block_hash = block.hash();
-
-                    ProposalBuildResult::Timeout {
-                        block: std::sync::Arc::new(block),
-                        block_hash,
+                    // Either no certificates, or JMT not ready - inherit parent state
+                    if !committed_certificates.is_empty() {
+                        tracing::debug!(
+                            node = from,
+                            height = height.0,
+                            round = round,
+                            skipped_certs = committed_certificates.len(),
+                            ?current_root,
+                            ?parent_state_root,
+                            "JMT not ready - proposing without certificates"
+                        );
                     }
+                    (parent_state_root, parent_state_version, vec![], None)
                 };
+
+                // Build the block
+                let header = BlockHeader {
+                    height,
+                    parent_hash,
+                    parent_qc,
+                    proposer,
+                    timestamp,
+                    round,
+                    is_fallback,
+                    state_root,
+                    state_version,
+                };
+
+                let block = Block {
+                    header,
+                    retry_transactions,
+                    priority_transactions,
+                    transactions,
+                    committed_certificates: certs_to_include.clone(),
+                    deferred,
+                    aborted,
+                    commitment_proofs,
+                };
+
+                let block_hash = block.hash();
+
+                // Cache the JMT snapshot for efficient commit (if we computed one)
+                if let Some(snapshot) = jmt_snapshot {
+                    self.jmt_cache.insert((from, block_hash), snapshot);
+                }
 
                 self.schedule_event(
                     from,
@@ -1485,7 +1439,8 @@ impl SimulationRunner {
                     Event::ProposalBuilt {
                         height,
                         round,
-                        result,
+                        block: std::sync::Arc::new(block),
+                        block_hash,
                     },
                 );
             }

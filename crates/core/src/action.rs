@@ -312,8 +312,8 @@ pub enum Action {
         timestamp: u64,
         /// Whether this is a fallback block.
         is_fallback: bool,
-        /// The state root of the parent block. Runner waits for local JMT
-        /// to reach this root before computing.
+        /// The state root of the parent block. If local JMT matches this root,
+        /// certificates can be included. Otherwise, block is built without certs.
         parent_state_root: Hash,
         /// Parent's state version (for computing new state_version).
         parent_state_version: u64,
@@ -323,7 +323,7 @@ pub enum Action {
         priority_transactions: Vec<Arc<RoutableTransaction>>,
         /// Other transactions (normal priority).
         transactions: Vec<Arc<RoutableTransaction>>,
-        /// Committed certificates to include.
+        /// Committed certificates to include (if JMT is ready).
         committed_certificates: Vec<Arc<TransactionCertificate>>,
         /// Commitment proofs for cross-shard transactions.
         commitment_proofs: HashMap<Hash, CommitmentProof>,
@@ -331,8 +331,6 @@ pub enum Action {
         deferred: Vec<TransactionDefer>,
         /// Aborted transactions.
         aborted: Vec<TransactionAbort>,
-        /// Maximum time to wait for JMT to catch up before returning timeout.
-        timeout: Duration,
     },
 
     /// Execute a batch of single-shard transactions.

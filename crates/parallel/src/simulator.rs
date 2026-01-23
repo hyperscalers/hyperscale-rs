@@ -876,21 +876,19 @@ impl SimNode {
                 commitment_proofs,
                 deferred,
                 aborted,
-                timeout: _, // Timeout ignored in parallel simulation
             } => {
-                use hyperscale_core::ProposalBuildResult;
                 use hyperscale_types::{Block, BlockHeader};
 
                 // In parallel simulation, JMT commits are synchronous so compute immediately.
                 let local_shard = self.state.shard();
                 let current_root = self.storage.current_jmt_root();
 
-                let result = if current_root == parent_state_root
-                    && !committed_certificates.is_empty()
-                {
-                    // JMT is ready and we have certificates - compute state root
+                // Check if JMT is ready for certificates
+                let jmt_ready = current_root == parent_state_root;
+                let include_certs = jmt_ready && !committed_certificates.is_empty();
 
-                    // Extract writes from certificates for local shard
+                let (state_root, state_version, certs_to_include) = if include_certs {
+                    // JMT ready - compute speculative root from certificates
                     let writes_per_cert: Vec<Vec<_>> = committed_certificates
                         .iter()
                         .map(|cert| {
@@ -901,82 +899,48 @@ impl SimNode {
                         })
                         .collect();
 
-                    let (state_root, _snapshot) = self
+                    let (root, _snapshot) = self
                         .storage
                         .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
 
-                    let state_version = parent_state_version + committed_certificates.len() as u64;
-
-                    // Build the block
-                    let header = BlockHeader {
-                        height,
-                        parent_hash,
-                        parent_qc,
-                        proposer,
-                        timestamp,
-                        round,
-                        is_fallback,
-                        state_root,
-                        state_version,
-                    };
-
-                    let block = Block {
-                        header,
-                        retry_transactions,
-                        priority_transactions,
-                        transactions,
-                        committed_certificates,
-                        deferred,
-                        aborted,
-                        commitment_proofs,
-                    };
-
-                    let block_hash = block.hash();
-
-                    ProposalBuildResult::Success {
-                        block: std::sync::Arc::new(block),
-                        block_hash,
-                    }
+                    let version = parent_state_version + committed_certificates.len() as u64;
+                    (root, version, committed_certificates)
                 } else {
-                    // JMT not ready or no certificates - build block without certificates
-                    let state_root = parent_state_root;
-                    let state_version = parent_state_version;
-
-                    let header = BlockHeader {
-                        height,
-                        parent_hash,
-                        parent_qc,
-                        proposer,
-                        timestamp,
-                        round,
-                        is_fallback,
-                        state_root,
-                        state_version,
-                    };
-
-                    let block = Block {
-                        header,
-                        retry_transactions,
-                        priority_transactions,
-                        transactions,
-                        committed_certificates: vec![],
-                        deferred,
-                        aborted,
-                        commitment_proofs: std::collections::HashMap::new(),
-                    };
-
-                    let block_hash = block.hash();
-
-                    ProposalBuildResult::Timeout {
-                        block: std::sync::Arc::new(block),
-                        block_hash,
-                    }
+                    // Either no certificates, or JMT not ready - inherit parent state
+                    (parent_state_root, parent_state_version, vec![])
                 };
+
+                // Build the block
+                let header = BlockHeader {
+                    height,
+                    parent_hash,
+                    parent_qc,
+                    proposer,
+                    timestamp,
+                    round,
+                    is_fallback,
+                    state_root,
+                    state_version,
+                };
+
+                let block = Block {
+                    header,
+                    retry_transactions,
+                    priority_transactions,
+                    transactions,
+                    committed_certificates: certs_to_include,
+                    deferred,
+                    aborted,
+                    commitment_proofs,
+                };
+
+                let block_hash = block.hash();
 
                 self.internal_queue.push_back(Event::ProposalBuilt {
                     height,
                     round,
-                    result,
+                    block: std::sync::Arc::new(block),
+                    block_hash,
                 });
             }
 

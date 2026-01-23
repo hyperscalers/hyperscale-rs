@@ -12,7 +12,7 @@
 //! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
 //! the complete block data, making it recoverable from any honest validator in that set.
 
-use hyperscale_core::{Action, Event, OutboundMessage, ProposalBuildResult, TimerId};
+use hyperscale_core::{Action, Event, OutboundMessage, TimerId};
 
 /// BFT statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1172,7 +1172,6 @@ impl BftState {
                 commitment_proofs,
                 deferred: deferred_filtered,
                 aborted: aborted_with_height,
-                timeout: self.config.state_root_compute_timeout,
             },
         ]
     }
@@ -3086,12 +3085,13 @@ impl BftState {
     /// Called when the runner completes `Action::BuildProposal`. The runner has
     /// computed the state root, built the complete block, and cached the WriteBatch
     /// for efficient commit later.
-    #[instrument(skip(self, result), fields(height = %height.0, round = round))]
+    #[instrument(skip(self, block), fields(height = %height.0, round = round))]
     pub fn on_proposal_built(
         &mut self,
         height: BlockHeight,
         round: u64,
-        result: ProposalBuildResult,
+        block: Arc<Block>,
+        block_hash: Hash,
     ) -> Vec<Action> {
         // Take the pending proposal - if it doesn't match (height, round), something is wrong
         let Some(pending) = self.pending_proposal.take() else {
@@ -3116,30 +3116,15 @@ impl BftState {
             return vec![];
         }
 
-        // Extract block and hash from result (both success and timeout return a block)
-        let (block, block_hash, has_certificates) = match result {
-            ProposalBuildResult::Success { block, block_hash } => {
-                info!(
-                    validator = ?self.validator_id(),
-                    height = height.0,
-                    round = round,
-                    block_hash = ?block_hash,
-                    certificates = block.committed_certificates.len(),
-                    "Proposal built with certificates"
-                );
-                (block, block_hash, true)
-            }
-            ProposalBuildResult::Timeout { block, block_hash } => {
-                warn!(
-                    validator = ?self.validator_id(),
-                    height = height.0,
-                    round = round,
-                    block_hash = ?block_hash,
-                    "Proposal built without certificates (timeout)"
-                );
-                (block, block_hash, false)
-            }
-        };
+        let has_certificates = !block.committed_certificates.is_empty();
+        info!(
+            validator = ?self.validator_id(),
+            height = height.0,
+            round = round,
+            block_hash = ?block_hash,
+            certificates = block.committed_certificates.len(),
+            "Broadcasting proposal"
+        );
 
         // Build hashes for gossip and pending block
         let retry_hashes: Vec<Hash> = block

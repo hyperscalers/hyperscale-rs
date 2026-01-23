@@ -510,9 +510,12 @@ impl StateMachine for NodeStateMachine {
             Event::ProposalBuilt {
                 height,
                 round,
-                result,
+                block,
+                block_hash,
             } => {
-                return self.bft.on_proposal_built(*height, *round, result.clone());
+                return self
+                    .bft
+                    .on_proposal_built(*height, *round, block.clone(), *block_hash);
             }
 
             // JMT state commit completed - update tracked state and notify BFT

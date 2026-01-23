@@ -70,16 +70,6 @@ pub struct BftConfig {
     ///
     /// Set to Duration::ZERO to disable rate limiting (not recommended for production).
     pub min_block_interval: Duration,
-
-    /// Timeout for state root computation when proposing blocks with certificates.
-    ///
-    /// When a proposer wants to include certificates in a block, it needs to compute
-    /// the new state root. This requires the JMT to be at the parent block's state.
-    /// If the JMT hasn't caught up within this timeout, the proposer will emit an
-    /// empty block (no certificates) instead.
-    ///
-    /// This should be well under the view change timeout to avoid stalling consensus.
-    pub state_root_compute_timeout: Duration,
 }
 
 impl Default for BftConfig {
@@ -97,7 +87,6 @@ impl Default for BftConfig {
             certificate_fetch_timeout: Duration::from_millis(500),
             cleanup_interval: Duration::from_secs(1),
             min_block_interval: Duration::from_millis(150),
-            state_root_compute_timeout: Duration::from_millis(100),
         }
     }
 }

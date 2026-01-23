@@ -32,26 +32,6 @@ pub enum EventPriority {
     Client = 3,
 }
 
-/// Result of building a proposal block.
-#[derive(Debug, Clone)]
-pub enum ProposalBuildResult {
-    /// Successfully built the block with certificates.
-    Success {
-        /// The complete block, ready for broadcast.
-        block: Arc<Block>,
-        /// Pre-computed block hash (saves recalculating).
-        block_hash: Hash,
-    },
-    /// JMT didn't catch up to parent state within the timeout.
-    /// Runner built the block without certificates (using parent state).
-    Timeout {
-        /// The block without certificates, ready for broadcast.
-        block: Arc<Block>,
-        /// Pre-computed block hash.
-        block_hash: Hash,
-    },
-}
-
 /// All possible events a node can receive.
 ///
 /// Events are **passive data** - they describe something that happened.
@@ -316,8 +296,10 @@ pub enum Event {
         height: BlockHeight,
         /// Round of the proposal (for correlation).
         round: u64,
-        /// The build result.
-        result: ProposalBuildResult,
+        /// The built block.
+        block: Arc<Block>,
+        /// Pre-computed block hash.
+        block_hash: Hash,
     },
 
     /// JMT state commit completed for a block's certificates.
