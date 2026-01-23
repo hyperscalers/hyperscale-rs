@@ -86,12 +86,6 @@ pub struct RocksDbStorage {
     /// calls could read stale versions and attempt to update from pruned parent nodes.
     jmt: Mutex<JmtState>,
 
-    /// Condition variable for waiting on JMT state changes.
-    ///
-    /// Used by proposers waiting for JMT to catch up to parent state before
-    /// computing state roots. Notified whenever JMT state is committed.
-    jmt_changed: std::sync::Condvar,
-
     /// Cache of block commit data, keyed by block hash.
     ///
     /// When a block is verified, we build a [`BlockCommitCache`] containing:
@@ -175,7 +169,6 @@ impl RocksDbStorage {
                 current_version: version,
                 current_root_hash: root_hash,
             }),
-            jmt_changed: std::sync::Condvar::new(),
             block_commit_cache: Mutex::new(HashMap::new()),
         })
     }
@@ -417,9 +410,6 @@ impl RocksDbStorage {
         // Persist JMT state (outside lock - RocksDB is thread-safe)
         self.persist_jmt_state(new_version, new_root);
 
-        // Notify any waiters that JMT state has changed
-        self.jmt_changed.notify_all();
-
         let elapsed = start.elapsed();
         metrics::record_rocksdb_write(elapsed.as_secs_f64());
 
@@ -503,21 +493,6 @@ impl RocksDbStorage {
     pub fn current_jmt_root(&self) -> hyperscale_types::Hash {
         let jmt = self.jmt.lock().unwrap();
         hyperscale_types::Hash::from_bytes(&jmt.current_root_hash.0)
-    }
-
-    /// Wait for the JMT state to change, with a timeout.
-    ///
-    /// Returns the new JMT root after waking, or the current root if timed out.
-    /// Also returns whether the wait timed out.
-    pub fn wait_for_jmt_change(
-        &self,
-        timeout: std::time::Duration,
-    ) -> (hyperscale_types::Hash, bool) {
-        let jmt = self.jmt.lock().unwrap();
-        let result = self.jmt_changed.wait_timeout(jmt, timeout).unwrap();
-        let timed_out = result.1.timed_out();
-        let root = hyperscale_types::Hash::from_bytes(&result.0.current_root_hash.0);
-        (root, timed_out)
     }
 
     /// Compute speculative state root and capture a snapshot for later application.
@@ -742,9 +717,6 @@ impl RocksDbStorage {
 
         // 3. Persist the new JMT state
         self.persist_jmt_state(new_version, new_root);
-
-        // 4. Notify any waiters that JMT state has changed
-        self.jmt_changed.notify_all();
 
         let total_elapsed = start.elapsed();
         metrics::record_rocksdb_write(rocksdb_elapsed.as_secs_f64());
@@ -1595,9 +1567,6 @@ impl RocksDbStorage {
 
         // 5. Persist JMT state (outside lock - RocksDB is thread-safe)
         self.persist_jmt_state(new_version, new_root);
-
-        // 6. Notify any waiters that JMT state has changed
-        self.jmt_changed.notify_all();
 
         tracing::debug!(
             tx_hash = %certificate.transaction_hash,
