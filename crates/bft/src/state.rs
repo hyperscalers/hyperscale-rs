@@ -7518,20 +7518,16 @@ mod tests {
             HashMap::new(),                // no commitment proofs
         );
 
-        // Should contain a BlockHeader broadcast (proposal triggered)
-        let has_block_header = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(_),
-                    ..
-                }
-            )
-        });
+        // Should contain a BuildProposal action (proposal triggered)
+        // After the refactor, proposal building is async - we emit BuildProposal
+        // and the runner calls back with ProposalBuilt which triggers the broadcast.
+        let has_build_proposal = actions.iter().any(
+            |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight(4)),
+        );
 
         assert!(
-            has_block_header,
-            "Should propose immediately after QC formation when has deferrals"
+            has_build_proposal,
+            "Should trigger proposal build after QC formation when has deferrals"
         );
     }
 
@@ -8116,19 +8112,15 @@ mod tests {
             HashMap::new(),
         );
 
-        // Should contain a BlockHeader broadcast (enough time passed)
-        let has_block_header = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(_),
-                    ..
-                }
-            )
-        });
+        // Should contain a BuildProposal action (enough time passed)
+        // After the refactor, proposal building is async - we emit BuildProposal
+        // and the runner calls back with ProposalBuilt which triggers the broadcast.
+        let has_build_proposal = actions.iter().any(
+            |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight(4)),
+        );
 
         assert!(
-            has_block_header,
+            has_build_proposal,
             "Should propose after rate limit interval has passed (200ms > 150ms)"
         );
     }
@@ -8279,25 +8271,24 @@ mod tests {
             HashMap::new(),
         );
 
-        let has_block_header = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(_),
-                    ..
-                }
-            )
-        });
+        // Should contain a BuildProposal action (rate limiting disabled)
+        // After the refactor, proposal building is async - we emit BuildProposal
+        // and the runner calls back with ProposalBuilt which triggers the broadcast.
+        let has_build_proposal = actions.iter().any(
+            |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight(4)),
+        );
 
         assert!(
-            has_block_header,
+            has_build_proposal,
             "Should allow immediate proposal when min_block_interval is zero"
         );
     }
 
     #[test]
     fn test_proposal_timer_updates_last_proposal_time() {
-        // Verify that on_proposal_timer updates last_proposal_time when a proposal is made.
+        // Verify that on_proposal_built updates last_proposal_time when a proposal is broadcast.
+        // After the refactor, on_proposal_timer emits BuildProposal, and the runner calls back
+        // with on_proposal_built which updates last_proposal_time and broadcasts the block.
         let mut state = make_test_state();
         state.set_time(Duration::from_millis(5000));
 
@@ -8308,7 +8299,7 @@ mod tests {
         // With 4 validators, validator 0 proposes for height 0, 4, 8, etc.
         // Since committed_height=0, next height is 1, and (1+0)%4=1, so validator 1 proposes.
         // We need to set up a QC so that the next height is 4 (validator 0's turn).
-        state.latest_qc = Some(QuorumCertificate {
+        let parent_qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
@@ -8317,7 +8308,8 @@ mod tests {
             aggregated_signature: zero_bls_signature(),
             voting_power: VotePower(3),
             weighted_timestamp_ms: 5000,
-        });
+        };
+        state.latest_qc = Some(parent_qc.clone());
 
         // Now next_height = 4, (4+0)%4=0, so validator 0 proposes
         let actions = state.on_proposal_timer(
@@ -8328,8 +8320,47 @@ mod tests {
             HashMap::new(),
         );
 
-        // Check that a proposal was made
-        let proposed = actions.iter().any(|a| {
+        // Check that a BuildProposal action was emitted (async proposal)
+        let build_proposal = actions.iter().any(
+            |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight(4)),
+        );
+
+        assert!(
+            build_proposal,
+            "Validator 0 should request proposal build for height 4"
+        );
+
+        // last_proposal_time not yet updated - happens on_proposal_built
+        assert_eq!(state.last_proposal_time, Duration::ZERO);
+
+        // Simulate the runner completing the proposal build
+        let block = Block {
+            header: BlockHeader {
+                height: BlockHeight(4),
+                parent_hash: Hash::from_bytes(b"block_3"),
+                parent_qc,
+                proposer: ValidatorId(0),
+                timestamp: 5000,
+                round: 0,
+                is_fallback: false,
+                state_root: Hash::ZERO,
+                state_version: 0,
+            },
+            retry_transactions: vec![],
+            priority_transactions: vec![],
+            transactions: vec![],
+            committed_certificates: vec![],
+            deferred: vec![],
+            aborted: vec![],
+            commitment_proofs: HashMap::new(),
+        };
+        let block_hash = block.hash();
+        let block_arc = Arc::new(block);
+
+        let broadcast_actions = state.on_proposal_built(BlockHeight(4), 0, block_arc, block_hash);
+
+        // Check that a BlockHeader broadcast was emitted
+        let has_broadcast = broadcast_actions.iter().any(|a| {
             matches!(
                 a,
                 Action::BroadcastToShard {
@@ -8338,8 +8369,10 @@ mod tests {
                 }
             )
         });
-
-        assert!(proposed, "Validator 0 should propose for height 4");
+        assert!(
+            has_broadcast,
+            "Should broadcast block after on_proposal_built"
+        );
 
         // Verify last_proposal_time was updated
         assert_eq!(
