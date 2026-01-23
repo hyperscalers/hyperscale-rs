@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 /// JMT state bundled for thread-safe access.
 pub(crate) struct SharedJmtState {
-    tree_store: Mutex<TypedInMemoryTreeStore>,
+    tree_store: TypedInMemoryTreeStore,
     current_version: Mutex<u64>,
     current_root_hash: Mutex<StateRootHash>,
 }
@@ -35,7 +35,7 @@ pub(crate) struct SharedJmtState {
 impl SharedJmtState {
     fn new() -> Self {
         Self {
-            tree_store: Mutex::new(TypedInMemoryTreeStore::new().with_pruning_enabled()),
+            tree_store: TypedInMemoryTreeStore::new().with_pruning_enabled(),
             current_version: Mutex::new(0),
             current_root_hash: Mutex::new(StateRootHash([0u8; 32])),
         }
@@ -91,8 +91,7 @@ impl SharedJmtState {
             );
         }
 
-        let tree_store = self.tree_store.lock().unwrap();
-        let overlay = OverlayTreeStore::new(&tree_store);
+        let overlay = OverlayTreeStore::new(&self.tree_store);
 
         let base_version = *self.current_version.lock().unwrap();
         let mut current_version = base_version;
@@ -120,7 +119,6 @@ impl SharedJmtState {
 
     /// Apply a JMT snapshot directly, inserting precomputed nodes.
     fn apply_snapshot(&self, snapshot: JmtSnapshot) {
-        let tree_store = self.tree_store.lock().unwrap();
         let mut current_version = self.current_version.lock().unwrap();
         let mut current_root_hash = self.current_root_hash.lock().unwrap();
 
@@ -146,7 +144,7 @@ impl SharedJmtState {
 
         // Insert all captured nodes
         for (key, node) in snapshot.nodes {
-            tree_store.insert_node(key, node);
+            self.tree_store.insert_node(key, node);
         }
 
         // Advance version and update root
@@ -155,7 +153,6 @@ impl SharedJmtState {
     }
 
     fn commit(&self, updates: &DatabaseUpdates) {
-        let tree_store = self.tree_store.lock().unwrap();
         let mut current_version = self.current_version.lock().unwrap();
         let mut current_root_hash = self.current_root_hash.lock().unwrap();
 
@@ -165,7 +162,7 @@ impl SharedJmtState {
             Some(*current_version)
         };
 
-        let new_root = put_at_next_version(&*tree_store, parent_version, updates);
+        let new_root = put_at_next_version(&self.tree_store, parent_version, updates);
         *current_version += 1;
         *current_root_hash = new_root;
     }
