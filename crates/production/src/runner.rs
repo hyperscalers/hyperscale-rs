@@ -2443,13 +2443,10 @@ impl ProductionRunner {
                         );
                     } else {
                         // Build and cache the BlockCommitCache for efficient commit later.
-                        // Pre-serialize certificates and state writes so commit only needs
-                        // to build a WriteBatch and do 1 fsync.
-                        let (cert_data, state_writes) =
-                            storage.build_commit_cache_data(&certificates, local_shard);
+                        // Pre-build the WriteBatch so commit only needs 1 fsync.
+                        let write_batch = storage.build_write_batch(&certificates, local_shard);
                         let cache = crate::storage::BlockCommitCache {
-                            cert_data,
-                            state_writes,
+                            write_batch,
                             jmt_snapshot,
                         };
                         storage.cache_block_commit(block_hash, cache);
@@ -2470,80 +2467,57 @@ impl ProductionRunner {
                 });
             }
 
-            Action::ComputeStateRoot {
+            Action::BuildProposal {
+                proposer,
                 height,
                 round,
+                parent_hash,
+                parent_qc,
+                timestamp,
+                is_fallback,
                 parent_state_root,
-                writes_per_cert,
+                parent_state_version,
+                retry_transactions,
+                priority_transactions,
+                transactions,
+                committed_certificates,
+                commitment_proofs,
+                deferred,
+                aborted,
                 timeout,
             } => {
                 let event_tx = self.callback_tx.clone();
                 let storage = self.storage.clone();
+                let local_shard = self.local_shard;
 
-                // State root computation for proposals. Need to wait for JMT to catch up
-                // to parent_state_root before computing. Uses condvar for efficient waiting.
-                //
-                // NOTE: We don't cache the snapshot here because we don't know the block
-                // hash yet (it's computed after the block is built). The proposer will
-                // fall back to per-certificate commits. This is fine because:
-                // 1. Only 1 out of N validators is the proposer
-                // 2. The N-1 verifiers will cache their snapshots
+                // Build proposal block. Wait for JMT to catch up, compute state root,
+                // build the block, and cache the WriteBatch for efficient commit.
                 self.thread_pools.spawn_consensus_crypto(move || {
-                    use hyperscale_core::StateRootComputeResult;
+                    use hyperscale_core::ProposalBuildResult;
+                    use hyperscale_types::{Block, BlockHeader};
 
                     let start = std::time::Instant::now();
 
                     // Wait for JMT to reach parent_state_root using condvar
-                    loop {
+                    let jmt_ready = loop {
                         let current_root = storage.current_jmt_root();
 
                         if current_root == parent_state_root {
-                            // JMT is ready - compute the speculative root
-                            let (state_root, _snapshot) = storage
-                                .compute_speculative_root_from_base(
-                                    parent_state_root,
-                                    &writes_per_cert,
-                                );
-
-                            let elapsed = start.elapsed().as_secs_f64();
-                            tracing::debug!(
-                                height = height,
-                                round = round,
-                                state_root = ?state_root,
-                                elapsed_ms = elapsed * 1000.0,
-                                "State root computed for proposal"
-                            );
-
-                            event_tx
-                                .send(Event::StateRootComputed {
-                                    height,
-                                    round,
-                                    result: StateRootComputeResult::Success { state_root },
-                                })
-                                .expect("callback channel closed");
-                            return;
+                            break true;
                         }
 
                         // Calculate remaining timeout
                         let elapsed = start.elapsed();
                         if elapsed >= timeout {
                             tracing::warn!(
-                                height = height,
+                                height = height.0,
                                 round = round,
                                 current_root = ?current_root,
                                 parent_state_root = ?parent_state_root,
                                 elapsed_ms = elapsed.as_secs_f64() * 1000.0,
-                                "State root computation timed out - JMT not caught up"
+                                "BuildProposal timed out - JMT not caught up"
                             );
-
-                            event_tx
-                                .send(Event::StateRootComputed {
-                                    height,
-                                    round,
-                                    result: StateRootComputeResult::Timeout,
-                                })
-                                .expect("callback channel closed");
-                            return;
+                            break false;
                         }
 
                         // Wait for JMT state to change with remaining timeout
@@ -2557,28 +2531,145 @@ impl ProductionRunner {
                                 // Race: JMT caught up just as we timed out
                                 continue;
                             }
-
-                            let elapsed = start.elapsed().as_secs_f64();
-                            tracing::warn!(
-                                height = height,
-                                round = round,
-                                current_root = ?current_root,
-                                parent_state_root = ?parent_state_root,
-                                elapsed_ms = elapsed * 1000.0,
-                                "State root computation timed out - JMT not caught up"
-                            );
-
-                            event_tx
-                                .send(Event::StateRootComputed {
-                                    height,
-                                    round,
-                                    result: StateRootComputeResult::Timeout,
-                                })
-                                .expect("callback channel closed");
-                            return;
+                            break false;
                         }
                         // JMT changed - loop back to check if it's the root we need
-                    }
+                    };
+
+                    // Check if we can include certificates (JMT must be ready if we have certs)
+                    let can_include_certs = jmt_ready || committed_certificates.is_empty();
+
+                    let result = if can_include_certs {
+                        // Either JMT is ready for certificates, or there are no certificates.
+                        // Build block with whatever certificates we have.
+
+                        let (state_root, state_version, jmt_snapshot) =
+                            if !committed_certificates.is_empty() {
+                                // Extract writes from certificates for local shard
+                                let writes_per_cert: Vec<Vec<_>> = committed_certificates
+                                    .iter()
+                                    .map(|cert| {
+                                        cert.shard_proofs
+                                            .get(&local_shard)
+                                            .map(|proof| proof.state_writes.clone())
+                                            .unwrap_or_default()
+                                    })
+                                    .collect();
+
+                                // Compute speculative root and get JMT snapshot
+                                let (root, snapshot) = storage.compute_speculative_root_from_base(
+                                    parent_state_root,
+                                    &writes_per_cert,
+                                );
+                                let version =
+                                    parent_state_version + committed_certificates.len() as u64;
+                                (root, version, Some(snapshot))
+                            } else {
+                                // No certificates - inherit parent state
+                                (parent_state_root, parent_state_version, None)
+                            };
+
+                        // Build the block
+                        let header = BlockHeader {
+                            height,
+                            parent_hash,
+                            parent_qc,
+                            proposer,
+                            timestamp,
+                            round,
+                            is_fallback,
+                            state_root,
+                            state_version,
+                        };
+
+                        let block = Block {
+                            header,
+                            retry_transactions,
+                            priority_transactions,
+                            transactions,
+                            committed_certificates: committed_certificates.clone(),
+                            deferred,
+                            aborted,
+                            commitment_proofs,
+                        };
+
+                        let block_hash = block.hash();
+
+                        // Build and cache WriteBatch for efficient commit (if we have certs)
+                        if let Some(snapshot) = jmt_snapshot {
+                            let write_batch =
+                                storage.build_write_batch(&committed_certificates, local_shard);
+                            let cache = crate::storage::BlockCommitCache {
+                                write_batch,
+                                jmt_snapshot: snapshot,
+                            };
+                            storage.cache_block_commit(block_hash, cache);
+                        }
+
+                        let elapsed = start.elapsed().as_secs_f64();
+                        tracing::info!(
+                            height = height.0,
+                            round = round,
+                            block_hash = ?block_hash,
+                            certificates = committed_certificates.len(),
+                            transactions = block.retry_transactions.len() + block.priority_transactions.len() + block.transactions.len(),
+                            state_root = ?state_root,
+                            elapsed_ms = elapsed * 1000.0,
+                            "Built proposal (WriteBatch cached if certs present)"
+                        );
+
+                        ProposalBuildResult::Success {
+                            block: std::sync::Arc::new(block),
+                            block_hash,
+                        }
+                    } else {
+                        // JMT not ready but we have certificates - drop certificates (timeout)
+                        tracing::warn!(
+                            height = height.0,
+                            round = round,
+                            dropped_certs = committed_certificates.len(),
+                            "JMT not ready - building block without certificates"
+                        );
+
+                        let header = BlockHeader {
+                            height,
+                            parent_hash,
+                            parent_qc,
+                            proposer,
+                            timestamp,
+                            round,
+                            is_fallback,
+                            state_root: parent_state_root,
+                            state_version: parent_state_version,
+                        };
+
+                        // Build block without certificates but WITH transactions
+                        let block = Block {
+                            header,
+                            retry_transactions,
+                            priority_transactions,
+                            transactions,
+                            committed_certificates: vec![],
+                            deferred,
+                            aborted,
+                            commitment_proofs: std::collections::HashMap::new(),
+                        };
+
+                        let block_hash = block.hash();
+
+                        ProposalBuildResult::Timeout {
+                            block: std::sync::Arc::new(block),
+                            block_hash,
+                        }
+                    };
+
+                    event_tx
+                        .send(Event::ProposalBuilt {
+                            height,
+                            round,
+                            result,
+                        })
+                        .expect("callback channel closed");
                 });
             }
 

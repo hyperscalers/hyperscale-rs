@@ -1341,48 +1341,148 @@ impl SimulationRunner {
                 );
             }
 
-            Action::ComputeStateRoot {
+            Action::BuildProposal {
+                proposer,
                 height,
                 round,
+                parent_hash,
+                parent_qc,
+                timestamp,
+                is_fallback,
                 parent_state_root,
-                writes_per_cert,
+                parent_state_version,
+                retry_transactions,
+                priority_transactions,
+                transactions,
+                committed_certificates,
+                commitment_proofs,
+                deferred,
+                aborted,
                 timeout: _, // Timeout ignored in simulation - everything is synchronous
             } => {
+                use hyperscale_core::ProposalBuildResult;
+                use hyperscale_types::{Block, BlockHeader};
+
                 // In simulation, JMT commits are synchronous so we can compute immediately.
-                // Check if JMT is at the expected parent state.
-                //
-                // NOTE: We don't cache the snapshot here because we don't know the block
-                // hash yet (it's computed after the block is built). The proposer will
-                // fall back to per-certificate commits. This is fine because:
-                // 1. Only 1 out of N validators is the proposer
-                // 2. The N-1 verifiers will cache their snapshots
                 let storage = &self.node_storage[from as usize];
+                let local_shard = self.nodes[from as usize].shard();
                 let current_root = storage.current_jmt_root();
 
-                let result = if current_root == parent_state_root {
-                    // JMT is ready - compute speculative root
-                    let (state_root, _snapshot) = storage
-                        .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
-                    hyperscale_core::StateRootComputeResult::Success { state_root }
+                // Check if we can include certificates (JMT must be at parent state)
+                let can_include_certs =
+                    current_root == parent_state_root || committed_certificates.is_empty();
+
+                let result = if can_include_certs {
+                    // Either JMT is ready for certificates, or there are no certificates.
+                    // Build block with whatever certificates we have.
+
+                    let (state_root, state_version, jmt_snapshot) = if !committed_certificates
+                        .is_empty()
+                    {
+                        // Extract writes from certificates for local shard
+                        let writes_per_cert: Vec<Vec<_>> = committed_certificates
+                            .iter()
+                            .map(|cert| {
+                                cert.shard_proofs
+                                    .get(&local_shard)
+                                    .map(|proof| proof.state_writes.clone())
+                                    .unwrap_or_default()
+                            })
+                            .collect();
+
+                        let (root, snapshot) = storage.compute_speculative_root_from_base(
+                            parent_state_root,
+                            &writes_per_cert,
+                        );
+                        let version = parent_state_version + committed_certificates.len() as u64;
+                        (root, version, Some(snapshot))
+                    } else {
+                        // No certificates - inherit parent state
+                        (parent_state_root, parent_state_version, None)
+                    };
+
+                    // Build the block
+                    let header = BlockHeader {
+                        height,
+                        parent_hash,
+                        parent_qc,
+                        proposer,
+                        timestamp,
+                        round,
+                        is_fallback,
+                        state_root,
+                        state_version,
+                    };
+
+                    let block = Block {
+                        header,
+                        retry_transactions,
+                        priority_transactions,
+                        transactions,
+                        committed_certificates: committed_certificates.clone(),
+                        deferred,
+                        aborted,
+                        commitment_proofs,
+                    };
+
+                    let block_hash = block.hash();
+
+                    // Cache the JMT snapshot for efficient commit (if we computed one)
+                    if let Some(snapshot) = jmt_snapshot {
+                        self.jmt_cache.insert((from, block_hash), snapshot);
+                    }
+
+                    ProposalBuildResult::Success {
+                        block: std::sync::Arc::new(block),
+                        block_hash,
+                    }
                 } else {
-                    // In simulation, if JMT isn't at the right state, it means we're ahead
-                    // of the commit sequence. This shouldn't happen often in well-behaved
-                    // simulation, but we handle it by returning timeout.
+                    // JMT not ready but we have certificates - drop certificates (timeout)
                     tracing::warn!(
                         node = from,
-                        height = height,
+                        height = height.0,
                         round = round,
                         ?current_root,
                         ?parent_state_root,
-                        "JMT not at expected parent state in simulation - returning timeout"
+                        dropped_certs = committed_certificates.len(),
+                        "JMT not at expected parent state - building block without certificates"
                     );
-                    hyperscale_core::StateRootComputeResult::Timeout
+
+                    let header = BlockHeader {
+                        height,
+                        parent_hash,
+                        parent_qc,
+                        proposer,
+                        timestamp,
+                        round,
+                        is_fallback,
+                        state_root: parent_state_root,
+                        state_version: parent_state_version,
+                    };
+
+                    let block = Block {
+                        header,
+                        retry_transactions,
+                        priority_transactions,
+                        transactions,
+                        committed_certificates: vec![],
+                        deferred,
+                        aborted,
+                        commitment_proofs: std::collections::HashMap::new(),
+                    };
+
+                    let block_hash = block.hash();
+
+                    ProposalBuildResult::Timeout {
+                        block: std::sync::Arc::new(block),
+                        block_hash,
+                    }
                 };
 
                 self.schedule_event(
                     from,
                     self.now,
-                    Event::StateRootComputed {
+                    Event::ProposalBuilt {
                         height,
                         round,
                         result,

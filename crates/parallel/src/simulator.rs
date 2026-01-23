@@ -859,28 +859,121 @@ impl SimNode {
                     .push_back(Event::StateRootVerified { block_hash, valid });
             }
 
-            Action::ComputeStateRoot {
+            Action::BuildProposal {
+                proposer,
                 height,
                 round,
+                parent_hash,
+                parent_qc,
+                timestamp,
+                is_fallback,
                 parent_state_root,
-                writes_per_cert,
+                parent_state_version,
+                retry_transactions,
+                priority_transactions,
+                transactions,
+                committed_certificates,
+                commitment_proofs,
+                deferred,
+                aborted,
                 timeout: _, // Timeout ignored in parallel simulation
             } => {
+                use hyperscale_core::ProposalBuildResult;
+                use hyperscale_types::{Block, BlockHeader};
+
                 // In parallel simulation, JMT commits are synchronous so compute immediately.
+                let local_shard = self.state.shard();
                 let current_root = self.storage.current_jmt_root();
 
-                let result = if current_root == parent_state_root {
-                    // JMT is ready - compute speculative root
+                let result = if current_root == parent_state_root
+                    && !committed_certificates.is_empty()
+                {
+                    // JMT is ready and we have certificates - compute state root
+
+                    // Extract writes from certificates for local shard
+                    let writes_per_cert: Vec<Vec<_>> = committed_certificates
+                        .iter()
+                        .map(|cert| {
+                            cert.shard_proofs
+                                .get(&local_shard)
+                                .map(|proof| proof.state_writes.clone())
+                                .unwrap_or_default()
+                        })
+                        .collect();
+
                     let (state_root, _snapshot) = self
                         .storage
                         .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
-                    hyperscale_core::StateRootComputeResult::Success { state_root }
+
+                    let state_version = parent_state_version + committed_certificates.len() as u64;
+
+                    // Build the block
+                    let header = BlockHeader {
+                        height,
+                        parent_hash,
+                        parent_qc,
+                        proposer,
+                        timestamp,
+                        round,
+                        is_fallback,
+                        state_root,
+                        state_version,
+                    };
+
+                    let block = Block {
+                        header,
+                        retry_transactions,
+                        priority_transactions,
+                        transactions,
+                        committed_certificates,
+                        deferred,
+                        aborted,
+                        commitment_proofs,
+                    };
+
+                    let block_hash = block.hash();
+
+                    ProposalBuildResult::Success {
+                        block: std::sync::Arc::new(block),
+                        block_hash,
+                    }
                 } else {
-                    // JMT not at expected state - return timeout
-                    hyperscale_core::StateRootComputeResult::Timeout
+                    // JMT not ready or no certificates - build block without certificates
+                    let state_root = parent_state_root;
+                    let state_version = parent_state_version;
+
+                    let header = BlockHeader {
+                        height,
+                        parent_hash,
+                        parent_qc,
+                        proposer,
+                        timestamp,
+                        round,
+                        is_fallback,
+                        state_root,
+                        state_version,
+                    };
+
+                    let block = Block {
+                        header,
+                        retry_transactions,
+                        priority_transactions,
+                        transactions,
+                        committed_certificates: vec![],
+                        deferred,
+                        aborted,
+                        commitment_proofs: std::collections::HashMap::new(),
+                    };
+
+                    let block_hash = block.hash();
+
+                    ProposalBuildResult::Timeout {
+                        block: std::sync::Arc::new(block),
+                        block_hash,
+                    }
                 };
 
-                self.internal_queue.push_back(Event::StateRootComputed {
+                self.internal_queue.push_back(Event::ProposalBuilt {
                     height,
                     round,
                     result,

@@ -31,7 +31,7 @@ mod message;
 mod traits;
 
 pub use action::{Action, CrossShardExecutionRequest, TransactionStatus};
-pub use event::{Event, EventPriority, StateRootComputeResult};
+pub use event::{Event, EventPriority, ProposalBuildResult};
 pub use message::OutboundMessage;
 pub use traits::{NoOpStateRootComputer, StateMachine, StateRootComputer};
 

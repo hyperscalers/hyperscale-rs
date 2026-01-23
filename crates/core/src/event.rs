@@ -32,17 +32,24 @@ pub enum EventPriority {
     Client = 3,
 }
 
-/// Result of state root computation for a proposal.
+/// Result of building a proposal block.
 #[derive(Debug, Clone)]
-pub enum StateRootComputeResult {
-    /// JMT was ready (or became ready), here's the computed root.
+pub enum ProposalBuildResult {
+    /// Successfully built the block with certificates.
     Success {
-        /// The computed state root after applying certificate writes.
-        state_root: Hash,
+        /// The complete block, ready for broadcast.
+        block: Arc<Block>,
+        /// Pre-computed block hash (saves recalculating).
+        block_hash: Hash,
     },
     /// JMT didn't catch up to parent state within the timeout.
-    /// Proposer should build block without certificates.
-    Timeout,
+    /// Runner built the block without certificates (using parent state).
+    Timeout {
+        /// The block without certificates, ready for broadcast.
+        block: Arc<Block>,
+        /// Pre-computed block hash.
+        block_hash: Hash,
+    },
 }
 
 /// All possible events a node can receive.
@@ -296,20 +303,21 @@ pub enum Event {
         valid: bool,
     },
 
-    /// State root computation completed for a proposal.
+    /// Proposal block built by the runner.
     ///
-    /// Callback from `Action::ComputeStateRoot`. Used by proposers to get the
-    /// state root before broadcasting a block with certificates.
+    /// Callback from `Action::BuildProposal`. Contains the complete block
+    /// ready for broadcast, or indicates timeout if JMT didn't catch up.
     ///
-    /// The runner waits for the JMT to reach the parent state, then computes
-    /// the new root. If the JMT doesn't catch up in time, returns `Timeout`.
-    StateRootComputed {
-        /// Height of the proposal this computation was for.
-        height: u64,
-        /// Round of the proposal this computation was for.
+    /// The runner waits for the JMT to reach the parent state, computes the
+    /// state root, builds the complete block, and caches the WriteBatch for
+    /// efficient commit later.
+    ProposalBuilt {
+        /// Height of the proposal (for correlation).
+        height: BlockHeight,
+        /// Round of the proposal (for correlation).
         round: u64,
-        /// The computation result.
-        result: StateRootComputeResult,
+        /// The build result.
+        result: ProposalBuildResult,
     },
 
     /// JMT state commit completed for a block's certificates.
@@ -721,7 +729,7 @@ impl Event {
             | Event::QcSignatureVerified { .. }
             | Event::CycleProofVerified { .. }
             | Event::StateRootVerified { .. }
-            | Event::StateRootComputed { .. }
+            | Event::ProposalBuilt { .. }
             | Event::TransactionsExecuted { .. }
             | Event::SpeculativeExecutionComplete { .. }
             | Event::CrossShardTransactionsExecuted { .. }
@@ -842,7 +850,7 @@ impl Event {
             Event::QcSignatureVerified { .. } => "QcSignatureVerified",
             Event::CycleProofVerified { .. } => "CycleProofVerified",
             Event::StateRootVerified { .. } => "StateRootVerified",
-            Event::StateRootComputed { .. } => "StateRootComputed",
+            Event::ProposalBuilt { .. } => "ProposalBuilt",
 
             // Async Callbacks - Execution
             Event::TransactionsExecuted { .. } => "TransactionsExecuted",

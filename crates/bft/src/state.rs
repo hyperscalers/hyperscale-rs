@@ -12,7 +12,7 @@
 //! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
 //! the complete block data, making it recoverable from any honest validator in that set.
 
-use hyperscale_core::{Action, Event, OutboundMessage, StateRootComputeResult, TimerId};
+use hyperscale_core::{Action, Event, OutboundMessage, ProposalBuildResult, TimerId};
 
 /// BFT statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
@@ -131,38 +131,17 @@ struct PendingStateRootVerification {
     certificates: Vec<std::sync::Arc<hyperscale_types::TransactionCertificate>>,
 }
 
-/// Pending proposal waiting for state root computation.
+/// Pending proposal waiting for the runner to build the block.
 ///
-/// When proposing a block with certificates, we need to wait for the JMT to
-/// reach the parent's state before we can compute the new state root. This
-/// struct stores all the context needed to finish building the block once
-/// the state root is computed.
+/// When proposing a block with certificates, we emit `Action::BuildProposal`
+/// and store this to correlate the `Event::ProposalBuilt` callback.
+/// The runner builds the complete block and caches the WriteBatch.
 #[derive(Debug, Clone)]
 struct PendingProposal {
     /// Block height being proposed.
     height: BlockHeight,
     /// Round being proposed.
     round: u64,
-    /// Parent block hash.
-    parent_hash: Hash,
-    /// Parent QC (included in block header).
-    parent_qc: QuorumCertificate,
-    /// Block timestamp.
-    timestamp: u64,
-    /// Transactions to include (all three sections).
-    retry_transactions: Vec<Arc<RoutableTransaction>>,
-    priority_transactions: Vec<Arc<RoutableTransaction>>,
-    transactions: Vec<Arc<RoutableTransaction>>,
-    /// Committed certificates to include.
-    committed_certificates: Vec<Arc<TransactionCertificate>>,
-    /// Commitment proofs for cross-shard transactions.
-    commitment_proofs: HashMap<Hash, CommitmentProof>,
-    /// Deferred transactions.
-    deferred: Vec<TransactionDefer>,
-    /// Aborted transactions.
-    aborted: Vec<TransactionAbort>,
-    /// Parent's state version (for computing new state_version).
-    parent_state_version: u64,
 }
 
 /// BFT consensus state machine.
@@ -368,11 +347,11 @@ pub struct BftState {
     // ═══════════════════════════════════════════════════════════════════════════
     // Pending Proposal
     // ═══════════════════════════════════════════════════════════════════════════
-    /// Pending proposal waiting for state root computation.
+    /// Pending proposal waiting for the runner to build the block.
     ///
-    /// When proposing a block with certificates, we emit `Action::ComputeStateRoot`
-    /// and store the proposal context here. Once `Event::StateRootComputed` arrives,
-    /// we can finish building and broadcast the block.
+    /// When proposing a block with certificates, we emit `Action::BuildProposal`
+    /// and store height/round here for correlation. Once `Event::ProposalBuilt`
+    /// arrives, we store the block and broadcast it.
     pending_proposal: Option<PendingProposal>,
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1015,7 +994,7 @@ impl BftState {
         );
 
         // Reschedule the timer
-        let mut actions = vec![Action::SetTimer {
+        let actions = vec![Action::SetTimer {
             id: TimerId::Proposal,
             duration: self.config.proposal_interval,
         }];
@@ -1138,201 +1117,64 @@ impl BftState {
             .map(|b| (b.header.state_root, b.header.state_version))
             .unwrap_or((Hash::ZERO, 0)); // Genesis parent has zero state
 
-        // Check if we have certificates to include
-        if !committed_certificates.is_empty() {
-            // We have certificates - need to compute state root.
-            // Check if our JMT is at the parent's state.
-            let (_, jmt_root) = self.get_local_jmt_state();
-
-            if jmt_root == parent_state_root {
-                // JMT is ready - emit ComputeStateRoot action and wait for callback.
-                // Store all the proposal context so we can finish when the callback arrives.
-                let local_shard = self.local_shard();
-                let writes_per_cert: Vec<Vec<_>> = committed_certificates
-                    .iter()
-                    .map(|cert| {
-                        cert.shard_proofs
-                            .get(&local_shard)
-                            .map(|proof| proof.state_writes.clone())
-                            .unwrap_or_default()
-                    })
-                    .collect();
-
-                // Build set of certificate hashes for stale deferral filtering
-                let cert_hash_set: std::collections::HashSet<Hash> = committed_certificates
-                    .iter()
-                    .map(|c| c.transaction_hash)
-                    .collect();
-
-                // Filter out stale deferrals
-                let deferred_filtered: Vec<TransactionDefer> = deferred_with_height
-                    .into_iter()
-                    .filter(|d| {
-                        let hyperscale_types::DeferReason::LivelockCycle { winner_tx_hash } =
-                            &d.reason;
-                        !cert_hash_set.contains(winner_tx_hash)
-                            && !cert_hash_set.contains(&d.tx_hash)
-                    })
-                    .collect();
-
-                self.pending_proposal = Some(PendingProposal {
-                    height: block_height,
-                    round,
-                    parent_hash,
-                    parent_qc: parent_qc.clone(),
-                    timestamp,
-                    retry_transactions,
-                    priority_transactions,
-                    transactions: other_transactions,
-                    committed_certificates,
-                    commitment_proofs,
-                    deferred: deferred_filtered,
-                    aborted: aborted_with_height,
-                    parent_state_version,
-                });
-
-                info!(
-                    validator = ?self.validator_id(),
-                    height = next_height,
-                    round = round,
-                    certificates = self.pending_proposal.as_ref().unwrap().committed_certificates.len(),
-                    "JMT ready, requesting state root computation for proposal"
-                );
-
-                return vec![Action::ComputeStateRoot {
-                    height: next_height,
-                    round,
-                    parent_state_root,
-                    writes_per_cert,
-                    timeout: self.config.state_root_compute_timeout,
-                }];
-            } else {
-                // JMT not ready - propose without certificates.
-                // Certificates stay in the pool for next proposal.
-                info!(
-                    validator = ?self.validator_id(),
-                    height = next_height,
-                    round = round,
-                    jmt_root = ?jmt_root,
-                    parent_state_root = ?parent_state_root,
-                    pending_certs = committed_certificates.len(),
-                    "JMT not caught up to parent state, proposing without certificates"
-                );
-                // Fall through to build block without certificates
-            }
-        }
-
-        // No certificates (or JMT not ready) - build block immediately.
-        // State inherits from parent. Certificates are empty for this block.
-        let final_state_root = parent_state_root;
-        let final_state_version = parent_state_version;
-        let committed_certificates: Vec<Arc<TransactionCertificate>> = vec![];
-        let commitment_proofs: HashMap<Hash, CommitmentProof> = HashMap::new();
-
-        let header = BlockHeader {
-            height: block_height,
-            parent_hash,
-            parent_qc: parent_qc.clone(),
-            proposer: self.validator_id(),
-            timestamp,
-            round,
-            is_fallback: false,
-            state_root: final_state_root,
-            state_version: final_state_version,
-        };
-
-        // No certificates in this block, so no stale deferral filtering needed
-        let block = Block {
-            header: header.clone(),
-            retry_transactions: retry_transactions.clone(),
-            priority_transactions: priority_transactions.clone(),
-            transactions: other_transactions.clone(),
-            committed_certificates: committed_certificates.clone(),
-            deferred: deferred_with_height.clone(),
-            aborted: aborted_with_height.clone(),
-            commitment_proofs: commitment_proofs.clone(),
-        };
-
-        let block_hash = block.hash();
-        let retry_hashes: Vec<Hash> = retry_transactions.iter().map(|tx| tx.hash()).collect();
-        let priority_hashes: Vec<Hash> = priority_transactions.iter().map(|tx| tx.hash()).collect();
-        let tx_hashes: Vec<Hash> = other_transactions.iter().map(|tx| tx.hash()).collect();
-
-        let cert_hashes: Vec<Hash> = committed_certificates
+        // Build set of certificate hashes for stale deferral filtering
+        let cert_hash_set: std::collections::HashSet<Hash> = committed_certificates
             .iter()
             .map(|c| c.transaction_hash)
             .collect();
 
-        let total_tx_count = retry_hashes.len() + priority_hashes.len() + tx_hashes.len();
+        // Filter out stale deferrals (where the winner or loser tx is in this block's certs)
+        let deferred_filtered: Vec<TransactionDefer> = deferred_with_height
+            .into_iter()
+            .filter(|d| {
+                let hyperscale_types::DeferReason::LivelockCycle { winner_tx_hash } = &d.reason;
+                !cert_hash_set.contains(winner_tx_hash) && !cert_hash_set.contains(&d.tx_hash)
+            })
+            .collect();
+
+        // Track that we have a pending proposal (for correlation)
+        self.pending_proposal = Some(PendingProposal {
+            height: block_height,
+            round,
+        });
+
         info!(
             validator = ?self.validator_id(),
             height = next_height,
             round = round,
-            block_hash = ?block_hash,
-            transactions = total_tx_count,
-            retries = retry_hashes.len(),
-            priority = priority_hashes.len(),
-            certificates = cert_hashes.len(),
-            "Proposing block"
+            transactions = retry_transactions.len() + priority_transactions.len() + other_transactions.len(),
+            certificates = committed_certificates.len(),
+            "Requesting block build for proposal"
         );
 
-        // Store our own block as pending (already complete)
-        let mut pending = PendingBlock::with_proofs(
-            header.clone(),
-            retry_hashes.clone(),
-            priority_hashes.clone(),
-            tx_hashes.clone(),
-            cert_hashes.clone(),
-            deferred_with_height.clone(),
-            aborted_with_height.clone(),
-            commitment_proofs.clone(),
-        );
-        for tx in &retry_transactions {
-            pending.add_transaction_arc(Arc::clone(tx));
-        }
-        for tx in &priority_transactions {
-            pending.add_transaction_arc(Arc::clone(tx));
-        }
-        for tx in &other_transactions {
-            pending.add_transaction_arc(Arc::clone(tx));
-        }
-        for cert in &committed_certificates {
-            pending.add_certificate(Arc::clone(cert));
-        }
-        if let Ok(constructed) = pending.construct_block() {
-            self.pending_blocks.insert(block_hash, pending);
-            self.pending_block_created_at.insert(block_hash, self.now);
-            self.certified_blocks
-                .insert(block_hash, ((*constructed).clone(), parent_qc));
-        }
-
-        // Create gossip message - include commitment proofs for ordering validation
-        let gossip = hyperscale_messages::BlockHeaderGossip::full(
-            header,
-            retry_hashes,
-            priority_hashes,
-            tx_hashes,
-            cert_hashes,
-            deferred_with_height,
-            aborted_with_height,
-            commitment_proofs,
-        );
-
-        // Track proposal time for rate limiting
-        self.last_proposal_time = self.now;
-
-        // Record leader activity - we are producing blocks
-        self.record_leader_activity();
-
-        actions.push(Action::BroadcastToShard {
-            shard: self.local_shard(),
-            message: OutboundMessage::BlockHeader(Box::new(gossip)),
-        });
-
-        // Vote for our own block
-        actions.extend(self.create_vote(block_hash, next_height, round));
-
-        actions
+        // Always use BuildProposal - the runner handles JMT readiness and timeout.
+        // This ensures transactions are always included regardless of certificate state.
+        // Include SetTimer to reschedule the proposal timer.
+        vec![
+            Action::SetTimer {
+                id: TimerId::Proposal,
+                duration: self.config.proposal_interval,
+            },
+            Action::BuildProposal {
+                proposer: self.validator_id(),
+                height: block_height,
+                round,
+                parent_hash,
+                parent_qc: parent_qc.clone(),
+                timestamp,
+                is_fallback: false,
+                parent_state_root,
+                parent_state_version,
+                retry_transactions,
+                priority_transactions,
+                transactions: other_transactions,
+                committed_certificates,
+                commitment_proofs,
+                deferred: deferred_filtered,
+                aborted: aborted_with_height,
+                timeout: self.config.state_root_compute_timeout,
+            },
+        ]
     }
 
     /// Build and broadcast a fallback block during view change.
@@ -3243,119 +3085,79 @@ impl BftState {
         self.try_vote_on_block(block_hash, height, round)
     }
 
-    /// Handle state root computation result for a proposal.
+    /// Handle proposal built by the runner.
     ///
-    /// Called when the runner completes `Action::ComputeStateRoot`. If computation
-    /// succeeded, we can now build and broadcast the block with certificates.
-    /// If it timed out, we build a block without certificates.
-    #[instrument(skip(self, result), fields(height = height, round = round))]
-    pub fn on_state_root_computed(
+    /// Called when the runner completes `Action::BuildProposal`. The runner has
+    /// computed the state root, built the complete block, and cached the WriteBatch
+    /// for efficient commit later.
+    #[instrument(skip(self, result), fields(height = %height.0, round = round))]
+    pub fn on_proposal_built(
         &mut self,
-        height: u64,
+        height: BlockHeight,
         round: u64,
-        result: StateRootComputeResult,
+        result: ProposalBuildResult,
     ) -> Vec<Action> {
         // Take the pending proposal - if it doesn't match (height, round), something is wrong
         let Some(pending) = self.pending_proposal.take() else {
             warn!(
-                height = height,
+                height = height.0,
                 round = round,
-                "StateRootComputed received but no pending proposal"
+                "ProposalBuilt received but no pending proposal"
             );
             return vec![];
         };
 
-        if pending.height.0 != height || pending.round != round {
+        if pending.height != height || pending.round != round {
             warn!(
                 expected_height = pending.height.0,
                 expected_round = pending.round,
-                received_height = height,
+                received_height = height.0,
                 received_round = round,
-                "StateRootComputed mismatch - discarding stale result"
+                "ProposalBuilt mismatch - discarding stale result"
             );
             // Put back the pending proposal if it's different (shouldn't happen)
             self.pending_proposal = Some(pending);
             return vec![];
         }
 
-        match result {
-            StateRootComputeResult::Success { state_root } => {
-                // Computation succeeded - build and broadcast block with certificates
-                let state_version =
-                    pending.parent_state_version + pending.committed_certificates.len() as u64;
-
+        // Extract block and hash from result (both success and timeout return a block)
+        let (block, block_hash, has_certificates) = match result {
+            ProposalBuildResult::Success { block, block_hash } => {
                 info!(
                     validator = ?self.validator_id(),
-                    height = height,
+                    height = height.0,
                     round = round,
-                    certificates = pending.committed_certificates.len(),
-                    state_root = ?state_root,
-                    state_version = state_version,
-                    "State root computed, building block with certificates"
+                    block_hash = ?block_hash,
+                    certificates = block.committed_certificates.len(),
+                    "Proposal built with certificates"
                 );
-
-                self.build_and_broadcast_proposal(pending, state_root, state_version)
+                (block, block_hash, true)
             }
-            StateRootComputeResult::Timeout => {
-                // Timed out - build block without certificates
+            ProposalBuildResult::Timeout { block, block_hash } => {
                 warn!(
                     validator = ?self.validator_id(),
-                    height = height,
+                    height = height.0,
                     round = round,
-                    pending_certs = pending.committed_certificates.len(),
-                    "State root computation timed out, building block without certificates"
+                    block_hash = ?block_hash,
+                    "Proposal built without certificates (timeout)"
                 );
-
-                // Build empty block (inherits parent state)
-                self.build_and_broadcast_empty_proposal(pending)
+                (block, block_hash, false)
             }
-        }
-    }
-
-    /// Build and broadcast a proposal with the computed state root.
-    fn build_and_broadcast_proposal(
-        &mut self,
-        pending: PendingProposal,
-        state_root: Hash,
-        state_version: u64,
-    ) -> Vec<Action> {
-        let header = BlockHeader {
-            height: pending.height,
-            parent_hash: pending.parent_hash,
-            parent_qc: pending.parent_qc.clone(),
-            proposer: self.validator_id(),
-            timestamp: pending.timestamp,
-            round: pending.round,
-            is_fallback: false,
-            state_root,
-            state_version,
         };
 
-        let block = Block {
-            header: header.clone(),
-            retry_transactions: pending.retry_transactions.clone(),
-            priority_transactions: pending.priority_transactions.clone(),
-            transactions: pending.transactions.clone(),
-            committed_certificates: pending.committed_certificates.clone(),
-            deferred: pending.deferred.clone(),
-            aborted: pending.aborted.clone(),
-            commitment_proofs: pending.commitment_proofs.clone(),
-        };
-
-        let block_hash = block.hash();
-
-        let retry_hashes: Vec<Hash> = pending
+        // Build hashes for gossip and pending block
+        let retry_hashes: Vec<Hash> = block
             .retry_transactions
             .iter()
             .map(|tx| tx.hash())
             .collect();
-        let priority_hashes: Vec<Hash> = pending
+        let priority_hashes: Vec<Hash> = block
             .priority_transactions
             .iter()
             .map(|tx| tx.hash())
             .collect();
-        let tx_hashes: Vec<Hash> = pending.transactions.iter().map(|tx| tx.hash()).collect();
-        let cert_hashes: Vec<Hash> = pending
+        let tx_hashes: Vec<Hash> = block.transactions.iter().map(|tx| tx.hash()).collect();
+        let cert_hashes: Vec<Hash> = block
             .committed_certificates
             .iter()
             .map(|c| c.transaction_hash)
@@ -3364,36 +3166,37 @@ impl BftState {
         let total_tx_count = retry_hashes.len() + priority_hashes.len() + tx_hashes.len();
         info!(
             validator = ?self.validator_id(),
-            height = pending.height.0,
-            round = pending.round,
+            height = height.0,
+            round = round,
             block_hash = ?block_hash,
             transactions = total_tx_count,
             certificates = cert_hashes.len(),
-            "Proposing block with certificates"
+            has_certificates = has_certificates,
+            "Broadcasting proposal"
         );
 
         // Store our own block as pending (already complete)
         let mut pending_block = PendingBlock::with_proofs(
-            header.clone(),
+            block.header.clone(),
             retry_hashes.clone(),
             priority_hashes.clone(),
             tx_hashes.clone(),
             cert_hashes.clone(),
-            pending.deferred.clone(),
-            pending.aborted.clone(),
-            pending.commitment_proofs.clone(),
+            block.deferred.clone(),
+            block.aborted.clone(),
+            block.commitment_proofs.clone(),
         );
 
-        for tx in &pending.retry_transactions {
+        for tx in &block.retry_transactions {
             pending_block.add_transaction_arc(Arc::clone(tx));
         }
-        for tx in &pending.priority_transactions {
+        for tx in &block.priority_transactions {
             pending_block.add_transaction_arc(Arc::clone(tx));
         }
-        for tx in &pending.transactions {
+        for tx in &block.transactions {
             pending_block.add_transaction_arc(Arc::clone(tx));
         }
-        for cert in &pending.committed_certificates {
+        for cert in &block.committed_certificates {
             pending_block.add_certificate(Arc::clone(cert));
         }
 
@@ -3409,14 +3212,14 @@ impl BftState {
 
         // Build gossip message with complete block data
         let gossip = hyperscale_messages::BlockHeaderGossip {
-            header,
+            header: block.header.clone(),
             retry_hashes,
             priority_hashes,
             transaction_hashes: tx_hashes,
             certificate_hashes: cert_hashes,
-            deferred: pending.deferred.clone(),
-            aborted: pending.aborted.clone(),
-            commitment_proofs: pending.commitment_proofs.clone(),
+            deferred: block.deferred.clone(),
+            aborted: block.aborted.clone(),
+            commitment_proofs: block.commitment_proofs.clone(),
         };
 
         let mut actions = vec![Action::BroadcastToShard {
@@ -3425,123 +3228,7 @@ impl BftState {
         }];
 
         // Vote for our own block
-        actions.extend(self.create_vote(block_hash, pending.height.0, pending.round));
-
-        actions
-    }
-
-    /// Build and broadcast a proposal without certificates (timeout or JMT not ready).
-    fn build_and_broadcast_empty_proposal(&mut self, pending: PendingProposal) -> Vec<Action> {
-        // Inherit parent's state since no certificates
-        let state_root = self
-            .get_block_by_hash(pending.parent_hash)
-            .map(|b| b.header.state_root)
-            .unwrap_or(Hash::ZERO);
-        let state_version = pending.parent_state_version;
-
-        let header = BlockHeader {
-            height: pending.height,
-            parent_hash: pending.parent_hash,
-            parent_qc: pending.parent_qc.clone(),
-            proposer: self.validator_id(),
-            timestamp: pending.timestamp,
-            round: pending.round,
-            is_fallback: false,
-            state_root,
-            state_version,
-        };
-
-        // No certificates, empty commitment proofs
-        let committed_certificates: Vec<Arc<TransactionCertificate>> = vec![];
-        let commitment_proofs: HashMap<Hash, CommitmentProof> = HashMap::new();
-
-        let block = Block {
-            header: header.clone(),
-            retry_transactions: pending.retry_transactions.clone(),
-            priority_transactions: pending.priority_transactions.clone(),
-            transactions: pending.transactions.clone(),
-            committed_certificates: committed_certificates.clone(),
-            deferred: pending.deferred.clone(),
-            aborted: pending.aborted.clone(),
-            commitment_proofs: commitment_proofs.clone(),
-        };
-
-        let block_hash = block.hash();
-
-        let retry_hashes: Vec<Hash> = pending
-            .retry_transactions
-            .iter()
-            .map(|tx| tx.hash())
-            .collect();
-        let priority_hashes: Vec<Hash> = pending
-            .priority_transactions
-            .iter()
-            .map(|tx| tx.hash())
-            .collect();
-        let tx_hashes: Vec<Hash> = pending.transactions.iter().map(|tx| tx.hash()).collect();
-        let cert_hashes: Vec<Hash> = vec![];
-
-        let total_tx_count = retry_hashes.len() + priority_hashes.len() + tx_hashes.len();
-        info!(
-            validator = ?self.validator_id(),
-            height = pending.height.0,
-            round = pending.round,
-            block_hash = ?block_hash,
-            transactions = total_tx_count,
-            "Proposing block without certificates (timeout)"
-        );
-
-        // Store our own block as pending (already complete)
-        let mut pending_block = PendingBlock::with_proofs(
-            header.clone(),
-            retry_hashes.clone(),
-            priority_hashes.clone(),
-            tx_hashes.clone(),
-            cert_hashes.clone(),
-            pending.deferred.clone(),
-            pending.aborted.clone(),
-            commitment_proofs.clone(),
-        );
-
-        for tx in &pending.retry_transactions {
-            pending_block.add_transaction_arc(Arc::clone(tx));
-        }
-        for tx in &pending.priority_transactions {
-            pending_block.add_transaction_arc(Arc::clone(tx));
-        }
-        for tx in &pending.transactions {
-            pending_block.add_transaction_arc(Arc::clone(tx));
-        }
-
-        if let Err(e) = pending_block.construct_block() {
-            warn!("Failed to construct own proposal block: {}", e);
-            return vec![];
-        }
-
-        self.pending_blocks.insert(block_hash, pending_block);
-        self.pending_block_created_at.insert(block_hash, self.now);
-        self.last_proposal_time = self.now;
-        self.record_leader_activity();
-
-        // Build gossip message
-        let gossip = hyperscale_messages::BlockHeaderGossip {
-            header,
-            retry_hashes,
-            priority_hashes,
-            transaction_hashes: tx_hashes,
-            certificate_hashes: cert_hashes,
-            deferred: pending.deferred,
-            aborted: pending.aborted,
-            commitment_proofs,
-        };
-
-        let mut actions = vec![Action::BroadcastToShard {
-            shard: self.local_shard(),
-            message: OutboundMessage::BlockHeader(Box::new(gossip)),
-        }];
-
-        // Vote for our own block
-        actions.extend(self.create_vote(block_hash, pending.height.0, pending.round));
+        actions.extend(self.create_vote(block_hash, height.0, round));
 
         actions
     }

@@ -2,11 +2,12 @@
 
 use crate::{message::OutboundMessage, Event, TimerId};
 use hyperscale_types::{
-    Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CycleProof,
-    EpochConfig, EpochId, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    SignerBitfield, StateCertificate, StateEntry, StateProvision, StateVoteBlock, SubstateWrite,
-    TransactionCertificate, ValidatorId, VotePower,
+    Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
+    CycleProof, EpochConfig, EpochId, Hash, NodeId, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, SignerBitfield, StateCertificate, StateEntry, StateProvision, StateVoteBlock,
+    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -285,28 +286,51 @@ pub enum Action {
         certificates: Vec<Arc<TransactionCertificate>>,
     },
 
-    /// Compute state root for a block proposal.
+    /// Build a complete block proposal.
     ///
-    /// Used by proposers to compute the state_root before broadcasting a block.
-    /// The runner waits for the JMT to reach `parent_state_root`, then computes
-    /// the new root after applying certificate writes.
+    /// The runner waits for the JMT to reach `parent_state_root`, computes the
+    /// new state root, builds the complete block, and caches the WriteBatch for
+    /// efficient commit later.
     ///
-    /// Returns `Event::StateRootComputed` with either the computed root or a
+    /// Returns `Event::ProposalBuilt` with either the complete block or a
     /// timeout if the JMT doesn't catch up within the specified duration.
     ///
-    /// This ensures proposals only include certificates when the JMT is ready,
-    /// guaranteeing proposer and verifier compute from the same base state.
-    ComputeStateRoot {
-        /// Height of the block being proposed (for correlation).
-        height: u64,
-        /// Round of the block being proposed (for correlation).
+    /// This combines state root computation and block building into a single
+    /// round-trip, enabling the proposer to use the fast commit path (1 fsync).
+    BuildProposal {
+        /// Proposer's validator ID (for block header).
+        proposer: ValidatorId,
+        /// Block height being proposed.
+        height: BlockHeight,
+        /// Round being proposed.
         round: u64,
+        /// Parent block hash.
+        parent_hash: Hash,
+        /// Parent QC (included in block header).
+        parent_qc: QuorumCertificate,
+        /// Block timestamp.
+        timestamp: u64,
+        /// Whether this is a fallback block.
+        is_fallback: bool,
         /// The state root of the parent block. Runner waits for local JMT
         /// to reach this root before computing.
         parent_state_root: Hash,
-        /// State writes grouped by certificate. Each certificate's writes are
-        /// applied at a separate JMT version.
-        writes_per_cert: Vec<Vec<SubstateWrite>>,
+        /// Parent's state version (for computing new state_version).
+        parent_state_version: u64,
+        /// Retry transactions (highest priority).
+        retry_transactions: Vec<Arc<RoutableTransaction>>,
+        /// Priority transactions (cross-shard with commitment proofs).
+        priority_transactions: Vec<Arc<RoutableTransaction>>,
+        /// Other transactions (normal priority).
+        transactions: Vec<Arc<RoutableTransaction>>,
+        /// Committed certificates to include.
+        committed_certificates: Vec<Arc<TransactionCertificate>>,
+        /// Commitment proofs for cross-shard transactions.
+        commitment_proofs: HashMap<Hash, CommitmentProof>,
+        /// Deferred transactions.
+        deferred: Vec<TransactionDefer>,
+        /// Aborted transactions.
+        aborted: Vec<TransactionAbort>,
         /// Maximum time to wait for JMT to catch up before returning timeout.
         timeout: Duration,
     },
@@ -653,7 +677,7 @@ impl Action {
                 | Action::VerifyQcSignature { .. }
                 | Action::VerifyCycleProof { .. }
                 | Action::VerifyStateRoot { .. }
-                | Action::ComputeStateRoot { .. }
+                | Action::BuildProposal { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
@@ -717,7 +741,7 @@ impl Action {
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
             Action::VerifyCycleProof { .. } => "VerifyCycleProof",
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
-            Action::ComputeStateRoot { .. } => "ComputeStateRoot",
+            Action::BuildProposal { .. } => "BuildProposal",
 
             // Delegated Work - Execution
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",
