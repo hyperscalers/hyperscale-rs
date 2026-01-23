@@ -1027,7 +1027,7 @@ impl ProductionRunner {
             }
         };
         if let Err(e) = result {
-            tracing::warn!(error = ?e, "Radix Engine genesis failed (may be OK for testing)");
+            panic!("Radix Engine genesis failed: {e:?}");
         }
 
         // Get the JMT state AFTER genesis bootstrap.
