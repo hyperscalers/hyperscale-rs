@@ -22,11 +22,15 @@ use hyperscale_types::NodeId;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, Snapshot, WriteBatch, DB};
 use sbor::prelude::*;
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{instrument, Level};
+
+/// Maximum number of entries in the block commit cache.
+/// When exceeded, oldest entries are evicted.
+const BLOCK_COMMIT_CACHE_MAX_SIZE: usize = 32;
 
 /// Cached data for efficient block commit.
 ///
@@ -45,6 +49,60 @@ pub struct BlockCommitCache {
     /// JMT snapshot containing precomputed tree nodes.
     /// Applied after the WriteBatch to update the in-memory Merkle tree.
     pub jmt_snapshot: JmtSnapshot,
+}
+
+/// LRU-style cache for block commit data.
+///
+/// Maintains insertion order via a VecDeque to enable FIFO eviction when
+/// the cache exceeds [`BLOCK_COMMIT_CACHE_MAX_SIZE`].
+struct BlockCommitCacheLru {
+    /// The actual cache data.
+    map: HashMap<hyperscale_types::Hash, BlockCommitCache>,
+    /// Insertion order for FIFO eviction. Front = oldest.
+    order: VecDeque<hyperscale_types::Hash>,
+}
+
+impl BlockCommitCacheLru {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    /// Insert a cache entry, evicting oldest entries if needed.
+    fn insert(&mut self, block_hash: hyperscale_types::Hash, cache: BlockCommitCache) {
+        // If already present, remove from order tracking (will re-add at end)
+        if self.map.contains_key(&block_hash) {
+            self.order.retain(|h| *h != block_hash);
+        }
+
+        // Evict oldest entries if at capacity
+        while self.map.len() >= BLOCK_COMMIT_CACHE_MAX_SIZE {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+                tracing::debug!(
+                    evicted_block = ?oldest,
+                    "Evicted oldest entry from block commit cache"
+                );
+            } else {
+                break;
+            }
+        }
+
+        self.map.insert(block_hash, cache);
+        self.order.push_back(block_hash);
+    }
+
+    /// Remove and return a cache entry.
+    fn remove(&mut self, block_hash: &hyperscale_types::Hash) -> Option<BlockCommitCache> {
+        if let Some(cache) = self.map.remove(block_hash) {
+            self.order.retain(|h| h != block_hash);
+            Some(cache)
+        } else {
+            None
+        }
+    }
 }
 
 /// JMT state bundled together for atomic updates.
@@ -95,9 +153,9 @@ pub struct RocksDbStorage {
     /// When the block commits, the cached WriteBatch is applied with a single
     /// fsync instead of N fsyncs for N certificates.
     ///
-    /// Uses a simple HashMap since WriteBatch isn't Sync (contains raw pointer).
-    /// The mutex is only held briefly during insert/remove operations.
-    block_commit_cache: Mutex<HashMap<hyperscale_types::Hash, BlockCommitCache>>,
+    /// Uses LRU eviction to bound memory usage. Maximum size is
+    /// [`BLOCK_COMMIT_CACHE_MAX_SIZE`] (32 entries).
+    block_commit_cache: Mutex<BlockCommitCacheLru>,
 }
 
 /// Error type for storage operations.
@@ -169,7 +227,7 @@ impl RocksDbStorage {
                 current_version: version,
                 current_root_hash: root_hash,
             }),
-            block_commit_cache: Mutex::new(HashMap::new()),
+            block_commit_cache: Mutex::new(BlockCommitCacheLru::new()),
         })
     }
 
@@ -577,21 +635,24 @@ impl RocksDbStorage {
     ///
     /// Called after verification to store the pre-built WriteBatch and JMT snapshot.
     /// When the block commits, [`take_block_commit_cache`] retrieves it.
-    pub fn cache_block_commit(&self, block_hash: hyperscale_types::Hash, cache: BlockCommitCache) {
-        let mut map = self.block_commit_cache.lock().unwrap();
-        map.insert(block_hash, cache);
+    ///
+    /// Uses LRU eviction - oldest entries are removed when cache exceeds
+    /// [`BLOCK_COMMIT_CACHE_MAX_SIZE`].
+    pub fn cache_block_commit(&self, block_hash: hyperscale_types::Hash, entry: BlockCommitCache) {
+        let mut cache = self.block_commit_cache.lock().unwrap();
+        cache.insert(block_hash, entry);
     }
 
     /// Take a cached block commit, removing it from the cache.
     ///
     /// Called during block commit to retrieve and apply the precomputed data.
-    /// Returns `None` if no cache was present (proposer case, or cache eviction).
+    /// Returns `None` if no cache was present (e.g., cache eviction or sync block).
     pub fn take_block_commit_cache(
         &self,
         block_hash: hyperscale_types::Hash,
     ) -> Option<BlockCommitCache> {
-        let mut map = self.block_commit_cache.lock().unwrap();
-        map.remove(&block_hash)
+        let mut cache = self.block_commit_cache.lock().unwrap();
+        cache.remove(&block_hash)
     }
 
     /// Build a WriteBatch for all certificates in a block.
