@@ -1776,20 +1776,46 @@ impl SimulationRunner {
                 let local_shard = self.nodes[from as usize].shard();
                 let block_hash = block.hash();
 
-                // NOTE: JMT snapshot cache disabled in simulation pending further investigation.
-                // The snapshot application causes tree inconsistencies in some edge cases.
-                // Always use slow path (per-certificate commits) for now.
-                // See: https://github.com/hyperscale/hyperscale-rs/issues/XXX
-                let _snapshot = self.jmt_cache.remove(&(from, block_hash));
-                {
-                    // Slow path: recompute per-certificate (proposer case or cache miss)
+                // Try to use cached JMT snapshot from verification (fast path).
+                // Falls back to per-certificate commits if no cache present (proposer case)
+                // or if the JMT has advanced since verification (stale cache).
+                let snapshot = self.jmt_cache.remove(&(from, block_hash));
+                let use_fast_path = snapshot.as_ref().is_some_and(|s| {
+                    // Snapshot is only valid if JMT is still at the expected base state.
+                    // Must check BOTH root AND version, since root can be unchanged with
+                    // empty commits (same root, different version).
+                    let current_root = storage.current_jmt_root();
+                    let current_version = storage.current_jmt_version();
+                    let snapshot_base = hyperscale_types::Hash::from_bytes(&s.base_root.0);
+                    let root_matches = current_root == snapshot_base;
+                    let version_matches = current_version == s.base_version;
+                    root_matches && version_matches
+                });
+
+                if use_fast_path {
+                    let snapshot = snapshot.unwrap();
+                    // Fast path: apply precomputed JMT snapshot
+                    storage.apply_jmt_snapshot(snapshot);
+                    // Still need to store certificates
                     for cert in &block.committed_certificates {
-                        if let Some(shard_proof) = cert.shard_proofs.get(&local_shard) {
-                            let writes = &shard_proof.state_writes;
-                            if !writes.is_empty() {
-                                storage.commit_certificate_with_writes(cert, writes);
-                            }
-                        }
+                        let writes = cert
+                            .shard_proofs
+                            .get(&local_shard)
+                            .map(|proof| proof.state_writes.as_slice())
+                            .unwrap_or(&[]);
+                        storage.commit_substate_data_only(cert, writes);
+                    }
+                } else {
+                    // Slow path: recompute per-certificate (proposer case, cache miss, or stale cache)
+                    // Always commit every certificate to advance JMT version.
+                    // This ensures JMT version matches certificates.len() used in state_version.
+                    for cert in &block.committed_certificates {
+                        let writes = cert
+                            .shard_proofs
+                            .get(&local_shard)
+                            .map(|proof| proof.state_writes.as_slice())
+                            .unwrap_or(&[]);
+                        storage.commit_certificate_with_writes(cert, writes);
                     }
                 }
 

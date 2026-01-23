@@ -39,6 +39,10 @@ pub struct JmtSnapshot {
     /// Used to verify the JMT is in the expected state before applying.
     pub base_root: StateRootHash,
 
+    /// The JMT version this snapshot was computed from.
+    /// Used together with base_root to verify the JMT is in the expected state.
+    pub base_version: u64,
+
     /// The resulting state root after applying all certificate writes.
     pub result_root: StateRootHash,
 
@@ -105,16 +109,19 @@ impl<'a> OverlayTreeStore<'a> {
     /// # Arguments
     ///
     /// * `base_root` - The JMT root this computation started from
+    /// * `base_version` - The JMT version this computation started from
     /// * `result_root` - The computed state root after applying all writes
     /// * `num_versions` - Number of JMT versions advanced (typically = number of certificates)
     pub fn into_snapshot(
         self,
         base_root: StateRootHash,
+        base_version: u64,
         result_root: StateRootHash,
         num_versions: u64,
     ) -> JmtSnapshot {
         JmtSnapshot {
             base_root,
+            base_version,
             result_root,
             num_versions,
             nodes: self.inserted_nodes.into_inner(),

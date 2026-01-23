@@ -74,6 +74,7 @@ impl SharedJmtState {
         if writes_per_cert.is_empty() {
             let snapshot = JmtSnapshot {
                 base_root,
+                base_version: *self.current_version.lock().unwrap(),
                 result_root: base_root,
                 num_versions: 0,
                 nodes: std::collections::HashMap::new(),
@@ -93,7 +94,8 @@ impl SharedJmtState {
         let tree_store = self.tree_store.lock().unwrap();
         let overlay = OverlayTreeStore::new(&tree_store);
 
-        let mut current_version = *self.current_version.lock().unwrap();
+        let base_version = *self.current_version.lock().unwrap();
+        let mut current_version = base_version;
         let mut result_root = base_root;
         let num_versions = writes_per_cert.len() as u64;
 
@@ -111,7 +113,7 @@ impl SharedJmtState {
         }
 
         let result_hash = Hash::from_bytes(&result_root.0);
-        let snapshot = overlay.into_snapshot(base_root, result_root, num_versions);
+        let snapshot = overlay.into_snapshot(base_root, base_version, result_root, num_versions);
 
         (result_hash, snapshot)
     }
@@ -122,11 +124,23 @@ impl SharedJmtState {
         let mut current_version = self.current_version.lock().unwrap();
         let mut current_root_hash = self.current_root_hash.lock().unwrap();
 
-        // Verify we're applying to the expected base state
+        // Verify we're applying to the expected base state.
+        // Must check BOTH root AND version. Root can be unchanged with empty commits
+        // (same root, different version), but the nodes are keyed by version.
         if *current_root_hash != snapshot.base_root {
             panic!(
-                "JMT snapshot base mismatch: expected {:?}, got {:?}",
+                "JMT snapshot base ROOT mismatch: expected {:?}, got {:?}. \
+                 This indicates a race condition where the JMT advanced between \
+                 verification and commit.",
                 snapshot.base_root, *current_root_hash
+            );
+        }
+        if *current_version != snapshot.base_version {
+            panic!(
+                "JMT snapshot base VERSION mismatch: expected {}, got {}. \
+                 The root matched but version didn't - this can happen with empty commits. \
+                 Snapshot nodes are keyed by version, so this snapshot cannot be applied.",
+                snapshot.base_version, *current_version
             );
         }
 
@@ -141,10 +155,6 @@ impl SharedJmtState {
     }
 
     fn commit(&self, updates: &DatabaseUpdates) {
-        if updates.node_updates.is_empty() {
-            return;
-        }
-
         let tree_store = self.tree_store.lock().unwrap();
         let mut current_version = self.current_version.lock().unwrap();
         let mut current_root_hash = self.current_root_hash.lock().unwrap();
@@ -234,6 +244,11 @@ impl SimStorage {
     /// Get the current JMT root hash.
     pub fn current_jmt_root(&self) -> Hash {
         self.jmt.current_jmt_root()
+    }
+
+    /// Get the current JMT version.
+    pub fn current_jmt_version(&self) -> u64 {
+        self.jmt.state_version()
     }
 
     /// Clear all data (useful for testing).

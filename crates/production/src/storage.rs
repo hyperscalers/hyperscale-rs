@@ -527,6 +527,7 @@ impl RocksDbStorage {
         if writes_per_cert.is_empty() {
             let snapshot = JmtSnapshot {
                 base_root,
+                base_version: jmt.current_version,
                 result_root: base_root,
                 num_versions: 0,
                 nodes: std::collections::HashMap::new(),
@@ -549,7 +550,8 @@ impl RocksDbStorage {
         // Apply each certificate's writes at a separate version using the overlay.
         let overlay = OverlayTreeStore::new(&jmt.tree_store);
 
-        let mut current_version = jmt.current_version;
+        let base_version = jmt.current_version;
+        let mut current_version = base_version;
         let mut root = jmt.current_root_hash;
         let num_versions = writes_per_cert.len() as u64;
 
@@ -566,7 +568,7 @@ impl RocksDbStorage {
         }
 
         let result_root = hyperscale_types::Hash::from_bytes(&root.0);
-        let snapshot = overlay.into_snapshot(base_root, root, num_versions);
+        let snapshot = overlay.into_snapshot(base_root, base_version, root, num_versions);
 
         (result_root, snapshot)
     }
@@ -692,12 +694,22 @@ impl RocksDbStorage {
         // 2. Apply the JMT snapshot (in-memory, fast)
         let mut jmt = self.jmt.lock().unwrap();
 
-        // Verify we're applying to the expected base state
+        // Verify we're applying to the expected base state.
+        // Must check BOTH root AND version. Root can be unchanged with empty commits
+        // (same root, different version), but the nodes are keyed by version.
         if jmt.current_root_hash != cache.jmt_snapshot.base_root {
             panic!(
-                "JMT snapshot base mismatch: expected {:?}, got {:?}. \
+                "JMT snapshot base ROOT mismatch: expected {:?}, got {:?}. \
                  This is a bug - snapshot was computed from different JMT state.",
                 cache.jmt_snapshot.base_root, jmt.current_root_hash
+            );
+        }
+        if jmt.current_version != cache.jmt_snapshot.base_version {
+            panic!(
+                "JMT snapshot base VERSION mismatch: expected {}, got {}. \
+                 The root matched but version didn't - this can happen with empty commits. \
+                 Snapshot nodes are keyed by version, so this snapshot cannot be applied.",
+                cache.jmt_snapshot.base_version, jmt.current_version
             );
         }
 
