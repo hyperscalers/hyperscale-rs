@@ -589,6 +589,7 @@ impl RocksDbStorage {
                 result_root: base_root,
                 num_versions: 0,
                 nodes: std::collections::HashMap::new(),
+                stale_tree_parts: Vec::new(),
             };
             return (current_root, snapshot);
         }
@@ -777,12 +778,19 @@ impl RocksDbStorage {
             jmt.tree_store.insert_node(key, node);
         }
 
+        // Prune stale nodes
+        let stale_count = cache.jmt_snapshot.stale_tree_parts.len();
+        for stale_part in cache.jmt_snapshot.stale_tree_parts {
+            jmt.tree_store.record_stale_tree_part(stale_part);
+        }
+
         // Advance version and update root
         jmt.current_version += cache.jmt_snapshot.num_versions;
         jmt.current_root_hash = cache.jmt_snapshot.result_root;
 
         let new_version = jmt.current_version;
         let new_root = jmt.current_root_hash;
+        let tree_node_count = jmt.tree_store.tree_nodes.read().unwrap().len();
         drop(jmt); // Release lock before I/O
 
         // 3. Persist the new JMT state
@@ -796,6 +804,8 @@ impl RocksDbStorage {
             new_version,
             new_root = %hex::encode(new_root.0),
             nodes_count,
+            stale_count,
+            tree_node_count,
             rocksdb_ms = rocksdb_elapsed.as_millis(),
             total_ms = total_elapsed.as_millis(),
             "Applied block commit cache (single fsync)"

@@ -78,6 +78,7 @@ impl SharedJmtState {
                 result_root: base_root,
                 num_versions: 0,
                 nodes: std::collections::HashMap::new(),
+                stale_tree_parts: Vec::new(),
             };
             return (current_root_hash, snapshot);
         }
@@ -145,6 +146,11 @@ impl SharedJmtState {
         // Insert all captured nodes
         for (key, node) in snapshot.nodes {
             self.tree_store.insert_node(key, node);
+        }
+
+        // Prune stale nodes
+        for stale_part in snapshot.stale_tree_parts {
+            self.tree_store.record_stale_tree_part(stale_part);
         }
 
         // Advance version and update root

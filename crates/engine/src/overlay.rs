@@ -53,6 +53,9 @@ pub struct JmtSnapshot {
     /// Nodes created during speculative computation.
     /// These are inserted directly into the real JMT on apply.
     pub nodes: HashMap<StoredTreeNodeKey, TreeNode>,
+
+    /// Stale tree parts to prune when applying the snapshot.
+    pub stale_tree_parts: Vec<StaleTreePart>,
 }
 
 /// An overlay tree store that captures writes without modifying the underlying store.
@@ -88,6 +91,9 @@ pub struct OverlayTreeStore<'a> {
     /// Set of keys that have been marked as stale (deleted) in the overlay.
     /// Lookups for these keys return None even if they exist in the base store.
     stale_keys: RefCell<HashSet<StoredTreeNodeKey>>,
+
+    /// Stale tree parts for pruning on commit.
+    stale_tree_parts: RefCell<Vec<StaleTreePart>>,
 }
 
 impl<'a> OverlayTreeStore<'a> {
@@ -97,6 +103,7 @@ impl<'a> OverlayTreeStore<'a> {
             base,
             inserted_nodes: RefCell::new(HashMap::new()),
             stale_keys: RefCell::new(HashSet::new()),
+            stale_tree_parts: RefCell::new(Vec::new()),
         }
     }
 
@@ -119,12 +126,18 @@ impl<'a> OverlayTreeStore<'a> {
         result_root: StateRootHash,
         num_versions: u64,
     ) -> JmtSnapshot {
+        // Don't filter stale parts - intermediate nodes from multi-cert processing
+        // may appear in both inserted_nodes and stale_tree_parts.
+        let inserted_nodes = self.inserted_nodes.into_inner();
+        let stale_tree_parts = self.stale_tree_parts.into_inner();
+
         JmtSnapshot {
             base_root,
             base_version,
             result_root,
             num_versions,
-            nodes: self.inserted_nodes.into_inner(),
+            nodes: inserted_nodes,
+            stale_tree_parts,
         }
     }
 }
@@ -166,33 +179,14 @@ impl<'a> WriteableTreeStore for OverlayTreeStore<'a> {
     }
 
     fn record_stale_tree_part(&self, part: StaleTreePart) {
-        // Mark nodes as stale in the overlay so subsequent reads return None.
-        //
-        // NOTE: For `StaleTreePart::Subtree`, we only mark the root as stale rather than
-        // recursively walking the entire subtree. This is correct for speculative computation
-        // because:
-        //
-        // 1. Stale nodes are from the PREVIOUS version of the tree (before our speculative update)
-        // 2. The speculative computation creates NEW nodes at a NEW version number
-        // 3. Reads during `put_at_next_version` use version-qualified keys: (version, nibble_path)
-        // 4. New nodes are stored at version N+1, stale nodes were at version N
-        // 5. Therefore, reads for child nodes will either:
-        //    a) Find them in the overlay (newly created) - correct
-        //    b) Find them in the base store at their old version - correct (we're reading
-        //       parent chain nodes that weren't modified)
-        //    c) Not find them because the whole subtree was replaced - also correct
-        //
-        // The real tree store DOES need full recursive deletion for garbage collection,
-        // but the overlay is temporary and discarded after computing the speculative root.
-        match part {
-            StaleTreePart::Node(key) => {
-                self.stale_keys.borrow_mut().insert(key);
-            }
-            StaleTreePart::Subtree(root_key) => {
-                // Mark only the subtree root as stale. See explanation above for why
-                // recursive deletion is not needed for speculative computation.
-                self.stale_keys.borrow_mut().insert(root_key);
-            }
-        }
+        // Track stale key for overlay reads, and full part for later pruning.
+        // For Subtree, we only mark the root as stale (not recursive) since
+        // version-qualified keys prevent conflicts with new nodes.
+        let key = match &part {
+            StaleTreePart::Node(k) => k.clone(),
+            StaleTreePart::Subtree(k) => k.clone(),
+        };
+        self.stale_keys.borrow_mut().insert(key);
+        self.stale_tree_parts.borrow_mut().push(part);
     }
 }
