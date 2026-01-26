@@ -1084,7 +1084,13 @@ impl BftState {
         let (parent_state_root, parent_state_version) = self
             .get_block_by_hash(parent_hash)
             .map(|b| (b.header.state_root, b.header.state_version))
-            .unwrap_or((Hash::ZERO, 0)); // Genesis parent has zero state
+            .unwrap_or_else(|| {
+                // Parent not found - use local JMT state as fallback.
+                // This handles genesis case and edge cases where the parent block
+                // is missing from pending_blocks (e.g., after recovery or sync).
+                let (version, root) = self.get_local_jmt_state();
+                (root, version)
+            });
 
         // Build set of certificate hashes for stale deferral filtering
         let cert_hash_set: std::collections::HashSet<Hash> = committed_certificates
@@ -1536,30 +1542,17 @@ impl BftState {
         // proposing empty sync blocks) while catching up on historical blocks in parallel.
         if !header.parent_qc.is_genesis() {
             let parent_height = header.parent_qc.height.0;
-
-            // IMPORTANT: Update latest_qc from the header BEFORE checking if we need sync.
-            // This ensures our latest_qc reflects the highest QC we've seen from the network.
-            let should_update_qc = self
-                .latest_qc
-                .as_ref()
-                .is_none_or(|existing| header.parent_qc.height.0 > existing.height.0);
-            if should_update_qc {
-                debug!(
-                    validator = ?self.validator_id(),
-                    qc_height = header.parent_qc.height.0,
-                    "Updated latest_qc from received block header (before sync check)"
-                );
-                self.latest_qc = Some(header.parent_qc.clone());
-                self.maybe_unlock_for_qc(&header.parent_qc);
-            }
+            let parent_block_hash = header.parent_qc.block_hash;
 
             // Check if we have a COMPLETE parent block. If the parent is incomplete
             // (missing transactions/certificates), we need to sync to get the full data.
             // This is more aggressive than checking has_block_at_height() which would
             // return true for incomplete pending blocks.
-            if !self.has_complete_block_at_height(parent_height) {
+            let have_parent = self.has_complete_block_at_height(parent_height);
+
+            if !have_parent {
                 let target_height = parent_height;
-                let target_hash = header.parent_qc.block_hash;
+                let target_hash = parent_block_hash;
 
                 info!(
                     validator = ?self.validator_id(),
@@ -1573,6 +1566,25 @@ impl BftState {
                 // This allows us to build QCs and propose sync blocks while syncing.
                 // start_sync sets the syncing flag immediately and returns StartSync action.
                 sync_actions = self.start_sync(target_height, target_hash);
+            }
+
+            // Only update latest_qc if we actually have the parent block it references.
+            // If we don't have the parent, we can't use this QC for proposing because
+            // we won't be able to look up the parent's state_root. This prevents
+            // proposing blocks with state_root=Hash::ZERO when the parent is missing.
+            let should_update_qc = have_parent
+                && self
+                    .latest_qc
+                    .as_ref()
+                    .is_none_or(|existing| header.parent_qc.height.0 > existing.height.0);
+            if should_update_qc {
+                debug!(
+                    validator = ?self.validator_id(),
+                    qc_height = header.parent_qc.height.0,
+                    "Updated latest_qc from received block header"
+                );
+                self.latest_qc = Some(header.parent_qc.clone());
+                self.maybe_unlock_for_qc(&header.parent_qc);
             }
         }
 
@@ -2239,14 +2251,14 @@ impl BftState {
     fn initiate_state_root_verification(&mut self, block_hash: Hash, block: &Block) -> Vec<Action> {
         // Get the parent block's state_root. This is the base state that the proposer
         // used when computing the new state_root. We must verify from the same base.
+        let (_, current_root) = self.get_local_jmt_state();
         let parent_state_root = self
             .get_block_by_hash(block.header.parent_hash)
             .map(|parent| parent.header.state_root)
-            .unwrap_or(Hash::ZERO); // Genesis parent has zero root
+            .unwrap_or(current_root); // Genesis or missing parent - use current JMT root
 
         // Check if our local JMT root matches the parent's state_root.
         // This ensures we're computing from the same base state as the proposer.
-        let (_, current_root) = self.get_local_jmt_state();
 
         if current_root == parent_state_root {
             // JMT is ready - verify immediately
