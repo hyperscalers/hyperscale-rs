@@ -255,6 +255,161 @@ impl Drop for ShutdownHandle {
     }
 }
 
+/// Request to commit a block's state changes.
+///
+/// Sent to the dedicated commit task to ensure sequential processing.
+/// This prevents race conditions where concurrent `spawn_blocking` tasks
+/// could complete out of order, causing JMT version mismatches.
+struct BlockCommitRequest {
+    /// The block to commit.
+    block: Block,
+    /// Block height for logging.
+    height: u64,
+    /// Block hash for cache lookup.
+    block_hash: Hash,
+}
+
+/// Handle for the dedicated block commit task.
+///
+/// Commits are processed sequentially to maintain JMT consistency.
+/// The task runs on a dedicated blocking thread and processes commits
+/// in FIFO order from the channel.
+struct BlockCommitTaskHandle {
+    /// Sender for submitting commit requests.
+    tx: mpsc::Sender<BlockCommitRequest>,
+    /// Join handle for the commit task (for graceful shutdown).
+    #[allow(dead_code)]
+    join_handle: tokio::task::JoinHandle<()>,
+}
+
+/// Spawn the dedicated block commit task.
+///
+/// This task processes block commits sequentially to prevent JMT version race conditions.
+/// Without serialization, concurrent `spawn_blocking` tasks could complete out of order,
+/// causing the pre-computed `BlockCommitCache` to have a stale base version.
+///
+/// The task:
+/// 1. Receives `BlockCommitRequest` from the channel (FIFO order)
+/// 2. Tries to apply the cached `BlockCommitCache` (fast path, 1 fsync)
+/// 3. Falls back to per-certificate commits if cache is stale (slow path)
+/// 4. Sends `StateCommitComplete` event when done
+fn spawn_block_commit_task(
+    storage: Arc<RocksDbStorage>,
+    local_shard: ShardGroupId,
+    rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
+    callback_tx: mpsc::UnboundedSender<Event>,
+) -> BlockCommitTaskHandle {
+    // Bounded channel with small capacity - commits should be fast and we don't want
+    // to buffer many blocks. Backpressure here means consensus is outpacing storage.
+    let (tx, mut rx) = mpsc::channel::<BlockCommitRequest>(16);
+
+    let join_handle = tokio::task::spawn(async move {
+        while let Some(request) = rx.recv().await {
+            let BlockCommitRequest {
+                block,
+                height,
+                block_hash,
+            } = request;
+
+            // Move the actual commit work to a blocking thread since it does RocksDB I/O.
+            // But we await it here to ensure sequential processing.
+            let storage = storage.clone();
+            let local_shard = local_shard;
+            let rpc_status = rpc_status.clone();
+            let callback_tx = callback_tx.clone();
+
+            // This is the key difference from before: we AWAIT the blocking task,
+            // ensuring commits complete in order before processing the next one.
+            let _ = tokio::task::spawn_blocking(move || {
+                // Try to use cached BlockCommitCache from verification (fast path).
+                // Falls back to per-certificate commits if cache is stale.
+                let used_fast_path =
+                    if let Some(cache) = storage.take_block_commit_cache(block_hash) {
+                        let num_certs = block.committed_certificates.len();
+                        if storage.try_apply_block_commit_cache(cache) {
+                            tracing::info!(
+                                block_height = height,
+                                total_certs = num_certs,
+                                local_shard = local_shard.0,
+                                "Applied block commit cache (fast path, 1 fsync)"
+                            );
+                            true
+                        } else {
+                            // Cache was stale (JMT state changed), fall back to slow path
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                if !used_fast_path {
+                    // SLOW PATH: recompute per-certificate (N fsyncs)
+                    let mut applied_count = 0u32;
+                    let mut empty_count = 0u32;
+                    for cert in &block.committed_certificates {
+                        let writes = cert
+                            .shard_proofs
+                            .get(&local_shard)
+                            .map(|proof| proof.state_writes.as_slice())
+                            .unwrap_or(&[]);
+
+                        storage.commit_certificate_with_writes(cert, writes);
+                        if writes.is_empty() {
+                            empty_count += 1;
+                        } else {
+                            applied_count += 1;
+                        }
+                    }
+
+                    tracing::info!(
+                        block_height = height,
+                        total_certs = block.committed_certificates.len(),
+                        applied_count,
+                        empty_count,
+                        local_shard = local_shard.0,
+                        "Applied certificate state writes (slow path, {} fsyncs)",
+                        block.committed_certificates.len()
+                    );
+                }
+
+                // Get the resulting state root after all commits
+                use hyperscale_engine::SubstateStore;
+                let state_root_hash = storage.state_root_hash();
+                let state_version = storage.state_version();
+
+                // Update RPC status with new JMT state version and root hash
+                if let Some(rpc_status) = rpc_status {
+                    let state_root_hex = hex::encode(state_root_hash.0);
+                    tokio::spawn(async move {
+                        let mut status = rpc_status.write().await;
+                        status.state_version = state_version;
+                        status.state_root_hash = state_root_hex;
+                    });
+                }
+
+                // Notify state machine that JMT commit is complete.
+                let state_root = hyperscale_types::Hash::from_bytes(&state_root_hash.0);
+                if let Err(e) = callback_tx.send(Event::StateCommitComplete {
+                    height,
+                    state_version,
+                    state_root,
+                }) {
+                    tracing::error!(
+                        block_height = height,
+                        error = %e,
+                        "Failed to send StateCommitComplete event"
+                    );
+                }
+            })
+            .await;
+        }
+
+        tracing::debug!("Block commit task shutting down");
+    });
+
+    BlockCommitTaskHandle { tx, join_handle }
+}
+
 /// Builder for constructing a [`ProductionRunner`].
 ///
 /// Required fields:
@@ -697,6 +852,15 @@ impl ProductionRunnerBuilder {
         });
         let dispatch_tx = action_dispatcher.tx.clone();
 
+        // Spawn dedicated block commit task.
+        // Commits are processed sequentially to prevent JMT version race conditions.
+        let block_commit_task = spawn_block_commit_task(
+            storage.clone(),
+            local_shard,
+            self.rpc_status.clone(),
+            callback_tx.clone(),
+        );
+
         Ok(ProductionRunner {
             timer_rx,
             callback_rx,
@@ -747,6 +911,7 @@ impl ProductionRunnerBuilder {
             recently_received_txs,
             pending_gossiped_cert_batch: PendingGossipedCertBatch::default(),
             gossiped_cert_batch_deadline: None,
+            block_commit_task,
         })
     }
 }
@@ -899,6 +1064,9 @@ pub struct ProductionRunner {
     pending_gossiped_cert_batch: PendingGossipedCertBatch,
     /// Deadline for flushing pending gossiped certificate batch. None if none pending.
     gossiped_cert_batch_deadline: Option<tokio::time::Instant>,
+    /// Handle for the dedicated block commit task.
+    /// Commits are serialized through this task to prevent JMT version race conditions.
+    block_commit_task: BlockCommitTaskHandle,
 }
 
 impl ProductionRunner {
@@ -2960,104 +3128,33 @@ impl ProductionRunner {
                 // EmitCommittedBlock is emitted when a block commits (not when certified),
                 // so this is the correct place for state application.
                 //
-                // OPTIMIZATION: If we have a cached JMT snapshot from verification,
-                // apply it directly instead of recomputing certificate-by-certificate.
-                // This avoids redundant JMT computation (verification already did it).
+                // SERIALIZATION: Commits are sent to a dedicated task that processes them
+                // sequentially. This prevents race conditions where concurrent spawn_blocking
+                // tasks complete out of order, causing JMT version mismatches.
                 //
-                // After commit completes, we send StateCommitComplete so the state machine
+                // OPTIMIZATION: If we have a cached JMT snapshot from verification,
+                // the commit task applies it directly (fast path). Otherwise it falls back
+                // to per-certificate commits (slow path).
+                //
+                // After commit completes, StateCommitComplete is sent so the state machine
                 // knows it's safe to compute speculative roots for the next proposal.
                 if !block.committed_certificates.is_empty() {
-                    let storage = self.storage.clone();
-                    let local_shard = self.local_shard;
-                    let rpc_status = self.rpc_status.clone();
-                    let block_for_commit = block.clone();
-                    let block_height = height;
-                    let block_hash = block.hash();
-                    let callback_tx = self.callback_tx.clone();
+                    let request = BlockCommitRequest {
+                        block: block.clone(),
+                        height,
+                        block_hash: block.hash(),
+                    };
 
-                    tokio::task::spawn_blocking(move || {
-                        // Try to use cached BlockCommitCache from verification (fast path).
-                        // Falls back to per-certificate commits if no cache present
-                        // (cache eviction or synced blocks).
-                        if let Some(cache) = storage.take_block_commit_cache(block_hash) {
-                            // FAST PATH: Apply the pre-built WriteBatch with a single fsync,
-                            // then apply the precomputed JMT snapshot (in-memory).
-                            let num_certs = block_for_commit.committed_certificates.len();
-                            storage.apply_block_commit_cache(cache);
-
-                            tracing::info!(
-                                block_height,
-                                total_certs = num_certs,
-                                local_shard = local_shard.0,
-                                "Applied block commit cache (fast path, 1 fsync)"
-                            );
-                        } else {
-                            // SLOW PATH: recompute per-certificate (N fsyncs)
-                            // This happens when the cache is evicted (LRU overflow) or for
-                            // synced blocks. Proposers cache during BuildProposal, and
-                            // verifiers cache during VerifyStateRoot, so both normally
-                            // get the fast path.
-                            let mut applied_count = 0u32;
-                            let mut empty_count = 0u32;
-                            for cert in &block_for_commit.committed_certificates {
-                                // Always commit every certificate to advance JMT version.
-                                // This ensures JMT version matches certificates.len() used in state_version.
-                                // Get writes for local shard, or empty vec if no writes for this shard.
-                                let writes = cert
-                                    .shard_proofs
-                                    .get(&local_shard)
-                                    .map(|proof| proof.state_writes.as_slice())
-                                    .unwrap_or(&[]);
-
-                                storage.commit_certificate_with_writes(cert, writes);
-                                if writes.is_empty() {
-                                    empty_count += 1;
-                                } else {
-                                    applied_count += 1;
-                                }
-                            }
-
-                            tracing::info!(
-                                block_height,
-                                total_certs = block_for_commit.committed_certificates.len(),
-                                applied_count,
-                                empty_count,
-                                local_shard = local_shard.0,
-                                "Applied certificate state writes (slow path, {} fsyncs)",
-                                block_for_commit.committed_certificates.len()
-                            );
-                        }
-
-                        // Get the resulting state root after all commits
-                        use hyperscale_engine::SubstateStore;
-                        let state_root_hash = storage.state_root_hash();
-                        let state_version = storage.state_version();
-
-                        // Update RPC status with new JMT state version and root hash
-                        if let Some(rpc_status) = rpc_status {
-                            let state_root_hex = hex::encode(state_root_hash.0);
-                            tokio::spawn(async move {
-                                let mut status = rpc_status.write().await;
-                                status.state_version = state_version;
-                                status.state_root_hash = state_root_hex;
-                            });
-                        }
-
-                        // Notify state machine that JMT commit is complete.
-                        // This allows safe computation of speculative roots for next proposal.
-                        let state_root = hyperscale_types::Hash::from_bytes(&state_root_hash.0);
-                        if let Err(e) = callback_tx.send(Event::StateCommitComplete {
-                            height: block_height,
-                            state_version,
-                            state_root,
-                        }) {
-                            tracing::error!(
-                                block_height,
-                                error = ?e,
-                                "Failed to send StateCommitComplete event"
-                            );
-                        }
-                    });
+                    // Send to dedicated commit task for sequential processing.
+                    // try_send to avoid blocking the event loop - if channel is full,
+                    // we're severely backlogged and should log a warning.
+                    if let Err(e) = self.block_commit_task.tx.try_send(request) {
+                        tracing::error!(
+                            height,
+                            error = %e,
+                            "Failed to send block commit request - commit channel full or closed"
+                        );
+                    }
                 }
             }
 

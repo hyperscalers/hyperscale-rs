@@ -363,20 +363,73 @@ impl ReadableTreeStore for RocksDbStorage {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Snapshot-based tree store for concurrent JMT reads
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A tree store that reads JMT nodes from a RocksDB snapshot.
+///
+/// This provides point-in-time isolation for JMT reads: any nodes deleted by
+/// concurrent block commits remain visible through this snapshot. This prevents
+/// the race condition where speculative JMT computation reads nodes that are
+/// being deleted by a concurrent commit.
+///
+/// # Lifetime
+/// The snapshot must outlive all reads through this store. When dropped, the
+/// snapshot releases its hold on the RocksDB version, allowing garbage collection.
+pub struct SnapshotTreeStore<'a> {
+    /// RocksDB snapshot for point-in-time reads.
+    snapshot: Snapshot<'a>,
+    /// Reference to the DB for column family handles.
+    db: &'a DB,
+}
+
+impl<'a> SnapshotTreeStore<'a> {
+    /// Create a new snapshot-based tree store.
+    ///
+    /// Takes a RocksDB snapshot at the current point in time. All reads through
+    /// this store will see the database state as of this moment, regardless of
+    /// any concurrent writes.
+    pub fn new(db: &'a DB) -> Self {
+        Self {
+            snapshot: db.snapshot(),
+            db,
+        }
+    }
+}
+
+impl ReadableTreeStore for SnapshotTreeStore<'_> {
+    fn get_node(&self, key: &StoredTreeNodeKey) -> Option<TreeNode> {
+        let cf = self.db.cf_handle(JMT_NODES_CF)?;
+        let encoded_key = encode_jmt_key(key);
+        self.snapshot
+            .get_cf(cf, &encoded_key)
+            .ok()
+            .flatten()
+            .and_then(|bytes| sbor::basic_decode::<VersionedTreeNode>(&bytes).ok())
+            .map(|versioned| versioned.fully_update_and_into_latest_version())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Overlay tree store for speculative JMT computation
 // ═══════════════════════════════════════════════════════════════════════
 
-/// An overlay tree store that captures writes without modifying the underlying RocksDB.
+/// An overlay tree store that captures writes without modifying the underlying store.
 ///
-/// Reads check the overlay first, then fall through to RocksDB.
+/// Reads check the overlay first, then fall through to the base store.
 /// Writes only go to the overlay and are discarded when the overlay is dropped.
 ///
 /// This enables speculative JMT root computation where we need to compute what
 /// the root WOULD be without actually persisting any nodes. Multiple concurrent
 /// speculative computations can run without corrupting each other.
-pub struct OverlayTreeStore<'a> {
-    /// The underlying RocksDB storage (read-only access).
-    base: &'a RocksDbStorage,
+///
+/// # Type Parameter
+/// `B` is the base store type, which must implement `ReadableTreeStore`. This is
+/// typically either `RocksDbStorage` (for direct reads) or `SnapshotTreeStore`
+/// (for snapshot-isolated reads that are immune to concurrent deletions).
+pub struct OverlayTreeStore<'a, B: ReadableTreeStore> {
+    /// The underlying store (read-only access).
+    base: &'a B,
 
     /// Overlay of node insertions. Maps key -> node.
     /// Nodes inserted during speculative computation are stored here.
@@ -390,9 +443,9 @@ pub struct OverlayTreeStore<'a> {
     stale_tree_parts: RefCell<Vec<StaleTreePart>>,
 }
 
-impl<'a> OverlayTreeStore<'a> {
-    /// Create a new overlay wrapping the given RocksDB storage.
-    pub fn new(base: &'a RocksDbStorage) -> Self {
+impl<'a, B: ReadableTreeStore> OverlayTreeStore<'a, B> {
+    /// Create a new overlay wrapping the given base store.
+    pub fn new(base: &'a B) -> Self {
         Self {
             base,
             inserted_nodes: RefCell::new(HashMap::new()),
@@ -427,7 +480,7 @@ impl<'a> OverlayTreeStore<'a> {
     }
 }
 
-impl ReadableTreeStore for OverlayTreeStore<'_> {
+impl<B: ReadableTreeStore> ReadableTreeStore for OverlayTreeStore<'_, B> {
     fn get_node(&self, key: &StoredTreeNodeKey) -> Option<TreeNode> {
         // Check if the key was marked as stale (deleted)
         if self.stale_keys.borrow().contains(key) {
@@ -439,12 +492,12 @@ impl ReadableTreeStore for OverlayTreeStore<'_> {
             return Some(node.clone());
         }
 
-        // Fall through to RocksDB
+        // Fall through to base store
         self.base.get_node(key)
     }
 }
 
-impl WriteableTreeStore for OverlayTreeStore<'_> {
+impl<B: ReadableTreeStore> WriteableTreeStore for OverlayTreeStore<'_, B> {
     fn insert_node(&self, key: StoredTreeNodeKey, node: TreeNode) {
         // Remove from stale set if it was previously marked stale
         self.stale_keys.borrow_mut().remove(&key);
@@ -745,9 +798,19 @@ impl RocksDbStorage {
             );
         }
 
-        // Expensive computation runs without holding the JMT lock.
-        // The overlay reads from RocksDB (which is thread-safe) and captures writes in memory.
-        let overlay = OverlayTreeStore::new(self);
+        // CRITICAL: Use a RocksDB snapshot for point-in-time isolation.
+        //
+        // This computation runs on the consensus-crypto thread pool, concurrent with
+        // block commits on the state machine thread. Block commits delete stale JMT
+        // nodes from RocksDB. Without a snapshot, this computation could read nodes
+        // that are deleted mid-computation, causing a panic in the Radix JMT code.
+        //
+        // The snapshot provides a consistent view of RocksDB at this moment. Even if
+        // another thread deletes nodes, our reads through the snapshot still see them.
+        // The snapshot is lightweight (just a version marker) and automatically releases
+        // when dropped at the end of this function.
+        let snapshot_store = SnapshotTreeStore::new(&self.db);
+        let overlay = OverlayTreeStore::new(&snapshot_store);
 
         let mut current_version = base_version;
         let mut root = base_root;
@@ -879,7 +942,15 @@ impl RocksDbStorage {
     ///
     /// Panics if the current JMT root doesn't match the snapshot's base_root,
     /// or if the RocksDB write fails.
-    pub fn apply_block_commit_cache(&self, mut cache: BlockCommitCache) {
+    /// Try to apply a pre-computed block commit cache.
+    ///
+    /// Returns `true` if the cache was successfully applied (fast path),
+    /// or `false` if the cache couldn't be applied due to JMT state mismatch
+    /// (caller should fall back to slow path).
+    ///
+    /// # Panics
+    /// Only panics on unrecoverable errors (RocksDB write failure).
+    pub fn try_apply_block_commit_cache(&self, mut cache: BlockCommitCache) -> bool {
         let start = Instant::now();
 
         // Verify we're applying to the expected base state BEFORE writing anything.
@@ -888,19 +959,21 @@ impl RocksDbStorage {
         {
             let jmt = self.jmt.read().unwrap();
             if jmt.current_root_hash != cache.jmt_snapshot.base_root {
-                panic!(
-                    "JMT snapshot base ROOT mismatch: expected {:?}, got {:?}. \
-                     This is a bug - snapshot was computed from different JMT state.",
-                    cache.jmt_snapshot.base_root, jmt.current_root_hash
+                tracing::warn!(
+                    expected_root = ?cache.jmt_snapshot.base_root,
+                    actual_root = ?jmt.current_root_hash,
+                    "JMT snapshot base ROOT mismatch - falling back to slow path"
                 );
+                return false;
             }
             if jmt.current_version != cache.jmt_snapshot.base_version {
-                panic!(
-                    "JMT snapshot base VERSION mismatch: expected {}, got {}. \
-                     The root matched but version didn't - this can happen with empty commits. \
-                     Snapshot nodes are keyed by version, so this snapshot cannot be applied.",
-                    cache.jmt_snapshot.base_version, jmt.current_version
+                tracing::warn!(
+                    expected_version = cache.jmt_snapshot.base_version,
+                    actual_version = jmt.current_version,
+                    "JMT snapshot base VERSION mismatch - falling back to slow path. \
+                     This can happen with empty commits or concurrent block processing."
                 );
+                return false;
             }
         }
 
@@ -975,6 +1048,8 @@ impl RocksDbStorage {
             total_ms = total_elapsed.as_millis(),
             "Applied block commit cache (single fsync)"
         );
+
+        true
     }
 }
 
