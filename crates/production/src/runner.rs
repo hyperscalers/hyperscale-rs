@@ -1232,6 +1232,7 @@ impl ProductionRunner {
             is_fallback: false,
             state_root: genesis_jmt_root,
             state_version: genesis_jmt_version,
+            transaction_root: Hash::ZERO,
         };
 
         let genesis_block = Block {
@@ -2635,6 +2636,58 @@ impl ProductionRunner {
                 });
             }
 
+            Action::VerifyTransactionRoot {
+                block_hash,
+                expected_root,
+                retry_transactions,
+                priority_transactions,
+                transactions,
+            } => {
+                let event_tx = self.callback_tx.clone();
+
+                // Transaction root verification is a pure CPU computation (merkle tree).
+                // Use consensus crypto pool since it's on the critical voting path.
+                self.thread_pools.spawn_consensus_crypto(move || {
+                    let start = std::time::Instant::now();
+
+                    // Compute transaction merkle root from all sections
+                    let computed_root = hyperscale_types::compute_transaction_root(
+                        &retry_transactions,
+                        &priority_transactions,
+                        &transactions,
+                    );
+
+                    let valid = computed_root == expected_root;
+
+                    let elapsed = start.elapsed().as_secs_f64();
+                    if !valid {
+                        tracing::warn!(
+                            block_hash = ?block_hash,
+                            expected_root = ?expected_root,
+                            computed_root = ?computed_root,
+                            retry_count = retry_transactions.len(),
+                            priority_count = priority_transactions.len(),
+                            tx_count = transactions.len(),
+                            elapsed_ms = elapsed * 1000.0,
+                            "Transaction root verification FAILED"
+                        );
+                    } else {
+                        tracing::debug!(
+                            block_hash = ?block_hash,
+                            elapsed_ms = elapsed * 1000.0,
+                            total_txs = retry_transactions.len() + priority_transactions.len() + transactions.len(),
+                            "Transaction root verified"
+                        );
+                    }
+
+                    event_tx
+                        .send(Event::TransactionRootVerified { block_hash, valid })
+                        .expect(
+                            "callback channel closed - Loss of this event would cause a deadlock",
+                        );
+                });
+            }
+
             Action::BuildProposal {
                 proposer,
                 height,
@@ -2703,6 +2756,13 @@ impl ProductionRunner {
                         (parent_state_root, parent_state_version, vec![], None)
                     };
 
+                    // Compute transaction root from all transaction sections
+                    let transaction_root = hyperscale_types::compute_transaction_root(
+                        &retry_transactions,
+                        &priority_transactions,
+                        &transactions,
+                    );
+
                     // Build the block
                     let header = BlockHeader {
                         height,
@@ -2714,6 +2774,7 @@ impl ProductionRunner {
                         is_fallback,
                         state_root,
                         state_version,
+                        transaction_root,
                     };
 
                     let block = Block {

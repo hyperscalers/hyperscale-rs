@@ -30,6 +30,16 @@ pub struct RoutableTransaction {
     /// Cached hash (computed on first access).
     hash: Hash,
 
+    /// Cached serialized transaction bytes.
+    ///
+    /// These are the SBOR-encoded bytes of the `UserTransaction`, captured during
+    /// construction or deserialization. This avoids redundant re-serialization when:
+    /// - Computing transaction merkle roots for block headers
+    /// - Re-encoding for network transmission
+    ///
+    /// The hash is computed from these bytes (plus retry_details if present).
+    serialized_bytes: Vec<u8>,
+
     /// Cached validated transaction (computed on first validation).
     /// This avoids re-validating signatures during execution.
     /// Not serialized - reconstructed on demand.
@@ -55,6 +65,7 @@ impl Clone for RoutableTransaction {
             declared_writes: self.declared_writes.clone(),
             retry_details: self.retry_details.clone(),
             hash: self.hash,
+            serialized_bytes: self.serialized_bytes.clone(),
             validated: OnceLock::new(), // Don't clone cache - will be recomputed if needed
         }
     }
@@ -89,10 +100,14 @@ impl RoutableTransaction {
         declared_writes: Vec<NodeId>,
         retry_details: Option<RetryDetails>,
     ) -> Self {
+        // Serialize the transaction payload - we keep these bytes for:
+        // 1. Computing the hash (below)
+        // 2. Efficient re-encoding for network/merkle (via serialized_bytes())
+        let payload = manifest_encode(&transaction).expect("transaction should be encodable");
+
         // Hash includes transaction payload AND retry_details (if present)
         // This ensures retries have different hashes than originals
         let mut hasher = blake3::Hasher::new();
-        let payload = manifest_encode(&transaction).expect("transaction should be encodable");
         hasher.update(&payload);
 
         // Include retry_details in hash if present
@@ -108,6 +123,7 @@ impl RoutableTransaction {
             declared_writes,
             retry_details,
             hash,
+            serialized_bytes: payload,
             validated: OnceLock::new(),
         }
     }
@@ -153,9 +169,22 @@ impl RoutableTransaction {
         self.validated.get().is_some()
     }
 
+    /// Get the cached serialized transaction bytes.
+    ///
+    /// These are the SBOR-encoded bytes of the underlying `UserTransaction`,
+    /// captured during construction or deserialization. Use this for:
+    /// - Computing transaction merkle roots (avoids re-serialization)
+    /// - Network encoding (bytes are ready to use)
+    pub fn serialized_bytes(&self) -> &[u8] {
+        &self.serialized_bytes
+    }
+
     /// Get the transaction as SBOR-encoded bytes.
+    ///
+    /// This returns a clone of the cached serialized bytes. For read-only access,
+    /// prefer `serialized_bytes()` which returns a reference.
     pub fn transaction_bytes(&self) -> Vec<u8> {
-        manifest_encode(&self.transaction).expect("transaction should be encodable")
+        self.serialized_bytes.clone()
     }
 
     /// Check if this transaction is cross-shard for the given number of shards.
@@ -244,10 +273,8 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         let hash_bytes: [u8; 32] = *self.hash.as_bytes();
         encoder.encode(&hash_bytes)?;
 
-        // Encode transaction as bytes (using ManifestSbor)
-        let tx_bytes = manifest_encode(&self.transaction)
-            .map_err(|_| sbor::EncodeError::MaxDepthExceeded(0))?;
-        encoder.encode(&tx_bytes)?;
+        // Encode transaction as bytes (using cached serialized_bytes)
+        encoder.encode(&self.serialized_bytes)?;
 
         // Encode declared_reads
         encoder.encode(&self.declared_reads)?;
@@ -303,6 +330,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             declared_reads,
             declared_writes,
             retry_details,
+            serialized_bytes: tx_bytes,
             validated: OnceLock::new(),
         })
     }

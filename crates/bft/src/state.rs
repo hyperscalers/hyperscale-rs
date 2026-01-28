@@ -294,6 +294,12 @@ pub struct BftState {
     /// Blocks with verified state roots (prevents re-verification).
     verified_state_roots: HashSet<Hash>,
 
+    /// Blocks with verified transaction roots (prevents re-verification).
+    verified_transaction_roots: HashSet<Hash>,
+
+    /// Blocks where transaction root verification is currently in-flight.
+    transaction_root_verifications_in_flight: HashSet<Hash>,
+
     /// Blocks with verified CycleProofs (prevents re-verification).
     verified_cycle_proofs: HashSet<Hash>,
 
@@ -438,6 +444,8 @@ impl BftState {
             // This will be updated when blocks commit via 2-chain rule.
             last_chain_committed_state_version: recovered.jmt_state.map(|(v, _)| v).unwrap_or(0),
             verified_state_roots: HashSet::new(),
+            verified_transaction_roots: HashSet::new(),
+            transaction_root_verifications_in_flight: HashSet::new(),
             verified_cycle_proofs: HashSet::new(),
             verified_qcs: HashMap::new(),
             buffered_synced_blocks: std::collections::BTreeMap::new(),
@@ -1203,6 +1211,7 @@ impl BftState {
             is_fallback: true,
             state_root,
             state_version,
+            transaction_root: Hash::ZERO, // Fallback blocks have no transactions
         };
 
         let block = Block {
@@ -1317,6 +1326,7 @@ impl BftState {
             is_fallback: false, // Not a fallback - just empty due to sync
             state_root,
             state_version,
+            transaction_root: Hash::ZERO, // Sync blocks have no transactions
         };
 
         let block = Block {
@@ -2022,7 +2032,7 @@ impl BftState {
                 }
 
                 // Initiate all async verifications in parallel.
-                // Both CycleProof and StateRoot verification can run concurrently.
+                // CycleProof, StateRoot, and TransactionRoot verifications run concurrently.
                 let mut verification_actions = Vec::new();
 
                 // If block has deferrals with CycleProofs, initiate async verification.
@@ -2035,6 +2045,12 @@ impl BftState {
                 if self.block_needs_state_root_verification(&block) {
                     verification_actions
                         .extend(self.initiate_state_root_verification(block_hash, &block));
+                }
+
+                // Verify transaction root if block has transactions.
+                if self.block_needs_transaction_root_verification(&block) {
+                    verification_actions
+                        .extend(self.initiate_transaction_root_verification(block_hash, &block));
                 }
 
                 // If any verifications were initiated, wait for them to complete.
@@ -2179,6 +2195,7 @@ impl BftState {
     /// Returns true if:
     /// - CycleProof verification is done (or not needed)
     /// - State root verification is done (or not needed)
+    /// - Transaction root verification is done (or not needed)
     ///
     /// Used by verification callbacks to determine if it's safe to vote.
     fn block_verifications_complete(&self, block: &Block) -> bool {
@@ -2202,7 +2219,16 @@ impl BftState {
             self.verified_state_roots.contains(&block_hash)
         };
 
-        cycle_proof_ok && state_root_ok
+        // Check transaction root verification status
+        let transaction_root_ok = if block.transaction_count() == 0 {
+            // No transactions - no verification needed
+            true
+        } else {
+            // Has transactions - must be in verified set
+            self.verified_transaction_roots.contains(&block_hash)
+        };
+
+        cycle_proof_ok && state_root_ok && transaction_root_ok
     }
 
     /// Check if a block needs state root verification before voting.
@@ -3098,6 +3124,117 @@ impl BftState {
             debug!(
                 block_hash = ?block_hash,
                 "State root done, waiting for other verifications"
+            );
+            return vec![];
+        }
+
+        let height = pending_block.header().height.0;
+        let round = pending_block.header().round;
+
+        // All verifications complete - vote
+        self.create_vote(block_hash, height, round)
+    }
+
+    /// Check if a block needs transaction root verification before voting.
+    ///
+    /// Returns true if the block has transactions and we haven't already verified
+    /// or initiated verification.
+    fn block_needs_transaction_root_verification(&self, block: &Block) -> bool {
+        if block.transaction_count() == 0 {
+            return false;
+        }
+
+        let block_hash = block.hash();
+
+        // Skip if already verified or in-flight
+        if self.verified_transaction_roots.contains(&block_hash)
+            || self
+                .transaction_root_verifications_in_flight
+                .contains(&block_hash)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    /// Initiate transaction root verification for a block.
+    ///
+    /// Unlike state root verification, this doesn't depend on JMT state and can
+    /// be verified immediately. This runs in parallel with state root and cycle
+    /// proof verifications.
+    fn initiate_transaction_root_verification(
+        &mut self,
+        block_hash: Hash,
+        block: &Block,
+    ) -> Vec<Action> {
+        debug!(
+            block_hash = ?block_hash,
+            retry_count = block.retry_transactions.len(),
+            priority_count = block.priority_transactions.len(),
+            tx_count = block.transactions.len(),
+            expected_root = ?block.header.transaction_root,
+            "Initiating transaction root verification"
+        );
+
+        self.transaction_root_verifications_in_flight
+            .insert(block_hash);
+
+        vec![Action::VerifyTransactionRoot {
+            block_hash,
+            expected_root: block.header.transaction_root,
+            retry_transactions: block.retry_transactions.clone(),
+            priority_transactions: block.priority_transactions.clone(),
+            transactions: block.transactions.clone(),
+        }]
+    }
+
+    /// Handle transaction root verification result.
+    ///
+    /// Called when the runner completes `Action::VerifyTransactionRoot`. If the
+    /// transaction root is invalid, the block is rejected. If valid, proceeds to
+    /// vote for the block (assuming other verifications are also complete).
+    #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
+    pub fn on_transaction_root_verified(&mut self, block_hash: Hash, valid: bool) -> Vec<Action> {
+        // Remove from in-flight regardless of outcome
+        self.transaction_root_verifications_in_flight
+            .remove(&block_hash);
+
+        if !valid {
+            warn!(
+                block_hash = ?block_hash,
+                "Transaction root verification FAILED - proposer included incorrect transaction_root!"
+            );
+            // Remove the pending block since the proposer lied about transactions
+            self.pending_blocks.remove(&block_hash);
+            return vec![];
+        }
+
+        self.verified_transaction_roots.insert(block_hash);
+
+        debug!(
+            block_hash = ?block_hash,
+            "Transaction root verified successfully"
+        );
+
+        let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
+            warn!(
+                block_hash = ?block_hash,
+                "Transaction root verification complete but pending block not found"
+            );
+            return vec![];
+        };
+
+        let block = match pending_block.block() {
+            Some(b) => b,
+            None => return vec![],
+        };
+
+        // Check if all verifications are complete (state root, cycle proofs may still be pending)
+        if !self.block_verifications_complete(&block) {
+            debug!(
+                block_hash = ?block_hash,
+                "Transaction root done, waiting for other verifications"
             );
             return vec![];
         }
@@ -4806,6 +4943,14 @@ impl BftState {
         self.verified_state_roots
             .retain(|hash| self.pending_blocks.contains_key(hash));
 
+        // Remove in-flight transaction root verifications for blocks no longer in pending_blocks.
+        self.transaction_root_verifications_in_flight
+            .retain(|hash| self.pending_blocks.contains_key(hash));
+
+        // Remove verified transaction roots for blocks no longer in pending_blocks.
+        self.verified_transaction_roots
+            .retain(|hash| self.pending_blocks.contains_key(hash));
+
         // Remove verified QC cache entries for heights at or below committed height.
         // We keep entries slightly above committed_height in case of view changes
         // where multiple proposals at the same height share the same parent_qc.
@@ -5212,6 +5357,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         }
     }
 
@@ -5231,6 +5377,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
 
         // Should pass - genesis blocks skip timestamp validation
@@ -5324,6 +5471,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
 
         // Should pass - fallback blocks skip timestamp validation
@@ -5343,6 +5491,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
         assert!(
             state.validate_timestamp(&normal_header).is_err(),
@@ -5417,6 +5566,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
 
         // Process the block header
@@ -5502,6 +5652,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
 
         let block_hash = header.hash();
@@ -5591,6 +5742,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
 
         let block_hash = header.hash();
@@ -5668,6 +5820,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
 
         // Process header
@@ -6198,6 +6351,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
         let block_a_hash = block_a.hash();
 
@@ -6211,6 +6365,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
         let block_b_hash = block_b.hash();
 
@@ -6253,6 +6408,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
         let block_hash = block.hash();
 
@@ -6289,6 +6445,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 state_version: 0,
+                transaction_root: Hash::ZERO,
             };
             state.try_vote_on_block(block.hash(), height, 0);
         }
@@ -6577,6 +6734,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
         let original_block_hash = original_header.hash();
 
@@ -6668,6 +6826,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
 
         // Even though the receiving validator might be at view=31,
@@ -6701,6 +6860,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
 
         let result = state.validate_header(&header);
@@ -7035,6 +7195,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
         let original_block_hash = original_header.hash();
 
@@ -7306,6 +7467,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
         let block_hash_r1 = header_round1.hash();
 
@@ -7319,6 +7481,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
         let block_hash_r2 = header_round2.hash();
 
@@ -7332,6 +7495,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
         let block_hash_r3 = header_round3.hash();
 
@@ -7346,6 +7510,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
         let block_hash_h6 = header_height6.hash();
 
@@ -7617,6 +7782,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
 
         // Process first block header
@@ -7654,6 +7820,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
 
         // Process second block header
@@ -8366,6 +8533,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 state_version: 0,
+                transaction_root: Hash::ZERO,
             },
             retry_transactions: vec![],
             priority_transactions: vec![],
@@ -8933,6 +9101,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 state_version: 0,
+                transaction_root: Hash::ZERO,
             },
             retry_transactions: vec![],
             priority_transactions: vec![],

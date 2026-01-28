@@ -431,6 +431,7 @@ impl SimulationRunner {
                 is_fallback: false,
                 state_root: genesis_jmt_root,
                 state_version: genesis_jmt_version,
+                transaction_root: Hash::ZERO,
             };
 
             let genesis_block = Block {
@@ -546,6 +547,7 @@ impl SimulationRunner {
                 is_fallback: false,
                 state_root: genesis_jmt_root,
                 state_version: genesis_jmt_version,
+                transaction_root: Hash::ZERO,
             };
 
             let genesis_block = Block {
@@ -1341,6 +1343,42 @@ impl SimulationRunner {
                 );
             }
 
+            Action::VerifyTransactionRoot {
+                block_hash,
+                expected_root,
+                retry_transactions,
+                priority_transactions,
+                transactions,
+            } => {
+                // Compute transaction merkle root from all sections
+                let computed_root = hyperscale_types::compute_transaction_root(
+                    &retry_transactions,
+                    &priority_transactions,
+                    &transactions,
+                );
+
+                let valid = computed_root == expected_root;
+
+                if !valid {
+                    tracing::warn!(
+                        node = from,
+                        ?block_hash,
+                        ?computed_root,
+                        ?expected_root,
+                        retry_count = retry_transactions.len(),
+                        priority_count = priority_transactions.len(),
+                        tx_count = transactions.len(),
+                        "Transaction root verification failed"
+                    );
+                }
+
+                self.schedule_event(
+                    from,
+                    self.now,
+                    Event::TransactionRootVerified { block_hash, valid },
+                );
+            }
+
             Action::BuildProposal {
                 proposer,
                 height,
@@ -1402,6 +1440,13 @@ impl SimulationRunner {
                     (parent_state_root, parent_state_version, vec![], None)
                 };
 
+                // Compute transaction root from all transaction sections
+                let transaction_root = hyperscale_types::compute_transaction_root(
+                    &retry_transactions,
+                    &priority_transactions,
+                    &transactions,
+                );
+
                 // Build the block
                 let header = BlockHeader {
                     height,
@@ -1413,6 +1458,7 @@ impl SimulationRunner {
                     is_fallback,
                     state_root,
                     state_version,
+                    transaction_root,
                 };
 
                 let block = Block {

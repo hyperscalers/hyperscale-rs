@@ -282,6 +282,26 @@ pub enum Action {
         certificates: Vec<Arc<TransactionCertificate>>,
     },
 
+    /// Verify a block's transaction root.
+    ///
+    /// Computes the merkle root from the block's transactions (retry, priority, normal)
+    /// and compares against the block header's claimed transaction_root.
+    /// Returns `Event::TransactionRootVerified`.
+    ///
+    /// This is a pure CPU operation (no JMT dependency) so it can be verified
+    /// in parallel with state root verification.
+    VerifyTransactionRoot {
+        block_hash: Hash,
+        /// Expected transaction root from block header.
+        expected_root: Hash,
+        /// Retry transactions (highest priority section).
+        retry_transactions: Vec<Arc<RoutableTransaction>>,
+        /// Priority transactions (cross-shard with commitment proofs).
+        priority_transactions: Vec<Arc<RoutableTransaction>>,
+        /// Normal transactions.
+        transactions: Vec<Arc<RoutableTransaction>>,
+    },
+
     /// Build a complete block proposal.
     ///
     /// The runner waits for the JMT to reach `parent_state_root`, computes the
@@ -656,6 +676,7 @@ impl Action {
                 | Action::VerifyQcSignature { .. }
                 | Action::VerifyCycleProof { .. }
                 | Action::VerifyStateRoot { .. }
+                | Action::VerifyTransactionRoot { .. }
                 | Action::BuildProposal { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
@@ -720,6 +741,7 @@ impl Action {
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
             Action::VerifyCycleProof { .. } => "VerifyCycleProof",
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
+            Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
             Action::BuildProposal { .. } => "BuildProposal",
 
             // Delegated Work - Execution

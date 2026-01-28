@@ -283,6 +283,23 @@ pub enum Event {
         valid: bool,
     },
 
+    /// Transaction root verification completed.
+    ///
+    /// Callback from `Action::VerifyTransactionRoot`. Reports whether the block's
+    /// claimed transaction_root matches the computed merkle root from the block's
+    /// transactions (retry, priority, normal sections).
+    ///
+    /// If valid=false, the validator MUST NOT vote for this block - the proposer
+    /// included an incorrect transaction root.
+    TransactionRootVerified {
+        /// Block hash this verification was for.
+        block_hash: Hash,
+        /// Whether the transaction root matches.
+        /// true = proposer's transaction_root is correct, safe to vote
+        /// false = proposer's transaction_root is WRONG, reject block
+        valid: bool,
+    },
+
     /// Proposal block built by the runner.
     ///
     /// Callback from `Action::BuildProposal`. Contains the complete block
@@ -711,6 +728,7 @@ impl Event {
             | Event::QcSignatureVerified { .. }
             | Event::CycleProofVerified { .. }
             | Event::StateRootVerified { .. }
+            | Event::TransactionRootVerified { .. }
             | Event::ProposalBuilt { .. }
             | Event::TransactionsExecuted { .. }
             | Event::SpeculativeExecutionComplete { .. }
@@ -832,6 +850,7 @@ impl Event {
             Event::QcSignatureVerified { .. } => "QcSignatureVerified",
             Event::CycleProofVerified { .. } => "CycleProofVerified",
             Event::StateRootVerified { .. } => "StateRootVerified",
+            Event::TransactionRootVerified { .. } => "TransactionRootVerified",
             Event::ProposalBuilt { .. } => "ProposalBuilt",
 
             // Async Callbacks - Execution

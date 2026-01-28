@@ -1953,6 +1953,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 state_version: 0,
+                transaction_root: Hash::ZERO,
             },
             retry_transactions: vec![],
             priority_transactions: vec![],

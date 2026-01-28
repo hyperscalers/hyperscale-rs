@@ -1,12 +1,59 @@
 //! Block and BlockHeader types for consensus.
 
 use crate::{
-    BlockHeight, CommitmentProof, Hash, QuorumCertificate, RoutableTransaction, TransactionAbort,
-    TransactionCertificate, TransactionDefer, ValidatorId,
+    compute_merkle_root, BlockHeight, CommitmentProof, Hash, QuorumCertificate,
+    RoutableTransaction, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId,
 };
 use sbor::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Tag prefixes for transaction slot provability in merkle tree.
+/// Each transaction's leaf hash is `hash(TAG || tx_hash)`, allowing
+/// merkle proofs to prove both inclusion AND which slot the tx belongs to.
+const RETRY_TAG: &[u8] = b"RETRY";
+const PRIORITY_TAG: &[u8] = b"PRIORITY";
+const NORMAL_TAG: &[u8] = b"NORMAL";
+
+/// Compute the transaction merkle root for a block.
+///
+/// Transactions are organized into three sections with tagged leaf hashes:
+/// - Retry transactions: `hash(RETRY || tx_hash)`
+/// - Priority transactions: `hash(PRIORITY || tx_hash)`
+/// - Normal transactions: `hash(NORMAL || tx_hash)`
+///
+/// The root is computed over the concatenation of all tagged hashes in order.
+/// Returns `Hash::ZERO` if all sections are empty.
+pub fn compute_transaction_root(
+    retry_transactions: &[Arc<RoutableTransaction>],
+    priority_transactions: &[Arc<RoutableTransaction>],
+    transactions: &[Arc<RoutableTransaction>],
+) -> Hash {
+    let total_count = retry_transactions.len() + priority_transactions.len() + transactions.len();
+
+    if total_count == 0 {
+        return Hash::ZERO;
+    }
+
+    let mut leaves = Vec::with_capacity(total_count);
+
+    // Add retry transaction leaves
+    for tx in retry_transactions {
+        leaves.push(Hash::from_parts(&[RETRY_TAG, tx.hash().as_bytes()]));
+    }
+
+    // Add priority transaction leaves
+    for tx in priority_transactions {
+        leaves.push(Hash::from_parts(&[PRIORITY_TAG, tx.hash().as_bytes()]));
+    }
+
+    // Add normal transaction leaves
+    for tx in transactions {
+        leaves.push(Hash::from_parts(&[NORMAL_TAG, tx.hash().as_bytes()]));
+    }
+
+    compute_merkle_root(&leaves)
+}
 
 /// Block header containing consensus metadata.
 ///
@@ -15,6 +62,7 @@ use std::sync::Arc;
 /// - Proposer identity
 /// - Proof of parent commitment (parent QC)
 /// - State commitment (JMT root after applying committed certificates)
+/// - Transaction commitment (merkle root of all transactions in the block)
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockHeader {
     /// Block height in the chain (genesis = 0).
@@ -43,6 +91,19 @@ pub struct BlockHeader {
 
     /// JMT version corresponding to state_root. Increments by 1 per certificate with state writes.
     pub state_version: u64,
+
+    /// Merkle root of all transactions in this block.
+    ///
+    /// Computed over tagged transaction hashes from all three sections in order:
+    /// `[RETRY || hash, ...] ++ [PRIORITY || hash, ...] ++ [NORMAL || hash, ...]`
+    ///
+    /// This enables:
+    /// - Proving a transaction is in the block (merkle inclusion proof)
+    /// - Proving which slot a transaction belongs to (via tag prefix)
+    /// - Proving transaction ordering (via merkle path position)
+    ///
+    /// For empty blocks (fallback, sync), this is `Hash::ZERO`.
+    pub transaction_root: Hash,
 }
 
 impl BlockHeader {
@@ -369,6 +430,7 @@ impl Block {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 state_version: 0,
+                transaction_root: Hash::ZERO,
             },
             retry_transactions: vec![],
             priority_transactions: vec![],
@@ -563,6 +625,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             state_version: 0,
+            transaction_root: Hash::ZERO,
         };
 
         let hash1 = header.hash();
@@ -578,5 +641,52 @@ mod tests {
         assert!(genesis.is_genesis());
         assert_eq!(genesis.height(), BlockHeight(0));
         assert_eq!(genesis.transaction_count(), 0);
+        assert_eq!(genesis.header.transaction_root, Hash::ZERO);
+    }
+
+    #[test]
+    fn test_compute_transaction_root_empty() {
+        let root = compute_transaction_root(&[], &[], &[]);
+        assert_eq!(root, Hash::ZERO);
+    }
+
+    #[test]
+    fn test_compute_transaction_root_deterministic() {
+        use radix_common::network::NetworkDefinition;
+        use radix_transactions::builder::ManifestBuilder;
+
+        // Create a simple transaction for testing
+        let manifest = ManifestBuilder::new().drop_all_proofs().build();
+        let network = NetworkDefinition::simulator();
+        let key = crate::generate_ed25519_keypair();
+        let notarized = crate::sign_and_notarize(manifest, &network, 1, &key).unwrap();
+        let tx = Arc::new(RoutableTransaction::try_from(notarized).unwrap());
+
+        let root1 = compute_transaction_root(&[], &[], &[tx.clone()]);
+        let root2 = compute_transaction_root(&[], &[], &[tx.clone()]);
+        assert_eq!(root1, root2);
+        assert_ne!(root1, Hash::ZERO);
+    }
+
+    #[test]
+    fn test_compute_transaction_root_slot_affects_hash() {
+        use radix_common::network::NetworkDefinition;
+        use radix_transactions::builder::ManifestBuilder;
+
+        // Create a transaction
+        let manifest = ManifestBuilder::new().drop_all_proofs().build();
+        let network = NetworkDefinition::simulator();
+        let key = crate::generate_ed25519_keypair();
+        let notarized = crate::sign_and_notarize(manifest, &network, 1, &key).unwrap();
+        let tx = Arc::new(RoutableTransaction::try_from(notarized).unwrap());
+
+        // Same tx in different slots should produce different roots
+        let root_retry = compute_transaction_root(&[tx.clone()], &[], &[]);
+        let root_priority = compute_transaction_root(&[], &[tx.clone()], &[]);
+        let root_normal = compute_transaction_root(&[], &[], &[tx.clone()]);
+
+        assert_ne!(root_retry, root_priority);
+        assert_ne!(root_priority, root_normal);
+        assert_ne!(root_retry, root_normal);
     }
 }

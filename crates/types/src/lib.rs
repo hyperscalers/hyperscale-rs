@@ -57,7 +57,7 @@ pub use epoch::{
     EpochConfig, EpochId, GlobalConsensusConfig, GlobalValidatorInfo, ShardCommitteeConfig,
     ShardHashRange, ValidatorRating, ValidatorShardState, DEFAULT_EPOCH_LENGTH,
 };
-pub use hash::Hash;
+pub use hash::{compute_merkle_root, Hash};
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
 pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
 pub use proofs::{commitment_proof_message, CommitmentProof, CycleProof};
@@ -66,7 +66,7 @@ pub use signing::{
     DOMAIN_EXEC_VOTE, DOMAIN_STATE_PROVISION,
 };
 
-pub use block::{Block, BlockHeader, BlockMetadata};
+pub use block::{compute_transaction_root, Block, BlockHeader, BlockMetadata};
 pub use quorum_certificate::QuorumCertificate;
 pub use signer_bitfield::SignerBitfield;
 pub use state::{

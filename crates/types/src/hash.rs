@@ -112,6 +112,50 @@ impl Hash {
     }
 }
 
+/// Compute a binary merkle root from a list of hashes.
+///
+/// Uses Blake3 to combine sibling pairs at each level. For odd-length levels,
+/// the last hash is promoted unchanged to the next level.
+///
+/// Returns `Hash::ZERO` for an empty list.
+///
+/// # Algorithm
+///
+/// ```text
+/// Level 0 (leaves): [H0, H1, H2, H3, H4]
+/// Level 1:          [hash(H0||H1), hash(H2||H3), H4]
+/// Level 2:          [hash(L1_0||L1_1), H4]
+/// Level 3 (root):   [hash(L2_0||L2_1)]
+/// ```
+pub fn compute_merkle_root(hashes: &[Hash]) -> Hash {
+    if hashes.is_empty() {
+        return Hash::ZERO;
+    }
+    if hashes.len() == 1 {
+        return hashes[0];
+    }
+
+    let mut level: Vec<Hash> = hashes.to_vec();
+
+    while level.len() > 1 {
+        let mut next_level = Vec::with_capacity(level.len().div_ceil(2));
+
+        for chunk in level.chunks(2) {
+            let hash = if chunk.len() == 2 {
+                Hash::from_parts(&[chunk[0].as_bytes(), chunk[1].as_bytes()])
+            } else {
+                // Odd node promotes up unchanged
+                chunk[0]
+            };
+            next_level.push(hash);
+        }
+
+        level = next_level;
+    }
+
+    level[0]
+}
+
 impl fmt::Debug for Hash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let hex = self.to_hex();
@@ -176,5 +220,55 @@ mod tests {
         assert!(Hash::ZERO.is_zero());
         assert!(!Hash::MAX.is_zero());
         assert!(!Hash::from_bytes(b"test").is_zero());
+    }
+
+    #[test]
+    fn test_merkle_root_empty() {
+        assert_eq!(compute_merkle_root(&[]), Hash::ZERO);
+    }
+
+    #[test]
+    fn test_merkle_root_single() {
+        let h = Hash::from_bytes(b"single");
+        assert_eq!(compute_merkle_root(&[h]), h);
+    }
+
+    #[test]
+    fn test_merkle_root_two() {
+        let h0 = Hash::from_bytes(b"left");
+        let h1 = Hash::from_bytes(b"right");
+        let expected = Hash::from_parts(&[h0.as_bytes(), h1.as_bytes()]);
+        assert_eq!(compute_merkle_root(&[h0, h1]), expected);
+    }
+
+    #[test]
+    fn test_merkle_root_deterministic() {
+        let hashes: Vec<Hash> = (0..5).map(|i| Hash::from_bytes(&[i])).collect();
+        let root1 = compute_merkle_root(&hashes);
+        let root2 = compute_merkle_root(&hashes);
+        assert_eq!(root1, root2);
+    }
+
+    #[test]
+    fn test_merkle_root_order_matters() {
+        let h0 = Hash::from_bytes(b"a");
+        let h1 = Hash::from_bytes(b"b");
+        let root_ab = compute_merkle_root(&[h0, h1]);
+        let root_ba = compute_merkle_root(&[h1, h0]);
+        assert_ne!(root_ab, root_ba);
+    }
+
+    #[test]
+    fn test_merkle_root_odd_count() {
+        // With 3 hashes: hash(hash(h0||h1) || h2)
+        let h0 = Hash::from_bytes(b"0");
+        let h1 = Hash::from_bytes(b"1");
+        let h2 = Hash::from_bytes(b"2");
+
+        let level1_left = Hash::from_parts(&[h0.as_bytes(), h1.as_bytes()]);
+        // h2 promotes up unchanged
+        let expected = Hash::from_parts(&[level1_left.as_bytes(), h2.as_bytes()]);
+
+        assert_eq!(compute_merkle_root(&[h0, h1, h2]), expected);
     }
 }

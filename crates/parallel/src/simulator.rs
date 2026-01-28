@@ -859,6 +859,26 @@ impl SimNode {
                     .push_back(Event::StateRootVerified { block_hash, valid });
             }
 
+            Action::VerifyTransactionRoot {
+                block_hash,
+                expected_root,
+                retry_transactions,
+                priority_transactions,
+                transactions,
+            } => {
+                // Compute transaction merkle root from all sections
+                let computed_root = hyperscale_types::compute_transaction_root(
+                    &retry_transactions,
+                    &priority_transactions,
+                    &transactions,
+                );
+
+                let valid = computed_root == expected_root;
+
+                self.internal_queue
+                    .push_back(Event::TransactionRootVerified { block_hash, valid });
+            }
+
             Action::BuildProposal {
                 proposer,
                 height,
@@ -910,6 +930,13 @@ impl SimNode {
                     (parent_state_root, parent_state_version, vec![])
                 };
 
+                // Compute transaction root from all transaction sections
+                let transaction_root = hyperscale_types::compute_transaction_root(
+                    &retry_transactions,
+                    &priority_transactions,
+                    &transactions,
+                );
+
                 // Build the block
                 let header = BlockHeader {
                     height,
@@ -921,6 +948,7 @@ impl SimNode {
                     is_fallback,
                     state_root,
                     state_version,
+                    transaction_root,
                 };
 
                 let block = Block {
@@ -1428,6 +1456,7 @@ impl ParallelSimulator {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 state_version: 0,
+                transaction_root: Hash::ZERO,
             };
             let genesis_block = Block {
                 header: genesis_header,
@@ -1578,6 +1607,7 @@ impl ParallelSimulator {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 state_version: 0,
+                transaction_root: Hash::ZERO,
             };
             let genesis_block = Block {
                 header: genesis_header,

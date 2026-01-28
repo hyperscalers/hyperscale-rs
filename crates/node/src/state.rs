@@ -506,6 +506,9 @@ impl StateMachine for NodeStateMachine {
             Event::StateRootVerified { block_hash, valid } => {
                 return self.bft.on_state_root_verified(*block_hash, *valid);
             }
+            Event::TransactionRootVerified { block_hash, valid } => {
+                return self.bft.on_transaction_root_verified(*block_hash, *valid);
+            }
 
             Event::ProposalBuilt {
                 height,
