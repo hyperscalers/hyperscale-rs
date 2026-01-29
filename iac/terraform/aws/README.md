@@ -44,7 +44,7 @@ create_us_west_nodes   = false
 
 {network_name}-{region}-{node_type}{node_number}.sandbox.extratools.works
 
-cassandra-test-eu-west-1-bootstrap0.sandbox.extratools.works
-cassandra-test-ap-south-1-spam20.sandbox.extratools.works
-cassandra-test-us-wast-1-validator39.sandbox.extratools.works ...
+hyperscalers-test-eu-west-1-bootstrap0.sandbox.extratools.works
+hyperscalers-test-ap-south-1-spam20.sandbox.extratools.works
+hyperscalers-test-us-wast-1-validator39.sandbox.extratools.works ...
 ```

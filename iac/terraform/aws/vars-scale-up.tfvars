@@ -1,4 +1,4 @@
-ap_south_1_bootstrap_nodes = "1"
+ap_south_1_bootstrap_nodes = "0"
 ap_south_1_spam_nodes      = "0"
 ap_south_1_validator_nodes = "0"
 

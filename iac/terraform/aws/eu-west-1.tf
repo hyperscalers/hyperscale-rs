@@ -2,7 +2,7 @@ data "aws_ami" "eu_west_1" {
   provider    = aws.eu-west-1
   most_recent = true
   name_regex  = local.ami_filter_prefix
-  owners      = ["482406383367"]
+  owners      = ["471354728008"]
 }
 
 locals {
@@ -170,12 +170,12 @@ locals {
 }
 
 data "aws_key_pair" "eu_west_1_key_pair" {
-  key_name = aws_key_pair.cassandra_eu_west_1_key_pair.key_name
+  key_name = aws_key_pair.hyperscalers_eu_west_1_key_pair.key_name
   provider = aws.eu-west-1
 }
 
-resource "aws_key_pair" "cassandra_eu_west_1_key_pair" {
-  key_name   = "cassandra-test-eu-west-1-key"
+resource "aws_key_pair" "hyperscalers_eu_west_1_key_pair" {
+  key_name   = "hyperscalers-test-eu-west-1-key"
   public_key = local.casandra_key.public_key
   provider   = aws.eu-west-1
 

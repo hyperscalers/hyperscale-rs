@@ -87,26 +87,62 @@ resource "aws_route_table_association" "additional_public_subnet_association" {
   route_table_id = aws_route_table.public_route.id
 }
 
-
-
-module "var_tags_validator" {
-  source          = "./var-tags"
-  nodes_with_vars = var.public_validator_instances
+# Centralized field mapping for tag transformations
+module "field_mapping" {
+  source = "../tag-field-mapping"
 }
 
-module "var_tags_fullnodes" {
-  source          = "./var-tags"
-  nodes_with_vars = var.public_fullnode_instances
+# Transform snake_case vars to AWS tags
+locals {
+  validator_tags = {
+    for key, val in var.public_validator_instances :
+    key => merge(
+      { Name = key },
+      { for field in module.field_mapping.fields :
+        module.field_mapping.tag_mapping[field] => lookup(val, field, null)
+      }
+    )
+  }
+
+  fullnode_tags = {
+    for key, val in var.public_fullnode_instances :
+    key => merge(
+      { Name = key },
+      { for field in module.field_mapping.fields :
+        module.field_mapping.tag_mapping[field] => lookup(val, field, null)
+      }
+    )
+  }
+
+  bootstrap_tags = {
+    for key, val in var.public_bootstrap_instances :
+    key => merge(
+      { Name = key },
+      { for field in module.field_mapping.fields :
+        module.field_mapping.tag_mapping[field] => lookup(val, field, null)
+      }
+    )
+  }
+
+  spam_tags = {
+    for key, val in var.public_spam_instances :
+    key => merge(
+      { Name = key },
+      { for field in module.field_mapping.fields :
+        module.field_mapping.tag_mapping[field] => lookup(val, field, null)
+      }
+    )
+  }
 }
 
 resource "aws_eip" "public_validator_instances" {
-  for_each   = module.var_tags_validator.out-tags-from-vars
+  for_each   = local.validator_tags
   depends_on = [aws_internet_gateway.igw]
   tags       = merge(merge(var.tags, each.value), { Name = "${var.network_name}_${each.key}" })
 }
 
 resource "aws_eip" "public_fullnode_instances" {
-  for_each   = module.var_tags_fullnodes.out-tags-from-vars
+  for_each   = local.fullnode_tags
   depends_on = [aws_internet_gateway.igw]
   tags       = merge(merge(var.tags, each.value), { Name = "${var.network_name}_${each.key}" })
 }
@@ -202,35 +238,14 @@ EOF
 # CASSANDRA NODES RESOURCES
 ####################################################################
 
-module "var_tags_bootstrap" {
-  source          = "./var-tags"
-  nodes_with_vars = var.public_bootstrap_instances
-}
-
 resource "aws_eip" "public_bootstrap_instances" {
-  for_each   = module.var_tags_bootstrap.out-tags-from-vars
+  for_each   = local.bootstrap_tags
   depends_on = [aws_internet_gateway.igw]
   tags       = merge(merge(var.tags, each.value), { Name = "${var.network_name}_${each.key}" })
-}
-
-module "var_tags_spam" {
-  source          = "./var-tags"
-  nodes_with_vars = var.public_spam_instances
 }
 
 resource "aws_eip" "public_spam_instances" {
-  for_each   = module.var_tags_spam.out-tags-from-vars
+  for_each   = local.spam_tags
   depends_on = [aws_internet_gateway.igw]
   tags       = merge(merge(var.tags, each.value), { Name = "${var.network_name}_${each.key}" })
 }
-
-# module "var_tags_validator" {
-#   source          = "./var-tags"
-#   nodes_with_vars = var.validator_instances
-# }
-
-# resource "aws_eip" "validator_instances" {
-#   for_each   = module.var_tags_validator.out-tags-from-vars
-#   depends_on = [aws_internet_gateway.igw]
-#   tags       = merge(merge(var.tags, each.value), { Name = "${var.network_name}-${each.key}" })
-# }

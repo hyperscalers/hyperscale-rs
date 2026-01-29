@@ -33,6 +33,6 @@ provider "aws" {
   region = "ap-southeast-2"
 }
 
-provider "cloudflare" {
-  api_token = jsondecode(data.aws_secretsmanager_secret_version.current_extratools_dot_works_details.secret_string)["token_id"]
-}
+# provider "cloudflare" {
+#   api_token = jsondecode(data.aws_secretsmanager_secret_version.current_extratools_dot_works_details.secret_string)["token_id"]
+# }

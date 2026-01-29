@@ -1,21 +1,13 @@
-data "cloudflare_ip_ranges" "cloudflare" {}
-
 data "aws_region" "current" {}
 
-output "ipv4" {
-  value = data.cloudflare_ip_ranges.cloudflare.ipv4_cidr_blocks
-}
-
-output "ipv6" {
-  value = data.cloudflare_ip_ranges.cloudflare.ipv6_cidr_blocks
-}
-
 variable "ipv4_cidr_blocks" {
-  default = []
+  description = "IPv4 CIDR blocks allowed for ingress"
+  default     = ["0.0.0.0/0"]
 }
 
 variable "ipv6_cidr_blocks" {
-  default = []
+  description = "IPv6 CIDR blocks allowed for ingress"
+  default     = ["::/0"]
 }
 
 variable "devops_ipv4_cidr" {
@@ -26,12 +18,9 @@ variable "devops_ipv6_cidr" {
   default = []
 }
 
-
 locals {
-  ipv4_cidr        = length(var.ipv4_cidr_blocks) == 0 ? data.cloudflare_ip_ranges.cloudflare.ipv4_cidr_blocks : var.ipv4_cidr_blocks
-  ipv6_cidr        = length(var.ipv6_cidr_blocks) == 0 ? data.cloudflare_ip_ranges.cloudflare.ipv6_cidr_blocks : var.ipv6_cidr_blocks
-  ipv4_cidr_merged = concat(var.devops_ipv4_cidr, local.ipv4_cidr)
-  ipv6_cidr_merged = concat(var.devops_ipv6_cidr, local.ipv6_cidr)
+  ipv4_cidr_merged = concat(var.devops_ipv4_cidr, var.ipv4_cidr_blocks)
+  ipv6_cidr_merged = concat(var.devops_ipv6_cidr, var.ipv6_cidr_blocks)
 }
 resource "aws_security_group" "allow-ssh-http-https" {
   vpc_id      = aws_vpc.vpc.id

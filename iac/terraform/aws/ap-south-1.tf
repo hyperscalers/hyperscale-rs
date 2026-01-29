@@ -2,7 +2,7 @@ data "aws_ami" "ap_south_1" {
   provider    = aws.ap-south-1
   most_recent = true
   name_regex  = local.ami_filter_prefix
-  owners      = ["482406383367"]
+  owners      = ["471354728008"]
 }
 
 locals {
@@ -170,12 +170,12 @@ locals {
 }
 
 data "aws_key_pair" "ap_south_1_key_pair" {
-  key_name = aws_key_pair.cassandra_ap_south_1_key_pair.key_name
+  key_name = aws_key_pair.hyperscalers_ap_south_1_key_pair.key_name
   provider = aws.ap-south-1
 }
 
-resource "aws_key_pair" "cassandra_ap_south_1_key_pair" {
-  key_name   = "cassandra-test-ap-south-1-key"
+resource "aws_key_pair" "hyperscalers_ap_south_1_key_pair" {
+  key_name   = "hyperscalers-test-ap-south-1-key"
   public_key = local.casandra_key.public_key
   provider   = aws.ap-south-1
 

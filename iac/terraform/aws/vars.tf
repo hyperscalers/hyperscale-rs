@@ -7,7 +7,7 @@ variable "SPAM_INSTANCE_TYPE" {
 }
 
 variable "network_name" {
-  default = "cassandra_test"
+  default = "hyperscalers_test"
 }
 variable "running_or_stopped" {
   default = "running"

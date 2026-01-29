@@ -22,24 +22,56 @@ output "sg_core_security_group" {
   value = aws_security_group.core_security_group.id
 }
 
-module "public_validator_instances" {
-  source          = "./tags-vars"
-  nodes_with_tags = aws_eip.public_validator_instances
+# Transform AWS EIP tags back to snake_case vars
+locals {
+  validator_vars = {
+    for key, val in aws_eip.public_validator_instances :
+    key => merge(
+      { public_ip = val.public_ip },
+      { for field in module.field_mapping.fields :
+        field => lookup(val.tags, module.field_mapping.tag_mapping[field], null)
+      }
+    )
+  }
+
+  fullnode_vars = {
+    for key, val in aws_eip.public_fullnode_instances :
+    key => merge(
+      { public_ip = val.public_ip },
+      { for field in module.field_mapping.fields :
+        field => lookup(val.tags, module.field_mapping.tag_mapping[field], null)
+      }
+    )
+  }
+
+  bootstrap_vars = {
+    for key, val in aws_eip.public_bootstrap_instances :
+    key => merge(
+      { public_ip = val.public_ip },
+      { for field in module.field_mapping.fields :
+        field => lookup(val.tags, module.field_mapping.tag_mapping[field], null)
+      }
+    )
+  }
+
+  spam_vars = {
+    for key, val in aws_eip.public_spam_instances :
+    key => merge(
+      { public_ip = val.public_ip },
+      { for field in module.field_mapping.fields :
+        field => lookup(val.tags, module.field_mapping.tag_mapping[field], null)
+      }
+    )
+  }
 }
 
 output "public_validator_instance_ips" {
-  value      = module.public_validator_instances.out-vars-from-tags
+  value      = local.validator_vars
   depends_on = [aws_eip.public_validator_instances]
 }
 
-
-module "public_fullnode_instances" {
-  source          = "./tags-vars"
-  nodes_with_tags = aws_eip.public_fullnode_instances
-}
-
 output "public_fullnode_instance_ips" {
-  value      = module.public_fullnode_instances.out-vars-from-tags
+  value      = local.fullnode_vars
   depends_on = [aws_eip.public_fullnode_instances]
 }
 
@@ -56,22 +88,12 @@ output "public_witnessnode_instance_ips" {
 # CASSANDRA OUTPUTS
 ####################################################################
 
-module "public_bootstrap_instances" {
-  source          = "./tags-vars"
-  nodes_with_tags = aws_eip.public_bootstrap_instances
-}
-
 output "public_bootstrap_instance_ips" {
-  value      = module.public_bootstrap_instances.out-vars-from-tags
+  value      = local.bootstrap_vars
   depends_on = [aws_eip.public_bootstrap_instances]
 }
 
-module "public_spam_instances" {
-  source          = "./tags-vars"
-  nodes_with_tags = aws_eip.public_spam_instances
-}
-
 output "public_spam_instance_ips" {
-  value      = module.public_spam_instances.out-vars-from-tags
+  value      = local.spam_vars
   depends_on = [aws_eip.public_spam_instances]
 }

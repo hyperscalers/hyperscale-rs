@@ -8,10 +8,6 @@ terraform {
       source  = "hashicorp/template"
       version = ">= 2.2.0"
     }
-    cloudflare = {
-      source  = "cloudflare/cloudflare"
-      version = "~> 4"
-    }
   }
   required_version = ">= 1.0.0"
 }

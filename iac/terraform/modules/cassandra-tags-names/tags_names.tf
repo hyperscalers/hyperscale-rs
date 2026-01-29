@@ -1,3 +1,6 @@
+# Creates tag maps for bootstrap, spam, and validator nodes
+# Uses centralized field mapping for consistency
+
 variable "bootstrap_nodes" {
   default = {}
 }
@@ -13,136 +16,63 @@ variable "validator_nodes" {
 variable "region" {
 }
 
+module "field_mapping" {
+  source = "../tag-field-mapping"
+}
+
 locals {
-  BOOTSTRAP_LIST = flatten([for bootstrap, node_types in var.bootstrap_nodes :
-    flatten([for node_type, nodes in node_types :
-      flatten([for node, values in nodes :
-        {
-          tag                    = "${replace(var.region, "-", "_")}_${node_type}${bootstrap}"
-          enable_health          = lookup(values, "enable_health", null)
-          enable_metrics         = lookup(values, "enable_metrics", null)
-          enable_validation      = lookup(values, "enable_validation", null)
-          enable_version         = lookup(values, "enable_version", null)
-          enable_jmx_exporter    = lookup(values, "enable_jmx_exporter", null)
-          extra_archive          = lookup(values, "extra_archive", null)
-          dns_subdomain          = lookup(values, "dns_subdomain", null)
-          explicit_instance_type = lookup(values, "explicit_instance_type", null)
-          explicit_ami           = lookup(values, "explicit_ami", null)
-          genesis_validator      = lookup(values, "genesis_validator", null)
-          access_type            = lookup(values, "access_type", null)
-          collect_metrics        = lookup(values, "collect_metrics", null)
-          collect_logs           = lookup(values, "collect_logs", null)
-        }
-      ])
-      if node_type == "bootstrap"
-    ])
-  ])
-
+  # Helper function to extract node tags from nested config
+  # Flattens the nested structure and creates a map keyed by tag name
   BOOTSTRAP_TAGS = {
-    for key, values in local.BOOTSTRAP_LIST :
-    values["tag"] => {
-      core_private_ip        = lookup(values, "core_private_ip", null)
-      enable_health          = lookup(values, "enable_health", null)
-      enable_metrics         = lookup(values, "enable_metrics", null)
-      collect_metrics        = lookup(values, "collect_metrics", null)
-      collect_logs           = lookup(values, "collect_logs", null)
-      enable_validation      = lookup(values, "enable_validation", null)
-      enable_version         = lookup(values, "enable_version", null)
-      enable_jmx_exporter    = lookup(values, "enable_jmx_exporter", null)
-      extra_archive          = lookup(values, "extra_archive", null)
-      dns_subdomain          = lookup(values, "dns_subdomain", null)
-      explicit_instance_type = lookup(values, "explicit_instance_type", null)
-      explicit_ami           = lookup(values, "explicit_ami", null)
-      genesis_validator      = lookup(values, "genesis_validator", null)
-    }
-  }
-
-  SPAM_LIST = flatten([for spam, node_types in var.spam_nodes :
-    flatten([for node_type, nodes in node_types :
-      flatten([for node, values in nodes :
-        {
-          tag                    = "${replace(var.region, "-", "_")}_${node_type}${spam}"
-          enable_health          = lookup(values, "enable_health", null)
-          enable_metrics         = lookup(values, "enable_metrics", null)
-          enable_validation      = lookup(values, "enable_validation", null)
-          enable_version         = lookup(values, "enable_version", null)
-          enable_jmx_exporter    = lookup(values, "enable_jmx_exporter", null)
-          extra_archive          = lookup(values, "extra_archive", null)
-          dns_subdomain          = lookup(values, "dns_subdomain", null)
-          explicit_instance_type = lookup(values, "explicit_instance_type", null)
-          explicit_ami           = lookup(values, "explicit_ami", null)
-          migration_aux_node     = lookup(values, "migration_aux_node", null)
-          access_type            = lookup(values, "access_type", null)
-          collect_metrics        = lookup(values, "collect_metrics", null)
-          collect_logs           = lookup(values, "collect_logs", null)
-        }
+    for item in flatten([
+      for bootstrap, node_types in var.bootstrap_nodes :
+      flatten([
+        for node_type, nodes in node_types :
+        flatten([
+          for node, values in nodes : {
+            tag    = "${replace(var.region, "-", "_")}_${node_type}${bootstrap}"
+            values = values
+          }
+        ])
+        if node_type == "bootstrap"
       ])
-      if node_type == "spam"
-    ])
-  ])
+    ]) :
+    item.tag => { for field in module.field_mapping.fields : field => lookup(item.values, field, null) }
+  }
 
   SPAM_TAGS = {
-    for key, values in local.SPAM_LIST :
-    values["tag"] => {
-      enable_health          = lookup(values, "enable_health", null)
-      enable_metrics         = lookup(values, "enable_metrics", null)
-      enable_validation      = lookup(values, "enable_validation", null)
-      enable_version         = lookup(values, "enable_version", null)
-      enable_jmx_exporter    = lookup(values, "enable_jmx_exporter", null)
-      extra_archive          = lookup(values, "extra_archive", null)
-      dns_subdomain          = lookup(values, "dns_subdomain", null)
-      explicit_instance_type = lookup(values, "explicit_instance_type", null)
-      explicit_ami           = lookup(values, "explicit_ami", null)
-      migration_aux_node     = lookup(values, "migration_aux_node", null)
-      access_type            = lookup(values, "access_type", null)
-      collect_metrics        = lookup(values, "collect_metrics", null)
-      collect_logs           = lookup(values, "collect_logs", null)
-    }
-  }
-
-  VALIDATOR_LIST = flatten([for validator, node_types in var.validator_nodes :
-    flatten([for node_type, nodes in node_types :
-      flatten([for node, values in nodes :
-        {
-          tag                    = "${replace(var.region, "-", "_")}_${node_type}${validator}"
-          enable_health          = lookup(values, "enable_health", null)
-          enable_metrics         = lookup(values, "enable_metrics", null)
-          enable_validation      = lookup(values, "enable_validation", null)
-          enable_version         = lookup(values, "enable_version", null)
-          enable_jmx_exporter    = lookup(values, "enable_jmx_exporter", null)
-          extra_archive          = lookup(values, "extra_archive", null)
-          dns_subdomain          = lookup(values, "dns_subdomain", null)
-          explicit_instance_type = lookup(values, "explicit_instance_type", null)
-          explicit_ami           = lookup(values, "explicit_ami", null)
-          migration_aux_node     = lookup(values, "migration_aux_node", null)
-          access_type            = lookup(values, "access_type", null)
-          collect_metrics        = lookup(values, "collect_metrics", null)
-          collect_logs           = lookup(values, "collect_logs", null)
-        }
+    for item in flatten([
+      for spam, node_types in var.spam_nodes :
+      flatten([
+        for node_type, nodes in node_types :
+        flatten([
+          for node, values in nodes : {
+            tag    = "${replace(var.region, "-", "_")}_${node_type}${spam}"
+            values = values
+          }
+        ])
+        if node_type == "spam"
       ])
-      if node_type == "validator"
-    ])
-  ])
+    ]) :
+    item.tag => { for field in module.field_mapping.fields : field => lookup(item.values, field, null) }
+  }
 
   VALIDATOR_TAGS = {
-    for key, values in local.VALIDATOR_LIST :
-    values["tag"] => {
-      enable_health          = lookup(values, "enable_health", null)
-      enable_metrics         = lookup(values, "enable_metrics", null)
-      enable_validation      = lookup(values, "enable_validation", null)
-      enable_version         = lookup(values, "enable_version", null)
-      enable_jmx_exporter    = lookup(values, "enable_jmx_exporter", null)
-      extra_archive          = lookup(values, "extra_archive", null)
-      dns_subdomain          = lookup(values, "dns_subdomain", null)
-      explicit_instance_type = lookup(values, "explicit_instance_type", null)
-      explicit_ami           = lookup(values, "explicit_ami", null)
-      migration_aux_node     = lookup(values, "migration_aux_node", null)
-      access_type            = lookup(values, "access_type", null)
-      collect_metrics        = lookup(values, "collect_metrics", null)
-      collect_logs           = lookup(values, "collect_logs", null)
-    }
+    for item in flatten([
+      for validator, node_types in var.validator_nodes :
+      flatten([
+        for node_type, nodes in node_types :
+        flatten([
+          for node, values in nodes : {
+            tag    = "${replace(var.region, "-", "_")}_${node_type}${validator}"
+            values = values
+          }
+        ])
+        if node_type == "validator"
+      ])
+    ]) :
+    item.tag => { for field in module.field_mapping.fields : field => lookup(item.values, field, null) }
   }
-
 }
 
 output "BOOTSTRAP_TAGS" {
