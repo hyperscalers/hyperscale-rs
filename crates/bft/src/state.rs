@@ -1073,7 +1073,7 @@ impl BftState {
                 break;
             }
 
-            for cert in &block.committed_certificates {
+            for cert in &block.certificates {
                 qc_chain_cert_hashes.insert(cert.transaction_hash);
             }
 
@@ -1081,7 +1081,7 @@ impl BftState {
         }
 
         // Include certificates (limit by config), excluding those already in QC chain blocks
-        let committed_certificates: Vec<_> = certificates
+        let certificates_to_propose: Vec<_> = certificates
             .into_iter()
             .filter(|c| !qc_chain_cert_hashes.contains(&c.transaction_hash))
             .take(self.config.max_certificates_per_block)
@@ -1101,7 +1101,7 @@ impl BftState {
             });
 
         // Build set of certificate hashes for stale deferral filtering
-        let cert_hash_set: std::collections::HashSet<Hash> = committed_certificates
+        let cert_hash_set: std::collections::HashSet<Hash> = certificates_to_propose
             .iter()
             .map(|c| c.transaction_hash)
             .collect();
@@ -1126,7 +1126,7 @@ impl BftState {
             height = next_height,
             round = round,
             transactions = retry_transactions.len() + priority_transactions.len() + other_transactions.len(),
-            certificates = committed_certificates.len(),
+            certificates = certificates_to_propose.len(),
             "Requesting block build for proposal"
         );
 
@@ -1151,7 +1151,7 @@ impl BftState {
                 retry_transactions,
                 priority_transactions,
                 transactions: other_transactions,
-                committed_certificates,
+                certificates: certificates_to_propose,
                 commitment_proofs,
                 deferred: deferred_filtered,
                 aborted: aborted_with_height,
@@ -1188,7 +1188,7 @@ impl BftState {
         // during view changes where a Byzantine proposer might try to advance consensus time
         let timestamp = parent_qc.weighted_timestamp_ms;
 
-        // Fallback blocks have no committed_certificates, so state doesn't change.
+        // Fallback blocks have no certificates, so state doesn't change.
         // We inherit state_root and state_version from the parent block's header.
         let (parent_state_root, parent_state_version) = self
             .get_block_by_hash(parent_hash)
@@ -1219,7 +1219,7 @@ impl BftState {
             retry_transactions: vec![], // Empty - fallback blocks have no transactions
             priority_transactions: vec![], // Empty
             transactions: vec![],       // Empty
-            committed_certificates: vec![], // Empty
+            certificates: vec![],       // Empty
             deferred: vec![],
             aborted: vec![],
             commitment_proofs: HashMap::new(), // Empty - no transactions
@@ -1303,7 +1303,7 @@ impl BftState {
         // inherit the parent timestamp (proposed after timeout, clock may have drifted).
         let timestamp = self.now.as_millis() as u64;
 
-        // Sync blocks have no committed_certificates, so state doesn't change.
+        // Sync blocks have no certificates, so state doesn't change.
         // We inherit state_root and state_version from the parent block's header.
         let (parent_state_root, parent_state_version) = self
             .get_block_by_hash(parent_hash)
@@ -1334,7 +1334,7 @@ impl BftState {
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions: vec![],
-            committed_certificates: vec![],
+            certificates: vec![],
             deferred: vec![],
             aborted: vec![],
             commitment_proofs: HashMap::new(),
@@ -2211,7 +2211,7 @@ impl BftState {
         };
 
         // Check state root verification status
-        let state_root_ok = if block.committed_certificates.is_empty() {
+        let state_root_ok = if block.certificates.is_empty() {
             // No certificates - no verification needed
             true
         } else {
@@ -2233,10 +2233,10 @@ impl BftState {
 
     /// Check if a block needs state root verification before voting.
     ///
-    /// Returns true if the block has committed_certificates (which change state)
+    /// Returns true if the block has certificates (which change state)
     /// and we haven't already verified or initiated verification.
     fn block_needs_state_root_verification(&self, block: &Block) -> bool {
-        if block.committed_certificates.is_empty() {
+        if block.certificates.is_empty() {
             return false;
         }
 
@@ -2259,7 +2259,7 @@ impl BftState {
 
     /// Initiate state root verification for a block.
     ///
-    /// Collects state writes from the block's committed_certificates for our local shard.
+    /// Collects state writes from the block's certificates for our local shard.
     /// Uses the block header's state_version to derive the required base version, then
     /// either verifies immediately (if JMT is ready) or queues for later.
     ///
@@ -2290,7 +2290,7 @@ impl BftState {
             // JMT is ready - verify immediately
             debug!(
                 block_hash = ?block_hash,
-                certificate_count = block.committed_certificates.len(),
+                certificate_count = block.certificates.len(),
                 expected_root = ?block.header.state_root,
                 parent_state_root = ?parent_state_root,
                 current_jmt_root = ?current_root,
@@ -2303,13 +2303,13 @@ impl BftState {
                 block_hash,
                 parent_state_root,
                 expected_root: block.header.state_root,
-                certificates: block.committed_certificates.clone(),
+                certificates: block.certificates.clone(),
             }]
         } else {
             // JMT not ready - queue for later
             debug!(
                 block_hash = ?block_hash,
-                certificate_count = block.committed_certificates.len(),
+                certificate_count = block.certificates.len(),
                 expected_root = ?block.header.state_root,
                 parent_state_root = ?parent_state_root,
                 current_jmt_root = ?current_root,
@@ -2321,7 +2321,7 @@ impl BftState {
                 PendingStateRootVerification {
                     required_root: parent_state_root,
                     expected_root: block.header.state_root,
-                    certificates: block.committed_certificates.clone(),
+                    certificates: block.certificates.clone(),
                 },
             );
 
@@ -2354,7 +2354,7 @@ impl BftState {
 
         // Build set of certificate hashes in this block for staleness checks
         let cert_hashes: HashSet<Hash> = block
-            .committed_certificates
+            .certificates
             .iter()
             .map(|c| c.transaction_hash)
             .collect();
@@ -3282,7 +3282,7 @@ impl BftState {
             return vec![];
         }
 
-        let has_certificates = !block.committed_certificates.is_empty();
+        let has_certificates = !block.certificates.is_empty();
 
         // Build hashes for gossip and pending block
         let retry_hashes: Vec<Hash> = block
@@ -3297,7 +3297,7 @@ impl BftState {
             .collect();
         let tx_hashes: Vec<Hash> = block.transactions.iter().map(|tx| tx.hash()).collect();
         let cert_hashes: Vec<Hash> = block
-            .committed_certificates
+            .certificates
             .iter()
             .map(|c| c.transaction_hash)
             .collect();
@@ -3335,7 +3335,7 @@ impl BftState {
         for tx in &block.transactions {
             pending_block.add_transaction_arc(Arc::clone(tx));
         }
-        for cert in &block.committed_certificates {
+        for cert in &block.certificates {
             pending_block.add_certificate(Arc::clone(cert));
         }
 
@@ -3492,12 +3492,12 @@ impl BftState {
         // Look up the block to count transactions and certificates
         if let Some(pending) = self.pending_blocks.get(&committable_hash) {
             if let Some(block) = pending.block() {
-                (block.transactions.len(), block.committed_certificates.len())
+                (block.transactions.len(), block.certificates.len())
             } else {
                 (0, 0)
             }
         } else if let Some((block, _)) = self.certified_blocks.get(&committable_hash) {
-            (block.transactions.len(), block.committed_certificates.len())
+            (block.transactions.len(), block.certificates.len())
         } else {
             (0, 0)
         }
@@ -6081,7 +6081,7 @@ mod tests {
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions: vec![],
-            committed_certificates: certificates.into_iter().map(Arc::new).collect(),
+            certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
             commitment_proofs: HashMap::new(),
@@ -7869,7 +7869,7 @@ mod tests {
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions,
-            committed_certificates: vec![],
+            certificates: vec![],
             deferred: vec![],
             aborted: vec![],
             commitment_proofs: HashMap::new(),
@@ -7889,7 +7889,7 @@ mod tests {
             retry_transactions,
             priority_transactions,
             transactions,
-            committed_certificates: vec![],
+            certificates: vec![],
             deferred: vec![],
             aborted: vec![],
             commitment_proofs,
@@ -7907,7 +7907,7 @@ mod tests {
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions,
-            committed_certificates: vec![],
+            certificates: vec![],
             deferred: vec![],
             aborted: vec![],
             commitment_proofs,
@@ -8538,7 +8538,7 @@ mod tests {
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions: vec![],
-            committed_certificates: vec![],
+            certificates: vec![],
             deferred: vec![],
             aborted: vec![],
             commitment_proofs: HashMap::new(),
@@ -9106,7 +9106,7 @@ mod tests {
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions: vec![],
-            committed_certificates: vec![],
+            certificates: vec![],
             deferred: vec![],
             aborted: vec![],
             commitment_proofs: HashMap::new(),

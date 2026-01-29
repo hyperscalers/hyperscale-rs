@@ -99,7 +99,7 @@ async fn test_storage_operations() {
         retry_transactions: vec![],
         priority_transactions: vec![],
         transactions: vec![],
-        committed_certificates: vec![],
+        certificates: vec![],
         deferred: vec![],
         aborted: vec![],
         commitment_proofs: std::collections::HashMap::new(),

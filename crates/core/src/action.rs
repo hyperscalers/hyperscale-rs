@@ -259,7 +259,7 @@ pub enum Action {
 
     /// Verify a block's state root against the JMT.
     ///
-    /// Computes the speculative state root from committed_certificates and compares
+    /// Computes the speculative state root from certificates and compares
     /// against the block header's claimed state_root. Returns `Event::StateRootVerified`.
     ///
     /// Each inner Vec represents one certificate's writes. They must be applied
@@ -328,7 +328,7 @@ pub enum Action {
         retry_transactions: Vec<Arc<RoutableTransaction>>,
         priority_transactions: Vec<Arc<RoutableTransaction>>,
         transactions: Vec<Arc<RoutableTransaction>>,
-        committed_certificates: Vec<Arc<TransactionCertificate>>,
+        certificates: Vec<Arc<TransactionCertificate>>,
         commitment_proofs: HashMap<Hash, CommitmentProof>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,

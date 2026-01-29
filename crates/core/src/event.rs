@@ -270,7 +270,7 @@ pub enum Event {
     ///
     /// Callback from `Action::VerifyStateRoot`. Reports whether the block's
     /// claimed state_root matches the computed JMT root after applying all
-    /// committed_certificates.
+    /// certificates.
     ///
     /// If valid=false, the validator MUST NOT vote for this block - the proposer
     /// included an incorrect state root.

@@ -591,7 +591,7 @@ impl StateMachine for NodeStateMachine {
                 // Remove committed certificates from execution state
                 // They've been included in this block, so don't need to be proposed again
                 // Also invalidate any speculative results that conflict with these writes
-                for cert in &block.committed_certificates {
+                for cert in &block.certificates {
                     self.execution
                         .remove_finalized_certificate(&cert.transaction_hash, *height);
                     // Invalidate speculative results that read from nodes being written

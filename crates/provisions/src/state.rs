@@ -519,7 +519,7 @@ impl ProvisionCoordinator {
     /// Handle block committed - cleanup completed/aborted transactions.
     pub fn on_block_committed(&mut self, block: &hyperscale_types::Block) -> Vec<Action> {
         // Clean up completed transactions (certificates committed)
-        for cert in &block.committed_certificates {
+        for cert in &block.certificates {
             self.cleanup_tx(&cert.transaction_hash);
         }
 

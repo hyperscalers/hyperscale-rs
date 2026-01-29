@@ -86,7 +86,7 @@ pub struct BlockHeader {
     /// Whether this block was created as a fallback when leader timed out.
     pub is_fallback: bool,
 
-    /// JMT state root hash after applying all committed_certificates in this block.
+    /// JMT state root hash after applying all certificates in this block.
     pub state_root: Hash,
 
     /// JMT version corresponding to state_root. Increments by 1 per certificate with state writes.
@@ -132,7 +132,7 @@ impl BlockHeader {
 /// 3. **transactions**: All other transactions
 ///
 /// Additional block contents:
-/// - **committed_certificates**: Finalized transaction certificates (Accept/Reject decisions)
+/// - **certificates**: Finalized transaction certificates (Accept/Reject decisions)
 /// - **deferred**: Transactions deferred due to cross-shard cycles (livelock prevention)
 /// - **aborted**: Transactions aborted due to timeout or rejection
 ///
@@ -164,7 +164,7 @@ pub struct Block {
     pub transactions: Vec<Arc<RoutableTransaction>>,
 
     /// Transaction certificates for finalized transactions.
-    pub committed_certificates: Vec<Arc<TransactionCertificate>>,
+    pub certificates: Vec<Arc<TransactionCertificate>>,
 
     /// Transactions deferred due to cross-shard livelock cycles.
     ///
@@ -198,11 +198,11 @@ impl PartialEq for Block {
             && tx_lists_equal(&self.retry_transactions, &other.retry_transactions)
             && tx_lists_equal(&self.priority_transactions, &other.priority_transactions)
             && tx_lists_equal(&self.transactions, &other.transactions)
-            && self.committed_certificates.len() == other.committed_certificates.len()
+            && self.certificates.len() == other.certificates.len()
             && self
-                .committed_certificates
+                .certificates
                 .iter()
-                .zip(other.committed_certificates.iter())
+                .zip(other.certificates.iter())
                 .all(|(a, b)| a.as_ref() == b.as_ref())
             && self.deferred == other.deferred
             && self.aborted == other.aborted
@@ -248,8 +248,8 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         // Certificates (manual encoding to unwrap Arc)
         encoder.write_value_kind(sbor::ValueKind::Array)?;
         encoder.write_value_kind(sbor::ValueKind::Tuple)?;
-        encoder.write_size(self.committed_certificates.len())?;
-        for cert in &self.committed_certificates {
+        encoder.write_size(self.certificates.len())?;
+        for cert in &self.certificates {
             encoder.encode_deeper_body(cert.as_ref())?;
         }
         encoder.encode(&self.deferred)?;
@@ -312,11 +312,11 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
         decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
         let cert_count = decoder.read_size()?;
-        let mut committed_certificates = Vec::with_capacity(cert_count);
+        let mut certificates = Vec::with_capacity(cert_count);
         for _ in 0..cert_count {
             let cert: TransactionCertificate =
                 decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
-            committed_certificates.push(Arc::new(cert));
+            certificates.push(Arc::new(cert));
         }
 
         let deferred: Vec<TransactionDefer> = decoder.decode()?;
@@ -338,7 +338,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             retry_transactions,
             priority_transactions,
             transactions,
-            committed_certificates,
+            certificates,
             deferred,
             aborted,
             commitment_proofs,
@@ -435,7 +435,7 @@ impl Block {
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions: vec![],
-            committed_certificates: vec![],
+            certificates: vec![],
             deferred: vec![],
             aborted: vec![],
             commitment_proofs: HashMap::new(),
@@ -454,12 +454,12 @@ impl Block {
 
     /// Get number of committed certificates in this block.
     pub fn certificate_count(&self) -> usize {
-        self.committed_certificates.len()
+        self.certificates.len()
     }
 
     /// Get transaction hashes from committed certificates.
     pub fn committed_transaction_hashes(&self) -> Vec<Hash> {
-        self.committed_certificates
+        self.certificates
             .iter()
             .map(|cert| cert.transaction_hash)
             .collect()
@@ -467,7 +467,7 @@ impl Block {
 
     /// Check if this block contains a certificate for a specific transaction.
     pub fn contains_certificate(&self, tx_hash: &Hash) -> bool {
-        self.committed_certificates
+        self.certificates
             .iter()
             .any(|cert| &cert.transaction_hash == tx_hash)
     }
@@ -574,7 +574,7 @@ impl BlockMetadata {
                 .collect(),
             tx_hashes: block.transactions.iter().map(|tx| tx.hash()).collect(),
             cert_hashes: block
-                .committed_certificates
+                .certificates
                 .iter()
                 .map(|c| c.transaction_hash)
                 .collect(),

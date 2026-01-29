@@ -325,7 +325,7 @@ fn spawn_block_commit_task(
                 // Falls back to per-certificate commits if cache is stale.
                 let used_fast_path =
                     if let Some(cache) = storage.take_block_commit_cache(block_hash) {
-                        let num_certs = block.committed_certificates.len();
+                        let num_certs = block.certificates.len();
                         if storage.try_apply_block_commit_cache(cache) {
                             tracing::info!(
                                 block_height = height,
@@ -346,7 +346,7 @@ fn spawn_block_commit_task(
                     // SLOW PATH: recompute per-certificate (N fsyncs)
                     let mut applied_count = 0u32;
                     let mut empty_count = 0u32;
-                    for cert in &block.committed_certificates {
+                    for cert in &block.certificates {
                         let writes = cert
                             .shard_proofs
                             .get(&local_shard)
@@ -363,12 +363,12 @@ fn spawn_block_commit_task(
 
                     tracing::info!(
                         block_height = height,
-                        total_certs = block.committed_certificates.len(),
+                        total_certs = block.certificates.len(),
                         applied_count,
                         empty_count,
                         local_shard = local_shard.0,
                         "Applied certificate state writes (slow path, {} fsyncs)",
-                        block.committed_certificates.len()
+                        block.certificates.len()
                     );
                 }
 
@@ -1240,7 +1240,7 @@ impl ProductionRunner {
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions: vec![],
-            committed_certificates: vec![],
+            certificates: vec![],
             deferred: vec![],
             aborted: vec![],
             commitment_proofs: std::collections::HashMap::new(),
@@ -2701,7 +2701,7 @@ impl ProductionRunner {
                 retry_transactions,
                 priority_transactions,
                 transactions,
-                committed_certificates,
+                certificates,
                 commitment_proofs,
                 deferred,
                 aborted,
@@ -2722,12 +2722,12 @@ impl ProductionRunner {
                     let jmt_ready = current_root == parent_state_root;
 
                     // Can include certificates only if JMT is ready
-                    let include_certs = jmt_ready && !committed_certificates.is_empty();
+                    let include_certs = jmt_ready && !certificates.is_empty();
 
                     let (state_root, state_version, certs_to_include, jmt_snapshot) = if include_certs
                     {
                         // JMT ready - compute speculative root from certificates
-                        let writes_per_cert: Vec<Vec<_>> = committed_certificates
+                        let writes_per_cert: Vec<Vec<_>> = certificates
                             .iter()
                             .map(|cert| {
                                 cert.shard_proofs
@@ -2739,15 +2739,15 @@ impl ProductionRunner {
 
                         let (root, snapshot) = storage
                             .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
-                        let version = parent_state_version + committed_certificates.len() as u64;
-                        (root, version, committed_certificates, Some(snapshot))
+                        let version = parent_state_version + certificates.len() as u64;
+                        (root, version, certificates, Some(snapshot))
                     } else {
                         // Either no certificates, or JMT not ready - inherit parent state
-                        if !committed_certificates.is_empty() {
+                        if !certificates.is_empty() {
                             tracing::debug!(
                                 height = height.0,
                                 round = round,
-                                skipped_certs = committed_certificates.len(),
+                                skipped_certs = certificates.len(),
                                 ?current_root,
                                 ?parent_state_root,
                                 "JMT not ready - proposing without certificates"
@@ -2782,7 +2782,7 @@ impl ProductionRunner {
                         retry_transactions,
                         priority_transactions,
                         transactions,
-                        committed_certificates: certs_to_include.clone(),
+                        certificates: certs_to_include.clone(),
                         deferred,
                         aborted,
                         commitment_proofs,
@@ -3132,7 +3132,7 @@ impl ProductionRunner {
                     block_hash = ?block.hash(),
                     height = height,
                     view = current_view,
-                    certificates = block.committed_certificates.len(),
+                    certificates = block.certificates.len(),
                     "Block committed"
                 );
 
@@ -3199,7 +3199,7 @@ impl ProductionRunner {
                 //
                 // After commit completes, StateCommitComplete is sent so the state machine
                 // knows it's safe to compute speculative roots for the next proposal.
-                if !block.committed_certificates.is_empty() {
+                if !block.certificates.is_empty() {
                     let request = BlockCommitRequest {
                         block: block.clone(),
                         height,

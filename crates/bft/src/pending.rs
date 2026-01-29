@@ -272,7 +272,7 @@ impl PendingBlock {
             retry_transactions,
             priority_transactions,
             transactions,
-            committed_certificates: certificates,
+            certificates,
             deferred,
             aborted,
             commitment_proofs,

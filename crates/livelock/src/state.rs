@@ -390,7 +390,7 @@ impl LivelockState {
         }
 
         // Process committed certificates (transactions completed)
-        for cert in &block.committed_certificates {
+        for cert in &block.certificates {
             self.on_certificate_committed(&cert.transaction_hash);
         }
 
@@ -406,7 +406,7 @@ impl LivelockState {
             height = height.0,
             deferred = block.deferred.len(),
             aborted = block.aborted.len(),
-            certificates = block.committed_certificates.len(),
+            certificates = block.certificates.len(),
             "Processed block commit for livelock state"
         );
     }
@@ -827,7 +827,7 @@ mod tests {
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions: vec![],
-            committed_certificates: vec![],
+            certificates: vec![],
             deferred: vec![deferral],
             aborted: vec![],
             commitment_proofs: std::collections::HashMap::new(),
@@ -885,7 +885,7 @@ mod tests {
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions: vec![],
-            committed_certificates: vec![std::sync::Arc::new(cert)],
+            certificates: vec![std::sync::Arc::new(cert)],
             deferred: vec![],
             aborted: vec![],
             commitment_proofs: std::collections::HashMap::new(),

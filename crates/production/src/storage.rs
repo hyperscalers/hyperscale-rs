@@ -1380,7 +1380,7 @@ impl RocksDbStorage {
         }
 
         // 3. Store certificates (deduplicated)
-        for cert in &block.committed_certificates {
+        for cert in &block.certificates {
             let cert_value =
                 sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
             batch.put_cf(certs_cf, cert.transaction_hash.as_bytes(), cert_value);
@@ -1463,7 +1463,7 @@ impl RocksDbStorage {
             retry_transactions,
             priority_transactions,
             transactions,
-            committed_certificates: certificates,
+            certificates,
             deferred: metadata.deferred,
             aborted: metadata.aborted,
             commitment_proofs: metadata.commitment_proofs,
@@ -1572,7 +1572,7 @@ impl RocksDbStorage {
             retry_transactions,
             priority_transactions,
             transactions,
-            committed_certificates: certificates,
+            certificates,
             deferred: metadata.deferred,
             aborted: metadata.aborted,
             commitment_proofs: metadata.commitment_proofs,
@@ -2507,7 +2507,7 @@ mod tests {
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions: vec![],
-            committed_certificates: vec![],
+            certificates: vec![],
             deferred: vec![],
             aborted: vec![],
             commitment_proofs: std::collections::HashMap::new(),
@@ -2563,7 +2563,7 @@ mod tests {
                 retry_transactions: vec![],
                 priority_transactions: vec![],
                 transactions: vec![],
-                committed_certificates: vec![],
+                certificates: vec![],
                 deferred: vec![],
                 aborted: vec![],
                 commitment_proofs: std::collections::HashMap::new(),

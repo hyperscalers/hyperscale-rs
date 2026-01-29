@@ -439,7 +439,7 @@ impl SimulationRunner {
                 retry_transactions: vec![],
                 priority_transactions: vec![],
                 transactions: vec![],
-                committed_certificates: vec![],
+                certificates: vec![],
                 deferred: vec![],
                 aborted: vec![],
                 commitment_proofs: std::collections::HashMap::new(),
@@ -555,7 +555,7 @@ impl SimulationRunner {
                 retry_transactions: vec![],
                 priority_transactions: vec![],
                 transactions: vec![],
-                committed_certificates: vec![],
+                certificates: vec![],
                 deferred: vec![],
                 aborted: vec![],
                 commitment_proofs: std::collections::HashMap::new(),
@@ -1392,7 +1392,7 @@ impl SimulationRunner {
                 retry_transactions,
                 priority_transactions,
                 transactions,
-                committed_certificates,
+                certificates,
                 commitment_proofs,
                 deferred,
                 aborted,
@@ -1406,11 +1406,11 @@ impl SimulationRunner {
 
                 // Check if JMT is ready for certificates
                 let jmt_ready = current_root == parent_state_root;
-                let include_certs = jmt_ready && !committed_certificates.is_empty();
+                let include_certs = jmt_ready && !certificates.is_empty();
 
                 let (state_root, state_version, certs_to_include, jmt_snapshot) = if include_certs {
                     // JMT ready - compute speculative root from certificates
-                    let writes_per_cert: Vec<Vec<_>> = committed_certificates
+                    let writes_per_cert: Vec<Vec<_>> = certificates
                         .iter()
                         .map(|cert| {
                             cert.shard_proofs
@@ -1422,16 +1422,16 @@ impl SimulationRunner {
 
                     let (root, snapshot) = storage
                         .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
-                    let version = parent_state_version + committed_certificates.len() as u64;
-                    (root, version, committed_certificates, Some(snapshot))
+                    let version = parent_state_version + certificates.len() as u64;
+                    (root, version, certificates, Some(snapshot))
                 } else {
                     // Either no certificates, or JMT not ready - inherit parent state
-                    if !committed_certificates.is_empty() {
+                    if !certificates.is_empty() {
                         tracing::debug!(
                             node = from,
                             height = height.0,
                             round = round,
-                            skipped_certs = committed_certificates.len(),
+                            skipped_certs = certificates.len(),
                             ?current_root,
                             ?parent_state_root,
                             "JMT not ready - proposing without certificates"
@@ -1466,7 +1466,7 @@ impl SimulationRunner {
                     retry_transactions,
                     priority_transactions,
                     transactions,
-                    committed_certificates: certs_to_include.clone(),
+                    certificates: certs_to_include.clone(),
                     deferred,
                     aborted,
                     commitment_proofs,
@@ -1843,7 +1843,7 @@ impl SimulationRunner {
                     // Fast path: apply precomputed JMT snapshot
                     storage.apply_jmt_snapshot(snapshot);
                     // Still need to store certificates
-                    for cert in &block.committed_certificates {
+                    for cert in &block.certificates {
                         let writes = cert
                             .shard_proofs
                             .get(&local_shard)
@@ -1855,7 +1855,7 @@ impl SimulationRunner {
                     // Slow path: recompute per-certificate (cache miss, stale cache, or synced blocks)
                     // Always commit every certificate to advance JMT version.
                     // This ensures JMT version matches certificates.len() used in state_version.
-                    for cert in &block.committed_certificates {
+                    for cert in &block.certificates {
                         let writes = cert
                             .shard_proofs
                             .get(&local_shard)

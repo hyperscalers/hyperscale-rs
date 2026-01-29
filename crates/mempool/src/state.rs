@@ -572,7 +572,7 @@ impl MempoolState {
         }
 
         // 3. Process certificates - mark completed, trigger retries
-        for cert in &block.committed_certificates {
+        for cert in &block.certificates {
             actions.extend(self.on_certificate_committed(
                 cert.transaction_hash,
                 cert.decision,
@@ -1958,7 +1958,7 @@ mod tests {
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions: transactions.into_iter().map(Arc::new).collect(),
-            committed_certificates: certificates.into_iter().map(Arc::new).collect(),
+            certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
             commitment_proofs: std::collections::HashMap::new(),
