@@ -18,5 +18,5 @@ us_west_1_bootstrap_nodes = "0"
 us_west_1_spam_nodes      = "0"
 us_west_1_validator_nodes = "0"
 
-COMMON_INSTANCE_TYPE = "t3a.micro"
+COMMON_INSTANCE_TYPE = "t3.micro"
 SPAM_INSTANCE_TYPE = "t3.micro"
