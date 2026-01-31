@@ -22,10 +22,10 @@ locals {
   ipv4_cidr_merged = concat(var.devops_ipv4_cidr, var.ipv4_cidr_blocks)
   ipv6_cidr_merged = concat(var.devops_ipv6_cidr, var.ipv6_cidr_blocks)
 }
-resource "aws_security_group" "allow-ssh-http-https" {
+resource "aws_security_group" "allow-ssh-8080" {
   vpc_id      = aws_vpc.vpc.id
-  name        = "${var.network_name}-${data.aws_region.current.name}-allow-ssh-http-https"
-  description = "security group that allows ssh and all egress traffic"
+  name        = "${var.network_name}-${data.aws_region.current.name}-allow-ssh-8080"
+  description = "security group that allows ssh and 8080 and all egress traffic"
   egress {
     from_port = 0
     to_port   = 0
@@ -35,14 +35,14 @@ resource "aws_security_group" "allow-ssh-http-https" {
   }
 
   ingress {
-    from_port        = 443
-    to_port          = 443
+    from_port        = 8080
+    to_port          = 8080
     protocol         = "tcp"
     cidr_blocks      = local.ipv4_cidr_merged
     ipv6_cidr_blocks = local.ipv6_cidr_merged
   }
 
-  tags = merge(var.tags, { Name = "${var.network_name}-${data.aws_region.current.name}-allow-ssh-http-https" })
+  tags = merge(var.tags, { Name = "${var.network_name}-${data.aws_region.current.name}-allow-ssh-8080" })
 
   lifecycle {
     create_before_destroy = true

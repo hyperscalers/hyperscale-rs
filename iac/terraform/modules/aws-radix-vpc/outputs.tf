@@ -10,8 +10,8 @@ output "additional_public_subnets" {
     for key, val in aws_subnet.additional_public_subnet : key => val.id
   }
 }
-output "sg_allow_ssh_https_id" {
-  value = aws_security_group.allow-ssh-http-https.id
+output "sg_allow_ssh_8080_id" {
+  value = aws_security_group.allow-ssh-8080.id
 }
 
 output "sg_allow_gossip_port_id" {
