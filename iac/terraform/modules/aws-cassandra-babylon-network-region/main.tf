@@ -97,7 +97,7 @@ module "bootstrap_nodes" {
   key_name           = var.key_pair != null ? var.key_pair.key_name : null
   vpc_security_group_ids = [
     aws_security_group.cassandra_validators_sg.id,
-    module.vpc_resources.sg_allow_ssh_https_id,
+    module.vpc_resources.sg_allow_ssh_8080_id,
     module.vpc_resources.sg_allow_gossip_port_id
   ]
   root_block_device           = var.root_block_device
@@ -139,7 +139,7 @@ module "spam_nodes" {
   key_name           = var.key_pair != null ? var.key_pair.key_name : null
   vpc_security_group_ids = [
     aws_security_group.cassandra_validators_sg.id,
-    module.vpc_resources.sg_allow_ssh_https_id,
+    module.vpc_resources.sg_allow_ssh_8080_id,
     module.vpc_resources.sg_allow_gossip_port_id
   ]
   root_block_device           = var.root_block_device
@@ -179,7 +179,7 @@ module "validator_nodes" {
   radix_network_name = var.network
   key_name           = var.key_pair != null ? var.key_pair.key_name : null
   vpc_security_group_ids = [
-    module.vpc_resources.sg_allow_ssh_https_id,
+    module.vpc_resources.sg_allow_ssh_8080_id,
     module.vpc_resources.sg_allow_gossip_port_id,
     aws_security_group.cassandra_validators_sg.id
   ]
