@@ -4,15 +4,18 @@
 #
 # Usage:
 #   ./scripts/generate-distributed-config.sh --hosts "IP1,IP2..." [--nodes-per-host N] [--out-dir DIR]
+#   ./scripts/generate-distributed-config.sh --hosts "IP1,IP2..." --node-names "name1,name2..."
 #
 # Examples:
 #   ./scripts/generate-distributed-config.sh --hosts "192.168.1.10,192.168.1.11" --nodes-per-host 2
+#   ./scripts/generate-distributed-config.sh --hosts "192.168.1.10,192.168.1.11" --node-names "validator-east,validator-west"
 #
 
 set -e
 
 # Default configuration
 HOSTS=""
+NODE_NAMES=""
 OUT_DIR="./distributed-cluster-data"
 BASE_PORT=9000
 TCP_BASE_PORT=30500
@@ -58,6 +61,10 @@ while [[ $# -gt 0 ]]; do
             NODES_PER_HOST="$2"
             shift 2
             ;;
+        --node-names)
+            NODE_NAMES="$2"
+            shift 2
+            ;;
         --shards|--num-shards)
             NUM_SHARDS="$2"
             shift 2
@@ -100,9 +107,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --help|-h)
             echo "Usage: $0 --hosts \"IP1,IP2...\" [--nodes-per-host N] [--shards N] [--out-dir DIR] [--clean]"
-            echo "       [--crypto-threads N] [--execution-threads N] [--io-threads N]"
+            echo "       [--node-names \"name1,name2...\"] [--crypto-threads N] [--execution-threads N] [--io-threads N]"
             echo "       [--copy-to-remote] [--remote-path DIR] [--remote-user USER]"
             echo "       [--mempool-max-in-flight N] [--mempool-max-in-flight-hard-limit N] [--mempool-max-pending N]"
+            echo ""
+            echo "Options:"
+            echo "  --node-names    Comma-separated list of node names for deterministic key generation."
+            echo "                  If provided, keys are derived from node names instead of numeric IDs."
+            echo "                  Number of names must equal HOSTS * NODES_PER_HOST."
             exit 0
             ;;
         *)
@@ -121,6 +133,18 @@ fi
 IFS=',' read -r -a HOST_IPS <<< "$HOSTS"
 NUM_HOSTS=${#HOST_IPS[@]}
 TOTAL_NODES=$((NUM_HOSTS * NODES_PER_HOST))
+
+# Parse node names if provided
+declare -a NODE_NAMES_ARRAY
+if [ -n "$NODE_NAMES" ]; then
+    IFS=',' read -r -a NODE_NAMES_ARRAY <<< "$NODE_NAMES"
+    if [ "${#NODE_NAMES_ARRAY[@]}" -ne "$TOTAL_NODES" ]; then
+        echo "ERROR: Number of node names (${#NODE_NAMES_ARRAY[@]}) must equal total nodes ($TOTAL_NODES)"
+        echo "       Total nodes = HOSTS ($NUM_HOSTS) * NODES_PER_HOST ($NODES_PER_HOST)"
+        exit 1
+    fi
+    echo "Using custom node names for key generation"
+fi
 
 if (( TOTAL_NODES % NUM_SHARDS != 0 )); then
     echo "ERROR: Total nodes ($TOTAL_NODES) must be divisible by number of shards ($NUM_SHARDS)"
@@ -184,9 +208,16 @@ for i in "${!HOST_IPS[@]}"; do
         mkdir -p "$NODE_DIR"
         
         KEY_FILE="$NODE_DIR/signing.key"
-        
-        # Deterministic seed for reproducibility (99999 + NODE_ID)
-        SEED_HEX=$(printf '%064x' $((99999 + NODE_ID)))
+
+        # Deterministic seed for reproducibility
+        if [ -n "$NODE_NAMES" ]; then
+            # Use node name to derive seed via SHA256
+            NODE_NAME="${NODE_NAMES_ARRAY[$NODE_ID]}"
+            SEED_HEX=$(echo -n "$NODE_NAME" | shasum -a 256 | cut -d' ' -f1)
+        else
+            # Fall back to numeric seed (99999 + NODE_ID)
+            SEED_HEX=$(printf '%064x' $((99999 + NODE_ID)))
+        fi
         echo "$SEED_HEX" | xxd -r -p > "$KEY_FILE"
         
         # Keygen outputs: PUBKEY_HEX PEER_ID
@@ -202,7 +233,11 @@ for i in "${!HOST_IPS[@]}"; do
         # Calculate ports: offset by local index
         NODE_P2P_PORTS[$NODE_ID]=$((BASE_PORT + v))
         
-        echo "  Host $i ($IP) Node $v (Global ID $NODE_ID): ${PUBKEY:0:16}... PeerID: $PEER_ID"
+        if [ -n "$NODE_NAMES" ]; then
+            echo "  Host $i ($IP) Node $v '$NODE_NAME' (Global ID $NODE_ID): ${PUBKEY:0:16}... PeerID: $PEER_ID"
+        else
+            echo "  Host $i ($IP) Node $v (Global ID $NODE_ID): ${PUBKEY:0:16}... PeerID: $PEER_ID"
+        fi
     done
 done
 

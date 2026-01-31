@@ -55,3 +55,11 @@ tla/
 # Docker compose and monitoring (dynamically generated)
 scripts/monitoring/prometheus.yml
 scripts/docker-compose.generated.yml
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.auto.tfvars
+.terraform.lock.hcl
