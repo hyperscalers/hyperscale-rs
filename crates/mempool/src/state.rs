@@ -536,7 +536,46 @@ impl MempoolState {
             }
         }
 
-        // 1. Update transaction status to Committed and add locks.
+        // Handle retry transactions superseding their originals.
+        // When a retry T' is committed, its original T must be marked as Retried and evicted.
+        // This releases T's locks so T' can acquire them. This is consensus-agreed: the retry
+        // being in the block means all validators agree T is superseded.
+        // Only iterate retry_transactions to avoid overhead in the common case.
+        // Note: Execution state cleanup is handled by NodeStateMachine, similar to deferrals.
+        for retry_tx in &block.retry_transactions {
+            let original_hash = retry_tx.original_hash();
+            let retry_hash = retry_tx.hash();
+
+            if let Some(entry) = self.pool.get(&original_hash) {
+                // Only process if original is in a non-terminal state
+                if !entry.status.is_final() {
+                    let added_at = entry.added_at;
+                    let cross_shard = entry.cross_shard;
+                    let submitted_locally = entry.submitted_locally;
+
+                    tracing::info!(
+                        original = %original_hash,
+                        retry = %retry_hash,
+                        original_status = ?entry.status,
+                        "Retry committed - marking original as Retried"
+                    );
+
+                    // Emit status update for the original
+                    actions.push(Action::EmitTransactionStatus {
+                        tx_hash: original_hash,
+                        status: TransactionStatus::Retried { new_tx: retry_hash },
+                        added_at,
+                        cross_shard,
+                        submitted_locally,
+                    });
+
+                    // Evict the original - this releases its locks
+                    self.evict_terminal(original_hash);
+                }
+            }
+        }
+
+        // Update transaction status to Committed and add locks.
         // This must happen synchronously to prevent the same transactions from being
         // re-proposed before the status update is processed. The execution state machine
         // also emits TransactionStatusChanged events, but those go through an async channel
@@ -566,12 +605,12 @@ impl MempoolState {
             }
         }
 
-        // 2. Process deferrals - update status to Deferred
+        // Process deferrals - update status to Deferred
         for deferral in &block.deferred {
             actions.extend(self.on_deferral_committed(deferral.tx_hash, &deferral.reason, height));
         }
 
-        // 3. Process certificates - mark completed, trigger retries
+        // Process certificates - mark completed, trigger retries
         for cert in &block.certificates {
             actions.extend(self.on_certificate_committed(
                 cert.transaction_hash,
@@ -580,8 +619,8 @@ impl MempoolState {
             ));
         }
 
-        // 4. Process aborts - mark as aborted with reason and evict
-        //    Also abort any transactions that were deferred by the aborted winner.
+        // Process aborts - mark as aborted with reason and evict.
+        // Also abort any transactions that were deferred by the aborted winner.
         for abort in &block.aborted {
             if let Some(entry) = self.pool.get(&abort.tx_hash) {
                 let added_at = entry.added_at;
@@ -1328,6 +1367,10 @@ impl MempoolState {
     ///
     /// Determines if the transaction is deferred by locked nodes. If deferred,
     /// adds to deferred_by_nodes. If ready, adds to the appropriate ready set.
+    ///
+    /// Special case: Retry transactions are not blocked by locks held by their
+    /// original transaction. When a retry T' arrives, it supersedes T, so T's
+    /// locks should not prevent T' from being proposed.
     fn add_to_ready_tracking(
         &mut self,
         hash: Hash,
@@ -1335,11 +1378,26 @@ impl MempoolState {
         cross_shard: bool,
     ) {
         // Find all locked nodes that block this transaction
-        let blocking_nodes: HashSet<NodeId> = tx
+        let mut blocking_nodes: HashSet<NodeId> = tx
             .all_declared_nodes()
             .filter(|node| self.locked_nodes_cache.contains(node))
             .copied()
             .collect();
+
+        // Special case: retry transactions are not blocked by their original's locks.
+        // When a retry T' arrives (e.g., via gossip from a shard that created the retry),
+        // it should supersede T. The locks T holds should not block T'.
+        if !blocking_nodes.is_empty() && tx.is_retry() {
+            let original_hash = tx.original_hash();
+            if let Some(original_entry) = self.pool.get(&original_hash) {
+                if original_entry.status.holds_state_lock() {
+                    // Remove the original's nodes from blocking_nodes - they don't block the retry
+                    let original_nodes: HashSet<NodeId> =
+                        original_entry.tx.all_declared_nodes().copied().collect();
+                    blocking_nodes.retain(|node| !original_nodes.contains(node));
+                }
+            }
+        }
 
         if !blocking_nodes.is_empty() {
             // Transaction is deferred by one or more locked nodes

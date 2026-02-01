@@ -588,6 +588,20 @@ impl StateMachine for NodeStateMachine {
                     self.execution.cleanup_transaction(&abort.tx_hash);
                 }
 
+                // Cleanup execution state for original transactions superseded by retries.
+                // When a retry T' is committed, the original T's execution state must be
+                // cleaned up so T' can execute fresh. The mempool marks T as Retried and
+                // releases its locks; here we clean up execution tracking.
+                for retry_tx in &block.retry_transactions {
+                    let original_hash = retry_tx.original_hash();
+                    // Only cleanup if the original is different from the retry
+                    // (original_hash returns self.hash() for non-retries, but retry_transactions
+                    // should only contain actual retries)
+                    if original_hash != retry_tx.hash() {
+                        self.execution.cleanup_transaction(&original_hash);
+                    }
+                }
+
                 // Remove committed certificates from execution state
                 // They've been included in this block, so don't need to be proposed again
                 // Also invalidate any speculative results that conflict with these writes
