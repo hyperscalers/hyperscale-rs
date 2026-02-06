@@ -210,12 +210,13 @@ pub struct BftState {
     vote_sets: HashMap<Hash, VoteSet>,
 
     /// Vote locking: tracks which block hash we voted for at each height.
-    /// Critical for BFT safety - prevents voting for conflicting blocks at the same height,
-    /// even across different rounds. This is the core safety invariant of BFT consensus.
+    /// Critical for BFT safety - prevents voting for conflicting blocks at the same height
+    /// and round. The lock may be released across rounds on timeout (see `advance_round`)
+    /// or when a QC proves the lock is irrelevant (see `maybe_unlock_for_qc`).
     ///
     /// Key: height, Value: (block_hash, round)
     /// We also track the round to allow re-voting for the SAME block in a later round
-    /// (which is safe), while preventing votes for DIFFERENT blocks at the same height.
+    /// (which is safe), while preventing votes for DIFFERENT blocks at the same height and round.
     voted_heights: HashMap<u64, (Hash, u64)>,
 
     /// Tracks which block each validator has voted for at each height.
@@ -1974,8 +1975,9 @@ impl BftState {
     /// For the main entry point, use `trigger_qc_verification_or_vote`.
     fn try_vote_on_block(&mut self, block_hash: Hash, height: u64, round: u64) -> Vec<Action> {
         // Check vote locking - have we already voted for a block at this height?
-        // BFT Safety: A validator must NEVER vote for conflicting blocks at the same height,
-        // even across different rounds. This prevents equivocation attacks.
+        // BFT Safety: A validator must not vote for conflicting blocks at the same height
+        // in the same round. Across rounds, the vote lock may be released on timeout if
+        // no QC has formed (see `advance_round`), or via QC-based unlock (see `maybe_unlock_for_qc`).
         if let Some(&(existing_hash, existing_round)) = self.voted_heights.get(&height) {
             if existing_hash == block_hash {
                 // Already voted for this exact block (possibly in an earlier round)
@@ -2531,9 +2533,10 @@ impl BftState {
         sign_us = tracing::field::Empty,
     ))]
     fn create_vote(&mut self, block_hash: Hash, height: u64, round: u64) -> Vec<Action> {
-        // Record that we voted for this block at this height
-        // This is the core safety invariant: once we vote for a block at a height,
-        // we can never vote for a different block at that height
+        // Record that we voted for this block at this height.
+        // Core safety invariant: we will not vote for a different block at this height
+        // unless the vote lock is released on timeout (see `advance_round`) or by
+        // QC-based unlock (see `maybe_unlock_for_qc`).
         self.voted_heights.insert(height, (block_hash, round));
 
         // Create signature with domain separation (prevents cross-shard replay)
@@ -2832,7 +2835,7 @@ impl BftState {
 
             // Equivocation detection: check if this validator already voted for a DIFFERENT
             // block at the same height AND round. Voting for different blocks at different
-            // rounds is allowed (HotStuff-2 unlock), but same round is Byzantine behavior.
+            // rounds is allowed (vote lock release on timeout/QC), but same round is Byzantine behavior.
             let vote_key = (vote.height.0, vote.voter);
             if let Some(&(existing_hash, existing_round)) =
                 self.received_votes_by_height.get(&vote_key)
@@ -4322,9 +4325,12 @@ impl BftState {
             "Advancing round locally (implicit view change)"
         );
 
-        // HotStuff-2 unlock: If no QC has formed at this height, we can safely
-        // clear our vote lock. This is determined by checking if latest_qc is
-        // still below our current height.
+        // Timeout-based unlock: If no QC has formed at this height, we clear our
+        // vote lock to allow voting for a new proposal in the next round. Safety is
+        // maintained by quorum intersection — even if a QC did form but we haven't
+        // seen it, a conflicting block can never reach quorum.
+        // Note: this is more aggressive than HotStuff-2 (which requires a TC or
+        // higher QC to unlock). See `maybe_unlock_for_qc` for QC-based unlocking.
         let latest_qc_height = self.latest_qc.as_ref().map(|qc| qc.height.0).unwrap_or(0);
         if latest_qc_height < height {
             // No QC formed at current height - safe to unlock
@@ -4338,7 +4344,7 @@ impl BftState {
                     new_round = self.view,
                     latest_qc_height = latest_qc_height,
                     cleared_votes = cleared_votes,
-                    "Unlocking vote at height (no QC formed, safe per HotStuff-2)"
+                    "Unlocking vote at height (no QC formed, safe by quorum intersection)"
                 );
             }
         }
