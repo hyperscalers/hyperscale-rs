@@ -25,7 +25,7 @@ use sbor::prelude::*;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{instrument, Level};
 
@@ -106,17 +106,6 @@ impl BlockCommitCacheLru {
     }
 }
 
-/// JMT state bundled together for atomic updates.
-///
-/// JMT tree nodes are stored in the `jmt_nodes` column family in RocksDB.
-/// This struct only tracks the current version and root hash for efficient access.
-struct JmtState {
-    /// Current state version (persisted to DB).
-    current_version: u64,
-    /// Current JMT state root hash (persisted to DB).
-    current_root_hash: StateRootHash,
-}
-
 /// RocksDB-based storage for production use.
 ///
 /// Features:
@@ -129,16 +118,12 @@ struct JmtState {
 /// Implements Radix's `SubstateDatabase` and `CommittableSubstateDatabase` directly,
 /// plus our `SubstateStore` extension for snapshots, node listing, and JMT state roots.
 ///
-/// # JMT State Tracking
-///
-/// JMT tree nodes are persisted to RocksDB in the `jmt_nodes` column family.
-/// The JMT metadata (version and root hash) is persisted separately for fast access.
-/// On startup, only the metadata is loaded - tree nodes are read on demand from RocksDB.
+/// JMT tree nodes are persisted in the `jmt_nodes` column family. JMT metadata
+/// (version and root hash) is in the default CF under well-known keys and read
+/// directly from RocksDB on demand — always hot in the memtable since they're
+/// written on every commit.
 pub struct RocksDbStorage {
     db: Arc<DB>,
-
-    /// JMT state protected by RwLock for concurrent reads during verification.
-    jmt: RwLock<JmtState>,
 
     /// Cache of block commit data, keyed by block hash.
     ///
@@ -219,15 +204,8 @@ impl RocksDbStorage {
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
-        // Load JMT state from DB (or initialize if first run)
-        let (version, root_hash) = Self::load_jmt_state(&db);
-
         Ok(Self {
             db: Arc::new(db),
-            jmt: RwLock::new(JmtState {
-                current_version: version,
-                current_root_hash: root_hash,
-            }),
             block_commit_cache: Mutex::new(BlockCommitCacheLru::new()),
             enable_historical_substate_values: config.enable_historical_substate_values,
             state_version_history_length: config.state_version_history_length,
@@ -244,30 +222,27 @@ impl RocksDbStorage {
         self.state_version_history_length
     }
 
-    /// Load JMT state from the database.
-    fn load_jmt_state(db: &DB) -> (u64, StateRootHash) {
-        // Try to load from default CF with well-known keys
-        let version = db
+    /// Read JMT version and root hash directly from RocksDB.
+    ///
+    /// These keys are written on every commit, so they're always hot in the
+    /// memtable — this is effectively a hashtable lookup, not a disk read.
+    fn read_jmt_metadata(&self) -> (u64, StateRootHash) {
+        let version = self
+            .db
             .get(b"jmt:version")
             .ok()
             .flatten()
-            .and_then(|v| v.try_into().ok())
+            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
             .map(u64::from_be_bytes)
             .unwrap_or(0);
 
-        let root_hash = db
+        let root_hash = self
+            .db
             .get(b"jmt:root_hash")
             .ok()
             .flatten()
-            .and_then(|v| {
-                if v.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&v);
-                    Some(StateRootHash(arr))
-                } else {
-                    None
-                }
-            })
+            .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+            .map(StateRootHash)
             .unwrap_or(StateRootHash([0u8; 32]));
 
         (version, root_hash)
@@ -755,10 +730,7 @@ impl RocksDbStorage {
         }
 
         // Compute JMT updates using an overlay
-        let (base_version, base_root) = {
-            let jmt = self.jmt.read().unwrap();
-            (jmt.current_version, jmt.current_root_hash)
-        };
+        let (base_version, base_root) = self.read_jmt_metadata();
 
         let overlay = OverlayTreeStore::new(self);
         let parent_version = if base_version == 0 {
@@ -817,13 +789,6 @@ impl RocksDbStorage {
         self.db
             .write(batch)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
-
-        // Update in-memory JMT state
-        {
-            let mut jmt = self.jmt.write().unwrap();
-            jmt.current_version = new_version;
-            jmt.current_root_hash = new_root;
-        }
 
         let elapsed = start.elapsed();
         metrics::record_rocksdb_write(elapsed.as_secs_f64());
@@ -895,19 +860,19 @@ impl SubstateStore for RocksDbStorage {
     }
 
     fn state_version(&self) -> u64 {
-        self.jmt.read().unwrap().current_version
+        self.read_jmt_metadata().0
     }
 
     fn state_root_hash(&self) -> StateRootHash {
-        self.jmt.read().unwrap().current_root_hash
+        self.read_jmt_metadata().1
     }
 }
 
 impl RocksDbStorage {
     /// Get the current JMT root hash.
     pub fn current_jmt_root(&self) -> hyperscale_types::Hash {
-        let jmt = self.jmt.read().unwrap();
-        hyperscale_types::Hash::from_bytes(&jmt.current_root_hash.0)
+        let (_, root_hash) = self.read_jmt_metadata();
+        hyperscale_types::Hash::from_bytes(&root_hash.0)
     }
 
     /// Compute speculative state root and capture a snapshot for later application.
@@ -1121,25 +1086,23 @@ impl RocksDbStorage {
         // Verify we're applying to the expected base state BEFORE writing anything.
         // Must check BOTH root AND version. Root can be unchanged with empty commits
         // (same root, different version), but the nodes are keyed by version.
-        {
-            let jmt = self.jmt.read().unwrap();
-            if jmt.current_root_hash != cache.jmt_snapshot.base_root {
-                tracing::warn!(
-                    expected_root = ?cache.jmt_snapshot.base_root,
-                    actual_root = ?jmt.current_root_hash,
-                    "JMT snapshot base ROOT mismatch - falling back to slow path"
-                );
-                return false;
-            }
-            if jmt.current_version != cache.jmt_snapshot.base_version {
-                tracing::warn!(
-                    expected_version = cache.jmt_snapshot.base_version,
-                    actual_version = jmt.current_version,
-                    "JMT snapshot base VERSION mismatch - falling back to slow path. \
-                     This can happen with empty commits or concurrent block processing."
-                );
-                return false;
-            }
+        let (current_version, current_root_hash) = self.read_jmt_metadata();
+        if current_root_hash != cache.jmt_snapshot.base_root {
+            tracing::warn!(
+                expected_root = ?cache.jmt_snapshot.base_root,
+                actual_root = ?current_root_hash,
+                "JMT snapshot base ROOT mismatch - falling back to slow path"
+            );
+            return false;
+        }
+        if current_version != cache.jmt_snapshot.base_version {
+            tracing::warn!(
+                expected_version = cache.jmt_snapshot.base_version,
+                actual_version = current_version,
+                "JMT snapshot base VERSION mismatch - falling back to slow path. \
+                 This can happen with empty commits or concurrent block processing."
+            );
+            return false;
         }
 
         // Add JMT nodes to the WriteBatch so everything is written atomically
@@ -1213,18 +1176,9 @@ impl RocksDbStorage {
             "BFT SAFETY CRITICAL: block commit failed - node state would diverge from network",
         );
 
-        let rocksdb_elapsed = start.elapsed();
-
-        // Update in-memory JMT state
-        {
-            let mut jmt = self.jmt.write().unwrap();
-            jmt.current_version = new_version;
-            jmt.current_root_hash = new_root;
-        }
-
-        let total_elapsed = start.elapsed();
-        metrics::record_rocksdb_write(rocksdb_elapsed.as_secs_f64());
-        metrics::record_storage_operation("apply_block_commit_cache", total_elapsed.as_secs_f64());
+        let elapsed = start.elapsed();
+        metrics::record_rocksdb_write(elapsed.as_secs_f64());
+        metrics::record_storage_operation("apply_block_commit_cache", elapsed.as_secs_f64());
 
         tracing::debug!(
             new_version,
@@ -1232,8 +1186,7 @@ impl RocksDbStorage {
             nodes_count,
             stale_count,
             associations_count,
-            rocksdb_ms = rocksdb_elapsed.as_millis(),
-            total_ms = total_elapsed.as_millis(),
+            elapsed_ms = elapsed.as_millis(),
             "Applied block commit cache (single fsync)"
         );
 
@@ -2048,10 +2001,7 @@ impl RocksDbStorage {
         }
 
         // 3. Compute JMT updates using an overlay
-        let (base_version, base_root) = {
-            let jmt = self.jmt.read().unwrap();
-            (jmt.current_version, jmt.current_root_hash)
-        };
+        let (base_version, base_root) = self.read_jmt_metadata();
 
         let overlay = OverlayTreeStore::new(self);
         let parent_version = if base_version == 0 {
@@ -2113,13 +2063,6 @@ impl RocksDbStorage {
         self.db.write_opt(batch, &write_opts).expect(
             "BFT SAFETY CRITICAL: certificate commit failed - node state would diverge from network",
         );
-
-        // 6. Update in-memory JMT state
-        {
-            let mut jmt = self.jmt.write().unwrap();
-            jmt.current_version = new_version;
-            jmt.current_root_hash = new_root;
-        }
 
         tracing::debug!(
             tx_hash = %certificate.transaction_hash,
@@ -2324,7 +2267,7 @@ impl RocksDbStorage {
     pub fn run_jmt_gc(&self) -> usize {
         let start = Instant::now();
 
-        let current_version = self.jmt.read().unwrap().current_version;
+        let (current_version, _) = self.read_jmt_metadata();
 
         // Calculate the cutoff version - delete stale parts older than this
         let cutoff_version = current_version.saturating_sub(self.state_version_history_length);
