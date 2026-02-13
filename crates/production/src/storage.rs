@@ -11,7 +11,6 @@
 //! JMT data is stored in dedicated column families (`jmt_nodes`, `jmt_meta`).
 //! On each commit, the JMT is updated and a new state root hash is computed.
 
-use crate::metrics;
 use hyperscale_engine::{
     encode_jmt_key, keys, put_at_next_version, AssociatedSubstateValue,
     CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
@@ -19,6 +18,7 @@ use hyperscale_engine::{
     PartitionEntry, ReadableTreeStore, StaleTreePart, StateRootHash, StoredTreeNodeKey,
     SubstateDatabase, SubstateStore, TreeNode, VersionedTreeNode, WriteableTreeStore,
 };
+use hyperscale_metrics as metrics;
 use hyperscale_types::NodeId;
 use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, Snapshot, WriteBatch, DB};
 use sbor::prelude::*;
@@ -298,7 +298,7 @@ impl SubstateDatabase for RocksDbStorage {
         let key = keys::to_storage_key(partition_key, sort_key);
         let result = self.db.get(&key).ok().flatten();
         let elapsed = start.elapsed();
-        metrics::record_rocksdb_read(elapsed.as_secs_f64());
+        metrics::record_storage_read(elapsed.as_secs_f64());
 
         // Record span fields
         let span = tracing::Span::current();
@@ -791,7 +791,7 @@ impl RocksDbStorage {
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
 
         let elapsed = start.elapsed();
-        metrics::record_rocksdb_write(elapsed.as_secs_f64());
+        metrics::record_storage_write(elapsed.as_secs_f64());
 
         // Record span fields
         let span = tracing::Span::current();
@@ -1177,7 +1177,7 @@ impl RocksDbStorage {
         );
 
         let elapsed = start.elapsed();
-        metrics::record_rocksdb_write(elapsed.as_secs_f64());
+        metrics::record_storage_write(elapsed.as_secs_f64());
         metrics::record_storage_operation("apply_block_commit_cache", elapsed.as_secs_f64());
 
         tracing::debug!(
@@ -1299,7 +1299,7 @@ impl RocksDbStorage {
             .expect("block persistence failed - cannot maintain chain state");
 
         let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_rocksdb_write(elapsed);
+        metrics::record_storage_write(elapsed);
         metrics::record_storage_operation("put_block", elapsed);
         metrics::record_block_persisted();
     }
@@ -1325,7 +1325,7 @@ impl RocksDbStorage {
             }
         };
         let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_rocksdb_read(elapsed);
+        metrics::record_storage_read(elapsed);
         metrics::record_storage_operation("get_block", elapsed);
         result
     }
@@ -1406,7 +1406,7 @@ impl RocksDbStorage {
             .flatten()
             .and_then(|v| sbor::basic_decode(&v).ok());
 
-        metrics::record_rocksdb_read(start.elapsed().as_secs_f64());
+        metrics::record_storage_read(start.elapsed().as_secs_f64());
         result
     }
 
@@ -1435,7 +1435,7 @@ impl RocksDbStorage {
             .collect();
 
         let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_rocksdb_read(elapsed);
+        metrics::record_storage_read(elapsed);
         metrics::record_storage_operation("get_transactions_batch", elapsed);
 
         txs
@@ -1505,7 +1505,7 @@ impl RocksDbStorage {
             .expect("block persistence failed - cannot maintain chain state");
 
         let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_rocksdb_write(elapsed);
+        metrics::record_storage_write(elapsed);
         metrics::record_storage_operation("put_block_denormalized", elapsed);
         metrics::record_block_persisted();
         metrics::record_transactions_persisted(block.transaction_count());
@@ -1583,7 +1583,7 @@ impl RocksDbStorage {
         };
 
         let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_rocksdb_read(elapsed);
+        metrics::record_storage_read(elapsed);
         metrics::record_storage_operation("get_block_denormalized", elapsed);
 
         Some((block, metadata.qc))
@@ -1611,7 +1611,7 @@ impl RocksDbStorage {
             .and_then(|v| sbor::basic_decode(&v).ok())?;
 
         let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_rocksdb_read(elapsed);
+        metrics::record_storage_read(elapsed);
         metrics::record_storage_operation("get_block_metadata", elapsed);
 
         Some(metadata)
@@ -1692,7 +1692,7 @@ impl RocksDbStorage {
         };
 
         let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_rocksdb_read(elapsed);
+        metrics::record_storage_read(elapsed);
         metrics::record_storage_operation("get_block_for_sync_complete", elapsed);
 
         Some((block, metadata.qc))
@@ -1846,7 +1846,7 @@ impl RocksDbStorage {
             .and_then(|v| sbor::basic_decode(&v).ok());
 
         let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_rocksdb_read(elapsed);
+        metrics::record_storage_read(elapsed);
         metrics::record_storage_operation("get_chain_metadata", elapsed);
 
         (height, hash, qc)
@@ -1914,7 +1914,7 @@ impl RocksDbStorage {
             .collect();
 
         let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_rocksdb_read(elapsed);
+        metrics::record_storage_read(elapsed);
         metrics::record_storage_operation("get_certificates_batch", elapsed);
 
         certs
@@ -2073,7 +2073,7 @@ impl RocksDbStorage {
         );
 
         let elapsed = start.elapsed();
-        metrics::record_rocksdb_write(elapsed.as_secs_f64());
+        metrics::record_storage_write(elapsed.as_secs_f64());
         metrics::record_storage_operation("commit_cert_writes", elapsed.as_secs_f64());
         metrics::record_storage_batch_size(write_count);
         metrics::record_certificate_persisted();
@@ -2126,7 +2126,7 @@ impl RocksDbStorage {
             .expect("BFT SAFETY CRITICAL: vote persistence failed - cannot continue safely");
 
         let elapsed = start.elapsed();
-        metrics::record_rocksdb_write(elapsed.as_secs_f64());
+        metrics::record_storage_write(elapsed.as_secs_f64());
         metrics::record_storage_operation("put_vote", elapsed.as_secs_f64());
         metrics::record_vote_persisted();
 

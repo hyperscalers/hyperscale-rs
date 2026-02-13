@@ -1,0 +1,9 @@
+[package]
+name = "hyperscale-metrics-prometheus"
+version.workspace = true
+edition.workspace = true
+description = "Prometheus metrics recorder for hyperscale"
+
+[dependencies]
+hyperscale-metrics.workspace = true
+prometheus = "0.14.0"

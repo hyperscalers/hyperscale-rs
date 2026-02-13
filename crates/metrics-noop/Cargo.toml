@@ -1,0 +1,8 @@
+[package]
+name = "hyperscale-metrics-noop"
+version.workspace = true
+edition.workspace = true
+description = "No-op metrics recorder for hyperscale"
+
+[dependencies]
+hyperscale-metrics.workspace = true

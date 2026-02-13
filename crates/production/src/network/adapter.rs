@@ -10,13 +10,13 @@ use super::codec::CodecError;
 use super::codec_pool::CodecPoolHandle;
 use super::config::Libp2pConfig;
 use super::topic::Topic;
-use crate::metrics;
 use crate::network::config::VersionInteroperabilityMode;
 use crate::validation_batcher::ValidationBatcherHandle;
 use dashmap::DashMap;
 use futures::future::Either;
 use futures::{FutureExt, StreamExt};
 use hyperscale_core::{Event, OutboundMessage};
+use hyperscale_metrics as metrics;
 use hyperscale_types::{Bls12381G1PublicKey, MessagePriority, ShardGroupId, ValidatorId};
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::{OrTransport, Transport};
@@ -1199,7 +1199,7 @@ impl Libp2pAdapter {
                             peers = swarm.connected_peers().count(),
                             "Failed to publish message to gossipsub topic - message may be lost"
                         );
-                        crate::metrics::record_gossipsub_publish_failure(&topic_ident.to_string());
+                        metrics::record_gossipsub_publish_failure(&topic_ident.to_string());
                     }
                 } else {
                     trace!(topic = %topic_ident, data_len, "Published message to gossipsub topic");

@@ -34,11 +34,11 @@
 //! - Delivering results to BFT
 //! - Persisting to storage
 
-use crate::metrics;
 use crate::network::{RequestManager, RequestPriority};
 use crate::storage::RocksDbStorage;
 use hyperscale_core::Event;
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
+use hyperscale_metrics as metrics;
 use hyperscale_types::{Hash, RoutableTransaction, TransactionCertificate, ValidatorId};
 use libp2p::PeerId;
 use std::collections::{HashMap, HashSet};
@@ -348,7 +348,7 @@ impl FetchManager {
 
         let state = BlockFetchState::new(block_hash, FetchKind::Transaction, proposer, tx_hashes);
         self.tx_fetches.insert(block_hash, state);
-        metrics::record_fetch_started(FetchKind::Transaction);
+        metrics::record_fetch_started(FetchKind::Transaction.as_str());
     }
 
     /// Request certificates for a pending block.
@@ -390,7 +390,7 @@ impl FetchManager {
 
         let state = BlockFetchState::new(block_hash, FetchKind::Certificate, proposer, cert_hashes);
         self.cert_fetches.insert(block_hash, state);
-        metrics::record_fetch_started(FetchKind::Certificate);
+        metrics::record_fetch_started(FetchKind::Certificate.as_str());
     }
 
     /// Cancel a fetch for a block.
@@ -493,7 +493,7 @@ impl FetchManager {
             "Received transactions"
         );
 
-        metrics::record_fetch_items_received(FetchKind::Transaction, received_count);
+        metrics::record_fetch_items_received(FetchKind::Transaction.as_str(), received_count);
 
         // Deliver to BFT
         if !transactions.is_empty() {
@@ -510,7 +510,7 @@ impl FetchManager {
         if state.is_complete() {
             info!(?block_hash, "Transaction fetch complete");
             self.tx_fetches.remove(&block_hash);
-            metrics::record_fetch_completed(FetchKind::Transaction);
+            metrics::record_fetch_completed(FetchKind::Transaction.as_str());
         }
     }
 
@@ -542,7 +542,7 @@ impl FetchManager {
             "Received certificates"
         );
 
-        metrics::record_fetch_items_received(FetchKind::Certificate, received_count);
+        metrics::record_fetch_items_received(FetchKind::Certificate.as_str(), received_count);
 
         // Persist to storage
         if !certificates.is_empty() {
@@ -570,7 +570,7 @@ impl FetchManager {
         if state.is_complete() {
             info!(?block_hash, "Certificate fetch complete");
             self.cert_fetches.remove(&block_hash);
-            metrics::record_fetch_completed(FetchKind::Certificate);
+            metrics::record_fetch_completed(FetchKind::Certificate.as_str());
         }
     }
 
@@ -589,7 +589,7 @@ impl FetchManager {
             error,
             "Fetch operation failed"
         );
-        metrics::record_fetch_failed(kind);
+        metrics::record_fetch_failed(kind.as_str());
 
         // Mark the hashes as no longer in-flight so they can be retried
         let state = match kind {
@@ -777,7 +777,7 @@ impl FetchManager {
         };
 
         let elapsed = start.elapsed();
-        metrics::record_fetch_latency(FetchKind::Transaction, elapsed);
+        metrics::record_fetch_latency(FetchKind::Transaction.as_str(), elapsed.as_secs_f64());
 
         // Decode response
         match sbor::basic_decode::<GetTransactionsResponse>(&response_bytes) {
@@ -828,7 +828,7 @@ impl FetchManager {
         };
 
         let elapsed = start.elapsed();
-        metrics::record_fetch_latency(FetchKind::Certificate, elapsed);
+        metrics::record_fetch_latency(FetchKind::Certificate.as_str(), elapsed.as_secs_f64());
 
         // Decode response
         match sbor::basic_decode::<GetCertificatesResponse>(&response_bytes) {

@@ -1,0 +1,5 @@
+[package]
+name = "hyperscale-metrics"
+version.workspace = true
+edition.workspace = true
+description = "Metrics traits and facade for hyperscale"

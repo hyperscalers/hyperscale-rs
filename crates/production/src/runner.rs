@@ -15,6 +15,7 @@ use crate::timers::TimerManager;
 use hyperscale_bft::BftConfig;
 use hyperscale_engine::{NetworkDefinition, RadixExecutor};
 use hyperscale_mempool::MempoolConfig;
+use hyperscale_metrics as metrics;
 use hyperscale_types::BlockHeight;
 use quick_cache::sync::Cache as QuickCache;
 
@@ -635,6 +636,9 @@ impl ProductionRunnerBuilder {
     ///
     /// Returns an error if any required field is missing or if network setup fails.
     pub async fn build(self) -> Result<ProductionRunner, RunnerError> {
+        // Install the Prometheus metrics backend before anything records metrics.
+        hyperscale_metrics_prometheus::install();
+
         // Extract required fields
         let topology = self
             .topology
@@ -1368,7 +1372,7 @@ impl ProductionRunner {
                 // METRICS: Check early to avoid starvation under load (non-blocking, fast)
                 _ = metrics_tick.tick() => {
                     // Update thread pool queue depths (non-blocking)
-                    crate::metrics::set_pool_queue_depths(
+                    metrics::set_pool_queue_depths(
                         self.thread_pools.consensus_crypto_queue_depth(),
                         self.thread_pools.crypto_queue_depth(),
                         self.thread_pools.tx_validation_queue_depth(),
@@ -1377,7 +1381,7 @@ impl ProductionRunner {
 
                     // Update event channel depths (non-blocking)
                     // Note: inbound requests are handled by InboundRouter task
-                    crate::metrics::set_channel_depths(&crate::metrics::ChannelDepths {
+                    metrics::set_channel_depths(&metrics::ChannelDepths {
                         callback: self.callback_rx.len(),
                         consensus: self.consensus_rx.len(),
                         validated_tx: self.validated_tx_rx.len(),
@@ -1389,18 +1393,18 @@ impl ProductionRunner {
                     });
 
                     // Update sync status (non-blocking)
-                    crate::metrics::set_sync_status(
+                    metrics::set_sync_status(
                         self.sync_manager.blocks_behind(),
                         self.sync_manager.is_syncing(),
                     );
 
                     // Update fetch status (non-blocking)
                     let fetch_status = self.fetch_manager.status();
-                    crate::metrics::set_fetch_in_flight(fetch_status.in_flight_operations);
+                    metrics::set_fetch_in_flight(fetch_status.in_flight_operations);
 
                     // Update peer count using cached value (non-blocking)
                     let peer_count = self.network.cached_peer_count();
-                    crate::metrics::set_libp2p_peers(peer_count);
+                    metrics::set_libp2p_peers(peer_count);
 
                     // Update RPC status with peer count (non-blocking: skip if contended)
                     if let Some(ref rpc_status) = self.rpc_status {
@@ -1411,25 +1415,26 @@ impl ProductionRunner {
 
                     // Update BFT metrics (view changes, round)
                     let bft_stats = self.state.bft().stats();
-                    crate::metrics::set_bft_stats(&bft_stats);
+                    metrics::set_bft_round(bft_stats.current_round);
+                    metrics::set_view_changes(bft_stats.view_changes);
 
                     // Update speculative execution metrics
                     let (started, hits, late_hits, misses, invalidated) =
                         self.state.execution_mut().take_speculative_metrics();
                     if started > 0 {
-                        crate::metrics::record_speculative_execution_started(started);
+                        metrics::record_speculative_execution_started(started);
                     }
                     if hits > 0 {
-                        crate::metrics::record_speculative_execution_cache_hit(hits);
+                        metrics::record_speculative_execution_cache_hit(hits);
                     }
                     if late_hits > 0 {
-                        crate::metrics::record_speculative_execution_late_hit(late_hits);
+                        metrics::record_speculative_execution_late_hit(late_hits);
                     }
                     if misses > 0 {
-                        crate::metrics::record_speculative_execution_cache_miss(misses);
+                        metrics::record_speculative_execution_cache_miss(misses);
                     }
                     if invalidated > 0 {
-                        crate::metrics::record_speculative_execution_invalidated(invalidated);
+                        metrics::record_speculative_execution_invalidated(invalidated);
                     }
 
                     // Update mempool snapshot for RPC queries (non-blocking: skip if contended)
@@ -1445,13 +1450,13 @@ impl ProductionRunner {
                         let at_pending_limit = mempool.at_pending_limit();
 
                         // Update Prometheus metrics
-                        crate::metrics::set_mempool_size(total);
-                        crate::metrics::set_lock_contention_from_stats(&stats);
+                        metrics::set_mempool_size(total);
+                        metrics::set_lock_contention(stats.deferred_count, stats.contention_ratio());
 
                         // Backpressure metrics - use mempool's view of in-flight TXs
                         let in_flight = mempool.in_flight();
-                        crate::metrics::set_in_flight(in_flight);
-                        crate::metrics::set_backpressure_active(mempool.at_in_flight_limit());
+                        metrics::set_in_flight(in_flight);
+                        metrics::set_backpressure_active(mempool.at_in_flight_limit());
 
                         if let Ok(mut snap) = snapshot.try_write() {
                             snap.pending_count = stats.pending_count as usize;
@@ -2014,7 +2019,7 @@ impl ProductionRunner {
                         tx_hash = ?vote.transaction_hash,
                         "CRITICAL: Failed to dispatch state vote - dispatcher channel closed"
                     );
-                    crate::metrics::increment_dispatch_failures("state_vote");
+                    metrics::increment_dispatch_failures("state_vote");
                 }
             }
 
@@ -2032,7 +2037,7 @@ impl ProductionRunner {
                         tx_hash = ?certificate.transaction_hash,
                         "CRITICAL: Failed to dispatch state certificate - dispatcher channel closed"
                     );
-                    crate::metrics::increment_dispatch_failures("state_certificate");
+                    metrics::increment_dispatch_failures("state_certificate");
                 }
             }
 
@@ -2050,7 +2055,7 @@ impl ProductionRunner {
                         tx_hash = ?provision.transaction_hash,
                         "CRITICAL: Failed to dispatch state provision - dispatcher channel closed"
                     );
-                    crate::metrics::increment_dispatch_failures("state_provision");
+                    metrics::increment_dispatch_failures("state_provision");
                 }
             }
 
@@ -2126,7 +2131,7 @@ impl ProductionRunner {
                                 all_signatures.push(vote.signature);
                                 all_verified.push((*idx, vote.clone(), *power));
                             } else {
-                                crate::metrics::record_signature_verification_failure();
+                                metrics::record_signature_verification_failure();
                                 tracing::warn!(
                                     voter = ?vote.voter,
                                     block_hash = ?block_hash,
@@ -2180,7 +2185,7 @@ impl ProductionRunner {
                             }
                         };
 
-                        crate::metrics::record_signature_verification_latency(
+                        metrics::record_signature_verification_latency(
                             "qc_build",
                             start.elapsed().as_secs_f64(),
                         );
@@ -2196,7 +2201,7 @@ impl ProductionRunner {
                             .expect("callback channel closed");
                     } else {
                         // No quorum with valid votes - return verified votes for later
-                        crate::metrics::record_signature_verification_latency(
+                        metrics::record_signature_verification_latency(
                             "vote_batch",
                             start.elapsed().as_secs_f64(),
                         );
@@ -2299,7 +2304,7 @@ impl ProductionRunner {
                                     signer_indices.push(idx);
                                 }
                             } else {
-                                crate::metrics::record_signature_verification_failure();
+                                metrics::record_signature_verification_failure();
                                 tracing::warn!(
                                     tx_hash = %tx_hash,
                                     validator = provision.validator_id.0,
@@ -2334,7 +2339,7 @@ impl ProductionRunner {
                         (verified, proof)
                     };
 
-                    crate::metrics::record_signature_verification_latency(
+                    metrics::record_signature_verification_latency(
                         "provision_batch_verify_aggregate",
                         start.elapsed().as_secs_f64(),
                     );
@@ -2415,7 +2420,7 @@ impl ProductionRunner {
                         voting_power: voting_power.0,
                     };
 
-                    crate::metrics::record_signature_verification_latency(
+                    metrics::record_signature_verification_latency(
                         "state_cert_aggregation",
                         start.elapsed().as_secs_f64(),
                     );
@@ -2508,12 +2513,12 @@ impl ProductionRunner {
                         }
                     };
 
-                    crate::metrics::record_signature_verification_latency(
+                    metrics::record_signature_verification_latency(
                         "qc",
                         start.elapsed().as_secs_f64(),
                     );
                     if !valid {
-                        crate::metrics::record_signature_verification_failure();
+                        metrics::record_signature_verification_failure();
                     }
                     event_tx
                         .send(Event::QcSignatureVerified { block_hash, valid })
@@ -2557,12 +2562,12 @@ impl ProductionRunner {
                                 >= quorum_threshold
                     };
 
-                    crate::metrics::record_signature_verification_latency(
+                    metrics::record_signature_verification_latency(
                         "cycle_proof",
                         start.elapsed().as_secs_f64(),
                     );
                     if !valid {
-                        crate::metrics::record_signature_verification_failure();
+                        metrics::record_signature_verification_failure();
                     }
                     event_tx
                         .send(Event::CycleProofVerified {
@@ -2909,7 +2914,7 @@ impl ProductionRunner {
                             })
                             .collect()
                     });
-                    crate::metrics::record_execution_latency(start.elapsed().as_secs_f64());
+                    metrics::record_execution_latency(start.elapsed().as_secs_f64());
 
                     // Dispatch all votes (channel sends are fast, no need to parallelize)
                     for vote in votes {
@@ -2994,7 +2999,7 @@ impl ProductionRunner {
                             })
                             .collect()
                     });
-                    crate::metrics::record_speculative_execution_latency(
+                    metrics::record_speculative_execution_latency(
                         start.elapsed().as_secs_f64(),
                     );
 
@@ -3123,7 +3128,7 @@ impl ProductionRunner {
                         // Calculate latency from submission to finalization
                         let now = self.state.now();
                         let latency_secs = now.saturating_sub(added_at).as_secs_f64();
-                        crate::metrics::record_transaction_finalized(latency_secs, cross_shard);
+                        metrics::record_transaction_finalized(latency_secs, cross_shard);
                     }
                 }
 
@@ -3158,17 +3163,17 @@ impl ProductionRunner {
                     .as_millis() as u64;
                 let commit_latency_secs =
                     (now_ms.saturating_sub(block.header.timestamp)) as f64 / 1000.0;
-                crate::metrics::record_block_committed(height, commit_latency_secs);
+                metrics::record_block_committed(height, commit_latency_secs);
 
                 // Record livelock metrics for deferrals in this block.
                 for _deferral in &block.deferred {
-                    crate::metrics::record_livelock_deferral();
-                    crate::metrics::record_livelock_cycle_detected();
+                    metrics::record_livelock_deferral();
+                    metrics::record_livelock_cycle_detected();
                 }
 
                 // Update deferred transaction count gauge.
                 let livelock_stats = self.state.livelock().stats();
-                crate::metrics::set_livelock_deferred_count(livelock_stats.pending_deferrals);
+                metrics::set_livelock_deferred_count(livelock_stats.pending_deferrals);
 
                 // Update sync manager's committed height - critical for correct sync behavior.
                 // If sync completes, notify the state machine so it can resume view changes.
@@ -3595,7 +3600,7 @@ impl ProductionRunner {
             // Verified certs
             for ((cert, _, _), valid) in verifiable.into_iter().zip(verification_results) {
                 if !valid {
-                    crate::metrics::record_signature_verification_failure();
+                    metrics::record_signature_verification_failure();
                 }
                 let _ = event_tx.send(Event::StateCertificateSignatureVerified {
                     certificate: cert,
@@ -3613,14 +3618,14 @@ impl ProductionRunner {
 
             // Failed aggregation certs (invalid)
             for cert in failed_aggregation {
-                crate::metrics::record_signature_verification_failure();
+                metrics::record_signature_verification_failure();
                 let _ = event_tx.send(Event::StateCertificateSignatureVerified {
                     certificate: cert,
                     valid: false,
                 });
             }
 
-            crate::metrics::record_signature_verification_latency(
+            metrics::record_signature_verification_latency(
                 "state_cert",
                 start.elapsed().as_secs_f64(),
             );
@@ -3691,7 +3696,7 @@ impl ProductionRunner {
                         .or_default()
                         .push((vote, power));
                 } else {
-                    crate::metrics::record_signature_verification_failure();
+                    metrics::record_signature_verification_failure();
                 }
             }
 
@@ -3705,7 +3710,7 @@ impl ProductionRunner {
                     .expect("callback channel closed - Loss of this event would cause a deadlock");
             }
 
-            crate::metrics::record_signature_verification_latency(
+            metrics::record_signature_verification_latency(
                 "state_vote_batch",
                 start.elapsed().as_secs_f64(),
             );
@@ -3828,7 +3833,7 @@ impl ProductionRunner {
                 verifiable.into_iter().zip(verification_results)
             {
                 if !valid {
-                    crate::metrics::record_signature_verification_failure();
+                    metrics::record_signature_verification_failure();
                 }
                 let _ = event_tx.send(Event::GossipedCertificateSignatureVerified {
                     tx_hash,
@@ -3848,7 +3853,7 @@ impl ProductionRunner {
 
             // Failed aggregation certs (invalid)
             for (tx_hash, shard) in failed_aggregation {
-                crate::metrics::record_signature_verification_failure();
+                metrics::record_signature_verification_failure();
                 let _ = event_tx.send(Event::GossipedCertificateSignatureVerified {
                     tx_hash,
                     shard,
@@ -3856,7 +3861,7 @@ impl ProductionRunner {
                 });
             }
 
-            crate::metrics::record_signature_verification_latency(
+            metrics::record_signature_verification_latency(
                 "gossiped_cert",
                 start.elapsed().as_secs_f64(),
             );
@@ -3875,7 +3880,7 @@ impl ProductionRunner {
                 crypto_queue_depth = self.thread_pools.crypto_queue_depth(),
                 "Gossiped cert batch rejected due to crypto pool backpressure"
             );
-            crate::metrics::record_backpressure_event("gossiped_cert_verification");
+            metrics::record_backpressure_event("gossiped_cert_verification");
         }
     }
 
@@ -3966,7 +3971,7 @@ impl ProductionRunner {
                     .collect()
             });
 
-            crate::metrics::record_execution_latency(start.elapsed().as_secs_f64());
+            metrics::record_execution_latency(start.elapsed().as_secs_f64());
 
             if batch_size > 1 {
                 tracing::debug!(

@@ -1,31 +1,30 @@
-//! Production metrics using native Prometheus client.
+//! Prometheus metrics backend for Hyperscale.
 //!
-//! Metrics are domain-specific rather than generic event counters.
-//! Use traces for event-level granularity during investigations.
+//! Implements [`hyperscale_metrics::MetricsRecorder`] using native Prometheus
+//! counters, gauges, and histograms.
 //!
-//! Note: Some metrics functions are not yet hooked up but are intentionally
-//! kept for future integration. The dead_code allow is intentional here.
+//! # Usage
+//!
+//! Call [`install()`] once at startup before any metrics are recorded:
+//! ```ignore
+//! hyperscale_metrics_prometheus::install();
+//! ```
 #![allow(dead_code)]
 
+use hyperscale_metrics::{ChannelDepths, MetricsRecorder};
 use prometheus::{
     register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
     register_histogram_vec, Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec,
 };
-use std::sync::OnceLock;
 
-static METRICS: OnceLock<Metrics> = OnceLock::new();
-
-/// Domain-specific metrics for production monitoring.
+/// Domain-specific Prometheus metrics for production monitoring.
 pub struct Metrics {
     // === Consensus ===
     pub blocks_committed: Counter,
     pub block_commit_latency: Histogram,
     pub block_height: Gauge,
-    /// Current BFT round number within the current height.
     pub round: Gauge,
-    /// Total number of view changes (round advances due to timeout).
     pub view_changes: Gauge,
-    /// Build information with version label.
     pub build_info: GaugeVec,
 
     // === Transactions ===
@@ -33,11 +32,8 @@ pub struct Metrics {
     pub mempool_size: Gauge,
 
     // === Backpressure ===
-    /// Number of transactions currently holding state locks (Committed or Executed status).
     pub in_flight: Gauge,
-    /// Whether backpressure limit is currently active (0 or 1).
     pub backpressure_active: Gauge,
-    /// Number of TXs with commitment proofs attached in last proposal.
     pub txs_with_commitment_proof: Gauge,
 
     // === Infrastructure ===
@@ -55,38 +51,23 @@ pub struct Metrics {
     pub speculative_execution_invalidated: Counter,
 
     // === Thread Pools ===
-    /// Queue depth of the consensus crypto pool (block votes, QC verification).
-    /// This pool is liveness-critical and should remain near zero under load.
     pub consensus_crypto_pool_queue_depth: Gauge,
-    /// Queue depth of the general crypto pool (provisions, state votes).
     pub crypto_pool_queue_depth: Gauge,
-    /// Queue depth of the tx validation pool (transaction signature verification).
-    /// Isolated from general crypto to prevent tx floods from blocking execution progress.
     pub tx_validation_pool_queue_depth: Gauge,
     pub execution_pool_queue_depth: Gauge,
 
     // === Event Channel Depths ===
-    /// Depth of the callback channel (crypto/execution results).
     pub callback_channel_depth: Gauge,
-    /// Depth of the consensus channel (BFT network messages).
     pub consensus_channel_depth: Gauge,
-    /// Depth of the validated transactions channel.
     pub validated_tx_channel_depth: Gauge,
-    /// Depth of the RPC transaction submission channel.
     pub rpc_tx_channel_depth: Gauge,
-    /// Depth of the status channel (transaction status updates).
     pub status_channel_depth: Gauge,
-    /// Depth of the inbound sync request channel.
     pub sync_request_channel_depth: Gauge,
-    /// Depth of the inbound transaction fetch request channel.
     pub tx_request_channel_depth: Gauge,
-    /// Depth of the inbound certificate fetch request channel.
     pub cert_request_channel_depth: Gauge,
 
     // === Transaction Ingress ===
-    /// Total transactions rejected because node is syncing.
     pub tx_ingress_rejected_syncing: Counter,
-    /// Total transactions rejected because pending count is too high.
     pub tx_ingress_rejected_pending_limit: Counter,
 
     // === Storage ===
@@ -119,7 +100,7 @@ pub struct Metrics {
     pub sync_response_errors: CounterVec,
     pub sync_peers_banned: Counter,
 
-    // === Fetch (transactions/certificates) ===
+    // === Fetch ===
     pub fetch_started: CounterVec,
     pub fetch_completed: CounterVec,
     pub fetch_failed: CounterVec,
@@ -143,31 +124,20 @@ pub struct Metrics {
     pub transactions_rejected: CounterVec,
 
     // === Cross-Shard Message Delivery ===
-    /// Failures to dispatch cross-shard messages (channel closed).
     pub dispatch_failures: CounterVec,
-    /// Cross-shard message batches that failed initial broadcast (queued for retry).
     pub broadcast_failures: Counter,
-    /// Cross-shard message batches successfully delivered after retry.
     pub broadcast_retry_successes: Counter,
-    /// Cross-shard message batches dropped after max retries.
     pub broadcast_messages_dropped: Counter,
-    /// Current size of the broadcast retry queue.
     pub broadcast_retry_queue_size: Gauge,
-    /// Gossipsub publish failures by topic.
     pub gossipsub_publish_failures: CounterVec,
-    /// Network request retries by request type (block, transaction, certificate).
     pub network_request_retries: CounterVec,
-    /// Early arrival buffer evictions.
     pub early_arrival_evictions: Counter,
-    /// Backpressure events by source (e.g., "gossiped_cert_verification").
     pub backpressure_events: CounterVec,
-    /// Pending gossiped certificate verifications (waiting for batch dispatch).
     pub pending_gossiped_cert_batch_size: Gauge,
 }
 
 impl Metrics {
     fn new() -> Self {
-        // Latency buckets: 1ms to 60s
         let latency_buckets = vec![
             0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
         ];
@@ -184,6 +154,7 @@ impl Metrics {
 
         Self {
             build_info,
+
             // Consensus
             blocks_committed: register_counter!(
                 "hyperscale_blocks_committed_total",
@@ -552,7 +523,7 @@ impl Metrics {
             )
             .unwrap(),
 
-            // Fetch (transactions/certificates)
+            // Fetch
             fetch_started: register_counter_vec!(
                 "hyperscale_fetch_started_total",
                 "Total fetch operations started",
@@ -722,556 +693,451 @@ impl Metrics {
     }
 }
 
-/// Get or initialize the global metrics instance.
-pub fn metrics() -> &'static Metrics {
-    METRICS.get_or_init(Metrics::new)
+/// Prometheus-backed metrics recorder.
+pub struct PrometheusRecorder {
+    metrics: Metrics,
 }
 
-/// Record a block committed.
-pub fn record_block_committed(height: u64, commit_latency_secs: f64) {
-    let m = metrics();
-    m.blocks_committed.inc();
-    m.block_commit_latency.observe(commit_latency_secs);
-    m.block_height.set(height as f64);
+impl PrometheusRecorder {
+    fn new() -> Self {
+        Self {
+            metrics: Metrics::new(),
+        }
+    }
 }
 
-/// Record a transaction finalized.
-pub fn record_transaction_finalized(latency_secs: f64, cross_shard: bool) {
-    let label = if cross_shard { "true" } else { "false" };
-    metrics()
-        .transactions_finalized
-        .with_label_values(&[label])
-        .observe(latency_secs);
+impl MetricsRecorder for PrometheusRecorder {
+    // ── Storage ──────────────────────────────────────────────────────
+
+    fn record_storage_read(&self, latency_secs: f64) {
+        self.metrics.rocksdb_read_latency.observe(latency_secs);
+    }
+
+    fn record_storage_write(&self, latency_secs: f64) {
+        self.metrics.rocksdb_write_latency.observe(latency_secs);
+    }
+
+    fn record_storage_operation(&self, operation: &str, latency_secs: f64) {
+        self.metrics
+            .storage_operation_latency
+            .with_label_values(&[operation])
+            .observe(latency_secs);
+    }
+
+    fn record_storage_batch_size(&self, size: usize) {
+        self.metrics.storage_batch_size.observe(size as f64);
+    }
+
+    fn record_block_persisted(&self) {
+        self.metrics.storage_blocks_persisted.inc();
+    }
+
+    fn record_certificate_persisted(&self) {
+        self.metrics.storage_certificates_persisted.inc();
+    }
+
+    fn record_vote_persisted(&self) {
+        self.metrics.storage_votes_persisted.inc();
+    }
+
+    fn record_transactions_persisted(&self, count: usize) {
+        self.metrics
+            .storage_transactions_persisted
+            .inc_by(count as f64);
+    }
+
+    // ── Consensus ────────────────────────────────────────────────────
+
+    fn record_block_committed(&self, height: u64, commit_latency_secs: f64) {
+        self.metrics.blocks_committed.inc();
+        self.metrics
+            .block_commit_latency
+            .observe(commit_latency_secs);
+        self.metrics.block_height.set(height as f64);
+    }
+
+    fn record_transaction_finalized(&self, latency_secs: f64, cross_shard: bool) {
+        let label = if cross_shard { "true" } else { "false" };
+        self.metrics
+            .transactions_finalized
+            .with_label_values(&[label])
+            .observe(latency_secs);
+    }
+
+    fn set_block_height(&self, height: u64) {
+        self.metrics.block_height.set(height as f64);
+    }
+
+    fn set_bft_round(&self, round: u64) {
+        self.metrics.round.set(round as f64);
+    }
+
+    fn set_view_changes(&self, count: u64) {
+        self.metrics.view_changes.set(count as f64);
+    }
+
+    fn set_mempool_size(&self, size: usize) {
+        self.metrics.mempool_size.set(size as f64);
+    }
+
+    fn set_in_flight(&self, count: usize) {
+        self.metrics.in_flight.set(count as f64);
+    }
+
+    fn set_backpressure_active(&self, active: bool) {
+        self.metrics
+            .backpressure_active
+            .set(if active { 1.0 } else { 0.0 });
+    }
+
+    fn set_txs_with_commitment_proof(&self, count: usize) {
+        self.metrics.txs_with_commitment_proof.set(count as f64);
+    }
+
+    // ── Infrastructure ───────────────────────────────────────────────
+
+    fn set_pool_queue_depths(
+        &self,
+        consensus_crypto: usize,
+        crypto: usize,
+        tx_validation: usize,
+        execution: usize,
+    ) {
+        self.metrics
+            .consensus_crypto_pool_queue_depth
+            .set(consensus_crypto as f64);
+        self.metrics.crypto_pool_queue_depth.set(crypto as f64);
+        self.metrics
+            .tx_validation_pool_queue_depth
+            .set(tx_validation as f64);
+        self.metrics
+            .execution_pool_queue_depth
+            .set(execution as f64);
+    }
+
+    fn set_channel_depths(&self, depths: &ChannelDepths) {
+        self.metrics
+            .callback_channel_depth
+            .set(depths.callback as f64);
+        self.metrics
+            .consensus_channel_depth
+            .set(depths.consensus as f64);
+        self.metrics
+            .validated_tx_channel_depth
+            .set(depths.validated_tx as f64);
+        self.metrics.rpc_tx_channel_depth.set(depths.rpc_tx as f64);
+        self.metrics.status_channel_depth.set(depths.status as f64);
+        self.metrics
+            .sync_request_channel_depth
+            .set(depths.sync_request as f64);
+        self.metrics
+            .tx_request_channel_depth
+            .set(depths.tx_request as f64);
+        self.metrics
+            .cert_request_channel_depth
+            .set(depths.cert_request as f64);
+    }
+
+    fn record_execution_latency(&self, latency_secs: f64) {
+        self.metrics.execution_latency.observe(latency_secs);
+    }
+
+    fn record_speculative_execution_latency(&self, latency_secs: f64) {
+        self.metrics
+            .speculative_execution_latency
+            .observe(latency_secs);
+    }
+
+    fn record_speculative_execution_started(&self, count: u64) {
+        self.metrics
+            .speculative_execution_started
+            .inc_by(count as f64);
+    }
+
+    fn record_speculative_execution_cache_hit(&self, count: u64) {
+        self.metrics
+            .speculative_execution_cache_hit
+            .inc_by(count as f64);
+    }
+
+    fn record_speculative_execution_late_hit(&self, count: u64) {
+        self.metrics
+            .speculative_execution_late_hit
+            .inc_by(count as f64);
+    }
+
+    fn record_speculative_execution_cache_miss(&self, count: u64) {
+        self.metrics
+            .speculative_execution_cache_miss
+            .inc_by(count as f64);
+    }
+
+    fn record_speculative_execution_invalidated(&self, count: u64) {
+        self.metrics
+            .speculative_execution_invalidated
+            .inc_by(count as f64);
+    }
+
+    fn record_signature_verification_latency(&self, sig_type: &str, latency_secs: f64) {
+        self.metrics
+            .signature_verification_latency
+            .with_label_values(&[sig_type])
+            .observe(latency_secs);
+    }
+
+    fn record_signature_verification_failure(&self) {
+        self.metrics.signature_verification_failures.inc();
+    }
+
+    // ── Network ──────────────────────────────────────────────────────
+
+    fn record_network_message_sent(&self) {
+        self.metrics.network_messages_sent.inc();
+    }
+
+    fn record_network_message_received(&self) {
+        self.metrics.network_messages_received.inc();
+    }
+
+    fn set_libp2p_peers(&self, count: usize) {
+        self.metrics.libp2p_peers_connected.set(count as f64);
+    }
+
+    fn record_libp2p_bandwidth(&self, bytes_in: u64, bytes_out: u64) {
+        self.metrics
+            .libp2p_bandwidth_in_bytes
+            .inc_by(bytes_in as f64);
+        self.metrics
+            .libp2p_bandwidth_out_bytes
+            .inc_by(bytes_out as f64);
+    }
+
+    fn record_pending_response_channels(&self, count: usize) {
+        self.metrics
+            .libp2p_pending_response_channels
+            .set(count as f64);
+    }
+
+    fn record_network_event_loop_panic(&self) {
+        self.metrics.libp2p_event_loop_panics.inc();
+    }
+
+    fn record_gossipsub_publish_failure(&self, topic: &str) {
+        let topic_type = topic.rsplit('/').next().unwrap_or("unknown");
+        self.metrics
+            .gossipsub_publish_failures
+            .with_label_values(&[topic_type])
+            .inc();
+    }
+
+    fn record_request_retry(&self, request_type: &str) {
+        self.metrics
+            .network_request_retries
+            .with_label_values(&[request_type])
+            .inc();
+    }
+
+    fn increment_dispatch_failures(&self, message_type: &str) {
+        self.metrics
+            .dispatch_failures
+            .with_label_values(&[message_type])
+            .inc();
+    }
+
+    fn record_broadcast_failure(&self) {
+        self.metrics.broadcast_failures.inc();
+    }
+
+    fn record_broadcast_retry_success(&self) {
+        self.metrics.broadcast_retry_successes.inc();
+    }
+
+    fn record_broadcast_message_dropped(&self) {
+        self.metrics.broadcast_messages_dropped.inc();
+    }
+
+    fn set_broadcast_retry_queue_size(&self, size: usize) {
+        self.metrics.broadcast_retry_queue_size.set(size as f64);
+    }
+
+    fn record_backpressure_event(&self, source: &str) {
+        self.metrics
+            .backpressure_events
+            .with_label_values(&[source])
+            .inc();
+    }
+
+    fn set_pending_gossiped_cert_batch_size(&self, size: usize) {
+        self.metrics
+            .pending_gossiped_cert_batch_size
+            .set(size as f64);
+    }
+
+    fn record_early_arrival_eviction(&self) {
+        self.metrics.early_arrival_evictions.inc();
+    }
+
+    // ── Sync ─────────────────────────────────────────────────────────
+
+    fn set_sync_status(&self, blocks_behind: u64, in_progress: bool) {
+        self.metrics.sync_blocks_behind.set(blocks_behind as f64);
+        self.metrics
+            .sync_in_progress
+            .set(if in_progress { 1.0 } else { 0.0 });
+    }
+
+    fn record_sync_block_downloaded(&self) {
+        self.metrics.sync_blocks_downloaded.inc();
+    }
+
+    fn record_sync_block_received_by_bft(&self) {
+        self.metrics.sync_blocks_received_by_bft.inc();
+    }
+
+    fn record_sync_block_submitted_for_verification(&self) {
+        self.metrics.sync_blocks_submitted_for_verification.inc();
+    }
+
+    fn record_sync_block_buffered(&self) {
+        self.metrics.sync_blocks_buffered.inc();
+    }
+
+    fn record_sync_block_filtered(&self, reason: &str) {
+        self.metrics
+            .sync_blocks_filtered
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    fn record_sync_block_verified(&self) {
+        self.metrics.sync_blocks_verified.inc();
+    }
+
+    fn record_sync_block_applied(&self) {
+        self.metrics.sync_blocks_applied.inc();
+    }
+
+    fn record_sync_response_error(&self, error_type: &str) {
+        self.metrics
+            .sync_response_errors
+            .with_label_values(&[error_type])
+            .inc();
+    }
+
+    fn record_sync_peer_banned(&self) {
+        self.metrics.sync_peers_banned.inc();
+    }
+
+    // ── Fetch ────────────────────────────────────────────────────────
+
+    fn record_fetch_started(&self, kind: &str) {
+        self.metrics.fetch_started.with_label_values(&[kind]).inc();
+    }
+
+    fn record_fetch_completed(&self, kind: &str) {
+        self.metrics
+            .fetch_completed
+            .with_label_values(&[kind])
+            .inc();
+    }
+
+    fn record_fetch_failed(&self, kind: &str) {
+        self.metrics.fetch_failed.with_label_values(&[kind]).inc();
+    }
+
+    fn record_fetch_items_received(&self, kind: &str, count: usize) {
+        self.metrics
+            .fetch_items_received
+            .with_label_values(&[kind])
+            .inc_by(count as f64);
+    }
+
+    fn record_fetch_latency(&self, kind: &str, latency_secs: f64) {
+        self.metrics
+            .fetch_latency
+            .with_label_values(&[kind])
+            .observe(latency_secs);
+    }
+
+    fn set_fetch_in_flight(&self, count: usize) {
+        self.metrics.fetch_in_flight.set(count as f64);
+    }
+
+    fn record_fetch_response_sent(&self, kind: &str, count: usize) {
+        self.metrics
+            .fetch_items_sent
+            .with_label_values(&[kind])
+            .inc_by(count as f64);
+    }
+
+    // ── Transaction Ingress ──────────────────────────────────────────
+
+    fn record_tx_ingress_rejected_syncing(&self) {
+        self.metrics.tx_ingress_rejected_syncing.inc();
+    }
+
+    fn record_tx_ingress_rejected_pending_limit(&self) {
+        self.metrics.tx_ingress_rejected_pending_limit.inc();
+    }
+
+    fn record_transaction_rejected(&self, reason: &str) {
+        self.metrics
+            .transactions_rejected
+            .with_label_values(&[reason])
+            .inc();
+    }
+
+    fn record_invalid_message(&self) {
+        self.metrics.invalid_messages_received.inc();
+    }
+
+    // ── Livelock ─────────────────────────────────────────────────────
+
+    fn record_livelock_cycle_detected(&self) {
+        self.metrics.livelock_cycles_detected.inc();
+    }
+
+    fn record_livelock_deferral(&self) {
+        self.metrics.livelock_deferrals.inc();
+    }
+
+    fn set_livelock_deferred_count(&self, count: usize) {
+        self.metrics
+            .livelock_deferred_transactions
+            .set(count as f64);
+    }
+
+    // ── Lock Contention ──────────────────────────────────────────────
+
+    fn set_lock_contention(&self, deferred: u64, ratio: f64) {
+        self.metrics.lock_contention_deferred.set(deferred as f64);
+        self.metrics.lock_contention_ratio.set(ratio);
+    }
 }
 
-/// Update BFT metrics from BftStats.
-pub fn set_bft_stats(stats: &hyperscale_bft::BftStats) {
-    let m = metrics();
-    m.round.set(stats.current_round as f64);
-    m.view_changes.set(stats.view_changes as f64);
-}
-
-/// Update mempool size.
-pub fn set_mempool_size(size: usize) {
-    metrics().mempool_size.set(size as f64);
-}
-
-/// Update in-flight transaction count (transactions holding state locks).
-pub fn set_in_flight(count: usize) {
-    metrics().in_flight.set(count as f64);
-}
-
-/// Update backpressure active status.
-pub fn set_backpressure_active(active: bool) {
-    metrics()
-        .backpressure_active
-        .set(if active { 1.0 } else { 0.0 });
-}
-
-/// Update count of TXs with commitment proofs.
-pub fn set_txs_with_commitment_proof(count: usize) {
-    metrics().txs_with_commitment_proof.set(count as f64);
-}
-
-/// Update thread pool queue depths.
-pub fn set_pool_queue_depths(
-    consensus_crypto: usize,
-    crypto: usize,
-    tx_validation: usize,
-    execution: usize,
-) {
-    let m = metrics();
-    m.consensus_crypto_pool_queue_depth
-        .set(consensus_crypto as f64);
-    m.crypto_pool_queue_depth.set(crypto as f64);
-    m.tx_validation_pool_queue_depth.set(tx_validation as f64);
-    m.execution_pool_queue_depth.set(execution as f64);
-}
-
-/// Channel depth statistics for the event loop.
-#[derive(Debug, Default)]
-pub struct ChannelDepths {
-    /// Callback channel (crypto/execution results).
-    pub callback: usize,
-    /// Consensus channel (BFT network messages).
-    pub consensus: usize,
-    /// Validated transactions channel.
-    pub validated_tx: usize,
-    /// RPC transaction submissions channel.
-    pub rpc_tx: usize,
-    /// Status updates channel.
-    pub status: usize,
-    /// Inbound sync request channel.
-    pub sync_request: usize,
-    /// Inbound transaction fetch request channel.
-    pub tx_request: usize,
-    /// Inbound certificate fetch request channel.
-    pub cert_request: usize,
-}
-
-/// Update event channel depths.
-pub fn set_channel_depths(depths: &ChannelDepths) {
-    let m = metrics();
-    m.callback_channel_depth.set(depths.callback as f64);
-    m.consensus_channel_depth.set(depths.consensus as f64);
-    m.validated_tx_channel_depth.set(depths.validated_tx as f64);
-    m.rpc_tx_channel_depth.set(depths.rpc_tx as f64);
-    m.status_channel_depth.set(depths.status as f64);
-    m.sync_request_channel_depth.set(depths.sync_request as f64);
-    m.tx_request_channel_depth.set(depths.tx_request as f64);
-    m.cert_request_channel_depth.set(depths.cert_request as f64);
-}
-
-/// Record a rejected transaction because the node is syncing.
-pub fn record_tx_ingress_rejected_syncing() {
-    metrics().tx_ingress_rejected_syncing.inc();
-}
-
-/// Record a rejected transaction because pending count is too high.
-pub fn record_tx_ingress_rejected_pending_limit() {
-    metrics().tx_ingress_rejected_pending_limit.inc();
-}
-
-/// Record RocksDB read latency.
-pub fn record_rocksdb_read(latency_secs: f64) {
-    metrics().rocksdb_read_latency.observe(latency_secs);
-}
-
-/// Record RocksDB write latency.
-pub fn record_rocksdb_write(latency_secs: f64) {
-    metrics().rocksdb_write_latency.observe(latency_secs);
-}
-
-/// Record storage operation latency by type.
+/// Install the Prometheus metrics recorder as the global backend.
 ///
-/// **Cardinality control**: Use only these predefined operation types:
-/// - `"put_block"` - persisting a committed block
-/// - `"put_vote"` - persisting own vote (BFT safety critical)
-/// - `"put_certificate"` - persisting a transaction certificate
-/// - `"commit_cert_writes"` - atomic certificate + state writes
-/// - `"get_block"` - fetching a block by height
-/// - `"get_certificate"` - fetching a certificate by hash
-/// - `"get_chain_metadata"` - fetching chain height/hash/qc
-/// - `"get_state_entries"` - fetching state for provisioning
-/// - `"load_recovered_state"` - crash recovery state load
-pub fn record_storage_operation(operation: &str, latency_secs: f64) {
-    metrics()
-        .storage_operation_latency
-        .with_label_values(&[operation])
-        .observe(latency_secs);
+/// Idempotent — safe to call multiple times (e.g., in tests). Only the
+/// first call creates and registers the Prometheus metrics.
+pub fn install() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        hyperscale_metrics::set_global_recorder(Box::new(PrometheusRecorder::new()));
+    });
 }
 
-/// Record the size of an atomic write batch.
-pub fn record_storage_batch_size(size: usize) {
-    metrics().storage_batch_size.observe(size as f64);
-}
-
-/// Record a vote persisted.
-pub fn record_vote_persisted() {
-    metrics().storage_votes_persisted.inc();
-}
-
-/// Record a certificate persisted.
-pub fn record_certificate_persisted() {
-    metrics().storage_certificates_persisted.inc();
-}
-
-/// Record a block persisted.
-pub fn record_block_persisted() {
-    metrics().storage_blocks_persisted.inc();
-}
-
-/// Record transactions persisted (call once per transaction).
-pub fn record_transactions_persisted(count: usize) {
-    metrics()
-        .storage_transactions_persisted
-        .inc_by(count as f64);
-}
-
-/// Update libp2p peer count.
-pub fn set_libp2p_peers(count: usize) {
-    metrics().libp2p_peers_connected.set(count as f64);
-}
-
-/// Record libp2p bandwidth.
-pub fn record_libp2p_bandwidth(bytes_in: u64, bytes_out: u64) {
-    let m = metrics();
-    m.libp2p_bandwidth_in_bytes.inc_by(bytes_in as f64);
-    m.libp2p_bandwidth_out_bytes.inc_by(bytes_out as f64);
-}
-
-/// Record number of pending response channels (for leak detection).
-pub fn record_pending_response_channels(count: usize) {
-    metrics().libp2p_pending_response_channels.set(count as f64);
-}
-
-/// Record a network event loop panic (critical error).
-pub fn record_network_event_loop_panic() {
-    metrics().libp2p_event_loop_panics.inc();
-}
-
-/// Update sync status.
-pub fn set_sync_status(blocks_behind: u64, in_progress: bool) {
-    let m = metrics();
-    m.sync_blocks_behind.set(blocks_behind as f64);
-    m.sync_in_progress.set(if in_progress { 1.0 } else { 0.0 });
-}
-
-/// Record a block downloaded during sync.
-pub fn record_sync_block_downloaded() {
-    metrics().sync_blocks_downloaded.inc();
-}
-
-/// Record a sync block received by BFT state machine.
-pub fn record_sync_block_received_by_bft() {
-    metrics().sync_blocks_received_by_bft.inc();
-}
-
-/// Record a sync block submitted for QC verification.
-pub fn record_sync_block_submitted_for_verification() {
-    metrics().sync_blocks_submitted_for_verification.inc();
-}
-
-/// Record a sync block buffered (out of order).
-pub fn record_sync_block_buffered() {
-    metrics().sync_blocks_buffered.inc();
-}
-
-/// Record a sync block filtered out.
+/// Gather and encode all registered Prometheus metrics as text format.
 ///
-/// Valid reasons: "already_committed", "qc_mismatch", "already_pending", "already_buffered"
-pub fn record_sync_block_filtered(reason: &str) {
-    metrics()
-        .sync_blocks_filtered
-        .with_label_values(&[reason])
-        .inc();
-}
-
-/// Record a sync block QC verified.
-pub fn record_sync_block_verified() {
-    metrics().sync_blocks_verified.inc();
-}
-
-/// Record a sync block applied (committed).
-pub fn record_sync_block_applied() {
-    metrics().sync_blocks_applied.inc();
-}
-
-/// Record a sync response error by type.
-///
-/// **Cardinality control**: Use only these predefined error types (from `SyncResponseError::metric_label()`):
-///
-/// Non-malicious (retry with different peer):
-/// - `"no_request"` - response when no request pending
-/// - `"peer_mismatch"` - response from unexpected peer
-/// - `"request_id_mismatch"` - wrong request ID
-/// - `"state_mismatch"` - block doesn't extend current state
-/// - `"timeout"` - sync fetch request timed out
-/// - `"network_error"` - network-level failure
-/// - `"empty"` - peer doesn't have the block (may have pruned it or has incomplete data)
-/// - `"decode_error"` - failed to decode response
-///
-/// Malicious (results in peer ban):
-/// - `"qc_hash_mismatch"` - QC doesn't match block
-/// - `"qc_height_mismatch"` - QC height wrong
-/// - `"qc_sig_invalid"` - QC signature invalid
-/// - `"qc_no_quorum"` - QC lacks quorum
-/// - `"block_hash_mismatch"` - block hash mismatch
-/// - `"block_parent_mismatch"` - block parent mismatch
-pub fn record_sync_response_error(error_type: &str) {
-    metrics()
-        .sync_response_errors
-        .with_label_values(&[error_type])
-        .inc();
-}
-
-/// Record a peer banned for malicious sync behavior.
-pub fn record_sync_peer_banned() {
-    metrics().sync_peers_banned.inc();
-}
-
-/// Record a livelock cycle detection event.
-pub fn record_livelock_cycle_detected() {
-    metrics().livelock_cycles_detected.inc();
-}
-
-/// Record a transaction deferral due to cycle detection.
-pub fn record_livelock_deferral() {
-    metrics().livelock_deferrals.inc();
-}
-
-/// Update the count of currently deferred transactions.
-pub fn set_livelock_deferred_count(count: usize) {
-    metrics().livelock_deferred_transactions.set(count as f64);
-}
-
-/// Record a signature verification failure.
-pub fn record_signature_verification_failure() {
-    metrics().signature_verification_failures.inc();
-}
-
-/// Record an invalid message received.
-pub fn record_invalid_message() {
-    metrics().invalid_messages_received.inc();
-}
-
-/// Record a transaction rejection with reason.
-///
-/// **Cardinality control**: Use only these predefined reasons to avoid
-/// label explosion in Prometheus:
-/// - `"duplicate"` - transaction already in mempool
-/// - `"invalid_signature"` - signature verification failed
-/// - `"invalid_format"` - malformed transaction
-/// - `"wrong_shard"` - transaction routed to wrong shard
-/// - `"mempool_full"` - mempool capacity exceeded
-/// - `"nonce_too_low"` - nonce already used
-/// - `"insufficient_balance"` - sender has insufficient funds
-/// - `"execution_failed"` - transaction execution rejected
-///
-/// Do NOT use dynamic strings (e.g., error messages) as reasons.
-pub fn record_transaction_rejected(reason: &str) {
-    debug_assert!(
-        matches!(
-            reason,
-            "duplicate"
-                | "invalid_signature"
-                | "invalid_format"
-                | "wrong_shard"
-                | "mempool_full"
-                | "nonce_too_low"
-                | "insufficient_balance"
-                | "execution_failed"
-        ),
-        "Unknown rejection reason: {} - add to allowed list or use existing",
-        reason
-    );
-    metrics()
-        .transactions_rejected
-        .with_label_values(&[reason])
-        .inc();
-}
-
-/// Record network message sent.
-pub fn record_network_message_sent() {
-    metrics().network_messages_sent.inc();
-}
-
-/// Record network message received.
-pub fn record_network_message_received() {
-    metrics().network_messages_received.inc();
-}
-
-/// Record signature verification latency by type.
-///
-/// Types:
-/// - "vote": Individual vote signature (BLS or Ed25519)
-/// - "qc": Aggregated QC signature (BLS aggregate)
-/// - "state_vote": State vote signature (execution layer)
-/// - "state_cert": State certificate aggregated signature
-/// - "provision": Provision signature
-pub fn record_signature_verification_latency(sig_type: &str, latency_secs: f64) {
-    metrics()
-        .signature_verification_latency
-        .with_label_values(&[sig_type])
-        .observe(latency_secs);
-}
-
-/// Record execution latency.
-pub fn record_execution_latency(latency_secs: f64) {
-    metrics().execution_latency.observe(latency_secs);
-}
-
-/// Record speculative execution latency.
-pub fn record_speculative_execution_latency(latency_secs: f64) {
-    metrics()
-        .speculative_execution_latency
-        .observe(latency_secs);
-}
-
-/// Record speculative execution started.
-pub fn record_speculative_execution_started(count: u64) {
-    metrics().speculative_execution_started.inc_by(count as f64);
-}
-
-/// Record speculative execution cache hits.
-pub fn record_speculative_execution_cache_hit(count: u64) {
-    metrics()
-        .speculative_execution_cache_hit
-        .inc_by(count as f64);
-}
-
-/// Record speculative execution late hits (commit before speculation complete).
-/// These are also counted as cache hits - this metric tracks the dedup optimization.
-pub fn record_speculative_execution_late_hit(count: u64) {
-    metrics()
-        .speculative_execution_late_hit
-        .inc_by(count as f64);
-}
-
-/// Record speculative execution cache misses.
-pub fn record_speculative_execution_cache_miss(count: u64) {
-    metrics()
-        .speculative_execution_cache_miss
-        .inc_by(count as f64);
-}
-
-/// Record speculative executions invalidated.
-pub fn record_speculative_execution_invalidated(count: u64) {
-    metrics()
-        .speculative_execution_invalidated
-        .inc_by(count as f64);
-}
-
-/// Update lock contention metrics.
-pub fn set_lock_contention(deferred: u64, ratio: f64) {
-    let m = metrics();
-    m.lock_contention_deferred.set(deferred as f64);
-    m.lock_contention_ratio.set(ratio);
-}
-
-/// Update lock contention metrics from LockContentionStats.
-///
-/// This is a convenience wrapper that extracts the relevant fields
-/// from the mempool's LockContentionStats struct.
-pub fn set_lock_contention_from_stats(stats: &hyperscale_mempool::LockContentionStats) {
-    set_lock_contention(stats.deferred_count, stats.contention_ratio());
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Fetch Metrics (transactions/certificates)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Record a fetch operation started.
-///
-/// **Cardinality control**: `kind` must be one of:
-/// - `"transaction"` - fetching transactions for a pending block
-/// - `"certificate"` - fetching certificates for a pending block
-pub fn record_fetch_started(kind: crate::fetch::FetchKind) {
-    metrics()
-        .fetch_started
-        .with_label_values(&[kind.as_str()])
-        .inc();
-}
-
-/// Record a fetch operation completed successfully.
-pub fn record_fetch_completed(kind: crate::fetch::FetchKind) {
-    metrics()
-        .fetch_completed
-        .with_label_values(&[kind.as_str()])
-        .inc();
-}
-
-/// Record a fetch operation failed.
-pub fn record_fetch_failed(kind: crate::fetch::FetchKind) {
-    metrics()
-        .fetch_failed
-        .with_label_values(&[kind.as_str()])
-        .inc();
-}
-
-/// Record items received via fetch.
-pub fn record_fetch_items_received(kind: crate::fetch::FetchKind, count: usize) {
-    metrics()
-        .fetch_items_received
-        .with_label_values(&[kind.as_str()])
-        .inc_by(count as f64);
-}
-
-/// Record fetch operation latency.
-pub fn record_fetch_latency(kind: crate::fetch::FetchKind, latency: std::time::Duration) {
-    metrics()
-        .fetch_latency
-        .with_label_values(&[kind.as_str()])
-        .observe(latency.as_secs_f64());
-}
-
-/// Update the number of in-flight fetch requests.
-pub fn set_fetch_in_flight(count: usize) {
-    metrics().fetch_in_flight.set(count as f64);
-}
-
-/// Record items sent in response to a fetch request.
-///
-/// Called by the fetch handler when responding to inbound fetch requests.
-pub fn record_fetch_response_sent(kind: &str, count: usize) {
-    metrics()
-        .fetch_items_sent
-        .with_label_values(&[kind])
-        .inc_by(count as f64);
-}
-
-// === Cross-Shard Message Delivery Metrics ===
-
-/// Increment dispatch failure counter for cross-shard messages.
-///
-/// Called when the action dispatcher channel is closed (critical failure).
-pub fn increment_dispatch_failures(message_type: &str) {
-    metrics()
-        .dispatch_failures
-        .with_label_values(&[message_type])
-        .inc();
-}
-
-/// Record a broadcast failure (queued for retry).
-pub fn record_broadcast_failure() {
-    metrics().broadcast_failures.inc();
-}
-
-/// Record a successful retry of a broadcast.
-pub fn record_broadcast_retry_success() {
-    metrics().broadcast_retry_successes.inc();
-}
-
-/// Record a message batch dropped after max retries.
-pub fn record_broadcast_message_dropped() {
-    metrics().broadcast_messages_dropped.inc();
-}
-
-/// Update the current retry queue size.
-pub fn set_broadcast_retry_queue_size(size: usize) {
-    metrics().broadcast_retry_queue_size.set(size as f64);
-}
-
-/// Record a gossipsub publish failure.
-///
-/// Extracts the topic type from the full topic string for better grouping.
-pub fn record_gossipsub_publish_failure(topic: &str) {
-    // Extract topic type from full topic string (e.g., "/hyperscale/shard/0/votes" -> "votes")
-    let topic_type = topic.rsplit('/').next().unwrap_or("unknown");
-    metrics()
-        .gossipsub_publish_failures
-        .with_label_values(&[topic_type])
-        .inc();
-}
-
-/// Record a network request retry.
-///
-/// Called when a request times out (likely due to packet loss) and is automatically retried.
-/// Request types: "block", "transaction", "certificate"
-pub fn record_request_retry(request_type: &str) {
-    metrics()
-        .network_request_retries
-        .with_label_values(&[request_type])
-        .inc();
-}
-
-/// Record an early arrival buffer eviction.
-pub fn record_early_arrival_eviction() {
-    metrics().early_arrival_evictions.inc();
-}
-
-/// Record a backpressure event.
-///
-/// Called when work is rejected due to queue saturation.
-/// Source examples: "gossiped_cert_verification", "tx_validation"
-pub fn record_backpressure_event(source: &str) {
-    metrics()
-        .backpressure_events
-        .with_label_values(&[source])
-        .inc();
-}
-
-/// Update the pending gossiped certificate batch size gauge.
-pub fn set_pending_gossiped_cert_batch_size(size: usize) {
-    metrics().pending_gossiped_cert_batch_size.set(size as f64);
+/// Returns `(content_type, encoded_body)` suitable for an HTTP response.
+pub fn encode_metrics() -> Result<(String, Vec<u8>), String> {
+    use prometheus::{Encoder, TextEncoder};
+    let encoder = TextEncoder::new();
+    let metric_families = prometheus::gather();
+    let content_type = encoder.format_type().to_string();
+    let mut buffer = Vec::new();
+    encoder
+        .encode(&metric_families, &mut buffer)
+        .map_err(|e| format!("{e}"))?;
+    Ok((content_type, buffer))
 }

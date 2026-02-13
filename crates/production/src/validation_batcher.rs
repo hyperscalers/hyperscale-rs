@@ -20,6 +20,7 @@
 use crate::thread_pools::ThreadPoolManager;
 use hyperscale_core::Event;
 use hyperscale_engine::TransactionValidation;
+use hyperscale_metrics as metrics;
 use hyperscale_types::{Hash, RoutableTransaction};
 use quick_cache::sync::Cache;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -281,7 +282,7 @@ impl ValidationBatcher {
                             error = %e,
                             "Transaction validation failed"
                         );
-                        crate::metrics::record_invalid_message();
+                        metrics::record_invalid_message();
                     }
                 }
             }

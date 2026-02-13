@@ -44,6 +44,7 @@ use hyperscale_messages::request::{
     GetCertificatesRequest, GetTransactionsRequest, FETCH_TYPE_CERTIFICATE, FETCH_TYPE_TRANSACTION,
 };
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
+use hyperscale_metrics as metrics;
 use hyperscale_types::{
     Block, BlockHeight, Hash, QuorumCertificate, RoutableTransaction, TransactionCertificate,
 };
@@ -362,7 +363,7 @@ impl InboundRouter {
         let response = GetTransactionsResponse::new(found_transactions);
         match sbor::basic_encode(&response) {
             Ok(data) => {
-                crate::metrics::record_fetch_response_sent("transaction", found_count);
+                metrics::record_fetch_response_sent("transaction", found_count);
                 data
             }
             Err(e) => {
@@ -431,7 +432,7 @@ impl InboundRouter {
         let response = GetCertificatesResponse::new(found_certificates);
         match sbor::basic_encode(&response) {
             Ok(data) => {
-                crate::metrics::record_fetch_response_sent("certificate", found_count);
+                metrics::record_fetch_response_sent("certificate", found_count);
                 data
             }
             Err(e) => {

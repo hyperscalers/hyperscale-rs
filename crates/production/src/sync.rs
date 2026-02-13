@@ -44,10 +44,10 @@
 //! - Block validation and ordering
 //! - Malicious peer banning
 
-use crate::metrics;
 use crate::network::{compute_peer_id_for_validator, RequestManager, RequestPriority};
 use crate::sync_error::SyncResponseError;
 use hyperscale_core::Event;
+use hyperscale_metrics as metrics;
 use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, Topology};
 use libp2p::PeerId;
 use serde::Serialize;

@@ -24,6 +24,8 @@ hyperscale-core.workspace = true
 hyperscale-bft.workspace = true
 hyperscale-engine.workspace = true
 hyperscale-mempool.workspace = true
+hyperscale-metrics.workspace = true
+hyperscale-metrics-prometheus.workspace = true
 hyperscale-node.workspace = true
 hyperscale-types.workspace = true
 hyperscale-messages.workspace = true
@@ -70,9 +72,6 @@ tracing-opentelemetry = "0.32.0"
 
 # Tracing subscriber for layer composition
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "registry"] }
-
-# Native Prometheus for metrics (not via OTEL - avoids translation issues)
-prometheus = "0.14.0"
 
 # JSON serialization for health check responses
 serde = { version = "1.0", features = ["derive"] }

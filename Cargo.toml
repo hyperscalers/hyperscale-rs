@@ -4,6 +4,9 @@ members = [
     "crates/types",
     "crates/core",
     "crates/messages",
+    "crates/metrics",
+    "crates/metrics-noop",
+    "crates/metrics-prometheus",
     "crates/bft",
     "crates/engine",
     "crates/execution",
@@ -23,6 +26,9 @@ default-members = [
     "crates/types",
     "crates/core",
     "crates/messages",
+    "crates/metrics",
+    "crates/metrics-noop",
+    "crates/metrics-prometheus",
     "crates/bft",
     "crates/engine",
     "crates/execution",
@@ -45,6 +51,9 @@ edition = "2021"
 [workspace.dependencies]
 # Internal crates
 hyperscale-bft = { path = "crates/bft" }
+hyperscale-metrics = { path = "crates/metrics" }
+hyperscale-metrics-noop = { path = "crates/metrics-noop" }
+hyperscale-metrics-prometheus = { path = "crates/metrics-prometheus" }
 hyperscale-core = { path = "crates/core" }
 hyperscale-engine = { path = "crates/engine" }
 hyperscale-execution = { path = "crates/execution" }

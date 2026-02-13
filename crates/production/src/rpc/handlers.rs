@@ -9,8 +9,8 @@ use axum::{
     Json,
 };
 use hyperscale_core::TransactionStatus;
+use hyperscale_metrics as metrics;
 use hyperscale_types::{Hash, RoutableTransaction, TransactionDecision};
-use prometheus::{Encoder, TextEncoder};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -50,27 +50,19 @@ pub async fn ready_handler(State(state): State<RpcState>) -> impl IntoResponse {
 
 /// Handler for `GET /metrics` - Prometheus metrics.
 pub async fn metrics_handler() -> impl IntoResponse {
-    let encoder = TextEncoder::new();
-    let metric_families = prometheus::gather();
-
-    let mut buffer = Vec::new();
-    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
-        tracing::error!(error = ?e, "Failed to encode metrics");
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to encode metrics".to_string(),
-        )
-            .into_response();
+    match hyperscale_metrics_prometheus::encode_metrics() {
+        Ok((content_type, buffer)) => {
+            ([(axum::http::header::CONTENT_TYPE, content_type)], buffer).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to encode metrics");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to encode metrics".to_string(),
+            )
+                .into_response()
+        }
     }
-
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            encoder.format_type().to_string(),
-        )],
-        buffer,
-    )
-        .into_response()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -148,7 +140,7 @@ pub async fn submit_transaction_handler(
     if let Some(threshold) = state.sync_backpressure_threshold {
         let sync_status = state.sync_status.load();
         if sync_status.blocks_behind > threshold {
-            crate::metrics::record_tx_ingress_rejected_syncing();
+            metrics::record_tx_ingress_rejected_syncing();
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(SubmitTransactionResponse {
@@ -184,7 +176,7 @@ pub async fn submit_transaction_handler(
 
         // Check if pending transaction count is too high
         if snapshot.at_pending_limit {
-            crate::metrics::record_tx_ingress_rejected_pending_limit();
+            metrics::record_tx_ingress_rejected_pending_limit();
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(SubmitTransactionResponse {

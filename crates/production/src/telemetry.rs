@@ -14,7 +14,6 @@ use opentelemetry_sdk::{
     Resource,
 };
 use opentelemetry_semantic_conventions::resource::{SERVICE_NAME, SERVICE_VERSION};
-use prometheus::{Encoder, TextEncoder};
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -319,27 +318,19 @@ fn start_metrics_server(
 
 /// Handler for `/metrics` - returns Prometheus metrics.
 async fn metrics_handler() -> impl axum::response::IntoResponse {
-    let encoder = TextEncoder::new();
-    let metric_families = prometheus::gather();
-
-    let mut buffer = Vec::new();
-    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
-        tracing::error!(error = ?e, "Failed to encode metrics");
-        return (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to encode metrics",
-        )
-            .into_response();
+    match hyperscale_metrics_prometheus::encode_metrics() {
+        Ok((content_type, buffer)) => {
+            ([(axum::http::header::CONTENT_TYPE, content_type)], buffer).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to encode metrics");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to encode metrics",
+            )
+                .into_response()
+        }
     }
-
-    (
-        [(
-            axum::http::header::CONTENT_TYPE,
-            encoder.format_type().to_string(),
-        )],
-        buffer,
-    )
-        .into_response()
 }
 
 /// Handler for `/health` - liveness probe.

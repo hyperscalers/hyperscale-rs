@@ -26,9 +26,9 @@
 
 use super::codec::{decode_message, encode_message, CodecError};
 use super::Topic;
-use crate::metrics;
 use crate::ThreadPoolManager;
 use hyperscale_core::{Event, OutboundMessage};
+use hyperscale_metrics as metrics;
 use libp2p::PeerId as Libp2pPeerId;
 use std::sync::Arc;
 use tokio::sync::mpsc;

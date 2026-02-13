@@ -73,7 +73,6 @@
 mod action_dispatcher;
 mod fetch;
 mod message_batcher;
-pub(crate) mod metrics;
 pub mod network;
 pub mod rpc;
 mod runner;
