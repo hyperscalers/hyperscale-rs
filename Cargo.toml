@@ -1,47 +1,53 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/types",
-    "crates/core",
-    "crates/messages",
-    "crates/metrics",
-    "crates/metrics-noop",
-    "crates/metrics-prometheus",
     "crates/bft",
+    "crates/core",
     "crates/engine",
     "crates/execution",
     "crates/livelock",
     "crates/mempool",
-    "crates/provisions",
+    "crates/messages",
+    "crates/metrics",
+    "crates/metrics-noop",
+    "crates/metrics-prometheus",
     "crates/node",
+    "crates/parallel",
+    "crates/production",
+    "crates/provisions",
     "crates/simulation",
     "crates/simulator",
-    "crates/production",
     "crates/spammer",
-    "crates/parallel",
+    "crates/storage",
+    "crates/storage-memory",
+    "crates/storage-rocksdb",
     "crates/test-helpers",
+    "crates/types",
 ]
 
 default-members = [
-    "crates/types",
-    "crates/core",
-    "crates/messages",
-    "crates/metrics",
-    "crates/metrics-noop",
-    "crates/metrics-prometheus",
     "crates/bft",
+    "crates/core",
     "crates/engine",
     "crates/execution",
     "crates/livelock",
     "crates/mempool",
-    "crates/provisions",
+    "crates/messages",
+    "crates/metrics",
+    "crates/metrics-noop",
+    "crates/metrics-prometheus",
     "crates/node",
+    "crates/parallel",
+    "crates/production",
+    "crates/provisions",
     "crates/simulation",
     "crates/simulator",
-    "crates/production",
     "crates/spammer",
-    "crates/parallel",
+    "crates/storage",
+    "crates/storage-memory",
+    "crates/storage-rocksdb",
     "crates/test-helpers",
+    "crates/types",
 ]
 
 [workspace.package]
@@ -55,6 +61,9 @@ hyperscale-metrics = { path = "crates/metrics" }
 hyperscale-metrics-noop = { path = "crates/metrics-noop" }
 hyperscale-metrics-prometheus = { path = "crates/metrics-prometheus" }
 hyperscale-core = { path = "crates/core" }
+hyperscale-storage = { path = "crates/storage" }
+hyperscale-storage-memory = { path = "crates/storage-memory" }
+hyperscale-storage-rocksdb = { path = "crates/storage-rocksdb" }
 hyperscale-engine = { path = "crates/engine" }
 hyperscale-execution = { path = "crates/execution" }
 hyperscale-livelock = { path = "crates/livelock" }

@@ -15,6 +15,7 @@ use hyperscale_engine::TransactionValidation;
 use hyperscale_production::{
     ProductionRunner, RocksDbStorage, ThreadPoolConfig, ThreadPoolManager,
 };
+use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, ValidatorId,
 };
@@ -117,14 +118,9 @@ async fn test_storage_operations() {
     assert_eq!(retrieved_block.header.height, BlockHeight(1));
 
     // Test chain metadata
-    storage.set_chain_metadata(
-        BlockHeight(1),
-        Some(Hash::from_bytes(&[1u8; 32])),
-        Some(&qc),
-    );
-    let (height, hash, _) = storage.get_chain_metadata();
-    assert_eq!(height, BlockHeight(1));
-    assert!(hash.is_some());
+    storage.set_committed_state(BlockHeight(1), Hash::from_bytes(&[1u8; 32]), &qc);
+    assert_eq!(storage.committed_height(), BlockHeight(1));
+    assert!(storage.committed_hash().is_some());
 
     info!("Storage operations verified");
 }

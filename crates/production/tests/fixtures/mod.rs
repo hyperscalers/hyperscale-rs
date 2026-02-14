@@ -82,7 +82,7 @@ impl TestFixtures {
         let global_validators: Vec<ValidatorInfo> = (0..num_validators)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId(i as u64),
-                public_key: public_keys[i as usize].clone(),
+                public_key: public_keys[i as usize],
                 voting_power: 1,
             })
             .collect();

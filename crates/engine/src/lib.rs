@@ -24,25 +24,6 @@
 //! - **Production**: Spawns executor methods on rayon thread pool (parallel, async callback)
 //!
 //! Both use the real Radix Engine - the difference is the calling convention.
-//!
-//! # Example
-//!
-//! ```ignore
-//! use hyperscale_engine::{RadixExecutor, ExecutionOutput};
-//! use hyperscale_storage::SimStorage;
-//!
-//! // Runner owns storage
-//! let storage = SimStorage::new();
-//!
-//! // Create executor (no storage parameter)
-//! let executor = RadixExecutor::new(NetworkDefinition::simulator());
-//!
-//! // Run genesis (storage passed by reference)
-//! executor.run_genesis(&storage)?;
-//!
-//! // Execute transactions (storage passed by reference)
-//! let output = executor.execute_single_shard(&storage, &transactions)?;
-//! ```
 
 #![warn(missing_docs)]
 
@@ -50,31 +31,13 @@ mod error;
 mod execution;
 mod executor;
 mod genesis;
-mod jmt_snapshot;
 mod result;
-mod storage;
 mod validation;
 
-pub use execution::{substate_writes_to_database_updates, ProvisionedSnapshot};
+pub use execution::ProvisionedSnapshot;
 pub use executor::RadixExecutor;
 pub use genesis::GenesisConfig;
-pub use jmt_snapshot::{JmtSnapshot, LeafSubstateKeyAssociation};
-pub use storage::{keys, SubstateStore, RADIX_PREFIX};
 pub use validation::TransactionValidation;
 
-// Re-export commonly needed Radix types for storage implementations
-pub use radix_common::crypto::Hash as StateRootHash;
+// Re-export Radix types needed by engine callers (not storage-related)
 pub use radix_common::network::NetworkDefinition;
-pub use radix_common::prelude::{DatabaseUpdate, DbSubstateValue};
-pub use radix_substate_store_interface::interface::{
-    CommittableSubstateDatabase, DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates,
-    PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase,
-};
-
-// Re-export JMT types for storage implementations
-pub use radix_substate_store_impls::state_tree::put_at_next_version;
-pub use radix_substate_store_impls::state_tree::tree_store::{
-    encode_key as encode_jmt_key, AssociatedSubstateValue, ReadableTreeStore, StaleTreePart,
-    StoredTreeNodeKey, TreeNode, TypedInMemoryTreeStore, Version as StateVersion,
-    VersionedTreeNode, WriteableTreeStore,
-};

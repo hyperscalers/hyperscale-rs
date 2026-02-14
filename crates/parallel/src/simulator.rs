@@ -23,6 +23,7 @@ use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_simulation::{NetworkTrafficAnalyzer, SimStorage, SimulatedNetwork};
+use hyperscale_storage::{CommitStore, ConsensusStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, bls_keypair_from_seed, verify_bls12381_v1, zero_bls_signature,
     Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
@@ -237,6 +238,9 @@ pub struct SimNode {
     simulated_time: Duration,
     /// Outbound events that need to be broadcast to shard peers.
     outbound_events: Vec<(ShardGroupId, Event)>,
+    /// Precomputed commit handles from `prepare_block_commit`, keyed by block hash.
+    /// Populated by `VerifyStateRoot` / `BuildProposal`, consumed by `EmitCommittedBlock`.
+    prepared_commits: HashMap<Hash, <SimStorage as CommitStore>::PreparedCommit>,
 }
 
 impl SimNode {
@@ -261,6 +265,7 @@ impl SimNode {
             pending_timers: HashMap::new(),
             simulated_time: Duration::ZERO,
             outbound_events: Vec::new(),
+            prepared_commits: HashMap::new(),
         }
     }
 
@@ -385,15 +390,10 @@ impl SimNode {
 
             // In parallel simulation, we trust certificates (skip BLS verification for speed).
             // Production verifies signatures before persisting.
-            let local_shard = self.state.shard();
-            let writes: Vec<_> = certificate
-                .shard_proofs
-                .get(&local_shard)
-                .map(|c| c.state_writes.clone())
-                .unwrap_or_default();
-
-            self.storage
-                .commit_certificate_with_writes(certificate, &writes);
+            // Store certificate WITHOUT committing state writes. State writes are
+            // only applied when the certificate is included in a committed block
+            // (via PersistTransactionCertificate). This matches production and sim runner.
+            self.storage.store_certificate(certificate);
 
             // Notify state machine to cancel local building and add to finalized
             let actions = self.state.handle(Event::GossipedCertificateVerified {
@@ -833,27 +833,17 @@ impl SimNode {
                 expected_root,
                 certificates,
             } => {
-                // Extract state writes from certificates for our local shard.
                 let local_shard = self.state.shard();
-                let writes_per_cert: Vec<Vec<_>> = certificates
-                    .iter()
-                    .map(|cert| {
-                        cert.shard_proofs
-                            .get(&local_shard)
-                            .map(|proof| proof.state_writes.clone())
-                            .unwrap_or_default()
-                    })
-                    .collect();
-
-                // Verify root hash by computing from the parent's state root.
-                // This ensures proposer and verifier compute from the same base.
-                // NOTE: In parallel simulation we don't cache snapshots since each
-                // shard runs independently and there's no commit-time reuse benefit.
-                let (computed_root, _snapshot) = self
-                    .storage
-                    .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
+                let (computed_root, prepared) = self.storage.prepare_block_commit(
+                    parent_state_root,
+                    &certificates,
+                    local_shard,
+                );
 
                 let valid = computed_root == expected_root;
+                if valid {
+                    self.prepared_commits.insert(block_hash, prepared);
+                }
 
                 self.internal_queue
                     .push_back(Event::StateRootVerified { block_hash, valid });
@@ -901,33 +891,26 @@ impl SimNode {
 
                 // In parallel simulation, JMT commits are synchronous so compute immediately.
                 let local_shard = self.state.shard();
-                let current_root = self.storage.current_jmt_root();
+                use hyperscale_storage::SubstateStore;
+                let current_root = self.storage.state_root_hash();
 
                 // Check if JMT is ready for certificates
                 let jmt_ready = current_root == parent_state_root;
                 let include_certs = jmt_ready && !certificates.is_empty();
 
-                let (state_root, state_version, certs_to_include) = if include_certs {
+                let (state_root, state_version, certs_to_include, prepared) = if include_certs {
                     // JMT ready - compute speculative root from certificates
-                    let writes_per_cert: Vec<Vec<_>> = certificates
-                        .iter()
-                        .map(|cert| {
-                            cert.shard_proofs
-                                .get(&local_shard)
-                                .map(|proof| proof.state_writes.clone())
-                                .unwrap_or_default()
-                        })
-                        .collect();
-
-                    let (root, _snapshot) = self
-                        .storage
-                        .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
+                    let (root, prepared) = self.storage.prepare_block_commit(
+                        parent_state_root,
+                        &certificates,
+                        local_shard,
+                    );
 
                     let version = parent_state_version + certificates.len() as u64;
-                    (root, version, certificates)
+                    (root, version, certificates, Some(prepared))
                 } else {
                     // Either no certificates, or JMT not ready - inherit parent state
-                    (parent_state_root, parent_state_version, vec![])
+                    (parent_state_root, parent_state_version, vec![], None)
                 };
 
                 // Compute transaction root from all transaction sections
@@ -963,6 +946,10 @@ impl SimNode {
                 };
 
                 let block_hash = block.hash();
+
+                if let Some(prepared) = prepared {
+                    self.prepared_commits.insert(block_hash, prepared);
+                }
 
                 self.internal_queue.push_back(Event::ProposalBuilt {
                     height,
@@ -1130,24 +1117,24 @@ impl SimNode {
             // Storage actions
             Action::PersistBlock { block, qc } => {
                 let height = block.header.height;
-                self.storage.put_block(height, block, qc);
+                self.storage.put_block(height, &block, &qc);
             }
 
             Action::PersistTransactionCertificate { certificate } => {
                 let local_shard = self.state.shard();
-                if let Some((_, cert)) = certificate
+
+                // Only store certificate metadata; state writes are committed
+                // at EmitCommittedBlock time via commit_prepared_block/commit_block.
+                self.storage.store_certificate(&certificate);
+
+                // Commit to the shared cache storage so future executions see the state
+                let writes = certificate
                     .shard_proofs
-                    .iter()
-                    .find(|(shard, _)| **shard == local_shard)
-                {
-                    // Commit to node's local storage
-                    self.storage
-                        .commit_certificate_with_writes(&certificate, &cert.state_writes);
-                    // Also commit to the shared cache storage so future executions see the state
-                    cache.commit_writes(local_shard.0, &cert.state_writes);
-                } else {
-                    self.storage
-                        .put_certificate(certificate.transaction_hash, certificate.clone());
+                    .get(&local_shard)
+                    .map(|proof| proof.state_writes.as_slice())
+                    .unwrap_or(&[]);
+                if !writes.is_empty() {
+                    cache.commit_writes(local_shard.0, writes);
                 }
 
                 // After persisting, gossip certificate to same-shard peers.
@@ -1202,9 +1189,19 @@ impl SimNode {
             }
 
             Action::EmitCommittedBlock { block } => {
+                let local_shard = self.state.shard();
+                let block_hash = block.hash();
+
+                let result = if let Some(prepared) = self.prepared_commits.remove(&block_hash) {
+                    self.storage.commit_prepared_block(prepared)
+                } else {
+                    self.storage.commit_block(&block.certificates, local_shard)
+                };
+
                 debug!(
                     node = self.index,
                     height = block.header.height.0,
+                    state_version = result.state_version,
                     "Block committed"
                 );
             }

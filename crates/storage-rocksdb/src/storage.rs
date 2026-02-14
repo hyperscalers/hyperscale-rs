@@ -11,100 +11,26 @@
 //! JMT data is stored in dedicated column families (`jmt_nodes`, `jmt_meta`).
 //! On each commit, the JMT is updated and a new state root hash is computed.
 
-use hyperscale_engine::{
-    encode_jmt_key, keys, put_at_next_version, AssociatedSubstateValue,
-    CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    DbSubstateValue, JmtSnapshot, LeafSubstateKeyAssociation, PartitionDatabaseUpdates,
-    PartitionEntry, ReadableTreeStore, StaleTreePart, StateRootHash, StoredTreeNodeKey,
-    SubstateDatabase, SubstateStore, TreeNode, VersionedTreeNode, WriteableTreeStore,
-};
 use hyperscale_metrics as metrics;
+use hyperscale_storage::{
+    jmt::{
+        encode_key as encode_jmt_key, put_at_next_version, ReadableTreeStore, StaleTreePart,
+        StoredTreeNodeKey, TreeNode, VersionedTreeNode,
+    },
+    keys, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
+    DbSubstateValue, JmtSnapshot, OverlayTreeStore, PartitionDatabaseUpdates, PartitionEntry,
+    StateRootHash, SubstateDatabase, SubstateLookup, SubstateStore,
+};
 use hyperscale_types::NodeId;
-use rocksdb::{ColumnFamily, ColumnFamilyDescriptor, Options, Snapshot, WriteBatch, DB};
+use rocksdb::{
+    ColumnFamily, ColumnFamilyDescriptor, Options, Snapshot, WriteBatch, WriteOptions, DB,
+};
 use sbor::prelude::*;
-use std::cell::{RefCell, UnsafeCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{instrument, Level};
-
-/// Maximum number of entries in the block commit cache.
-/// When exceeded, oldest entries are evicted.
-const BLOCK_COMMIT_CACHE_MAX_SIZE: usize = 32;
-
-/// Cached data for efficient block commit.
-///
-/// Built during state root verification and applied during block commit.
-/// This enables batching all RocksDB writes into a single atomic write operation
-/// with one fsync, instead of N fsyncs for N certificates.
-///
-/// # Performance
-///
-/// Without batching: 40 certificates × ~5ms fsync = ~200ms per block commit
-/// With batching: 1 fsync = ~5ms per block commit
-pub struct BlockCommitCache {
-    /// Pre-built RocksDB WriteBatch containing all certificate + state writes.
-    pub write_batch: WriteBatch,
-
-    /// JMT snapshot containing precomputed tree nodes.
-    /// Applied after the WriteBatch to update the in-memory Merkle tree.
-    pub jmt_snapshot: JmtSnapshot,
-}
-
-/// LRU-style cache for block commit data.
-///
-/// Maintains insertion order via a VecDeque to enable FIFO eviction when
-/// the cache exceeds [`BLOCK_COMMIT_CACHE_MAX_SIZE`].
-struct BlockCommitCacheLru {
-    /// The actual cache data.
-    map: HashMap<hyperscale_types::Hash, BlockCommitCache>,
-    /// Insertion order for FIFO eviction. Front = oldest.
-    order: VecDeque<hyperscale_types::Hash>,
-}
-
-impl BlockCommitCacheLru {
-    fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-
-    /// Insert a cache entry, evicting oldest entries if needed.
-    fn insert(&mut self, block_hash: hyperscale_types::Hash, cache: BlockCommitCache) {
-        // If already present, remove from order tracking (will re-add at end)
-        if self.map.contains_key(&block_hash) {
-            self.order.retain(|h| *h != block_hash);
-        }
-
-        // Evict oldest entries if at capacity
-        while self.map.len() >= BLOCK_COMMIT_CACHE_MAX_SIZE {
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-                tracing::debug!(
-                    evicted_block = ?oldest,
-                    "Evicted oldest entry from block commit cache"
-                );
-            } else {
-                break;
-            }
-        }
-
-        self.map.insert(block_hash, cache);
-        self.order.push_back(block_hash);
-    }
-
-    /// Remove and return a cache entry.
-    fn remove(&mut self, block_hash: &hyperscale_types::Hash) -> Option<BlockCommitCache> {
-        if let Some(cache) = self.map.remove(block_hash) {
-            self.order.retain(|h| h != block_hash);
-            Some(cache)
-        } else {
-            None
-        }
-    }
-}
 
 /// RocksDB-based storage for production use.
 ///
@@ -125,18 +51,9 @@ impl BlockCommitCacheLru {
 pub struct RocksDbStorage {
     db: Arc<DB>,
 
-    /// Cache of block commit data, keyed by block hash.
-    ///
-    /// When a block is verified, we build a [`BlockCommitCache`] containing:
-    /// - A pre-built RocksDB WriteBatch with all certificate + state writes
-    /// - A JMT snapshot with precomputed Merkle tree nodes
-    ///
-    /// When the block commits, the cached WriteBatch is applied with a single
-    /// fsync instead of N fsyncs for N certificates.
-    ///
-    /// Uses LRU eviction to bound memory usage. Maximum size is
-    /// [`BLOCK_COMMIT_CACHE_MAX_SIZE`] (32 entries).
-    block_commit_cache: Mutex<BlockCommitCacheLru>,
+    /// Serializes JMT-mutating commits to prevent interleaved read-modify-write
+    /// sequences (e.g., `read_jmt_metadata` + `WriteBatch` write).
+    commit_lock: Mutex<()>,
 
     /// Whether to persist historical substate values for historical queries.
     enable_historical_substate_values: bool,
@@ -194,11 +111,15 @@ impl RocksDbStorage {
         }
         opts.set_block_based_table_factory(&block_opts);
 
-        // Column families
+        // Column families - use the same options as the DB for consistency
         let cf_descriptors: Vec<_> = config
             .column_families
             .into_iter()
-            .map(|name| ColumnFamilyDescriptor::new(name, Options::default()))
+            .map(|name| {
+                let mut cf_opts = Options::default();
+                cf_opts.set_compression_type(config.compression.to_rocksdb());
+                ColumnFamilyDescriptor::new(name, cf_opts)
+            })
             .collect();
 
         let db = DB::open_cf_descriptors(&opts, path, cf_descriptors)
@@ -206,7 +127,7 @@ impl RocksDbStorage {
 
         Ok(Self {
             db: Arc::new(db),
-            block_commit_cache: Mutex::new(BlockCommitCacheLru::new()),
+            commit_lock: Mutex::new(()),
             enable_historical_substate_values: config.enable_historical_substate_values,
             state_version_history_length: config.state_version_history_length,
         })
@@ -230,43 +151,101 @@ impl RocksDbStorage {
         let version = self
             .db
             .get(b"jmt:version")
-            .ok()
-            .flatten()
-            .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
-            .map(u64::from_be_bytes)
+            .expect("BFT CRITICAL: failed to read jmt:version")
+            .map(|v| {
+                u64::from_be_bytes(
+                    <[u8; 8]>::try_from(v.as_slice()).expect("jmt:version must be 8 bytes"),
+                )
+            })
             .unwrap_or(0);
 
         let root_hash = self
             .db
             .get(b"jmt:root_hash")
-            .ok()
-            .flatten()
-            .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
-            .map(StateRootHash)
+            .expect("BFT CRITICAL: failed to read jmt:root_hash")
+            .map(|v| {
+                StateRootHash(
+                    <[u8; 32]>::try_from(v.as_slice()).expect("jmt:root_hash must be 32 bytes"),
+                )
+            })
             .unwrap_or(StateRootHash([0u8; 32]));
 
         (version, root_hash)
     }
 
-    /// Get a column family handle by name.
-    #[allow(dead_code)]
-    fn cf(&self, name: &str) -> Result<&ColumnFamily, StorageError> {
-        self.db
-            .cf_handle(name)
-            .ok_or_else(|| StorageError::DatabaseError(format!("Column family {} not found", name)))
+    /// Append JMT data from a snapshot to a WriteBatch.
+    ///
+    /// Writes JMT nodes, stale tree parts (for deferred GC), historical
+    /// substate associations (if enabled), and JMT metadata (version + root hash).
+    ///
+    /// This is the write-side complement to `read_jmt_metadata`.
+    fn append_jmt_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        snapshot: &JmtSnapshot,
+        new_version: u64,
+    ) {
+        // JMT nodes
+        let jmt_cf = self
+            .db
+            .cf_handle(JMT_NODES_CF)
+            .expect("jmt_nodes column family must exist");
+        for (key, node) in &snapshot.nodes {
+            let encoded_key = encode_jmt_key(key);
+            let encoded_node =
+                sbor::basic_encode(&VersionedTreeNode::from_latest_version(node.clone()))
+                    .expect("JMT node encoding must succeed");
+            batch.put_cf(jmt_cf, encoded_key, encoded_node);
+        }
+
+        // Stale parts for deferred GC
+        if !snapshot.stale_tree_parts.is_empty() {
+            let stale_cf = self
+                .db
+                .cf_handle(STALE_STATE_HASH_TREE_PARTS_CF)
+                .expect("stale_state_hash_tree_parts column family must exist");
+            let version_key = new_version.to_be_bytes();
+            let encoded_parts = sbor::basic_encode(&snapshot.stale_tree_parts)
+                .expect("encoding stale parts must succeed");
+            batch.put_cf(stale_cf, version_key, encoded_parts);
+        }
+
+        // Historical associations
+        if self.enable_historical_substate_values {
+            let assoc_cf = self
+                .db
+                .cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)
+                .expect("associated_state_tree_values column family must exist");
+            for assoc in &snapshot.leaf_substate_associations {
+                let encoded_key = encode_jmt_key(&assoc.tree_node_key);
+                batch.put_cf(assoc_cf, encoded_key, &assoc.substate_value);
+            }
+        }
+
+        // JMT metadata
+        batch.put(b"jmt:version", new_version.to_be_bytes());
+        batch.put(b"jmt:root_hash", snapshot.result_root.0);
     }
 
-    /// Internal: iterate over a key range.
+    /// Internal: iterate over a key range in the state CF.
     fn iter_range<'a>(
         &'a self,
         start: &[u8],
         end: &[u8],
     ) -> impl Iterator<Item = (Box<[u8]>, Box<[u8]>)> + 'a {
-        let mut iter = self.db.raw_iterator();
+        let state_cf = self
+            .db
+            .cf_handle(STATE_CF)
+            .expect("state column family must exist");
+        let mut iter = self.db.raw_iterator_cf(state_cf);
         iter.seek(start);
         let end = end.to_vec();
+        let mut done = false;
 
         std::iter::from_fn(move || {
+            if done {
+                return None;
+            }
             if iter.valid() {
                 let key = iter.key()?;
                 if key < end.as_slice() {
@@ -275,9 +254,14 @@ impl RocksDbStorage {
                     iter.next();
                     Some((k, v))
                 } else {
+                    done = true;
                     None
                 }
             } else {
+                done = true;
+                if let Err(e) = iter.status() {
+                    panic!("RocksDB iterator error: {e}");
+                }
                 None
             }
         })
@@ -296,7 +280,14 @@ impl SubstateDatabase for RocksDbStorage {
     ) -> Option<DbSubstateValue> {
         let start = Instant::now();
         let key = keys::to_storage_key(partition_key, sort_key);
-        let result = self.db.get(&key).ok().flatten();
+        let state_cf = self
+            .db
+            .cf_handle(STATE_CF)
+            .expect("state column family must exist");
+        let result = self
+            .db
+            .get_cf(state_cf, &key)
+            .expect("RocksDB read failure on state CF");
         let elapsed = start.elapsed();
         metrics::record_storage_read(elapsed.as_secs_f64());
 
@@ -324,7 +315,7 @@ impl SubstateDatabase for RocksDbStorage {
             }
             None => prefix.clone(),
         };
-        let end = keys::next_prefix(&prefix);
+        let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
 
         let items = self.iter_range(&start, &end);
 
@@ -338,6 +329,9 @@ impl SubstateDatabase for RocksDbStorage {
         }))
     }
 }
+
+/// Column family name for substate data.
+const STATE_CF: &str = "state";
 
 /// Column family name for JMT tree nodes.
 const JMT_NODES_CF: &str = "jmt_nodes";
@@ -357,10 +351,12 @@ impl ReadableTreeStore for RocksDbStorage {
         let encoded_key = encode_jmt_key(key);
         self.db
             .get_cf(cf, &encoded_key)
-            .ok()
-            .flatten()
-            .and_then(|bytes| sbor::basic_decode::<VersionedTreeNode>(&bytes).ok())
-            .map(|versioned| versioned.fully_update_and_into_latest_version())
+            .expect("RocksDB read failure on jmt_nodes CF")
+            .map(|bytes| {
+                sbor::basic_decode::<VersionedTreeNode>(&bytes)
+                    .unwrap_or_else(|e| panic!("JMT node corruption detected: {e:?}"))
+                    .fully_update_and_into_latest_version()
+            })
     }
 }
 
@@ -378,7 +374,7 @@ impl ReadableTreeStore for RocksDbStorage {
 /// # Lifetime
 /// The snapshot must outlive all reads through this store. When dropped, the
 /// snapshot releases its hold on the RocksDB version, allowing garbage collection.
-pub struct SnapshotTreeStore<'a> {
+pub(crate) struct SnapshotTreeStore<'a> {
     /// RocksDB snapshot for point-in-time reads.
     snapshot: Snapshot<'a>,
     /// Reference to the DB for column family handles.
@@ -407,12 +403,11 @@ impl<'a> SnapshotTreeStore<'a> {
         partition_key: &DbPartitionKey,
         sort_key: &DbSortKey,
     ) -> Option<Vec<u8>> {
-        let cf = self.db.cf_handle("state")?;
+        let cf = self.db.cf_handle(STATE_CF)?;
         let key = keys::to_storage_key(partition_key, sort_key);
         self.snapshot
             .get_cf(cf, &key)
-            .ok()
-            .flatten()
+            .expect("RocksDB snapshot read failure on state CF")
             .map(|v| v.to_vec())
     }
 
@@ -427,22 +422,22 @@ impl<'a> SnapshotTreeStore<'a> {
         let version = self
             .snapshot
             .get(b"jmt:version")
-            .ok()
-            .flatten()
-            .and_then(|bytes| {
-                let arr: [u8; 8] = bytes.as_slice().try_into().ok()?;
-                Some(u64::from_be_bytes(arr))
+            .expect("BFT CRITICAL: failed to read jmt:version from snapshot")
+            .map(|bytes| {
+                u64::from_be_bytes(
+                    <[u8; 8]>::try_from(bytes.as_slice()).expect("jmt:version must be 8 bytes"),
+                )
             })
             .unwrap_or(0);
 
         let root_hash = self
             .snapshot
             .get(b"jmt:root_hash")
-            .ok()
-            .flatten()
-            .and_then(|bytes| {
-                let arr: [u8; 32] = bytes.as_slice().try_into().ok()?;
-                Some(StateRootHash(arr))
+            .expect("BFT CRITICAL: failed to read jmt:root_hash from snapshot")
+            .map(|bytes| {
+                StateRootHash(
+                    <[u8; 32]>::try_from(bytes.as_slice()).expect("jmt:root_hash must be 32 bytes"),
+                )
             })
             .unwrap_or(StateRootHash([0u8; 32]));
 
@@ -456,200 +451,27 @@ impl ReadableTreeStore for SnapshotTreeStore<'_> {
         let encoded_key = encode_jmt_key(key);
         self.snapshot
             .get_cf(cf, &encoded_key)
-            .ok()
-            .flatten()
-            .and_then(|bytes| sbor::basic_decode::<VersionedTreeNode>(&bytes).ok())
-            .map(|versioned| versioned.fully_update_and_into_latest_version())
+            .expect("RocksDB snapshot read failure on jmt_nodes CF")
+            .map(|bytes| {
+                sbor::basic_decode::<VersionedTreeNode>(&bytes)
+                    .unwrap_or_else(|e| panic!("JMT node corruption detected: {e:?}"))
+                    .fully_update_and_into_latest_version()
+            })
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Overlay tree store for speculative JMT computation
+// Substate lookup for historical JMT associations
+// Uses the unified OverlayTreeStore from hyperscale_storage.
 // ═══════════════════════════════════════════════════════════════════════
 
-/// An overlay tree store that captures writes without modifying the underlying store.
-///
-/// Reads check the overlay first, then fall through to the base store.
-/// Writes only go to the overlay and are discarded when the overlay is dropped.
-///
-/// This enables speculative JMT root computation where we need to compute what
-/// the root WOULD be without actually persisting any nodes. Multiple concurrent
-/// speculative computations can run without corrupting each other.
-///
-/// # Type Parameter
-/// `B` is the base store type, which must implement `ReadableTreeStore`. This is
-/// typically either `RocksDbStorage` (for direct reads) or `SnapshotTreeStore`
-/// (for snapshot-isolated reads that are immune to concurrent deletions).
-///
-/// # Historical State Support
-///
-/// When `enable_historical_values` is true, the overlay collects associations
-/// between JMT leaf nodes and their substate values. This requires a
-/// `SnapshotTreeStore` base to enable substate lookups for unchanged values.
-pub struct OverlayTreeStore<'a, B: ReadableTreeStore> {
-    /// The underlying store (read-only access).
-    base: &'a B,
-
-    /// Overlay of node insertions. Maps key -> node.
-    /// Nodes inserted during speculative computation are stored here.
-    inserted_nodes: RefCell<HashMap<StoredTreeNodeKey, TreeNode>>,
-
-    /// Set of keys that have been marked as stale (deleted) in the overlay.
-    /// Lookups for these keys return None even if they exist in the base store.
-    stale_keys: RefCell<HashSet<StoredTreeNodeKey>>,
-
-    /// Stale tree parts for pruning on commit.
-    stale_tree_parts: RefCell<Vec<StaleTreePart>>,
-
-    /// Associations between JMT leaf nodes and their substate values.
-    /// Only populated when `enable_historical_values` is true.
-    leaf_substate_associations: RefCell<Vec<LeafSubstateKeyAssociation>>,
-
-    /// Whether to collect leaf-to-substate associations for historical queries.
-    enable_historical_values: bool,
-
-    /// Optional reference to snapshot for looking up unchanged substate values.
-    /// Required when `enable_historical_values` is true.
-    substate_snapshot: Option<&'a SnapshotTreeStore<'a>>,
-}
-
-impl<'a, B: ReadableTreeStore> OverlayTreeStore<'a, B> {
-    /// Create a new overlay wrapping the given base store.
-    ///
-    /// Historical value collection is disabled. Use [`with_historical_values`]
-    /// to enable it.
-    pub fn new(base: &'a B) -> Self {
-        Self {
-            base,
-            inserted_nodes: RefCell::new(HashMap::new()),
-            stale_keys: RefCell::new(HashSet::new()),
-            stale_tree_parts: RefCell::new(Vec::new()),
-            leaf_substate_associations: RefCell::new(Vec::new()),
-            enable_historical_values: false,
-            substate_snapshot: None,
-        }
-    }
-
-    /// Convert this overlay into a snapshot that can be applied later.
-    ///
-    /// Consumes the overlay and extracts the captured nodes into a [`JmtSnapshot`].
-    /// The snapshot can be cached and applied to the real JMT during block commit,
-    /// avoiding redundant recomputation of the same tree updates.
-    ///
-    /// If historical value collection was enabled, the snapshot will also contain
-    /// leaf-to-substate associations.
-    pub fn into_snapshot(
-        self,
-        base_root: StateRootHash,
-        base_version: u64,
-        result_root: StateRootHash,
-        num_versions: u64,
-    ) -> JmtSnapshot {
-        let inserted_nodes = self.inserted_nodes.into_inner();
-        let stale_tree_parts = self.stale_tree_parts.into_inner();
-        let leaf_substate_associations = self.leaf_substate_associations.into_inner();
-
-        JmtSnapshot {
-            base_root,
-            base_version,
-            result_root,
-            num_versions,
-            nodes: inserted_nodes,
-            stale_tree_parts,
-            leaf_substate_associations,
-        }
-    }
-}
-
-impl<'a> OverlayTreeStore<'a, SnapshotTreeStore<'a>> {
-    /// Enable historical value collection.
-    ///
-    /// When enabled, the overlay will collect associations between JMT leaf nodes
-    /// and their substate values. This requires the snapshot to look up unchanged
-    /// values.
-    ///
-    /// # Arguments
-    /// * `snapshot` - The snapshot to use for looking up unchanged substate values
-    pub fn with_historical_values(mut self, snapshot: &'a SnapshotTreeStore<'a>) -> Self {
-        self.enable_historical_values = true;
-        self.substate_snapshot = Some(snapshot);
-        self
-    }
-}
-
-impl<B: ReadableTreeStore> ReadableTreeStore for OverlayTreeStore<'_, B> {
-    fn get_node(&self, key: &StoredTreeNodeKey) -> Option<TreeNode> {
-        // Check if the key was marked as stale (deleted)
-        if self.stale_keys.borrow().contains(key) {
-            return None;
-        }
-
-        // Check overlay first
-        if let Some(node) = self.inserted_nodes.borrow().get(key) {
-            return Some(node.clone());
-        }
-
-        // Fall through to base store
-        self.base.get_node(key)
-    }
-}
-
-impl<B: ReadableTreeStore> WriteableTreeStore for OverlayTreeStore<'_, B> {
-    fn insert_node(&self, key: StoredTreeNodeKey, node: TreeNode) {
-        // Remove from stale set if it was previously marked stale
-        self.stale_keys.borrow_mut().remove(&key);
-        // Insert into overlay
-        self.inserted_nodes.borrow_mut().insert(key, node);
-    }
-
-    fn associate_substate(
+impl SubstateLookup for SnapshotTreeStore<'_> {
+    fn lookup_substate(
         &self,
-        state_tree_leaf_key: &StoredTreeNodeKey,
         partition_key: &DbPartitionKey,
         sort_key: &DbSortKey,
-        substate_value: AssociatedSubstateValue,
-    ) {
-        if !self.enable_historical_values {
-            return;
-        }
-
-        let value = match substate_value {
-            AssociatedSubstateValue::Upserted(v) => v.to_vec(),
-            AssociatedSubstateValue::Unchanged => {
-                // Look up the unchanged value from the snapshot.
-                // This may fail if the substate was created earlier in the same batch
-                // (not yet persisted to RocksDB). In that case, skip the association -
-                // we'll have captured it when it was originally created.
-                let snapshot = self
-                    .substate_snapshot
-                    .expect("substate_snapshot required when enable_historical_values is true");
-                match snapshot.get_substate(partition_key, sort_key) {
-                    Some(v) => v,
-                    None => {
-                        // Substate not in snapshot - likely created earlier in this batch.
-                        // Skip this association; the value was captured when it was upserted.
-                        return;
-                    }
-                }
-            }
-        };
-
-        self.leaf_substate_associations
-            .borrow_mut()
-            .push(LeafSubstateKeyAssociation {
-                tree_node_key: state_tree_leaf_key.clone(),
-                substate_value: value,
-            });
-    }
-
-    fn record_stale_tree_part(&self, part: StaleTreePart) {
-        // Track stale key for overlay reads, and full part for later pruning.
-        let key = match &part {
-            StaleTreePart::Node(k) => k.clone(),
-            StaleTreePart::Subtree(k) => k.clone(),
-        };
-        self.stale_keys.borrow_mut().insert(key);
-        self.stale_tree_parts.borrow_mut().push(part);
+    ) -> Option<Vec<u8>> {
+        self.get_substate(partition_key, sort_key)
     }
 }
 
@@ -668,10 +490,16 @@ impl RocksDbStorage {
         latency_us = tracing::field::Empty,
     ))]
     pub fn commit(&self, updates: &DatabaseUpdates) -> Result<(), StorageError> {
+        let _commit_guard = self.commit_lock.lock().unwrap();
         let start = Instant::now();
         let mut batch = WriteBatch::default();
         let mut put_count = 0u64;
         let mut delete_count = 0u64;
+
+        let state_cf = self
+            .db
+            .cf_handle(STATE_CF)
+            .expect("state column family must exist");
 
         for (node_key, node_updates) in &updates.node_updates {
             for (partition_num, partition_updates) in &node_updates.partition_updates {
@@ -686,11 +514,11 @@ impl RocksDbStorage {
                             let key = keys::to_storage_key(&partition_key, sort_key);
                             match update {
                                 DatabaseUpdate::Set(value) => {
-                                    batch.put(&key, value);
+                                    batch.put_cf(state_cf, &key, value);
                                     put_count += 1;
                                 }
                                 DatabaseUpdate::Delete => {
-                                    batch.delete(&key);
+                                    batch.delete_cf(state_cf, &key);
                                     delete_count += 1;
                                 }
                             }
@@ -699,18 +527,19 @@ impl RocksDbStorage {
                     PartitionDatabaseUpdates::Reset {
                         new_substate_values,
                     } => {
-                        // Delete all existing in partition
+                        // Delete all existing in partition using a snapshot iterator
                         let prefix = keys::partition_prefix(&partition_key);
-                        let end = keys::next_prefix(&prefix);
+                        let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
 
-                        let mut iter = self.db.raw_iterator();
+                        let snap = self.db.snapshot();
+                        let mut iter = snap.raw_iterator_cf(state_cf);
                         iter.seek(&prefix);
                         while iter.valid() {
                             if let Some(key) = iter.key() {
                                 if key >= end.as_slice() {
                                     break;
                                 }
-                                batch.delete(key);
+                                batch.delete_cf(state_cf, key);
                                 delete_count += 1;
                                 iter.next();
                             } else {
@@ -721,7 +550,7 @@ impl RocksDbStorage {
                         // Insert new values
                         for (sort_key, value) in new_substate_values {
                             let key = keys::to_storage_key(&partition_key, sort_key);
-                            batch.put(&key, value);
+                            batch.put_cf(state_cf, &key, value);
                             put_count += 1;
                         }
                     }
@@ -729,10 +558,15 @@ impl RocksDbStorage {
             }
         }
 
-        // Compute JMT updates using an overlay
-        let (base_version, base_root) = self.read_jmt_metadata();
+        // Compute JMT updates using a snapshot-based overlay for isolation
+        let snapshot_store = SnapshotTreeStore::new(&self.db);
+        let (base_version, base_root) = snapshot_store.read_jmt_metadata();
 
-        let overlay = OverlayTreeStore::new(self);
+        let overlay = if self.enable_historical_substate_values {
+            OverlayTreeStore::new(&snapshot_store).with_substate_lookup(&snapshot_store)
+        } else {
+            OverlayTreeStore::new(&snapshot_store)
+        };
         let parent_version = if base_version == 0 {
             None
         } else {
@@ -740,52 +574,13 @@ impl RocksDbStorage {
         };
         let new_root = put_at_next_version(&overlay, parent_version, updates);
         let new_version = base_version + 1;
-        let snapshot = overlay.into_snapshot(base_root, base_version, new_root, 1);
+        let jmt_snapshot = overlay.into_snapshot(base_root, base_version, new_root, 1);
 
-        // Add JMT nodes to the batch
-        let jmt_cf = self
-            .db
-            .cf_handle(JMT_NODES_CF)
-            .expect("jmt_nodes column family must exist");
+        self.append_jmt_to_batch(&mut batch, &jmt_snapshot, new_version);
 
-        for (key, node) in &snapshot.nodes {
-            let encoded_key = encode_jmt_key(key);
-            let encoded_node =
-                sbor::basic_encode(&VersionedTreeNode::from_latest_version(node.clone()))
-                    .expect("JMT node encoding must succeed");
-            batch.put_cf(jmt_cf, encoded_key, encoded_node);
-        }
-
-        // Queue stale parts for deferred GC instead of deleting immediately
-        if !snapshot.stale_tree_parts.is_empty() {
-            let stale_cf = self
-                .db
-                .cf_handle(STALE_STATE_HASH_TREE_PARTS_CF)
-                .expect("stale_state_hash_tree_parts column family must exist");
-
-            let version_key = new_version.to_be_bytes();
-            let encoded_parts = sbor::basic_encode(&snapshot.stale_tree_parts)
-                .expect("encoding stale parts must succeed");
-            batch.put_cf(stale_cf, version_key, encoded_parts);
-        }
-
-        // Persist associations if enabled
-        if self.enable_historical_substate_values {
-            let assoc_cf = self
-                .db
-                .cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)
-                .expect("associated_state_tree_values column family must exist");
-            for assoc in &snapshot.leaf_substate_associations {
-                let encoded_key = encode_jmt_key(&assoc.tree_node_key);
-                batch.put_cf(assoc_cf, encoded_key, &assoc.substate_value);
-            }
-        }
-
-        // Add JMT metadata to the batch
-        batch.put(b"jmt:version", new_version.to_be_bytes());
-        batch.put(b"jmt:root_hash", new_root.0);
-
-        // Write everything atomically - RocksDB handles internal synchronization
+        // Write everything atomically. No sync needed here — this method is only
+        // used for genesis bootstrap via CommittableSubstateDatabase. RocksDB WAL
+        // provides crash safety; the subsequent block commit path uses sync writes.
         self.db
             .write(batch)
             .map_err(|e| StorageError::DatabaseError(e.to_string()))?;
@@ -799,21 +594,6 @@ impl RocksDbStorage {
         tracing::debug!(put_count, delete_count, new_version, "commit complete");
 
         Ok(())
-    }
-
-    /// Get a mutable reference for APIs that require `&mut self`.
-    ///
-    /// # Safety
-    /// This is safe because RocksDB is internally thread-safe. The mutable reference
-    /// is only needed to satisfy trait bounds (like `CommittableSubstateDatabase`),
-    /// not for actual exclusivity. RocksDB's `DB` type uses internal locking.
-    #[allow(clippy::mut_from_ref)]
-    pub unsafe fn as_mut(&self) -> &mut Self {
-        // Use UnsafeCell pattern to avoid the invalid_reference_casting lint.
-        // This is sound because RocksDB is internally synchronized.
-        let cell = UnsafeCell::new(std::ptr::null_mut::<Self>());
-        *cell.get() = self as *const Self as *mut Self;
-        &mut **cell.get()
     }
 }
 
@@ -835,6 +615,7 @@ impl SubstateStore for RocksDbStorage {
         // of creation, immune to concurrent writes.
         RocksDbSnapshot {
             snapshot: self.db.snapshot(),
+            db: &self.db,
         }
     }
 
@@ -844,7 +625,7 @@ impl SubstateStore for RocksDbStorage {
     ) -> Box<dyn Iterator<Item = (u8, DbSortKey, Vec<u8>)> + '_> {
         let prefix = keys::node_prefix(node_id);
         let prefix_len = prefix.len();
-        let end = keys::next_prefix(&prefix);
+        let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
 
         let items = self.iter_range(&prefix, &end);
 
@@ -863,18 +644,13 @@ impl SubstateStore for RocksDbStorage {
         self.read_jmt_metadata().0
     }
 
-    fn state_root_hash(&self) -> StateRootHash {
-        self.read_jmt_metadata().1
+    fn state_root_hash(&self) -> hyperscale_types::Hash {
+        let (_, root_hash) = self.read_jmt_metadata();
+        hyperscale_types::Hash::from_hash_bytes(&root_hash.0)
     }
 }
 
 impl RocksDbStorage {
-    /// Get the current JMT root hash.
-    pub fn current_jmt_root(&self) -> hyperscale_types::Hash {
-        let (_, root_hash) = self.read_jmt_metadata();
-        hyperscale_types::Hash::from_bytes(&root_hash.0)
-    }
-
     /// Compute speculative state root and capture a snapshot for later application.
     ///
     /// This is used for state root verification and proposal. The caller specifies
@@ -893,10 +669,10 @@ impl RocksDbStorage {
     /// # Returns
     /// A tuple of (computed_state_root, snapshot). The snapshot can be applied
     /// to the real JMT during commit via [`apply_jmt_snapshot`].
-    pub fn compute_speculative_root_from_base(
+    pub(crate) fn compute_speculative_root_from_base(
         &self,
         expected_base_root: hyperscale_types::Hash,
-        writes_per_cert: &[Vec<hyperscale_types::SubstateWrite>],
+        updates_per_cert: &[DatabaseUpdates],
     ) -> (hyperscale_types::Hash, JmtSnapshot) {
         // This computation runs on the consensus-crypto thread pool, concurrent with
         // block commits on the tokio runtime threads. Block commits delete stale JMT
@@ -910,10 +686,10 @@ impl RocksDbStorage {
         let snapshot_store = SnapshotTreeStore::new(&self.db);
         let (base_version, base_root) = snapshot_store.read_jmt_metadata();
 
-        let current_root = hyperscale_types::Hash::from_bytes(&base_root.0);
+        let current_root = hyperscale_types::Hash::from_hash_bytes(&base_root.0);
 
         // If no certificates, return current root with empty snapshot.
-        if writes_per_cert.is_empty() {
+        if updates_per_cert.is_empty() {
             let snapshot = JmtSnapshot {
                 base_root,
                 base_version,
@@ -937,55 +713,30 @@ impl RocksDbStorage {
 
         // Create overlay, optionally enabling historical value collection
         let overlay = if self.enable_historical_substate_values {
-            OverlayTreeStore::new(&snapshot_store).with_historical_values(&snapshot_store)
+            OverlayTreeStore::new(&snapshot_store).with_substate_lookup(&snapshot_store)
         } else {
             OverlayTreeStore::new(&snapshot_store)
         };
 
         let mut current_version = base_version;
         let mut root = base_root;
-        let num_versions = writes_per_cert.len() as u64;
+        let num_versions = updates_per_cert.len() as u64;
 
-        for cert_writes in writes_per_cert {
-            let updates = hyperscale_engine::substate_writes_to_database_updates(cert_writes);
+        for updates in updates_per_cert {
             let parent_version = if current_version == 0 {
                 None
             } else {
                 Some(current_version)
             };
 
-            root = put_at_next_version(&overlay, parent_version, &updates);
+            root = put_at_next_version(&overlay, parent_version, updates);
             current_version += 1;
         }
 
-        let result_root = hyperscale_types::Hash::from_bytes(&root.0);
+        let result_root = hyperscale_types::Hash::from_hash_bytes(&root.0);
         let snapshot = overlay.into_snapshot(base_root, base_version, root, num_versions);
 
         (result_root, snapshot)
-    }
-
-    /// Cache a block commit for later application.
-    ///
-    /// Called after verification to store the pre-built WriteBatch and JMT snapshot.
-    /// When the block commits, [`take_block_commit_cache`] retrieves it.
-    ///
-    /// Uses LRU eviction - oldest entries are removed when cache exceeds
-    /// [`BLOCK_COMMIT_CACHE_MAX_SIZE`].
-    pub fn cache_block_commit(&self, block_hash: hyperscale_types::Hash, entry: BlockCommitCache) {
-        let mut cache = self.block_commit_cache.lock().unwrap();
-        cache.insert(block_hash, entry);
-    }
-
-    /// Take a cached block commit, removing it from the cache.
-    ///
-    /// Called during block commit to retrieve and apply the precomputed data.
-    /// Returns `None` if no cache was present (e.g., cache eviction or sync block).
-    pub fn take_block_commit_cache(
-        &self,
-        block_hash: hyperscale_types::Hash,
-    ) -> Option<BlockCommitCache> {
-        let mut cache = self.block_commit_cache.lock().unwrap();
-        cache.remove(&block_hash)
     }
 
     /// Build a WriteBatch for all certificates in a block.
@@ -1001,7 +752,7 @@ impl RocksDbStorage {
     /// # Returns
     ///
     /// A WriteBatch containing all certificate and state writes.
-    pub fn build_write_batch(
+    pub(crate) fn build_write_batch(
         &self,
         certificates: &[std::sync::Arc<hyperscale_types::TransactionCertificate>],
         local_shard: hyperscale_types::ShardGroupId,
@@ -1014,7 +765,7 @@ impl RocksDbStorage {
             .expect("certificates column family must exist");
         let state_cf = self
             .db
-            .cf_handle("state")
+            .cf_handle(STATE_CF)
             .expect("state column family must exist");
 
         for cert in certificates {
@@ -1023,38 +774,16 @@ impl RocksDbStorage {
                 sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
             batch.put_cf(cert_cf, cert.transaction_hash.as_bytes(), cert_bytes);
 
-            // Add state writes for local shard
+            // Add state writes for local shard (iterate SubstateWrite directly,
+            // avoiding intermediate DatabaseUpdates allocation)
             if let Some(shard_proof) = cert.shard_proofs.get(&local_shard) {
-                let updates = hyperscale_engine::substate_writes_to_database_updates(
-                    &shard_proof.state_writes,
-                );
-                for (db_node_key, node_updates) in &updates.node_updates {
-                    for (partition_num, partition_updates) in &node_updates.partition_updates {
-                        if let hyperscale_engine::PartitionDatabaseUpdates::Delta {
-                            substate_updates,
-                        } = partition_updates
-                        {
-                            for (db_sort_key, update) in substate_updates {
-                                let partition_key = hyperscale_engine::DbPartitionKey {
-                                    node_key: db_node_key.clone(),
-                                    partition_num: *partition_num,
-                                };
-                                let storage_key = hyperscale_engine::keys::to_storage_key(
-                                    &partition_key,
-                                    db_sort_key,
-                                );
-
-                                match update {
-                                    hyperscale_engine::DatabaseUpdate::Set(value) => {
-                                        batch.put_cf(state_cf, &storage_key, value);
-                                    }
-                                    hyperscale_engine::DatabaseUpdate::Delete => {
-                                        batch.delete_cf(state_cf, &storage_key);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                for write in &shard_proof.state_writes {
+                    let storage_key = hyperscale_storage::keys::storage_key_from_write(
+                        &write.node_id,
+                        &write.partition,
+                        &write.sort_key,
+                    );
+                    batch.put_cf(state_cf, &storage_key, &write.value);
                 }
             }
         }
@@ -1062,42 +791,40 @@ impl RocksDbStorage {
         batch
     }
 
-    /// Apply a cached block commit with a single fsync.
+    /// Try to apply a prepared block commit with a single fsync.
     ///
-    /// This is the fast path for block commit when we have a cached BlockCommitCache
-    /// from verification. Applies the pre-built WriteBatch atomically with one fsync,
-    /// including all JMT nodes from the snapshot.
+    /// This is the fast path for block commit. Applies the pre-built WriteBatch
+    /// atomically with one fsync, including all JMT nodes from the snapshot.
     ///
-    /// # Panics
-    ///
-    /// Panics if the current JMT root doesn't match the snapshot's base_root,
-    /// or if the RocksDB write fails.
-    /// Try to apply a pre-computed block commit cache.
-    ///
-    /// Returns `true` if the cache was successfully applied (fast path),
-    /// or `false` if the cache couldn't be applied due to JMT state mismatch
+    /// Returns `true` if successfully applied (fast path),
+    /// or `false` if the JMT state has changed since preparation
     /// (caller should fall back to slow path).
     ///
     /// # Panics
     /// Only panics on unrecoverable errors (RocksDB write failure).
-    pub fn try_apply_block_commit_cache(&self, mut cache: BlockCommitCache) -> bool {
+    pub(crate) fn try_apply_prepared_commit(
+        &self,
+        mut write_batch: WriteBatch,
+        jmt_snapshot: JmtSnapshot,
+    ) -> bool {
+        let _commit_guard = self.commit_lock.lock().unwrap();
         let start = Instant::now();
 
         // Verify we're applying to the expected base state BEFORE writing anything.
         // Must check BOTH root AND version. Root can be unchanged with empty commits
         // (same root, different version), but the nodes are keyed by version.
         let (current_version, current_root_hash) = self.read_jmt_metadata();
-        if current_root_hash != cache.jmt_snapshot.base_root {
+        if current_root_hash != jmt_snapshot.base_root {
             tracing::warn!(
-                expected_root = ?cache.jmt_snapshot.base_root,
+                expected_root = ?jmt_snapshot.base_root,
                 actual_root = ?current_root_hash,
                 "JMT snapshot base ROOT mismatch - falling back to slow path"
             );
             return false;
         }
-        if current_version != cache.jmt_snapshot.base_version {
+        if current_version != jmt_snapshot.base_version {
             tracing::warn!(
-                expected_version = cache.jmt_snapshot.base_version,
+                expected_version = jmt_snapshot.base_version,
                 actual_version = current_version,
                 "JMT snapshot base VERSION mismatch - falling back to slow path. \
                  This can happen with empty commits or concurrent block processing."
@@ -1105,80 +832,25 @@ impl RocksDbStorage {
             return false;
         }
 
-        // Add JMT nodes to the WriteBatch so everything is written atomically
-        let jmt_cf = self
-            .db
-            .cf_handle(JMT_NODES_CF)
-            .expect("jmt_nodes column family must exist");
+        let nodes_count = jmt_snapshot.nodes.len();
+        let stale_count = jmt_snapshot.stale_tree_parts.len();
+        let associations_count = jmt_snapshot.leaf_substate_associations.len();
+        let new_version = jmt_snapshot.base_version + jmt_snapshot.num_versions;
+        let new_root = jmt_snapshot.result_root;
 
-        let nodes_count = cache.jmt_snapshot.nodes.len();
-        for (key, node) in &cache.jmt_snapshot.nodes {
-            let encoded_key = encode_jmt_key(key);
-            let encoded_node =
-                sbor::basic_encode(&VersionedTreeNode::from_latest_version(node.clone()))
-                    .expect("JMT node encoding must succeed");
-            cache.write_batch.put_cf(jmt_cf, encoded_key, encoded_node);
-        }
-
-        // Queue stale parts for deferred GC instead of deleting immediately.
-        // This makes commits faster and enables configurable history retention.
-        let stale_count = cache.jmt_snapshot.stale_tree_parts.len();
-        if !cache.jmt_snapshot.stale_tree_parts.is_empty() {
-            let stale_cf = self
-                .db
-                .cf_handle(STALE_STATE_HASH_TREE_PARTS_CF)
-                .expect("stale_state_hash_tree_parts column family must exist");
-
-            // Key by the version at which these parts became stale (the new version)
-            let stale_version = cache.jmt_snapshot.base_version + cache.jmt_snapshot.num_versions;
-            let version_key = stale_version.to_be_bytes();
-
-            // Encode the stale parts list
-            let encoded_parts = sbor::basic_encode(&cache.jmt_snapshot.stale_tree_parts)
-                .expect("encoding stale parts must succeed");
-
-            cache
-                .write_batch
-                .put_cf(stale_cf, version_key, encoded_parts);
-        }
-
-        // Persist historical substate value associations if enabled
-        let associations_count = if self.enable_historical_substate_values {
-            let assoc_cf = self
-                .db
-                .cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)
-                .expect("associated_state_tree_values column family must exist");
-            let count = cache.jmt_snapshot.leaf_substate_associations.len();
-            for assoc in &cache.jmt_snapshot.leaf_substate_associations {
-                let encoded_key = encode_jmt_key(&assoc.tree_node_key);
-                cache
-                    .write_batch
-                    .put_cf(assoc_cf, encoded_key, &assoc.substate_value);
-            }
-            count
-        } else {
-            0
-        };
-
-        // Add JMT metadata to the batch
-        let new_version = cache.jmt_snapshot.base_version + cache.jmt_snapshot.num_versions;
-        let new_root = cache.jmt_snapshot.result_root;
-        cache
-            .write_batch
-            .put(b"jmt:version", new_version.to_be_bytes());
-        cache.write_batch.put(b"jmt:root_hash", new_root.0);
+        self.append_jmt_to_batch(&mut write_batch, &jmt_snapshot, new_version);
 
         // Apply everything atomically with a single fsync
         let mut write_opts = rocksdb::WriteOptions::default();
         write_opts.set_sync(true);
 
-        self.db.write_opt(cache.write_batch, &write_opts).expect(
+        self.db.write_opt(write_batch, &write_opts).expect(
             "BFT SAFETY CRITICAL: block commit failed - node state would diverge from network",
         );
 
         let elapsed = start.elapsed();
         metrics::record_storage_write(elapsed.as_secs_f64());
-        metrics::record_storage_operation("apply_block_commit_cache", elapsed.as_secs_f64());
+        metrics::record_storage_operation("apply_prepared_commit", elapsed.as_secs_f64());
 
         tracing::debug!(
             new_version,
@@ -1187,7 +859,7 @@ impl RocksDbStorage {
             stale_count,
             associations_count,
             elapsed_ms = elapsed.as_millis(),
-            "Applied block commit cache (single fsync)"
+            "Applied prepared commit (single fsync)"
         );
 
         true
@@ -1201,6 +873,7 @@ impl RocksDbStorage {
 /// through this snapshot.
 pub struct RocksDbSnapshot<'a> {
     snapshot: Snapshot<'a>,
+    db: &'a DB,
 }
 
 impl SubstateDatabase for RocksDbSnapshot<'_> {
@@ -1210,7 +883,10 @@ impl SubstateDatabase for RocksDbSnapshot<'_> {
         sort_key: &DbSortKey,
     ) -> Option<DbSubstateValue> {
         let key = keys::to_storage_key(partition_key, sort_key);
-        self.snapshot.get(&key).ok().flatten()
+        let state_cf = self.db.cf_handle(STATE_CF)?;
+        self.snapshot
+            .get_cf(state_cf, &key)
+            .expect("RocksDB snapshot read failure on state CF")
     }
 
     fn list_raw_values_from_db_key(
@@ -1229,12 +905,20 @@ impl SubstateDatabase for RocksDbSnapshot<'_> {
             }
             None => prefix.clone(),
         };
-        let end = keys::next_prefix(&prefix);
+        let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
 
-        let mut iter = self.snapshot.raw_iterator();
+        let state_cf = self
+            .db
+            .cf_handle(STATE_CF)
+            .expect("state column family must exist");
+        let mut iter = self.snapshot.raw_iterator_cf(state_cf);
         iter.seek(&start);
 
+        let mut done = false;
         let raw_iter = std::iter::from_fn(move || {
+            if done {
+                return None;
+            }
             if iter.valid() {
                 let key = iter.key()?;
                 if key < end.as_slice() {
@@ -1243,9 +927,14 @@ impl SubstateDatabase for RocksDbSnapshot<'_> {
                     iter.next();
                     Some((k, v))
                 } else {
+                    done = true;
                     None
                 }
             } else {
+                done = true;
+                if let Err(e) = iter.status() {
+                    panic!("RocksDB snapshot iterator error: {e}");
+                }
                 None
             }
         });
@@ -1271,96 +960,25 @@ use hyperscale_types::{
 };
 
 impl RocksDbStorage {
-    /// Store a committed block with its quorum certificate.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the block cannot be persisted. This is intentional: committed blocks
-    /// are essential for crash recovery. If we cannot persist a block, we will have
-    /// gaps in our chain on restart, requiring a full sync from peers. Crashing
-    /// immediately surfaces the storage issue rather than silently creating an
-    /// inconsistent state.
-    pub fn put_block(&self, height: BlockHeight, block: &Block, qc: &QuorumCertificate) {
-        let start = Instant::now();
-        let cf = self
-            .db
-            .cf_handle("blocks")
-            .expect("blocks column family must exist");
-
-        // Key: height as big-endian bytes (for natural ordering)
-        let key = height.0.to_be_bytes();
-
-        // Value: SBOR-encoded (block, qc) tuple
-        let value = sbor::basic_encode(&(block, qc))
-            .expect("block encoding must succeed - this is a bug if it fails");
-
-        self.db
-            .put_cf(cf, key, value)
-            .expect("block persistence failed - cannot maintain chain state");
-
-        let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_storage_write(elapsed);
-        metrics::record_storage_operation("put_block", elapsed);
-        metrics::record_block_persisted();
-    }
-
-    /// Get a committed block by height.
-    pub fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
-        let start = Instant::now();
-        let cf = self.db.cf_handle("blocks")?;
-        let key = height.0.to_be_bytes();
-
-        let result = match self.db.get_cf(cf, key) {
-            Ok(Some(value)) => match sbor::basic_decode::<(Block, QuorumCertificate)>(&value) {
-                Ok(result) => Some(result),
-                Err(e) => {
-                    tracing::error!("Failed to decode block at height {}: {:?}", height.0, e);
-                    None
-                }
-            },
-            Ok(None) => None,
-            Err(e) => {
-                tracing::error!("Failed to read block at height {}: {}", height.0, e);
-                None
-            }
-        };
-        let elapsed = start.elapsed().as_secs_f64();
-        metrics::record_storage_read(elapsed);
-        metrics::record_storage_operation("get_block", elapsed);
-        result
-    }
-
     /// Get a range of committed blocks [from, to).
     ///
-    /// Returns blocks in ascending height order.
+    /// Returns blocks in ascending height order. Uses `get_block_denormalized`
+    /// for each height to properly reconstruct blocks from metadata + individual
+    /// transaction/certificate entries.
     pub fn get_blocks_range(
         &self,
         from: BlockHeight,
         to: BlockHeight,
     ) -> Vec<(Block, QuorumCertificate)> {
-        let cf = match self.db.cf_handle("blocks") {
-            Some(cf) => cf,
-            None => return vec![],
-        };
-
-        let start_key = from.0.to_be_bytes();
-        let end_key = to.0.to_be_bytes();
-
-        let iter = self.db.iterator_cf(
-            cf,
-            rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
-        );
-
-        iter.take_while(|item| match item {
-            Ok((key, _)) => key.as_ref() < end_key.as_slice(),
-            Err(_) => false,
-        })
-        .filter_map(|item| {
-            item.ok().and_then(|(_, value)| {
-                sbor::basic_decode::<(Block, QuorumCertificate)>(&value).ok()
-            })
-        })
-        .collect()
+        let mut result = Vec::new();
+        let mut h = from.0;
+        while h < to.0 {
+            if let Some(block_qc) = self.get_block_denormalized(BlockHeight(h)) {
+                result.push(block_qc);
+            }
+            h += 1;
+        }
+        result
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1372,26 +990,17 @@ impl RocksDbStorage {
     /// This is idempotent - storing the same transaction twice is safe.
     /// Used by `put_block_denormalized` to store transactions separately from block metadata.
     pub fn put_transaction(&self, tx: &RoutableTransaction) {
-        let cf = match self.db.cf_handle("transactions") {
-            Some(cf) => cf,
-            None => {
-                tracing::error!("transactions column family not found");
-                return;
-            }
-        };
+        let cf = self
+            .db
+            .cf_handle("transactions")
+            .expect("transactions column family must exist");
 
         let hash = tx.hash();
-        let value = match sbor::basic_encode(tx) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("Failed to encode transaction: {:?}", e);
-                return;
-            }
-        };
+        let value = sbor::basic_encode(tx).expect("transaction encoding must succeed");
 
-        if let Err(e) = self.db.put_cf(cf, hash.as_bytes(), value) {
-            tracing::error!("Failed to store transaction: {}", e);
-        }
+        self.db
+            .put_cf(cf, hash.as_bytes(), value)
+            .expect("failed to persist transaction");
     }
 
     /// Get a transaction by hash.
@@ -1459,7 +1068,7 @@ impl RocksDbStorage {
     ///
     /// Panics if the block cannot be persisted. This is intentional: committed blocks
     /// are essential for crash recovery.
-    pub fn put_block_denormalized(&self, block: &Block, qc: &QuorumCertificate) {
+    pub(crate) fn put_block_denormalized(&self, block: &Block, qc: &QuorumCertificate) {
         let start = Instant::now();
         let mut batch = rocksdb::WriteBatch::default();
 
@@ -1499,9 +1108,11 @@ impl RocksDbStorage {
             batch.put_cf(certs_cf, cert.transaction_hash.as_bytes(), cert_value);
         }
 
-        // Atomic write
+        // Atomic write with sync for crash safety
+        let mut write_opts = WriteOptions::default();
+        write_opts.set_sync(true);
         self.db
-            .write(batch)
+            .write_opt(batch, &write_opts)
             .expect("block persistence failed - cannot maintain chain state");
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -1519,7 +1130,7 @@ impl RocksDbStorage {
     /// Returns `None` if the block metadata is not found, or if any referenced
     /// transactions or certificates are missing. This ensures sync responses
     /// always contain complete, self-contained blocks.
-    pub fn get_block_denormalized(
+    pub(crate) fn get_block_denormalized(
         &self,
         height: BlockHeight,
     ) -> Option<(Block, QuorumCertificate)> {
@@ -1793,57 +1404,33 @@ impl RocksDbStorage {
         hash: Option<Hash>,
         qc: Option<&QuorumCertificate>,
     ) {
-        // Store in default column family with well-known keys
-        if let Err(e) = self
-            .db
-            .put(b"chain:committed_height", height.0.to_be_bytes())
-        {
-            tracing::error!("Failed to store committed height: {}", e);
-        }
-
+        let mut batch = WriteBatch::default();
+        batch.put(b"chain:committed_height", height.0.to_be_bytes());
         if let Some(h) = hash {
-            if let Err(e) = self.db.put(b"chain:committed_hash", h.as_bytes()) {
-                tracing::error!("Failed to store committed hash: {}", e);
-            }
+            batch.put(b"chain:committed_hash", h.as_bytes());
         }
-
         if let Some(qc) = qc {
-            if let Ok(encoded) = sbor::basic_encode(qc) {
-                if let Err(e) = self.db.put(b"chain:committed_qc", encoded) {
-                    tracing::error!("Failed to store committed QC: {}", e);
-                }
-            }
+            let encoded = sbor::basic_encode(qc).expect("QC encoding must succeed");
+            batch.put(b"chain:committed_qc", encoded);
         }
+        let mut opts = WriteOptions::default();
+        opts.set_sync(true);
+        self.db
+            .write_opt(batch, &opts)
+            .expect("BFT SAFETY CRITICAL: chain metadata write failed");
     }
 
     /// Get the chain metadata (committed height, hash, and QC).
+    ///
+    /// Reads all three chain metadata keys in one call. Use the individual
+    /// `read_committed_height`, `read_committed_hash`, `read_latest_qc`
+    /// methods when only one value is needed.
     pub fn get_chain_metadata(&self) -> (BlockHeight, Option<Hash>, Option<QuorumCertificate>) {
         let start = Instant::now();
 
-        let height = self
-            .db
-            .get(b"chain:committed_height")
-            .ok()
-            .flatten()
-            .map(|v| {
-                let bytes: [u8; 8] = v.as_slice().try_into().unwrap_or([0; 8]);
-                BlockHeight(u64::from_be_bytes(bytes))
-            })
-            .unwrap_or(BlockHeight(0));
-
-        let hash = self
-            .db
-            .get(b"chain:committed_hash")
-            .ok()
-            .flatten()
-            .map(|v| Hash::from_hash_bytes(&v));
-
-        let qc = self
-            .db
-            .get(b"chain:committed_qc")
-            .ok()
-            .flatten()
-            .and_then(|v| sbor::basic_decode(&v).ok());
+        let height = self.read_committed_height();
+        let hash = self.read_committed_hash();
+        let qc = self.read_latest_qc();
 
         let elapsed = start.elapsed().as_secs_f64();
         metrics::record_storage_read(elapsed);
@@ -1852,31 +1439,53 @@ impl RocksDbStorage {
         (height, hash, qc)
     }
 
+    /// Read only the committed height from RocksDB.
+    fn read_committed_height(&self) -> BlockHeight {
+        self.db
+            .get(b"chain:committed_height")
+            .ok()
+            .flatten()
+            .map(|v| {
+                let bytes: [u8; 8] = v.as_slice().try_into().unwrap_or([0; 8]);
+                BlockHeight(u64::from_be_bytes(bytes))
+            })
+            .unwrap_or(BlockHeight(0))
+    }
+
+    /// Read only the committed hash from RocksDB.
+    fn read_committed_hash(&self) -> Option<Hash> {
+        self.db
+            .get(b"chain:committed_hash")
+            .ok()
+            .flatten()
+            .map(|v| Hash::from_hash_bytes(&v))
+    }
+
+    /// Read only the latest QC from RocksDB.
+    fn read_latest_qc(&self) -> Option<QuorumCertificate> {
+        self.db
+            .get(b"chain:committed_qc")
+            .ok()
+            .flatten()
+            .and_then(|v| sbor::basic_decode(&v).ok())
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Certificate storage
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Store a transaction certificate.
     pub fn put_certificate(&self, hash: &Hash, cert: &TransactionCertificate) {
-        let cf = match self.db.cf_handle("certificates") {
-            Some(cf) => cf,
-            None => {
-                tracing::error!("certificates column family not found");
-                return;
-            }
-        };
+        let cf = self
+            .db
+            .cf_handle("certificates")
+            .expect("certificates column family must exist");
 
-        let value = match sbor::basic_encode(cert) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::error!("Failed to encode certificate: {:?}", e);
-                return;
-            }
-        };
+        let value = sbor::basic_encode(cert).expect("certificate encoding must succeed");
 
-        if let Err(e) = self.db.put_cf(cf, hash.as_bytes(), value) {
-            tracing::error!("Failed to store certificate: {}", e);
-        }
+        self.db
+            .put_cf(cf, hash.as_bytes(), value)
+            .expect("failed to persist certificate");
     }
 
     /// Get a transaction certificate by transaction hash.
@@ -1951,6 +1560,7 @@ impl RocksDbStorage {
         certificate: &TransactionCertificate,
         writes: &[hyperscale_types::SubstateWrite],
     ) {
+        let _commit_guard = self.commit_lock.lock().unwrap();
         let start = Instant::now();
         let mut batch = rocksdb::WriteBatch::default();
         let mut write_count = 0usize;
@@ -1968,29 +1578,29 @@ impl RocksDbStorage {
         // 2. Add state writes to batch
         let state_cf = self
             .db
-            .cf_handle("state")
+            .cf_handle(STATE_CF)
             .expect("state column family must exist");
-        let updates = hyperscale_engine::substate_writes_to_database_updates(writes);
+        let updates = hyperscale_storage::substate_writes_to_database_updates(writes);
         for (db_node_key, node_updates) in &updates.node_updates {
             for (partition_num, partition_updates) in &node_updates.partition_updates {
-                if let hyperscale_engine::PartitionDatabaseUpdates::Delta { substate_updates } =
+                if let hyperscale_storage::PartitionDatabaseUpdates::Delta { substate_updates } =
                     partition_updates
                 {
                     for (db_sort_key, update) in substate_updates {
                         // Build composite key: prefix + node_key + partition + sort_key
-                        let partition_key = hyperscale_engine::DbPartitionKey {
+                        let partition_key = hyperscale_storage::DbPartitionKey {
                             node_key: db_node_key.clone(),
                             partition_num: *partition_num,
                         };
                         let storage_key =
-                            hyperscale_engine::keys::to_storage_key(&partition_key, db_sort_key);
+                            hyperscale_storage::keys::to_storage_key(&partition_key, db_sort_key);
 
                         match update {
-                            hyperscale_engine::DatabaseUpdate::Set(value) => {
+                            hyperscale_storage::DatabaseUpdate::Set(value) => {
                                 batch.put_cf(state_cf, &storage_key, value);
                                 write_count += 1;
                             }
-                            hyperscale_engine::DatabaseUpdate::Delete => {
+                            hyperscale_storage::DatabaseUpdate::Delete => {
                                 batch.delete_cf(state_cf, &storage_key);
                                 write_count += 1;
                             }
@@ -2000,10 +1610,15 @@ impl RocksDbStorage {
             }
         }
 
-        // 3. Compute JMT updates using an overlay
-        let (base_version, base_root) = self.read_jmt_metadata();
+        // 3. Compute JMT updates using a snapshot-based overlay for isolation
+        let snapshot_store = SnapshotTreeStore::new(&self.db);
+        let (base_version, base_root) = snapshot_store.read_jmt_metadata();
 
-        let overlay = OverlayTreeStore::new(self);
+        let overlay = if self.enable_historical_substate_values {
+            OverlayTreeStore::new(&snapshot_store).with_substate_lookup(&snapshot_store)
+        } else {
+            OverlayTreeStore::new(&snapshot_store)
+        };
         let parent_version = if base_version == 0 {
             None
         } else {
@@ -2011,50 +1626,10 @@ impl RocksDbStorage {
         };
         let new_root = put_at_next_version(&overlay, parent_version, &updates);
         let new_version = base_version + 1;
-        let snapshot = overlay.into_snapshot(base_root, base_version, new_root, 1);
+        let jmt_snapshot = overlay.into_snapshot(base_root, base_version, new_root, 1);
 
-        // 4. Add JMT nodes to the batch
-        let jmt_cf = self
-            .db
-            .cf_handle(JMT_NODES_CF)
-            .expect("jmt_nodes column family must exist");
-
-        for (key, node) in &snapshot.nodes {
-            let encoded_key = encode_jmt_key(key);
-            let encoded_node =
-                sbor::basic_encode(&VersionedTreeNode::from_latest_version(node.clone()))
-                    .expect("JMT node encoding must succeed");
-            batch.put_cf(jmt_cf, encoded_key, encoded_node);
-        }
-
-        // Queue stale parts for deferred GC instead of deleting immediately
-        if !snapshot.stale_tree_parts.is_empty() {
-            let stale_cf = self
-                .db
-                .cf_handle(STALE_STATE_HASH_TREE_PARTS_CF)
-                .expect("stale_state_hash_tree_parts column family must exist");
-
-            let version_key = new_version.to_be_bytes();
-            let encoded_parts = sbor::basic_encode(&snapshot.stale_tree_parts)
-                .expect("encoding stale parts must succeed");
-            batch.put_cf(stale_cf, version_key, encoded_parts);
-        }
-
-        // Persist associations if enabled
-        if self.enable_historical_substate_values {
-            let assoc_cf = self
-                .db
-                .cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)
-                .expect("associated_state_tree_values column family must exist");
-            for assoc in &snapshot.leaf_substate_associations {
-                let encoded_key = encode_jmt_key(&assoc.tree_node_key);
-                batch.put_cf(assoc_cf, encoded_key, &assoc.substate_value);
-            }
-        }
-
-        // Add JMT metadata to the batch
-        batch.put(b"jmt:version", new_version.to_be_bytes());
-        batch.put(b"jmt:root_hash", new_root.0);
+        // 4. Add JMT data to the batch
+        self.append_jmt_to_batch(&mut batch, &jmt_snapshot, new_version);
 
         // 5. Write batch atomically with sync for durability
         let mut write_opts = rocksdb::WriteOptions::default();
@@ -2217,9 +1792,9 @@ impl RocksDbStorage {
         // Note: We always include JMT state, even at version 0, because genesis bootstrap
         // populates the JMT with initial Radix state at version 0 but with a non-zero root.
         // The version 0 case is handled correctly by the state machine.
-        use hyperscale_engine::SubstateStore;
+        use hyperscale_storage::SubstateStore;
         let jmt_version = self.state_version();
-        let jmt_root = hyperscale_types::Hash::from_bytes(&self.state_root_hash().0);
+        let jmt_root = self.state_root_hash();
         let jmt_state = Some((jmt_version, jmt_root));
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -2532,10 +2107,183 @@ impl Default for RocksDbConfig {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// CommitStore implementation
+// ═══════════════════════════════════════════════════════════════════════
+
+use hyperscale_storage::extract_writes_per_cert;
+
+/// Precomputed commit work for a RocksDB block commit.
+///
+/// Contains a pre-built `WriteBatch` (all certificate + state writes) and a
+/// `JmtSnapshot` (precomputed Merkle tree nodes). Also carries the certificates
+/// and shard for fallback recompute if the prepared data is stale.
+///
+/// # Performance
+///
+/// Without batching: 40 certificates × ~5ms fsync = ~200ms per block commit
+/// With batching: 1 fsync = ~5ms per block commit
+pub struct RocksDbPreparedCommit {
+    write_batch: WriteBatch,
+    jmt_snapshot: JmtSnapshot,
+    certificates: Vec<Arc<TransactionCertificate>>,
+    local_shard: hyperscale_types::ShardGroupId,
+}
+
+impl hyperscale_storage::CommitStore for RocksDbStorage {
+    type PreparedCommit = RocksDbPreparedCommit;
+
+    fn prepare_block_commit(
+        &self,
+        parent_state_root: hyperscale_types::Hash,
+        certificates: &[Arc<TransactionCertificate>],
+        local_shard: hyperscale_types::ShardGroupId,
+    ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
+        let writes_per_cert = extract_writes_per_cert(certificates, local_shard);
+
+        // Convert SubstateWrites → DatabaseUpdates once upfront, reuse for JMT.
+        let updates_per_cert: Vec<DatabaseUpdates> = writes_per_cert
+            .iter()
+            .map(|writes| hyperscale_storage::substate_writes_to_database_updates(writes))
+            .collect();
+
+        let (computed_root, jmt_snapshot) =
+            self.compute_speculative_root_from_base(parent_state_root, &updates_per_cert);
+
+        let write_batch = self.build_write_batch(certificates, local_shard);
+
+        let prepared = RocksDbPreparedCommit {
+            write_batch,
+            jmt_snapshot,
+            certificates: certificates.to_vec(),
+            local_shard,
+        };
+
+        (computed_root, prepared)
+    }
+
+    fn commit_prepared_block(
+        &self,
+        prepared: Self::PreparedCommit,
+    ) -> hyperscale_storage::CommitResult {
+        let used_fast_path =
+            self.try_apply_prepared_commit(prepared.write_batch, prepared.jmt_snapshot);
+
+        if !used_fast_path {
+            // Stale cache: fall back to per-certificate recompute
+            for cert in &prepared.certificates {
+                let writes = cert
+                    .shard_proofs
+                    .get(&prepared.local_shard)
+                    .map(|proof| proof.state_writes.as_slice())
+                    .unwrap_or(&[]);
+                self.commit_certificate_with_writes(cert, writes);
+            }
+        }
+
+        use hyperscale_storage::SubstateStore;
+        hyperscale_storage::CommitResult {
+            state_version: self.state_version(),
+            state_root: self.state_root_hash(),
+        }
+    }
+
+    fn commit_block(
+        &self,
+        certificates: &[Arc<TransactionCertificate>],
+        local_shard: hyperscale_types::ShardGroupId,
+    ) -> hyperscale_storage::CommitResult {
+        for cert in certificates {
+            let writes = cert
+                .shard_proofs
+                .get(&local_shard)
+                .map(|proof| proof.state_writes.as_slice())
+                .unwrap_or(&[]);
+            self.commit_certificate_with_writes(cert, writes);
+        }
+
+        use hyperscale_storage::SubstateStore;
+        hyperscale_storage::CommitResult {
+            state_version: self.state_version(),
+            state_root: self.state_root_hash(),
+        }
+    }
+
+    fn commit_certificate(
+        &self,
+        certificate: &TransactionCertificate,
+        writes: &[hyperscale_types::SubstateWrite],
+    ) {
+        self.commit_certificate_with_writes(certificate, writes);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// ConsensusStore implementation
+// ═══════════════════════════════════════════════════════════════════════
+
+impl hyperscale_storage::ConsensusStore for RocksDbStorage {
+    fn put_block(&self, height: BlockHeight, block: &Block, qc: &QuorumCertificate) {
+        debug_assert_eq!(
+            height, block.header.height,
+            "height must match block header"
+        );
+        self.put_block_denormalized(block, qc);
+    }
+
+    fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+        self.get_block_denormalized(height)
+    }
+
+    fn set_committed_height(&self, height: BlockHeight) {
+        self.set_chain_metadata(height, None, None);
+    }
+
+    fn committed_height(&self) -> BlockHeight {
+        self.read_committed_height()
+    }
+
+    fn set_committed_state(&self, height: BlockHeight, hash: Hash, qc: &QuorumCertificate) {
+        self.set_chain_metadata(height, Some(hash), Some(qc));
+    }
+
+    fn committed_hash(&self) -> Option<Hash> {
+        self.read_committed_hash()
+    }
+
+    fn latest_qc(&self) -> Option<QuorumCertificate> {
+        self.read_latest_qc()
+    }
+
+    fn store_certificate(&self, certificate: &TransactionCertificate) {
+        self.put_certificate(&certificate.transaction_hash, certificate);
+    }
+
+    fn get_certificate(&self, hash: &Hash) -> Option<TransactionCertificate> {
+        RocksDbStorage::get_certificate(self, hash)
+    }
+
+    fn put_own_vote(&self, height: u64, round: u64, block_hash: Hash) {
+        RocksDbStorage::put_own_vote(self, height, round, block_hash);
+    }
+
+    fn get_own_vote(&self, height: u64) -> Option<(Hash, u64)> {
+        RocksDbStorage::get_own_vote(self, height)
+    }
+
+    fn get_all_own_votes(&self) -> std::collections::HashMap<u64, (Hash, u64)> {
+        RocksDbStorage::get_all_own_votes(self)
+    }
+
+    fn prune_own_votes(&self, committed_height: u64) {
+        RocksDbStorage::prune_own_votes(self, committed_height);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_engine::NodeDatabaseUpdates;
+    use hyperscale_storage::{ConsensusStore, NodeDatabaseUpdates};
     use tempfile::TempDir;
 
     #[test]

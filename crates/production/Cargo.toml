@@ -26,12 +26,11 @@ hyperscale-engine.workspace = true
 hyperscale-mempool.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-metrics-prometheus.workspace = true
+hyperscale-storage.workspace = true
+hyperscale-storage-rocksdb.workspace = true
 hyperscale-node.workspace = true
 hyperscale-types.workspace = true
 hyperscale-messages.workspace = true
-
-# RocksDB for production persistence (version must match radix-substate-store-impls)
-rocksdb.workspace = true
 
 # Networking - libp2p with QUIC transport
 libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "quic", "tcp", "noise", "yamux", "tokio", "macros", "identify"] }

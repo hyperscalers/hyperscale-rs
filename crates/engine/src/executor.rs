@@ -35,7 +35,7 @@ use crate::execution::{
 };
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
-use crate::storage::SubstateStore;
+use hyperscale_storage::{CommittableSubstateDatabase, SubstateDatabase, SubstateStore};
 use hyperscale_types::{
     Hash, NodeId, PartitionNumber, RoutableTransaction, StateEntry, StateProvision, SubstateWrite,
 };
@@ -119,13 +119,16 @@ impl RadixExecutor {
     ///
     /// This initializes the Radix Engine state with system packages, faucet, etc.
     /// Should be called once per simulation before any transactions.
-    pub fn run_genesis<S: SubstateStore>(&self, storage: &mut S) -> Result<(), GenesisError> {
+    pub fn run_genesis<S: SubstateDatabase + CommittableSubstateDatabase>(
+        &self,
+        storage: &mut S,
+    ) -> Result<(), GenesisError> {
         GenesisBuilder::new(self.network.clone()).build(storage)?;
         Ok(())
     }
 
     /// Run genesis with custom configuration.
-    pub fn run_genesis_with_config<S: SubstateStore>(
+    pub fn run_genesis_with_config<S: SubstateDatabase + CommittableSubstateDatabase>(
         &self,
         storage: &mut S,
         config: GenesisConfig,
@@ -340,7 +343,7 @@ impl RadixExecutor {
         storage: &S,
         nodes: &[NodeId],
     ) -> Vec<StateEntry> {
-        use crate::storage::RADIX_PREFIX;
+        use hyperscale_storage::RADIX_PREFIX;
         use radix_substate_store_interface::db_key_mapper::{
             DatabaseKeyMapper, SpreadPrefixKeyMapper,
         };

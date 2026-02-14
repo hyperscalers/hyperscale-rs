@@ -38,13 +38,13 @@
 
 use super::adapter::{Libp2pAdapter, STREAM_PROTOCOL};
 use super::wire;
-use crate::storage::RocksDbStorage;
 use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
 use hyperscale_messages::request::{
     GetCertificatesRequest, GetTransactionsRequest, FETCH_TYPE_CERTIFICATE, FETCH_TYPE_TRANSACTION,
 };
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
 use hyperscale_metrics as metrics;
+use hyperscale_storage_rocksdb::RocksDbStorage;
 use hyperscale_types::{
     Block, BlockHeight, Hash, QuorumCertificate, RoutableTransaction, TransactionCertificate,
 };

@@ -12,13 +12,12 @@ hyperscale-execution.workspace = true
 hyperscale-mempool.workspace = true
 hyperscale-messages.workspace = true
 hyperscale-node.workspace = true
+hyperscale-storage.workspace = true
+hyperscale-storage-memory.workspace = true
 hyperscale-types.workspace = true
 
 # Radix dependencies for real execution
 radix-common.workspace = true
-
-# In-memory storage with O(1) snapshots
-im.workspace = true
 
 thiserror.workspace = true
 tracing.workspace = true

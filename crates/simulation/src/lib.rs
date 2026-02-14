@@ -31,12 +31,11 @@
 mod event_queue;
 mod network;
 mod runner;
-mod storage;
 mod traffic;
 
+pub use hyperscale_storage_memory::SimStorage;
 pub use network::{NetworkConfig, SimulatedNetwork};
 pub use runner::SimulationRunner;
-pub use storage::SimStorage;
 pub use traffic::{BandwidthReport, NetworkTrafficAnalyzer};
 
 /// Type alias for deterministic node indexing in simulation.

@@ -35,10 +35,11 @@
 //! - Persisting to storage
 
 use crate::network::{RequestManager, RequestPriority};
-use crate::storage::RocksDbStorage;
 use hyperscale_core::Event;
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
 use hyperscale_metrics as metrics;
+use hyperscale_storage::ConsensusStore;
+use hyperscale_storage_rocksdb::RocksDbStorage;
 use hyperscale_types::{Hash, RoutableTransaction, TransactionCertificate, ValidatorId};
 use libp2p::PeerId;
 use std::collections::{HashMap, HashSet};
@@ -550,7 +551,7 @@ impl FetchManager {
             let certs = certificates.clone();
             tokio::spawn(async move {
                 for cert in &certs {
-                    storage.put_certificate(&cert.transaction_hash, cert);
+                    storage.store_certificate(cert);
                 }
             });
         }

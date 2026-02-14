@@ -8,7 +8,6 @@ use crate::network::{
     Libp2pAdapter, Libp2pConfig, NetworkError,
 };
 use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
-use crate::storage::RocksDbStorage;
 use crate::sync::{SyncConfig, SyncManager};
 use crate::thread_pools::ThreadPoolManager;
 use crate::timers::TimerManager;
@@ -16,6 +15,11 @@ use hyperscale_bft::BftConfig;
 use hyperscale_engine::{NetworkDefinition, RadixExecutor};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics as metrics;
+use hyperscale_storage::{
+    CommitStore, CommittableSubstateDatabase, ConsensusStore, DatabaseUpdates, DbPartitionKey,
+    DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
+};
+use hyperscale_storage_rocksdb::RocksDbStorage;
 use hyperscale_types::BlockHeight;
 use quick_cache::sync::Cache as QuickCache;
 
@@ -36,6 +40,96 @@ use thiserror::Error;
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{span, Level};
+
+/// Maximum number of prepared commit handles to keep in the cache.
+/// Matches the old `BLOCK_COMMIT_CACHE_MAX_SIZE` constant.
+const PREPARED_COMMIT_CACHE_MAX_SIZE: usize = 32;
+
+/// Bounded FIFO cache for prepared commit handles.
+///
+/// Evicts the oldest entry when at capacity. Uses a `VecDeque` to track
+/// insertion order so the oldest entry can be found in O(1).
+struct PreparedCommitCache {
+    map: std::collections::HashMap<Hash, <RocksDbStorage as CommitStore>::PreparedCommit>,
+    order: std::collections::VecDeque<Hash>,
+}
+
+impl PreparedCommitCache {
+    fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        block_hash: Hash,
+        prepared: <RocksDbStorage as CommitStore>::PreparedCommit,
+    ) {
+        // If already present, remove from order tracking
+        if self.map.contains_key(&block_hash) {
+            self.order.retain(|h| *h != block_hash);
+        }
+
+        // Evict oldest entries if at capacity
+        while self.map.len() >= PREPARED_COMMIT_CACHE_MAX_SIZE {
+            if let Some(oldest) = self.order.pop_front() {
+                self.map.remove(&oldest);
+                tracing::debug!(
+                    evicted_block = ?oldest,
+                    "Evicted oldest entry from prepared commit cache"
+                );
+            } else {
+                break;
+            }
+        }
+
+        self.map.insert(block_hash, prepared);
+        self.order.push_back(block_hash);
+    }
+
+    fn remove(
+        &mut self,
+        block_hash: &Hash,
+    ) -> Option<<RocksDbStorage as CommitStore>::PreparedCommit> {
+        if let Some(prepared) = self.map.remove(block_hash) {
+            self.order.retain(|h| h != block_hash);
+            Some(prepared)
+        } else {
+            None
+        }
+    }
+}
+
+/// Wrapper that bridges `RocksDbStorage`'s `&self` commit with the Radix Engine's
+/// `&mut self` `CommittableSubstateDatabase` trait, used only for genesis execution.
+struct GenesisMutWrapper<'a>(&'a RocksDbStorage);
+
+impl SubstateDatabase for GenesisMutWrapper<'_> {
+    fn get_raw_substate_by_db_key(
+        &self,
+        partition_key: &DbPartitionKey,
+        sort_key: &DbSortKey,
+    ) -> Option<DbSubstateValue> {
+        self.0.get_raw_substate_by_db_key(partition_key, sort_key)
+    }
+
+    fn list_raw_values_from_db_key(
+        &self,
+        partition_key: &DbPartitionKey,
+        from_sort_key: Option<&DbSortKey>,
+    ) -> Box<dyn Iterator<Item = PartitionEntry> + '_> {
+        self.0
+            .list_raw_values_from_db_key(partition_key, from_sort_key)
+    }
+}
+
+impl CommittableSubstateDatabase for GenesisMutWrapper<'_> {
+    fn commit(&mut self, updates: &DatabaseUpdates) {
+        self.0.commit(updates).expect("genesis commit failed");
+    }
+}
 
 /// Errors from the production runner.
 #[derive(Debug, Error)]
@@ -266,8 +360,10 @@ struct BlockCommitRequest {
     block: Block,
     /// Block height for logging.
     height: u64,
-    /// Block hash for cache lookup.
-    block_hash: Hash,
+    /// Precomputed commit work from `prepare_block_commit`, if available.
+    /// `Some` → fast path (apply cached WriteBatch + JMT snapshot).
+    /// `None` → slow path (recompute per-certificate).
+    prepared: Option<<RocksDbStorage as CommitStore>::PreparedCommit>,
 }
 
 /// Handle for the dedicated block commit task.
@@ -287,12 +383,12 @@ struct BlockCommitTaskHandle {
 ///
 /// This task processes block commits sequentially to prevent JMT version race conditions.
 /// Without serialization, concurrent `spawn_blocking` tasks could complete out of order,
-/// causing the pre-computed `BlockCommitCache` to have a stale base version.
+/// causing the pre-computed commit cache to have a stale base version.
 ///
 /// The task:
 /// 1. Receives `BlockCommitRequest` from the channel (FIFO order)
-/// 2. Tries to apply the cached `BlockCommitCache` (fast path, 1 fsync)
-/// 3. Falls back to per-certificate commits if cache is stale (slow path)
+/// 2. If a `PreparedCommit` handle is present, uses `commit_prepared_block` (fast path)
+/// 3. Otherwise, uses `commit_block` to recompute from scratch (slow path)
 /// 4. Sends `StateCommitComplete` event when done
 fn spawn_block_commit_task(
     storage: Arc<RocksDbStorage>,
@@ -309,7 +405,7 @@ fn spawn_block_commit_task(
             let BlockCommitRequest {
                 block,
                 height,
-                block_hash,
+                prepared,
             } = request;
 
             // Move the actual commit work to a blocking thread since it does RocksDB I/O.
@@ -321,79 +417,40 @@ fn spawn_block_commit_task(
 
             // This is the key difference from before: we AWAIT the blocking task,
             // ensuring commits complete in order before processing the next one.
+            let cert_count = block.certificates.len();
             let _ = tokio::task::spawn_blocking(move || {
-                // Try to use cached BlockCommitCache from verification (fast path).
-                // Falls back to per-certificate commits if cache is stale.
-                let used_fast_path =
-                    if let Some(cache) = storage.take_block_commit_cache(block_hash) {
-                        let num_certs = block.certificates.len();
-                        if storage.try_apply_block_commit_cache(cache) {
-                            tracing::info!(
-                                block_height = height,
-                                total_certs = num_certs,
-                                local_shard = local_shard.0,
-                                "Applied block commit cache (fast path, 1 fsync)"
-                            );
-                            true
-                        } else {
-                            // Cache was stale (JMT state changed), fall back to slow path
-                            false
-                        }
-                    } else {
-                        false
-                    };
-
-                if !used_fast_path {
-                    // SLOW PATH: recompute per-certificate (N fsyncs)
-                    let mut applied_count = 0u32;
-                    let mut empty_count = 0u32;
-                    for cert in &block.certificates {
-                        let writes = cert
-                            .shard_proofs
-                            .get(&local_shard)
-                            .map(|proof| proof.state_writes.as_slice())
-                            .unwrap_or(&[]);
-
-                        storage.commit_certificate_with_writes(cert, writes);
-                        if writes.is_empty() {
-                            empty_count += 1;
-                        } else {
-                            applied_count += 1;
-                        }
-                    }
-
+                // Use prepared handle (fast path) if available, otherwise recompute.
+                let result = if let Some(prepared) = prepared {
                     tracing::info!(
                         block_height = height,
-                        total_certs = block.certificates.len(),
-                        applied_count,
-                        empty_count,
-                        local_shard = local_shard.0,
-                        "Applied certificate state writes (slow path, {} fsyncs)",
-                        block.certificates.len()
+                        certs = cert_count,
+                        "Committing block (fast path)"
                     );
-                }
-
-                // Get the resulting state root after all commits
-                use hyperscale_engine::SubstateStore;
-                let state_root_hash = storage.state_root_hash();
-                let state_version = storage.state_version();
+                    storage.commit_prepared_block(prepared)
+                } else {
+                    tracing::info!(
+                        block_height = height,
+                        certs = cert_count,
+                        "Committing block (slow path)"
+                    );
+                    storage.commit_block(&block.certificates, local_shard)
+                };
 
                 // Update RPC status with new JMT state version and root hash
                 if let Some(rpc_status) = rpc_status {
-                    let state_root_hex = hex::encode(state_root_hash.0);
+                    let state_root_hex = hex::encode(result.state_root.as_bytes());
                     tokio::spawn(async move {
                         let mut status = rpc_status.write().await;
-                        status.state_version = state_version;
+                        status.state_version = result.state_version;
                         status.state_root_hash = state_root_hex;
                     });
                 }
 
                 // Notify state machine that JMT commit is complete.
-                let state_root = hyperscale_types::Hash::from_bytes(&state_root_hash.0);
                 if let Err(e) = callback_tx.send(Event::StateCommitComplete {
                     height,
-                    state_version,
-                    state_root,
+                    state_version: result.state_version,
+                    state_root: result.state_root,
                 }) {
                     tracing::error!(
                         block_height = height,
@@ -828,7 +885,7 @@ impl ProductionRunnerBuilder {
 
         // Create shared transaction cache to avoid redundant RocksDB writes.
         // Transactions are inserted on gossip reception and served to fetch requests.
-        // Final persistence happens atomically in put_block_denormalized on block commit.
+        // Final persistence happens atomically in put_block on block commit.
         let recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>> =
             Arc::new(QuickCache::new(50_000));
 
@@ -916,6 +973,7 @@ impl ProductionRunnerBuilder {
             pending_gossiped_cert_batch: PendingGossipedCertBatch::default(),
             gossiped_cert_batch_deadline: None,
             block_commit_task,
+            prepared_commits: Arc::new(std::sync::Mutex::new(PreparedCommitCache::new())),
         })
     }
 }
@@ -1071,6 +1129,13 @@ pub struct ProductionRunner {
     /// Handle for the dedicated block commit task.
     /// Commits are serialized through this task to prevent JMT version race conditions.
     block_commit_task: BlockCommitTaskHandle,
+    /// Precomputed commit handles from `prepare_block_commit`, keyed by block hash.
+    ///
+    /// Populated by `VerifyStateRoot` / `BuildProposal` (on crypto pool threads),
+    /// consumed by `EmitCommittedBlock` (on main event loop).
+    /// `Arc<Mutex>` because crypto pool closures need shared access.
+    /// Bounded to [`PREPARED_COMMIT_CACHE_MAX_SIZE`] entries with FIFO eviction.
+    prepared_commits: Arc<std::sync::Mutex<PreparedCommitCache>>,
 }
 
 impl ProductionRunner {
@@ -1169,7 +1234,7 @@ impl ProductionRunner {
     /// and initializes the state machine, which sets up the initial proposal timer.
     fn maybe_initialize_genesis(&mut self) {
         // Check if we already have committed blocks
-        let (height, _, _) = self.storage.get_chain_metadata();
+        let height = self.storage.committed_height();
         let has_blocks = height.0 > 0;
 
         if has_blocks {
@@ -1182,22 +1247,20 @@ impl ProductionRunner {
             "No committed blocks - initializing genesis"
         );
 
-        // Run Radix Engine genesis to set up initial state
-        // SAFETY: RocksDB is internally thread-safe. We use unsafe to get &mut
-        // because the CommittableSubstateDatabase trait requires it, but RocksDB
-        // doesn't actually need exclusive access.
-        let result = unsafe {
-            let storage_mut = self.storage.as_mut();
-            if let Some(config) = self.genesis_config.take() {
-                tracing::info!(
-                    xrd_balances = config.xrd_balances.len(),
-                    "Running genesis with custom configuration"
-                );
-                self.executor.run_genesis_with_config(storage_mut, config)
-            } else {
-                self.executor.run_genesis(storage_mut)
-            }
+        // Run Radix Engine genesis to set up initial state.
+        // Uses GenesisMutWrapper to bridge RocksDbStorage's &self commit()
+        // with the Radix Engine's &mut self CommittableSubstateDatabase trait.
+        let mut wrapper = GenesisMutWrapper(&self.storage);
+        let result = if let Some(config) = self.genesis_config.take() {
+            tracing::info!(
+                xrd_balances = config.xrd_balances.len(),
+                "Running genesis with custom configuration"
+            );
+            self.executor.run_genesis_with_config(&mut wrapper, config)
+        } else {
+            self.executor.run_genesis(&mut wrapper)
         };
+
         if let Err(e) = result {
             panic!("Radix Engine genesis failed: {e:?}");
         }
@@ -1205,9 +1268,9 @@ impl ProductionRunner {
         // Get the JMT state AFTER genesis bootstrap.
         // This is critical - genesis may have populated the JMT with initial state,
         // and the genesis block header must reflect this actual state.
-        use hyperscale_engine::SubstateStore;
+        use hyperscale_storage::SubstateStore;
         let genesis_jmt_version = self.storage.state_version();
-        let genesis_jmt_root = Hash::from_bytes(&self.storage.state_root_hash().0);
+        let genesis_jmt_root = self.storage.state_root_hash();
 
         tracing::info!(
             genesis_jmt_version,
@@ -1876,7 +1939,7 @@ impl ProductionRunner {
                         // Cache the transaction so peers can fetch it before block commit.
                         // Previously this eagerly wrote to RocksDB, causing 2-3x write
                         // amplification (gossip + block commit). Now we cache in memory
-                        // and let put_block_denormalized handle the single atomic write.
+                        // and let put_block handle the single atomic write.
                         self.recently_received_txs.insert(tx.hash(), Arc::clone(tx));
                     }
 
@@ -2590,33 +2653,16 @@ impl ProductionRunner {
                 let event_tx = self.callback_tx.clone();
                 let storage = self.storage.clone();
                 let local_shard = self.local_shard;
+                let prepared_commits = self.prepared_commits.clone();
 
                 // State root verification can be expensive for large blocks.
                 // Use consensus crypto pool since this is on the critical voting path.
                 self.thread_pools.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
 
-                    // Extract state writes from certificates for our local shard.
-                    // Each certificate's writes are kept separate for incremental JMT application.
-                    let writes_per_cert: Vec<Vec<_>> = certificates
-                        .iter()
-                        .map(|cert| {
-                            cert.shard_proofs
-                                .get(&local_shard)
-                                .map(|proof| proof.state_writes.clone())
-                                .unwrap_or_default()
-                        })
-                        .collect();
-
-                    // Compute what the root would be after applying writes incrementally.
-                    // Each certificate's writes are applied at a separate JMT version.
-                    // We verify from parent_state_root to ensure proposer and verifier
-                    // compute from the same base state.
-                    //
-                    // This also returns a snapshot of the JMT nodes created, which we
-                    // cache for reuse during block commit.
-                    let (computed_root, jmt_snapshot) = storage
-                        .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
+                    // Compute speculative state root and get prepared commit handle.
+                    let (computed_root, prepared) =
+                        storage.prepare_block_commit(parent_state_root, &certificates, local_shard);
 
                     let valid = computed_root == expected_root;
 
@@ -2631,21 +2677,18 @@ impl ProductionRunner {
                             "State root verification FAILED"
                         );
                     } else {
-                        // Build and cache the BlockCommitCache for efficient commit later.
-                        // Pre-build the WriteBatch so commit only needs 1 fsync.
-                        let write_batch = storage.build_write_batch(&certificates, local_shard);
-                        let cache = crate::storage::BlockCommitCache {
-                            write_batch,
-                            jmt_snapshot,
-                        };
-                        storage.cache_block_commit(block_hash, cache);
-
                         tracing::debug!(
                             block_hash = ?block_hash,
                             elapsed_ms = elapsed * 1000.0,
                             cert_count = certificates.len(),
-                            "State root verified and commit cache built"
+                            "State root verified and commit work prepared"
                         );
+                        // Store prepared handle for use at commit time.
+                        // Only cache on success — failed verifications won't commit.
+                        prepared_commits
+                            .lock()
+                            .unwrap()
+                            .insert(block_hash, prepared);
                     }
 
                     event_tx
@@ -2729,38 +2772,32 @@ impl ProductionRunner {
                 let event_tx = self.callback_tx.clone();
                 let storage = self.storage.clone();
                 let local_shard = self.local_shard;
+                let prepared_commits = self.prepared_commits.clone();
 
                 // Build proposal block. Check if JMT is ready, compute state root if so,
-                // build the block, and cache the WriteBatch for efficient commit.
+                // build the block, and store the PreparedCommit for efficient commit.
                 self.thread_pools.spawn_consensus_crypto(move || {
+                    use hyperscale_storage::SubstateStore;
                     use hyperscale_types::{Block, BlockHeader};
 
                     let start = std::time::Instant::now();
 
                     // Check if JMT is at parent_state_root (no waiting - instant check)
-                    let current_root = storage.current_jmt_root();
+                    let current_root = storage.state_root_hash();
                     let jmt_ready = current_root == parent_state_root;
 
                     // Can include certificates only if JMT is ready
                     let include_certs = jmt_ready && !certificates.is_empty();
 
-                    let (state_root, state_version, certs_to_include, jmt_snapshot) = if include_certs
-                    {
-                        // JMT ready - compute speculative root from certificates
-                        let writes_per_cert: Vec<Vec<_>> = certificates
-                            .iter()
-                            .map(|cert| {
-                                cert.shard_proofs
-                                    .get(&local_shard)
-                                    .map(|proof| proof.state_writes.clone())
-                                    .unwrap_or_default()
-                            })
-                            .collect();
-
-                        let (root, snapshot) = storage
-                            .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
+                    let (state_root, state_version, certs_to_include, prepared) = if include_certs {
+                        // JMT ready - compute speculative root and get prepared commit handle
+                        let (root, prepared) = storage.prepare_block_commit(
+                            parent_state_root,
+                            &certificates,
+                            local_shard,
+                        );
                         let version = parent_state_version + certificates.len() as u64;
-                        (root, version, certificates, Some(snapshot))
+                        (root, version, certificates, Some(prepared))
                     } else {
                         // Either no certificates, or JMT not ready - inherit parent state
                         if !certificates.is_empty() {
@@ -2810,15 +2847,11 @@ impl ProductionRunner {
 
                     let block_hash = block.hash();
 
-                    // Cache WriteBatch for efficient commit (if we included certs)
-                    if let Some(snapshot) = jmt_snapshot {
-                        let write_batch =
-                            storage.build_write_batch(&certs_to_include, local_shard);
-                        let cache = crate::storage::BlockCommitCache {
-                            write_batch,
-                            jmt_snapshot: snapshot,
-                        };
-                        storage.cache_block_commit(block_hash, cache);
+                    // Store prepared handle under the real block hash.
+                    // Unlike the old code, no re-computation needed — the handle
+                    // doesn't carry a block hash, just precomputed work.
+                    if let Some(prepared) = prepared {
+                        prepared_commits.lock().unwrap().insert(block_hash, prepared);
                     }
 
                     let elapsed = start.elapsed().as_secs_f64();
@@ -3220,10 +3253,12 @@ impl ProductionRunner {
                 // After commit completes, StateCommitComplete is sent so the state machine
                 // knows it's safe to compute speculative roots for the next proposal.
                 if !block.certificates.is_empty() {
+                    let block_hash = block.hash();
+                    let prepared = self.prepared_commits.lock().unwrap().remove(&block_hash);
                     let request = BlockCommitRequest {
                         block: block.clone(),
                         height,
-                        block_hash: block.hash(),
+                        prepared,
                     };
 
                     // Send to dedicated commit task for sequential processing.
@@ -3255,10 +3290,10 @@ impl ProductionRunner {
                 // the block commits. State application happens in EmitCommittedBlock.
                 let storage = self.storage.clone();
                 let height = block.height();
+                let block_hash = block.hash();
                 tokio::task::spawn_blocking(move || {
-                    storage.put_block_denormalized(&block, &qc);
-                    // Update chain metadata
-                    storage.set_chain_metadata(height, None, None);
+                    storage.put_block(height, &block, &qc);
+                    storage.set_committed_state(height, block_hash, &qc);
                     // Prune old votes - we no longer need votes at or below committed height
                     storage.prune_own_votes(height.0);
                 });
@@ -3287,7 +3322,7 @@ impl ProductionRunner {
                 // Fire-and-forget: RocksDB WAL ensures durability
                 let cert_for_persist = certificate.clone();
                 tokio::task::spawn_blocking(move || {
-                    storage.put_certificate(&cert_for_persist.transaction_hash, &cert_for_persist);
+                    storage.store_certificate(&cert_for_persist);
                 });
 
                 // Only gossip cross-shard certificates where it provides more value.
@@ -3369,7 +3404,9 @@ impl ProductionRunner {
                 let storage = self.storage.clone();
 
                 tokio::task::spawn_blocking(move || {
-                    let (height, hash, qc) = storage.get_chain_metadata();
+                    let height = storage.committed_height();
+                    let hash = storage.committed_hash();
+                    let qc = storage.latest_qc();
                     event_tx
                         .send(Event::ChainMetadataFetched { height, hash, qc })
                         .expect(
@@ -4013,7 +4050,7 @@ impl ProductionRunner {
 
         // Fire-and-forget persist of certificate bytes only (no state writes)
         tokio::task::spawn_blocking(move || {
-            storage.put_certificate(&cert_for_persist.transaction_hash, &cert_for_persist);
+            storage.store_certificate(&cert_for_persist);
         });
 
         // Notify state machine to cancel local building and add to finalized

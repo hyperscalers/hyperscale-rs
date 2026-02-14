@@ -5,8 +5,9 @@
 //! shared. This dramatically improves simulation performance at scale.
 
 use dashmap::DashMap;
-use hyperscale_engine::{CommittableSubstateDatabase, RadixExecutor, RADIX_PREFIX};
-use hyperscale_simulation::SimStorage;
+use hyperscale_engine::RadixExecutor;
+use hyperscale_storage::{CommittableSubstateDatabase, RADIX_PREFIX};
+use hyperscale_storage_memory::SimStorage;
 use hyperscale_types::{
     verify_bls12381_v1, zero_bls_signature, Bls12381G1PublicKey, Bls12381G2Signature, Hash, NodeId,
     RoutableTransaction, StateEntry,
@@ -124,7 +125,7 @@ impl SimulationCache {
     pub fn commit_writes(&self, shard_id: u64, writes: &[hyperscale_types::SubstateWrite]) {
         if let Some(storage_ref) = self.shard_storage.get(&shard_id) {
             if let Ok(mut storage) = storage_ref.lock() {
-                let updates = hyperscale_engine::substate_writes_to_database_updates(writes);
+                let updates = hyperscale_storage::substate_writes_to_database_updates(writes);
                 storage.commit(&updates);
             }
         }
@@ -136,7 +137,7 @@ impl SimulationCache {
     /// to be sent to other shards. Returns `StateEntry` with pre-computed
     /// storage keys for efficient cross-shard execution.
     pub fn fetch_state_entries(&self, shard_id: u64, nodes: &[NodeId]) -> Vec<StateEntry> {
-        use hyperscale_engine::SubstateStore;
+        use hyperscale_storage::SubstateStore;
 
         let storage_ref = match self.shard_storage.get(&shard_id) {
             Some(s) => s,

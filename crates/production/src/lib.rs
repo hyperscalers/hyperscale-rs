@@ -76,7 +76,6 @@ mod message_batcher;
 pub mod network;
 pub mod rpc;
 mod runner;
-mod storage;
 mod sync;
 mod sync_error;
 mod telemetry;
@@ -84,9 +83,11 @@ mod thread_pools;
 mod timers;
 mod validation_batcher;
 
+pub use hyperscale_storage_rocksdb::{
+    CompressionType, RocksDbConfig, RocksDbStorage, StorageError,
+};
 pub use network::Libp2pConfig;
 pub use runner::{ProductionRunner, RunnerError};
-pub use storage::{CompressionType, RocksDbConfig, RocksDbStorage, StorageError};
 pub use sync::SyncStatus;
 pub use sync_error::SyncResponseError;
 pub use telemetry::{init_telemetry, TelemetryConfig, TelemetryGuard};

@@ -1,0 +1,19 @@
+[package]
+name = "hyperscale-storage"
+version.workspace = true
+edition.workspace = true
+description = "Storage traits and shared types"
+
+[dependencies]
+# Internal crates
+hyperscale-types.workspace = true
+
+# Radix dependencies (for SubstateDatabase, JMT types)
+radix-common.workspace = true
+radix-substate-store-interface.workspace = true
+radix-substate-store-impls.workspace = true
+
+# Key encoding
+indexmap.workspace = true
+
+[dev-dependencies]

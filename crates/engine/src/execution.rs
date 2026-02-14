@@ -6,17 +6,16 @@
 //! efficient execution. The sending shard computes storage keys once, so the
 //! receiving shard can use them directly without expensive hash computations.
 
-use crate::storage::keys;
+use hyperscale_storage::keys;
 use hyperscale_types::{Hash, NodeId, PartitionNumber, StateEntry, SubstateWrite};
 use radix_common::prelude::DatabaseUpdate;
 use radix_engine::transaction::{
     execute_transaction, ExecutionConfig, TransactionReceipt, TransactionResult,
 };
 use radix_engine::vm::DefaultVmModules;
-use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 use radix_substate_store_interface::interface::{
-    CreateDatabaseUpdates, DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates,
-    PartitionDatabaseUpdates, SubstateDatabase,
+    CreateDatabaseUpdates, DatabaseUpdates, DbPartitionKey, DbSortKey, PartitionDatabaseUpdates,
+    SubstateDatabase,
 };
 use radix_transactions::prelude::ExecutableTransaction;
 use std::collections::BTreeMap;
@@ -71,52 +70,6 @@ pub fn extract_substate_writes(receipt: &TransactionReceipt) -> Vec<SubstateWrit
     }
 
     writes
-}
-
-/// Convert SubstateWrites back to DatabaseUpdates for committing to storage.
-///
-/// This is the inverse of `extract_substate_writes()`. Used when applying
-/// certificate state writes during `PersistTransactionCertificate`.
-///
-/// # Arguments
-///
-/// * `writes` - The substate writes to convert (typically from a certificate's shard_proofs)
-///
-/// # Returns
-///
-/// A `DatabaseUpdates` structure that can be passed to `CommittableSubstateDatabase::commit()`
-pub fn substate_writes_to_database_updates(writes: &[SubstateWrite]) -> DatabaseUpdates {
-    let mut updates = DatabaseUpdates::default();
-
-    for write in writes {
-        let radix_node_id = radix_common::types::NodeId(write.node_id.0);
-        let radix_partition = radix_common::types::PartitionNumber(write.partition.0);
-
-        let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
-        let db_partition_num = SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
-        let db_sort_key = DbSortKey(write.sort_key.clone());
-
-        let node_updates =
-            updates
-                .node_updates
-                .entry(db_node_key)
-                .or_insert_with(|| NodeDatabaseUpdates {
-                    partition_updates: indexmap::IndexMap::new(),
-                });
-
-        let partition_updates = node_updates
-            .partition_updates
-            .entry(db_partition_num)
-            .or_insert_with(|| PartitionDatabaseUpdates::Delta {
-                substate_updates: indexmap::IndexMap::new(),
-            });
-
-        if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
-            substate_updates.insert(db_sort_key, DatabaseUpdate::Set(write.value.clone()));
-        }
-    }
-
-    updates
 }
 
 /// Compute a deterministic commitment hash for a set of substate writes.
@@ -247,7 +200,7 @@ impl<S: SubstateDatabase> SubstateDatabase for ProvisionedSnapshot<'_, S> {
         // Build prefix for this partition
         let prefix = keys::partition_prefix(partition_key);
         let prefix_len = prefix.len();
-        let prefix_end = keys::next_prefix(&prefix);
+        let prefix_end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
 
         // Build start key
         let start = match from_sort_key {

@@ -6,15 +6,16 @@
 
 use crate::event_queue::EventKey;
 use crate::network::{NetworkConfig, SimulatedNetwork};
-use crate::storage::SimStorage;
 use crate::traffic::NetworkTrafficAnalyzer;
 use crate::NodeIndex;
+use crate::SimStorage;
 use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
-use hyperscale_engine::{JmtSnapshot, RadixExecutor};
+use hyperscale_engine::RadixExecutor;
 use hyperscale_execution::{DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_node::NodeStateMachine;
+use hyperscale_storage::{CommitStore, ConsensusStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, bls_keypair_from_seed, verify_bls12381_v1, zero_bls_signature,
     Block, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
@@ -96,10 +97,9 @@ pub struct SimulationRunner {
     /// Maps (node_index, tx_hash) -> status for querying final transaction states.
     tx_status_cache: HashMap<(NodeIndex, TxHash), TransactionStatus>,
 
-    /// Per-node JMT snapshot cache.
-    /// Stores snapshots created during verification for reuse at commit time.
-    /// Maps (node_index, block_hash) -> snapshot.
-    jmt_cache: HashMap<(NodeIndex, TxHash), JmtSnapshot>,
+    /// Precomputed commit handles from `prepare_block_commit`, keyed by (node, block_hash).
+    /// Populated by `VerifyStateRoot` / `BuildProposal`, consumed by `EmitCommittedBlock`.
+    prepared_commits: HashMap<(NodeIndex, TxHash), <SimStorage as CommitStore>::PreparedCommit>,
 }
 
 /// Statistics collected during simulation.
@@ -254,7 +254,7 @@ impl SimulationRunner {
             seen_messages: HashSet::new(),
             sync_targets: HashMap::new(),
             tx_status_cache: HashMap::new(),
-            jmt_cache: HashMap::new(),
+            prepared_commits: HashMap::new(),
         }
     }
 
@@ -380,7 +380,7 @@ impl SimulationRunner {
     ///
     /// After initialization, proposal timers are scheduled for all nodes.
     pub fn initialize_genesis(&mut self) {
-        use hyperscale_engine::SubstateStore;
+        use hyperscale_storage::SubstateStore;
         use hyperscale_types::{Block, BlockHeader, BlockHeight, Hash, QuorumCertificate};
 
         // Run Radix Engine genesis on each node's storage
@@ -411,7 +411,7 @@ impl SimulationRunner {
             let shard_start = shard_id * validators_per_shard;
             let first_node_storage = &self.node_storage[shard_start as usize];
             let genesis_jmt_version = first_node_storage.state_version();
-            let genesis_jmt_root = Hash::from_bytes(&first_node_storage.state_root_hash().0);
+            let genesis_jmt_root = first_node_storage.state_root_hash();
 
             info!(
                 shard = shard_id,
@@ -489,7 +489,8 @@ impl SimulationRunner {
             radix_common::math::Decimal,
         )>,
     ) {
-        use hyperscale_engine::{GenesisConfig, SubstateStore};
+        use hyperscale_engine::GenesisConfig;
+        use hyperscale_storage::SubstateStore;
         use hyperscale_types::{Block, BlockHeader, BlockHeight, Hash, QuorumCertificate};
 
         // Run Radix Engine genesis on each node's storage with balances
@@ -527,7 +528,7 @@ impl SimulationRunner {
             let shard_start = shard_id * validators_per_shard;
             let first_node_storage = &self.node_storage[shard_start as usize];
             let genesis_jmt_version = first_node_storage.state_version();
-            let genesis_jmt_root = Hash::from_bytes(&first_node_storage.state_root_hash().0);
+            let genesis_jmt_root = first_node_storage.state_root_hash();
 
             info!(
                 shard = shard_id,
@@ -645,7 +646,7 @@ impl SimulationRunner {
             // Handle TransactionCertificateReceived directly in runner (like production).
             // Verify signatures synchronously (no async in simulation) and persist.
             if let Event::TransactionCertificateReceived { ref certificate } = event {
-                let storage = &mut self.node_storage[node_index as usize];
+                let storage = &self.node_storage[node_index as usize];
                 let tx_hash = certificate.transaction_hash;
 
                 // Skip if already in storage
@@ -1299,26 +1300,11 @@ impl SimulationRunner {
                 expected_root,
                 certificates,
             } => {
-                // Extract state writes from certificates for our local shard.
+                // Compute speculative state root and get prepared commit handle.
                 let local_shard = self.nodes[from as usize].shard();
-                let writes_per_cert: Vec<Vec<_>> = certificates
-                    .iter()
-                    .map(|cert| {
-                        cert.shard_proofs
-                            .get(&local_shard)
-                            .map(|proof| proof.state_writes.clone())
-                            .unwrap_or_default()
-                    })
-                    .collect();
-
-                // Compute speculative state root using overlay pattern.
-                // Each certificate's writes are applied at a separate JMT version.
-                // Use parent_state_root as base to match proposer's computation.
-                //
-                // Also captures a snapshot of the JMT nodes for reuse at commit time.
                 let storage = &self.node_storage[from as usize];
-                let (computed_root, snapshot) =
-                    storage.compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
+                let (computed_root, prepared) =
+                    storage.prepare_block_commit(parent_state_root, &certificates, local_shard);
 
                 let valid = computed_root == expected_root;
 
@@ -1332,8 +1318,9 @@ impl SimulationRunner {
                         "State root verification failed"
                     );
                 } else {
-                    // Cache the snapshot for reuse during commit
-                    self.jmt_cache.insert((from, block_hash), snapshot);
+                    // Store prepared handle for use at commit time.
+                    // Only cache on success — failed verifications won't commit.
+                    self.prepared_commits.insert((from, block_hash), prepared);
                 }
 
                 self.schedule_event(
@@ -1397,33 +1384,24 @@ impl SimulationRunner {
                 deferred,
                 aborted,
             } => {
+                use hyperscale_storage::SubstateStore;
                 use hyperscale_types::{Block, BlockHeader};
 
                 // In simulation, JMT commits are synchronous so we can compute immediately.
                 let storage = &self.node_storage[from as usize];
                 let local_shard = self.nodes[from as usize].shard();
-                let current_root = storage.current_jmt_root();
+                let current_root = storage.state_root_hash();
 
                 // Check if JMT is ready for certificates
                 let jmt_ready = current_root == parent_state_root;
                 let include_certs = jmt_ready && !certificates.is_empty();
 
-                let (state_root, state_version, certs_to_include, jmt_snapshot) = if include_certs {
-                    // JMT ready - compute speculative root from certificates
-                    let writes_per_cert: Vec<Vec<_>> = certificates
-                        .iter()
-                        .map(|cert| {
-                            cert.shard_proofs
-                                .get(&local_shard)
-                                .map(|proof| proof.state_writes.clone())
-                                .unwrap_or_default()
-                        })
-                        .collect();
-
-                    let (root, snapshot) = storage
-                        .compute_speculative_root_from_base(parent_state_root, &writes_per_cert);
+                let (state_root, state_version, certs_to_include, prepared) = if include_certs {
+                    // JMT ready - compute speculative root and get prepared commit handle
+                    let (root, prepared) =
+                        storage.prepare_block_commit(parent_state_root, &certificates, local_shard);
                     let version = parent_state_version + certificates.len() as u64;
-                    (root, version, certificates, Some(snapshot))
+                    (root, version, certificates, Some(prepared))
                 } else {
                     // Either no certificates, or JMT not ready - inherit parent state
                     if !certificates.is_empty() {
@@ -1474,9 +1452,9 @@ impl SimulationRunner {
 
                 let block_hash = block.hash();
 
-                // Cache the JMT snapshot for efficient commit (if we computed one)
-                if let Some(snapshot) = jmt_snapshot {
-                    self.jmt_cache.insert((from, block_hash), snapshot);
+                // Store prepared handle under the real block hash.
+                if let Some(prepared) = prepared {
+                    self.prepared_commits.insert((from, block_hash), prepared);
                 }
 
                 self.schedule_event(
@@ -1814,70 +1792,27 @@ impl SimulationRunner {
                 debug!(block_hash = ?block.hash(), "Block committed");
 
                 // Commit state writes for all certificates in this block.
-                // This matches production behavior where state is committed in EmitCommittedBlock.
-                //
-                // OPTIMIZATION: If we have a cached JMT snapshot from verification,
-                // apply it directly instead of recomputing certificate-by-certificate.
-                let storage = &mut self.node_storage[from as usize];
+                // Use prepared handle (fast path) if available from verification/proposal.
+                let storage = &self.node_storage[from as usize];
                 let local_shard = self.nodes[from as usize].shard();
                 let block_hash = block.hash();
 
-                // Try to use cached JMT snapshot from verification (fast path).
-                // Falls back to per-certificate commits if no cache present (cache miss,
-                // stale cache, or synced blocks).
-                let snapshot = self.jmt_cache.remove(&(from, block_hash));
-                let use_fast_path = snapshot.as_ref().is_some_and(|s| {
-                    // Snapshot is only valid if JMT is still at the expected base state.
-                    // Must check BOTH root AND version, since root can be unchanged with
-                    // empty commits (same root, different version).
-                    let current_root = storage.current_jmt_root();
-                    let current_version = storage.current_jmt_version();
-                    let snapshot_base = hyperscale_types::Hash::from_bytes(&s.base_root.0);
-                    let root_matches = current_root == snapshot_base;
-                    let version_matches = current_version == s.base_version;
-                    root_matches && version_matches
-                });
-
-                if use_fast_path {
-                    let snapshot = snapshot.unwrap();
-                    // Fast path: apply precomputed JMT snapshot
-                    storage.apply_jmt_snapshot(snapshot);
-                    // Still need to store certificates
-                    for cert in &block.certificates {
-                        let writes = cert
-                            .shard_proofs
-                            .get(&local_shard)
-                            .map(|proof| proof.state_writes.as_slice())
-                            .unwrap_or(&[]);
-                        storage.commit_substate_data_only(cert, writes);
-                    }
+                let prepared = self.prepared_commits.remove(&(from, block_hash));
+                let result = if let Some(prepared) = prepared {
+                    storage.commit_prepared_block(prepared)
                 } else {
-                    // Slow path: recompute per-certificate (cache miss, stale cache, or synced blocks)
-                    // Always commit every certificate to advance JMT version.
-                    // This ensures JMT version matches certificates.len() used in state_version.
-                    for cert in &block.certificates {
-                        let writes = cert
-                            .shard_proofs
-                            .get(&local_shard)
-                            .map(|proof| proof.state_writes.as_slice())
-                            .unwrap_or(&[]);
-                        storage.commit_certificate_with_writes(cert, writes);
-                    }
-                }
+                    storage.commit_block(&block.certificates, local_shard)
+                };
 
                 // Send StateCommitComplete so state machine knows JMT is up to date.
                 // In simulation this is synchronous, but we still need the event for tracking.
-                use hyperscale_engine::SubstateStore;
-                let state_version = storage.state_version();
-                let state_root_hash = storage.state_root_hash();
-                let state_root = hyperscale_types::Hash::from_bytes(&state_root_hash.0);
                 self.schedule_event(
                     from,
                     self.now,
                     Event::StateCommitComplete {
                         height: block.header.height.0,
-                        state_version,
-                        state_root,
+                        state_version: result.state_version,
+                        state_root: result.state_root,
                     },
                 );
             }
@@ -1894,14 +1829,15 @@ impl SimulationRunner {
             Action::PersistBlock { block, qc } => {
                 // Store block and QC in this node's storage
                 let height = block.header.height;
-                let storage = &mut self.node_storage[from as usize];
-                storage.put_block(height, block, qc);
-                // Update committed height if this is the highest
-                if height > storage.committed_height() {
-                    storage.set_committed_height(height);
+                let block_hash = block.hash();
+                let storage = &self.node_storage[from as usize];
+                ConsensusStore::put_block(storage, height, &block, &qc);
+                // Update committed state if this is the highest
+                if height > ConsensusStore::committed_height(storage) {
+                    ConsensusStore::set_committed_state(storage, height, block_hash, &qc);
                 }
                 // Prune old votes - we no longer need votes at or below committed height
-                storage.prune_own_votes(height.0);
+                ConsensusStore::prune_own_votes(storage, height.0);
 
                 // If this node is syncing, try to fetch more blocks that may now be available.
                 // This handles the case where sync was triggered before all target blocks
@@ -1925,21 +1861,13 @@ impl SimulationRunner {
                 }
             }
             Action::PersistTransactionCertificate { certificate } => {
-                // Store certificate AND commit state writes in this node's storage
-                // This is the deferred commit - state writes are only applied when
-                // the certificate is included in a committed block.
-                let storage = &mut self.node_storage[from as usize];
+                // Only store certificate metadata; state writes are committed
+                // at EmitCommittedBlock time via commit_prepared_block/commit_block.
+                // This matches production behavior and prevents double-commit.
+                let storage = &self.node_storage[from as usize];
                 let local_shard = self.nodes[from as usize].shard();
 
-                // Extract writes for local shard from the certificate's shard_proofs
-                let writes = certificate
-                    .shard_proofs
-                    .get(&local_shard)
-                    .map(|cert| cert.state_writes.as_slice())
-                    .unwrap_or(&[]);
-
-                // Commit certificate + writes atomically (mirrors production behavior)
-                storage.commit_certificate_with_writes(&certificate, writes);
+                storage.store_certificate(&certificate);
 
                 // After persisting, gossip certificate to same-shard peers.
                 // This ensures other validators have the certificate before the proposer
@@ -1963,7 +1891,7 @@ impl SimulationRunner {
             } => {
                 // **BFT Safety Critical**: Store our vote before broadcasting.
                 // This ensures we remember what we voted for after a restart.
-                let storage = &mut self.node_storage[from as usize];
+                let storage = &self.node_storage[from as usize];
                 storage.put_own_vote(height.0, round, block_hash);
                 trace!(
                     node = from,

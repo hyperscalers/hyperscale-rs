@@ -13,6 +13,8 @@ hyperscale-types.workspace = true
 hyperscale-bft.workspace = true
 hyperscale-engine.workspace = true
 hyperscale-mempool.workspace = true
+hyperscale-storage.workspace = true
+hyperscale-storage-memory.workspace = true
 
 # Reuse production infrastructure (thread pools)
 hyperscale-production.workspace = true

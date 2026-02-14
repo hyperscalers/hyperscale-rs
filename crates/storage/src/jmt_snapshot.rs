@@ -11,7 +11,8 @@
 //! substate values. These associations are persisted to enable querying
 //! historical state at any past version (within the retention window).
 
-use crate::{StaleTreePart, StateRootHash, StoredTreeNodeKey, TreeNode};
+use crate::jmt::{StaleTreePart, StoredTreeNodeKey, TreeNode};
+use crate::StateRootHash;
 use std::collections::HashMap;
 
 /// Associates a JMT leaf node with the substate value it represents.
@@ -62,6 +63,7 @@ pub struct LeafSubstateKeyAssociation {
 /// associations between JMT leaf nodes and their substate values. These
 /// should be persisted alongside the JMT nodes to enable historical queries.
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct JmtSnapshot {
     /// The JMT root this snapshot was computed from.
     /// Used to verify the JMT is in the expected state before applying.
