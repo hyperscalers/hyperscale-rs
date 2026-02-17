@@ -19,8 +19,8 @@ use hyperscale_storage::{
     PartitionDatabaseUpdates, PartitionEntry, StateRootHash, SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{
-    Block, BlockHeight, Hash, NodeId, QuorumCertificate, ShardGroupId, SubstateWrite,
-    TransactionCertificate,
+    Block, BlockHeight, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    SubstateWrite, TransactionCertificate,
 };
 use im::OrdMap;
 use std::collections::{BTreeMap, HashMap};
@@ -257,6 +257,10 @@ pub struct SimStorage {
     /// Committed consensus state (height + hash + QC) bundled for atomic updates.
     committed_state: RwLock<CommittedConsensusState>,
 
+    /// Transactions indexed by hash.
+    /// Populated when blocks are committed via `put_block`.
+    transactions: RwLock<HashMap<Hash, RoutableTransaction>>,
+
     /// Transaction certificates indexed by transaction hash.
     /// Used for cross-shard transaction finalization.
     certificates: RwLock<HashMap<Hash, TransactionCertificate>>,
@@ -280,6 +284,7 @@ impl SimStorage {
                 hash: None,
                 qc: None,
             }),
+            transactions: RwLock::new(HashMap::new()),
             certificates: RwLock::new(HashMap::new()),
             own_votes: RwLock::new(HashMap::new()),
         }
@@ -666,6 +671,18 @@ impl CommitStore for SimStorage {
 
 impl ConsensusStore for SimStorage {
     fn put_block(&self, height: BlockHeight, block: &Block, qc: &QuorumCertificate) {
+        // Index all transactions by hash for batch lookups
+        let mut txs = self.transactions.write().unwrap();
+        for tx in block
+            .retry_transactions
+            .iter()
+            .chain(block.priority_transactions.iter())
+            .chain(block.transactions.iter())
+        {
+            txs.insert(tx.hash(), tx.as_ref().clone());
+        }
+        drop(txs);
+
         self.blocks
             .write()
             .unwrap()
@@ -730,6 +747,24 @@ impl ConsensusStore for SimStorage {
             .write()
             .unwrap()
             .retain(|height, _| *height > committed_height);
+    }
+
+    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+        // SimStorage stores complete blocks, so this is the same as get_block
+        self.blocks.read().unwrap().get(&height).cloned()
+    }
+
+    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {
+        let txs = self.transactions.read().unwrap();
+        hashes.iter().filter_map(|h| txs.get(h).cloned()).collect()
+    }
+
+    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate> {
+        let certs = self.certificates.read().unwrap();
+        hashes
+            .iter()
+            .filter_map(|h| certs.get(h).cloned())
+            .collect()
     }
 }
 

@@ -3,7 +3,9 @@
 //! Abstracts block, certificate, vote, and metadata storage.
 //! All methods take `&self` — implementations use interior mutability.
 
-use hyperscale_types::{Block, BlockHeight, Hash, QuorumCertificate, TransactionCertificate};
+use hyperscale_types::{
+    Block, BlockHeight, Hash, QuorumCertificate, RoutableTransaction, TransactionCertificate,
+};
 use std::collections::HashMap;
 
 /// Abstracts consensus-related storage for both simulation and production.
@@ -55,4 +57,20 @@ pub trait ConsensusStore: Send + Sync {
 
     /// Remove votes at or below a committed height (cleanup).
     fn prune_own_votes(&self, committed_height: u64);
+
+    /// Get a complete block for serving sync requests.
+    ///
+    /// Returns `Some((block, qc))` only if the full block is available with all
+    /// transactions and certificates. Returns `None` if any data is missing.
+    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)>;
+
+    /// Get multiple transactions by hash (batch read).
+    ///
+    /// Returns only transactions that were found (missing hashes are skipped).
+    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction>;
+
+    /// Get multiple certificates by hash (batch read).
+    ///
+    /// Returns only certificates that were found (missing hashes are skipped).
+    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate>;
 }

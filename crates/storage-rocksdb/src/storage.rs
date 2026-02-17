@@ -2299,6 +2299,18 @@ impl hyperscale_storage::ConsensusStore for RocksDbStorage {
     fn prune_own_votes(&self, committed_height: u64) {
         RocksDbStorage::prune_own_votes(self, committed_height);
     }
+
+    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+        RocksDbStorage::get_block_for_sync(self, height)
+    }
+
+    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {
+        RocksDbStorage::get_transactions_batch(self, hashes)
+    }
+
+    fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate> {
+        RocksDbStorage::get_certificates_batch(self, hashes)
+    }
 }
 
 #[cfg(test)]
