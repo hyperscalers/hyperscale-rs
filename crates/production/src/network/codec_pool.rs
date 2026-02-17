@@ -26,8 +26,9 @@
 
 use super::codec::{decode_message, encode_message, CodecError};
 use super::Topic;
-use crate::ThreadPoolManager;
 use hyperscale_core::{Event, OutboundMessage};
+use hyperscale_dispatch::Dispatch;
+use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
 use libp2p::PeerId as Libp2pPeerId;
 use std::sync::Arc;
@@ -36,17 +37,17 @@ use tracing::{trace, warn};
 
 /// Handle for async message encoding/decoding using the shared thread pool.
 ///
-/// This wraps a `ThreadPoolManager` and provides convenient methods for
+/// This wraps a [`PooledDispatch`] and provides convenient methods for
 /// spawning codec work on the shared codec thread pool.
 #[derive(Clone)]
 pub struct CodecPoolHandle {
-    thread_pools: Arc<ThreadPoolManager>,
+    dispatch: Arc<PooledDispatch>,
 }
 
 impl CodecPoolHandle {
-    /// Create a new handle wrapping the thread pool manager.
-    pub fn new(thread_pools: Arc<ThreadPoolManager>) -> Self {
-        Self { thread_pools }
+    /// Create a new handle wrapping the dispatch implementation.
+    pub fn new(dispatch: Arc<PooledDispatch>) -> Self {
+        Self { dispatch }
     }
 
     /// Decode a message asynchronously and send results to the consensus channel.
@@ -70,7 +71,7 @@ impl CodecPoolHandle {
         consensus_tx: mpsc::Sender<Event>,
         tx_validation_handle: crate::validation_batcher::ValidationBatcherHandle,
     ) {
-        self.thread_pools.spawn_codec(move || {
+        self.dispatch.spawn_codec(move || {
             let result = decode_message(&topic, &data);
 
             match result {
@@ -127,19 +128,19 @@ impl CodecPoolHandle {
 
     /// Get current codec pool queue depth (for metrics).
     pub fn queue_depth(&self) -> usize {
-        self.thread_pools.codec_queue_depth()
+        self.dispatch.codec_queue_depth()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ThreadPoolConfig;
+    use hyperscale_dispatch_pooled::ThreadPoolConfig;
 
     #[test]
     fn test_codec_pool_handle_creation() {
-        let thread_pools = Arc::new(ThreadPoolManager::new(ThreadPoolConfig::minimal()).unwrap());
-        let handle = CodecPoolHandle::new(thread_pools);
+        let dispatch = Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap());
+        let handle = CodecPoolHandle::new(dispatch);
         assert_eq!(handle.queue_depth(), 0);
     }
 
@@ -148,8 +149,8 @@ mod tests {
         use hyperscale_messages::gossip::BlockVoteGossip;
         use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash, ValidatorId};
 
-        let thread_pools = Arc::new(ThreadPoolManager::new(ThreadPoolConfig::minimal()).unwrap());
-        let handle = CodecPoolHandle::new(thread_pools);
+        let dispatch = Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap());
+        let handle = CodecPoolHandle::new(dispatch);
 
         let vote = BlockVote {
             block_hash: Hash::from_bytes(&[1u8; 32]),

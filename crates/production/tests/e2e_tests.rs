@@ -12,9 +12,7 @@ mod fixtures;
 use fixtures::TestFixtures;
 use hyperscale_bft::BftConfig;
 use hyperscale_engine::TransactionValidation;
-use hyperscale_production::{
-    ProductionRunner, RocksDbStorage, ThreadPoolConfig, ThreadPoolManager,
-};
+use hyperscale_production::{PooledDispatch, ProductionRunner, RocksDbStorage, ThreadPoolConfig};
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, ValidatorId,
@@ -33,9 +31,9 @@ fn test_tx_validator() -> Arc<TransactionValidation> {
     Arc::new(TransactionValidation::new(NetworkDefinition::simulator()))
 }
 
-/// Create a minimal test thread pool manager.
-fn test_thread_pools() -> Arc<ThreadPoolManager> {
-    Arc::new(ThreadPoolManager::new(ThreadPoolConfig::minimal()).unwrap())
+/// Create a minimal test dispatch.
+fn test_dispatch() -> Arc<PooledDispatch> {
+    Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap())
 }
 
 /// Create a test transaction validation handle.
@@ -48,7 +46,7 @@ fn test_tx_validation_handle() -> (
     let handle = hyperscale_production::spawn_tx_validation_batcher(
         hyperscale_production::ValidationBatcherConfig::default(),
         test_tx_validator(),
-        test_thread_pools(),
+        test_dispatch(),
         output_tx,
     );
     (handle, output_rx)
@@ -56,7 +54,7 @@ fn test_tx_validation_handle() -> (
 
 /// Create a test codec pool handle for network adapter tests.
 fn test_codec_pool_handle() -> hyperscale_production::network::CodecPoolHandle {
-    hyperscale_production::network::CodecPoolHandle::new(test_thread_pools())
+    hyperscale_production::network::CodecPoolHandle::new(test_dispatch())
 }
 
 /// Test timeout values (from design spec).

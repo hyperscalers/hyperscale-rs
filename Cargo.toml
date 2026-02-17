@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "crates/bft",
     "crates/core",
+    "crates/dispatch",
+    "crates/dispatch-pooled",
+    "crates/dispatch-sync",
     "crates/engine",
     "crates/execution",
     "crates/livelock",
@@ -28,6 +31,9 @@ members = [
 default-members = [
     "crates/bft",
     "crates/core",
+    "crates/dispatch",
+    "crates/dispatch-pooled",
+    "crates/dispatch-sync",
     "crates/engine",
     "crates/execution",
     "crates/livelock",
@@ -61,6 +67,9 @@ hyperscale-metrics = { path = "crates/metrics" }
 hyperscale-metrics-noop = { path = "crates/metrics-noop" }
 hyperscale-metrics-prometheus = { path = "crates/metrics-prometheus" }
 hyperscale-core = { path = "crates/core" }
+hyperscale-dispatch = { path = "crates/dispatch" }
+hyperscale-dispatch-pooled = { path = "crates/dispatch-pooled" }
+hyperscale-dispatch-sync = { path = "crates/dispatch-sync" }
 hyperscale-storage = { path = "crates/storage" }
 hyperscale-storage-memory = { path = "crates/storage-memory" }
 hyperscale-storage-rocksdb = { path = "crates/storage-rocksdb" }

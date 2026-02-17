@@ -9,9 +9,10 @@ use crate::network::{
 };
 use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
 use crate::sync::{SyncConfig, SyncManager};
-use crate::thread_pools::ThreadPoolManager;
 use crate::timers::TimerManager;
 use hyperscale_bft::BftConfig;
+use hyperscale_dispatch::Dispatch;
+use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_engine::{NetworkDefinition, RadixExecutor};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics as metrics;
@@ -490,7 +491,7 @@ fn spawn_block_commit_task(
 /// - `network` - libp2p configuration for peer-to-peer communication
 ///
 /// Optional fields:
-/// - `thread_pools` - Thread pool manager (defaults to auto-configured)
+/// - `dispatch` - Dispatch implementation (defaults to auto-configured)
 /// - `channel_capacity` - Event channel capacity (defaults to 10,000)
 ///
 /// # Example
@@ -530,7 +531,7 @@ pub struct ProductionRunnerBuilder {
     topology: Option<Arc<dyn Topology>>,
     signing_key: Option<Bls12381G1PrivateKey>,
     bft_config: Option<BftConfig>,
-    thread_pools: Option<Arc<ThreadPoolManager>>,
+    dispatch: Option<Arc<PooledDispatch>>,
     storage: Option<Arc<RocksDbStorage>>,
     network_config: Option<Libp2pConfig>,
     ed25519_keypair: Option<identity::Keypair>,
@@ -567,7 +568,7 @@ impl ProductionRunnerBuilder {
             topology: None,
             signing_key: None,
             bft_config: None,
-            thread_pools: None,
+            dispatch: None,
             storage: None,
             network_config: None,
             ed25519_keypair: None,
@@ -610,9 +611,9 @@ impl ProductionRunnerBuilder {
         self
     }
 
-    /// Set the thread pool manager (optional, defaults to auto-configured pools).
-    pub fn thread_pools(mut self, pools: Arc<ThreadPoolManager>) -> Self {
-        self.thread_pools = Some(pools);
+    /// Set the dispatch implementation (optional, defaults to auto-configured pools).
+    pub fn dispatch(mut self, dispatch: Arc<PooledDispatch>) -> Self {
+        self.dispatch = Some(dispatch);
         self
     }
 
@@ -718,11 +719,11 @@ impl ProductionRunnerBuilder {
         let bft_config = self
             .bft_config
             .ok_or_else(|| RunnerError::SendError("bft_config is required".into()))?;
-        let thread_pools = match self.thread_pools {
+        let dispatch = match self.dispatch {
             Some(pools) => pools,
-            None => Arc::new(
-                ThreadPoolManager::auto().map_err(|e| RunnerError::SendError(e.to_string()))?,
-            ),
+            None => {
+                Arc::new(PooledDispatch::auto().map_err(|e| RunnerError::SendError(e.to_string()))?)
+            }
         };
         let storage = self
             .storage
@@ -797,14 +798,14 @@ impl ProductionRunnerBuilder {
         let tx_validation_handle = crate::validation_batcher::spawn_tx_validation_batcher(
             crate::validation_batcher::ValidationBatcherConfig::default(),
             tx_validator.clone(),
-            thread_pools.clone(),
+            dispatch.clone(),
             validated_tx_tx,
         );
 
         // Create codec pool handle for async message encoding/decoding
         // This uses the shared thread pool manager's codec pool to offload SBOR
         // operations from the network event loop.
-        let codec_pool_handle = crate::network::CodecPoolHandle::new(thread_pools.clone());
+        let codec_pool_handle = crate::network::CodecPoolHandle::new(dispatch.clone());
 
         // Create network adapter with shared transaction validation batcher
         let network = Libp2pAdapter::new(
@@ -950,7 +951,7 @@ impl ProductionRunnerBuilder {
             epoch_start_time: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("system time before UNIX epoch"),
-            thread_pools,
+            dispatch,
             timer_manager,
             network,
             sync_manager,
@@ -1040,8 +1041,8 @@ pub struct ProductionRunner {
     /// This is used for consensus timestamps to ensure nodes agree on time even if
     /// they start at different moments.
     epoch_start_time: Duration,
-    /// Thread pool manager for crypto and execution workloads.
-    thread_pools: Arc<ThreadPoolManager>,
+    /// Dispatch implementation for crypto and execution workloads.
+    dispatch: Arc<PooledDispatch>,
     /// Timer manager for setting/cancelling timers.
     timer_manager: TimerManager,
     /// Network adapter for libp2p communication.
@@ -1170,9 +1171,9 @@ impl ProductionRunner {
         self.epoch_start_time + self.start_time.elapsed()
     }
 
-    /// Get a reference to the thread pool manager.
-    pub fn thread_pools(&self) -> &Arc<ThreadPoolManager> {
-        &self.thread_pools
+    /// Get a reference to the dispatch implementation.
+    pub fn dispatch(&self) -> &Arc<PooledDispatch> {
+        &self.dispatch
     }
 
     /// Get a reference to the network adapter.
@@ -1393,7 +1394,7 @@ impl ProductionRunner {
     /// Uses `biased` select for priority ordering - higher priority channels
     /// are always checked first, but all channels get processed when ready.
     pub async fn run(mut self) -> Result<(), RunnerError> {
-        let config = self.thread_pools.config();
+        let config = self.dispatch.config();
         tracing::info!(
             node_index = self.state.node_index(),
             shard = ?self.state.shard(),
@@ -1448,10 +1449,10 @@ impl ProductionRunner {
                 _ = metrics_tick.tick() => {
                     // Update thread pool queue depths (non-blocking)
                     metrics::set_pool_queue_depths(
-                        self.thread_pools.consensus_crypto_queue_depth(),
-                        self.thread_pools.crypto_queue_depth(),
-                        self.thread_pools.tx_validation_queue_depth(),
-                        self.thread_pools.execution_queue_depth(),
+                        self.dispatch.consensus_crypto_queue_depth(),
+                        self.dispatch.crypto_queue_depth(),
+                        self.dispatch.tx_validation_queue_depth(),
+                        self.dispatch.execution_queue_depth(),
                     );
 
                     // Update event channel depths (non-blocking)
@@ -2160,7 +2161,7 @@ impl ProductionRunner {
             } => {
                 let event_tx = self.callback_tx.clone();
                 // QC building is liveness-critical - use dedicated consensus crypto pool
-                self.thread_pools.spawn_consensus_crypto(move || {
+                self.dispatch.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
 
                     // Start with already-verified votes (e.g., our own vote)
@@ -2304,7 +2305,7 @@ impl ProductionRunner {
             } => {
                 let event_tx = self.callback_tx.clone();
                 let topology = self.topology.clone();
-                self.thread_pools.spawn_crypto(move || {
+                self.dispatch.spawn_crypto(move || {
                     let start = std::time::Instant::now();
 
                     // All provisions for the same (tx, source_shard) sign the SAME message.
@@ -2443,7 +2444,7 @@ impl ProductionRunner {
             } => {
                 let event_tx = self.callback_tx.clone();
                 let topology = self.topology.clone();
-                self.thread_pools.spawn_crypto(move || {
+                self.dispatch.spawn_crypto(move || {
                     let start = std::time::Instant::now();
 
                     // Deduplicate votes by validator to avoid aggregating the same signature multiple times
@@ -2562,7 +2563,7 @@ impl ProductionRunner {
             } => {
                 let event_tx = self.callback_tx.clone();
                 // QC verification is LIVENESS-CRITICAL - use consensus crypto pool
-                self.thread_pools.spawn_consensus_crypto(move || {
+                self.dispatch.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
                     // Get signer keys based on QC's signer bitfield
                     let signer_keys: Vec<_> = public_keys
@@ -2613,7 +2614,7 @@ impl ProductionRunner {
             } => {
                 let event_tx = self.callback_tx.clone();
                 // CycleProof verification is LIVENESS-CRITICAL - use consensus crypto pool
-                self.thread_pools.spawn_consensus_crypto(move || {
+                self.dispatch.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
 
                     let valid = if public_keys.is_empty() {
@@ -2669,7 +2670,7 @@ impl ProductionRunner {
 
                 // State root verification can be expensive for large blocks.
                 // Use consensus crypto pool since this is on the critical voting path.
-                self.thread_pools.spawn_consensus_crypto(move || {
+                self.dispatch.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
 
                     // Compute speculative state root and get prepared commit handle.
@@ -2722,7 +2723,7 @@ impl ProductionRunner {
 
                 // Transaction root verification is a pure CPU computation (merkle tree).
                 // Use consensus crypto pool since it's on the critical voting path.
-                self.thread_pools.spawn_consensus_crypto(move || {
+                self.dispatch.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
 
                     // Compute transaction merkle root from all sections
@@ -2788,7 +2789,7 @@ impl ProductionRunner {
 
                 // Build proposal block. Check if JMT is ready, compute state root if so,
                 // build the block, and store the PreparedCommit for efficient commit.
-                self.thread_pools.spawn_consensus_crypto(move || {
+                self.dispatch.spawn_consensus_crypto(move || {
                     use hyperscale_storage::SubstateStore;
                     use hyperscale_types::{Block, BlockHeader};
 
@@ -2903,7 +2904,6 @@ impl ProductionRunner {
                 let dispatch_tx = self.dispatch_tx.clone();
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
-                let thread_pools = self.thread_pools.clone();
                 // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
                 let key_bytes = self.signing_key.to_bytes();
                 let signing_key =
@@ -2911,14 +2911,14 @@ impl ProductionRunner {
                 let local_shard = self.local_shard;
                 let validator_id = self.topology.local_validator_id();
 
-                self.thread_pools.spawn_execution(move || {
+                self.dispatch.spawn_execution(move || {
                     let start = std::time::Instant::now();
                     // Execute transactions AND sign votes in parallel using the execution pool.
                     // Combining execute + sign in one parallel operation avoids:
                     // 1. Cross-pool blocking (execution waiting on crypto)
                     // 2. Extra synchronization overhead
                     // Each transaction gets its own storage snapshot for isolated execution.
-                    let votes: Vec<StateVoteBlock> = thread_pools.execution_pool().install(|| {
+                    let votes: Vec<StateVoteBlock> = {
                         use rayon::prelude::*;
                         transactions
                             .par_iter()
@@ -2958,7 +2958,7 @@ impl ProductionRunner {
                                 }
                             })
                             .collect()
-                    });
+                    };
                     metrics::record_execution_latency(start.elapsed().as_secs_f64());
 
                     // Dispatch all votes (channel sends are fast, no need to parallelize)
@@ -2991,7 +2991,6 @@ impl ProductionRunner {
                 let dispatch_tx = self.dispatch_tx.clone();
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
-                let thread_pools = self.thread_pools.clone();
                 // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
                 let key_bytes = self.signing_key.to_bytes();
                 let signing_key =
@@ -2999,11 +2998,11 @@ impl ProductionRunner {
                 let local_shard = self.local_shard;
                 let validator_id = self.topology.local_validator_id();
 
-                self.thread_pools.spawn_execution(move || {
+                self.dispatch.spawn_execution(move || {
                     let start = std::time::Instant::now();
                     // Execute transactions AND sign votes in parallel using the execution pool.
                     // Same pattern as ExecuteTransactions - no deferred signing.
-                    let votes: Vec<StateVoteBlock> = thread_pools.execution_pool().install(|| {
+                    let votes: Vec<StateVoteBlock> = {
                         use rayon::prelude::*;
                         transactions
                             .par_iter()
@@ -3043,7 +3042,7 @@ impl ProductionRunner {
                                 }
                             })
                             .collect()
-                    });
+                    };
                     metrics::record_speculative_execution_latency(
                         start.elapsed().as_secs_f64(),
                     );
@@ -3097,7 +3096,7 @@ impl ProductionRunner {
             Action::ComputeMerkleRoot { tx_hash, writes } => {
                 let event_tx = self.callback_tx.clone();
 
-                self.thread_pools.spawn_execution(move || {
+                self.dispatch.spawn_execution(move || {
                     // Simple merkle root computation using hash chain
                     // A proper implementation would use a sparse Merkle tree
                     let root = if writes.is_empty() {
@@ -3583,15 +3582,13 @@ impl ProductionRunner {
 
         let event_tx = self.callback_tx.clone();
         let batch_size = certs.len();
-        let thread_pools = Arc::clone(&self.thread_pools);
 
-        self.thread_pools.spawn_crypto(move || {
+        self.dispatch.spawn_crypto(move || {
             let start = std::time::Instant::now();
 
             // Step 1: Pre-process certificates in parallel - aggregate signer keys and build messages
             // This is the expensive part that benefits from parallelization
-            // Use pool.install() to ensure par_iter uses crypto pool, not global
-            let prepared: Vec<_> = thread_pools.crypto_pool().install(|| {
+            let prepared: Vec<_> = {
                 use rayon::prelude::*;
                 certs
                     .into_par_iter()
@@ -3616,7 +3613,7 @@ impl ProductionRunner {
                         (cert, msg, aggregated_pk)
                     })
                     .collect()
-            });
+            };
 
             // Step 2: Batch verify all signatures
             // Separate into verifiable (have aggregated_pk) and special cases (empty signers)
@@ -3719,7 +3716,7 @@ impl ProductionRunner {
         let tx_count = batched_votes.len();
         let vote_count: usize = batched_votes.iter().map(|(_, v)| v.len()).sum();
 
-        self.thread_pools.spawn_crypto(move || {
+        self.dispatch.spawn_crypto(move || {
             let start = std::time::Instant::now();
 
             // Flatten all votes into a single list for batch verification
@@ -3808,17 +3805,15 @@ impl ProductionRunner {
 
         let event_tx = self.callback_tx.clone();
         let batch_size = batch.len();
-        let thread_pools = Arc::clone(&self.thread_pools);
 
         // Check backpressure before spawning - if crypto pool is overloaded,
         // these gossiped certs will timeout and be cleaned up by TTL.
         // This is acceptable since gossiped certs are non-critical and can be re-fetched.
-        if !self.thread_pools.try_spawn_crypto(move || {
+        if !self.dispatch.try_spawn_crypto(move || {
             let start = std::time::Instant::now();
 
             // Step 1: Pre-process certificates in parallel - aggregate signer keys and build messages
-            // Use pool.install() to ensure par_iter uses crypto pool, not global
-            let prepared: Vec<_> = thread_pools.crypto_pool().install(|| {
+            let prepared: Vec<_> = {
                 use rayon::prelude::*;
                 batch
                     .into_par_iter()
@@ -3843,7 +3838,7 @@ impl ProductionRunner {
                         (tx_hash, shard, cert, msg, aggregated_pk)
                     })
                     .collect()
-            });
+            };
 
             // Step 2: Batch verify all signatures
             // Separate into verifiable (have aggregated_pk) and special cases
@@ -3939,7 +3934,7 @@ impl ProductionRunner {
             // Log and let TTL cleanup handle these certs
             tracing::warn!(
                 batch_size,
-                crypto_queue_depth = self.thread_pools.crypto_queue_depth(),
+                crypto_queue_depth = self.dispatch.crypto_queue_depth(),
                 "Gossiped cert batch rejected due to crypto pool backpressure"
             );
             metrics::record_backpressure_event("gossiped_cert_verification");
@@ -3966,14 +3961,13 @@ impl ProductionRunner {
         let executor = self.executor.clone();
         let topology = self.topology.clone();
         let local_shard = self.local_shard;
-        let thread_pools = self.thread_pools.clone();
         let batch_size = requests.len();
         // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
         let key_bytes = self.signing_key.to_bytes();
         let signing_key = Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
         let validator_id = topology.local_validator_id();
 
-        self.thread_pools.spawn_execution(move || {
+        self.dispatch.spawn_execution(move || {
             let start = std::time::Instant::now();
 
             // Execute all transactions AND sign votes in parallel using the execution pool.
@@ -3981,7 +3975,7 @@ impl ProductionRunner {
             // 1. Cross-pool blocking (execution waiting on crypto)
             // 2. Extra synchronization overhead
             // Each transaction gets its own storage snapshot for isolated execution.
-            let votes: Vec<StateVoteBlock> = thread_pools.execution_pool().install(|| {
+            let votes: Vec<StateVoteBlock> = {
                 use rayon::prelude::*;
                 requests
                     .par_iter()
@@ -4031,7 +4025,7 @@ impl ProductionRunner {
                         }
                     })
                     .collect()
-            });
+            };
 
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
 

@@ -37,7 +37,7 @@
 //! The number of threads for each pool is configurable:
 //!
 //! ```no_run
-//! use hyperscale_production::{ThreadPoolConfig, ThreadPoolManager, ProductionRunner};
+//! use hyperscale_production::{ThreadPoolConfig, PooledDispatch, ProductionRunner};
 //! use std::sync::Arc;
 //!
 //! // Auto-detect cores and use default ratios (25% crypto, 50% execution, 25% I/O)
@@ -64,10 +64,10 @@
 //!     .build()
 //!     .unwrap();
 //!
-//! let manager = ThreadPoolManager::new(config).unwrap();
+//! let dispatch = PooledDispatch::new(config).unwrap();
 //!
-//! // Share thread pools across multiple runners (e.g., multi-shard node)
-//! let shared_pools = Arc::new(manager);
+//! // Share dispatch across multiple runners (e.g., multi-shard node)
+//! let shared_dispatch = Arc::new(dispatch);
 //! ```
 
 mod action_dispatcher;
@@ -79,10 +79,10 @@ mod runner;
 mod sync;
 mod sync_error;
 mod telemetry;
-mod thread_pools;
 mod timers;
 mod validation_batcher;
 
+pub use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 pub use hyperscale_storage_rocksdb::{
     CompressionType, RocksDbConfig, RocksDbStorage, StorageError,
 };
@@ -91,7 +91,6 @@ pub use runner::{ProductionRunner, RunnerError};
 pub use sync::SyncStatus;
 pub use sync_error::SyncResponseError;
 pub use telemetry::{init_telemetry, TelemetryConfig, TelemetryGuard};
-pub use thread_pools::{ThreadPoolConfig, ThreadPoolManager};
 pub use validation_batcher::{
     spawn_tx_validation_batcher, ValidationBatcherConfig, ValidationBatcherHandle,
 };

@@ -1,6 +1,6 @@
 //! Configuration for parallel simulation.
 
-use hyperscale_production::ThreadPoolConfig;
+use hyperscale_dispatch_pooled::ThreadPoolConfig;
 use hyperscale_simulation::NetworkConfig;
 use std::time::Duration;
 

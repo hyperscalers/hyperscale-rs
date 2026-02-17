@@ -1,0 +1,8 @@
+[package]
+name = "hyperscale-dispatch-sync"
+version.workspace = true
+edition.workspace = true
+description = "Synchronous inline dispatch for deterministic simulation"
+
+[dependencies]
+hyperscale-dispatch.workspace = true

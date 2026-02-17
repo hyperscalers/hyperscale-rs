@@ -1,0 +1,7 @@
+[package]
+name = "hyperscale-dispatch"
+version.workspace = true
+edition.workspace = true
+description = "Dispatch trait for work scheduling across priority-isolated pools"
+
+[dependencies]

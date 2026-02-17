@@ -53,8 +53,8 @@ use hyperscale_production::network::{
 };
 use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
 use hyperscale_production::{
-    init_telemetry, ProductionRunner, RocksDbConfig, RocksDbStorage, TelemetryConfig,
-    ThreadPoolConfig, ThreadPoolManager,
+    init_telemetry, PooledDispatch, ProductionRunner, RocksDbConfig, RocksDbStorage,
+    TelemetryConfig, ThreadPoolConfig,
 };
 use hyperscale_types::{
     bls_keypair_from_seed, generate_bls_keypair, Bls12381G1PrivateKey, Bls12381G1PublicKey,
@@ -1208,10 +1208,9 @@ async fn main() -> Result<()> {
     let network_config = build_network_config(&config.network)?;
     let rocksdb_config = build_rocksdb_config(&config.storage);
 
-    // Initialize thread pools
-    let thread_pools = Arc::new(
-        ThreadPoolManager::new(thread_config).context("Failed to initialize thread pools")?,
-    );
+    // Initialize dispatch pools
+    let dispatch =
+        Arc::new(PooledDispatch::new(thread_config).context("Failed to initialize thread pools")?);
 
     // Open storage
     let db_path = config.node.data_dir.join("db");
@@ -1248,7 +1247,7 @@ async fn main() -> Result<()> {
         .topology(topology)
         .signing_key(signing_keypair)
         .bft_config(bft_config)
-        .thread_pools(thread_pools)
+        .dispatch(dispatch)
         .storage(storage)
         .network(network_config, p2p_identity)
         .rpc_status(rpc_node_status.clone())

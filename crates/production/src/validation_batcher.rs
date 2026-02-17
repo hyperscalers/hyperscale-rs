@@ -17,8 +17,9 @@
 //! 2. Collects transactions for a short time window (e.g., 20ms)
 //! 3. Dispatches a single crypto task that validates all in parallel via rayon
 
-use crate::thread_pools::ThreadPoolManager;
 use hyperscale_core::Event;
+use hyperscale_dispatch::Dispatch;
+use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_engine::TransactionValidation;
 use hyperscale_metrics as metrics;
 use hyperscale_types::{Hash, RoutableTransaction};
@@ -175,7 +176,7 @@ impl ValidationBatcherHandle {
 pub struct ValidationBatcher {
     config: ValidationBatcherConfig,
     validator: Arc<TransactionValidation>,
-    thread_pools: Arc<ThreadPoolManager>,
+    dispatch: Arc<PooledDispatch>,
     output_tx: mpsc::UnboundedSender<Event>,
     stats: Arc<ValidationBatcherStats>,
 }
@@ -249,24 +250,20 @@ impl ValidationBatcher {
         let validator = Arc::clone(&self.validator);
         let output_tx = self.output_tx.clone();
         let stats = Arc::clone(&self.stats);
-        let thread_pools = Arc::clone(&self.thread_pools);
 
         debug!(batch_size, "Dispatching transaction validation batch");
 
-        // Spawn a single task that uses pool.install() to run par_iter on the correct pool.
-        // This ensures all parallel work stays within the tx_validation pool.
-        self.thread_pools.spawn_tx_validation(move || {
-            // Use pool.install() to ensure par_iter uses tx_validation pool, not global
-            let results: Vec<_> = thread_pools.tx_validation_pool().install(|| {
-                use rayon::prelude::*;
-                batch
-                    .into_par_iter()
-                    .map(|tx| {
-                        let result = validator.validate_transaction(&tx);
-                        (tx, result)
-                    })
-                    .collect()
-            });
+        // Spawn a single task on the tx_validation pool.
+        // The pool automatically wraps in install() so par_iter uses the correct pool.
+        self.dispatch.spawn_tx_validation(move || {
+            use rayon::prelude::*;
+            let results: Vec<_> = batch
+                .into_par_iter()
+                .map(|tx| {
+                    let result = validator.validate_transaction(&tx);
+                    (tx, result)
+                })
+                .collect();
 
             // Send results back
             for (tx, result) in results {
@@ -296,7 +293,7 @@ impl ValidationBatcher {
 pub fn spawn_tx_validation_batcher(
     config: ValidationBatcherConfig,
     validator: Arc<TransactionValidation>,
-    thread_pools: Arc<ThreadPoolManager>,
+    dispatch: Arc<PooledDispatch>,
     output_tx: mpsc::UnboundedSender<Event>,
 ) -> ValidationBatcherHandle {
     let stats = Arc::new(ValidationBatcherStats::default());
@@ -312,7 +309,7 @@ pub fn spawn_tx_validation_batcher(
     let batcher = ValidationBatcher {
         config,
         validator,
-        thread_pools,
+        dispatch,
         output_tx,
         stats,
     };

@@ -1,20 +1,22 @@
-//! Configurable thread pool management for production deployment.
+//! Rayon thread pool dispatch for production deployment.
 //!
-//! This module provides flexible core allocation for the different workload types:
+//! This module provides [`PooledDispatch`] which schedules work across
+//! priority-isolated rayon thread pools:
 //!
-//! - **State Machine**: Single thread for deterministic event processing
-//! - **Crypto Pool**: BLS signature verification (CPU-intensive)
-//! - **Execution Pool**: Transaction execution via Radix Engine
-//! - **Async I/O**: Network, storage, timers (tokio runtime)
+//! - **Consensus Crypto**: Liveness-critical (block votes, QC verification)
+//! - **Crypto**: General signature verification (provisions, state votes)
+//! - **TX Validation**: Transaction signature verification (isolated from crypto)
+//! - **Execution**: Radix Engine transaction execution
+//! - **Codec**: SBOR message encoding/decoding
 //!
 //! # Example
 //!
 //! ```no_run
-//! use hyperscale_production::{ThreadPoolConfig, ThreadPoolManager};
+//! use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 //!
 //! // Auto-detect cores and use default ratios
 //! let config = ThreadPoolConfig::auto();
-//! let manager = ThreadPoolManager::new(config).unwrap();
+//! let dispatch = PooledDispatch::new(config).unwrap();
 //!
 //! // Or customize
 //! let config = ThreadPoolConfig::builder()
@@ -24,7 +26,7 @@
 //!     .build()
 //!     .unwrap();
 //!
-//! let manager = ThreadPoolManager::new(config).unwrap();
+//! let dispatch = PooledDispatch::new(config).unwrap();
 //! ```
 
 use std::num::NonZeroUsize;
@@ -32,6 +34,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::instrument;
+
+use hyperscale_dispatch::Dispatch;
 
 /// Errors from thread pool configuration.
 #[derive(Debug, Error)]
@@ -78,12 +82,16 @@ pub struct ThreadPoolConfig {
     pub codec_threads: usize,
 
     /// Number of threads for the tokio async runtime (network, storage, timers).
-    /// These are mostly I/O-bound.
+    /// These are mostly I/O-bound. Not used by dispatch itself — provided for
+    /// runner configuration.
     pub io_threads: usize,
 
     /// Whether to pin threads to specific CPU cores.
     /// Improves cache locality but reduces flexibility.
     pub pin_cores: bool,
+
+    /// Starting core index for consensus crypto pool (if pinning enabled).
+    pub consensus_crypto_core_start: Option<usize>,
 
     /// Starting core index for crypto pool (if pinning enabled).
     pub crypto_core_start: Option<usize>,
@@ -137,31 +145,32 @@ impl ThreadPoolConfig {
     ///
     /// Useful for testing or when you want to limit resource usage.
     pub fn for_core_count(total_cores: usize) -> Self {
-        // Reserve 1 core for state machine + 2 for consensus crypto
-        let remaining = total_cores.saturating_sub(3).max(6);
+        // Reserve 1 core for state machine + 2 for consensus crypto.
+        // Floor at 6 so small machines still get 1 thread per pool (over-subscribing is fine).
+        let pool_budget = total_cores.saturating_sub(3).max(6);
 
         // Allocation:
         // - Consensus crypto is fixed at 2 threads (liveness critical for block votes/QC)
-        // - All other pools use percentage-based allocation from remaining cores
-        let (consensus_crypto, tx_validation, codec, crypto, execution, io) = if remaining <= 6 {
+        // - All other pools use percentage-based allocation from pool_budget
+        let (consensus_crypto, tx_validation, codec, crypto, execution, io) = if pool_budget <= 6 {
             // Minimum viable: 1 each for variable pools, 2 for consensus crypto
             (2, 1, 1, 1, 1, 1)
         } else {
             // Consensus crypto: fixed 2 threads (enough for ~1000 votes/sec)
             let consensus_crypto = 2;
 
-            // Remaining cores split by percentage:
+            // Pool budget split by percentage:
             // - Crypto: 35% (provisions, state votes, gossiped cert verification - highest load)
             // - Execution: 25% (Radix Engine)
             // - TX Validation: 15% (transaction signature verification, bursty)
             // - I/O: 15% (network, storage, timers)
             // - Codec: 10% (SBOR encode/decode)
-            let crypto = (remaining * 35 / 100).max(1);
-            let execution = (remaining * 25 / 100).max(1);
-            let tx_validation = (remaining * 15 / 100).max(1);
-            let io = (remaining * 15 / 100).max(1);
+            let crypto = (pool_budget * 35 / 100).max(1);
+            let execution = (pool_budget * 25 / 100).max(1);
+            let tx_validation = (pool_budget * 15 / 100).max(1);
+            let io = (pool_budget * 15 / 100).max(1);
             // Codec gets the remainder to ensure we use all cores
-            let codec = remaining
+            let codec = pool_budget
                 .saturating_sub(crypto)
                 .saturating_sub(execution)
                 .saturating_sub(tx_validation)
@@ -185,6 +194,7 @@ impl ThreadPoolConfig {
             codec_threads: codec,
             io_threads: io,
             pin_cores: false,
+            consensus_crypto_core_start: None,
             crypto_core_start: None,
             execution_core_start: None,
             io_core_start: None,
@@ -209,6 +219,7 @@ impl ThreadPoolConfig {
             codec_threads: 1,
             io_threads: 1,
             pin_cores: false,
+            consensus_crypto_core_start: None,
             crypto_core_start: None,
             execution_core_start: None,
             io_core_start: None,
@@ -350,6 +361,13 @@ impl ThreadPoolConfigBuilder {
         self
     }
 
+    /// Set the starting core for the consensus crypto pool.
+    pub fn consensus_crypto_core_start(mut self, core: usize) -> Self {
+        self.config.consensus_crypto_core_start = Some(core);
+        self.config.pin_cores = true;
+        self
+    }
+
     /// Set the starting core for the crypto pool.
     pub fn crypto_core_start(mut self, core: usize) -> Self {
         self.config.crypto_core_start = Some(core);
@@ -401,73 +419,41 @@ impl Default for ThreadPoolConfigBuilder {
     }
 }
 
-/// Manages thread pools for production deployment.
+/// Rayon thread pool dispatch for production deployment.
 ///
-/// Creates and owns:
-/// - A rayon thread pool for consensus-critical crypto (block votes, QC verification)
-/// - A rayon thread pool for general crypto operations (provisions, state votes)
-/// - A rayon thread pool for transaction signature validation (isolated from other crypto)
-/// - A rayon thread pool for execution operations (Radix Engine)
-/// - A rayon thread pool for codec operations (SBOR encoding/decoding)
-/// - Configuration for tokio runtime (actual runtime created by caller)
+/// Creates and owns priority-isolated rayon thread pools:
+/// - Consensus crypto pool (block votes, QC verification) — liveness-critical
+/// - General crypto pool (provisions, state votes)
+/// - TX validation pool (transaction signatures) — isolated from crypto
+/// - Execution pool (Radix Engine)
+/// - Codec pool (SBOR encoding/decoding)
 ///
-/// The separation of consensus crypto from general crypto is critical for liveness:
-/// under high load, provision and state vote verification can queue up, but block vote
-/// verification must remain responsive to form QCs within the view_change_timeout.
-///
-/// Transaction validation is further isolated to prevent transaction floods from
-/// blocking provision/state vote verification which are needed for execution progress.
-///
-/// Codec operations are isolated to prevent large message encoding/decoding from
-/// blocking the network event loop.
-pub struct ThreadPoolManager {
-    /// Configuration used to create the pools.
+/// Spawned closures are automatically wrapped in `rayon::ThreadPool::install()`,
+/// ensuring that `par_iter` and other parallel primitives use the correct pool.
+pub struct PooledDispatch {
     config: ThreadPoolConfig,
-
-    /// Rayon pool for consensus-critical crypto (block votes, QC verification).
-    /// This pool is kept small and dedicated to ensure liveness under load.
-    consensus_crypto_pool: rayon::ThreadPool,
-
-    /// Rayon pool for general crypto operations (provisions, state votes).
-    crypto_pool: rayon::ThreadPool,
-
-    /// Rayon pool for transaction signature validation.
-    /// Isolated from general crypto to prevent tx floods from blocking execution progress.
-    tx_validation_pool: rayon::ThreadPool,
-
-    /// Rayon pool for execution operations (Radix Engine).
-    execution_pool: rayon::ThreadPool,
-
-    /// Rayon pool for codec operations (SBOR encoding/decoding).
-    /// Isolated to prevent large message serialization from blocking the network event loop.
-    codec_pool: rayon::ThreadPool,
-
-    /// Queue depth tracking for consensus crypto pool (for metrics).
+    consensus_crypto_pool: Arc<rayon::ThreadPool>,
+    crypto_pool: Arc<rayon::ThreadPool>,
+    tx_validation_pool: Arc<rayon::ThreadPool>,
+    execution_pool: Arc<rayon::ThreadPool>,
+    codec_pool: Arc<rayon::ThreadPool>,
     consensus_crypto_pending: Arc<AtomicUsize>,
-
-    /// Queue depth tracking for general crypto pool (for metrics).
     crypto_pending: Arc<AtomicUsize>,
-
-    /// Queue depth tracking for tx validation pool (for metrics).
     tx_validation_pending: Arc<AtomicUsize>,
-
-    /// Queue depth tracking for execution pool (for metrics).
     execution_pending: Arc<AtomicUsize>,
-
-    /// Queue depth tracking for codec pool (for metrics).
     codec_pending: Arc<AtomicUsize>,
 }
 
-impl ThreadPoolManager {
-    /// Create a new thread pool manager with the given configuration.
+impl PooledDispatch {
+    /// Create a new pooled dispatch with the given configuration.
     pub fn new(config: ThreadPoolConfig) -> Result<Self, ThreadPoolError> {
         config.validate()?;
 
-        let consensus_crypto_pool = Self::build_consensus_crypto_pool(&config)?;
-        let crypto_pool = Self::build_crypto_pool(&config)?;
-        let tx_validation_pool = Self::build_tx_validation_pool(&config)?;
-        let execution_pool = Self::build_execution_pool(&config)?;
-        let codec_pool = Self::build_codec_pool(&config)?;
+        let consensus_crypto_pool = Arc::new(Self::build_consensus_crypto_pool(&config)?);
+        let crypto_pool = Arc::new(Self::build_crypto_pool(&config)?);
+        let tx_validation_pool = Arc::new(Self::build_tx_validation_pool(&config)?);
+        let execution_pool = Arc::new(Self::build_execution_pool(&config)?);
+        let codec_pool = Arc::new(Self::build_codec_pool(&config)?);
 
         tracing::info!(
             consensus_crypto_threads = config.consensus_crypto_threads,
@@ -500,36 +486,46 @@ impl ThreadPoolManager {
         Self::new(ThreadPoolConfig::auto())
     }
 
-    /// Build the consensus-critical crypto pool (block votes, QC verification).
-    /// This pool is kept separate from general crypto to ensure liveness under load.
+    /// Get the configuration.
+    pub fn config(&self) -> &ThreadPoolConfig {
+        &self.config
+    }
+
     fn build_consensus_crypto_pool(
         config: &ThreadPoolConfig,
     ) -> Result<rayon::ThreadPool, ThreadPoolError> {
-        let builder = rayon::ThreadPoolBuilder::new()
+        let mut builder = rayon::ThreadPoolBuilder::new()
             .num_threads(config.consensus_crypto_threads)
             .stack_size(config.crypto_stack_size)
             .thread_name(|i| format!("consensus-crypto-{}", i));
 
-        // Note: We don't pin consensus crypto threads by default - they should be
-        // available to run on any core for best responsiveness under load.
+        if config.pin_cores {
+            let start_core = config.consensus_crypto_core_start.unwrap_or(1);
+            builder = builder.start_handler(move |i| {
+                let core_id = start_core + i;
+                if let Err(e) = pin_thread_to_core(core_id) {
+                    tracing::warn!(core = core_id, error = ?e, "Failed to pin consensus crypto thread");
+                } else {
+                    tracing::debug!(core = core_id, thread = i, "Pinned consensus crypto thread");
+                }
+            });
+        }
 
         builder
             .build()
             .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
     }
 
-    /// Build the general crypto pool (provisions, state votes).
     fn build_crypto_pool(config: &ThreadPoolConfig) -> Result<rayon::ThreadPool, ThreadPoolError> {
         let mut builder = rayon::ThreadPoolBuilder::new()
             .num_threads(config.crypto_threads)
             .stack_size(config.crypto_stack_size)
             .thread_name(|i| format!("crypto-{}", i));
 
-        // Core pinning for crypto threads
         if config.pin_cores {
             let start_core = config
                 .crypto_core_start
-                .unwrap_or(1 + config.consensus_crypto_threads); // Default: after consensus crypto
+                .unwrap_or(1 + config.consensus_crypto_threads);
             builder = builder.start_handler(move |i| {
                 let core_id = start_core + i;
                 if let Err(e) = pin_thread_to_core(core_id) {
@@ -545,19 +541,13 @@ impl ThreadPoolManager {
             .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
     }
 
-    /// Build the transaction validation pool (isolated from general crypto).
     fn build_tx_validation_pool(
         config: &ThreadPoolConfig,
     ) -> Result<rayon::ThreadPool, ThreadPoolError> {
-        let builder = rayon::ThreadPoolBuilder::new()
+        rayon::ThreadPoolBuilder::new()
             .num_threads(config.tx_validation_threads)
-            .stack_size(config.crypto_stack_size) // Same stack size as crypto
-            .thread_name(|i| format!("tx-val-{}", i));
-
-        // Note: No core pinning for tx validation - let OS schedule freely
-        // This pool handles bursty workloads and benefits from flexibility
-
-        builder
+            .stack_size(config.crypto_stack_size)
+            .thread_name(|i| format!("tx-val-{}", i))
             .build()
             .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
     }
@@ -570,11 +560,10 @@ impl ThreadPoolManager {
             .stack_size(config.execution_stack_size)
             .thread_name(|i| format!("exec-{}", i));
 
-        // Core pinning for execution threads
         if config.pin_cores {
             let start_core = config
                 .execution_core_start
-                .unwrap_or(1 + config.consensus_crypto_threads + config.crypto_threads); // Default: after both crypto pools
+                .unwrap_or(1 + config.consensus_crypto_threads + config.crypto_threads);
             builder = builder.start_handler(move |i| {
                 let core_id = start_core + i;
                 if let Err(e) = pin_thread_to_core(core_id) {
@@ -590,172 +579,45 @@ impl ThreadPoolManager {
             .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
     }
 
-    /// Build the codec pool (SBOR encoding/decoding).
     fn build_codec_pool(config: &ThreadPoolConfig) -> Result<rayon::ThreadPool, ThreadPoolError> {
-        let builder = rayon::ThreadPoolBuilder::new()
+        rayon::ThreadPoolBuilder::new()
             .num_threads(config.codec_threads)
-            .stack_size(config.crypto_stack_size) // Same stack size as crypto
-            .thread_name(|i| format!("codec-{}", i));
-
-        // Note: No core pinning for codec - let OS schedule freely
-        // This pool handles bursty workloads and benefits from flexibility
-
-        builder
+            .stack_size(config.crypto_stack_size)
+            .thread_name(|i| format!("codec-{}", i))
             .build()
             .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
     }
+}
 
-    /// Get a reference to the consensus crypto thread pool.
-    pub fn consensus_crypto_pool(&self) -> &rayon::ThreadPool {
-        &self.consensus_crypto_pool
-    }
-
-    /// Get a reference to the general crypto thread pool.
-    pub fn crypto_pool(&self) -> &rayon::ThreadPool {
-        &self.crypto_pool
-    }
-
-    /// Get a reference to the transaction validation thread pool.
-    pub fn tx_validation_pool(&self) -> &rayon::ThreadPool {
-        &self.tx_validation_pool
-    }
-
-    /// Get a reference to the execution thread pool.
-    pub fn execution_pool(&self) -> &rayon::ThreadPool {
-        &self.execution_pool
-    }
-
-    /// Get a reference to the codec thread pool.
-    pub fn codec_pool(&self) -> &rayon::ThreadPool {
-        &self.codec_pool
-    }
-
-    /// Get the configuration.
-    pub fn config(&self) -> &ThreadPoolConfig {
-        &self.config
-    }
-
-    /// Get the number of I/O threads (for tokio runtime configuration).
-    pub fn io_threads(&self) -> usize {
-        self.config.io_threads
-    }
-
-    /// Build a tokio runtime with the configured I/O threads.
-    ///
-    /// Note: The caller is responsible for entering and running this runtime.
-    pub fn build_tokio_runtime(&self) -> Result<tokio::runtime::Runtime, ThreadPoolError> {
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder.worker_threads(self.config.io_threads);
-        builder.thread_name("io");
-        builder.enable_all();
-
-        // Core pinning for I/O threads would require custom thread spawning
-        // which tokio doesn't directly support. We log a warning if requested.
-        if self.config.pin_cores && self.config.io_core_start.is_some() {
-            tracing::warn!(
-                "Core pinning for tokio I/O threads is not directly supported. \
-                 Consider using tokio-core-affinity crate for this feature."
-            );
-        }
-
-        builder
-            .build()
-            .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
-    }
-
-    /// Spawn a consensus-critical crypto task on the dedicated consensus crypto pool.
-    ///
-    /// Use this for block vote and QC signature verification - these are liveness-critical
-    /// and must not be blocked by general crypto work (provisions, state votes).
-    ///
-    /// Returns immediately; the task runs asynchronously.
-    /// Queue depth is tracked for metrics.
-    #[instrument(level = "debug", skip_all, fields(
-        queue_depth = self.consensus_crypto_pending.load(Ordering::Relaxed),
-    ))]
-    pub fn spawn_consensus_crypto<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
+impl Dispatch for PooledDispatch {
+    #[instrument(level = "debug", skip_all)]
+    fn spawn_consensus_crypto(&self, f: impl FnOnce() + Send + 'static) {
         self.consensus_crypto_pending
             .fetch_add(1, Ordering::Relaxed);
         let pending = self.consensus_crypto_pending.clone();
+        let pool = Arc::clone(&self.consensus_crypto_pool);
         self.consensus_crypto_pool.spawn(move || {
-            f();
+            pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
         });
     }
 
-    /// Spawn a general crypto verification task on the crypto pool.
-    ///
-    /// Use this for provisions and state votes - these are not consensus-critical
-    /// and can queue without affecting liveness.
-    ///
-    /// Note: Transaction validation should use `spawn_tx_validation` instead.
-    ///
-    /// Returns immediately; the task runs asynchronously.
-    /// Queue depth is tracked for metrics.
-    pub fn spawn_crypto<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
+    fn spawn_crypto(&self, f: impl FnOnce() + Send + 'static) {
         self.crypto_pending.fetch_add(1, Ordering::Relaxed);
         let pending = self.crypto_pending.clone();
+        let pool = Arc::clone(&self.crypto_pool);
         self.crypto_pool.spawn(move || {
-            f();
+            pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
         });
     }
 
-    /// Spawn a transaction validation task on the dedicated tx validation pool.
-    ///
-    /// Use this for transaction signature verification. This pool is isolated from
-    /// the general crypto pool to prevent transaction floods from blocking
-    /// provision/state vote verification which are needed for execution progress.
-    ///
-    /// Returns immediately; the task runs asynchronously.
-    /// Queue depth is tracked for metrics.
-    pub fn spawn_tx_validation<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        self.tx_validation_pending.fetch_add(1, Ordering::Relaxed);
-        let pending = self.tx_validation_pending.clone();
-        self.tx_validation_pool.spawn(move || {
-            f();
-            pending.fetch_sub(1, Ordering::Relaxed);
-        });
-    }
-
-    /// Spawn a crypto task with backpressure-based throttling (non-blocking).
-    ///
-    /// When the crypto queue is deep, this returns `false` to signal backpressure
-    /// to the caller. The caller can then decide to retry later or handle the
-    /// backpressure appropriately.
-    ///
-    /// **IMPORTANT**: This method is non-blocking. Previous versions used
-    /// `std::thread::sleep()` which blocked the event loop thread. This version
-    /// returns immediately with a backpressure signal instead.
-    ///
-    /// Use this for non-critical crypto work like provision verification where
-    /// slight delays are acceptable to maintain system stability.
-    ///
-    /// Returns:
-    /// - `true` if the task was spawned
-    /// - `false` if backpressure is active (queue depth > threshold)
-    ///
-    /// Backpressure threshold: queue depth > 100 (half of previous max)
-    pub fn try_spawn_crypto<F>(&self, f: F) -> bool
-    where
-        F: FnOnce() + Send + 'static,
-    {
+    fn try_spawn_crypto(&self, f: impl FnOnce() + Send + 'static) -> bool {
         let depth = self.crypto_pending.load(Ordering::Relaxed);
 
-        // Backpressure threshold - reject if queue is too deep
         const BACKPRESSURE_THRESHOLD: usize = 100;
 
         if depth > BACKPRESSURE_THRESHOLD {
-            // Signal backpressure - caller should retry later
             return false;
         }
 
@@ -763,103 +625,59 @@ impl ThreadPoolManager {
         true
     }
 
-    /// Spawn a crypto task, always succeeds (no backpressure).
-    ///
-    /// Use `try_spawn_crypto` for non-critical work that can tolerate backpressure.
-    /// Use this method only when the task MUST be spawned regardless of queue depth.
-    ///
-    /// **Deprecated**: Use `try_spawn_crypto` for new code to enable backpressure.
-    #[deprecated(note = "Use try_spawn_crypto for backpressure support")]
-    pub fn spawn_crypto_throttled<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
-        // For backwards compatibility, always spawn (no blocking)
-        // New code should use try_spawn_crypto and handle backpressure
-        self.spawn_crypto(f);
+    fn spawn_tx_validation(&self, f: impl FnOnce() + Send + 'static) {
+        self.tx_validation_pending.fetch_add(1, Ordering::Relaxed);
+        let pending = self.tx_validation_pending.clone();
+        let pool = Arc::clone(&self.tx_validation_pool);
+        self.tx_validation_pool.spawn(move || {
+            pool.install(f);
+            pending.fetch_sub(1, Ordering::Relaxed);
+        });
     }
 
-    /// Spawn an execution task on the execution pool.
-    ///
-    /// Returns immediately; the task runs asynchronously.
-    /// Queue depth is tracked for metrics.
-    #[instrument(level = "debug", skip_all, fields(
-        queue_depth = self.execution_pending.load(Ordering::Relaxed),
-    ))]
-    pub fn spawn_execution<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
+    #[instrument(level = "debug", skip_all)]
+    fn spawn_execution(&self, f: impl FnOnce() + Send + 'static) {
         self.execution_pending.fetch_add(1, Ordering::Relaxed);
         let pending = self.execution_pending.clone();
+        let pool = Arc::clone(&self.execution_pool);
         self.execution_pool.spawn(move || {
-            f();
+            pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
         });
     }
 
-    /// Spawn a codec task on the codec pool.
-    ///
-    /// Use this for SBOR encoding/decoding operations. This pool is isolated from
-    /// the network event loop to prevent large message serialization from blocking
-    /// network processing.
-    ///
-    /// Returns immediately; the task runs asynchronously.
-    /// Queue depth is tracked for metrics.
-    pub fn spawn_codec<F>(&self, f: F)
-    where
-        F: FnOnce() + Send + 'static,
-    {
+    fn spawn_codec(&self, f: impl FnOnce() + Send + 'static) {
         self.codec_pending.fetch_add(1, Ordering::Relaxed);
         let pending = self.codec_pending.clone();
+        let pool = Arc::clone(&self.codec_pool);
         self.codec_pool.spawn(move || {
-            f();
+            pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
         });
     }
 
-    /// Get current consensus crypto pool queue depth (for metrics).
-    pub fn consensus_crypto_queue_depth(&self) -> usize {
+    fn consensus_crypto_queue_depth(&self) -> usize {
         self.consensus_crypto_pending.load(Ordering::Relaxed)
     }
 
-    /// Get current general crypto pool queue depth (for metrics).
-    pub fn crypto_queue_depth(&self) -> usize {
+    fn crypto_queue_depth(&self) -> usize {
         self.crypto_pending.load(Ordering::Relaxed)
     }
 
-    /// Get current tx validation pool queue depth (for metrics).
-    pub fn tx_validation_queue_depth(&self) -> usize {
+    fn tx_validation_queue_depth(&self) -> usize {
         self.tx_validation_pending.load(Ordering::Relaxed)
     }
 
-    /// Get current codec pool queue depth (for metrics).
-    pub fn codec_queue_depth(&self) -> usize {
-        self.codec_pending.load(Ordering::Relaxed)
-    }
-
-    /// Get current execution pool queue depth (for metrics).
-    pub fn execution_queue_depth(&self) -> usize {
+    fn execution_queue_depth(&self) -> usize {
         self.execution_pending.load(Ordering::Relaxed)
     }
 
-    /// Install the crypto pool as the global rayon pool.
-    ///
-    /// This affects all uses of `rayon::spawn()` globally.
-    /// Generally not recommended - prefer using explicit pool references.
-    pub fn install_crypto_as_global(self) -> Arc<Self> {
-        // Note: rayon's global pool can only be set once, so this is a one-way operation
-        tracing::warn!(
-            "Installing crypto pool as global rayon pool. \
-             This affects all rayon::spawn() calls globally."
-        );
-        Arc::new(self)
+    fn codec_queue_depth(&self) -> usize {
+        self.codec_pending.load(Ordering::Relaxed)
     }
 }
 
 /// Pin the current thread to a specific CPU core.
-///
-/// This is platform-specific and may not be available on all systems.
 #[cfg(target_os = "linux")]
 fn pin_thread_to_core(core_id: usize) -> Result<(), ThreadPoolError> {
     use std::mem;
@@ -884,15 +702,10 @@ fn pin_thread_to_core(core_id: usize) -> Result<(), ThreadPoolError> {
 
 #[cfg(target_os = "macos")]
 fn pin_thread_to_core(core_id: usize) -> Result<(), ThreadPoolError> {
-    // macOS doesn't support strict CPU pinning like Linux.
-    // We can use thread_policy_set with THREAD_AFFINITY_POLICY as a hint,
-    // but it's not guaranteed to be respected.
     tracing::debug!(
         core = core_id,
         "Core pinning on macOS is best-effort (using affinity hints)"
     );
-
-    // For now, just log and succeed - the OS will schedule as it sees fit
     Ok(())
 }
 
@@ -923,7 +736,7 @@ mod tests {
 
     #[test]
     fn test_for_core_count() {
-        // 6 cores: remaining = max(6-3, 6) = 6, so minimum viable mode
+        // 6 cores: pool_budget = max(6-3, 6) = 6, so minimum viable mode
         // 2 consensus_crypto + 1 each for other pools
         let config = ThreadPoolConfig::for_core_count(6);
         assert_eq!(config.consensus_crypto_threads, 2);
@@ -933,7 +746,7 @@ mod tests {
         assert_eq!(config.codec_threads, 1);
         assert_eq!(config.io_threads, 1);
 
-        // 12 cores: remaining = 12 - 3 = 9 (percentage mode)
+        // 12 cores: pool_budget = 12 - 3 = 9 (percentage mode)
         // crypto 35% = 3, execution 25% = 2, tx_validation 15% = 1, io 15% = 1, codec = remainder = 2
         let config = ThreadPoolConfig::for_core_count(12);
         assert_eq!(config.consensus_crypto_threads, 2);
@@ -943,7 +756,7 @@ mod tests {
         assert_eq!(config.io_threads, 1);
         assert_eq!(config.codec_threads, 2);
 
-        // 18 cores: remaining = 18 - 3 = 15 (percentage mode)
+        // 18 cores: pool_budget = 18 - 3 = 15 (percentage mode)
         // crypto 35% = 5, execution 25% = 3, tx_validation 15% = 2, io 15% = 2, codec = remainder = 3
         let config = ThreadPoolConfig::for_core_count(18);
         assert_eq!(config.consensus_crypto_threads, 2);
@@ -953,7 +766,7 @@ mod tests {
         assert_eq!(config.io_threads, 2);
         assert_eq!(config.codec_threads, 3);
 
-        // 32 cores: remaining = 32 - 3 = 29 (percentage mode)
+        // 32 cores: pool_budget = 32 - 3 = 29 (percentage mode)
         // crypto 35% = 10, execution 25% = 7, tx_validation 15% = 4, io 15% = 4, codec = remainder = 4
         let config = ThreadPoolConfig::for_core_count(32);
         assert_eq!(config.consensus_crypto_threads, 2);
@@ -997,16 +810,18 @@ mod tests {
             .execution_threads(4)
             .io_threads(2)
             .state_machine_core(0)
-            .crypto_core_start(1)
-            .execution_core_start(3)
-            .io_core_start(7)
+            .consensus_crypto_core_start(1)
+            .crypto_core_start(3)
+            .execution_core_start(5)
+            .io_core_start(9)
             .build_unchecked();
 
         assert!(config.pin_cores);
         assert_eq!(config.state_machine_core, Some(0));
-        assert_eq!(config.crypto_core_start, Some(1));
-        assert_eq!(config.execution_core_start, Some(3));
-        assert_eq!(config.io_core_start, Some(7));
+        assert_eq!(config.consensus_crypto_core_start, Some(1));
+        assert_eq!(config.crypto_core_start, Some(3));
+        assert_eq!(config.execution_core_start, Some(5));
+        assert_eq!(config.io_core_start, Some(9));
     }
 
     #[test]
@@ -1022,15 +837,14 @@ mod tests {
     }
 
     #[test]
-    fn test_thread_pool_manager_creation() {
+    fn test_pooled_dispatch_creation() {
         let config = ThreadPoolConfig::minimal();
-        let manager = ThreadPoolManager::new(config).unwrap();
+        let dispatch = PooledDispatch::new(config).unwrap();
 
-        assert_eq!(manager.config().consensus_crypto_threads, 1);
-        assert_eq!(manager.config().crypto_threads, 1);
-        assert_eq!(manager.config().execution_threads, 1);
-        assert_eq!(manager.config().codec_threads, 1);
-        assert_eq!(manager.io_threads(), 1);
+        assert_eq!(dispatch.config().consensus_crypto_threads, 1);
+        assert_eq!(dispatch.config().crypto_threads, 1);
+        assert_eq!(dispatch.config().execution_threads, 1);
+        assert_eq!(dispatch.config().codec_threads, 1);
     }
 
     #[test]
@@ -1038,7 +852,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let config = ThreadPoolConfig::minimal();
-        let manager = ThreadPoolManager::new(config).unwrap();
+        let dispatch = PooledDispatch::new(config).unwrap();
 
         let consensus_crypto_counter = Arc::new(AtomicUsize::new(0));
         let crypto_counter = Arc::new(AtomicUsize::new(0));
@@ -1046,33 +860,28 @@ mod tests {
         let exec_counter = Arc::new(AtomicUsize::new(0));
         let codec_counter = Arc::new(AtomicUsize::new(0));
 
-        // Spawn on consensus crypto pool
         let counter = consensus_crypto_counter.clone();
-        manager.spawn_consensus_crypto(move || {
+        dispatch.spawn_consensus_crypto(move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
-        // Spawn on general crypto pool
         let counter = crypto_counter.clone();
-        manager.spawn_crypto(move || {
+        dispatch.spawn_crypto(move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
-        // Spawn on tx validation pool
         let counter = tx_validation_counter.clone();
-        manager.spawn_tx_validation(move || {
+        dispatch.spawn_tx_validation(move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
-        // Spawn on execution pool
         let counter = exec_counter.clone();
-        manager.spawn_execution(move || {
+        dispatch.spawn_execution(move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
-        // Spawn on codec pool
         let counter = codec_counter.clone();
-        manager.spawn_codec(move || {
+        dispatch.spawn_codec(move || {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 

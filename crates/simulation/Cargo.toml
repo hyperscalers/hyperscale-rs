@@ -16,6 +16,10 @@ hyperscale-storage.workspace = true
 hyperscale-storage-memory.workspace = true
 hyperscale-types.workspace = true
 
+# Dispatch (for future runner unification)
+hyperscale-dispatch.workspace = true
+hyperscale-dispatch-sync.workspace = true
+
 # Radix dependencies for real execution
 radix-common.workspace = true
 
