@@ -388,7 +388,15 @@ pub enum Action {
     // External Notifications
     // ═══════════════════════════════════════════════════════════════════════
     /// Emit a committed block for external observers.
-    EmitCommittedBlock { block: Block },
+    ///
+    /// Carries the certifying QC so the runner can persist committed metadata
+    /// (`set_committed_state`) after JMT state has been applied, not at
+    /// certification time.
+    EmitCommittedBlock {
+        block: Block,
+        /// The QC that certified this block.
+        qc: QuorumCertificate,
+    },
 
     /// Emit transaction status update for RPC status cache.
     ///
@@ -421,15 +429,15 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Storage: Consensus
     // ═══════════════════════════════════════════════════════════════════════
-    /// Persist a committed block to storage.
+    /// Persist a certified block to storage for sync availability.
     ///
-    /// This stores the block itself and updates chain metadata:
-    /// - Block bytes at `block:{height}`
-    /// - Latest committed height
-    /// - Latest block hash
+    /// This stores the block data only — it does NOT update committed metadata.
+    /// Committed metadata (`set_committed_state`) is persisted by the runner
+    /// after JMT state has been applied, to prevent committed_height from
+    /// getting ahead of actual JMT state on crash recovery.
     PersistBlock {
         block: Block,
-        /// The QC that certified this block (stored for recovery).
+        /// The QC that certified this block (stored alongside block data).
         qc: QuorumCertificate,
     },
 

@@ -1188,7 +1188,7 @@ impl SimNode {
                     .push_back(Event::ChainMetadataFetched { height, hash, qc });
             }
 
-            Action::EmitCommittedBlock { block } => {
+            Action::EmitCommittedBlock { block, qc: _ } => {
                 let local_shard = self.state.shard();
                 let block_hash = block.hash();
 

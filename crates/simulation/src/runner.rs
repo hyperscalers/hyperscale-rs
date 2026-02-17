@@ -1788,33 +1788,45 @@ impl SimulationRunner {
             }
 
             // Notifications - these would go to external observers
-            Action::EmitCommittedBlock { block } => {
+            Action::EmitCommittedBlock { block, qc } => {
                 debug!(block_hash = ?block.hash(), "Block committed");
 
-                // Commit state writes for all certificates in this block.
-                // Use prepared handle (fast path) if available from verification/proposal.
                 let storage = &self.node_storage[from as usize];
-                let local_shard = self.nodes[from as usize].shard();
                 let block_hash = block.hash();
+                let height = block.header.height;
 
-                let prepared = self.prepared_commits.remove(&(from, block_hash));
-                let result = if let Some(prepared) = prepared {
-                    storage.commit_prepared_block(prepared)
+                if !block.certificates.is_empty() {
+                    // Commit state writes for all certificates in this block.
+                    // Use prepared handle (fast path) if available from verification/proposal.
+                    let local_shard = self.nodes[from as usize].shard();
+
+                    let prepared = self.prepared_commits.remove(&(from, block_hash));
+                    let result = if let Some(prepared) = prepared {
+                        storage.commit_prepared_block(prepared)
+                    } else {
+                        storage.commit_block(&block.certificates, local_shard)
+                    };
+
+                    // Persist committed metadata AFTER state is applied.
+                    ConsensusStore::set_committed_state(storage, height, block_hash, &qc);
+                    ConsensusStore::prune_own_votes(storage, height.0);
+
+                    // Send StateCommitComplete so state machine knows JMT is up to date.
+                    // In simulation this is synchronous, but we still need the event for tracking.
+                    self.schedule_event(
+                        from,
+                        self.now,
+                        Event::StateCommitComplete {
+                            height: height.0,
+                            state_version: result.state_version,
+                            state_root: result.state_root,
+                        },
+                    );
                 } else {
-                    storage.commit_block(&block.certificates, local_shard)
-                };
-
-                // Send StateCommitComplete so state machine knows JMT is up to date.
-                // In simulation this is synchronous, but we still need the event for tracking.
-                self.schedule_event(
-                    from,
-                    self.now,
-                    Event::StateCommitComplete {
-                        height: block.header.height.0,
-                        state_version: result.state_version,
-                        state_root: result.state_root,
-                    },
-                );
+                    // Empty block - no state changes, but still update committed metadata.
+                    ConsensusStore::set_committed_state(storage, height, block_hash, &qc);
+                    ConsensusStore::prune_own_votes(storage, height.0);
+                }
             }
 
             Action::EmitTransactionStatus {
@@ -1827,17 +1839,13 @@ impl SimulationRunner {
 
             // Storage writes - store in SimStorage
             Action::PersistBlock { block, qc } => {
-                // Store block and QC in this node's storage
+                // Store block and QC in this node's storage for sync availability.
+                // NOTE: Committed metadata (set_committed_state, prune_own_votes) is NOT
+                // set here. PersistBlock fires at certification time, not commit time.
+                // Committed metadata is set in EmitCommittedBlock after state is applied.
                 let height = block.header.height;
-                let block_hash = block.hash();
                 let storage = &self.node_storage[from as usize];
                 ConsensusStore::put_block(storage, height, &block, &qc);
-                // Update committed state if this is the highest
-                if height > ConsensusStore::committed_height(storage) {
-                    ConsensusStore::set_committed_state(storage, height, block_hash, &qc);
-                }
-                // Prune old votes - we no longer need votes at or below committed height
-                ConsensusStore::prune_own_votes(storage, height.0);
 
                 // If this node is syncing, try to fetch more blocks that may now be available.
                 // This handles the case where sync was triggered before all target blocks

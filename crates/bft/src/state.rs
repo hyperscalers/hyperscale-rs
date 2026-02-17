@@ -3809,13 +3809,21 @@ impl BftState {
         let mut current_hash = block_hash;
 
         loop {
-            // Get the block to commit
-            let block = if let Some(pending) = self.pending_blocks.get(&current_hash) {
-                pending.block().map(|b| (*b).clone())
-            } else if let Some((block, _)) = self.certified_blocks.get(&current_hash) {
-                Some(block.clone())
+            // Get the block and its certifying QC.
+            // Check certified_blocks first since committed blocks should always
+            // have a QC (they were certified before commit in the two-chain rule).
+            let (block, qc) = if let Some((block, qc)) = self.certified_blocks.get(&current_hash) {
+                (Some(block.clone()), Some(qc.clone()))
+            } else if let Some(pending) = self.pending_blocks.get(&current_hash) {
+                // Fallback: block in pending_blocks but not certified_blocks.
+                // This shouldn't happen for committed blocks but handle gracefully.
+                warn!(
+                    block_hash = ?current_hash,
+                    "Committed block not found in certified_blocks - QC unavailable"
+                );
+                (pending.block().map(|b| (*b).clone()), None)
             } else {
-                None
+                (None, None)
             };
 
             let Some(block) = block else {
@@ -3874,6 +3882,7 @@ impl BftState {
 
             actions.push(Action::EmitCommittedBlock {
                 block: block.clone(),
+                qc: qc.unwrap_or_else(QuorumCertificate::genesis),
             });
             actions.push(Action::EnqueueInternal {
                 event: Event::BlockCommitted {
@@ -4163,10 +4172,11 @@ impl BftState {
         let mut actions = vec![
             Action::PersistBlock {
                 block: block.clone(),
-                qc,
+                qc: qc.clone(),
             },
             Action::EmitCommittedBlock {
                 block: block.clone(),
+                qc,
             },
             Action::EnqueueInternal {
                 event: Event::BlockCommitted {

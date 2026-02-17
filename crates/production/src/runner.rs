@@ -360,6 +360,10 @@ struct BlockCommitRequest {
     block: Block,
     /// Block height for logging.
     height: u64,
+    /// Block hash for committed metadata persistence.
+    block_hash: Hash,
+    /// The QC that certified this block (for committed metadata persistence).
+    qc: QuorumCertificate,
     /// Precomputed commit work from `prepare_block_commit`, if available.
     /// `Some` → fast path (apply cached WriteBatch + JMT snapshot).
     /// `None` → slow path (recompute per-certificate).
@@ -405,6 +409,8 @@ fn spawn_block_commit_task(
             let BlockCommitRequest {
                 block,
                 height,
+                block_hash,
+                qc,
                 prepared,
             } = request;
 
@@ -420,21 +426,27 @@ fn spawn_block_commit_task(
             let cert_count = block.certificates.len();
             let _ = tokio::task::spawn_blocking(move || {
                 // Use prepared handle (fast path) if available, otherwise recompute.
+                let fast_path = prepared.is_some();
                 let result = if let Some(prepared) = prepared {
-                    tracing::info!(
-                        block_height = height,
-                        certs = cert_count,
-                        "Committing block (fast path)"
-                    );
                     storage.commit_prepared_block(prepared)
                 } else {
-                    tracing::info!(
-                        block_height = height,
-                        certs = cert_count,
-                        "Committing block (slow path)"
-                    );
                     storage.commit_block(&block.certificates, local_shard)
                 };
+
+                // Persist committed metadata AFTER JMT state is confirmed applied.
+                // This guarantees that on recovery, committed_height never exceeds
+                // the actual JMT state, preventing state root divergence.
+                storage.set_committed_state(BlockHeight(height), block_hash, &qc);
+                storage.prune_own_votes(height);
+
+                tracing::info!(
+                    block_height = height,
+                    certs = cert_count,
+                    fast_path,
+                    state_version = result.state_version,
+                    state_root = ?result.state_root,
+                    "Block commit completed"
+                );
 
                 // Update RPC status with new JMT state version and root hash
                 if let Some(rpc_status) = rpc_status {
@@ -3178,7 +3190,7 @@ impl ProductionRunner {
                 }
             }
 
-            Action::EmitCommittedBlock { block } => {
+            Action::EmitCommittedBlock { block, qc } => {
                 let height = block.header.height.0;
                 let current_view = self.state.bft().view();
                 tracing::info!(
@@ -3250,14 +3262,17 @@ impl ProductionRunner {
                 // the commit task applies it directly (fast path). Otherwise it falls back
                 // to per-certificate commits (slow path).
                 //
-                // After commit completes, StateCommitComplete is sent so the state machine
-                // knows it's safe to compute speculative roots for the next proposal.
+                // After commit completes, the commit task persists committed metadata
+                // (set_committed_state, prune_own_votes) guaranteeing that on recovery
+                // committed_height never exceeds the actual JMT state.
                 if !block.certificates.is_empty() {
                     let block_hash = block.hash();
                     let prepared = self.prepared_commits.lock().unwrap().remove(&block_hash);
                     let request = BlockCommitRequest {
                         block: block.clone(),
                         height,
+                        block_hash,
+                        qc,
                         prepared,
                     };
 
@@ -3271,6 +3286,15 @@ impl ProductionRunner {
                             "Failed to send block commit request - commit channel full or closed"
                         );
                     }
+                } else {
+                    // Empty block (no certificates) - no state changes to apply,
+                    // but still update committed metadata so recovery knows this height.
+                    let storage = self.storage.clone();
+                    let block_hash = block.hash();
+                    tokio::task::spawn_blocking(move || {
+                        storage.set_committed_state(BlockHeight(height), block_hash, &qc);
+                        storage.prune_own_votes(height);
+                    });
                 }
             }
 
@@ -3288,14 +3312,15 @@ impl ProductionRunner {
                 // NOTE: State writes are NOT applied here. This action is emitted when
                 // a block is certified (has QC), but state should only be applied when
                 // the block commits. State application happens in EmitCommittedBlock.
+                //
+                // NOTE: Committed metadata (set_committed_state, prune_own_votes) is NOT
+                // set here. PersistBlock fires at certification time, not commit time.
+                // Committed metadata is set after JMT state is applied in the commit task
+                // (or directly for empty blocks) to prevent state divergence on recovery.
                 let storage = self.storage.clone();
                 let height = block.height();
-                let block_hash = block.hash();
                 tokio::task::spawn_blocking(move || {
                     storage.put_block(height, &block, &qc);
-                    storage.set_committed_state(height, block_hash, &qc);
-                    // Prune old votes - we no longer need votes at or below committed height
-                    storage.prune_own_votes(height.0);
                 });
             }
 

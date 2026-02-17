@@ -1797,6 +1797,27 @@ impl RocksDbStorage {
         let jmt_root = self.state_root_hash();
         let jmt_state = Some((jmt_version, jmt_root));
 
+        // Recovery invariant: committed_height must not exceed the JMT state.
+        // If committed_height is ahead of JMT, a previous run persisted committed
+        // metadata before the JMT commit completed (the bug fixed by moving
+        // set_committed_state to after JMT commit). Detect and warn so operators
+        // can investigate.
+        if committed_height.0 > 0 {
+            if let Some((block, _qc)) = self.get_block_denormalized(committed_height) {
+                let expected_version = block.header.state_version;
+                if jmt_version < expected_version {
+                    tracing::error!(
+                        committed_height = committed_height.0,
+                        expected_jmt_version = expected_version,
+                        actual_jmt_version = jmt_version,
+                        "RECOVERY: committed_height ahead of JMT state — \
+                         this node may have been affected by the premature \
+                         set_committed_state bug. Manual intervention required."
+                    );
+                }
+            }
+        }
+
         let elapsed = start.elapsed().as_secs_f64();
         metrics::record_storage_operation("load_recovered_state", elapsed);
 
