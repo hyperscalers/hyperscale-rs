@@ -7,6 +7,7 @@ description = "BFT consensus state machine"
 [dependencies]
 hyperscale-core.workspace = true
 hyperscale-messages.workspace = true
+hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
 
 indexmap.workspace = true

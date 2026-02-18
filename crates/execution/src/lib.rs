@@ -8,6 +8,8 @@
 //! - State provisioning
 //! - Vote aggregation and certificate formation
 
+pub mod handlers;
+
 mod pending;
 mod state;
 mod trackers;

@@ -60,6 +60,8 @@
 //! - [`ProvisionCoordinator`] - Main sub-state machine
 //! - [`TxRegistration`] - Registration info for cross-shard transactions
 
+pub mod handlers;
+
 mod state;
 
 pub use state::{ProvisionCoordinator, TxRegistration};

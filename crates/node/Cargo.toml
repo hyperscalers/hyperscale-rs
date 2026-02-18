@@ -7,11 +7,13 @@ description = "Combined node state machine"
 [dependencies]
 hyperscale-core.workspace = true
 hyperscale-bft.workspace = true
+hyperscale-engine.workspace = true
 hyperscale-execution.workspace = true
 hyperscale-livelock.workspace = true
 hyperscale-mempool.workspace = true
 hyperscale-messages.workspace = true
 hyperscale-provisions.workspace = true
+hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

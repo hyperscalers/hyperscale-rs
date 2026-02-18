@@ -26,11 +26,10 @@ use quick_cache::sync::Cache as QuickCache;
 use hyperscale_core::{Action, Event, OutboundMessage, StateMachine};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
-    batch_verify_bls_different_messages, batch_verify_bls_same_message, verify_bls12381_v1,
-    zero_bls_signature, Block, BlockHeader, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    Bls12381G2Signature, CommitmentProof, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, SignerBitfield, StateVoteBlock, Topology, TransactionCertificate, ValidatorId,
-    VotePower,
+    batch_verify_bls_different_messages, zero_bls_signature, Block, BlockHeader,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Hash, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, StateVoteBlock, Topology, TransactionCertificate,
+    ValidatorId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -2155,136 +2154,33 @@ impl ProductionRunner {
                 total_voting_power,
             } => {
                 let event_tx = self.callback_tx.clone();
-                // QC building is liveness-critical - use dedicated consensus crypto pool
                 self.dispatch.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
-
-                    // Start with already-verified votes (e.g., our own vote)
-                    let mut all_verified: Vec<(usize, BlockVote, u64)> = already_verified;
-                    let mut all_signatures: Vec<Bls12381G2Signature> = all_verified
-                        .iter()
-                        .map(|(_, v, _)| v.signature)
-                        .collect();
-
-                    // Extract signatures and public keys from votes to verify
-                    let signatures: Vec<Bls12381G2Signature> =
-                        votes_to_verify.iter().map(|(_, v, _, _)| v.signature).collect();
-                    let public_keys: Vec<Bls12381G1PublicKey> =
-                        votes_to_verify.iter().map(|(_, _, pk, _)| *pk).collect();
-
-                    // Batch verify all new signatures (same message optimization)
-                    let batch_valid = if votes_to_verify.is_empty() {
-                        true
-                    } else {
-                        batch_verify_bls_same_message(
-                            &signing_message,
-                            &signatures,
-                            &public_keys,
-                        )
-                    };
-
-                    if batch_valid {
-                        // Happy path: all new signatures valid, add them to verified set
-                        for (idx, vote, _, power) in votes_to_verify {
-                            all_signatures.push(vote.signature);
-                            all_verified.push((idx, vote, power));
-                        }
-                    } else {
-                        // Some signatures invalid - verify individually to find valid ones
-                        tracing::warn!(
-                            block_hash = ?block_hash,
-                            vote_count = votes_to_verify.len(),
-                            "Batch vote verification failed, falling back to individual verification"
-                        );
-
-                        for (idx, vote, pk, power) in &votes_to_verify {
-                            if verify_bls12381_v1(&signing_message, pk, &vote.signature) {
-                                all_signatures.push(vote.signature);
-                                all_verified.push((*idx, vote.clone(), *power));
-                            } else {
-                                metrics::record_signature_verification_failure();
-                                tracing::warn!(
-                                    voter = ?vote.voter,
-                                    block_hash = ?block_hash,
-                                    "Invalid vote signature detected"
-                                );
-                            }
-                        }
-                    }
-
-                    let verified_power: u64 = all_verified.iter().map(|(_, _, power)| power).sum();
-
-                    // Check if we have quorum with all verified votes
-                    if VotePower::has_quorum(verified_power, total_voting_power) && !all_signatures.is_empty() {
-                        // Build QC - aggregate signatures
-                        let qc = match Bls12381G2Signature::aggregate(&all_signatures, true) {
-                            Ok(aggregated_signature) => {
-                                // Sort votes by committee index for deterministic bitfield
-                                let mut sorted_votes = all_verified.clone();
-                                sorted_votes.sort_by_key(|(idx, _, _)| *idx);
-
-                                // Build signers bitfield and calculate weighted timestamp
-                                let max_idx = sorted_votes.iter().map(|(idx, _, _)| *idx).max().unwrap_or(0);
-                                let mut signers = SignerBitfield::new(max_idx + 1);
-                                let mut timestamp_weight_sum: u128 = 0;
-
-                                for (idx, vote, power) in &sorted_votes {
-                                    signers.set(*idx);
-                                    timestamp_weight_sum += vote.timestamp as u128 * *power as u128;
-                                }
-
-                                let weighted_timestamp_ms = if verified_power == 0 {
-                                    0
-                                } else {
-                                    (timestamp_weight_sum / verified_power as u128) as u64
-                                };
-
-                                Some(QuorumCertificate {
-                                    block_hash,
-                                    height,
-                                    parent_block_hash,
-                                    round,
-                                    aggregated_signature,
-                                    signers,
-                                    voting_power: VotePower(verified_power),
-                                    weighted_timestamp_ms,
-                                })
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to aggregate BLS signatures for QC: {}", e);
-                                None
-                            }
-                        };
-
-                        metrics::record_signature_verification_latency(
-                            "qc_build",
-                            start.elapsed().as_secs_f64(),
-                        );
-
-                        // Determine verified_votes before moving qc
-                        let return_votes = if qc.is_none() { all_verified } else { vec![] };
-                        event_tx
-                            .send(Event::QuorumCertificateResult {
-                                block_hash,
-                                qc,
-                                verified_votes: return_votes,
-                            })
-                            .expect("callback channel closed");
-                    } else {
-                        // No quorum with valid votes - return verified votes for later
-                        metrics::record_signature_verification_latency(
-                            "vote_batch",
-                            start.elapsed().as_secs_f64(),
-                        );
-
-                        event_tx
-                            .send(Event::QuorumCertificateResult {
-                                block_hash,
-                                qc: None,
-                                verified_votes: all_verified,
-                            })
-                            .expect("callback channel closed");
-                    }
+                    let result = hyperscale_bft::handlers::verify_and_build_qc(
+                        block_hash,
+                        height,
+                        round,
+                        parent_block_hash,
+                        &signing_message,
+                        votes_to_verify,
+                        already_verified,
+                        total_voting_power,
+                    );
+                    metrics::record_signature_verification_latency(
+                        if result.qc.is_some() {
+                            "qc_build"
+                        } else {
+                            "vote_batch"
+                        },
+                        start.elapsed().as_secs_f64(),
+                    );
+                    event_tx
+                        .send(Event::QuorumCertificateResult {
+                            block_hash: result.block_hash,
+                            qc: result.qc,
+                            verified_votes: result.verified_votes,
+                        })
+                        .expect("callback channel closed");
                 });
             }
 
@@ -2302,125 +2198,27 @@ impl ProductionRunner {
                 let topology = self.topology.clone();
                 self.dispatch.spawn_crypto(move || {
                     let start = std::time::Instant::now();
-
-                    // All provisions for the same (tx, source_shard) sign the SAME message.
-                    // This enables an optimized verification path:
-                    // 1. Aggregate all signatures into one
-                    // 2. Aggregate all public keys into one
-                    // 3. Single pairing check: e(agg_sig, G2) == e(agg_pk, H(msg))
-                    //
-                    // This is O(1) pairings instead of O(N), a massive speedup.
-                    // We only fall back to individual verification if the aggregate fails
-                    // (indicating a Byzantine validator submitted a bad signature).
-
-                    let signatures: Vec<Bls12381G2Signature> =
-                        provisions.iter().map(|p| p.signature).collect();
-
-                    // Happy path: try aggregate verification first (single pairing)
-                    let message = provisions
-                        .first()
-                        .map(|p| p.signing_message())
-                        .unwrap_or_default();
-
-                    let all_valid =
-                        batch_verify_bls_same_message(&message, &signatures, &public_keys);
-
-                    let (verified_provisions, commitment_proof) = if all_valid {
-                        // Fast path: all signatures valid, build proof directly
-                        let mut signers = SignerBitfield::new(committee_size);
-                        for provision in &provisions {
-                            if let Some(idx) = topology
-                                .committee_index_for_shard(source_shard, provision.validator_id)
-                            {
-                                signers.set(idx);
-                            }
-                        }
-
-                        let aggregated_signature =
-                            Bls12381G2Signature::aggregate(&signatures, true)
-                                .unwrap_or_else(|_| zero_bls_signature());
-
-                        let proof = CommitmentProof::new(
-                            tx_hash,
-                            source_shard,
-                            signers,
-                            aggregated_signature,
-                            block_height,
-                            block_timestamp,
-                            entries,
-                        );
-
-                        (provisions.clone(), Some(proof))
-                    } else {
-                        // Slow path: aggregate verification failed, find valid signatures
-                        // This only happens with Byzantine behavior (rare)
-                        tracing::warn!(
-                            tx_hash = %tx_hash,
-                            source_shard = source_shard.0,
-                            provision_count = provisions.len(),
-                            "Aggregate provision verification failed, falling back to individual"
-                        );
-
-                        let mut verified = Vec::new();
-                        let mut valid_sigs = Vec::new();
-                        let mut signer_indices = Vec::new();
-
-                        for (provision, pk) in provisions.iter().zip(public_keys.iter()) {
-                            if verify_bls12381_v1(&message, pk, &provision.signature) {
-                                verified.push(provision.clone());
-                                valid_sigs.push(provision.signature);
-                                if let Some(idx) = topology
-                                    .committee_index_for_shard(source_shard, provision.validator_id)
-                                {
-                                    signer_indices.push(idx);
-                                }
-                            } else {
-                                metrics::record_signature_verification_failure();
-                                tracing::warn!(
-                                    tx_hash = %tx_hash,
-                                    validator = provision.validator_id.0,
-                                    "Invalid provision signature"
-                                );
-                            }
-                        }
-
-                        let proof = if !valid_sigs.is_empty() {
-                            let mut signers = SignerBitfield::new(committee_size);
-                            for idx in &signer_indices {
-                                signers.set(*idx);
-                            }
-
-                            let aggregated_signature =
-                                Bls12381G2Signature::aggregate(&valid_sigs, true)
-                                    .unwrap_or_else(|_| zero_bls_signature());
-
-                            Some(CommitmentProof::new(
-                                tx_hash,
-                                source_shard,
-                                signers,
-                                aggregated_signature,
-                                block_height,
-                                block_timestamp,
-                                entries,
-                            ))
-                        } else {
-                            None
-                        };
-
-                        (verified, proof)
-                    };
-
+                    let result = hyperscale_provisions::handlers::verify_and_aggregate_provisions(
+                        tx_hash,
+                        source_shard,
+                        block_height,
+                        block_timestamp,
+                        entries,
+                        provisions,
+                        &public_keys,
+                        committee_size,
+                        topology.as_ref(),
+                    );
                     metrics::record_signature_verification_latency(
                         "provision_batch_verify_aggregate",
                         start.elapsed().as_secs_f64(),
                     );
-
                     event_tx
                         .send(Event::ProvisionsVerifiedAndAggregated {
                             tx_hash,
                             source_shard,
-                            verified_provisions,
-                            commitment_proof,
+                            verified_provisions: result.verified_provisions,
+                            commitment_proof: result.commitment_proof,
                         })
                         .expect(
                             "callback channel closed - Loss of this event would cause a deadlock",
@@ -2441,61 +2239,20 @@ impl ProductionRunner {
                 let topology = self.topology.clone();
                 self.dispatch.spawn_crypto(move || {
                     let start = std::time::Instant::now();
-
-                    // Deduplicate votes by validator to avoid aggregating the same signature multiple times
-                    let mut seen_validators = std::collections::HashSet::new();
-                    let unique_votes: Vec<_> = votes
-                        .iter()
-                        .filter(|vote| seen_validators.insert(vote.validator))
-                        .collect();
-
-                    // Aggregate BLS signatures from unique votes only
-                    let bls_signatures: Vec<Bls12381G2Signature> =
-                        unique_votes.iter().map(|vote| vote.signature).collect();
-
-                    let aggregated_signature = if !bls_signatures.is_empty() {
-                        Bls12381G2Signature::aggregate(&bls_signatures, true)
-                            .unwrap_or_else(|_| zero_bls_signature())
-                    } else {
-                        zero_bls_signature()
-                    };
-
-                    // Create signer bitfield
-                    // Use topology to get correct committee index for the shard.
-                    // Validator IDs are global but committee indices are per-shard.
-                    let mut signers = SignerBitfield::new(committee_size);
-
-                    for vote in &unique_votes {
-                        if let Some(idx) = topology.committee_index_for_shard(shard, vote.validator)
-                        {
-                            signers.set(idx);
-                        }
-                    }
-
-                    let success = votes.first().map(|v| v.success).unwrap_or(false);
-                    // All votes for the same tx should have identical state_writes
-                    let state_writes = votes
-                        .first()
-                        .map(|v| v.state_writes.clone())
-                        .unwrap_or_default();
-
-                    let certificate = hyperscale_types::StateCertificate {
-                        transaction_hash: tx_hash,
-                        shard_group_id: shard,
+                    let certificate = hyperscale_execution::handlers::aggregate_state_certificate(
+                        tx_hash,
+                        shard,
+                        merkle_root,
+                        &votes,
                         read_nodes,
-                        state_writes,
-                        outputs_merkle_root: merkle_root,
-                        success,
-                        aggregated_signature,
-                        signers,
-                        voting_power: voting_power.0,
-                    };
-
+                        voting_power,
+                        committee_size,
+                        topology.as_ref(),
+                    );
                     metrics::record_signature_verification_latency(
                         "state_cert_aggregation",
                         start.elapsed().as_secs_f64(),
                     );
-
                     event_tx
                         .send(Event::StateCertificateAggregated {
                             tx_hash,
@@ -2560,30 +2317,11 @@ impl ProductionRunner {
                 // QC verification is LIVENESS-CRITICAL - use consensus crypto pool
                 self.dispatch.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
-                    // Get signer keys based on QC's signer bitfield
-                    let signer_keys: Vec<_> = public_keys
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| qc.signers.is_set(*i))
-                        .map(|(_, pk)| *pk)
-                        .collect();
-
-                    let valid = if signer_keys.is_empty() {
-                        // No signers - invalid QC (genesis is handled before action is emitted)
-                        false
-                    } else {
-                        // Verify aggregated BLS signature against domain-separated message
-                        // Skip PK validation - keys come from trusted topology
-                        match Bls12381G1PublicKey::aggregate(&signer_keys, false) {
-                            Ok(aggregated_pk) => verify_bls12381_v1(
-                                &signing_message,
-                                &aggregated_pk,
-                                &qc.aggregated_signature,
-                            ),
-                            Err(_) => false,
-                        }
-                    };
-
+                    let valid = hyperscale_bft::handlers::verify_qc_signature(
+                        &qc,
+                        &public_keys,
+                        &signing_message,
+                    );
                     metrics::record_signature_verification_latency(
                         "qc",
                         start.elapsed().as_secs_f64(),
@@ -2611,28 +2349,12 @@ impl ProductionRunner {
                 // CycleProof verification is LIVENESS-CRITICAL - use consensus crypto pool
                 self.dispatch.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
-
-                    let valid = if public_keys.is_empty() {
-                        // No signers - invalid proof
-                        false
-                    } else {
-                        // Verify aggregated BLS signature
-                        // Skip PK validation - keys come from trusted topology
-                        let sig_valid = match Bls12381G1PublicKey::aggregate(&public_keys, false) {
-                            Ok(aggregated_pk) => verify_bls12381_v1(
-                                &signing_message,
-                                &aggregated_pk,
-                                &cycle_proof.winner_commitment.aggregated_signature,
-                            ),
-                            Err(_) => false,
-                        };
-
-                        // Also verify quorum threshold
-                        sig_valid
-                            && cycle_proof.winner_commitment.signer_count() as u64
-                                >= quorum_threshold
-                    };
-
+                    let valid = hyperscale_bft::handlers::verify_cycle_proof(
+                        &cycle_proof,
+                        &public_keys,
+                        &signing_message,
+                        quorum_threshold,
+                    );
                     metrics::record_signature_verification_latency(
                         "cycle_proof",
                         start.elapsed().as_secs_f64(),
@@ -2667,24 +2389,15 @@ impl ProductionRunner {
                 // Use consensus crypto pool since this is on the critical voting path.
                 self.dispatch.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
-
-                    // Compute speculative state root and get prepared commit handle.
-                    let (computed_root, prepared) =
-                        storage.prepare_block_commit(parent_state_root, &certificates, local_shard);
-
-                    let valid = computed_root == expected_root;
-
+                    let result = hyperscale_bft::handlers::verify_state_root(
+                        &*storage,
+                        parent_state_root,
+                        expected_root,
+                        &certificates,
+                        local_shard,
+                    );
                     let elapsed = start.elapsed().as_secs_f64();
-                    if !valid {
-                        tracing::warn!(
-                            block_hash = ?block_hash,
-                            expected_root = ?expected_root,
-                            computed_root = ?computed_root,
-                            parent_state_root = ?parent_state_root,
-                            elapsed_ms = elapsed * 1000.0,
-                            "State root verification FAILED"
-                        );
-                    } else {
+                    if result.valid {
                         tracing::debug!(
                             block_hash = ?block_hash,
                             elapsed_ms = elapsed * 1000.0,
@@ -2692,15 +2405,19 @@ impl ProductionRunner {
                             "State root verified and commit work prepared"
                         );
                         // Store prepared handle for use at commit time.
-                        // Only cache on success — failed verifications won't commit.
-                        prepared_commits
-                            .lock()
-                            .unwrap()
-                            .insert(block_hash, prepared);
+                        if let Some(prepared) = result.prepared_commit {
+                            prepared_commits
+                                .lock()
+                                .unwrap()
+                                .insert(block_hash, prepared);
+                        }
                     }
 
                     event_tx
-                        .send(Event::StateRootVerified { block_hash, valid })
+                        .send(Event::StateRootVerified {
+                            block_hash,
+                            valid: result.valid,
+                        })
                         .expect(
                             "callback channel closed - Loss of this event would cause a deadlock",
                         );
@@ -2720,29 +2437,12 @@ impl ProductionRunner {
                 // Use consensus crypto pool since it's on the critical voting path.
                 self.dispatch.spawn_consensus_crypto(move || {
                     let start = std::time::Instant::now();
-
-                    // Compute transaction merkle root from all sections
-                    let computed_root = hyperscale_types::compute_transaction_root(
-                        &retry_transactions,
-                        &priority_transactions,
-                        &transactions,
+                    let valid = hyperscale_bft::handlers::verify_transaction_root(
+                        expected_root, &retry_transactions,
+                        &priority_transactions, &transactions,
                     );
-
-                    let valid = computed_root == expected_root;
-
                     let elapsed = start.elapsed().as_secs_f64();
-                    if !valid {
-                        tracing::warn!(
-                            block_hash = ?block_hash,
-                            expected_root = ?expected_root,
-                            computed_root = ?computed_root,
-                            retry_count = retry_transactions.len(),
-                            priority_count = priority_transactions.len(),
-                            tx_count = transactions.len(),
-                            elapsed_ms = elapsed * 1000.0,
-                            "Transaction root verification FAILED"
-                        );
-                    } else {
+                    if valid {
                         tracing::debug!(
                             block_hash = ?block_hash,
                             elapsed_ms = elapsed * 1000.0,
@@ -2785,91 +2485,27 @@ impl ProductionRunner {
                 // Build proposal block. Check if JMT is ready, compute state root if so,
                 // build the block, and store the PreparedCommit for efficient commit.
                 self.dispatch.spawn_consensus_crypto(move || {
-                    use hyperscale_storage::SubstateStore;
-                    use hyperscale_types::{Block, BlockHeader};
-
                     let start = std::time::Instant::now();
-
-                    // Check if JMT is at parent_state_root (no waiting - instant check)
-                    let current_root = storage.state_root_hash();
-                    let jmt_ready = current_root == parent_state_root;
-
-                    // Can include certificates only if JMT is ready
-                    let include_certs = jmt_ready && !certificates.is_empty();
-
-                    let (state_root, state_version, certs_to_include, prepared) = if include_certs {
-                        // JMT ready - compute speculative root and get prepared commit handle
-                        let (root, prepared) = storage.prepare_block_commit(
-                            parent_state_root,
-                            &certificates,
-                            local_shard,
-                        );
-                        let version = parent_state_version + certificates.len() as u64;
-                        (root, version, certificates, Some(prepared))
-                    } else {
-                        // Either no certificates, or JMT not ready - inherit parent state
-                        if !certificates.is_empty() {
-                            tracing::debug!(
-                                height = height.0,
-                                round = round,
-                                skipped_certs = certificates.len(),
-                                ?current_root,
-                                ?parent_state_root,
-                                "JMT not ready - proposing without certificates"
-                            );
-                        }
-                        (parent_state_root, parent_state_version, vec![], None)
-                    };
-
-                    // Compute transaction root from all transaction sections
-                    let transaction_root = hyperscale_types::compute_transaction_root(
-                        &retry_transactions,
-                        &priority_transactions,
-                        &transactions,
+                    let result = hyperscale_bft::handlers::build_proposal(
+                        &*storage, proposer, height, round, parent_hash, parent_qc,
+                        timestamp, is_fallback, parent_state_root, parent_state_version,
+                        retry_transactions, priority_transactions, transactions,
+                        certificates, commitment_proofs, deferred, aborted, local_shard,
                     );
 
-                    // Build the block
-                    let header = BlockHeader {
-                        height,
-                        parent_hash,
-                        parent_qc,
-                        proposer,
-                        timestamp,
-                        round,
-                        is_fallback,
-                        state_root,
-                        state_version,
-                        transaction_root,
-                    };
-
-                    let block = Block {
-                        header,
-                        retry_transactions,
-                        priority_transactions,
-                        transactions,
-                        certificates: certs_to_include.clone(),
-                        deferred,
-                        aborted,
-                        commitment_proofs,
-                    };
-
-                    let block_hash = block.hash();
-
                     // Store prepared handle under the real block hash.
-                    // Unlike the old code, no re-computation needed — the handle
-                    // doesn't carry a block hash, just precomputed work.
-                    if let Some(prepared) = prepared {
-                        prepared_commits.lock().unwrap().insert(block_hash, prepared);
+                    if let Some(prepared) = result.prepared_commit {
+                        prepared_commits.lock().unwrap().insert(result.block_hash, prepared);
                     }
 
                     let elapsed = start.elapsed().as_secs_f64();
                     tracing::info!(
                         height = height.0,
                         round = round,
-                        block_hash = ?block_hash,
-                        certificates = certs_to_include.len(),
-                        transactions = block.retry_transactions.len() + block.priority_transactions.len() + block.transactions.len(),
-                        state_root = ?state_root,
+                        block_hash = ?result.block_hash,
+                        certificates = result.block.certificates.len(),
+                        transactions = result.block.retry_transactions.len() + result.block.priority_transactions.len() + result.block.transactions.len(),
+                        state_root = ?result.block.header.state_root,
                         elapsed_ms = elapsed * 1000.0,
                         "Built proposal"
                     );
@@ -2878,8 +2514,8 @@ impl ProductionRunner {
                         .send(Event::ProposalBuilt {
                             height,
                             round,
-                            block: std::sync::Arc::new(block),
-                            block_hash,
+                            block: std::sync::Arc::new(result.block),
+                            block_hash: result.block_hash,
                         })
                         .expect("callback channel closed");
                 });
@@ -3092,23 +2728,7 @@ impl ProductionRunner {
                 let event_tx = self.callback_tx.clone();
 
                 self.dispatch.spawn_execution(move || {
-                    // Simple merkle root computation using hash chain
-                    // A proper implementation would use a sparse Merkle tree
-                    let root = if writes.is_empty() {
-                        hyperscale_types::Hash::ZERO
-                    } else {
-                        // Sort writes for determinism
-                        let mut sorted = writes;
-                        sorted.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
-
-                        // Hash chain
-                        let mut data = Vec::new();
-                        for (node_id, value) in &sorted {
-                            data.extend_from_slice(&node_id.0);
-                            data.extend_from_slice(value);
-                        }
-                        hyperscale_types::Hash::from_bytes(&data)
-                    };
+                    let root = hyperscale_bft::handlers::compute_merkle_root(&writes);
                     event_tx
                         .send(Event::MerkleRootComputed { tx_hash, root })
                         .expect(

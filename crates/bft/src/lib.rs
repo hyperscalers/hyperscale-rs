@@ -56,6 +56,8 @@
 //!   advances its local view to R. This keeps validators in sync with network
 //!   progress and prevents view divergence.
 
+pub mod handlers;
+
 mod config;
 mod pending;
 mod state;
