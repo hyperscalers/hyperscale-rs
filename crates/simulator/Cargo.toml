@@ -7,14 +7,10 @@ description = "Long-running workload simulator"
 [dependencies]
 hyperscale-core.workspace = true
 hyperscale-mempool.workspace = true
-hyperscale-parallel.workspace = true
 hyperscale-simulation.workspace = true
 hyperscale-spammer.workspace = true
 hyperscale-types.workspace = true
 hyperscale-engine.workspace = true
-
-# Async runtime for parallel simulation
-tokio = { workspace = true, features = ["full"] }
 
 # Radix dependencies for transaction building
 radix-common.workspace = true

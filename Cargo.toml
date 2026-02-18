@@ -18,7 +18,6 @@ members = [
     "crates/network-libp2p",
     "crates/network-memory",
     "crates/node",
-    "crates/parallel",
     "crates/production",
     "crates/provisions",
     "crates/simulation",
@@ -50,7 +49,6 @@ default-members = [
     "crates/network-libp2p",
     "crates/network-memory",
     "crates/node",
-    "crates/parallel",
     "crates/production",
     "crates/provisions",
     "crates/simulation",
@@ -90,7 +88,6 @@ hyperscale-network = { path = "crates/network" }
 hyperscale-network-libp2p = { path = "crates/network-libp2p" }
 hyperscale-network-memory = { path = "crates/network-memory" }
 hyperscale-node = { path = "crates/node" }
-hyperscale-parallel = { path = "crates/parallel" }
 hyperscale-production = { path = "crates/production" }
 hyperscale-provisions = { path = "crates/provisions" }
 hyperscale-simulation = { path = "crates/simulation" }

@@ -34,9 +34,7 @@
 mod config;
 mod livelock;
 mod metrics;
-mod parallel;
 mod runner;
 
 pub use config::{SimulatorConfig, WorkloadConfig};
-pub use parallel::{ParallelOrchestrator, ParallelOrchestratorConfig};
 pub use runner::Simulator;

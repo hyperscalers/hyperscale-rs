@@ -30,7 +30,6 @@ Rust implementation of Hyperscale consensus protocol.
 | `hyperscale-simulator` | CLI tool for running simulations with metrics |
 | `hyperscale-production` | Production runner: libp2p networking, RocksDB storage, thread pools |
 | `hyperscale-spammer` | Transaction spammer CLI and library for load testing |
-| `hyperscale-parallel` | Parallel (non-deterministic) simulation for multi-core performance testing |
 | `hyperscale-test-helpers` | Test helpers providing properly-signed fixtures for crypto testing |
 
 ## Installation

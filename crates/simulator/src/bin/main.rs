@@ -1,34 +1,27 @@
 //! Hyperscale Simulator CLI
 //!
-//! Run long-running workload simulations with configurable parameters.
-//! Supports both deterministic (single-threaded) and parallel (multi-core) modes.
+//! Run long-running deterministic workload simulations with configurable parameters.
 //!
 //! # Example
 //!
 //! ```bash
-//! # Run a parallel simulation (default, multi-core, non-deterministic)
-//! hyperscale-sim --shards 2 --duration 60
-//!
 //! # Run a deterministic simulation with a fixed seed
 //! hyperscale-sim --seed 42 -s 2 -v 4 -d 60 --tps 1000
 //!
-//! # Run with more validators and cross-shard transactions
+//! # Run with a random seed
 //! hyperscale-sim -s 4 -v 5 -d 120 --cross-shard-ratio 0.3
 //! ```
 
 use clap::Parser;
-use hyperscale_simulator::{
-    ParallelOrchestrator, ParallelOrchestratorConfig, Simulator, SimulatorConfig, WorkloadConfig,
-};
+use hyperscale_simulator::{Simulator, SimulatorConfig, WorkloadConfig};
 use std::time::Duration;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 /// Hyperscale Simulator
 ///
-/// Runs long-running workload simulations. Supports two modes:
-/// - Parallel (default): Multi-core, realistic async behavior
-/// - Deterministic (--seed): Single-threaded, reproducible results when seed is provided
+/// Runs deterministic workload simulations. Single-threaded, reproducible
+/// when the same seed is used.
 #[derive(Parser, Debug)]
 #[command(name = "hyperscale-sim")]
 #[command(version, about, long_about = None)]
@@ -45,8 +38,7 @@ struct Args {
     #[arg(short = 'd', long, default_value = "30")]
     duration: u64,
 
-    /// Random seed for reproducible results. When set, runs in deterministic
-    /// single-threaded mode. When omitted, runs in parallel multi-core mode.
+    /// Random seed for reproducible results. When omitted, a random seed is used.
     #[arg(long)]
     seed: Option<u64>,
 
@@ -62,7 +54,7 @@ struct Args {
     #[arg(long)]
     cross_shard_ratio: Option<f64>,
 
-    /// Show livelock analysis at end (deterministic mode only)
+    /// Show livelock analysis at end
     #[arg(long)]
     analyze_livelocks: bool,
 
@@ -73,10 +65,6 @@ struct Args {
     /// Use no-contention account distribution (disjoint pairs for zero conflicts)
     #[arg(long)]
     no_contention: bool,
-
-    /// Drain duration in seconds (parallel mode only)
-    #[arg(long, default_value = "5")]
-    drain: u64,
 }
 
 fn main() {
@@ -101,76 +89,7 @@ fn main() {
         }
     });
 
-    if args.seed.is_some() {
-        run_deterministic(&args, cross_shard_ratio);
-    } else {
-        run_parallel(&args, cross_shard_ratio);
-    }
-}
-
-fn run_parallel(args: &Args, cross_shard_ratio: f64) {
-    // Generate a random seed for parallel mode
-    let seed: u64 = rand::random();
-
-    info!(
-        shards = args.shards,
-        validators = args.validators,
-        duration_secs = args.duration,
-        drain_secs = args.drain,
-        seed,
-        accounts = args.accounts,
-        tps = args.tps,
-        cross_shard_ratio,
-        "Starting PARALLEL simulation"
-    );
-
-    let mut config =
-        ParallelOrchestratorConfig::new(args.shards as usize, args.validators as usize)
-            .with_target_tps(args.tps as u64)
-            .with_submission_duration(Duration::from_secs(args.duration))
-            .with_drain_duration(Duration::from_secs(args.drain))
-            .with_accounts_per_shard(args.accounts)
-            .with_cross_shard_ratio(cross_shard_ratio)
-            .with_seed(seed);
-
-    if args.no_contention {
-        config = config.with_no_contention();
-    }
-
-    // Create tokio runtime and run
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create tokio runtime");
-
-    let enable_network_analysis = args.network_analysis;
-
-    let (report, traffic_report) = rt.block_on(async {
-        let mut orchestrator =
-            ParallelOrchestrator::new(config).expect("Failed to create parallel orchestrator");
-
-        // Enable traffic analysis if requested
-        if enable_network_analysis {
-            orchestrator.enable_traffic_analysis();
-        }
-
-        orchestrator
-            .run()
-            .await
-            .expect("Parallel simulation failed")
-    });
-
-    // Print summary
-    report.print_summary();
-
-    // Print network traffic analysis after main report
-    if let Some(traffic) = traffic_report {
-        traffic.print_summary();
-    }
-}
-
-fn run_deterministic(args: &Args, cross_shard_ratio: f64) {
-    let seed = args.seed.expect("deterministic mode requires seed");
+    let seed = args.seed.unwrap_or_else(rand::random);
 
     info!(
         shards = args.shards,
@@ -180,7 +99,7 @@ fn run_deterministic(args: &Args, cross_shard_ratio: f64) {
         accounts = args.accounts,
         tps = args.tps,
         cross_shard_ratio,
-        "Starting DETERMINISTIC simulation"
+        "Starting simulation"
     );
 
     // Calculate batch parameters to achieve target TPS
