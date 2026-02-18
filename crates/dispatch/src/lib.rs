@@ -75,4 +75,26 @@ pub trait Dispatch: Send + Sync {
 
     /// Current codec pool queue depth.
     fn codec_queue_depth(&self) -> usize;
+
+    /// Map a function over items on the execution pool, potentially in parallel.
+    ///
+    /// `PooledDispatch` uses `rayon::par_iter` for parallelism.
+    /// `SyncDispatch` uses sequential iteration (deterministic).
+    ///
+    /// This is a **blocking** call — it returns when all items are processed.
+    /// In production, call this from within a `spawn_execution` closure (already
+    /// off the event loop). In simulation, call inline.
+    fn map_execution<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
+    where
+        T: Sync,
+        R: Send;
+
+    /// Map a function over items on the crypto pool, potentially in parallel.
+    ///
+    /// Same semantics as `map_execution` but runs on the crypto pool.
+    /// Used for parallelizing pre-processing steps in batch crypto verification.
+    fn map_crypto<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
+    where
+        T: Sync,
+        R: Send;
 }

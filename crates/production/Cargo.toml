@@ -56,7 +56,6 @@ sbor.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-rayon.workspace = true
 parking_lot = "0.12"
 
 # Lock-free concurrent data structures

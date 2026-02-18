@@ -2521,21 +2521,18 @@ impl ProductionRunner {
                 });
             }
 
-            // Transaction execution on dedicated execution thread pool
-            // NOTE: Execution is READ-ONLY. State writes are collected in the results
-            // and committed later when TransactionCertificate is included in a block.
-            // After execution, signs votes and broadcasts + sends to state machine directly,
-            // avoiding a round-trip through the state machine for signing.
-            Action::ExecuteTransactions {
-                block_hash: _,
-                transactions,
-                state_root: _,
-            } => {
+            // Transaction execution (single-shard and speculative) on dedicated pool.
+            // Uses shared handle_delegated_action for the execute+sign algorithm,
+            // with map_execution providing parallel execution on the rayon pool.
+            action @ Action::ExecuteTransactions { .. }
+            | action @ Action::SpeculativeExecute { .. } => {
+                let is_speculative = matches!(action, Action::SpeculativeExecute { .. });
                 let event_tx = self.callback_tx.clone();
                 let dispatch_tx = self.dispatch_tx.clone();
+                let dispatch = self.dispatch.clone();
                 let storage = self.storage.clone();
                 let executor = self.executor.clone();
-                // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
+                let topology = self.topology.clone();
                 let key_bytes = self.signing_key.to_bytes();
                 let signing_key =
                     Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
@@ -2544,172 +2541,40 @@ impl ProductionRunner {
 
                 self.dispatch.spawn_execution(move || {
                     let start = std::time::Instant::now();
-                    // Execute transactions AND sign votes in parallel using the execution pool.
-                    // Combining execute + sign in one parallel operation avoids:
-                    // 1. Cross-pool blocking (execution waiting on crypto)
-                    // 2. Extra synchronization overhead
-                    // Each transaction gets its own storage snapshot for isolated execution.
-                    let votes: Vec<StateVoteBlock> = {
-                        use rayon::prelude::*;
-                        transactions
-                            .par_iter()
-                            .map(|tx| {
-                                // Execute
-                                let (tx_hash, success, state_root, state_writes) = match executor.execute_single_shard(&*storage, std::slice::from_ref(tx)) {
-                                    Ok(output) => {
-                                        if let Some(r) = output.results().first() {
-                                            (r.tx_hash, r.success, r.outputs_merkle_root, r.state_writes.clone())
-                                        } else {
-                                            (tx.hash(), false, hyperscale_types::Hash::ZERO, vec![])
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(tx_hash = ?tx.hash(), error = %e, "Transaction execution failed");
-                                        (tx.hash(), false, hyperscale_types::Hash::ZERO, vec![])
-                                    }
-                                };
-
-                                // Sign immediately after execution
-                                let message = hyperscale_types::exec_vote_message(
-                                    &tx_hash,
-                                    &state_root,
-                                    local_shard,
-                                    success,
-                                );
-                                let signature = signing_key.sign_v1(&message);
-
-                                StateVoteBlock {
-                                    transaction_hash: tx_hash,
-                                    shard_group_id: local_shard,
-                                    state_root,
-                                    success,
-                                    state_writes,
-                                    validator: validator_id,
-                                    signature,
-                                }
-                            })
-                            .collect()
+                    let ctx = hyperscale_node::action_handler::ActionContext {
+                        storage: &*storage,
+                        executor: &executor,
+                        topology: topology.as_ref(),
+                        signing_key: &signing_key,
+                        local_shard,
+                        validator_id,
+                        dispatch: &*dispatch,
                     };
-                    metrics::record_execution_latency(start.elapsed().as_secs_f64());
 
-                    // Dispatch all votes (channel sends are fast, no need to parallelize)
-                    for vote in votes {
-                        // Broadcast to shard peers via message batcher
-                        let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
-                            shard: local_shard,
-                            vote: vote.clone(),
-                        });
+                    if let Some(result) =
+                        hyperscale_node::action_handler::handle_delegated_action(action, &ctx)
+                    {
+                        if is_speculative {
+                            metrics::record_speculative_execution_latency(
+                                start.elapsed().as_secs_f64(),
+                            );
+                        } else {
+                            metrics::record_execution_latency(start.elapsed().as_secs_f64());
+                        }
 
-                        // Send to state machine for local handling (skips verification for own votes)
-                        event_tx
-                            .send(Event::StateVoteReceived { vote })
-                            .expect(
+                        for event in result.events {
+                            // Broadcast votes to shard peers via network
+                            if let Event::StateVoteReceived { ref vote } = event {
+                                let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
+                                    shard: local_shard,
+                                    vote: vote.clone(),
+                                });
+                            }
+                            event_tx.send(event).expect(
                                 "callback channel closed - Loss of this event would cause a deadlock",
                             );
+                        }
                     }
-                });
-            }
-
-            // Speculative execution of single-shard transactions before block commit.
-            // Executes AND signs inline (same as normal execution) to reduce latency.
-            // Votes are sent immediately via StateVoteReceived, and tx_hashes are reported
-            // back so the execution state machine can track what was speculatively executed.
-            Action::SpeculativeExecute {
-                block_hash,
-                transactions,
-            } => {
-                let event_tx = self.callback_tx.clone();
-                let dispatch_tx = self.dispatch_tx.clone();
-                let storage = self.storage.clone();
-                let executor = self.executor.clone();
-                // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
-                let key_bytes = self.signing_key.to_bytes();
-                let signing_key =
-                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
-                let local_shard = self.local_shard;
-                let validator_id = self.topology.local_validator_id();
-
-                self.dispatch.spawn_execution(move || {
-                    let start = std::time::Instant::now();
-                    // Execute transactions AND sign votes in parallel using the execution pool.
-                    // Same pattern as ExecuteTransactions - no deferred signing.
-                    let votes: Vec<StateVoteBlock> = {
-                        use rayon::prelude::*;
-                        transactions
-                            .par_iter()
-                            .map(|tx| {
-                                // Execute
-                                let (tx_hash, success, state_root, state_writes) = match executor.execute_single_shard(&*storage, std::slice::from_ref(tx)) {
-                                    Ok(output) => {
-                                        if let Some(r) = output.results().first() {
-                                            (r.tx_hash, r.success, r.outputs_merkle_root, r.state_writes.clone())
-                                        } else {
-                                            (tx.hash(), false, hyperscale_types::Hash::ZERO, vec![])
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(tx_hash = ?tx.hash(), error = %e, "Speculative execution failed");
-                                        (tx.hash(), false, hyperscale_types::Hash::ZERO, vec![])
-                                    }
-                                };
-
-                                // Sign immediately after execution
-                                let message = hyperscale_types::exec_vote_message(
-                                    &tx_hash,
-                                    &state_root,
-                                    local_shard,
-                                    success,
-                                );
-                                let signature = signing_key.sign_v1(&message);
-
-                                StateVoteBlock {
-                                    transaction_hash: tx_hash,
-                                    shard_group_id: local_shard,
-                                    state_root,
-                                    success,
-                                    state_writes,
-                                    validator: validator_id,
-                                    signature,
-                                }
-                            })
-                            .collect()
-                    };
-                    metrics::record_speculative_execution_latency(
-                        start.elapsed().as_secs_f64(),
-                    );
-
-                    // Collect tx_hashes for the completion event
-                    let tx_hashes: Vec<hyperscale_types::Hash> = votes
-                        .iter()
-                        .map(|v| v.transaction_hash)
-                        .collect();
-
-                    // Dispatch all votes (channel sends are fast, no need to parallelize)
-                    for vote in votes {
-                        // Broadcast to shard peers via message batcher
-                        let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
-                            shard: local_shard,
-                            vote: vote.clone(),
-                        });
-
-                        // Send to state machine for local handling (skips verification for own votes)
-                        event_tx
-                            .send(Event::StateVoteReceived { vote })
-                            .expect(
-                                "callback channel closed - Loss of this event would cause a deadlock",
-                            );
-                    }
-
-                    // Notify state machine that speculative execution completed
-                    // (for cache tracking - to skip re-execution on block commit)
-                    event_tx
-                        .send(Event::SpeculativeExecutionComplete {
-                            block_hash,
-                            tx_hashes,
-                        })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
                 });
             }
 
@@ -3184,7 +3049,7 @@ impl ProductionRunner {
     /// ~40% faster than individual verification. This is the highest volume crypto operation.
     ///
     /// The verification process:
-    /// 1. For each certificate, aggregate signer public keys based on bitfield (parallel with rayon)
+    /// 1. For each certificate, aggregate signer public keys based on bitfield (parallel via map_crypto)
     /// 2. Batch verify all (aggregated_pk, message, aggregated_sig) tuples
     /// 3. Send individual results back as events
     fn dispatch_state_cert_verifications(
@@ -3197,38 +3062,33 @@ impl ProductionRunner {
 
         let event_tx = self.callback_tx.clone();
         let batch_size = certs.len();
+        let dispatch = self.dispatch.clone();
 
         self.dispatch.spawn_crypto(move || {
             let start = std::time::Instant::now();
 
             // Step 1: Pre-process certificates in parallel - aggregate signer keys and build messages
             // This is the expensive part that benefits from parallelization
-            let prepared: Vec<_> = {
-                use rayon::prelude::*;
-                certs
-                    .into_par_iter()
-                    .map(|(cert, public_keys)| {
-                        let msg = cert.signing_message();
+            let prepared: Vec<_> = dispatch.map_crypto(&certs, |(cert, public_keys)| {
+                let msg = cert.signing_message();
 
-                        // Get signer keys based on bitfield
-                        let signer_keys: Vec<_> = public_keys
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| cert.signers.is_set(*i))
-                            .map(|(_, pk)| *pk)
-                            .collect();
+                // Get signer keys based on bitfield
+                let signer_keys: Vec<_> = public_keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| cert.signers.is_set(*i))
+                    .map(|(_, pk)| *pk)
+                    .collect();
 
-                        // Pre-aggregate the public keys (skip validation - keys from trusted topology)
-                        let aggregated_pk = if signer_keys.is_empty() {
-                            None // Will check for zero signature
-                        } else {
-                            Bls12381G1PublicKey::aggregate(&signer_keys, false).ok()
-                        };
+                // Pre-aggregate the public keys (skip validation - keys from trusted topology)
+                let aggregated_pk = if signer_keys.is_empty() {
+                    None // Will check for zero signature
+                } else {
+                    Bls12381G1PublicKey::aggregate(&signer_keys, false).ok()
+                };
 
-                        (cert, msg, aggregated_pk)
-                    })
-                    .collect()
-            };
+                (cert.clone(), msg, aggregated_pk)
+            });
 
             // Step 2: Batch verify all signatures
             // Separate into verifiable (have aggregated_pk) and special cases (empty signers)
@@ -3420,6 +3280,7 @@ impl ProductionRunner {
 
         let event_tx = self.callback_tx.clone();
         let batch_size = batch.len();
+        let dispatch = self.dispatch.clone();
 
         // Check backpressure before spawning - if crypto pool is overloaded,
         // these gossiped certs will timeout and be cleaned up by TTL.
@@ -3428,32 +3289,27 @@ impl ProductionRunner {
             let start = std::time::Instant::now();
 
             // Step 1: Pre-process certificates in parallel - aggregate signer keys and build messages
-            let prepared: Vec<_> = {
-                use rayon::prelude::*;
-                batch
-                    .into_par_iter()
-                    .map(|(tx_hash, _tx_cert, shard, cert, public_keys)| {
-                        let msg = cert.signing_message();
+            let prepared: Vec<_> =
+                dispatch.map_crypto(&batch, |(tx_hash, _tx_cert, shard, cert, public_keys)| {
+                    let msg = cert.signing_message();
 
-                        // Get signer keys based on bitfield
-                        let signer_keys: Vec<_> = public_keys
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| cert.signers.is_set(*i))
-                            .map(|(_, pk)| *pk)
-                            .collect();
+                    // Get signer keys based on bitfield
+                    let signer_keys: Vec<_> = public_keys
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| cert.signers.is_set(*i))
+                        .map(|(_, pk)| *pk)
+                        .collect();
 
-                        // Pre-aggregate the public keys (skip validation - keys from trusted topology)
-                        let aggregated_pk = if signer_keys.is_empty() {
-                            None // Will check for zero signature
-                        } else {
-                            Bls12381G1PublicKey::aggregate(&signer_keys, false).ok()
-                        };
+                    // Pre-aggregate the public keys (skip validation - keys from trusted topology)
+                    let aggregated_pk = if signer_keys.is_empty() {
+                        None // Will check for zero signature
+                    } else {
+                        Bls12381G1PublicKey::aggregate(&signer_keys, false).ok()
+                    };
 
-                        (tx_hash, shard, cert, msg, aggregated_pk)
-                    })
-                    .collect()
-            };
+                    (*tx_hash, *shard, cert.clone(), msg, aggregated_pk)
+                });
 
             // Step 2: Batch verify all signatures
             // Separate into verifiable (have aggregated_pk) and special cases
@@ -3558,10 +3414,9 @@ impl ProductionRunner {
 
     /// Dispatch cross-shard executions to the execution thread pool.
     ///
-    /// Executes all transactions in parallel using rayon's par_iter for maximum throughput.
-    /// Each transaction is executed with its provisioned state from other shards.
-    /// After execution, signs votes and broadcasts + sends to state machine directly,
-    /// avoiding a round-trip through the state machine for signing.
+    /// Uses the shared `handle_cross_shard_batch` for the execute+sign algorithm,
+    /// with `map_execution` providing parallel execution on the rayon pool.
+    /// After execution, broadcasts votes and sends to state machine directly.
     fn dispatch_cross_shard_executions(
         &self,
         requests: Vec<hyperscale_core::CrossShardExecutionRequest>,
@@ -3572,76 +3427,29 @@ impl ProductionRunner {
 
         let event_tx = self.callback_tx.clone();
         let dispatch_tx = self.dispatch_tx.clone();
+        let dispatch = self.dispatch.clone();
         let storage = self.storage.clone();
         let executor = self.executor.clone();
         let topology = self.topology.clone();
         let local_shard = self.local_shard;
         let batch_size = requests.len();
-        // Clone key bytes since Bls12381G1PrivateKey doesn't impl Clone
         let key_bytes = self.signing_key.to_bytes();
         let signing_key = Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
         let validator_id = topology.local_validator_id();
 
         self.dispatch.spawn_execution(move || {
             let start = std::time::Instant::now();
-
-            // Execute all transactions AND sign votes in parallel using the execution pool.
-            // Combining execute + sign in one parallel operation avoids:
-            // 1. Cross-pool blocking (execution waiting on crypto)
-            // 2. Extra synchronization overhead
-            // Each transaction gets its own storage snapshot for isolated execution.
-            let votes: Vec<StateVoteBlock> = {
-                use rayon::prelude::*;
-                requests
-                    .par_iter()
-                    .map(|req| {
-                        // Determine which nodes are local to this shard
-                        let is_local_node = |node_id: &hyperscale_types::NodeId| -> bool {
-                            topology.shard_for_node_id(node_id) == local_shard
-                        };
-
-                        // Execute
-                        let (tx_hash, success, state_root, state_writes) = match executor.execute_cross_shard(
-                            &*storage,
-                            std::slice::from_ref(&req.transaction),
-                            &req.provisions,
-                            is_local_node,
-                        ) {
-                            Ok(output) => {
-                                if let Some(r) = output.results().first() {
-                                    (r.tx_hash, r.success, r.outputs_merkle_root, r.state_writes.clone())
-                                } else {
-                                    (req.tx_hash, false, hyperscale_types::Hash::ZERO, vec![])
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(tx_hash = ?req.tx_hash, error = %e, "Cross-shard execution failed");
-                                (req.tx_hash, false, hyperscale_types::Hash::ZERO, vec![])
-                            }
-                        };
-
-                        // Sign immediately after execution
-                        let message = hyperscale_types::exec_vote_message(
-                            &tx_hash,
-                            &state_root,
-                            local_shard,
-                            success,
-                        );
-                        let signature = signing_key.sign_v1(&message);
-
-                        StateVoteBlock {
-                            transaction_hash: tx_hash,
-                            shard_group_id: local_shard,
-                            state_root,
-                            success,
-                            state_writes,
-                            validator: validator_id,
-                            signature,
-                        }
-                    })
-                    .collect()
+            let ctx = hyperscale_node::action_handler::ActionContext {
+                storage: &*storage,
+                executor: &executor,
+                topology: topology.as_ref(),
+                signing_key: &signing_key,
+                local_shard,
+                validator_id,
+                dispatch: &*dispatch,
             };
 
+            let events = hyperscale_node::action_handler::handle_cross_shard_batch(&requests, &ctx);
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
 
             if batch_size > 1 {
@@ -3651,17 +3459,15 @@ impl ProductionRunner {
                 );
             }
 
-            // Dispatch all votes (channel sends are fast, no need to parallelize)
-            for vote in votes {
-                // Broadcast to shard peers via message batcher
-                let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
-                    shard: local_shard,
-                    vote: vote.clone(),
-                });
-
-                // Send to state machine for local handling (skips verification for own votes)
+            for event in events {
+                if let Event::StateVoteReceived { ref vote } = event {
+                    let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
+                        shard: local_shard,
+                        vote: vote.clone(),
+                    });
+                }
                 event_tx
-                    .send(Event::StateVoteReceived { vote })
+                    .send(event)
                     .expect("callback channel closed - Loss of this event would cause a deadlock");
             }
         });

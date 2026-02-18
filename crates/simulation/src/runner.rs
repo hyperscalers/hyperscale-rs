@@ -1069,6 +1069,7 @@ impl SimulationRunner {
     /// For execution actions, additionally broadcasts state votes to shard peers.
     fn handle_delegated_action(&mut self, from: NodeIndex, action: Action) {
         let local_shard = self.nodes[from as usize].shard();
+        let dispatch = hyperscale_dispatch_sync::SyncDispatch;
         let ctx = hyperscale_node::action_handler::ActionContext {
             storage: &self.node_storage[from as usize],
             executor: &self.node_executor[from as usize],
@@ -1076,6 +1077,7 @@ impl SimulationRunner {
             signing_key: &self.node_keys[from as usize],
             local_shard,
             validator_id: self.nodes[from as usize].topology().local_validator_id(),
+            dispatch: &dispatch,
         };
         if let Some(result) = hyperscale_node::action_handler::handle_delegated_action(action, &ctx)
         {

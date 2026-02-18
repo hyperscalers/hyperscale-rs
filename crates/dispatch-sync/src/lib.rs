@@ -63,6 +63,22 @@ impl Dispatch for SyncDispatch {
     fn codec_queue_depth(&self) -> usize {
         0
     }
+
+    fn map_execution<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
+    where
+        T: Sync,
+        R: Send,
+    {
+        items.iter().map(f).collect()
+    }
+
+    fn map_crypto<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
+    where
+        T: Sync,
+        R: Send,
+    {
+        items.iter().map(f).collect()
+    }
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ description = "Combined node state machine"
 [dependencies]
 hyperscale-core.workspace = true
 hyperscale-bft.workspace = true
+hyperscale-dispatch.workspace = true
 hyperscale-engine.workspace = true
 hyperscale-execution.workspace = true
 hyperscale-livelock.workspace = true

@@ -8,7 +8,8 @@
 //! Production wraps calls in dispatch pools (thread pools) and delivers results
 //! via channels. Simulation calls inline and schedules events directly.
 
-use hyperscale_core::{Action, Event};
+use hyperscale_core::{Action, CrossShardExecutionRequest, Event};
+use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
@@ -18,13 +19,14 @@ use hyperscale_types::{
 use std::sync::Arc;
 
 /// Context for executing delegated actions.
-pub struct ActionContext<'a, S: CommitStore + SubstateStore> {
+pub struct ActionContext<'a, S: CommitStore + SubstateStore, D: Dispatch> {
     pub storage: &'a S,
     pub executor: &'a RadixExecutor,
     pub topology: &'a dyn Topology,
     pub signing_key: &'a Bls12381G1PrivateKey,
     pub local_shard: ShardGroupId,
     pub validator_id: ValidatorId,
+    pub dispatch: &'a D,
 }
 
 /// Result of handling a delegated action.
@@ -84,9 +86,9 @@ pub fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// the returned events include `Event::StateVoteReceived` for each vote. The runner is
 /// responsible for additionally broadcasting votes to shard peers (network-specific).
 #[allow(clippy::too_many_lines)]
-pub fn handle_delegated_action<S: CommitStore + SubstateStore>(
+pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
     action: Action,
-    ctx: &ActionContext<'_, S>,
+    ctx: &ActionContext<'_, S, D>,
 ) -> Option<DelegatedResult<S::PreparedCommit>> {
     match action {
         // --- BFT crypto verification ---
@@ -347,19 +349,16 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore>(
             transactions,
             state_root: _,
         } => {
-            let votes: Vec<StateVoteBlock> = transactions
-                .iter()
-                .map(|tx| {
-                    hyperscale_execution::handlers::execute_and_sign_single_shard(
-                        ctx.executor,
-                        ctx.storage,
-                        tx,
-                        ctx.signing_key,
-                        ctx.local_shard,
-                        ctx.validator_id,
-                    )
-                })
-                .collect();
+            let votes: Vec<StateVoteBlock> = ctx.dispatch.map_execution(&transactions, |tx| {
+                hyperscale_execution::handlers::execute_and_sign_single_shard(
+                    ctx.executor,
+                    ctx.storage,
+                    tx,
+                    ctx.signing_key,
+                    ctx.local_shard,
+                    ctx.validator_id,
+                )
+            });
 
             let events = votes
                 .into_iter()
@@ -376,19 +375,16 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore>(
             block_hash,
             transactions,
         } => {
-            let votes: Vec<StateVoteBlock> = transactions
-                .iter()
-                .map(|tx| {
-                    hyperscale_execution::handlers::execute_and_sign_single_shard(
-                        ctx.executor,
-                        ctx.storage,
-                        tx,
-                        ctx.signing_key,
-                        ctx.local_shard,
-                        ctx.validator_id,
-                    )
-                })
-                .collect();
+            let votes: Vec<StateVoteBlock> = ctx.dispatch.map_execution(&transactions, |tx| {
+                hyperscale_execution::handlers::execute_and_sign_single_shard(
+                    ctx.executor,
+                    ctx.storage,
+                    tx,
+                    ctx.signing_key,
+                    ctx.local_shard,
+                    ctx.validator_id,
+                )
+            });
 
             let tx_hashes: Vec<Hash> = votes.iter().map(|v| v.transaction_hash).collect();
             let mut events: Vec<Event> = votes
@@ -439,6 +435,35 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore>(
 
         _ => None,
     }
+}
+
+/// Execute a batch of cross-shard transactions in parallel and return vote events.
+///
+/// Production accumulates `ExecuteCrossShardTransaction` actions (5ms window, up to 256 items)
+/// and dispatches them as a batch. This function runs the batch through `map_execution`
+/// for parallel execution on the dispatch pool.
+pub fn handle_cross_shard_batch<S: CommitStore + SubstateStore, D: Dispatch>(
+    requests: &[CrossShardExecutionRequest],
+    ctx: &ActionContext<'_, S, D>,
+) -> Vec<Event> {
+    let votes: Vec<StateVoteBlock> = ctx.dispatch.map_execution(requests, |req| {
+        hyperscale_execution::handlers::execute_and_sign_cross_shard(
+            ctx.executor,
+            ctx.storage,
+            req.tx_hash,
+            &req.transaction,
+            &req.provisions,
+            ctx.signing_key,
+            ctx.local_shard,
+            ctx.validator_id,
+            ctx.topology,
+        )
+    });
+
+    votes
+        .into_iter()
+        .map(|vote| Event::StateVoteReceived { vote })
+        .collect()
 }
 
 /// Commit a block's state writes and update consensus metadata.

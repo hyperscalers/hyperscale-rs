@@ -675,6 +675,28 @@ impl Dispatch for PooledDispatch {
     fn codec_queue_depth(&self) -> usize {
         self.codec_pending.load(Ordering::Relaxed)
     }
+
+    fn map_execution<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
+    where
+        T: Sync,
+        R: Send,
+    {
+        self.execution_pool.install(|| {
+            use rayon::prelude::*;
+            items.par_iter().map(f).collect()
+        })
+    }
+
+    fn map_crypto<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
+    where
+        T: Sync,
+        R: Send,
+    {
+        self.crypto_pool.install(|| {
+            use rayon::prelude::*;
+            items.par_iter().map(f).collect()
+        })
+    }
 }
 
 /// Pin the current thread to a specific CPU core.
