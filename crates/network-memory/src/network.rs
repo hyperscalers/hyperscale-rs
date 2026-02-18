@@ -22,6 +22,10 @@ pub struct NetworkConfig {
     pub num_shards: u32,
     /// Packet loss rate (0.0 - 1.0). Messages are dropped with this probability.
     pub packet_loss_rate: f64,
+    /// When enabled, messages are encoded via `hyperscale_network::codec::encode_message()`
+    /// then decoded via `decode_message()` on delivery, exercising the same serialization
+    /// path as production.
+    pub codec_roundtrip: bool,
 }
 
 impl Default for NetworkConfig {
@@ -33,6 +37,7 @@ impl Default for NetworkConfig {
             validators_per_shard: 4,
             num_shards: 2,
             packet_loss_rate: 0.0,
+            codec_roundtrip: true,
         }
     }
 }
@@ -136,6 +141,13 @@ impl SimulatedNetwork {
     /// Get the current packet loss rate.
     pub fn packet_loss_rate(&self) -> f64 {
         self.config.packet_loss_rate
+    }
+
+    // ─── Codec Roundtrip ───
+
+    /// Whether codec roundtrip is enabled.
+    pub fn codec_roundtrip(&self) -> bool {
+        self.config.codec_roundtrip
     }
 
     // ─── Message Delivery Decision ───
@@ -447,5 +459,20 @@ mod tests {
         // Even with 0% packet loss, partition still blocks
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         assert!(network.should_deliver(0, 1, &mut rng).is_none());
+    }
+
+    #[test]
+    fn test_codec_roundtrip_default_enabled() {
+        let network = SimulatedNetwork::new(NetworkConfig::default());
+        assert!(network.codec_roundtrip());
+    }
+
+    #[test]
+    fn test_codec_roundtrip_disabled() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            codec_roundtrip: false,
+            ..Default::default()
+        });
+        assert!(!network.codec_roundtrip());
     }
 }

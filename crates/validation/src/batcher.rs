@@ -17,6 +17,7 @@
 //! 2. Collects transactions for a short time window (e.g., 20ms)
 //! 3. Dispatches a single crypto task that validates all in parallel via rayon
 
+use crate::TransactionSink;
 use hyperscale_core::Event;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_dispatch_pooled::PooledDispatch;
@@ -129,6 +130,12 @@ pub struct ValidationBatcherHandle {
     tx: mpsc::UnboundedSender<Arc<RoutableTransaction>>,
     stats: Arc<ValidationBatcherStats>,
     seen_cache: Arc<SeenCache>,
+}
+
+impl TransactionSink for ValidationBatcherHandle {
+    fn submit(&self, tx: Arc<RoutableTransaction>) -> bool {
+        self.submit(tx)
+    }
 }
 
 impl ValidationBatcherHandle {

@@ -29,7 +29,8 @@
 //! transaction completion, so we retry up to MAX_RETRY_ATTEMPTS times before
 //! giving up and logging an error.
 
-use crate::network::Libp2pAdapter;
+use crate::adapter::{Libp2pAdapter, NetworkError};
+use async_trait::async_trait;
 use hyperscale_core::OutboundMessage;
 use hyperscale_messages::{
     StateCertificateBatch, StateProvisionBatch, StateVoteBatch, TraceContext,
@@ -41,6 +42,31 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
+
+/// Trait for broadcasting messages to a shard group.
+///
+/// Abstracts the network broadcast capability so `MessageBatcher` doesn't
+/// depend on a concrete adapter type.
+#[async_trait]
+pub trait ShardBroadcast: Send + Sync {
+    /// Broadcast a message to all nodes in the given shard group.
+    async fn broadcast_shard(
+        &self,
+        shard: ShardGroupId,
+        message: &OutboundMessage,
+    ) -> Result<(), NetworkError>;
+}
+
+#[async_trait]
+impl ShardBroadcast for Libp2pAdapter {
+    async fn broadcast_shard(
+        &self,
+        shard: ShardGroupId,
+        message: &OutboundMessage,
+    ) -> Result<(), NetworkError> {
+        Libp2pAdapter::broadcast_shard(self, shard, message).await
+    }
+}
 
 /// Maximum retry attempts before giving up on a failed broadcast.
 const MAX_RETRY_ATTEMPTS: u32 = 5;
@@ -303,7 +329,7 @@ impl RetryEntry {
 /// The message batcher task.
 pub struct MessageBatcher {
     config: MessageBatcherConfig,
-    network: Arc<Libp2pAdapter>,
+    network: Arc<dyn ShardBroadcast>,
     stats: Arc<MessageBatcherStats>,
     /// Pending batches by shard.
     pending: HashMap<ShardGroupId, PendingBatch>,
@@ -675,7 +701,7 @@ impl MessageBatcher {
 /// Returns a handle that can be used to queue messages.
 pub fn spawn_message_batcher(
     config: MessageBatcherConfig,
-    network: Arc<Libp2pAdapter>,
+    network: Arc<impl ShardBroadcast + 'static>,
 ) -> MessageBatcherHandle {
     let stats = Arc::new(MessageBatcherStats::default());
     let (tx, rx) = mpsc::unbounded_channel();

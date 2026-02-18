@@ -1,0 +1,16 @@
+[package]
+name = "hyperscale-network-memory"
+version.workspace = true
+edition.workspace = true
+description = "Deterministic in-memory network transport for simulation"
+
+[dependencies]
+hyperscale-core.workspace = true
+hyperscale-network.workspace = true
+hyperscale-types.workspace = true
+
+rand.workspace = true
+rand_chacha.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]

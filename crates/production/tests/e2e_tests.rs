@@ -39,7 +39,7 @@ fn test_dispatch() -> Arc<PooledDispatch> {
 /// Create a test transaction validation handle.
 /// The output channel is returned so tests can receive validated transactions.
 fn test_tx_validation_handle() -> (
-    hyperscale_production::ValidationBatcherHandle,
+    Arc<dyn hyperscale_production::TransactionSink>,
     mpsc::UnboundedReceiver<hyperscale_core::Event>,
 ) {
     let (output_tx, output_rx) = mpsc::unbounded_channel();
@@ -49,12 +49,12 @@ fn test_tx_validation_handle() -> (
         test_dispatch(),
         output_tx,
     );
-    (handle, output_rx)
+    (Arc::new(handle), output_rx)
 }
 
 /// Create a test codec pool handle for network adapter tests.
-fn test_codec_pool_handle() -> hyperscale_production::network::CodecPoolHandle {
-    hyperscale_production::network::CodecPoolHandle::new(test_dispatch())
+fn test_codec_pool_handle() -> hyperscale_network_libp2p::CodecPoolHandle {
+    hyperscale_network_libp2p::CodecPoolHandle::new(test_dispatch())
 }
 
 /// Test timeout values (from design spec).
@@ -132,7 +132,7 @@ async fn test_storage_operations() {
 async fn test_network_adapter_starts() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-    use hyperscale_production::network::{Libp2pAdapter, Libp2pConfig};
+    use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
     use libp2p::identity;
 
     let keypair = identity::Keypair::generate_ed25519();
@@ -183,7 +183,7 @@ async fn test_network_adapter_starts() {
 async fn test_two_node_connection() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-    use hyperscale_production::network::{Libp2pAdapter, Libp2pConfig};
+    use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
     use libp2p::identity;
 
     // Node 1
@@ -272,7 +272,7 @@ async fn test_two_node_connection() {
 async fn test_topic_subscription() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-    use hyperscale_production::network::{Libp2pAdapter, Libp2pConfig};
+    use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
     use libp2p::identity;
 
     let keypair = identity::Keypair::generate_ed25519();
@@ -313,7 +313,7 @@ async fn test_topic_subscription() {
 async fn test_production_runner_with_network() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-    use hyperscale_production::network::Libp2pConfig;
+    use hyperscale_network_libp2p::Libp2pConfig;
     use libp2p::identity;
 
     let fixtures = TestFixtures::new(42, 1);
@@ -379,7 +379,7 @@ async fn test_production_runner_with_network() {
 async fn test_graceful_shutdown() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-    use hyperscale_production::network::Libp2pConfig;
+    use hyperscale_network_libp2p::Libp2pConfig;
     use libp2p::identity;
 
     let fixtures = TestFixtures::new(42, 1);

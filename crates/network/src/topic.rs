@@ -6,7 +6,7 @@
 //! # Examples
 //!
 //! ```
-//! use hyperscale_production::network::Topic;
+//! use hyperscale_network::Topic;
 //! use hyperscale_types::ShardGroupId;
 //!
 //! // Global topic (no shard)
@@ -205,18 +205,12 @@ impl Topic {
         Self::shard("block.vote", shard)
     }
 
-    // Note: view_change.vote and view_change.certificate topics removed
-    // Using HotStuff-2 implicit rounds instead
-
     /// Topic for transaction gossip.
     pub fn transaction_gossip(shard: ShardGroupId) -> Self {
         Self::shard("transaction.gossip", shard)
     }
 
     /// Topic for transaction certificate gossip (finalized certificates).
-    ///
-    /// When a TransactionCertificate is finalized, it is gossiped to same-shard
-    /// peers so they have it before the proposer includes it in a block.
     pub fn transaction_certificate(shard: ShardGroupId) -> Self {
         Self::shard("transaction.certificate", shard)
     }
@@ -297,13 +291,11 @@ mod tests {
 
     #[test]
     fn test_roundtrip() {
-        // Global topic roundtrip
         let original = Topic::global("test.message");
         let string = original.to_string();
         let parsed = Topic::parse(&string).unwrap();
         assert_eq!(original, parsed);
 
-        // Shard topic roundtrip
         let original = Topic::shard("test.message", ShardGroupId(42));
         let string = original.to_string();
         let parsed = Topic::parse(&string).unwrap();

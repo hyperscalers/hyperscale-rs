@@ -8,7 +8,7 @@ use std::time::Duration;
 /// # Example
 ///
 /// ```
-/// use hyperscale_production::network::Libp2pConfig;
+/// use hyperscale_network_libp2p::Libp2pConfig;
 /// use std::time::Duration;
 ///
 /// let config = Libp2pConfig::default()

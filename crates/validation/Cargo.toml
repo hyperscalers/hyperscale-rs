@@ -1,0 +1,21 @@
+[package]
+name = "hyperscale-validation"
+version.workspace = true
+edition.workspace = true
+description = "Transaction validation abstraction and batched validator"
+
+[dependencies]
+hyperscale-core.workspace = true
+hyperscale-dispatch.workspace = true
+hyperscale-dispatch-pooled.workspace = true
+hyperscale-engine.workspace = true
+hyperscale-metrics.workspace = true
+hyperscale-types.workspace = true
+
+quick_cache = "0.6"
+tracing.workspace = true
+tokio.workspace = true
+rayon.workspace = true
+hex = "0.4"
+
+[dev-dependencies]

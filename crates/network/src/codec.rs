@@ -13,15 +13,18 @@
 //! Message type is determined by the gossipsub topic, not by a field in the
 //! message. This simplifies the wire format and allows efficient routing.
 
-use super::wire;
+use crate::wire;
+use crate::Topic;
 use hyperscale_core::{Event, OutboundMessage};
 use hyperscale_messages::gossip::{
     BlockHeaderGossip, BlockVoteGossip, StateCertificateBatch, StateProvisionBatch, StateVoteBatch,
     TransactionCertificateGossip, TransactionGossip,
 };
 use hyperscale_messages::TraceContext;
-use hyperscale_types::ShardGroupId;
+use hyperscale_types::{RoutableTransaction, ShardGroupId};
+use std::sync::Arc;
 use thiserror::Error;
+use tracing::{trace, warn};
 
 /// Errors that can occur during message encoding/decoding.
 #[derive(Debug, Error)]
@@ -42,30 +45,23 @@ pub enum CodecError {
     UnknownTopic(String),
 }
 
+fn sbor_encode<T: sbor::BasicEncode>(value: &T) -> Result<Vec<u8>, CodecError> {
+    sbor::basic_encode(value).map_err(|e| CodecError::SborEncode(format!("{:?}", e)))
+}
+
 /// Encode an outbound message to wire format.
 ///
 /// SBOR-encodes the message then LZ4-compresses it.
 pub fn encode_message(message: &OutboundMessage) -> Result<Vec<u8>, CodecError> {
-    let sbor_bytes =
-        match message {
-            OutboundMessage::BlockHeader(gossip) => sbor::basic_encode(gossip)
-                .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
-            OutboundMessage::BlockVote(gossip) => sbor::basic_encode(gossip)
-                .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
-            OutboundMessage::StateProvisionBatch(batch) => {
-                sbor::basic_encode(batch).map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?
-            }
-            OutboundMessage::StateVoteBatch(batch) => {
-                sbor::basic_encode(batch).map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?
-            }
-            OutboundMessage::StateCertificateBatch(batch) => {
-                sbor::basic_encode(batch).map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?
-            }
-            OutboundMessage::TransactionCertificateGossip(gossip) => sbor::basic_encode(gossip)
-                .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
-            OutboundMessage::TransactionGossip(gossip) => sbor::basic_encode(gossip.as_ref())
-                .map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?,
-        };
+    let sbor_bytes = match message {
+        OutboundMessage::BlockHeader(gossip) => sbor_encode(gossip.as_ref())?,
+        OutboundMessage::BlockVote(gossip) => sbor_encode(gossip)?,
+        OutboundMessage::StateProvisionBatch(batch) => sbor_encode(batch)?,
+        OutboundMessage::StateVoteBatch(batch) => sbor_encode(batch)?,
+        OutboundMessage::StateCertificateBatch(batch) => sbor_encode(batch)?,
+        OutboundMessage::TransactionCertificateGossip(gossip) => sbor_encode(gossip)?,
+        OutboundMessage::TransactionGossip(gossip) => sbor_encode(gossip.as_ref())?,
+    };
 
     Ok(wire::compress(&sbor_bytes))
 }
@@ -88,10 +84,7 @@ pub struct DecodedMessage {
 /// LZ4-decompresses then SBOR-decodes the message.
 /// The topic determines the message type (topic-based dispatch).
 /// Returns the decoded events along with any trace context for distributed tracing.
-pub fn decode_message(
-    parsed_topic: &crate::network::Topic,
-    data: &[u8],
-) -> Result<DecodedMessage, CodecError> {
+pub fn decode_message(parsed_topic: &Topic, data: &[u8]) -> Result<DecodedMessage, CodecError> {
     if data.is_empty() {
         return Err(CodecError::MessageTooShort);
     }
@@ -207,9 +200,7 @@ pub fn decode_message(
 }
 
 /// Get the topic for an outbound message.
-pub fn topic_for_message(message: &OutboundMessage, shard: ShardGroupId) -> crate::network::Topic {
-    use crate::network::Topic;
-
+pub fn topic_for_message(message: &OutboundMessage, shard: ShardGroupId) -> Topic {
     match message {
         OutboundMessage::BlockHeader(_) => Topic::block_header(shard),
         OutboundMessage::BlockVote(_) => Topic::block_vote(shard),
@@ -219,6 +210,48 @@ pub fn topic_for_message(message: &OutboundMessage, shard: ShardGroupId) -> crat
         OutboundMessage::TransactionCertificateGossip(_) => Topic::transaction_certificate(shard),
         OutboundMessage::TransactionGossip(_) => Topic::transaction_gossip(shard),
     }
+}
+
+/// Decode a gossipsub message and route the resulting events.
+///
+/// Transaction gossips are routed to `tx_sink`; all other consensus events
+/// are sent via `event_sink`.
+///
+/// # Arguments
+///
+/// * `topic` - The parsed gossipsub topic (determines message type)
+/// * `data` - Raw (compressed) message bytes
+/// * `peer_label` - Human-readable peer identifier for logging (not tied to libp2p)
+/// * `event_sink` - Callback for consensus events. Returns `true` if accepted.
+/// * `tx_sink` - Callback for transaction gossips. Returns `true` if accepted.
+pub fn decode_and_route(
+    topic: &Topic,
+    data: &[u8],
+    peer_label: &str,
+    event_sink: &dyn Fn(Event) -> bool,
+    tx_sink: &dyn Fn(Arc<RoutableTransaction>) -> bool,
+) -> Result<(), CodecError> {
+    let decoded = decode_message(topic, data)?;
+
+    for event in decoded.events {
+        match event {
+            Event::TransactionGossipReceived { tx } => {
+                if !tx_sink(tx) {
+                    trace!(peer = peer_label, "Transaction deduplicated or sink closed");
+                }
+            }
+            event => {
+                if !event_sink(event) {
+                    warn!(
+                        peer = peer_label,
+                        "Failed to send decoded event to consensus"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -259,16 +292,13 @@ mod tests {
         };
         let message = OutboundMessage::BlockHeader(Box::new(gossip));
 
-        // Encode (now returns compressed data)
         let bytes = encode_message(&message).unwrap();
         assert!(!bytes.is_empty());
 
-        // Decode with topic
         let topic_str = "hyperscale/block.header/shard-0/1.0.0";
-        let topic = crate::network::Topic::parse(topic_str).unwrap();
+        let topic = Topic::parse(topic_str).unwrap();
         let decoded = decode_message(&topic, &bytes).unwrap();
 
-        // Block headers don't carry trace context
         assert!(decoded.trace_context.is_none());
         assert_eq!(decoded.events.len(), 1);
 
@@ -299,10 +329,9 @@ mod tests {
 
         let bytes = encode_message(&message).unwrap();
         let topic_str = "hyperscale/block.vote/shard-0/1.0.0";
-        let topic = crate::network::Topic::parse(topic_str).unwrap();
+        let topic = Topic::parse(topic_str).unwrap();
         let decoded = decode_message(&topic, &bytes).unwrap();
 
-        // Block votes don't carry trace context
         assert!(decoded.trace_context.is_none());
         assert_eq!(decoded.events.len(), 1);
 
@@ -317,19 +346,17 @@ mod tests {
 
     #[test]
     fn test_invalid_compressed_data() {
-        let bytes = vec![99, 1, 2, 3]; // invalid LZ4 data
-        let topic = crate::network::Topic::parse("hyperscale/block.header/shard-0/1.0.0").unwrap();
+        let bytes = vec![99, 1, 2, 3];
+        let topic = Topic::parse("hyperscale/block.header/shard-0/1.0.0").unwrap();
         let result = decode_message(&topic, &bytes);
         assert!(matches!(result, Err(CodecError::Decompress(_))));
     }
 
     #[test]
     fn test_unknown_topic() {
-        // Create valid compressed data for testing unknown topic
         let sbor_bytes = sbor::basic_encode(&()).unwrap();
         let bytes = wire::compress(&sbor_bytes);
-        // Topic with unknown message type
-        let topic = crate::network::Topic::parse("hyperscale/unknown.type/shard-0/1.0.0").unwrap();
+        let topic = Topic::parse("hyperscale/unknown.type/shard-0/1.0.0").unwrap();
         let result = decode_message(&topic, &bytes);
         assert!(matches!(result, Err(CodecError::UnknownTopic(_))));
     }

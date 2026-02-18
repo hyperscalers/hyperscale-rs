@@ -29,17 +29,13 @@
 //! ```
 
 mod event_queue;
-mod network;
 mod runner;
-mod traffic;
 
+pub use hyperscale_network_memory::{
+    BandwidthReport, NetworkConfig, NetworkTrafficAnalyzer, SimulatedNetwork,
+};
 pub use hyperscale_storage_memory::SimStorage;
-pub use network::{NetworkConfig, SimulatedNetwork};
 pub use runner::SimulationRunner;
-pub use traffic::{BandwidthReport, NetworkTrafficAnalyzer};
 
-/// Type alias for deterministic node indexing in simulation.
-///
-/// This is a simulation-only concept for routing between in-process nodes.
-/// Production code uses `ValidatorId` (from message signatures) and `PeerId` (libp2p).
-pub type NodeIndex = u32;
+// Re-export NodeIndex from network-memory (canonical definition).
+pub use hyperscale_network_memory::NodeIndex;

@@ -42,8 +42,8 @@
 //! 2. **Decoupled Latency**: Network delays don't affect state machine transitions
 //! 3. **Higher Throughput**: Event loop can process more events while broadcasts complete
 
+use crate::adapter::Libp2pAdapter;
 use crate::message_batcher::MessageBatcherHandle;
-use crate::network::Libp2pAdapter;
 use hyperscale_core::OutboundMessage;
 use hyperscale_types::ShardGroupId;
 use std::sync::Arc;

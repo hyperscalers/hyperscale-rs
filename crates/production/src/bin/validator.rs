@@ -48,10 +48,9 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use hyperscale_bft::BftConfig;
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_production::network::{
-    derive_libp2p_keypair, Libp2pConfig, VersionInteroperabilityMode,
-};
+use hyperscale_network_libp2p::{derive_libp2p_keypair, VersionInteroperabilityMode};
 use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
+use hyperscale_production::Libp2pConfig;
 use hyperscale_production::{
     init_telemetry, PooledDispatch, ProductionRunner, RocksDbConfig, RocksDbStorage,
     TelemetryConfig, ThreadPoolConfig,

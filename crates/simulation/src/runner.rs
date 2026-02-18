@@ -5,8 +5,6 @@
 //! inline (synchronously) for deterministic execution.
 
 use crate::event_queue::EventKey;
-use crate::network::{NetworkConfig, SimulatedNetwork};
-use crate::traffic::NetworkTrafficAnalyzer;
 use crate::NodeIndex;
 use crate::SimStorage;
 use hyperscale_bft::{BftConfig, RecoveredState};
@@ -14,6 +12,8 @@ use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
 use hyperscale_engine::RadixExecutor;
 use hyperscale_execution::{DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};
 use hyperscale_mempool::MempoolConfig;
+use hyperscale_network::{SyncConfig, SyncInput, SyncOutput, SyncProtocol};
+use hyperscale_network_memory::{NetworkConfig, NetworkTrafficAnalyzer, SimulatedNetwork};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_storage::{CommitStore, ConsensusStore};
 use hyperscale_types::{
@@ -89,9 +89,12 @@ pub struct SimulationRunner {
     /// Key is hash of (recipient, message_hash) to deduplicate per-node.
     seen_messages: HashSet<u64>,
 
-    /// Per-node sync targets. Maps node index to sync target height.
-    /// Used by the runner to track sync progress (replaces SyncState tracking).
-    sync_targets: HashMap<NodeIndex, u64>,
+    /// Per-node sync protocol state machines. One per node.
+    sync_protocols: Vec<SyncProtocol>,
+
+    /// Per-node pending sync fetches. Heights where the block wasn't available
+    /// on any peer yet, to be retried when new blocks become available.
+    sync_pending_fetches: HashMap<NodeIndex, HashSet<u64>>,
 
     /// Per-node transaction status cache. Captures all emitted statuses.
     /// Maps (node_index, tx_hash) -> status for querying final transaction states.
@@ -252,7 +255,10 @@ impl SimulationRunner {
             genesis_executed,
             traffic_analyzer: None,
             seen_messages: HashSet::new(),
-            sync_targets: HashMap::new(),
+            sync_protocols: (0..num_nodes)
+                .map(|_| SyncProtocol::new(SyncConfig::default()))
+                .collect(),
+            sync_pending_fetches: HashMap::new(),
             tx_status_cache: HashMap::new(),
             prepared_commits: HashMap::new(),
         }
@@ -284,7 +290,7 @@ impl SimulationRunner {
     /// Get a bandwidth report from the traffic analyzer.
     ///
     /// Returns `None` if traffic analysis is not enabled.
-    pub fn traffic_report(&self) -> Option<crate::traffic::BandwidthReport> {
+    pub fn traffic_report(&self) -> Option<hyperscale_network_memory::BandwidthReport> {
         self.traffic_analyzer
             .as_ref()
             .map(|analyzer| analyzer.generate_report(self.now, self.network.total_nodes()))
@@ -688,15 +694,9 @@ impl SimulationRunner {
                 self.process_action(node_index, action);
             }
 
-            // If this node is syncing, check if more blocks can be fetched from peers.
-            // This handles the case where sync was triggered before target blocks were
-            // available on peers. As other nodes commit blocks and broadcast headers,
-            // new blocks become available for sync.
-            if let Some(&sync_target) = self.sync_targets.get(&node_index) {
-                let current_height = self.nodes[node_index as usize].bft().committed_height();
-                if current_height < sync_target {
-                    self.handle_sync_needed(node_index, sync_target);
-                }
+            // Retry pending sync fetches if any blocks may now be available.
+            if self.sync_pending_fetches.contains_key(&node_index) {
+                self.retry_pending_sync_fetches(node_index);
             }
         }
 
@@ -796,9 +796,13 @@ impl SimulationRunner {
             // ═══════════════════════════════════════════════════════════════════════
             Action::StartSync {
                 target_height,
-                target_hash: _,
+                target_hash,
             } => {
-                self.handle_sync_needed(from, target_height);
+                let outputs = self.sync_protocols[from as usize].handle(SyncInput::StartSync {
+                    target_height,
+                    target_hash,
+                });
+                self.process_sync_outputs(from, outputs);
             }
 
             Action::FetchTransactions {
@@ -1827,6 +1831,11 @@ impl SimulationRunner {
                     ConsensusStore::set_committed_state(storage, height, block_hash, &qc);
                     ConsensusStore::prune_own_votes(storage, height.0);
                 }
+
+                // Feed committed height to sync protocol so it advances its window.
+                let outputs = self.sync_protocols[from as usize]
+                    .handle(SyncInput::BlockCommitted { height: height.0 });
+                self.process_sync_outputs(from, outputs);
             }
 
             Action::EmitTransactionStatus {
@@ -1847,24 +1856,11 @@ impl SimulationRunner {
                 let storage = &self.node_storage[from as usize];
                 ConsensusStore::put_block(storage, height, &block, &qc);
 
-                // If this node is syncing, try to fetch more blocks that may now be available.
-                // This handles the case where sync was triggered before all target blocks
-                // were committed on peers.
-                if let Some(&sync_target) = self.sync_targets.get(&from) {
-                    let current_height = self.nodes[from as usize].bft().committed_height();
-                    if current_height < sync_target {
-                        // Still need to sync more blocks - retry fetching
-                        self.handle_sync_needed(from, sync_target);
-                    } else {
-                        // Sync complete - notify state machine so it can resume view changes
-                        self.sync_targets.remove(&from);
-                        let sync_complete_event = Event::SyncComplete {
-                            height: sync_target,
-                        };
-                        let actions = self.nodes[from as usize].handle(sync_complete_event);
-                        for action in actions {
-                            self.process_action(from, action);
-                        }
+                // Retry any pending sync fetches — this peer may have just stored
+                // a block another syncing node needs.
+                if let Some(pending) = self.sync_pending_fetches.get(&from).cloned() {
+                    if !pending.is_empty() {
+                        self.retry_pending_sync_fetches(from);
                     }
                 }
             }
@@ -2037,72 +2033,85 @@ impl SimulationRunner {
         }
     }
 
-    /// Handle sync needed: the simulation runner fetches blocks directly.
-    ///
-    /// In production, this is handled by SyncManager with network I/O.
-    /// In simulation, we look up blocks from any peer's storage that has them
-    /// and deliver them directly to BFT via SyncBlockReadyToApply.
-    ///
-    /// Note: We send blocks one at a time. When BFT commits a block (via PersistBlock),
-    /// the runner will check if more sync blocks are needed and fetch them.
-    pub fn handle_sync_needed(&mut self, node: NodeIndex, target_height: u64) {
-        // Track the sync target (replaces SyncState tracking)
-        // Only update if target is higher than current
-        let current_target = self.sync_targets.get(&node).copied().unwrap_or(0);
-        if target_height > current_target {
-            self.sync_targets.insert(node, target_height);
-        }
-        let effective_target = target_height.max(current_target);
-
-        // Get node's current committed height from BFT state
-        let committed_height = self.nodes[node as usize].bft().committed_height();
-        let next_height = committed_height + 1;
-
-        // Check if sync is complete
-        if committed_height >= effective_target {
-            self.sync_targets.remove(&node);
-            // Notify state machine so it can resume view changes
-            let sync_complete_event = Event::SyncComplete {
-                height: effective_target,
-            };
-            let actions = self.nodes[node as usize].handle(sync_complete_event);
-            for action in actions {
-                self.process_action(node, action);
-            }
-            return;
-        }
-
-        // Only fetch the next block in sequence
-        if next_height <= effective_target {
-            if let Some((peer, block, qc)) = self.find_block_from_any_peer_with_index(next_height) {
-                // Simulate network round-trip to the peer
-                if let Some(delivery_time) = self.simulate_request_response(node, peer) {
-                    let event = Event::SyncBlockReadyToApply { block, qc };
-                    self.schedule_event(node, delivery_time, event);
-                    trace!(
-                        node = node,
-                        peer = peer,
-                        height = next_height,
-                        "Sync: scheduled block fetch with network latency"
-                    );
-                } else {
-                    trace!(
-                        node = node,
-                        peer = peer,
-                        height = next_height,
-                        "Sync: request dropped (partition or packet loss)"
-                    );
-                    // Request dropped - will retry on next timer or when triggered again
+    /// Process outputs from the sync protocol state machine.
+    fn process_sync_outputs(&mut self, node: NodeIndex, outputs: Vec<SyncOutput>) {
+        for output in outputs {
+            match output {
+                SyncOutput::FetchBlock { height } => {
+                    if let Some((peer, block, qc)) =
+                        self.find_block_from_any_peer_with_index(height)
+                    {
+                        if let Some(_delivery_time) = self.simulate_request_response(node, peer) {
+                            // Feed successful response back to protocol
+                            let inner_outputs = self.sync_protocols[node as usize].handle(
+                                SyncInput::BlockResponseReceived {
+                                    height,
+                                    block: Box::new(Some((block, qc))),
+                                },
+                            );
+                            self.process_sync_outputs(node, inner_outputs);
+                        } else {
+                            // Network drop — track as pending for retry
+                            self.sync_pending_fetches
+                                .entry(node)
+                                .or_default()
+                                .insert(height);
+                        }
+                    } else {
+                        // Block not available on any peer yet — track for retry
+                        self.sync_pending_fetches
+                            .entry(node)
+                            .or_default()
+                            .insert(height);
+                    }
                 }
-            } else {
-                trace!(
-                    node = node,
-                    height = next_height,
-                    target = effective_target,
-                    "Sync: no peer has block at height yet"
-                );
-                // Block not available yet - will retry when peers commit more blocks
+                SyncOutput::DeliverBlock { block, qc } => {
+                    let event = Event::SyncBlockReadyToApply {
+                        block: *block,
+                        qc: *qc,
+                    };
+                    self.schedule_event(node, self.now, event);
+                }
+                SyncOutput::SyncComplete { height } => {
+                    self.sync_pending_fetches.remove(&node);
+                    let actions = self.nodes[node as usize].handle(Event::SyncComplete { height });
+                    for action in actions {
+                        self.process_action(node, action);
+                    }
+                }
             }
+        }
+    }
+
+    /// Retry pending sync fetches that previously failed because blocks weren't available.
+    fn retry_pending_sync_fetches(&mut self, node: NodeIndex) {
+        let Some(pending) = self.sync_pending_fetches.get(&node).cloned() else {
+            return;
+        };
+        for height in pending {
+            if let Some((peer, block, qc)) = self.find_block_from_any_peer_with_index(height) {
+                if let Some(_delivery_time) = self.simulate_request_response(node, peer) {
+                    self.sync_pending_fetches
+                        .get_mut(&node)
+                        .unwrap()
+                        .remove(&height);
+                    let outputs = self.sync_protocols[node as usize].handle(
+                        SyncInput::BlockResponseReceived {
+                            height,
+                            block: Box::new(Some((block, qc))),
+                        },
+                    );
+                    self.process_sync_outputs(node, outputs);
+                }
+            }
+        }
+        // Clean up empty sets
+        if self
+            .sync_pending_fetches
+            .get(&node)
+            .is_some_and(|s| s.is_empty())
+        {
+            self.sync_pending_fetches.remove(&node);
         }
     }
 

@@ -14,6 +14,9 @@ members = [
     "crates/metrics",
     "crates/metrics-noop",
     "crates/metrics-prometheus",
+    "crates/network",
+    "crates/network-libp2p",
+    "crates/network-memory",
     "crates/node",
     "crates/parallel",
     "crates/production",
@@ -26,6 +29,7 @@ members = [
     "crates/storage-rocksdb",
     "crates/test-helpers",
     "crates/types",
+    "crates/validation",
 ]
 
 default-members = [
@@ -42,6 +46,9 @@ default-members = [
     "crates/metrics",
     "crates/metrics-noop",
     "crates/metrics-prometheus",
+    "crates/network",
+    "crates/network-libp2p",
+    "crates/network-memory",
     "crates/node",
     "crates/parallel",
     "crates/production",
@@ -54,6 +61,7 @@ default-members = [
     "crates/storage-rocksdb",
     "crates/test-helpers",
     "crates/types",
+    "crates/validation",
 ]
 
 [workspace.package]
@@ -78,6 +86,9 @@ hyperscale-execution = { path = "crates/execution" }
 hyperscale-livelock = { path = "crates/livelock" }
 hyperscale-mempool = { path = "crates/mempool" }
 hyperscale-messages = { path = "crates/messages" }
+hyperscale-network = { path = "crates/network" }
+hyperscale-network-libp2p = { path = "crates/network-libp2p" }
+hyperscale-network-memory = { path = "crates/network-memory" }
 hyperscale-node = { path = "crates/node" }
 hyperscale-parallel = { path = "crates/parallel" }
 hyperscale-production = { path = "crates/production" }
@@ -87,6 +98,7 @@ hyperscale-simulator = { path = "crates/simulator" }
 hyperscale-spammer = { path = "crates/spammer" }
 hyperscale-test-helpers = { path = "crates/test-helpers" }
 hyperscale-types = { path = "crates/types" }
+hyperscale-validation = { path = "crates/validation" }
 
 # External dependencies
 im = "15.1"

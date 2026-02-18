@@ -6,17 +6,14 @@
 //! - Request-Response for sync block fetching
 //! - QUIC transport for reliable, encrypted connections
 
-use super::codec::CodecError;
-use super::codec_pool::CodecPoolHandle;
-use super::config::Libp2pConfig;
-use super::topic::Topic;
-use crate::network::config::VersionInteroperabilityMode;
-use crate::validation_batcher::ValidationBatcherHandle;
+use crate::codec_pool::CodecPoolHandle;
+use crate::config::{Libp2pConfig, VersionInteroperabilityMode};
 use dashmap::DashMap;
 use futures::future::Either;
 use futures::{FutureExt, StreamExt};
-use hyperscale_core::{Event, OutboundMessage};
+use hyperscale_core::{Event, OutboundMessage, TransactionSink};
 use hyperscale_metrics as metrics;
+use hyperscale_network::{CodecError, Topic};
 use hyperscale_types::{Bls12381G1PublicKey, MessagePriority, ShardGroupId, ValidatorId};
 use libp2p::core::muxing::StreamMuxerBox;
 use libp2p::core::transport::{OrTransport, Transport};
@@ -329,7 +326,7 @@ impl Libp2pAdapter {
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
     /// * `consensus_tx` - Channel for high-priority consensus events (BFT messages)
-    /// * `tx_validation_handle` - Handle for submitting transactions to the shared batcher
+    /// * `tx_sink` - Sink for submitting decoded transactions to the validation pipeline
     /// * `codec_pool` - Handle for async message encoding/decoding
     ///
     /// # Returns
@@ -342,7 +339,7 @@ impl Libp2pAdapter {
         validator_id: ValidatorId,
         shard: ShardGroupId,
         consensus_tx: mpsc::Sender<Event>,
-        tx_validation_handle: ValidationBatcherHandle,
+        tx_sink: Arc<dyn TransactionSink>,
         codec_pool: CodecPoolHandle,
     ) -> Result<Arc<Self>, NetworkError> {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
@@ -611,7 +608,7 @@ impl Libp2pAdapter {
                 shutdown_rx,
                 cached_peer_count,
                 shard,
-                tx_validation_handle,
+                tx_sink,
                 config.version_interop_mode,
                 codec_pool,
             ))
@@ -703,7 +700,7 @@ impl Libp2pAdapter {
         // GossipSub has pre-established mesh connections with minimal latency for small committees.
         // DirectBroadcast via request-response adds per-message substream overhead.
 
-        let topic = super::codec::topic_for_message(message, shard);
+        let topic = hyperscale_network::topic_for_message(message, shard);
         let priority = message.priority();
         // Use synchronous encoding here since we're already on an async task
         // and encoding is fast for most messages. The codec pool is primarily
@@ -851,7 +848,7 @@ impl Libp2pAdapter {
         mut shutdown_rx: mpsc::Receiver<()>,
         cached_peer_count: Arc<AtomicUsize>,
         local_shard: ShardGroupId,
-        tx_validation_handle: ValidationBatcherHandle,
+        tx_sink: Arc<dyn TransactionSink>,
         version_interop_mode: VersionInteroperabilityMode,
         codec_pool: CodecPoolHandle,
     ) {
@@ -1152,7 +1149,7 @@ impl Libp2pAdapter {
                         &consensus_tx,
                         &peer_validators,
                         local_shard,
-                        &tx_validation_handle,
+                        &tx_sink,
                         &codec_pool,
                     ).await;
 
@@ -1290,7 +1287,7 @@ impl Libp2pAdapter {
         consensus_tx: &mpsc::Sender<Event>,
         peer_validators: &Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         local_shard: ShardGroupId,
-        tx_validation_handle: &ValidationBatcherHandle,
+        tx_sink: &Arc<dyn TransactionSink>,
         codec_pool: &CodecPoolHandle,
     ) {
         match event {
@@ -1303,7 +1300,7 @@ impl Libp2pAdapter {
                 // Parse topic immediately to determine message type and shard
                 // Using .as_str() avoids allocation
                 let topic_str = message.topic.as_str();
-                let parsed_topic = match crate::network::Topic::parse(topic_str) {
+                let parsed_topic = match hyperscale_network::Topic::parse(topic_str) {
                     Some(t) => t,
                     None => {
                         warn!(
@@ -1369,7 +1366,7 @@ impl Libp2pAdapter {
                     message.data,
                     propagation_source,
                     consensus_tx.clone(),
-                    tx_validation_handle.clone(),
+                    Arc::clone(tx_sink),
                 );
             }
 

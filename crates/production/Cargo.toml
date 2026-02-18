@@ -33,8 +33,11 @@ hyperscale-storage-rocksdb.workspace = true
 hyperscale-node.workspace = true
 hyperscale-types.workspace = true
 hyperscale-messages.workspace = true
+hyperscale-network.workspace = true
+hyperscale-network-libp2p.workspace = true
+hyperscale-validation.workspace = true
 
-# Networking - libp2p with QUIC transport
+# Networking - libp2p (used directly by validator/keygen binaries for Multiaddr/PeerId)
 libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "quic", "tcp", "noise", "yamux", "tokio", "macros", "identify"] }
 libp2p-stream = "0.4.0-alpha"
 futures = "0.3"
@@ -46,9 +49,6 @@ igd-next = { version = "0.14.3", features = ["aio_tokio"] }
 
 # Serialization
 sbor.workspace = true
-
-# Network compression (pure Rust, no C dependencies)
-lz4_flex = "0.12.0"
 
 # Async runtime
 thiserror.workspace = true

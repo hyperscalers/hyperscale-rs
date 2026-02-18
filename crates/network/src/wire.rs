@@ -61,7 +61,6 @@ mod tests {
 
     #[test]
     fn test_compressible_data() {
-        // Highly repetitive data should compress well
         let original = vec![0u8; 10000];
         let compressed = compress(&original);
         assert!(compressed.len() < original.len() / 2);
@@ -71,7 +70,6 @@ mod tests {
 
     #[test]
     fn test_incompressible_data() {
-        // Random-ish data won't compress much but should still roundtrip
         let original: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
         let compressed = compress(&original);
         let decompressed = decompress(&compressed).unwrap();

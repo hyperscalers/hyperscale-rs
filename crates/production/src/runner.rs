@@ -1,12 +1,5 @@
 //! Production runner implementation.
 
-use crate::action_dispatcher::{
-    spawn_action_dispatcher, ActionDispatcherContext, ActionDispatcherHandle, DispatchableAction,
-};
-use crate::network::{
-    compute_peer_id_for_validator, InboundRouter, InboundRouterConfig, InboundRouterHandle,
-    Libp2pAdapter, Libp2pConfig, NetworkError,
-};
 use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
 use crate::sync::{SyncConfig, SyncManager};
 use crate::timers::TimerManager;
@@ -16,6 +9,12 @@ use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_engine::{NetworkDefinition, RadixExecutor};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics as metrics;
+use hyperscale_network_libp2p::{
+    compute_peer_id_for_validator, spawn_action_dispatcher, spawn_message_batcher,
+    ActionDispatcherContext, ActionDispatcherHandle, DispatchableAction, InboundRouter,
+    InboundRouterConfig, InboundRouterHandle, Libp2pAdapter, Libp2pConfig, Libp2pKeypair,
+    MessageBatcherConfig, MessageBatcherHandle, NetworkError,
+};
 use hyperscale_storage::{
     CommitStore, CommittableSubstateDatabase, ConsensusStore, DatabaseUpdates, DbPartitionKey,
     DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
@@ -33,7 +32,6 @@ use hyperscale_types::{
     ShardGroupId, SignerBitfield, StateVoteBlock, Topology, TransactionCertificate, ValidatorId,
     VotePower,
 };
-use libp2p::identity;
 use sbor::prelude::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -497,10 +495,9 @@ fn spawn_block_commit_task(
 /// # Example
 ///
 /// ```no_run
-/// use hyperscale_production::{ProductionRunner, Libp2pConfig, RocksDbStorage, RocksDbConfig};
+/// use hyperscale_production::{ProductionRunner, Libp2pConfig, Libp2pKeypair, RocksDbStorage, RocksDbConfig};
 /// use hyperscale_bft::BftConfig;
 /// use hyperscale_types::{generate_bls_keypair, Bls12381G1PrivateKey};
-/// use libp2p::identity;
 /// use std::sync::Arc;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -513,7 +510,7 @@ fn spawn_block_commit_task(
 ///     RocksDbConfig::default(),
 /// )?;
 /// let network_config = Libp2pConfig::default();
-/// let ed25519_keypair = identity::Keypair::generate_ed25519();
+/// let ed25519_keypair = Libp2pKeypair::generate_ed25519();
 ///
 /// // Build the runner
 /// let runner = ProductionRunner::builder()
@@ -534,7 +531,7 @@ pub struct ProductionRunnerBuilder {
     dispatch: Option<Arc<PooledDispatch>>,
     storage: Option<Arc<RocksDbStorage>>,
     network_config: Option<Libp2pConfig>,
-    ed25519_keypair: Option<identity::Keypair>,
+    ed25519_keypair: Option<Libp2pKeypair>,
     channel_capacity: usize,
     /// Optional RPC status state to update on block commits and view changes.
     rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
@@ -626,7 +623,7 @@ impl ProductionRunnerBuilder {
     }
 
     /// Set the network configuration and Ed25519 keypair for libp2p.
-    pub fn network(mut self, config: Libp2pConfig, keypair: identity::Keypair) -> Self {
+    pub fn network(mut self, config: Libp2pConfig, keypair: Libp2pKeypair) -> Self {
         self.network_config = Some(config);
         self.ed25519_keypair = Some(keypair);
         self
@@ -795,8 +792,8 @@ impl ProductionRunnerBuilder {
         // 1. Deduplication - skip already-seen transactions
         // 2. Batching - collect transactions over time window for parallel validation
         // Output goes to validated_tx_tx (unbounded) to avoid blocking crypto pool threads
-        let tx_validation_handle = crate::validation_batcher::spawn_tx_validation_batcher(
-            crate::validation_batcher::ValidationBatcherConfig::default(),
+        let tx_validation_handle = hyperscale_validation::spawn_tx_validation_batcher(
+            hyperscale_validation::ValidationBatcherConfig::default(),
             tx_validator.clone(),
             dispatch.clone(),
             validated_tx_tx,
@@ -805,7 +802,7 @@ impl ProductionRunnerBuilder {
         // Create codec pool handle for async message encoding/decoding
         // This uses the shared thread pool manager's codec pool to offload SBOR
         // operations from the network event loop.
-        let codec_pool_handle = crate::network::CodecPoolHandle::new(dispatch.clone());
+        let codec_pool_handle = hyperscale_network_libp2p::CodecPoolHandle::new(dispatch.clone());
 
         // Create network adapter with shared transaction validation batcher
         let network = Libp2pAdapter::new(
@@ -814,7 +811,7 @@ impl ProductionRunnerBuilder {
             validator_id,
             local_shard,
             consensus_tx.clone(),
-            tx_validation_handle.clone(),
+            Arc::new(tx_validation_handle.clone()),
             codec_pool_handle,
         )
         .await?;
@@ -839,9 +836,9 @@ impl ProductionRunnerBuilder {
         // Create request manager for intelligent retry and peer selection.
         // This handles request-centric retry (same peer first, then rotate),
         // weighted peer selection based on health, and adaptive concurrency.
-        let request_manager = Arc::new(crate::network::RequestManager::new(
+        let request_manager = Arc::new(hyperscale_network_libp2p::RequestManager::new(
             network.clone(),
-            crate::network::RequestManagerConfig::default(),
+            hyperscale_network_libp2p::RequestManagerConfig::default(),
         ));
 
         // Create sync manager (uses consensus channel for sync events)
@@ -882,10 +879,8 @@ impl ProductionRunnerBuilder {
 
         // Create message batcher for execution layer messages
         // This batches state votes, certificates, and provisions to reduce network overhead
-        let message_batcher = crate::message_batcher::spawn_message_batcher(
-            crate::message_batcher::MessageBatcherConfig::default(),
-            network.clone(),
-        );
+        let message_batcher =
+            spawn_message_batcher(MessageBatcherConfig::default(), network.clone());
 
         // Create shared certificate cache for fetch handler.
         // This cache serves two purposes:
@@ -1064,7 +1059,7 @@ pub struct ProductionRunner {
     tx_validator: Arc<hyperscale_engine::TransactionValidation>,
     /// Handle for the shared transaction validation batcher.
     /// Used by both network gossip and RPC for dedup + batched validation.
-    tx_validation_handle: crate::validation_batcher::ValidationBatcherHandle,
+    tx_validation_handle: hyperscale_validation::ValidationBatcherHandle,
     /// Optional RPC status state to update on block commits.
     rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
     /// Optional transaction status cache for RPC queries.
@@ -1099,7 +1094,7 @@ pub struct ProductionRunner {
     /// Accumulates items and flushes periodically to reduce network overhead.
     /// Note: Now primarily used by action dispatcher, kept here for direct access if needed.
     #[allow(dead_code)]
-    message_batcher: crate::message_batcher::MessageBatcherHandle,
+    message_batcher: MessageBatcherHandle,
     /// Handle for the InboundRouter task.
     /// Processes all inbound requests (block sync, tx fetch, cert fetch) from other validators.
     #[allow(dead_code)]
@@ -1217,7 +1212,7 @@ impl ProductionRunner {
     /// This handle is used by network gossip for dedup + batched validation.
     /// RPC submissions should use `tx_submission_sender()` instead, which
     /// handles gossip before validation.
-    pub fn tx_validation_handle(&self) -> crate::validation_batcher::ValidationBatcherHandle {
+    pub fn tx_validation_handle(&self) -> hyperscale_validation::ValidationBatcherHandle {
         self.tx_validation_handle.clone()
     }
 

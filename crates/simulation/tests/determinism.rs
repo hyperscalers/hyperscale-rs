@@ -1884,6 +1884,7 @@ fn test_packet_loss_application() {
         cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,
         packet_loss_rate: 0.10, // 10% packet loss
+        ..Default::default()
     };
 
     let mut runner = SimulationRunner::new(config, 42);
@@ -1939,6 +1940,7 @@ fn test_packet_loss_determinism() {
         cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,
         packet_loss_rate: 0.2, // 20% packet loss for more variation
+        ..Default::default()
     };
 
     let seed = 12345u64;

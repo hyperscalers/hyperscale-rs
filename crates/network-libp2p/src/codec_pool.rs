@@ -24,36 +24,43 @@
 //! decode work is spawned to the shared codec pool which sends results directly to
 //! the consensus channel.
 
-use super::codec::{decode_message, encode_message, CodecError};
-use super::Topic;
-use hyperscale_core::{Event, OutboundMessage};
+use hyperscale_core::{Event, OutboundMessage, TransactionSink};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
+use hyperscale_network::{decode_and_route, encode_message, CodecError, Topic};
 use libp2p::PeerId as Libp2pPeerId;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{trace, warn};
+use tracing::warn;
 
-/// Handle for async message encoding/decoding using the shared thread pool.
+/// Handle for async message encoding/decoding using a dispatch implementation.
 ///
-/// This wraps a [`PooledDispatch`] and provides convenient methods for
-/// spawning codec work on the shared codec thread pool.
-#[derive(Clone)]
-pub struct CodecPoolHandle {
-    dispatch: Arc<PooledDispatch>,
+/// Generic over `D: Dispatch`, defaulting to [`PooledDispatch`] for production.
+/// The dispatch implementation determines how codec work is scheduled (rayon
+/// thread pool in production, inline in simulation).
+pub struct CodecPoolHandle<D: Dispatch = PooledDispatch> {
+    dispatch: Arc<D>,
 }
 
-impl CodecPoolHandle {
+impl<D: Dispatch> Clone for CodecPoolHandle<D> {
+    fn clone(&self) -> Self {
+        Self {
+            dispatch: self.dispatch.clone(),
+        }
+    }
+}
+
+impl<D: Dispatch> CodecPoolHandle<D> {
     /// Create a new handle wrapping the dispatch implementation.
-    pub fn new(dispatch: Arc<PooledDispatch>) -> Self {
+    pub fn new(dispatch: Arc<D>) -> Self {
         Self { dispatch }
     }
 
     /// Decode a message asynchronously and send results to the consensus channel.
     ///
     /// This method returns immediately - the actual decode work happens on the
-    /// shared codec thread pool, and decoded events are sent directly to the consensus
+    /// dispatch's codec pool, and decoded events are sent directly to the consensus
     /// channel.
     ///
     /// # Arguments
@@ -62,54 +69,35 @@ impl CodecPoolHandle {
     /// * `data` - Raw message bytes from the network
     /// * `propagation_source` - Peer that sent the message (for logging)
     /// * `consensus_tx` - Channel to send decoded events to
-    /// * `tx_validation_handle` - Handle for submitting transactions to validation batcher
+    /// * `tx_sink` - Sink for submitting decoded transactions to the validation pipeline
     pub fn decode_async(
         &self,
         topic: Topic,
         data: Vec<u8>,
         propagation_source: Libp2pPeerId,
         consensus_tx: mpsc::Sender<Event>,
-        tx_validation_handle: crate::validation_batcher::ValidationBatcherHandle,
+        tx_sink: Arc<dyn TransactionSink>,
     ) {
         self.dispatch.spawn_codec(move || {
-            let result = decode_message(&topic, &data);
+            let peer_label = propagation_source.to_string();
+
+            let result = decode_and_route(
+                &topic,
+                &data,
+                &peer_label,
+                &|event| consensus_tx.try_send(event).is_ok(),
+                &|tx| tx_sink.submit(tx),
+            );
 
             match result {
-                Ok(decoded) => {
+                Ok(()) => {
                     metrics::record_network_message_received();
-
-                    // Route based on event type
-                    for event in decoded.events {
-                        match event {
-                            Event::TransactionGossipReceived { tx } => {
-                                // Submit to batched validator for dedup and parallel validation
-                                if !tx_validation_handle.submit(tx) {
-                                    trace!(
-                                        peer = %propagation_source,
-                                        "Transaction deduplicated or batcher closed"
-                                    );
-                                }
-                            }
-                            event => {
-                                // Consensus messages - send to channel
-                                // We're on a rayon thread, so we need to use try_send
-                                if consensus_tx.try_send(event).is_err() {
-                                    // Channel full or closed - this shouldn't happen often
-                                    // since consensus channel is bounded but large
-                                    warn!(
-                                        peer = %propagation_source,
-                                        "Failed to send decoded event to consensus channel"
-                                    );
-                                }
-                            }
-                        }
-                    }
                 }
                 Err(e) => {
                     warn!(
                         error = %e,
                         topic = %topic,
-                        peer = %propagation_source,
+                        peer = %peer_label,
                         "Failed to decode message in codec pool"
                     );
                     metrics::record_invalid_message();

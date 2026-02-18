@@ -13,7 +13,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use hyperscale_simulation::traffic::NetworkTrafficAnalyzer;
+//! use hyperscale_network_memory::NetworkTrafficAnalyzer;
 //!
 //! let analyzer = NetworkTrafficAnalyzer::new();
 //!

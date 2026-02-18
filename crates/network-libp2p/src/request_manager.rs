@@ -30,11 +30,11 @@
 //! }
 //! ```
 
-use super::adapter::{Libp2pAdapter, NetworkError};
-use super::peer_health::{PeerHealthConfig, PeerHealthTracker};
-use super::wire;
+use crate::adapter::{Libp2pAdapter, NetworkError};
+use crate::peer_health::{PeerHealthConfig, PeerHealthTracker};
 use bytes::Bytes;
 use futures::{AsyncReadExt, AsyncWriteExt};
+use hyperscale_network::wire;
 use hyperscale_types::{BlockHeight, Hash};
 use libp2p::PeerId;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -919,7 +919,7 @@ pub struct RequestManagerStats {
     /// Global success rate across all peers.
     pub global_success_rate: f64,
     /// Detailed peer health statistics.
-    pub health_stats: super::peer_health::PeerHealthStats,
+    pub health_stats: crate::peer_health::PeerHealthStats,
 }
 
 #[cfg(test)]
