@@ -11,7 +11,7 @@ use crate::config::{Libp2pConfig, VersionInteroperabilityMode};
 use dashmap::DashMap;
 use futures::future::Either;
 use futures::{FutureExt, StreamExt};
-use hyperscale_core::{Event, OutboundMessage, TransactionSink};
+use hyperscale_core::{Event, TransactionSink};
 use hyperscale_metrics as metrics;
 use hyperscale_network::{CodecError, Topic};
 use hyperscale_types::{Bls12381G1PublicKey, MessagePriority, ShardGroupId, ValidatorId};
@@ -308,7 +308,9 @@ pub struct Libp2pAdapter {
     /// This avoids blocking the consensus loop to query peer count.
     cached_peer_count: Arc<AtomicUsize>,
 
-    /// Codec pool handle for async encoding (encoding happens on caller thread for broadcast).
+    /// Codec pool handle for decoding in the event loop.
+    /// Encoding is now done inline by callers via `hyperscale_network::encode_to_wire`.
+    #[allow(dead_code)]
     codec_pool: CodecPoolHandle,
 
     /// Stream control handle for opening outbound streams.
@@ -686,26 +688,20 @@ impl Libp2pAdapter {
         Ok(())
     }
 
-    /// Broadcast a message to a shard.
+    /// Publish pre-encoded data to a topic with a given priority.
     ///
-    /// Messages are routed to the appropriate priority channel based on their
-    /// [`MessagePriority`]. Critical messages (BFT consensus) are processed before
-    /// Background messages (sync).
-    pub async fn broadcast_shard(
+    /// Messages are routed to the appropriate priority channel based on the
+    /// provided [`MessagePriority`]. Critical messages (BFT consensus) are
+    /// processed before Background messages (sync).
+    ///
+    /// Callers are responsible for SBOR-encoding and compressing the message
+    /// before calling this method (use `hyperscale_network::encode_to_wire`).
+    pub fn publish(
         &self,
-        shard: ShardGroupId,
-        message: &OutboundMessage,
+        topic: &hyperscale_network::Topic,
+        data: Vec<u8>,
+        priority: MessagePriority,
     ) -> Result<(), NetworkError> {
-        // Use gossipsub for all consensus broadcasts - it's optimized for this use case.
-        // GossipSub has pre-established mesh connections with minimal latency for small committees.
-        // DirectBroadcast via request-response adds per-message substream overhead.
-
-        let topic = hyperscale_network::topic_for_message(message, shard);
-        let priority = message.priority();
-        // Use synchronous encoding here since we're already on an async task
-        // and encoding is fast for most messages. The codec pool is primarily
-        // beneficial for decoding in the event loop.
-        let data = self.codec_pool.encode_sync(message)?;
         let data_len = data.len();
 
         self.priority_channels
@@ -722,21 +718,11 @@ impl Libp2pAdapter {
 
         trace!(
             topic = %topic,
-            msg_type = message.type_name(),
             priority = ?priority,
-            "Broadcast to shard"
+            data_len,
+            "Published message"
         );
 
-        Ok(())
-    }
-
-    /// Broadcast a message globally (to all shards).
-    pub async fn broadcast_global(&self, message: &OutboundMessage) -> Result<(), NetworkError> {
-        // For now, global messages are sent to all shards.
-        // In the future, we might have dedicated global topics.
-        // Currently, no messages use global broadcast.
-        warn!("broadcast_global called but no global topics defined yet");
-        let _ = message; // suppress unused warning
         Ok(())
     }
 

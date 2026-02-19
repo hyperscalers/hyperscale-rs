@@ -2,7 +2,7 @@
 name = "hyperscale-network"
 version.workspace = true
 edition.workspace = true
-description = "Shared network protocol logic: codec, topics, sync/fetch state machines"
+description = "Shared network protocol logic: Network trait, codec, topics, handler registry"
 
 [dependencies]
 hyperscale-core.workspace = true

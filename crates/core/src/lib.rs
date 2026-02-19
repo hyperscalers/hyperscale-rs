@@ -27,13 +27,11 @@
 
 mod action;
 mod event;
-mod message;
 mod timer;
 mod traits;
 
 pub use action::{Action, CrossShardExecutionRequest, TransactionStatus};
 pub use event::{Event, EventPriority};
-pub use message::OutboundMessage;
 pub use timer::TimerScheduler;
 pub use traits::{NoOpStateRootComputer, StateMachine, StateRootComputer};
 

@@ -8,7 +8,7 @@
 //! - Delivering fetched data to BFT via event channel
 //!
 //! The core protocol logic (per-block hash tracking, chunking, completion detection)
-//! lives in `hyperscale_network::FetchProtocol`, shared with the simulation runner.
+//! lives in `hyperscale_node::FetchProtocol`, shared with the simulation runner.
 //!
 //! # Architecture
 //!
@@ -28,8 +28,8 @@
 use hyperscale_core::Event;
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
 use hyperscale_metrics as metrics;
-use hyperscale_network::{FetchInput, FetchOutput, FetchProtocol};
 use hyperscale_network_libp2p::{PeerId, RequestManager, RequestPriority};
+use hyperscale_node::{FetchInput, FetchOutput, FetchProtocol};
 use hyperscale_storage::ConsensusStore;
 use hyperscale_storage_rocksdb::RocksDbStorage;
 use hyperscale_types::{Hash, RoutableTransaction, TransactionCertificate, ValidatorId};
@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
 // Re-export shared types used by the rest of the production crate.
-pub use hyperscale_network::{FetchConfig, FetchKind, FetchStatus};
+pub use hyperscale_node::{FetchConfig, FetchKind, FetchStatus};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Callback Result from Spawned Tasks

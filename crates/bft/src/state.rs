@@ -12,7 +12,7 @@
 //! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
 //! the complete block data, making it recoverable from any honest validator in that set.
 
-use hyperscale_core::{Action, Event, OutboundMessage, TimerId};
+use hyperscale_core::{Action, Event, TimerId};
 
 /// BFT statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1254,9 +1254,9 @@ impl BftState {
         // Record leader activity - we are producing blocks
         self.record_leader_activity();
 
-        actions.push(Action::BroadcastToShard {
+        actions.push(Action::BroadcastBlockHeader {
             shard: self.local_shard(),
-            message: OutboundMessage::BlockHeader(Box::new(gossip)),
+            header: Box::new(gossip),
         });
 
         // Vote for our own fallback block
@@ -1369,9 +1369,9 @@ impl BftState {
         // Record leader activity - we are producing blocks
         self.record_leader_activity();
 
-        actions.push(Action::BroadcastToShard {
+        actions.push(Action::BroadcastBlockHeader {
             shard: self.local_shard(),
-            message: OutboundMessage::BlockHeader(Box::new(gossip)),
+            header: Box::new(gossip),
         });
 
         // Vote for our own sync block
@@ -1469,9 +1469,9 @@ impl BftState {
             commitment_proofs,
         );
 
-        actions.push(Action::BroadcastToShard {
+        actions.push(Action::BroadcastBlockHeader {
             shard: self.local_shard(),
-            message: OutboundMessage::BlockHeader(Box::new(gossip)),
+            header: Box::new(gossip),
         });
 
         // Note: We do NOT create a new vote here - we already voted for this block
@@ -2577,7 +2577,7 @@ impl BftState {
             round,
             block_hash,
             shard: self.local_shard(),
-            message: OutboundMessage::BlockVote(gossip),
+            vote: gossip,
         }];
 
         // Also process our own vote locally
@@ -3364,9 +3364,9 @@ impl BftState {
             commitment_proofs: block.commitment_proofs.clone(),
         };
 
-        let mut actions = vec![Action::BroadcastToShard {
+        let mut actions = vec![Action::BroadcastBlockHeader {
             shard: self.local_shard(),
-            message: OutboundMessage::BlockHeader(Box::new(gossip)),
+            header: Box::new(gossip),
         }];
 
         // Vote for our own block
@@ -5918,7 +5918,7 @@ mod tests {
         // Should broadcast a fallback block
         let has_broadcast = actions
             .iter()
-            .any(|a| matches!(a, Action::BroadcastToShard { .. }));
+            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
         assert!(
             has_broadcast,
             "Proposer should broadcast after round advance"
@@ -6775,26 +6775,16 @@ mod tests {
         let actions = state.repropose_locked_block(original_block_hash, height);
 
         // Should have broadcast action
-        let broadcast_action = actions.iter().find(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(_),
-                    ..
-                }
-            )
-        });
+        let broadcast_action = actions
+            .iter()
+            .find(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
         assert!(
             broadcast_action.is_some(),
             "Should broadcast the re-proposed block"
         );
 
         // Extract the header from the broadcast
-        if let Some(Action::BroadcastToShard {
-            message: OutboundMessage::BlockHeader(gossip),
-            ..
-        }) = broadcast_action
-        {
+        if let Some(Action::BroadcastBlockHeader { header: gossip, .. }) = broadcast_action {
             let reproposed_header = gossip.header();
 
             // CRITICAL: The round should be the ORIGINAL round, not the view change round
@@ -6967,15 +6957,9 @@ mod tests {
         );
 
         // Verify we broadcast a fallback block
-        let has_broadcast = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(_),
-                    ..
-                }
-            )
-        });
+        let has_broadcast = actions
+            .iter()
+            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
         assert!(has_broadcast, "Should broadcast fallback block");
     }
 
@@ -7240,26 +7224,16 @@ mod tests {
         assert_eq!(*new_round, 3, "Vote should be at round 3");
 
         // Should have broadcast action (fallback block)
-        let broadcast_action = actions.iter().find(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(_),
-                    ..
-                }
-            )
-        });
+        let broadcast_action = actions
+            .iter()
+            .find(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
         assert!(
             broadcast_action.is_some(),
             "Should broadcast fallback block when becoming proposer after view change"
         );
 
         // Verify it's a fallback block (not the original)
-        if let Some(Action::BroadcastToShard {
-            message: OutboundMessage::BlockHeader(gossip),
-            ..
-        }) = broadcast_action
-        {
+        if let Some(Action::BroadcastBlockHeader { header: gossip, .. }) = broadcast_action {
             assert!(gossip.header().is_fallback, "Should be a fallback block");
             assert_eq!(
                 gossip.header().round,
@@ -7324,26 +7298,16 @@ mod tests {
         let actions = state.advance_round();
 
         // Should create and broadcast a fallback block
-        let broadcast_action = actions.iter().find(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(_),
-                    ..
-                }
-            )
-        });
+        let broadcast_action = actions
+            .iter()
+            .find(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
         assert!(
             broadcast_action.is_some(),
             "Should broadcast fallback block"
         );
 
         // Extract and verify it's a fallback block
-        if let Some(Action::BroadcastToShard {
-            message: OutboundMessage::BlockHeader(gossip),
-            ..
-        }) = broadcast_action
-        {
+        if let Some(Action::BroadcastBlockHeader { header: gossip, .. }) = broadcast_action {
             assert!(
                 gossip.header().is_fallback,
                 "Block should be marked as fallback"
@@ -7668,15 +7632,9 @@ mod tests {
         );
 
         // Should NOT contain a BlockHeader broadcast (no proposal)
-        let has_block_header = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(_),
-                    ..
-                }
-            )
-        });
+        let has_block_header = actions
+            .iter()
+            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
 
         assert!(
             !has_block_header,
@@ -8259,15 +8217,9 @@ mod tests {
         );
 
         // Should NOT contain a BlockHeader broadcast (rate limited)
-        let has_block_header = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(_),
-                    ..
-                }
-            )
-        });
+        let has_block_header = actions
+            .iter()
+            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
 
         assert!(
             !has_block_header,
@@ -8395,15 +8347,9 @@ mod tests {
             HashMap::new(),
         );
 
-        let has_block_header = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(_),
-                    ..
-                }
-            )
-        });
+        let has_block_header = actions
+            .iter()
+            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
 
         assert!(
             !has_block_header,
@@ -8565,15 +8511,9 @@ mod tests {
         let broadcast_actions = state.on_proposal_built(BlockHeight(4), 0, block_arc, block_hash);
 
         // Check that a BlockHeader broadcast was emitted
-        let has_broadcast = broadcast_actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(_),
-                    ..
-                }
-            )
-        });
+        let has_broadcast = broadcast_actions
+            .iter()
+            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
         assert!(
             has_broadcast,
             "Should broadcast block after on_proposal_built"
@@ -8808,15 +8748,9 @@ mod tests {
         let actions = state.on_proposal_timer(&ready_txs, vec![], vec![], vec![], HashMap::new());
 
         // Should have broadcast a block header
-        let has_block_header = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(_),
-                    ..
-                }
-            )
-        });
+        let has_block_header = actions
+            .iter()
+            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
         assert!(
             has_block_header,
             "Should broadcast a block header while syncing"
@@ -8824,11 +8758,7 @@ mod tests {
 
         // Verify the block is empty (sync block)
         let block_gossip = actions.iter().find_map(|a| {
-            if let Action::BroadcastToShard {
-                message: OutboundMessage::BlockHeader(gossip),
-                ..
-            } = a
-            {
+            if let Action::BroadcastBlockHeader { header: gossip, .. } = a {
                 Some(gossip)
             } else {
                 None
@@ -8893,11 +8823,7 @@ mod tests {
 
         // Extract the block header
         let gossip = actions.iter().find_map(|a| {
-            if let Action::BroadcastToShard {
-                message: OutboundMessage::BlockHeader(gossip),
-                ..
-            } = a
-            {
+            if let Action::BroadcastBlockHeader { header: gossip, .. } = a {
                 Some(gossip)
             } else {
                 None
@@ -9227,11 +9153,7 @@ mod tests {
         let sync_header = sync_actions
             .iter()
             .find_map(|a| {
-                if let Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(gossip),
-                    ..
-                } = a
-                {
+                if let Action::BroadcastBlockHeader { header: gossip, .. } = a {
                     Some(&gossip.header)
                 } else {
                     None
@@ -9242,11 +9164,7 @@ mod tests {
         let fallback_header = fallback_actions
             .iter()
             .find_map(|a| {
-                if let Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(gossip),
-                    ..
-                } = a
-                {
+                if let Action::BroadcastBlockHeader { header: gossip, .. } = a {
                     Some(&gossip.header)
                 } else {
                     None
@@ -9308,15 +9226,9 @@ mod tests {
         );
 
         // Verify we got a proposal (not skipped due to syncing)
-        let has_proposal = actions1.iter().any(|a| {
-            matches!(
-                a,
-                Action::BroadcastToShard {
-                    message: OutboundMessage::BlockHeader(_),
-                    ..
-                }
-            )
-        });
+        let has_proposal = actions1
+            .iter()
+            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
         assert!(
             has_proposal,
             "Syncing validator should still propose (empty blocks)"

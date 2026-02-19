@@ -24,11 +24,11 @@
 //! decode work is spawned to the shared codec pool which sends results directly to
 //! the consensus channel.
 
-use hyperscale_core::{Event, OutboundMessage, TransactionSink};
+use hyperscale_core::{Event, TransactionSink};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
-use hyperscale_network::{decode_and_route, encode_message, CodecError, Topic};
+use hyperscale_network::{decode_and_route, Topic};
 use libp2p::PeerId as Libp2pPeerId;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -106,14 +106,6 @@ impl<D: Dispatch> CodecPoolHandle<D> {
         });
     }
 
-    /// Encode a message synchronously.
-    ///
-    /// Encoding is fast for most messages and happens on the caller's thread.
-    /// The codec pool is primarily beneficial for decoding in the event loop.
-    pub fn encode_sync(&self, message: &OutboundMessage) -> Result<Vec<u8>, CodecError> {
-        encode_message(message)
-    }
-
     /// Get current codec pool queue depth (for metrics).
     pub fn queue_depth(&self) -> usize {
         self.dispatch.codec_queue_depth()
@@ -133,12 +125,9 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_sync() {
+    fn test_encode_to_wire() {
         use hyperscale_messages::gossip::BlockVoteGossip;
         use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash, ValidatorId};
-
-        let dispatch = Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap());
-        let handle = CodecPoolHandle::new(dispatch);
 
         let vote = BlockVote {
             block_hash: Hash::from_bytes(&[1u8; 32]),
@@ -149,9 +138,8 @@ mod tests {
             timestamp: 0,
         };
         let gossip = BlockVoteGossip { vote };
-        let message = OutboundMessage::BlockVote(gossip);
 
-        let encoded = handle.encode_sync(&message).unwrap();
+        let encoded = hyperscale_network::encode_to_wire(&gossip).unwrap();
         assert!(!encoded.is_empty());
     }
 }

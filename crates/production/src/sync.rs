@@ -8,7 +8,7 @@
 //! - Delivering validated blocks to BFT via event channel
 //!
 //! The core protocol logic (height queues, sliding windows, block validation)
-//! lives in `hyperscale_network::SyncProtocol`, shared with the simulation runner.
+//! lives in `hyperscale_node::SyncProtocol`, shared with the simulation runner.
 //!
 //! # Architecture
 //!
@@ -27,10 +27,10 @@
 
 use hyperscale_core::Event;
 use hyperscale_metrics as metrics;
-use hyperscale_network::{SyncInput, SyncOutput, SyncProtocol};
 use hyperscale_network_libp2p::{
     compute_peer_id_for_validator, PeerId, RequestManager, RequestPriority,
 };
+use hyperscale_node::{SyncInput, SyncOutput, SyncProtocol};
 use hyperscale_types::{BlockHeight, Hash, Topology};
 use serde::Serialize;
 use std::sync::Arc;
@@ -38,7 +38,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 // Re-export shared types used by the rest of the production crate.
-pub use hyperscale_network::SyncStateKind;
+pub use hyperscale_node::SyncStateKind;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Production-Specific Status Type
@@ -90,7 +90,7 @@ impl Default for SyncStatus {
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
     /// Shared protocol configuration (window size, max concurrent fetches).
-    pub protocol: hyperscale_network::SyncConfig,
+    pub protocol: hyperscale_node::SyncConfig,
 
     /// Maximum number of spawned tokio fetch tasks.
     /// This limits how many tasks wait in RequestManager's acquire_slot() queue.
@@ -101,7 +101,7 @@ pub struct SyncConfig {
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
-            protocol: hyperscale_network::SyncConfig::default(),
+            protocol: hyperscale_node::SyncConfig::default(),
             // Leave headroom for FetchManager (tx/cert fetches) which shares RequestManager.
             // RequestManager has 64 slots; use ~half for sync, leaving room for fetch.
             max_spawned_fetches: 32,

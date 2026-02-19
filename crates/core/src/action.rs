@@ -1,6 +1,9 @@
 //! Action types for the deterministic state machine.
 
-use crate::{message::OutboundMessage, Event, TimerId};
+use crate::{Event, TimerId};
+use hyperscale_messages::{
+    BlockHeaderGossip, BlockVoteGossip, TransactionCertificateGossip, TransactionGossip,
+};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
     CycleProof, EpochConfig, EpochId, Hash, NodeId, QuorumCertificate, RoutableTransaction,
@@ -29,22 +32,34 @@ pub struct CrossShardExecutionRequest {
 #[derive(Debug, Clone)]
 pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
-    // Network: Generic (for BFT consensus and mempool)
+    // Network: BFT Consensus
     // ═══════════════════════════════════════════════════════════════════════
-    /// Broadcast a message to all nodes in a shard.
-    ///
-    /// Production uses gossipsub with topic-based routing.
-    /// Simulation routes to all nodes in the shard.
-    ///
-    /// Used for BFT consensus messages (BlockHeader, BlockVote) and mempool
-    /// (TransactionGossip). Execution messages use domain-specific actions below.
-    BroadcastToShard {
+    /// Broadcast a block header (proposal) to the local shard.
+    BroadcastBlockHeader {
         shard: ShardGroupId,
-        message: OutboundMessage,
+        header: Box<BlockHeaderGossip>,
     },
 
-    /// Broadcast a message to all nodes in the network.
-    BroadcastGlobal { message: OutboundMessage },
+    /// Broadcast a block vote to the local shard.
+    BroadcastBlockVote {
+        shard: ShardGroupId,
+        vote: BlockVoteGossip,
+    },
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Network: Mempool & Certificates
+    // ═══════════════════════════════════════════════════════════════════════
+    /// Broadcast a transaction gossip to a shard.
+    BroadcastTransaction {
+        shard: ShardGroupId,
+        gossip: Box<TransactionGossip>,
+    },
+
+    /// Broadcast a transaction certificate gossip to the local shard.
+    BroadcastTransactionCertificate {
+        shard: ShardGroupId,
+        gossip: TransactionCertificateGossip,
+    },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Network: Execution Layer (domain-specific, batchable by runner)
@@ -454,7 +469,7 @@ pub enum Action {
         round: u64,
         block_hash: Hash,
         shard: ShardGroupId,
-        message: OutboundMessage,
+        vote: BlockVoteGossip,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -661,8 +676,10 @@ impl Action {
     pub fn is_async(&self) -> bool {
         matches!(
             self,
-            Action::BroadcastToShard { .. }
-                | Action::BroadcastGlobal { .. }
+            Action::BroadcastBlockHeader { .. }
+                | Action::BroadcastBlockVote { .. }
+                | Action::BroadcastTransaction { .. }
+                | Action::BroadcastTransactionCertificate { .. }
                 | Action::BroadcastStateVote { .. }
                 | Action::BroadcastStateCertificate { .. }
                 | Action::BroadcastStateProvision { .. }
@@ -724,9 +741,13 @@ impl Action {
     /// Get the action type name for telemetry.
     pub fn type_name(&self) -> &'static str {
         match self {
-            // Network - Generic
-            Action::BroadcastToShard { .. } => "BroadcastToShard",
-            Action::BroadcastGlobal { .. } => "BroadcastGlobal",
+            // Network - BFT Consensus
+            Action::BroadcastBlockHeader { .. } => "BroadcastBlockHeader",
+            Action::BroadcastBlockVote { .. } => "BroadcastBlockVote",
+
+            // Network - Mempool & Certificates
+            Action::BroadcastTransaction { .. } => "BroadcastTransaction",
+            Action::BroadcastTransactionCertificate { .. } => "BroadcastTransactionCertificate",
 
             // Network - Execution Layer (batchable)
             Action::BroadcastStateVote { .. } => "BroadcastStateVote",

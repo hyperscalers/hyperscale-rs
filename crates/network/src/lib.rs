@@ -1,31 +1,26 @@
 //! Shared network protocol logic.
 //!
-//! This crate contains transport-independent protocol components:
+//! This crate contains transport utilities and the `Network` trait:
 //!
+//! - [`traits`]: `Network` trait for typed message sends and listener registration
+//! - [`handler_registry`]: Type-erased handler registry for implementations
 //! - [`wire`]: LZ4 compress/decompress helpers
 //! - [`topic`]: Gossipsub topic builder/parser
 //! - [`codec`]: SBOR encode/decode with topic-based dispatch
-//! - [`sync_protocol`]: Block sync state machine
-//! - [`fetch_protocol`]: Transaction/certificate fetch state machine
 //!
-//! No async runtime dependency. Each runner (production/simulation) drives
-//! the state machines and handles transport-specific I/O.
+//! Sync and fetch protocol state machines live in `hyperscale-node`.
+//!
+//! No async runtime dependency.
 
 pub mod codec;
-pub mod fetch_protocol;
-pub mod sync_protocol;
+pub mod handler_registry;
 pub mod topic;
+pub mod traits;
 pub mod wire;
 
 // Re-export key types
-pub use codec::{
-    decode_and_route, decode_message, encode_message, topic_for_message, CodecError, DecodedMessage,
-};
-pub use fetch_protocol::{
-    FetchConfig, FetchInput, FetchKind, FetchOutput, FetchProtocol, FetchStatus,
-};
-pub use sync_protocol::{
-    SyncConfig, SyncInput, SyncOutput, SyncProtocol, SyncStateKind, SyncStatus,
-};
+pub use codec::{decode_and_route, decode_message, encode_to_wire, CodecError, DecodedMessage};
+pub use handler_registry::HandlerRegistry;
 pub use topic::{ProtocolVersion, Topic};
+pub use traits::{Network, RequestError};
 pub use wire::{compress, decompress, WireError};

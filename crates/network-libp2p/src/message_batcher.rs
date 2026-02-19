@@ -31,11 +31,12 @@
 
 use crate::adapter::{Libp2pAdapter, NetworkError};
 use async_trait::async_trait;
-use hyperscale_core::OutboundMessage;
 use hyperscale_messages::{
     StateCertificateBatch, StateProvisionBatch, StateVoteBatch, TraceContext,
 };
-use hyperscale_types::{ShardGroupId, StateCertificate, StateProvision, StateVoteBlock};
+use hyperscale_types::{
+    MessagePriority, NetworkMessage, ShardGroupId, StateCertificate, StateProvision, StateVoteBlock,
+};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -43,28 +44,30 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, error, trace, warn};
 
-/// Trait for broadcasting messages to a shard group.
+/// Trait for publishing pre-encoded messages to a topic.
 ///
-/// Abstracts the network broadcast capability so `MessageBatcher` doesn't
+/// Abstracts the network publish capability so `MessageBatcher` doesn't
 /// depend on a concrete adapter type.
 #[async_trait]
-pub trait ShardBroadcast: Send + Sync {
-    /// Broadcast a message to all nodes in the given shard group.
-    async fn broadcast_shard(
+pub trait BroadcastNetwork: Send + Sync {
+    /// Publish pre-encoded data to a topic with a given priority.
+    async fn publish(
         &self,
-        shard: ShardGroupId,
-        message: &OutboundMessage,
+        topic: &hyperscale_network::Topic,
+        data: Vec<u8>,
+        priority: MessagePriority,
     ) -> Result<(), NetworkError>;
 }
 
 #[async_trait]
-impl ShardBroadcast for Libp2pAdapter {
-    async fn broadcast_shard(
+impl BroadcastNetwork for Libp2pAdapter {
+    async fn publish(
         &self,
-        shard: ShardGroupId,
-        message: &OutboundMessage,
+        topic: &hyperscale_network::Topic,
+        data: Vec<u8>,
+        priority: MessagePriority,
     ) -> Result<(), NetworkError> {
-        Libp2pAdapter::broadcast_shard(self, shard, message).await
+        Libp2pAdapter::publish(self, topic, data, priority)
     }
 }
 
@@ -329,7 +332,7 @@ impl RetryEntry {
 /// The message batcher task.
 pub struct MessageBatcher {
     config: MessageBatcherConfig,
-    network: Arc<dyn ShardBroadcast>,
+    network: Arc<dyn BroadcastNetwork>,
     stats: Arc<MessageBatcherStats>,
     /// Pending batches by shard.
     pending: HashMap<ShardGroupId, PendingBatch>,
@@ -475,9 +478,13 @@ impl MessageBatcher {
     ) -> Result<usize, String> {
         match batch {
             FailedBatchType::Votes(votes) => {
-                let msg = OutboundMessage::StateVoteBatch(StateVoteBatch::new(votes.clone()));
+                let batch_msg = StateVoteBatch::new(votes.clone());
+                let data =
+                    hyperscale_network::encode_to_wire(&batch_msg).map_err(|e| e.to_string())?;
+                let topic = hyperscale_network::Topic::state_vote_batch(shard);
+                let priority = StateVoteBatch::priority();
                 self.network
-                    .broadcast_shard(shard, &msg)
+                    .publish(&topic, data, priority)
                     .await
                     .map(|_| votes.len())
                     .map_err(|e| e.to_string())
@@ -485,9 +492,12 @@ impl MessageBatcher {
             FailedBatchType::Certificates(certs) => {
                 let mut batch_msg = StateCertificateBatch::new(certs.clone());
                 batch_msg.trace_context = TraceContext::from_current();
-                let msg = OutboundMessage::StateCertificateBatch(batch_msg);
+                let data =
+                    hyperscale_network::encode_to_wire(&batch_msg).map_err(|e| e.to_string())?;
+                let topic = hyperscale_network::Topic::state_certificate_batch(shard);
+                let priority = StateCertificateBatch::priority();
                 self.network
-                    .broadcast_shard(shard, &msg)
+                    .publish(&topic, data, priority)
                     .await
                     .map(|_| certs.len())
                     .map_err(|e| e.to_string())
@@ -495,9 +505,12 @@ impl MessageBatcher {
             FailedBatchType::Provisions(provs) => {
                 let mut batch_msg = StateProvisionBatch::new(provs.clone());
                 batch_msg.trace_context = TraceContext::from_current();
-                let msg = OutboundMessage::StateProvisionBatch(batch_msg);
+                let data =
+                    hyperscale_network::encode_to_wire(&batch_msg).map_err(|e| e.to_string())?;
+                let topic = hyperscale_network::Topic::state_provision_batch(shard);
+                let priority = StateProvisionBatch::priority();
                 self.network
-                    .broadcast_shard(shard, &msg)
+                    .publish(&topic, data, priority)
                     .await
                     .map(|_| provs.len())
                     .map_err(|e| e.to_string())
@@ -613,9 +626,17 @@ impl MessageBatcher {
         // Send votes batch
         if !votes.is_empty() {
             let count = votes.len();
-            let msg = OutboundMessage::StateVoteBatch(StateVoteBatch::new(votes.clone()));
+            let batch_msg = StateVoteBatch::new(votes.clone());
+            let send_result = match hyperscale_network::encode_to_wire(&batch_msg) {
+                Ok(data) => {
+                    let topic = hyperscale_network::Topic::state_vote_batch(shard);
+                    let priority = StateVoteBatch::priority();
+                    self.network.publish(&topic, data, priority).await
+                }
+                Err(e) => Err(NetworkError::CodecError(e)),
+            };
 
-            if let Err(e) = self.network.broadcast_shard(shard, &msg).await {
+            if let Err(e) = send_result {
                 self.stats
                     .broadcast_failures
                     .fetch_add(1, Ordering::Relaxed);
@@ -640,9 +661,16 @@ impl MessageBatcher {
             let count = certificates.len();
             let mut batch_msg = StateCertificateBatch::new(certificates.clone());
             batch_msg.trace_context = TraceContext::from_current();
-            let msg = OutboundMessage::StateCertificateBatch(batch_msg);
+            let send_result = match hyperscale_network::encode_to_wire(&batch_msg) {
+                Ok(data) => {
+                    let topic = hyperscale_network::Topic::state_certificate_batch(shard);
+                    let priority = StateCertificateBatch::priority();
+                    self.network.publish(&topic, data, priority).await
+                }
+                Err(e) => Err(NetworkError::CodecError(e)),
+            };
 
-            if let Err(e) = self.network.broadcast_shard(shard, &msg).await {
+            if let Err(e) = send_result {
                 self.stats
                     .broadcast_failures
                     .fetch_add(1, Ordering::Relaxed);
@@ -667,9 +695,16 @@ impl MessageBatcher {
             let count = provisions.len();
             let mut batch_msg = StateProvisionBatch::new(provisions.clone());
             batch_msg.trace_context = TraceContext::from_current();
-            let msg = OutboundMessage::StateProvisionBatch(batch_msg);
+            let send_result = match hyperscale_network::encode_to_wire(&batch_msg) {
+                Ok(data) => {
+                    let topic = hyperscale_network::Topic::state_provision_batch(shard);
+                    let priority = StateProvisionBatch::priority();
+                    self.network.publish(&topic, data, priority).await
+                }
+                Err(e) => Err(NetworkError::CodecError(e)),
+            };
 
-            if let Err(e) = self.network.broadcast_shard(shard, &msg).await {
+            if let Err(e) = send_result {
                 self.stats
                     .broadcast_failures
                     .fetch_add(1, Ordering::Relaxed);
@@ -701,7 +736,7 @@ impl MessageBatcher {
 /// Returns a handle that can be used to queue messages.
 pub fn spawn_message_batcher(
     config: MessageBatcherConfig,
-    network: Arc<impl ShardBroadcast + 'static>,
+    network: Arc<impl BroadcastNetwork + 'static>,
 ) -> MessageBatcherHandle {
     let stats = Arc::new(MessageBatcherStats::default());
     let (tx, rx) = mpsc::unbounded_channel();

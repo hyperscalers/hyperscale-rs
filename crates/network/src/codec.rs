@@ -15,13 +15,13 @@
 
 use crate::wire;
 use crate::Topic;
-use hyperscale_core::{Event, OutboundMessage};
+use hyperscale_core::Event;
 use hyperscale_messages::gossip::{
     BlockHeaderGossip, BlockVoteGossip, StateCertificateBatch, StateProvisionBatch, StateVoteBatch,
     TransactionCertificateGossip, TransactionGossip,
 };
 use hyperscale_messages::TraceContext;
-use hyperscale_types::{RoutableTransaction, ShardGroupId};
+use hyperscale_types::RoutableTransaction;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::{trace, warn};
@@ -45,24 +45,13 @@ pub enum CodecError {
     UnknownTopic(String),
 }
 
-fn sbor_encode<T: sbor::BasicEncode>(value: &T) -> Result<Vec<u8>, CodecError> {
-    sbor::basic_encode(value).map_err(|e| CodecError::SborEncode(format!("{:?}", e)))
-}
-
-/// Encode an outbound message to wire format.
+/// Encode a value to wire format (SBOR + LZ4 compression).
 ///
-/// SBOR-encodes the message then LZ4-compresses it.
-pub fn encode_message(message: &OutboundMessage) -> Result<Vec<u8>, CodecError> {
-    let sbor_bytes = match message {
-        OutboundMessage::BlockHeader(gossip) => sbor_encode(gossip.as_ref())?,
-        OutboundMessage::BlockVote(gossip) => sbor_encode(gossip)?,
-        OutboundMessage::StateProvisionBatch(batch) => sbor_encode(batch)?,
-        OutboundMessage::StateVoteBatch(batch) => sbor_encode(batch)?,
-        OutboundMessage::StateCertificateBatch(batch) => sbor_encode(batch)?,
-        OutboundMessage::TransactionCertificateGossip(gossip) => sbor_encode(gossip)?,
-        OutboundMessage::TransactionGossip(gossip) => sbor_encode(gossip.as_ref())?,
-    };
-
+/// This is a generic helper that SBOR-encodes any `BasicEncode` type then
+/// LZ4-compresses the result.
+pub fn encode_to_wire<T: sbor::BasicEncode>(value: &T) -> Result<Vec<u8>, CodecError> {
+    let sbor_bytes =
+        sbor::basic_encode(value).map_err(|e| CodecError::SborEncode(format!("{:?}", e)))?;
     Ok(wire::compress(&sbor_bytes))
 }
 
@@ -199,19 +188,6 @@ pub fn decode_message(parsed_topic: &Topic, data: &[u8]) -> Result<DecodedMessag
     }
 }
 
-/// Get the topic for an outbound message.
-pub fn topic_for_message(message: &OutboundMessage, shard: ShardGroupId) -> Topic {
-    match message {
-        OutboundMessage::BlockHeader(_) => Topic::block_header(shard),
-        OutboundMessage::BlockVote(_) => Topic::block_vote(shard),
-        OutboundMessage::StateProvisionBatch(_) => Topic::state_provision_batch(shard),
-        OutboundMessage::StateVoteBatch(_) => Topic::state_vote_batch(shard),
-        OutboundMessage::StateCertificateBatch(_) => Topic::state_certificate_batch(shard),
-        OutboundMessage::TransactionCertificateGossip(_) => Topic::transaction_certificate(shard),
-        OutboundMessage::TransactionGossip(_) => Topic::transaction_gossip(shard),
-    }
-}
-
 /// Decode a gossipsub message and route the resulting events.
 ///
 /// Transaction gossips are routed to `tx_sink`; all other consensus events
@@ -258,7 +234,7 @@ pub fn decode_and_route(
 mod tests {
     use super::*;
     use hyperscale_types::{
-        BlockHeader, BlockHeight, BlockVote, Hash, QuorumCertificate, ValidatorId,
+        BlockHeader, BlockHeight, BlockVote, Hash, QuorumCertificate, ShardGroupId, ValidatorId,
     };
     use std::collections::HashMap;
 
@@ -290,9 +266,8 @@ mod tests {
             aborted: vec![],
             commitment_proofs: HashMap::new(),
         };
-        let message = OutboundMessage::BlockHeader(Box::new(gossip));
 
-        let bytes = encode_message(&message).unwrap();
+        let bytes = encode_to_wire(&gossip).unwrap();
         assert!(!bytes.is_empty());
 
         let topic_str = "hyperscale/block.header/shard-0/1.0.0";
@@ -325,9 +300,8 @@ mod tests {
             timestamp: 0,
         };
         let gossip = BlockVoteGossip { vote: vote.clone() };
-        let message = OutboundMessage::BlockVote(gossip);
 
-        let bytes = encode_message(&message).unwrap();
+        let bytes = encode_to_wire(&gossip).unwrap();
         let topic_str = "hyperscale/block.vote/shard-0/1.0.0";
         let topic = Topic::parse(topic_str).unwrap();
         let decoded = decode_message(&topic, &bytes).unwrap();
@@ -362,21 +336,8 @@ mod tests {
     }
 
     #[test]
-    fn test_topic_for_message() {
-        let header = make_block_header();
-        let gossip = BlockHeaderGossip {
-            header,
-            retry_hashes: vec![],
-            priority_hashes: vec![],
-            transaction_hashes: vec![],
-            certificate_hashes: vec![],
-            deferred: vec![],
-            aborted: vec![],
-            commitment_proofs: HashMap::new(),
-        };
-        let message = OutboundMessage::BlockHeader(Box::new(gossip));
-
-        let topic = topic_for_message(&message, ShardGroupId(5));
+    fn test_topic_construction() {
+        let topic = Topic::block_header(ShardGroupId(5));
         assert_eq!(topic.to_string(), "hyperscale/block.header/shard-5/1.0.0");
     }
 }

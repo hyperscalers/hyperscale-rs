@@ -23,7 +23,7 @@ use hyperscale_storage_rocksdb::RocksDbStorage;
 use hyperscale_types::BlockHeight;
 use quick_cache::sync::Cache as QuickCache;
 
-use hyperscale_core::{Action, Event, OutboundMessage, StateMachine};
+use hyperscale_core::{Action, Event, StateMachine};
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
     batch_verify_bls_different_messages, zero_bls_signature, Block, BlockHeader,
@@ -1984,16 +1984,10 @@ impl ProductionRunner {
                     // This ensures other validators see the transaction even if we fail later
                     let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(&tx));
                     for shard in self.topology.all_shards_for_transaction(&tx) {
-                        let mut message = OutboundMessage::TransactionGossip(Box::new(gossip.clone()));
-                        message.inject_trace_context();
-                        if let Err(e) = self.network.broadcast_shard(shard, &message).await {
-                            tracing::warn!(
-                                ?shard,
-                                tx_hash = ?tx.hash(),
-                                error = ?e,
-                                "Failed to gossip RPC transaction to shard"
-                            );
-                        }
+                        let _ = self.dispatch_tx.send(DispatchableAction::BroadcastTransaction {
+                            shard,
+                            gossip: Box::new(gossip.clone()),
+                        });
                     }
 
                     // Step 2: Submit to batcher for validation
@@ -2052,24 +2046,28 @@ impl ProductionRunner {
         match action {
             // Network I/O - dispatch to action dispatcher task (fire-and-forget)
             // This prevents network latency from blocking the event loop.
-            Action::BroadcastToShard { shard, mut message } => {
-                // Inject trace context for cross-shard messages (no-op if feature disabled)
-                message.inject_trace_context();
-
-                // Dispatch to action dispatcher (unbounded channel - never blocks or drops)
+            Action::BroadcastBlockHeader { shard, header } => {
                 let _ = self
                     .dispatch_tx
-                    .send(DispatchableAction::BroadcastToShard { shard, message });
+                    .send(DispatchableAction::BroadcastBlockHeader { shard, header });
             }
 
-            Action::BroadcastGlobal { mut message } => {
-                // Inject trace context for cross-shard messages (no-op if feature disabled)
-                message.inject_trace_context();
-
-                // Dispatch to action dispatcher (unbounded channel - never blocks or drops)
+            Action::BroadcastBlockVote { shard, vote } => {
                 let _ = self
                     .dispatch_tx
-                    .send(DispatchableAction::BroadcastGlobal { message });
+                    .send(DispatchableAction::BroadcastBlockVote { shard, vote });
+            }
+
+            Action::BroadcastTransaction { shard, gossip } => {
+                let _ = self
+                    .dispatch_tx
+                    .send(DispatchableAction::BroadcastTransaction { shard, gossip });
+            }
+
+            Action::BroadcastTransactionCertificate { shard, gossip } => {
+                let _ = self
+                    .dispatch_tx
+                    .send(DispatchableAction::BroadcastTransactionCertificate { shard, gossip });
             }
 
             // Domain-specific execution broadcasts - dispatch to action dispatcher
@@ -2836,10 +2834,12 @@ impl ProductionRunner {
                 if certificate.shard_proofs.len() > 1 {
                     let gossip =
                         hyperscale_messages::TransactionCertificateGossip::new(certificate);
-                    let _ = self.dispatch_tx.send(DispatchableAction::BroadcastToShard {
-                        shard: local_shard,
-                        message: OutboundMessage::TransactionCertificateGossip(gossip),
-                    });
+                    let _ = self.dispatch_tx.send(
+                        DispatchableAction::BroadcastTransactionCertificate {
+                            shard: local_shard,
+                            gossip,
+                        },
+                    );
                 }
             }
 
@@ -2848,7 +2848,7 @@ impl ProductionRunner {
                 round,
                 block_hash,
                 shard,
-                message,
+                vote,
             } => {
                 // **BFT Safety Critical**: Must persist before broadcasting vote
                 // Prevents equivocation after crash/restart.
@@ -2867,7 +2867,7 @@ impl ProductionRunner {
                     // After persist completes, send broadcast to action dispatcher
                     // This ensures persist-before-broadcast ordering without blocking the event loop
                     let _ =
-                        dispatch_tx.send(DispatchableAction::BroadcastToShard { shard, message });
+                        dispatch_tx.send(DispatchableAction::BroadcastBlockVote { shard, vote });
                 });
                 // Note: No .await - we don't block the event loop
             }
@@ -3508,15 +3508,12 @@ impl ProductionRunner {
         // Gossip to all relevant shards first
         let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(&tx));
         for shard in self.topology.all_shards_for_transaction(&tx) {
-            let mut message = OutboundMessage::TransactionGossip(Box::new(gossip.clone()));
-            message.inject_trace_context();
-            if let Err(e) = self.network.broadcast_shard(shard, &message).await {
-                tracing::warn!(
-                    ?shard,
-                    error = ?e,
-                    "Failed to gossip transaction to shard"
-                );
-            }
+            let _ = self
+                .dispatch_tx
+                .send(DispatchableAction::BroadcastTransaction {
+                    shard,
+                    gossip: Box::new(gossip.clone()),
+                });
         }
 
         // Submit to batcher for validation

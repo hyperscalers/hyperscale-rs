@@ -30,7 +30,7 @@ pub use config::{Libp2pConfig, VersionInteroperabilityMode};
 pub use inbound::InboundHandlerConfig as InboundRouterConfig;
 pub use inbound_router::{InboundRouter, InboundRouterHandle};
 pub use message_batcher::{
-    spawn_message_batcher, MessageBatcherConfig, MessageBatcherHandle, ShardBroadcast,
+    spawn_message_batcher, BroadcastNetwork, MessageBatcherConfig, MessageBatcherHandle,
 };
 pub use peer_health::{PeerHealth, PeerHealthConfig, PeerHealthStats, PeerHealthTracker};
 pub use request_manager::{

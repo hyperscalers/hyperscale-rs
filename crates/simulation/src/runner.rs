@@ -8,13 +8,13 @@ use crate::event_queue::EventKey;
 use crate::NodeIndex;
 use crate::SimStorage;
 use hyperscale_bft::{BftConfig, RecoveredState};
-use hyperscale_core::{Action, Event, OutboundMessage, StateMachine, TimerId};
+use hyperscale_core::{Action, Event, StateMachine, TimerId};
 use hyperscale_engine::RadixExecutor;
 use hyperscale_execution::{DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_network::{SyncConfig, SyncInput, SyncOutput, SyncProtocol};
 use hyperscale_network_memory::{NetworkConfig, NetworkTrafficAnalyzer, SimulatedNetwork};
 use hyperscale_node::NodeStateMachine;
+use hyperscale_node::{SyncConfig, SyncInput, SyncOutput, SyncProtocol};
 use hyperscale_storage::{CommitStore, ConsensusStore};
 use hyperscale_types::{
     bls_keypair_from_seed, Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, Hash as TxHash,
@@ -25,7 +25,6 @@ use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{Hash, Hasher}; // Used by compute_dedup_key
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
@@ -82,10 +81,6 @@ pub struct SimulationRunner {
 
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
-
-    /// Seen message cache for deduplication (matches libp2p gossipsub behavior).
-    /// Key is hash of (recipient, message_hash) to deduplicate per-node.
-    seen_messages: HashSet<u64>,
 
     /// Per-node sync protocol state machines. One per node.
     sync_protocols: Vec<SyncProtocol>,
@@ -252,7 +247,6 @@ impl SimulationRunner {
             node_keys: keys,
             genesis_executed,
             traffic_analyzer: None,
-            seen_messages: HashSet::new(),
             sync_protocols: (0..num_nodes)
                 .map(|_| SyncProtocol::new(SyncConfig::default()))
                 .collect(),
@@ -635,13 +629,12 @@ impl SimulationRunner {
             // not the state machine.
             if let Event::SubmitTransaction { ref tx } = event {
                 let topology = self.nodes[node_index as usize].topology();
-                let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(tx));
                 for shard in topology.all_shards_for_transaction(tx) {
-                    let message = OutboundMessage::TransactionGossip(Box::new(gossip.clone()));
+                    let event = Event::TransactionGossipReceived { tx: Arc::clone(tx) };
                     let peers = self.network.peers_in_shard(shard);
                     for to in peers {
                         if to != node_index {
-                            self.try_deliver_message(node_index, to, &message);
+                            self.try_deliver_event(node_index, to, event.clone());
                         }
                     }
                 }
@@ -717,19 +710,57 @@ impl SimulationRunner {
     /// Process an action from a node.
     fn process_action(&mut self, from: NodeIndex, action: Action) {
         match action {
-            Action::BroadcastToShard { shard, message } => {
+            Action::BroadcastBlockHeader { shard, header } => {
+                let event = Event::BlockHeaderReceived {
+                    header: header.header.clone(),
+                    retry_hashes: header.retry_hashes.clone(),
+                    priority_hashes: header.priority_hashes.clone(),
+                    tx_hashes: header.transaction_hashes.clone(),
+                    cert_hashes: header.certificate_hashes.clone(),
+                    deferred: header.deferred.clone(),
+                    aborted: header.aborted.clone(),
+                    commitment_proofs: header.commitment_proofs.clone(),
+                };
                 let peers = self.network.peers_in_shard(shard);
                 for to in peers {
                     if to != from {
-                        self.try_deliver_message(from, to, &message);
+                        self.try_deliver_event(from, to, event.clone());
                     }
                 }
             }
 
-            Action::BroadcastGlobal { message } => {
-                for to in self.network.all_nodes() {
+            Action::BroadcastBlockVote { shard, vote } => {
+                let event = Event::BlockVoteReceived {
+                    vote: vote.vote.clone(),
+                };
+                let peers = self.network.peers_in_shard(shard);
+                for to in peers {
                     if to != from {
-                        self.try_deliver_message(from, to, &message);
+                        self.try_deliver_event(from, to, event.clone());
+                    }
+                }
+            }
+
+            Action::BroadcastTransaction { shard, gossip } => {
+                let event = Event::TransactionGossipReceived {
+                    tx: Arc::clone(&gossip.transaction),
+                };
+                let peers = self.network.peers_in_shard(shard);
+                for to in peers {
+                    if to != from {
+                        self.try_deliver_event(from, to, event.clone());
+                    }
+                }
+            }
+
+            Action::BroadcastTransactionCertificate { shard, gossip } => {
+                let event = Event::TransactionCertificateReceived {
+                    certificate: gossip.certificate.clone(),
+                };
+                let peers = self.network.peers_in_shard(shard);
+                for to in peers {
+                    if to != from {
+                        self.try_deliver_event(from, to, event.clone());
                     }
                 }
             }
@@ -907,13 +938,13 @@ impl SimulationRunner {
                 // After persisting, gossip certificate to same-shard peers.
                 // This ensures other validators have the certificate before the proposer
                 // includes it in a block, avoiding fetch delays.
-                let gossip =
-                    hyperscale_messages::TransactionCertificateGossip::new(certificate.clone());
-                let message = OutboundMessage::TransactionCertificateGossip(gossip);
+                let event = Event::TransactionCertificateReceived {
+                    certificate: certificate.clone(),
+                };
                 let peers = self.network.peers_in_shard(local_shard);
                 for to in peers {
                     if to != from {
-                        self.try_deliver_message(from, to, &message);
+                        self.try_deliver_event(from, to, event.clone());
                     }
                 }
             }
@@ -922,7 +953,7 @@ impl SimulationRunner {
                 round,
                 block_hash,
                 shard,
-                message,
+                vote,
             } => {
                 // **BFT Safety Critical**: Store our vote before broadcasting.
                 // This ensures we remember what we voted for after a restart.
@@ -937,7 +968,7 @@ impl SimulationRunner {
                 );
 
                 // Now broadcast the vote (simulated immediately after persist)
-                let broadcast_action = Action::BroadcastToShard { shard, message };
+                let broadcast_action = Action::BroadcastBlockVote { shard, vote };
                 self.process_action(from, broadcast_action);
             }
             // Storage reads - immediately return callback events in simulation
@@ -1350,67 +1381,7 @@ impl SimulationRunner {
         key
     }
 
-    /// Compute deduplication key for a (recipient, message) pair.
-    /// Each node maintains its own deduplication, so we include the recipient.
-    fn compute_dedup_key(to: NodeIndex, message_hash: u64) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        to.hash(&mut hasher);
-        message_hash.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    /// Try to deliver a message, accounting for partitions, packet loss, and deduplication.
-    /// Updates stats based on delivery outcome.
-    fn try_deliver_message(&mut self, from: NodeIndex, to: NodeIndex, message: &OutboundMessage) {
-        // Check partition first (deterministic - doesn't consume RNG)
-        if self.network.is_partitioned(from, to) {
-            self.stats.messages_dropped_partition += 1;
-            trace!(from = from, to = to, "Message dropped due to partition");
-            return;
-        }
-
-        // Check packet loss (probabilistic but deterministic with seeded RNG)
-        if self.network.should_drop_packet(&mut self.rng) {
-            self.stats.messages_dropped_loss += 1;
-            trace!(from = from, to = to, "Message dropped due to packet loss");
-            return;
-        }
-
-        // Check deduplication (matches libp2p gossipsub behavior)
-        // Uses OutboundMessage::message_hash() which hashes encoded message data
-        let message_hash = message.message_hash();
-        let dedup_key = Self::compute_dedup_key(to, message_hash);
-        if !self.seen_messages.insert(dedup_key) {
-            // Message already seen by this recipient - deduplicate
-            self.stats.messages_deduplicated += 1;
-            trace!(
-                from = from,
-                to = to,
-                message_type = message.type_name(),
-                "Message deduplicated (already seen)"
-            );
-            return;
-        }
-
-        // Record traffic for bandwidth analysis (if enabled)
-        if let Some(ref analyzer) = self.traffic_analyzer {
-            let (payload_size, wire_size) = message.encoded_size();
-            analyzer.record_message(message.type_name(), payload_size, wire_size, from, to);
-        }
-
-        // Message will be delivered - sample latency and schedule
-        // Batched messages expand to multiple events
-        let events = message.to_received_events();
-        let latency = self.network.sample_latency(from, to, &mut self.rng);
-        let delivery_time = self.now + latency;
-        for event in events {
-            self.schedule_event(to, delivery_time, event);
-        }
-        self.stats.messages_sent += 1;
-    }
-
     /// Try to deliver an event directly, accounting for partitions and packet loss.
-    /// Used for domain-specific actions that don't go through OutboundMessage.
     fn try_deliver_event(&mut self, from: NodeIndex, to: NodeIndex, event: Event) {
         // Check partition first (deterministic - doesn't consume RNG)
         if self.network.is_partitioned(from, to) {

@@ -30,8 +30,8 @@
 //!     │  (Fire-and-Forget Network I/O)                                  │
 //!     │                                                                 │
 //!     │  Handles network broadcasts:                                    │
-//!     │  - BroadcastToShard (block proposals, votes)                    │
-//!     │  - BroadcastGlobal (cross-shard messages)                       │
+//!     │  - BroadcastBlockHeader, BroadcastBlockVote                     │
+//!     │  - BroadcastTransaction, BroadcastTransactionCertificate        │
 //!     │  - Batched execution messages (votes, certs, provisions)        │
 //!     └─────────────────────────────────────────────────────────────────┘
 //! ```
@@ -44,8 +44,7 @@
 
 use crate::adapter::Libp2pAdapter;
 use crate::message_batcher::MessageBatcherHandle;
-use hyperscale_core::OutboundMessage;
-use hyperscale_types::ShardGroupId;
+use hyperscale_types::{NetworkMessage, ShardGroupId};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, trace, warn};
@@ -56,14 +55,29 @@ use tracing::{info, trace, warn};
 /// or synchronous completion.
 #[derive(Debug)]
 pub enum DispatchableAction {
-    /// Broadcast a message to a specific shard.
-    BroadcastToShard {
+    /// Broadcast a block header to a specific shard.
+    BroadcastBlockHeader {
         shard: ShardGroupId,
-        message: OutboundMessage,
+        header: Box<hyperscale_messages::BlockHeaderGossip>,
     },
 
-    /// Broadcast a message globally.
-    BroadcastGlobal { message: OutboundMessage },
+    /// Broadcast a block vote to a specific shard.
+    BroadcastBlockVote {
+        shard: ShardGroupId,
+        vote: hyperscale_messages::BlockVoteGossip,
+    },
+
+    /// Broadcast a transaction to a specific shard.
+    BroadcastTransaction {
+        shard: ShardGroupId,
+        gossip: Box<hyperscale_messages::TransactionGossip>,
+    },
+
+    /// Broadcast a transaction certificate to a specific shard.
+    BroadcastTransactionCertificate {
+        shard: ShardGroupId,
+        gossip: hyperscale_messages::TransactionCertificateGossip,
+    },
 
     /// Queue a state vote for batched broadcast.
     QueueStateVote {
@@ -149,35 +163,53 @@ async fn run_action_dispatcher(
     info!("Action dispatcher task shutting down (channel closed)");
 }
 
+/// Encode a message and publish it to the network.
+fn encode_and_publish<T: sbor::BasicEncode + NetworkMessage>(
+    context: &ActionDispatcherContext,
+    topic: &hyperscale_network::Topic,
+    value: &T,
+) -> Result<(), ActionDispatchError> {
+    let data = hyperscale_network::encode_to_wire(value)
+        .map_err(|e| ActionDispatchError::Network(e.to_string()))?;
+    let priority = T::priority();
+    context
+        .network
+        .publish(topic, data, priority)
+        .map_err(|e| ActionDispatchError::Network(e.to_string()))?;
+    Ok(())
+}
+
 /// Process a single dispatched action.
 async fn process_dispatched_action(
     action: &DispatchableAction,
     context: &ActionDispatcherContext,
 ) -> Result<(), ActionDispatchError> {
     match action {
-        DispatchableAction::BroadcastToShard { shard, message } => {
-            trace!(
-                ?shard,
-                msg_type = message.type_name(),
-                "Dispatching broadcast to shard"
-            );
-            context
-                .network
-                .broadcast_shard(*shard, message)
-                .await
-                .map_err(|e| ActionDispatchError::Network(e.to_string()))?;
+        DispatchableAction::BroadcastBlockHeader { shard, header } => {
+            trace!(?shard, "Dispatching block header broadcast to shard");
+            let topic = hyperscale_network::Topic::block_header(*shard);
+            encode_and_publish(context, &topic, header.as_ref())?;
         }
 
-        DispatchableAction::BroadcastGlobal { message } => {
+        DispatchableAction::BroadcastBlockVote { shard, vote } => {
+            trace!(?shard, "Dispatching block vote broadcast to shard");
+            let topic = hyperscale_network::Topic::block_vote(*shard);
+            encode_and_publish(context, &topic, vote)?;
+        }
+
+        DispatchableAction::BroadcastTransaction { shard, gossip } => {
+            trace!(?shard, "Dispatching transaction broadcast to shard");
+            let topic = hyperscale_network::Topic::transaction_gossip(*shard);
+            encode_and_publish(context, &topic, gossip.as_ref())?;
+        }
+
+        DispatchableAction::BroadcastTransactionCertificate { shard, gossip } => {
             trace!(
-                msg_type = message.type_name(),
-                "Dispatching global broadcast"
+                ?shard,
+                "Dispatching transaction certificate broadcast to shard"
             );
-            context
-                .network
-                .broadcast_global(message)
-                .await
-                .map_err(|e| ActionDispatchError::Network(e.to_string()))?;
+            let topic = hyperscale_network::Topic::transaction_certificate(*shard);
+            encode_and_publish(context, &topic, gossip)?;
         }
 
         DispatchableAction::QueueStateVote { shard, vote } => {

@@ -1,6 +1,6 @@
 //! Mempool state.
 
-use hyperscale_core::{Action, OutboundMessage, TransactionStatus};
+use hyperscale_core::{Action, TransactionStatus};
 use hyperscale_types::{
     AbortReason, Block, BlockHeight, DeferReason, Hash, NodeId, ReadyTransactions,
     RoutableTransaction, Topology, TransactionAbort, TransactionDecision,
@@ -407,9 +407,9 @@ impl MempoolState {
 
         shards
             .into_iter()
-            .map(|shard| Action::BroadcastToShard {
+            .map(|shard| Action::BroadcastTransaction {
                 shard,
-                message: OutboundMessage::TransactionGossip(Box::new(gossip.clone())),
+                gossip: Box::new(gossip.clone()),
             })
             .collect()
     }
