@@ -34,6 +34,7 @@ mod runner;
 pub use hyperscale_network_memory::{
     BandwidthReport, NetworkConfig, NetworkTrafficAnalyzer, SimulatedNetwork,
 };
+pub use hyperscale_node::TimerOp;
 pub use hyperscale_storage_memory::SimStorage;
 pub use runner::SimulationRunner;
 

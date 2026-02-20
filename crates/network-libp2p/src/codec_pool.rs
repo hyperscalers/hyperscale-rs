@@ -24,14 +24,13 @@
 //! decode work is spawned to the shared codec pool which sends results directly to
 //! the consensus channel.
 
-use hyperscale_core::{Event, TransactionSink};
+use hyperscale_core::Event;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network::{decode_and_route, Topic};
 use libp2p::PeerId as Libp2pPeerId;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tracing::warn;
 
 /// Handle for async message encoding/decoding using a dispatch implementation.
@@ -68,26 +67,20 @@ impl<D: Dispatch> CodecPoolHandle<D> {
     /// * `topic` - The parsed gossipsub topic (determines message type)
     /// * `data` - Raw message bytes from the network
     /// * `propagation_source` - Peer that sent the message (for logging)
-    /// * `consensus_tx` - Channel to send decoded events to
-    /// * `tx_sink` - Sink for submitting decoded transactions to the validation pipeline
+    /// * `consensus_tx` - Crossbeam channel to send decoded events to
     pub fn decode_async(
         &self,
         topic: Topic,
         data: Vec<u8>,
         propagation_source: Libp2pPeerId,
-        consensus_tx: mpsc::Sender<Event>,
-        tx_sink: Arc<dyn TransactionSink>,
+        consensus_tx: crossbeam::channel::Sender<Event>,
     ) {
         self.dispatch.spawn_codec(move || {
             let peer_label = propagation_source.to_string();
 
-            let result = decode_and_route(
-                &topic,
-                &data,
-                &peer_label,
-                &|event| consensus_tx.try_send(event).is_ok(),
-                &|tx| tx_sink.submit(tx),
-            );
+            let result = decode_and_route(&topic, &data, &peer_label, &|event| {
+                consensus_tx.send(event).is_ok()
+            });
 
             match result {
                 Ok(()) => {

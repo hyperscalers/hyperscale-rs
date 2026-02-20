@@ -28,7 +28,6 @@ members = [
     "crates/storage-rocksdb",
     "crates/test-helpers",
     "crates/types",
-    "crates/validation",
 ]
 
 default-members = [
@@ -59,7 +58,6 @@ default-members = [
     "crates/storage-rocksdb",
     "crates/test-helpers",
     "crates/types",
-    "crates/validation",
 ]
 
 [workspace.package]
@@ -95,7 +93,6 @@ hyperscale-simulator = { path = "crates/simulator" }
 hyperscale-spammer = { path = "crates/spammer" }
 hyperscale-test-helpers = { path = "crates/test-helpers" }
 hyperscale-types = { path = "crates/types" }
-hyperscale-validation = { path = "crates/validation" }
 
 # External dependencies
 im = "15.1"

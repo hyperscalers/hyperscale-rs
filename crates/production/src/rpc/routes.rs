@@ -44,14 +44,14 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Instant;
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     fn create_test_state() -> RpcState {
-        let (tx_submission_tx, _rx) = mpsc::unbounded_channel();
+        let (tx_submission_tx, _rx) = crossbeam::channel::unbounded();
         RpcState {
             ready: Arc::new(AtomicBool::new(true)),
-            sync_status: Arc::new(ArcSwap::new(Arc::new(crate::sync::SyncStatus::default()))),
+            sync_status: Arc::new(ArcSwap::new(Arc::new(crate::status::SyncStatus::default()))),
             node_status: Arc::new(RwLock::new(NodeStatusState {
                 validator_id: 1,
                 shard: 0,

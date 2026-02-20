@@ -11,6 +11,7 @@
 //! Runner ──► FetchProtocol::handle(FetchInput) ──► Vec<FetchOutput>
 //! ```
 
+use hyperscale_metrics as metrics;
 use hyperscale_types::{Hash, RoutableTransaction, TransactionCertificate, ValidatorId};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -307,6 +308,7 @@ impl FetchProtocol {
             proposer = proposer.0,
             "Starting transaction fetch"
         );
+        metrics::record_fetch_started("transaction");
 
         let state = BlockFetchState::new(proposer, tx_hashes);
         self.tx_fetches.insert(block_hash, state);
@@ -338,6 +340,7 @@ impl FetchProtocol {
             proposer = proposer.0,
             "Starting certificate fetch"
         );
+        metrics::record_fetch_started("certificate");
 
         let state = BlockFetchState::new(proposer, cert_hashes);
         self.cert_fetches.insert(block_hash, state);
@@ -359,6 +362,7 @@ impl FetchProtocol {
         let received_hashes: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
         let received_count = received_hashes.len();
         state.mark_received(received_hashes);
+        metrics::record_fetch_items_received("transaction", received_count);
 
         info!(
             ?block_hash,
@@ -378,6 +382,7 @@ impl FetchProtocol {
 
         if state.is_complete() {
             info!(?block_hash, "Transaction fetch complete");
+            metrics::record_fetch_completed("transaction");
             self.tx_fetches.remove(&block_hash);
         }
 
@@ -399,6 +404,7 @@ impl FetchProtocol {
         let received_hashes: Vec<Hash> = certificates.iter().map(|c| c.transaction_hash).collect();
         let received_count = received_hashes.len();
         state.mark_received(received_hashes);
+        metrics::record_fetch_items_received("certificate", received_count);
 
         info!(
             ?block_hash,
@@ -418,6 +424,7 @@ impl FetchProtocol {
 
         if state.is_complete() {
             info!(?block_hash, "Certificate fetch complete");
+            metrics::record_fetch_completed("certificate");
             self.cert_fetches.remove(&block_hash);
         }
 
@@ -437,6 +444,7 @@ impl FetchProtocol {
 
         if let Some(state) = state {
             state.mark_fetch_failed(&hashes);
+            metrics::record_fetch_failed(kind.as_str());
         }
 
         vec![]

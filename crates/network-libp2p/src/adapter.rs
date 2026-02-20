@@ -11,7 +11,7 @@ use crate::config::{Libp2pConfig, VersionInteroperabilityMode};
 use dashmap::DashMap;
 use futures::future::Either;
 use futures::{FutureExt, StreamExt};
-use hyperscale_core::{Event, TransactionSink};
+use hyperscale_core::Event;
 use hyperscale_metrics as metrics;
 use hyperscale_network::{CodecError, Topic};
 use hyperscale_types::{Bls12381G1PublicKey, MessagePriority, ShardGroupId, ValidatorId};
@@ -292,7 +292,7 @@ pub struct Libp2pAdapter {
 
     /// Consensus event channel for high-priority BFT messages (sent to runner).
     #[allow(dead_code)]
-    consensus_tx: mpsc::Sender<Event>,
+    consensus_tx: crossbeam::channel::Sender<Event>,
 
     /// Known validators (ValidatorId -> PeerId).
     /// Built from Topology at startup.
@@ -327,21 +327,18 @@ impl Libp2pAdapter {
     /// * `keypair` - Ed25519 keypair for libp2p identity (derived from validator key)
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
-    /// * `consensus_tx` - Channel for high-priority consensus events (BFT messages)
-    /// * `tx_sink` - Sink for submitting decoded transactions to the validation pipeline
+    /// * `consensus_tx` - Crossbeam channel for all decoded events (consensus + transactions)
     /// * `codec_pool` - Handle for async message encoding/decoding
     ///
     /// # Returns
     ///
     /// The adapter wrapped in an Arc for shared ownership.
-    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: Libp2pConfig,
         keypair: identity::Keypair,
         validator_id: ValidatorId,
         shard: ShardGroupId,
-        consensus_tx: mpsc::Sender<Event>,
-        tx_sink: Arc<dyn TransactionSink>,
+        consensus_tx: crossbeam::channel::Sender<Event>,
         codec_pool: CodecPoolHandle,
     ) -> Result<Arc<Self>, NetworkError> {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
@@ -610,7 +607,6 @@ impl Libp2pAdapter {
                 shutdown_rx,
                 cached_peer_count,
                 shard,
-                tx_sink,
                 config.version_interop_mode,
                 codec_pool,
             ))
@@ -829,12 +825,11 @@ impl Libp2pAdapter {
         mut finalization_rx: mpsc::UnboundedReceiver<SwarmCommand>,
         mut propagation_rx: mpsc::UnboundedReceiver<SwarmCommand>,
         mut background_rx: mpsc::UnboundedReceiver<SwarmCommand>,
-        consensus_tx: mpsc::Sender<Event>,
+        consensus_tx: crossbeam::channel::Sender<Event>,
         peer_validators: Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         mut shutdown_rx: mpsc::Receiver<()>,
         cached_peer_count: Arc<AtomicUsize>,
         local_shard: ShardGroupId,
-        tx_sink: Arc<dyn TransactionSink>,
         version_interop_mode: VersionInteroperabilityMode,
         codec_pool: CodecPoolHandle,
     ) {
@@ -1135,7 +1130,6 @@ impl Libp2pAdapter {
                         &consensus_tx,
                         &peer_validators,
                         local_shard,
-                        &tx_sink,
                         &codec_pool,
                     ).await;
 
@@ -1270,10 +1264,9 @@ impl Libp2pAdapter {
     /// Outbound requests are handled via raw streams by RequestManager.
     async fn handle_swarm_event(
         event: SwarmEvent<BehaviourEvent>,
-        consensus_tx: &mpsc::Sender<Event>,
+        consensus_tx: &crossbeam::channel::Sender<Event>,
         peer_validators: &Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         local_shard: ShardGroupId,
-        tx_sink: &Arc<dyn TransactionSink>,
         codec_pool: &CodecPoolHandle,
     ) {
         match event {
@@ -1352,7 +1345,6 @@ impl Libp2pAdapter {
                     message.data,
                     propagation_source,
                     consensus_tx.clone(),
-                    Arc::clone(tx_sink),
                 );
             }
 

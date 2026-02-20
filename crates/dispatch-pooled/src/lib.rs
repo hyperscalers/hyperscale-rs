@@ -430,6 +430,7 @@ impl Default for ThreadPoolConfigBuilder {
 ///
 /// Spawned closures are automatically wrapped in `rayon::ThreadPool::install()`,
 /// ensuring that `par_iter` and other parallel primitives use the correct pool.
+#[derive(Clone)]
 pub struct PooledDispatch {
     config: ThreadPoolConfig,
     consensus_crypto_pool: Arc<rayon::ThreadPool>,
@@ -693,6 +694,17 @@ impl Dispatch for PooledDispatch {
         R: Send,
     {
         self.crypto_pool.install(|| {
+            use rayon::prelude::*;
+            items.par_iter().map(f).collect()
+        })
+    }
+
+    fn map_tx_validation<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
+    where
+        T: Sync,
+        R: Send,
+    {
+        self.tx_validation_pool.install(|| {
             use rayon::prelude::*;
             items.par_iter().map(f).collect()
         })

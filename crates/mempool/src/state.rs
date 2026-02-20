@@ -359,9 +359,18 @@ impl MempoolState {
         self.on_submit_transaction_arc(Arc::new(tx))
     }
 
-    /// Handle transaction received via gossip.
+    /// Handle transaction received via gossip (or validated RPC submission).
+    ///
+    /// `submitted_locally` is `true` when the transaction originated from this
+    /// node's RPC endpoint and was validated through the batcher.  The flag is
+    /// propagated to `PoolEntry` so that finalization metrics are recorded only
+    /// on the submitting node.
     #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
-    pub fn on_transaction_gossip_arc(&mut self, tx: Arc<RoutableTransaction>) -> Vec<Action> {
+    pub fn on_transaction_gossip_arc(
+        &mut self,
+        tx: Arc<RoutableTransaction>,
+        submitted_locally: bool,
+    ) -> Vec<Action> {
         let hash = tx.hash();
 
         // Ignore if already have it or if tombstoned (completed/aborted/retried)
@@ -377,7 +386,7 @@ impl MempoolState {
                 status: TransactionStatus::Pending,
                 added_at: self.now,
                 cross_shard,
-                submitted_locally: false, // Received via gossip
+                submitted_locally,
             },
         );
 
@@ -394,7 +403,7 @@ impl MempoolState {
     /// Handle transaction received via gossip.
     #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
     pub fn on_transaction_gossip(&mut self, tx: RoutableTransaction) -> Vec<Action> {
-        self.on_transaction_gossip_arc(Arc::new(tx))
+        self.on_transaction_gossip_arc(Arc::new(tx), false)
     }
 
     /// Broadcast a transaction to all shards involved in it.

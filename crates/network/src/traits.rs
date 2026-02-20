@@ -3,7 +3,11 @@
 //! Defines the `Network` interface implemented by both production (`network-libp2p`)
 //! and simulation (`network-memory`) backends.
 
-use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
+use hyperscale_types::{
+    Block, BlockHeight, Hash, NetworkMessage, QuorumCertificate, Request, RoutableTransaction,
+    ShardGroupId, ShardMessage, TransactionCertificate, ValidatorId,
+};
+use std::sync::Arc;
 
 /// Error returned when a network request fails.
 #[derive(Debug, thiserror::Error)]
@@ -17,6 +21,18 @@ pub enum RequestError {
     #[error("Network shutting down")]
     Shutdown,
 }
+
+/// Callback for block fetch responses.
+pub type BlockResponseCallback =
+    Box<dyn FnOnce(Result<Option<(Block, QuorumCertificate)>, RequestError>) + Send>;
+
+/// Callback for transaction fetch responses.
+pub type TransactionsResponseCallback =
+    Box<dyn FnOnce(Result<Vec<Arc<RoutableTransaction>>, RequestError>) + Send>;
+
+/// Callback for certificate fetch responses.
+pub type CertificatesResponseCallback =
+    Box<dyn FnOnce(Result<Vec<TransactionCertificate>, RequestError>) + Send>;
 
 /// Network interface for sending typed messages and registering listeners.
 ///
@@ -73,5 +89,33 @@ pub trait Network: Send + Sync {
         peer: ValidatorId,
         request: &R,
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,
+    );
+
+    // ── High-level request methods ──
+    //
+    // These provide typed, peer-selecting request APIs that NodeLoop calls
+    // directly. Implementations handle peer selection and async dispatch.
+    // In production, these spawn tokio tasks via a RequestManager.
+    // In simulation, these buffer requests for the harness to fulfill.
+
+    /// Fetch a block by height. Implementation handles peer selection and retry.
+    fn request_block(&self, height: BlockHeight, on_response: BlockResponseCallback);
+
+    /// Fetch transactions by hash. Implementation prefers proposer, handles retry.
+    fn request_transactions(
+        &self,
+        proposer: ValidatorId,
+        block_hash: Hash,
+        hashes: Vec<Hash>,
+        on_response: TransactionsResponseCallback,
+    );
+
+    /// Fetch certificates by hash. Implementation prefers proposer, handles retry.
+    fn request_certificates(
+        &self,
+        proposer: ValidatorId,
+        block_hash: Hash,
+        hashes: Vec<Hash>,
+        on_response: CertificatesResponseCallback,
     );
 }

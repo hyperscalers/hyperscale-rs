@@ -48,6 +48,9 @@ pub enum Event {
     /// Periodic cleanup of stale state.
     CleanupTimer,
 
+    /// Periodic tick for the fetch protocol to retry pending operations.
+    FetchTick,
+
     // ═══════════════════════════════════════════════════════════════════════
     // Network Messages - BFT (priority: Network)
     // ═══════════════════════════════════════════════════════════════════════
@@ -109,8 +112,14 @@ pub enum Event {
     // ═══════════════════════════════════════════════════════════════════════
     // Network Messages - Mempool (priority: Network)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Received a transaction via gossip.
-    TransactionGossipReceived { tx: Arc<RoutableTransaction> },
+    /// Received a transaction via gossip (or validated RPC submission).
+    TransactionGossipReceived {
+        tx: Arc<RoutableTransaction>,
+        /// Set to `true` when the transaction originated from this node's RPC.
+        /// Propagated to mempool's `PoolEntry` so finalization metrics are only
+        /// recorded once (on the submitting node).
+        submitted_locally: bool,
+    },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Internal Events (priority: Internal)
@@ -638,6 +647,21 @@ pub enum Event {
         height: u64,
     },
 
+    /// Sync block response received from network callback (priority: Internal).
+    SyncBlockResponseReceived {
+        height: u64,
+        block: Box<Option<(Block, QuorumCertificate)>>,
+    },
+
+    /// Sync block fetch failed from network callback (priority: Internal).
+    SyncBlockFetchFailed { height: u64 },
+
+    /// Fetch transactions failed from network callback (priority: Internal).
+    FetchTransactionsFailed { block_hash: Hash, hashes: Vec<Hash> },
+
+    /// Fetch certificates failed from network callback (priority: Internal).
+    FetchCertificatesFailed { block_hash: Hash, hashes: Vec<Hash> },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Transaction Fetch Protocol (priority: Network)
     // Used when block header arrives but transactions are missing from mempool
@@ -744,9 +768,10 @@ impl Event {
             | Event::ChainMetadataFetched { .. } => EventPriority::Internal,
 
             // Timer events
-            Event::ProposalTimer | Event::CleanupTimer | Event::GlobalConsensusTimer => {
-                EventPriority::Timer
-            }
+            Event::ProposalTimer
+            | Event::CleanupTimer
+            | Event::FetchTick
+            | Event::GlobalConsensusTimer => EventPriority::Timer,
 
             // Network events
             Event::BlockHeaderReceived { .. }
@@ -774,9 +799,12 @@ impl Event {
 
             // Sync events have varying priorities
             // Note: SyncNeeded is now Action::StartSync
-            Event::SyncBlockReadyToApply { .. } | Event::SyncComplete { .. } => {
-                EventPriority::Internal
-            }
+            Event::SyncBlockReadyToApply { .. }
+            | Event::SyncComplete { .. }
+            | Event::SyncBlockResponseReceived { .. }
+            | Event::SyncBlockFetchFailed { .. }
+            | Event::FetchTransactionsFailed { .. }
+            | Event::FetchCertificatesFailed { .. } => EventPriority::Internal,
 
             Event::SyncBlockReceived { .. } => EventPriority::Network,
 
@@ -821,6 +849,7 @@ impl Event {
             // Timers
             Event::ProposalTimer => "ProposalTimer",
             Event::CleanupTimer => "CleanupTimer",
+            Event::FetchTick => "FetchTick",
 
             // Network - BFT
             Event::BlockHeaderReceived { .. } => "BlockHeaderReceived",
@@ -892,11 +921,15 @@ impl Event {
             Event::SyncBlockReceived { .. } => "SyncBlockReceived",
             Event::SyncBlockReadyToApply { .. } => "SyncBlockReadyToApply",
             Event::SyncComplete { .. } => "SyncComplete",
+            Event::SyncBlockResponseReceived { .. } => "SyncBlockResponseReceived",
+            Event::SyncBlockFetchFailed { .. } => "SyncBlockFetchFailed",
 
             // Transaction/Certificate Fetch Protocol (runner handles retries)
             Event::TransactionReceived { .. } => "TransactionReceived",
             Event::CertificateReceived { .. } => "CertificateReceived",
             Event::FetchedCertificateVerified { .. } => "FetchedCertificateVerified",
+            Event::FetchTransactionsFailed { .. } => "FetchTransactionsFailed",
+            Event::FetchCertificatesFailed { .. } => "FetchCertificatesFailed",
 
             // BLS aggregation callbacks
             Event::StateCertificateAggregated { .. } => "StateCertificateAggregated",

@@ -13,4 +13,6 @@
 
 mod storage;
 
-pub use storage::{CompressionType, RocksDbConfig, RocksDbSnapshot, RocksDbStorage, StorageError};
+pub use storage::{
+    CompressionType, RocksDbConfig, RocksDbSnapshot, RocksDbStorage, SharedStorage, StorageError,
+};

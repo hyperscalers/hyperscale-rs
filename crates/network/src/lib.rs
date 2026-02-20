@@ -22,5 +22,8 @@ pub mod wire;
 pub use codec::{decode_and_route, decode_message, encode_to_wire, CodecError, DecodedMessage};
 pub use handler_registry::HandlerRegistry;
 pub use topic::{ProtocolVersion, Topic};
-pub use traits::{Network, RequestError};
+pub use traits::{
+    BlockResponseCallback, CertificatesResponseCallback, Network, RequestError,
+    TransactionsResponseCallback,
+};
 pub use wire::{compress, decompress, WireError};

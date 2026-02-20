@@ -31,7 +31,7 @@
 /// primitives used inside spawned closures execute on the correct pool (not the
 /// global rayon pool). The pooled implementation achieves this by wrapping
 /// closures in `rayon::ThreadPool::install()`.
-pub trait Dispatch: Send + Sync {
+pub trait Dispatch: Send + Sync + Clone {
     /// Spawn a consensus-critical crypto task.
     ///
     /// Use for block vote and QC signature verification. These are liveness-critical
@@ -94,6 +94,15 @@ pub trait Dispatch: Send + Sync {
     /// Same semantics as `map_execution` but runs on the crypto pool.
     /// Used for parallelizing pre-processing steps in batch crypto verification.
     fn map_crypto<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
+    where
+        T: Sync,
+        R: Send;
+
+    /// Map a function over items on the tx validation pool, potentially in parallel.
+    ///
+    /// Same semantics as `map_execution` but runs on the tx validation pool.
+    /// Used for parallelizing batch transaction signature verification.
+    fn map_tx_validation<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
     where
         T: Sync,
         R: Send;

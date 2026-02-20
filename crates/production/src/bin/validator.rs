@@ -1240,8 +1240,8 @@ async fn main() -> Result<()> {
     let rpc_mempool_snapshot = Arc::new(RwLock::new(MempoolSnapshot::default()));
 
     // Create production runner first (before RPC server)
-    // This is necessary because the runner creates the shared ValidationBatcherHandle
-    // that we need to pass to the RPC server for async transaction validation.
+    // The runner creates the crossbeam event channel that the RPC server needs
+    // for submitting transactions directly to NodeLoop.
     let mut runner_builder = ProductionRunner::builder()
         .topology(topology)
         .signing_key(signing_keypair)

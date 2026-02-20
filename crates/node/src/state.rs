@@ -197,6 +197,11 @@ impl NodeStateMachine {
         &self.provisions
     }
 
+    /// Get the last committed JMT state: (height, version, root_hash).
+    pub fn last_committed_state(&self) -> (u64, u64, Hash) {
+        self.last_committed_state
+    }
+
     /// Initialize the node with a genesis block.
     ///
     /// Returns actions to be processed (e.g., initial timers).
@@ -797,15 +802,13 @@ impl StateMachine for NodeStateMachine {
                     .on_speculative_execution_complete(*block_hash, tx_hashes.clone());
             }
 
-            // SubmitTransaction: add to local mempool only.
-            // Gossip is handled by the runner before this event is sent, so we only
-            // need to add to the mempool here.
-            Event::SubmitTransaction { tx } => {
-                // Only add to our mempool if this transaction involves our shard.
-                // The runner will have already gossiped to all relevant shards.
-                if self.topology.involves_local_shard(tx) {
-                    return self.mempool.on_submit_transaction_arc(Arc::clone(tx));
-                }
+            // SubmitTransaction is intercepted by NodeLoop — gossips to shards,
+            // queues for validation, and the validated callback enters the mempool
+            // via TransactionGossipReceived. Should never reach the state machine.
+            Event::SubmitTransaction { .. } => {
+                tracing::warn!(
+                    "SubmitTransaction reached state machine — should be intercepted by NodeLoop"
+                );
                 return vec![];
             }
 
@@ -827,7 +830,10 @@ impl StateMachine for NodeStateMachine {
 
             // TransactionGossipReceived: add to mempool AND notify BFT
             // The BFT might have pending blocks waiting for this transaction
-            Event::TransactionGossipReceived { tx } => {
+            Event::TransactionGossipReceived {
+                tx,
+                submitted_locally,
+            } => {
                 // Only add to our mempool if this transaction involves our shard.
                 // Cross-shard transactions that don't touch our shard should be ignored.
                 if !self.topology.involves_local_shard(tx) {
@@ -835,7 +841,9 @@ impl StateMachine for NodeStateMachine {
                 }
 
                 let tx_hash = tx.hash();
-                let mut actions = self.mempool.on_transaction_gossip_arc(Arc::clone(tx));
+                let mut actions = self
+                    .mempool
+                    .on_transaction_gossip_arc(Arc::clone(tx), *submitted_locally);
 
                 // Check if any pending blocks are now complete
                 let mempool_map = self.mempool.as_hash_map();
@@ -1091,6 +1099,16 @@ impl StateMachine for NodeStateMachine {
 
             // GossipedCertificateSignatureVerified is handled by the runner, not here
             Event::GossipedCertificateSignatureVerified { .. } => {
+                return vec![];
+            }
+
+            // These events are intercepted by NodeLoop before reaching the state machine.
+            // They are handled by the sync/fetch protocol state machines inside NodeLoop.
+            Event::SyncBlockResponseReceived { .. }
+            | Event::SyncBlockFetchFailed { .. }
+            | Event::FetchTransactionsFailed { .. }
+            | Event::FetchCertificatesFailed { .. }
+            | Event::FetchTick => {
                 return vec![];
             }
         }

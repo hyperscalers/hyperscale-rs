@@ -1,16 +1,17 @@
 //! RPC server implementation.
 
 use super::routes::create_router;
-use super::state::{MempoolSnapshot, NodeStatusState, RpcState, TransactionStatusCache};
-use crate::sync::SyncStatus;
+use super::state::{
+    MempoolSnapshot, NodeStatusState, RpcState, TransactionStatusCache, TxSubmissionSender,
+};
+use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
-use hyperscale_types::RoutableTransaction;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
@@ -114,11 +115,8 @@ impl RpcServer {
     /// # Arguments
     ///
     /// * `config` - Server configuration
-    /// * `tx_submission_tx` - Channel to submit transactions to the runner for validation and gossip
-    pub fn new(
-        config: RpcServerConfig,
-        tx_submission_tx: mpsc::UnboundedSender<Arc<RoutableTransaction>>,
-    ) -> Self {
+    /// * `tx_submission_tx` - Crossbeam channel to submit transactions directly to NodeLoop
+    pub fn new(config: RpcServerConfig, tx_submission_tx: TxSubmissionSender) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;
         let state = RpcState {
             ready: Arc::new(AtomicBool::new(false)),
@@ -143,7 +141,7 @@ impl RpcServer {
         ready: Arc<AtomicBool>,
         sync_status: Arc<ArcSwap<SyncStatus>>,
         node_status: Arc<RwLock<NodeStatusState>>,
-        tx_submission_tx: mpsc::UnboundedSender<Arc<RoutableTransaction>>,
+        tx_submission_tx: TxSubmissionSender,
         tx_status_cache: Arc<RwLock<TransactionStatusCache>>,
         mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
     ) -> Self {
@@ -214,7 +212,7 @@ mod tests {
     #[tokio::test]
     async fn test_server_creation() {
         let config = RpcServerConfig::default();
-        let (tx_submission_tx, _rx) = mpsc::unbounded_channel();
+        let (tx_submission_tx, _rx) = crossbeam::channel::unbounded();
         let server = RpcServer::new(config, tx_submission_tx);
 
         // Server should be created successfully

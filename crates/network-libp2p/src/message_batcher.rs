@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use hyperscale_messages::{
     StateCertificateBatch, StateProvisionBatch, StateVoteBatch, TraceContext,
 };
+use hyperscale_metrics as metrics;
 use hyperscale_types::{
     MessagePriority, NetworkMessage, ShardGroupId, StateCertificate, StateProvision, StateVoteBlock,
 };
@@ -407,6 +408,7 @@ impl MessageBatcher {
         self.stats
             .retry_queue_size
             .store(self.retry_queue.len() as u64, Ordering::Relaxed);
+        metrics::set_broadcast_retry_queue_size(self.retry_queue.len());
 
         // Process each retry
         for mut entry in retries_to_process {
@@ -422,6 +424,7 @@ impl MessageBatcher {
                     self.stats
                         .items_sent
                         .fetch_add(count as u64, Ordering::Relaxed);
+                    metrics::record_broadcast_retry_success();
                     debug!(
                         shard = entry.shard.0,
                         batch_type = entry.batch.type_name(),
@@ -435,6 +438,7 @@ impl MessageBatcher {
                     if entry.attempts >= self.config.max_retry_attempts {
                         // Give up after max attempts
                         self.stats.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                        metrics::record_broadcast_message_dropped();
                         error!(
                             shard = entry.shard.0,
                             batch_type = entry.batch.type_name(),
@@ -524,6 +528,7 @@ impl MessageBatcher {
         while self.retry_queue.len() >= self.config.max_retry_queue_size {
             if let Some(dropped) = self.retry_queue.pop_front() {
                 self.stats.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                metrics::record_broadcast_message_dropped();
                 error!(
                     shard = dropped.shard.0,
                     batch_type = dropped.batch.type_name(),
@@ -546,6 +551,7 @@ impl MessageBatcher {
         self.stats
             .retry_queue_size
             .store(self.retry_queue.len() as u64, Ordering::Relaxed);
+        metrics::set_broadcast_retry_queue_size(self.retry_queue.len());
     }
 
     /// Queue an item, potentially triggering a flush if batch is full.
@@ -640,6 +646,7 @@ impl MessageBatcher {
                 self.stats
                     .broadcast_failures
                     .fetch_add(1, Ordering::Relaxed);
+                metrics::record_broadcast_failure();
                 warn!(
                     shard = shard.0,
                     count,
@@ -674,6 +681,7 @@ impl MessageBatcher {
                 self.stats
                     .broadcast_failures
                     .fetch_add(1, Ordering::Relaxed);
+                metrics::record_broadcast_failure();
                 warn!(
                     shard = shard.0,
                     count,
@@ -708,6 +716,7 @@ impl MessageBatcher {
                 self.stats
                     .broadcast_failures
                     .fetch_add(1, Ordering::Relaxed);
+                metrics::record_broadcast_failure();
                 warn!(
                     shard = shard.0,
                     count,

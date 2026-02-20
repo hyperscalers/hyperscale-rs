@@ -4,7 +4,7 @@
 //! The architecture instruments the production runner while preserving
 //! state machine determinism.
 
-use crate::sync::SyncStatus;
+use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
 use axum::{response::IntoResponse, routing::get, Router};
 use opentelemetry::trace::TracerProvider as _;
@@ -552,7 +552,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sync_status_endpoint() {
-        use crate::sync::{SyncStateKind, SyncStatus};
+        use crate::status::{SyncStateKind, SyncStatus};
 
         let sync_status = Arc::new(ArcSwap::new(Arc::new(SyncStatus {
             state: SyncStateKind::Syncing,

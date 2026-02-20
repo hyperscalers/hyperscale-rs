@@ -16,6 +16,7 @@ pub mod config;
 pub mod inbound;
 pub mod inbound_router;
 pub mod message_batcher;
+pub mod network;
 pub mod peer_health;
 pub mod request_manager;
 
@@ -32,6 +33,7 @@ pub use inbound_router::{InboundRouter, InboundRouterHandle};
 pub use message_batcher::{
     spawn_message_batcher, BroadcastNetwork, MessageBatcherConfig, MessageBatcherHandle,
 };
+pub use network::ProdNetwork;
 pub use peer_health::{PeerHealth, PeerHealthConfig, PeerHealthStats, PeerHealthTracker};
 pub use request_manager::{
     Request, RequestError, RequestManager, RequestManagerConfig, RequestManagerStats,

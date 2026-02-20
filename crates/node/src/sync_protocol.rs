@@ -13,6 +13,7 @@
 //! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
+use hyperscale_metrics as metrics;
 use hyperscale_types::{Block, Hash, QuorumCertificate};
 use serde::Serialize;
 use std::cmp::Reverse;
@@ -238,6 +239,7 @@ impl SyncProtocol {
                         got = block.header.height.0,
                         "Height mismatch in sync response"
                     );
+                    metrics::record_sync_block_filtered("height_mismatch");
                     self.queue_height(height);
                     return self.emit_fetch_outputs();
                 }
@@ -245,17 +247,21 @@ impl SyncProtocol {
                 let block_hash = block.hash();
                 if qc.block_hash != block_hash {
                     warn!(height, "QC block hash mismatch in sync response");
+                    metrics::record_sync_block_filtered("qc_hash_mismatch");
                     self.queue_height(height);
                     return self.emit_fetch_outputs();
                 }
 
                 if qc.height.0 != height {
                     warn!(height, "QC height mismatch in sync response");
+                    metrics::record_sync_block_filtered("qc_height_mismatch");
                     self.queue_height(height);
                     return self.emit_fetch_outputs();
                 }
 
                 trace!(height, "Valid sync block received");
+                metrics::record_sync_block_downloaded();
+                metrics::record_sync_block_verified();
                 let mut outputs = vec![SyncOutput::DeliverBlock {
                     block: Box::new(block),
                     qc: Box::new(qc),
@@ -265,6 +271,7 @@ impl SyncProtocol {
             }
             None => {
                 debug!(height, "Empty sync response, re-queuing");
+                metrics::record_sync_response_error("empty_response");
                 self.queue_height(height);
                 self.emit_fetch_outputs()
             }
@@ -274,6 +281,7 @@ impl SyncProtocol {
     fn handle_block_fetch_failed(&mut self, height: u64) -> Vec<SyncOutput> {
         self.heights_in_flight.remove(&height);
         warn!(height, "Sync fetch failed, re-queuing");
+        metrics::record_sync_response_error("fetch_failed");
         self.queue_height(height);
         self.emit_fetch_outputs()
     }
@@ -283,6 +291,7 @@ impl SyncProtocol {
         self.remove_heights_at_or_below(height);
 
         if let Some((target, _)) = self.sync_target {
+            metrics::record_sync_block_applied();
             if height >= target {
                 info!(height, target, "Sync complete");
                 self.sync_target = None;

@@ -31,7 +31,7 @@ pub trait CommitStore: Send + Sync {
     ///
     /// For RocksDB this contains a `WriteBatch` + `JmtSnapshot`.
     /// For SimStorage this contains a `JmtSnapshot` + certificate data.
-    type PreparedCommit: Send;
+    type PreparedCommit: Send + 'static;
 
     /// Compute speculative state root and return precomputed commit work.
     ///

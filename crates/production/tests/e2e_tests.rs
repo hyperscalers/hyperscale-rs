@@ -11,45 +11,21 @@ mod fixtures;
 
 use fixtures::TestFixtures;
 use hyperscale_bft::BftConfig;
-use hyperscale_engine::TransactionValidation;
 use hyperscale_production::{PooledDispatch, ProductionRunner, RocksDbStorage, ThreadPoolConfig};
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, ValidatorId,
 };
-use radix_common::network::NetworkDefinition;
 use serial_test::serial;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::info;
-
-/// Create a test transaction validator.
-fn test_tx_validator() -> Arc<TransactionValidation> {
-    Arc::new(TransactionValidation::new(NetworkDefinition::simulator()))
-}
 
 /// Create a minimal test dispatch.
 fn test_dispatch() -> Arc<PooledDispatch> {
     Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap())
-}
-
-/// Create a test transaction validation handle.
-/// The output channel is returned so tests can receive validated transactions.
-fn test_tx_validation_handle() -> (
-    Arc<dyn hyperscale_production::TransactionSink>,
-    mpsc::UnboundedReceiver<hyperscale_core::Event>,
-) {
-    let (output_tx, output_rx) = mpsc::unbounded_channel();
-    let handle = hyperscale_production::spawn_tx_validation_batcher(
-        hyperscale_production::ValidationBatcherConfig::default(),
-        test_tx_validator(),
-        test_dispatch(),
-        output_tx,
-    );
-    (Arc::new(handle), output_rx)
 }
 
 /// Create a test codec pool handle for network adapter tests.
@@ -146,8 +122,7 @@ async fn test_network_adapter_starts() {
         ..Default::default()
     };
 
-    let (consensus_tx, _consensus_rx) = mpsc::channel(100);
-    let (tx_validation_handle, _tx_rx) = test_tx_validation_handle();
+    let (consensus_tx, _consensus_rx) = crossbeam::channel::unbounded();
 
     let codec_pool = test_codec_pool_handle();
     let result = timeout(
@@ -158,7 +133,6 @@ async fn test_network_adapter_starts() {
             validator_id,
             shard,
             consensus_tx,
-            tx_validation_handle,
             codec_pool,
         ),
     )
@@ -193,8 +167,7 @@ async fn test_two_node_connection() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let (consensus_tx1, _consensus_rx1) = mpsc::channel(100);
-    let (tx_validation_handle1, _tx_rx1) = test_tx_validation_handle();
+    let (consensus_tx1, _consensus_rx1) = crossbeam::channel::unbounded();
     let codec_pool1 = test_codec_pool_handle();
 
     let adapter1 = Libp2pAdapter::new(
@@ -203,7 +176,6 @@ async fn test_two_node_connection() {
         ValidatorId(0),
         ShardGroupId(0),
         consensus_tx1,
-        tx_validation_handle1,
         codec_pool1,
     )
     .await
@@ -223,8 +195,7 @@ async fn test_two_node_connection() {
         bootstrap_peers: vec![node1_addr.clone()],
         ..Default::default()
     };
-    let (consensus_tx2, _consensus_rx2) = mpsc::channel(100);
-    let (tx_validation_handle2, _tx_rx2) = test_tx_validation_handle();
+    let (consensus_tx2, _consensus_rx2) = crossbeam::channel::unbounded();
     let codec_pool2 = test_codec_pool_handle();
 
     let adapter2 = Libp2pAdapter::new(
@@ -233,7 +204,6 @@ async fn test_two_node_connection() {
         ValidatorId(1),
         ShardGroupId(0),
         consensus_tx2,
-        tx_validation_handle2,
         codec_pool2,
     )
     .await
@@ -281,8 +251,7 @@ async fn test_topic_subscription() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let (consensus_tx, _consensus_rx) = mpsc::channel(100);
-    let (tx_validation_handle, _tx_rx) = test_tx_validation_handle();
+    let (consensus_tx, _consensus_rx) = crossbeam::channel::unbounded();
     let codec_pool = test_codec_pool_handle();
 
     let adapter = Libp2pAdapter::new(
@@ -291,7 +260,6 @@ async fn test_topic_subscription() {
         ValidatorId(0),
         ShardGroupId(0),
         consensus_tx,
-        tx_validation_handle,
         codec_pool,
     )
     .await

@@ -70,20 +70,16 @@
 //! let shared_dispatch = Arc::new(dispatch);
 //! ```
 
-mod fetch;
+mod event_loop;
 pub mod rpc;
 mod runner;
-mod sync;
+mod status;
 mod telemetry;
-mod timers;
 pub use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 pub use hyperscale_network_libp2p::{Libp2pConfig, Libp2pKeypair};
 pub use hyperscale_storage_rocksdb::{
     CompressionType, RocksDbConfig, RocksDbStorage, StorageError,
 };
-pub use hyperscale_validation::{
-    spawn_tx_validation_batcher, TransactionSink, ValidationBatcherConfig, ValidationBatcherHandle,
-};
 pub use runner::{ProductionRunner, RunnerError};
-pub use sync::{SyncStateKind, SyncStatus};
+pub use status::{SyncStateKind, SyncStatus};
 pub use telemetry::{init_telemetry, TelemetryConfig, TelemetryGuard};

@@ -32,6 +32,7 @@ serde = { version = "1.0", features = ["derive"] }
 # CLI (for config enums)
 clap = { version = "4", features = ["derive"] }
 
+crossbeam.workspace = true
 hex = "0.4"
 
 # Async runtime

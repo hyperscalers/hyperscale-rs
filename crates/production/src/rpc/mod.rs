@@ -56,7 +56,7 @@
 mod handlers;
 mod routes;
 mod server;
-mod state;
+pub(crate) mod state;
 mod types;
 
 pub use server::{RpcServer, RpcServerConfig, RpcServerHandle};

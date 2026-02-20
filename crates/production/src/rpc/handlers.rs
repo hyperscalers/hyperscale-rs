@@ -8,7 +8,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use hyperscale_core::TransactionStatus;
+use hyperscale_core::{Event, TransactionStatus};
 use hyperscale_metrics as metrics;
 use hyperscale_types::{Hash, RoutableTransaction, TransactionDecision};
 use std::sync::atomic::Ordering;
@@ -162,6 +162,7 @@ pub async fn submit_transaction_handler(
 
         // Check if in-flight hard limit reached
         if !snapshot.accepting_rpc_transactions {
+            metrics::record_transaction_rejected("in_flight_limit");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(SubmitTransactionResponse {
@@ -192,6 +193,7 @@ pub async fn submit_transaction_handler(
     let tx_bytes = match hex::decode(&request.transaction_hex) {
         Ok(bytes) => bytes,
         Err(e) => {
+            metrics::record_transaction_rejected("invalid_hex");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(SubmitTransactionResponse {
@@ -207,6 +209,7 @@ pub async fn submit_transaction_handler(
     let transaction: RoutableTransaction = match sbor::prelude::basic_decode(&tx_bytes) {
         Ok(tx) => tx,
         Err(e) => {
+            metrics::record_transaction_rejected("invalid_format");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(SubmitTransactionResponse {
@@ -221,12 +224,16 @@ pub async fn submit_transaction_handler(
     let hash = hex::encode(transaction.hash().as_bytes());
     let tx_arc = Arc::new(transaction);
 
-    // Submit to runner via unbounded channel.
-    // The runner will:
-    // 1. Gossip to all relevant shards (RPC submissions need gossip)
-    // 2. Submit to batcher for validation
+    // Submit directly to NodeLoop via crossbeam channel.
+    // NodeLoop will:
+    // 1. Gossip to all relevant shards
+    // 2. Queue for batch validation (via Dispatch)
     // 3. Dispatch to mempool after validation
-    if state.tx_submission_tx.send(tx_arc).is_err() {
+    if state
+        .tx_submission_tx
+        .send(Event::SubmitTransaction { tx: tx_arc })
+        .is_err()
+    {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(SubmitTransactionResponse {
@@ -396,18 +403,18 @@ pub async fn mempool_handler(State(state): State<RpcState>) -> impl IntoResponse
 mod tests {
     use super::*;
     use crate::rpc::state::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
-    use crate::sync::SyncStatus;
+    use crate::status::SyncStatus;
     use arc_swap::ArcSwap;
     use axum::{body::Body, http::Request, Router};
     use hyperscale_types::{BlockHeight, TransactionDecision};
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Instant;
-    use tokio::sync::{mpsc, RwLock};
+    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     fn create_test_state() -> RpcState {
-        let (tx_submission_tx, _rx) = mpsc::unbounded_channel();
+        let (tx_submission_tx, _rx) = crossbeam::channel::unbounded();
         RpcState {
             ready: Arc::new(AtomicBool::new(false)),
             sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
@@ -740,11 +747,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_rejected_when_syncing() {
-        let (tx_submission_tx, _rx) = mpsc::unbounded_channel();
+        let (tx_submission_tx, _rx) = crossbeam::channel::unbounded();
 
         // Create state with node that is 20 blocks behind (threshold is 10)
-        let sync_status = crate::sync::SyncStatus {
-            state: crate::sync::SyncStateKind::Syncing,
+        let sync_status = crate::status::SyncStatus {
+            state: crate::status::SyncStateKind::Syncing,
             current_height: 80,
             target_height: Some(100),
             blocks_behind: 20,
@@ -803,11 +810,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_submit_accepted_when_caught_up() {
-        let (tx_submission_tx, _rx) = mpsc::unbounded_channel();
+        let (tx_submission_tx, _rx) = crossbeam::channel::unbounded();
 
         // Create state with node that is only 5 blocks behind (under threshold of 10)
-        let sync_status = crate::sync::SyncStatus {
-            state: crate::sync::SyncStateKind::Syncing,
+        let sync_status = crate::status::SyncStatus {
+            state: crate::status::SyncStateKind::Syncing,
             current_height: 95,
             target_height: Some(100),
             blocks_behind: 5,

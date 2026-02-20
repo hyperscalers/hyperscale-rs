@@ -6,6 +6,7 @@
 
 pub mod action_handler;
 pub mod fetch_protocol;
+pub mod node_loop;
 pub mod sync_protocol;
 
 mod state;
@@ -13,6 +14,7 @@ mod state;
 pub use fetch_protocol::{
     FetchConfig, FetchInput, FetchKind, FetchOutput, FetchProtocol, FetchStatus,
 };
+pub use node_loop::TimerOp;
 pub use state::NodeStateMachine;
 pub use sync_protocol::{
     SyncConfig, SyncInput, SyncOutput, SyncProtocol, SyncStateKind, SyncStatus,

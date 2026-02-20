@@ -1,107 +1,91 @@
 //! Production runner implementation.
+//!
+//! # Architecture
+//!
+//! The production runner uses a **pinned thread** architecture:
+//!
+//! ```text
+//!  ┌──────────────────────────────────────────────────────────────────────┐
+//!  │  Core 0 (pinned std::thread)                                        │
+//!  │  ┌────────────────────────────────────────────────────────────────┐  │
+//!  │  │  NodeLoop<SharedStorage, ProdNetwork, PooledDispatch>         │  │
+//!  │  │    - State machine event processing                           │  │
+//!  │  │    - Storage I/O (RocksDB)                                    │  │
+//!  │  │    - Action handling (timers, broadcasts, crypto dispatch)    │  │
+//!  │  │    - Transaction validation batching via Dispatch              │  │
+//!  │  │    - RPC SubmitTransaction handling (gossip + validate)       │  │
+//!  │  │    - Batched message sending, batched crypto verification     │  │
+//!  │  └────────────────────────────────────────────────────────────────┘  │
+//!  │       ↑ crossbeam channels (all events) ↑                           │
+//!  └──────────────────────────────────────────────────────────────────────┘
+//!
+//!  ┌──────────────────────────────────────────────────────────────────────┐
+//!  │  Tokio runtime (multi-threaded)                                      │
+//!  │                                                                      │
+//!  │  Background tasks:                                                   │
+//!  │    - Libp2p adapter (gossipsub, streams) → crossbeam directly        │
+//!  │    - InboundRouter (peer fetch requests)                             │
+//!  │    - RPC server (sends Event::SubmitTransaction → crossbeam)         │
+//!  │    - ProdTimerManager (tokio sleep → crossbeam timer events)         │
+//!  │    - Metrics collection loop                                         │
+//!  └──────────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Channel topology
+//!
+//! ```text
+//! Libp2p adapter ──crossbeam──→ pinned thread (NodeLoop)
+//! RPC server     ──crossbeam──→ pinned thread (Event::SubmitTransaction)
+//! Dispatch       ──crossbeam──→ pinned thread (crypto/validation callbacks)
+//! ProdTimerManager ──crossbeam──→ pinned thread (timer events)
+//! ```
 
+use crate::event_loop::{spawn_pinned_loop, PinnedLoopConfig, ProdNodeLoop};
 use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
-use crate::sync::{SyncConfig, SyncManager};
-use crate::timers::TimerManager;
 use hyperscale_bft::BftConfig;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_engine::{NetworkDefinition, RadixExecutor};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics as metrics;
+use hyperscale_network_libp2p::ProdNetwork;
 use hyperscale_network_libp2p::{
-    compute_peer_id_for_validator, spawn_action_dispatcher, spawn_message_batcher,
-    ActionDispatcherContext, ActionDispatcherHandle, DispatchableAction, InboundRouter,
-    InboundRouterConfig, InboundRouterHandle, Libp2pAdapter, Libp2pConfig, Libp2pKeypair,
-    MessageBatcherConfig, MessageBatcherHandle, NetworkError,
+    compute_peer_id_for_validator, InboundRouter, InboundRouterConfig, InboundRouterHandle,
+    Libp2pAdapter, Libp2pConfig, Libp2pKeypair, NetworkError,
 };
 use hyperscale_storage::{
-    CommitStore, CommittableSubstateDatabase, ConsensusStore, DatabaseUpdates, DbPartitionKey,
-    DbSortKey, DbSubstateValue, PartitionEntry, SubstateDatabase,
+    CommittableSubstateDatabase, ConsensusStore, DatabaseUpdates, DbPartitionKey, DbSortKey,
+    DbSubstateValue, PartitionEntry, SubstateDatabase,
 };
-use hyperscale_storage_rocksdb::RocksDbStorage;
+use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use hyperscale_types::BlockHeight;
 use quick_cache::sync::Cache as QuickCache;
 
-use hyperscale_core::{Action, Event, StateMachine};
+use hyperscale_core::Event;
+use hyperscale_node::node_loop::{NodeLoop, TimerOp};
+use hyperscale_node::sync_protocol::SyncProtocol;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
-    batch_verify_bls_different_messages, zero_bls_signature, Block, BlockHeader,
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Hash, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, StateVoteBlock, Topology, TransactionCertificate,
-    ValidatorId,
+    Block, BlockHeader, Bls12381G1PrivateKey, Hash, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, Topology, TransactionCertificate, ValidatorId,
 };
-use sbor::prelude::*;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::oneshot;
 use tokio::sync::RwLock as TokioRwLock;
-use tokio::sync::{mpsc, oneshot};
-use tracing::{span, Level};
+use tracing::{info, warn};
 
-/// Maximum number of prepared commit handles to keep in the cache.
-/// Matches the old `BLOCK_COMMIT_CACHE_MAX_SIZE` constant.
-const PREPARED_COMMIT_CACHE_MAX_SIZE: usize = 32;
-
-/// Bounded FIFO cache for prepared commit handles.
-///
-/// Evicts the oldest entry when at capacity. Uses a `VecDeque` to track
-/// insertion order so the oldest entry can be found in O(1).
-struct PreparedCommitCache {
-    map: std::collections::HashMap<Hash, <RocksDbStorage as CommitStore>::PreparedCommit>,
-    order: std::collections::VecDeque<Hash>,
-}
-
-impl PreparedCommitCache {
-    fn new() -> Self {
-        Self {
-            map: std::collections::HashMap::new(),
-            order: std::collections::VecDeque::new(),
-        }
-    }
-
-    fn insert(
-        &mut self,
-        block_hash: Hash,
-        prepared: <RocksDbStorage as CommitStore>::PreparedCommit,
-    ) {
-        // If already present, remove from order tracking
-        if self.map.contains_key(&block_hash) {
-            self.order.retain(|h| *h != block_hash);
-        }
-
-        // Evict oldest entries if at capacity
-        while self.map.len() >= PREPARED_COMMIT_CACHE_MAX_SIZE {
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-                tracing::debug!(
-                    evicted_block = ?oldest,
-                    "Evicted oldest entry from prepared commit cache"
-                );
-            } else {
-                break;
-            }
-        }
-
-        self.map.insert(block_hash, prepared);
-        self.order.push_back(block_hash);
-    }
-
-    fn remove(
-        &mut self,
-        block_hash: &Hash,
-    ) -> Option<<RocksDbStorage as CommitStore>::PreparedCommit> {
-        if let Some(prepared) = self.map.remove(block_hash) {
-            self.order.retain(|h| h != block_hash);
-            Some(prepared)
-        } else {
-            None
-        }
-    }
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// GenesisMutWrapper — bridges RocksDB &self commit with Radix Engine &mut self
+// ═══════════════════════════════════════════════════════════════════════════
 
 /// Wrapper that bridges `RocksDbStorage`'s `&self` commit with the Radix Engine's
 /// `&mut self` `CommittableSubstateDatabase` trait, used only for genesis execution.
+///
+/// Takes `&RocksDbStorage` (accessed via `SharedStorage` deref) because the
+/// production runner wraps storage in `SharedStorage` (newtype over `Arc<RocksDbStorage>`)
+/// for shared ownership between the pinned thread and async tasks.
 struct GenesisMutWrapper<'a>(&'a RocksDbStorage);
 
 impl SubstateDatabase for GenesisMutWrapper<'_> {
@@ -129,6 +113,10 @@ impl CommittableSubstateDatabase for GenesisMutWrapper<'_> {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// RunnerError
+// ═══════════════════════════════════════════════════════════════════════════
+
 /// Errors from the production runner.
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -142,186 +130,9 @@ pub enum RunnerError {
     NetworkError(#[from] NetworkError),
 }
 
-/// Maximum batch sizes for time-windowed operations.
-/// These limits cap p99 latency by preventing unbounded batch growth under load.
-/// Values are tuned to balance throughput (larger batches = better amortization)
-/// against latency (smaller batches = faster completion).
-mod batch_limits {
-    /// State certs: parallel key aggregation benefits from ~core-count batches.
-    pub const MAX_STATE_CERTS: usize = 64;
-    /// State votes: cross-tx batching with 20ms window. Uses batch_verify_bls_different_messages
-    /// which achieves ~2 pairings regardless of batch size, so larger batches = better efficiency.
-    pub const MAX_STATE_VOTES: usize = 64;
-    /// Cross-shard execution: heavy per-item work, memory pressure from provisions.
-    pub const MAX_CROSS_SHARD_EXECUTIONS: usize = 32;
-    /// Gossiped certs: non-critical, can be re-fetched. Larger batches for efficiency.
-    pub const MAX_GOSSIPED_CERTS: usize = 64;
-}
-
-// Note: Block vote batching removed - vote verification is now deferred in the BFT
-// state machine until quorum is possible, then emitted as VerifyAndBuildQuorumCertificate.
-
-/// Pending cross-shard executions that can be batched.
-///
-/// Accumulates ExecuteCrossShardTransaction actions and executes them in parallel
-/// using rayon's par_iter for better throughput.
-#[derive(Default)]
-struct PendingCrossShardExecutions {
-    /// Cross-shard transactions waiting for execution.
-    requests: Vec<hyperscale_core::CrossShardExecutionRequest>,
-}
-
-impl PendingCrossShardExecutions {
-    fn is_empty(&self) -> bool {
-        self.requests.is_empty()
-    }
-
-    fn take(&mut self) -> Vec<hyperscale_core::CrossShardExecutionRequest> {
-        std::mem::take(&mut self.requests)
-    }
-
-    fn is_full(&self) -> bool {
-        self.requests.len() >= batch_limits::MAX_CROSS_SHARD_EXECUTIONS
-    }
-}
-
-/// Pending state certificate verifications with batching window.
-///
-/// State certificates have aggregated BLS signatures that are expensive to verify
-/// (~1.5ms each). By batching them with a 15ms window, we can use BLS batch
-/// verification which is ~40% faster than individual verification.
-#[derive(Default)]
-struct PendingStateCerts {
-    /// State certificates waiting for verification.
-    /// Each entry contains: (certificate, public_keys for the shard)
-    certs: Vec<(hyperscale_types::StateCertificate, Vec<Bls12381G1PublicKey>)>,
-}
-
-impl PendingStateCerts {
-    fn is_empty(&self) -> bool {
-        self.certs.is_empty()
-    }
-
-    fn take(&mut self) -> Vec<(hyperscale_types::StateCertificate, Vec<Bls12381G1PublicKey>)> {
-        std::mem::take(&mut self.certs)
-    }
-
-    fn is_full(&self) -> bool {
-        self.certs.len() >= batch_limits::MAX_STATE_CERTS
-    }
-}
-
-/// Pending state vote verifications with cross-transaction batching.
-///
-/// State votes from different transactions can be batched together for verification
-/// using `batch_verify_bls_different_messages`, which achieves ~2 pairings regardless
-/// of batch size (vs 2 pairings per transaction with separate batches).
-///
-/// Uses a 20ms batching window (longer than state certs' 15ms) since state votes
-/// are less latency-sensitive - they're part of cross-shard execution which has
-/// inherent network latency.
-///
-/// Batched state votes: (tx_hash, votes) where each vote is (vote, public_key, voting_power).
-type BatchedStateVotes = Vec<(Hash, Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>)>;
-
-#[derive(Default)]
-struct PendingStateVotes {
-    /// State votes waiting for verification, grouped by originating tx_hash.
-    items: BatchedStateVotes,
-    /// Total number of individual votes across all transactions.
-    vote_count: usize,
-}
-
-impl PendingStateVotes {
-    fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    fn push(&mut self, tx_hash: Hash, votes: Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>) {
-        self.vote_count += votes.len();
-        self.items.push((tx_hash, votes));
-    }
-
-    fn take(&mut self) -> BatchedStateVotes {
-        self.vote_count = 0;
-        std::mem::take(&mut self.items)
-    }
-
-    fn is_full(&self) -> bool {
-        // Cap by number of transactions OR total votes, whichever hits first
-        self.items.len() >= batch_limits::MAX_STATE_VOTES || self.vote_count >= 256
-    }
-}
-
-/// Pending verification of a gossiped TransactionCertificate.
-///
-/// When we receive a TransactionCertificate via gossip, we verify each embedded
-/// StateCertificate's BLS signature before persisting. This tracks the verification
-/// progress for a single certificate.
-struct PendingGossipCertVerification {
-    /// The certificate being verified.
-    certificate: TransactionCertificate,
-    /// Shards still awaiting verification callback.
-    pending_shards: std::collections::HashSet<ShardGroupId>,
-    /// Whether any verification has failed.
-    failed: bool,
-    /// When this verification started (for TTL cleanup).
-    created_at: std::time::Instant,
-}
-
-/// Pending gossiped certificate verifications that can be batched.
-///
-/// Instead of spawning one crypto task per shard, we accumulate gossiped certificates
-/// and verify them in batches using batch BLS verification. This significantly reduces
-/// crypto pool pressure under high gossip load.
-///
-/// Uses a 15ms batching window (same as state certs) since gossiped certs are
-/// not latency-critical - they can be re-fetched if needed.
-#[derive(Default)]
-struct PendingGossipedCertBatch {
-    /// Gossiped certificates waiting for batch verification.
-    /// Each entry contains: (tx_hash, certificate, shard_id, state_cert, public_keys)
-    items: Vec<(
-        Hash,
-        TransactionCertificate,
-        ShardGroupId,
-        hyperscale_types::StateCertificate,
-        Vec<Bls12381G1PublicKey>,
-    )>,
-}
-
-impl PendingGossipedCertBatch {
-    fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
-    fn take(
-        &mut self,
-    ) -> Vec<(
-        Hash,
-        TransactionCertificate,
-        ShardGroupId,
-        hyperscale_types::StateCertificate,
-        Vec<Bls12381G1PublicKey>,
-    )> {
-        std::mem::take(&mut self.items)
-    }
-
-    fn is_full(&self) -> bool {
-        self.items.len() >= batch_limits::MAX_GOSSIPED_CERTS
-    }
-}
-
-/// Maximum age for pending gossip certificate verifications before cleanup.
-/// If verification callbacks don't arrive within this time, the entry is removed.
-/// This is short (30s) since verification should complete in milliseconds.
-const PENDING_GOSSIP_CERT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Maximum age for RPC-submitted transaction tracking before cleanup.
-/// If a transaction doesn't finalize within this time, it's removed from tracking
-/// to prevent unbounded memory growth. This is generous (10 minutes) to allow
-/// for slow cross-shard transactions.
-const RPC_SUBMITTED_TX_TIMEOUT: Duration = Duration::from_secs(600);
+// ═══════════════════════════════════════════════════════════════════════════
+// ShutdownHandle
+// ═══════════════════════════════════════════════════════════════════════════
 
 /// Handle for shutting down a running ProductionRunner.
 ///
@@ -348,135 +159,9 @@ impl Drop for ShutdownHandle {
     }
 }
 
-/// Request to commit a block's state changes.
-///
-/// Sent to the dedicated commit task to ensure sequential processing.
-/// This prevents race conditions where concurrent `spawn_blocking` tasks
-/// could complete out of order, causing JMT version mismatches.
-struct BlockCommitRequest {
-    /// The block to commit.
-    block: Block,
-    /// Block height for logging.
-    height: u64,
-    /// Block hash for committed metadata persistence.
-    block_hash: Hash,
-    /// The QC that certified this block (for committed metadata persistence).
-    qc: QuorumCertificate,
-    /// Precomputed commit work from `prepare_block_commit`, if available.
-    /// `Some` → fast path (apply cached WriteBatch + JMT snapshot).
-    /// `None` → slow path (recompute per-certificate).
-    prepared: Option<<RocksDbStorage as CommitStore>::PreparedCommit>,
-}
-
-/// Handle for the dedicated block commit task.
-///
-/// Commits are processed sequentially to maintain JMT consistency.
-/// The task runs on a dedicated blocking thread and processes commits
-/// in FIFO order from the channel.
-struct BlockCommitTaskHandle {
-    /// Sender for submitting commit requests.
-    tx: mpsc::Sender<BlockCommitRequest>,
-    /// Join handle for the commit task (for graceful shutdown).
-    #[allow(dead_code)]
-    join_handle: tokio::task::JoinHandle<()>,
-}
-
-/// Spawn the dedicated block commit task.
-///
-/// This task processes block commits sequentially to prevent JMT version race conditions.
-/// Without serialization, concurrent `spawn_blocking` tasks could complete out of order,
-/// causing the pre-computed commit cache to have a stale base version.
-///
-/// The task:
-/// 1. Receives `BlockCommitRequest` from the channel (FIFO order)
-/// 2. If a `PreparedCommit` handle is present, uses `commit_prepared_block` (fast path)
-/// 3. Otherwise, uses `commit_block` to recompute from scratch (slow path)
-/// 4. Sends `StateCommitComplete` event when done
-fn spawn_block_commit_task(
-    storage: Arc<RocksDbStorage>,
-    local_shard: ShardGroupId,
-    rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
-    callback_tx: mpsc::UnboundedSender<Event>,
-) -> BlockCommitTaskHandle {
-    // Bounded channel with small capacity - commits should be fast and we don't want
-    // to buffer many blocks. Backpressure here means consensus is outpacing storage.
-    let (tx, mut rx) = mpsc::channel::<BlockCommitRequest>(16);
-
-    let join_handle = tokio::task::spawn(async move {
-        while let Some(request) = rx.recv().await {
-            let BlockCommitRequest {
-                block,
-                height,
-                block_hash,
-                qc,
-                prepared,
-            } = request;
-
-            // Move the actual commit work to a blocking thread since it does RocksDB I/O.
-            // But we await it here to ensure sequential processing.
-            let storage = storage.clone();
-            let local_shard = local_shard;
-            let rpc_status = rpc_status.clone();
-            let callback_tx = callback_tx.clone();
-
-            // This is the key difference from before: we AWAIT the blocking task,
-            // ensuring commits complete in order before processing the next one.
-            let cert_count = block.certificates.len();
-            let _ = tokio::task::spawn_blocking(move || {
-                // Use prepared handle (fast path) if available, otherwise recompute.
-                let fast_path = prepared.is_some();
-                let result = if let Some(prepared) = prepared {
-                    storage.commit_prepared_block(prepared)
-                } else {
-                    storage.commit_block(&block.certificates, local_shard)
-                };
-
-                // Persist committed metadata AFTER JMT state is confirmed applied.
-                // This guarantees that on recovery, committed_height never exceeds
-                // the actual JMT state, preventing state root divergence.
-                storage.set_committed_state(BlockHeight(height), block_hash, &qc);
-                storage.prune_own_votes(height);
-
-                tracing::info!(
-                    block_height = height,
-                    certs = cert_count,
-                    fast_path,
-                    state_version = result.state_version,
-                    state_root = ?result.state_root,
-                    "Block commit completed"
-                );
-
-                // Update RPC status with new JMT state version and root hash
-                if let Some(rpc_status) = rpc_status {
-                    let state_root_hex = hex::encode(result.state_root.as_bytes());
-                    tokio::spawn(async move {
-                        let mut status = rpc_status.write().await;
-                        status.state_version = result.state_version;
-                        status.state_root_hash = state_root_hex;
-                    });
-                }
-
-                // Notify state machine that JMT commit is complete.
-                if let Err(e) = callback_tx.send(Event::StateCommitComplete {
-                    height,
-                    state_version: result.state_version,
-                    state_root: result.state_root,
-                }) {
-                    tracing::error!(
-                        block_height = height,
-                        error = %e,
-                        "Failed to send StateCommitComplete event"
-                    );
-                }
-            })
-            .await;
-        }
-
-        tracing::debug!("Block commit task shutting down");
-    });
-
-    BlockCommitTaskHandle { tx, join_handle }
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// ProductionRunnerBuilder
+// ═══════════════════════════════════════════════════════════════════════════
 
 /// Builder for constructing a [`ProductionRunner`].
 ///
@@ -490,39 +175,6 @@ fn spawn_block_commit_task(
 /// Optional fields:
 /// - `dispatch` - Dispatch implementation (defaults to auto-configured)
 /// - `channel_capacity` - Event channel capacity (defaults to 10,000)
-///
-/// # Example
-///
-/// ```no_run
-/// use hyperscale_production::{ProductionRunner, Libp2pConfig, Libp2pKeypair, RocksDbStorage, RocksDbConfig};
-/// use hyperscale_bft::BftConfig;
-/// use hyperscale_types::{generate_bls_keypair, Bls12381G1PrivateKey};
-/// use std::sync::Arc;
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// // Create required dependencies
-/// let topology = todo!("Create topology from genesis or config");
-/// let signing_key = generate_bls_keypair();
-/// let bft_config = BftConfig::default();
-/// let storage = RocksDbStorage::open_with_config(
-///     "/tmp/hyperscale-db",
-///     RocksDbConfig::default(),
-/// )?;
-/// let network_config = Libp2pConfig::default();
-/// let ed25519_keypair = Libp2pKeypair::generate_ed25519();
-///
-/// // Build the runner
-/// let runner = ProductionRunner::builder()
-///     .topology(topology)
-///     .signing_key(signing_key)
-///     .bft_config(bft_config)
-///     .storage(Arc::new(storage))
-///     .network(network_config, ed25519_keypair)
-///     .build()
-///     .await?;
-/// # Ok(())
-/// # }
-/// ```
 pub struct ProductionRunnerBuilder {
     topology: Option<Arc<dyn Topology>>,
     signing_key: Option<Bls12381G1PrivateKey>,
@@ -574,16 +226,13 @@ impl ProductionRunnerBuilder {
             mempool_snapshot: None,
             genesis_config: None,
             network_definition: None,
-            speculative_max_txs: 500, // Default, matches hyperscale_execution::DEFAULT_SPECULATIVE_MAX_TXS
-            view_change_cooldown_rounds: 3, // Default, matches hyperscale_execution::DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS
+            speculative_max_txs: 500,
+            view_change_cooldown_rounds: 3,
             mempool_config: MempoolConfig::default(),
         }
     }
 
     /// Set the Radix network definition for transaction validation.
-    ///
-    /// This determines which network's transaction format to validate against.
-    /// Defaults to simulator network if not set.
     pub fn network_definition(mut self, network: NetworkDefinition) -> Self {
         self.network_definition = Some(network);
         self
@@ -614,8 +263,6 @@ impl ProductionRunnerBuilder {
     }
 
     /// Set the RocksDB storage for persistence and crash recovery.
-    ///
-    /// RocksDB is internally thread-safe, so no external lock is needed.
     pub fn storage(mut self, storage: Arc<RocksDbStorage>) -> Self {
         self.storage = Some(storage);
         self
@@ -635,68 +282,52 @@ impl ProductionRunnerBuilder {
     }
 
     /// Set the maximum transactions for speculative execution (in-flight + cached).
-    ///
-    /// Higher values allow more aggressive speculation but use more memory.
-    /// Default: 500
     pub fn speculative_max_txs(mut self, max_txs: usize) -> Self {
         self.speculative_max_txs = max_txs;
         self
     }
 
     /// Set the number of rounds to pause speculation after a view change.
-    ///
-    /// Higher values reduce wasted work during instability but may reduce hit rate.
-    /// Default: 3
     pub fn view_change_cooldown_rounds(mut self, rounds: u64) -> Self {
         self.view_change_cooldown_rounds = rounds;
         self
     }
 
     /// Set the mempool configuration.
-    ///
-    /// Controls in-flight transaction limits and backpressure thresholds.
-    /// Default: `MempoolConfig::default()`
     pub fn mempool_config(mut self, config: MempoolConfig) -> Self {
         self.mempool_config = config;
         self
     }
 
     /// Set the RPC status state to update on block commits and view changes.
-    ///
-    /// When set, the runner will update `block_height`, `view`, and `connected_peers`
-    /// fields as consensus progresses.
     pub fn rpc_status(mut self, status: Arc<TokioRwLock<NodeStatusState>>) -> Self {
         self.rpc_status = Some(status);
         self
     }
 
     /// Set the transaction status cache for RPC queries.
-    ///
-    /// When set, the runner will update transaction statuses as they progress
-    /// through the mempool and execution pipeline.
     pub fn tx_status_cache(mut self, cache: Arc<TokioRwLock<TransactionStatusCache>>) -> Self {
         self.tx_status_cache = Some(cache);
         self
     }
 
     /// Set the mempool snapshot for RPC queries.
-    ///
-    /// When set, the runner will periodically update mempool statistics.
     pub fn mempool_snapshot(mut self, snapshot: Arc<TokioRwLock<MempoolSnapshot>>) -> Self {
         self.mempool_snapshot = Some(snapshot);
         self
     }
 
     /// Set the genesis configuration for initial state.
-    ///
-    /// When set, the runner will use this configuration to bootstrap the Radix Engine
-    /// state with initial XRD balances and other genesis parameters.
     pub fn genesis_config(mut self, config: hyperscale_engine::GenesisConfig) -> Self {
         self.genesis_config = Some(config);
         self
     }
 
     /// Build the production runner.
+    ///
+    /// Creates all channels, the NodeLoop, networking adapters, and supporting
+    /// infrastructure. The NodeLoop is held in an `Option` so it can be moved
+    /// to the pinned thread when `run()` is called.
     ///
     /// # Errors
     ///
@@ -705,7 +336,8 @@ impl ProductionRunnerBuilder {
         // Install the Prometheus metrics backend before anything records metrics.
         hyperscale_metrics_prometheus::install();
 
-        // Extract required fields
+        // ── Extract required fields ──────────────────────────────────────
+
         let topology = self
             .topology
             .ok_or_else(|| RunnerError::SendError("topology is required".into()))?;
@@ -731,39 +363,31 @@ impl ProductionRunnerBuilder {
             .ed25519_keypair
             .ok_or_else(|| RunnerError::SendError("network keypair is required".into()))?;
 
-        // Separate channels for different event priorities:
-        // - timer_tx/rx: Critical priority - Timer events (proposal, cleanup)
-        //   These MUST never be blocked by network floods. Small dedicated channel.
-        // - callback_tx/rx: Highest priority - Internal events (crypto/execution callbacks)
-        //   These are results of in-flight work and must be processed immediately to
-        //   unblock consensus progress (e.g., vote signature verified -> can count vote)
-        // - consensus_tx/rx: High priority BFT events (votes, proposals, QCs)
-        // - validated_tx_tx/rx: Validated transactions from batcher (unbounded - don't block crypto pool)
-        //   Gossip-received transactions flow through here after validation
-        // - rpc_tx_tx/rx: RPC-submitted transactions (unbounded - don't block RPC handlers)
-        //   These need gossip before validation, unlike gossip-received transactions
-        // - status_tx/rx: Transaction status updates (non-consensus-critical)
-        // This prevents transaction floods from starving consensus events
-        let (timer_tx, timer_rx) = mpsc::channel(16); // Small channel, just for timers
-        let (callback_tx, callback_rx) = mpsc::unbounded_channel(); // Unbounded - thread pools must never block
-        let (consensus_tx, consensus_rx) = mpsc::channel(self.channel_capacity);
-        let (validated_tx_tx, validated_tx_rx) = mpsc::unbounded_channel(); // Unbounded - batcher must never block
-        let (rpc_tx_tx, rpc_tx_rx) = mpsc::unbounded_channel(); // Unbounded - RPC must never block
-        let (status_tx, status_rx) = mpsc::channel(self.channel_capacity);
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let validator_id = topology.local_validator_id();
         let local_shard = topology.local_shard();
 
-        // Load RecoveredState from storage for crash recovery
-        let recovered = storage.load_recovered_state();
-
-        // Clone signing key bytes for runner's state vote signing (state machine also needs it)
-        // Bls12381G1PrivateKey doesn't impl Clone
+        // Clone signing key bytes BEFORE passing to state machine (which consumes it).
+        // Bls12381G1PrivateKey doesn't impl Clone, so we round-trip through bytes.
         let key_bytes = signing_key.to_bytes();
-        let runner_signing_key =
+        let node_loop_signing_key =
             Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
 
-        // NodeIndex is a simulation concept - production uses 0
+        // ── Crossbeam channels (→ pinned thread) ───────────────────────
+        //
+        // These are the inputs to the pinned NodeLoop thread. Crossbeam unbounded
+        // channels are chosen because they are lock-free and sync-safe.
+        let (xb_timer_tx, xb_timer_rx) = crossbeam::channel::unbounded();
+        let (xb_callback_tx, xb_callback_rx) = crossbeam::channel::unbounded();
+        let (xb_consensus_tx, xb_consensus_rx) = crossbeam::channel::unbounded();
+        let (xb_shutdown_tx, xb_shutdown_rx) = crossbeam::channel::unbounded();
+
+        // ── Shutdown oneshot ─────────────────────────────────────────────
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        // ── Load crash recovery state ────────────────────────────────────
+        let recovered = storage.load_recovered_state();
+
+        // ── Create NodeStateMachine ──────────────────────────────────────
         let state = NodeStateMachine::with_speculative_config(
             0, // node_index not meaningful in production
             topology.clone(),
@@ -774,395 +398,241 @@ impl ProductionRunnerBuilder {
             self.view_change_cooldown_rounds,
             self.mempool_config,
         );
-        let timer_manager = TimerManager::new(timer_tx);
 
-        // Use configured network definition or default to simulator
+        // ── Create SharedStorage ────────────────────────────────────────
+        let shared_storage = SharedStorage::new(Arc::clone(&storage));
+
+        // ── Create ProdNetwork ───────────────────────────────────────────
+        //
+        // Wraps the Libp2p adapter for use by NodeLoop's action handler.
+        // encode_to_wire + adapter.publish() is sync-safe (non-blocking send).
+        // Note: We create the adapter below, then wrap it.
+        // ProdNetwork is created after the adapter.
+
+        // ── Use configured network definition or default ─────────────────
         let network_definition = self
             .network_definition
             .unwrap_or_else(NetworkDefinition::simulator);
 
-        // Create transaction validator for signature verification
+        // ── Create transaction validator ─────────────────────────────────
         let tx_validator = Arc::new(hyperscale_engine::TransactionValidation::new(
             network_definition.clone(),
         ));
 
-        // Create the shared transaction validation batcher
-        // This is used by both network gossip and RPC submissions for:
-        // 1. Deduplication - skip already-seen transactions
-        // 2. Batching - collect transactions over time window for parallel validation
-        // Output goes to validated_tx_tx (unbounded) to avoid blocking crypto pool threads
-        let tx_validation_handle = hyperscale_validation::spawn_tx_validation_batcher(
-            hyperscale_validation::ValidationBatcherConfig::default(),
-            tx_validator.clone(),
-            dispatch.clone(),
-            validated_tx_tx,
-        );
-
-        // Create codec pool handle for async message encoding/decoding
-        // This uses the shared thread pool manager's codec pool to offload SBOR
-        // operations from the network event loop.
+        // ── Create codec pool handle ─────────────────────────────────────
         let codec_pool_handle = hyperscale_network_libp2p::CodecPoolHandle::new(dispatch.clone());
 
-        // Create network adapter with shared transaction validation batcher
-        let network = Libp2pAdapter::new(
+        // ── Create Libp2p network adapter ────────────────────────────────
+        // Pass the crossbeam channel directly — decoded events (including
+        // transactions) flow straight to the pinned NodeLoop thread, bypassing
+        // the tokio mpsc bridge.
+        let adapter = Libp2pAdapter::new(
             network_config,
             ed25519_keypair,
             validator_id,
             local_shard,
-            consensus_tx.clone(),
-            Arc::new(tx_validation_handle.clone()),
+            xb_consensus_tx.clone(),
             codec_pool_handle,
         )
         .await?;
 
-        // Subscribe to local shard topics
-        network.subscribe_shard(local_shard).await?;
+        // Subscribe to local shard topics.
+        adapter.subscribe_shard(local_shard).await?;
 
-        // Register known validators for peer validation
-        // This allows us to validate that messages come from known validators.
-        // We register ALL validators from the global validator set because:
-        // 1. Cross-shard transactions are gossiped between shards
-        // 2. Validators may receive messages forwarded from other shards
-        // Note: We use global_validator_set() instead of committee_for_shard() because
-        // StaticTopology::with_local_shard() only populates the local shard's committee.
+        // Register ALL validators from the global set for peer validation.
+        // Cross-shard transactions are gossiped between shards, so we need
+        // all validators, not just local committee.
         for validator in &topology.global_validator_set().validators {
             let peer_id = compute_peer_id_for_validator(&validator.public_key);
-            network
+            adapter
                 .register_validator(validator.validator_id, peer_id)
                 .await;
         }
 
-        // Create request manager for intelligent retry and peer selection.
-        // This handles request-centric retry (same peer first, then rotate),
-        // weighted peer selection based on health, and adaptive concurrency.
+        // ── Create RequestManager ────────────────────────────────────────
         let request_manager = Arc::new(hyperscale_network_libp2p::RequestManager::new(
-            network.clone(),
+            adapter.clone(),
             hyperscale_network_libp2p::RequestManagerConfig::default(),
         ));
 
-        // Create sync manager (uses consensus channel for sync events)
-        // The topology is passed directly - SyncManager queries it for committee members
-        // SyncManager delegates retry logic to RequestManager.
-        // Sync only accepts complete blocks - no backfill mechanism needed.
-        let sync_manager = SyncManager::new(
-            SyncConfig::default(),
+        // ── Now create ProdNetwork wrapping the adapter ──────────────────
+        //
+        // ProdNetwork owns the RequestManager for typed request methods
+        // (request_block, request_transactions, request_certificates).
+        let prod_network = ProdNetwork::new(
+            adapter.clone(),
             request_manager.clone(),
-            consensus_tx.clone(),
             topology.clone(),
+            tokio::runtime::Handle::current(),
         );
 
-        // Create fetch manager for transactions and certificates.
-        // FetchManager delegates retry logic to RequestManager.
-        let mut fetch_manager = crate::fetch::FetchManager::new(
-            crate::fetch::FetchConfig::default(),
-            request_manager.clone(),
-            storage.clone(),
-            consensus_tx.clone(),
+        // ── Create RadixExecutor ─────────────────────────────────────────
+        let executor = RadixExecutor::new(network_definition);
+
+        // ── Create SyncProtocol for NodeLoop ─────────────────────────────
+        let sync_protocol = SyncProtocol::new(hyperscale_node::SyncConfig::default());
+
+        // ── Create NodeLoop ──────────────────────────────────────────────
+        //
+        // The NodeLoop owns the state machine, storage, executor, network,
+        // dispatch, and event sender. It processes ALL actions from the
+        // state machine on the pinned thread. Timer ops are returned in
+        // StepOutput and managed by ProdTimerManager on the pinned thread.
+
+        let node_loop = NodeLoop::new(
+            state,
+            shared_storage,
+            executor,
+            prod_network,
+            (*dispatch).clone(),
+            xb_callback_tx.clone(),
+            node_loop_signing_key,
+            topology.clone(),
+            local_shard,
+            validator_id,
+            sync_protocol,
+            tx_validator.clone(),
         );
 
-        // Register local committee members with fetch manager (excluding self)
-        // (fetch only happens within shard, so we only need local committee)
-        for &vid in topology.committee_for_shard(local_shard).iter() {
-            // Don't register self - we can't fetch from ourselves
-            if vid == validator_id {
-                continue;
-            }
-            if let Some(pk) = topology.public_key(vid) {
-                let peer_id = compute_peer_id_for_validator(&pk);
-                fetch_manager.register_committee_member(vid, peer_id);
-            }
-        }
-
-        // Create executor
-        let executor = Arc::new(RadixExecutor::new(network_definition));
-
-        // Create message batcher for execution layer messages
-        // This batches state votes, certificates, and provisions to reduce network overhead
-        let message_batcher =
-            spawn_message_batcher(MessageBatcherConfig::default(), network.clone());
-
-        // Create shared certificate cache for fetch handler.
-        // This cache serves two purposes:
-        // 1. Skip verification of gossiped certificates we already built ourselves
-        // 2. Serve fetch requests before async storage write completes (race fix)
-        // The race can occur when: proposer builds cert -> includes in block -> broadcasts
-        // but async storage write hasn't completed when peers try to fetch the cert.
+        // ── Get cache handles from NodeLoop ──────────────────────────────
+        //
+        // Caches live inside NodeLoop. Get Arc clones before moving to pinned thread.
+        // These are shared with InboundRouter for serving peer fetch requests.
         let recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>> =
-            Arc::new(QuickCache::new(10_000));
-
-        // Create shared transaction cache to avoid redundant RocksDB writes.
-        // Transactions are inserted on gossip reception and served to fetch requests.
-        // Final persistence happens atomically in put_block on block commit.
+            Arc::clone(node_loop.cert_cache());
         let recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>> =
-            Arc::new(QuickCache::new(50_000));
+            Arc::clone(node_loop.tx_cache());
 
-        // Spawn InboundRouter to handle all inbound requests.
-        // This replaces the old fetch_handler and handles:
-        // - Block sync requests (block data)
-        // - Transaction fetch requests (tx data by hash)
-        // - Certificate fetch requests (cert data by hash)
-        // Hot data is served from in-memory caches first, falling back to RocksDB.
-        // - recently_received_txs: transactions received via gossip (not yet committed)
-        // - recently_built_certs: certificates built locally (not yet committed)
+        // ── Spawn InboundRouter ──────────────────────────────────────────
+        //
+        // Handles all inbound requests (block sync, tx fetch, cert fetch) from peers.
+        // Hot data is served from in-memory caches, falling back to RocksDB.
         let inbound_router = InboundRouter::spawn(
             InboundRouterConfig::default(),
-            network.clone(),
+            adapter.clone(),
             storage.clone(),
             recently_received_txs.clone(),
             recently_built_certs.clone(),
         );
 
-        // Spawn action dispatcher task for fire-and-forget network I/O.
-        // Network broadcasts are moved off the event loop to prevent blocking.
-        let action_dispatcher = spawn_action_dispatcher(ActionDispatcherContext {
-            network: network.clone(),
-            message_batcher: message_batcher.clone(),
-        });
-        let dispatch_tx = action_dispatcher.tx.clone();
-
-        // Spawn dedicated block commit task.
-        // Commits are processed sequentially to prevent JMT version race conditions.
-        let block_commit_task = spawn_block_commit_task(
-            storage.clone(),
-            local_shard,
-            self.rpc_status.clone(),
-            callback_tx.clone(),
-        );
+        // ── Build ProductionRunner ───────────────────────────────────────
 
         Ok(ProductionRunner {
-            timer_rx,
-            callback_rx,
-            callback_tx,
-            consensus_rx,
-            consensus_tx,
-            validated_tx_rx,
-            rpc_tx_rx,
-            rpc_tx_tx,
-            status_rx,
-            status_tx,
-            state,
-            start_time: Instant::now(),
-            epoch_start_time: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time before UNIX epoch"),
-            dispatch,
-            timer_manager,
-            network,
-            sync_manager,
-            fetch_manager,
-            local_shard,
+            node_loop: Some(node_loop),
+            xb_timer_tx,
+            xb_consensus_tx,
+            xb_callback_tx: xb_callback_tx.clone(),
+            xb_shutdown_tx,
+            xb_timer_rx: Some(xb_timer_rx),
+            xb_callback_rx: Some(xb_callback_rx),
+            xb_consensus_rx: Some(xb_consensus_rx),
+            xb_shutdown_rx: Some(xb_shutdown_rx),
+            network: adapter,
             topology,
             storage,
-            executor,
-            tx_validator,
-            tx_validation_handle,
+            dispatch,
+            inbound_router,
             rpc_status: self.rpc_status,
             tx_status_cache: self.tx_status_cache,
             mempool_snapshot: self.mempool_snapshot,
             genesis_config: self.genesis_config,
-            shutdown_rx,
-            shutdown_tx: Some(shutdown_tx),
-            pending_cross_shard_executions: PendingCrossShardExecutions::default(),
-            cross_shard_execution_deadline: None,
-            pending_state_certs: PendingStateCerts::default(),
-            state_cert_deadline: None,
-            pending_state_votes: PendingStateVotes::default(),
-            state_vote_deadline: None,
-            signing_key: runner_signing_key,
-            message_batcher,
-            inbound_router,
-            dispatch_tx,
-            action_dispatcher,
-            rpc_submitted_txs: std::collections::HashMap::new(),
-            pending_gossip_cert_verifications: std::collections::HashMap::new(),
-            recently_built_certs,
+            local_shard,
             recently_received_txs,
-            pending_gossiped_cert_batch: PendingGossipedCertBatch::default(),
-            gossiped_cert_batch_deadline: None,
-            block_commit_task,
-            prepared_commits: Arc::new(std::sync::Mutex::new(PreparedCommitCache::new())),
+            recently_built_certs,
+            shutdown_rx: Some(shutdown_rx),
+            shutdown_tx: Some(shutdown_tx),
         })
     }
 }
 
-/// Production runner with async I/O.
+// ═══════════════════════════════════════════════════════════════════════════
+// ProductionRunner
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Production runner with NodeLoop on a pinned thread.
 ///
-/// Uses the event aggregator pattern: a single task owns the state machine
-/// and receives events via an mpsc channel.
-///
-/// # Thread Pool Configuration
-///
-/// The runner uses configurable thread pools for different workloads:
-/// - **Crypto Pool**: BLS signature verification (CPU-bound)
-/// - **Execution Pool**: Transaction execution via Radix Engine (CPU/memory)
-/// - **I/O Pool**: Network, storage, timers (tokio runtime)
-///
-/// Use [`ProductionRunner::builder()`] to construct a runner with all required
-/// dependencies.
+/// The state machine (NodeLoop) runs on a dedicated thread pinned to core 0.
+/// All state machine processing, storage I/O, action handling, and gossip cert
+/// verification happen on that thread. The tokio runtime handles async I/O
+/// routing, RPC transaction handling, sync/fetch management, and metrics.
 pub struct ProductionRunner {
-    /// Receives critical-priority timer events (proposal, cleanup).
-    /// Dedicated channel ensures timers are never blocked by network floods.
-    timer_rx: mpsc::Receiver<Event>,
-    /// Receives highest-priority callback events (crypto verification, execution results).
-    /// These are Internal priority events that unblock in-flight consensus work.
-    /// Unbounded channel ensures thread pools never block waiting to send results.
-    callback_rx: mpsc::UnboundedReceiver<Event>,
-    /// Clone this to send callback events from crypto/execution thread pools.
-    /// Unbounded to prevent thread pool deadlocks - backpressure should be at work dispatch, not result return.
-    callback_tx: mpsc::UnboundedSender<Event>,
-    /// Receives high-priority consensus events (BFT network messages).
-    consensus_rx: mpsc::Receiver<Event>,
-    /// Clone this to send consensus events from network.
-    consensus_tx: mpsc::Sender<Event>,
-    /// Receives validated transactions from the batcher (unbounded to avoid blocking crypto pool).
-    /// Gossip-received transactions flow through here after validation.
-    validated_tx_rx: mpsc::UnboundedReceiver<Event>,
-    /// Receives RPC-submitted transactions (unbounded to avoid blocking RPC handlers).
-    /// These need to be gossiped before validation, unlike gossip-received transactions.
-    rpc_tx_rx: mpsc::UnboundedReceiver<Arc<RoutableTransaction>>,
-    /// Sender for RPC transaction submissions - exposed via tx_submission_sender().
-    rpc_tx_tx: mpsc::UnboundedSender<Arc<RoutableTransaction>>,
-    /// Receives background status events (TransactionStatusChanged, TransactionExecuted).
-    /// These are non-consensus-critical and processed opportunistically.
-    status_rx: mpsc::Receiver<Event>,
-    /// Clone this to send status events.
-    status_tx: mpsc::Sender<Event>,
-    /// The state machine (owned, not shared).
-    state: NodeStateMachine,
-    /// Start time for uptime calculation (node-local, not used for consensus timestamps).
-    start_time: Instant,
-    /// Unix epoch time when the node started, for wall-clock time calculation.
-    /// This is used for consensus timestamps to ensure nodes agree on time even if
-    /// they start at different moments.
-    epoch_start_time: Duration,
-    /// Dispatch implementation for crypto and execution workloads.
-    dispatch: Arc<PooledDispatch>,
-    /// Timer manager for setting/cancelling timers.
-    timer_manager: TimerManager,
-    /// Network adapter for libp2p communication.
+    // ── NodeLoop (moved to pinned thread on run()) ───────────────────────
+    /// The NodeLoop, wrapped in Option because it's moved to the pinned thread.
+    /// `None` after `run()` extracts it.
+    node_loop: Option<ProdNodeLoop>,
+
+    // ── Crossbeam senders (async → pinned thread) ────────────────────────
+    /// Timer events to pinned thread (for external timer injection if needed).
+    #[allow(dead_code)]
+    xb_timer_tx: crossbeam::channel::Sender<Event>,
+    /// Consensus events to pinned thread (from Libp2p adapter routing).
+    xb_consensus_tx: crossbeam::channel::Sender<Event>,
+    /// Callback events to pinned thread (from bridge tasks, direct sends).
+    #[allow(dead_code)] // Kept alive to prevent crossbeam channel closure
+    xb_callback_tx: crossbeam::channel::Sender<Event>,
+    /// Shutdown signal to pinned thread.
+    xb_shutdown_tx: crossbeam::channel::Sender<()>,
+
+    // ── Crossbeam receivers (extracted for PinnedLoopConfig) ─────────────
+    /// Timer receiver (moved to PinnedLoopConfig).
+    xb_timer_rx: Option<crossbeam::channel::Receiver<Event>>,
+    /// Callback receiver (moved to PinnedLoopConfig).
+    xb_callback_rx: Option<crossbeam::channel::Receiver<Event>>,
+    /// Consensus receiver (moved to PinnedLoopConfig).
+    xb_consensus_rx: Option<crossbeam::channel::Receiver<Event>>,
+    /// Shutdown receiver (moved to PinnedLoopConfig).
+    xb_shutdown_rx: Option<crossbeam::channel::Receiver<()>>,
+
+    // ── Infrastructure ───────────────────────────────────────────────────
+    /// Libp2p network adapter (shared with InboundRouter, RequestManager).
     network: Arc<Libp2pAdapter>,
-    /// Sync manager for fetching blocks from peers.
-    sync_manager: SyncManager,
-    /// Fetch manager for fetching transactions and certificates from peers.
-    fetch_manager: crate::fetch::FetchManager,
+    /// Network topology.
+    topology: Arc<dyn Topology>,
+    /// RocksDB storage (for InboundRouter and genesis).
+    #[allow(dead_code)]
+    storage: Arc<RocksDbStorage>,
+    /// Thread pool dispatch.
+    dispatch: Arc<PooledDispatch>,
+    /// Handle for the InboundRouter task.
+    #[allow(dead_code)]
+    inbound_router: InboundRouterHandle,
     /// Local shard for network broadcasts.
     local_shard: ShardGroupId,
-    /// Network topology (needed for cross-shard execution).
-    topology: Arc<dyn Topology>,
-    /// Block storage for persistence and crash recovery.
-    /// RocksDB is internally thread-safe, so no external lock is needed.
-    storage: Arc<RocksDbStorage>,
-    /// Transaction executor.
-    executor: Arc<RadixExecutor>,
-    /// Transaction validator for signature verification.
-    tx_validator: Arc<hyperscale_engine::TransactionValidation>,
-    /// Handle for the shared transaction validation batcher.
-    /// Used by both network gossip and RPC for dedup + batched validation.
-    tx_validation_handle: hyperscale_validation::ValidationBatcherHandle,
-    /// Optional RPC status state to update on block commits.
+
+    // ── RPC state ────────────────────────────────────────────────────────
+    /// Optional RPC status state.
     rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
     /// Optional transaction status cache for RPC queries.
     tx_status_cache: Option<Arc<TokioRwLock<TransactionStatusCache>>>,
     /// Optional mempool snapshot for RPC queries.
+    #[allow(dead_code)]
     mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
+
+    // ── Genesis ──────────────────────────────────────────────────────────
     /// Optional genesis configuration for initial state.
     genesis_config: Option<hyperscale_engine::GenesisConfig>,
-    /// Shutdown signal receiver.
-    shutdown_rx: oneshot::Receiver<()>,
-    /// Shutdown handle sender (stored to return to caller).
-    shutdown_tx: Option<oneshot::Sender<()>>,
-    /// Pending cross-shard executions accumulated for batch parallel execution.
-    /// Uses a short batching window (5ms) to balance latency vs throughput.
-    pending_cross_shard_executions: PendingCrossShardExecutions,
-    /// Deadline for flushing pending cross-shard executions. None if none pending.
-    cross_shard_execution_deadline: Option<tokio::time::Instant>,
-    /// Pending state certificates accumulated for batch signature verification.
-    /// Uses a 15ms batching window - state certs are the highest volume crypto operation.
-    pending_state_certs: PendingStateCerts,
-    /// Deadline for flushing pending state certificates. None if none pending.
-    state_cert_deadline: Option<tokio::time::Instant>,
-    /// Pending state votes accumulated for cross-transaction batch verification.
-    /// Uses a 20ms batching window with batch_verify_bls_different_messages for
-    /// ~2 pairings regardless of batch size (vs 2 pairings per tx with separate batches).
-    pending_state_votes: PendingStateVotes,
-    /// Deadline for flushing pending state votes. None if none pending.
-    state_vote_deadline: Option<tokio::time::Instant>,
-    /// Signing key for state vote signing (cloned from state machine).
-    signing_key: Bls12381G1PrivateKey,
-    /// Message batcher for execution layer messages (votes, certificates, provisions).
-    /// Accumulates items and flushes periodically to reduce network overhead.
-    /// Note: Now primarily used by action dispatcher, kept here for direct access if needed.
-    #[allow(dead_code)]
-    message_batcher: MessageBatcherHandle,
-    /// Handle for the InboundRouter task.
-    /// Processes all inbound requests (block sync, tx fetch, cert fetch) from other validators.
-    #[allow(dead_code)]
-    inbound_router: InboundRouterHandle,
-    /// Sender for dispatching fire-and-forget actions to the action dispatcher task.
-    /// Network broadcasts, timer management, and non-critical writes go through this.
-    /// Unbounded to prevent dropping critical consensus messages under load.
-    dispatch_tx: mpsc::UnboundedSender<DispatchableAction>,
-    /// Handle for the dedicated action dispatcher task.
-    #[allow(dead_code)]
-    action_dispatcher: ActionDispatcherHandle,
-    /// Transaction hashes that were submitted via RPC (locally) with submission time.
-    /// Used to track which transactions should contribute to latency metrics.
-    /// Transactions are added when received via RPC, removed when finalized.
-    /// Old entries are cleaned up periodically to prevent unbounded growth.
-    rpc_submitted_txs: std::collections::HashMap<hyperscale_types::Hash, std::time::Instant>,
-    /// Pending verifications for gossiped TransactionCertificates.
-    /// Maps tx_hash -> verification state. When all shards verified, certificate is
-    /// persisted and GossipedCertificateVerified event sent to state machine.
-    pending_gossip_cert_verifications:
-        std::collections::HashMap<Hash, PendingGossipCertVerification>,
-    /// LRU cache of recently locally-built certificates.
-    /// Serves two purposes:
-    /// 1. Skip verification of gossiped certificates we already built ourselves
-    /// 2. Serve fetch requests before async storage write completes (race fix)
-    ///
-    /// Shared with fetch handler via Arc for serving sync requests.
-    ///
-    /// Capacity of 10,000 is sufficient - certificates older than this will have
-    /// long since been included in blocks.
-    recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
+
+    // ── Caches ───────────────────────────────────────────────────────────
     /// LRU cache of recently received transactions (via gossip or RPC).
-    /// Serves fetch requests before block commit, avoiding redundant RocksDB writes.
+    /// Shared with InboundRouter for serving peer fetch requests from memory.
+    #[allow(dead_code)] // Kept alive to maintain Arc reference for InboundRouter
     recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
-    /// Pending gossiped certificates accumulated for batch signature verification.
-    /// Uses a 15ms batching window with backpressure to prevent crypto pool saturation.
-    pending_gossiped_cert_batch: PendingGossipedCertBatch,
-    /// Deadline for flushing pending gossiped certificate batch. None if none pending.
-    gossiped_cert_batch_deadline: Option<tokio::time::Instant>,
-    /// Handle for the dedicated block commit task.
-    /// Commits are serialized through this task to prevent JMT version race conditions.
-    block_commit_task: BlockCommitTaskHandle,
-    /// Precomputed commit handles from `prepare_block_commit`, keyed by block hash.
-    ///
-    /// Populated by `VerifyStateRoot` / `BuildProposal` (on crypto pool threads),
-    /// consumed by `EmitCommittedBlock` (on main event loop).
-    /// `Arc<Mutex>` because crypto pool closures need shared access.
-    /// Bounded to [`PREPARED_COMMIT_CACHE_MAX_SIZE`] entries with FIFO eviction.
-    prepared_commits: Arc<std::sync::Mutex<PreparedCommitCache>>,
+    /// LRU cache of recently built certificates.
+    /// Shared with InboundRouter for serving peer fetch requests from memory.
+    #[allow(dead_code)]
+    recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
+
+    // ── Shutdown ─────────────────────────────────────────────────────────
+    /// Shutdown signal receiver (external shutdown request).
+    shutdown_rx: Option<oneshot::Receiver<()>>,
+    /// Shutdown handle sender (returned to caller via shutdown_handle()).
+    shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
 impl ProductionRunner {
     /// Create a new builder for constructing a production runner.
-    ///
-    /// All fields are required - see [`ProductionRunnerBuilder`] for details.
     pub fn builder() -> ProductionRunnerBuilder {
         ProductionRunnerBuilder::new()
-    }
-
-    /// Get wall-clock time as a Duration since UNIX epoch.
-    ///
-    /// This uses the system clock to ensure all nodes agree on timestamps,
-    /// regardless of when they started. This is critical for BFT timestamp
-    /// validation which checks that proposer timestamps are within acceptable
-    /// bounds of the validator's local time.
-    fn wall_clock_time(&self) -> Duration {
-        // Use cached epoch_start_time + elapsed for better monotonicity within a session,
-        // while still being based on wall-clock time across nodes.
-        self.epoch_start_time + self.start_time.elapsed()
     }
 
     /// Get a reference to the dispatch implementation.
@@ -1180,39 +650,21 @@ impl ProductionRunner {
         self.local_shard
     }
 
-    /// Get a sender for submitting consensus events.
+    /// Get a crossbeam sender for submitting consensus events.
     ///
-    /// This is the high-priority channel for BFT messages.
-    /// For transaction submission, use `transaction_sender()` instead.
-    pub fn event_sender(&self) -> mpsc::Sender<Event> {
-        self.consensus_tx.clone()
-    }
-
-    /// Get the transaction validator for signature verification.
-    pub fn tx_validator(&self) -> Arc<hyperscale_engine::TransactionValidation> {
-        self.tx_validator.clone()
+    /// Events sent through this sender are forwarded to the pinned NodeLoop
+    /// thread via the crossbeam consensus channel.
+    pub fn event_sender(&self) -> crossbeam::channel::Sender<Event> {
+        self.xb_consensus_tx.clone()
     }
 
     /// Get a sender for RPC transaction submissions.
     ///
-    /// Transactions submitted through this channel will be:
-    /// 1. Gossiped to all relevant shards (RPC submissions need gossip)
-    /// 2. Validated via the shared batcher
-    /// 3. Dispatched to the mempool
-    ///
-    /// This is the correct path for RPC-submitted transactions.
-    /// Network gossip uses the validation batcher directly (no gossip needed).
-    pub fn tx_submission_sender(&self) -> mpsc::UnboundedSender<Arc<RoutableTransaction>> {
-        self.rpc_tx_tx.clone()
-    }
-
-    /// Get the transaction validation batcher handle.
-    ///
-    /// This handle is used by network gossip for dedup + batched validation.
-    /// RPC submissions should use `tx_submission_sender()` instead, which
-    /// handles gossip before validation.
-    pub fn tx_validation_handle(&self) -> hyperscale_validation::ValidationBatcherHandle {
-        self.tx_validation_handle.clone()
+    /// Returns a crossbeam channel sender that feeds directly into the NodeLoop.
+    /// RPC handlers wrap transactions in `Event::SubmitTransaction` before sending.
+    /// NodeLoop handles gossip, validation, and mempool dispatch.
+    pub fn tx_submission_sender(&self) -> crossbeam::channel::Sender<Event> {
+        self.xb_consensus_tx.clone()
     }
 
     /// Take the shutdown handle.
@@ -1225,31 +677,33 @@ impl ProductionRunner {
             .map(|tx| ShutdownHandle { tx: Some(tx) })
     }
 
-    /// Get a mutable reference to the sync manager.
-    pub fn sync_manager_mut(&mut self) -> &mut SyncManager {
-        &mut self.sync_manager
-    }
-
-    /// Check if sync is in progress.
-    pub fn is_syncing(&self) -> bool {
-        self.sync_manager.is_syncing()
-    }
+    // ═══════════════════════════════════════════════════════════════════
+    // Genesis Initialization
+    // ═══════════════════════════════════════════════════════════════════
 
     /// Initialize genesis if this is a fresh start.
     ///
     /// Checks if we have any committed blocks. If not, creates a genesis block
-    /// and initializes the state machine, which sets up the initial proposal timer.
-    fn maybe_initialize_genesis(&mut self) {
+    /// and initializes the state machine (which sets up the initial proposal timer).
+    ///
+    /// This MUST be called before the NodeLoop is moved to the pinned thread,
+    /// since it needs mutable access to the NodeLoop.
+    fn maybe_initialize_genesis(&mut self) -> Vec<TimerOp> {
+        let node_loop = self
+            .node_loop
+            .as_mut()
+            .expect("node_loop must exist for genesis");
+
         // Check if we already have committed blocks
-        let height = self.storage.committed_height();
+        let height = node_loop.storage().committed_height();
         let has_blocks = height.0 > 0;
 
         if has_blocks {
-            tracing::info!("Existing blocks found, skipping genesis initialization");
-            return;
+            info!("Existing blocks found, skipping genesis initialization");
+            return Vec::new();
         }
 
-        tracing::info!(
+        info!(
             shard = ?self.local_shard,
             "No committed blocks - initializing genesis"
         );
@@ -1257,36 +711,37 @@ impl ProductionRunner {
         // Run Radix Engine genesis to set up initial state.
         // Uses GenesisMutWrapper to bridge RocksDbStorage's &self commit()
         // with the Radix Engine's &mut self CommittableSubstateDatabase trait.
-        let mut wrapper = GenesisMutWrapper(&self.storage);
-        let result = if let Some(config) = self.genesis_config.take() {
-            tracing::info!(
-                xrd_balances = config.xrd_balances.len(),
-                "Running genesis with custom configuration"
-            );
-            self.executor.run_genesis_with_config(&mut wrapper, config)
-        } else {
-            self.executor.run_genesis(&mut wrapper)
-        };
+        let genesis_config = self.genesis_config.take();
+        let result = node_loop.with_storage_and_executor(|storage, executor| {
+            // SharedStorage derefs to &RocksDbStorage.
+            let mut wrapper = GenesisMutWrapper(storage);
+            if let Some(config) = genesis_config {
+                info!(
+                    xrd_balances = config.xrd_balances.len(),
+                    "Running genesis with custom configuration"
+                );
+                executor.run_genesis_with_config(&mut wrapper, config)
+            } else {
+                executor.run_genesis(&mut wrapper)
+            }
+        });
 
         if let Err(e) = result {
             panic!("Radix Engine genesis failed: {e:?}");
         }
 
         // Get the JMT state AFTER genesis bootstrap.
-        // This is critical - genesis may have populated the JMT with initial state,
-        // and the genesis block header must reflect this actual state.
         use hyperscale_storage::SubstateStore;
-        let genesis_jmt_version = self.storage.state_version();
-        let genesis_jmt_root = self.storage.state_root_hash();
+        let genesis_jmt_version = node_loop.storage().state_version();
+        let genesis_jmt_root = node_loop.storage().state_root_hash();
 
-        tracing::info!(
+        info!(
             genesis_jmt_version,
             genesis_jmt_root = ?genesis_jmt_root,
             "JMT state after genesis bootstrap"
         );
 
-        // Create genesis block
-        // The first validator in the committee is the proposer for genesis
+        // Create genesis block.
         let first_validator = self
             .topology
             .committee_for_shard(self.local_shard)
@@ -1294,8 +749,6 @@ impl ProductionRunner {
             .copied()
             .unwrap_or(ValidatorId(0));
 
-        // Genesis block uses the actual JMT state from bootstrap, not zeros.
-        // This ensures all validators agree on the starting state.
         let genesis_header = BlockHeader {
             height: BlockHeight(0),
             parent_hash: Hash::from_bytes(&[0u8; 32]),
@@ -1321,2215 +774,161 @@ impl ProductionRunner {
         };
 
         let genesis_hash = genesis_block.hash();
-        tracing::info!(
+        info!(
             genesis_hash = ?genesis_hash,
             proposer = ?first_validator,
             "Created genesis block"
         );
 
-        // Initialize state machine with genesis (this sets up proposal timer)
-        let actions = self.state.initialize_genesis(genesis_block);
+        // Initialize state machine with genesis (this sets up proposal timer).
+        let actions = node_loop.state_mut().initialize_genesis(genesis_block);
+        info!(num_actions = actions.len(), "Genesis returned actions");
 
-        tracing::info!(num_actions = actions.len(), "Genesis returned actions");
+        // Process actions through NodeLoop (timers, etc.).
+        node_loop.handle_actions(actions);
+        node_loop.flush_all_batches();
 
-        // Process the actions (should be SetTimer for proposal)
-        for action in actions {
-            self.process_action_sync(action);
-        }
+        // Drain timer ops from genesis actions (includes ProposalTimer).
+        let genesis_output = node_loop.drain_pending_output();
+        let mut timer_ops = genesis_output.timer_ops;
 
         // CRITICAL: Update state machine with the genesis JMT state.
         // The state machine was created BEFORE genesis bootstrap ran, so it has
         // stale/zero state. We need to sync it with the actual JMT state from
         // genesis so future blocks compute state_root from the correct base.
-        let genesis_commit_actions = self.state.handle(Event::StateCommitComplete {
+        let genesis_commit_output = node_loop.step(Event::StateCommitComplete {
             height: 0,
             state_version: genesis_jmt_version,
             state_root: genesis_jmt_root,
         });
 
-        tracing::info!(
+        info!(
             genesis_jmt_version,
             genesis_jmt_root = ?genesis_jmt_root,
-            actions = genesis_commit_actions.len(),
+            actions = genesis_commit_output.actions_generated,
             "Updated state machine with genesis JMT state"
         );
 
-        for action in genesis_commit_actions {
-            self.process_action_sync(action);
-        }
+        // Collect any additional timer ops from the commit step.
+        timer_ops.extend(genesis_commit_output.timer_ops);
+
+        // Flush any batches from the genesis commit step.
+        node_loop.flush_all_batches();
+
+        timer_ops
     }
 
-    /// Process an action synchronously (for genesis initialization).
-    fn process_action_sync(&mut self, action: Action) {
-        match action {
-            Action::SetTimer { id, duration } => {
-                tracing::info!(timer_id = ?id, duration_ms = ?duration.as_millis(), "Setting timer from genesis");
-                self.timer_manager.set_timer(id, duration);
-            }
-            Action::CancelTimer { id } => {
-                self.timer_manager.cancel_timer(id);
-            }
-            _ => {
-                tracing::debug!(action = ?action, "Ignoring action during genesis init");
-            }
-        }
-    }
+    // ═══════════════════════════════════════════════════════════════════
+    // Main Run Loop
+    // ═══════════════════════════════════════════════════════════════════
 
-    /// Run the main event loop.
+    /// Run the production node.
     ///
-    /// This should be spawned as a task. It runs until the event channel closes.
-    ///
-    /// The state machine runs on the current thread (the caller should ensure
-    /// this is pinned to a dedicated core if desired). Crypto and execution
-    /// work is dispatched to the configured thread pools.
-    ///
-    /// # Priority Handling
-    ///
-    /// Uses `biased` select for priority ordering - higher priority channels
-    /// are always checked first, but all channels get processed when ready.
+    /// 1. Initializes genesis via NodeLoop (before spawning pinned thread)
+    /// 2. Extracts the NodeLoop and channel receivers for the pinned thread
+    /// 3. Spawns the pinned thread running the NodeLoop event loop
+    /// 4. Runs a minimal loop for metrics collection and shutdown handling
+    /// 5. On shutdown, signals the pinned thread and joins it
     pub async fn run(mut self) -> Result<(), RunnerError> {
         let config = self.dispatch.config();
-        tracing::info!(
-            node_index = self.state.node_index(),
-            shard = ?self.state.shard(),
+        info!(
+            shard = ?self.local_shard,
             crypto_threads = config.crypto_threads,
             execution_threads = config.execution_threads,
             io_threads = config.io_threads,
             pin_cores = config.pin_cores,
-            "Starting production runner"
+            "Starting production runner (NodeLoop architecture)"
         );
 
-        // Initialize genesis if this is a fresh start (no committed blocks)
-        self.maybe_initialize_genesis();
+        // ── 1. Initialize genesis before spawning pinned thread ──────────
+        let initial_timer_ops = self.maybe_initialize_genesis();
 
-        // Sync tick interval (100ms)
-        let mut sync_tick = tokio::time::interval(Duration::from_millis(100));
-        sync_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // ── 2. Extract NodeLoop and channel receivers for pinned thread ───
+        let node_loop = self
+            .node_loop
+            .take()
+            .expect("node_loop already taken (run called twice?)");
 
-        // Metrics tick interval (1 second)
+        let pinned_config = PinnedLoopConfig {
+            timer_tx: self.xb_timer_tx.clone(),
+            timer_rx: self.xb_timer_rx.take().expect("timer_rx already taken"),
+            callback_rx: self
+                .xb_callback_rx
+                .take()
+                .expect("callback_rx already taken"),
+            consensus_rx: self
+                .xb_consensus_rx
+                .take()
+                .expect("consensus_rx already taken"),
+            shutdown_rx: self
+                .xb_shutdown_rx
+                .take()
+                .expect("shutdown_rx already taken"),
+            tx_status_cache: self.tx_status_cache.clone(),
+            tokio_handle: tokio::runtime::Handle::current(),
+            initial_timer_ops,
+        };
+
+        // ── 3. Spawn pinned thread ───────────────────────────────────────
+        let loop_handle = spawn_pinned_loop(node_loop, pinned_config);
+
+        // ── 4. Metrics + shutdown loop ───────────────────────────────────
         let mut metrics_tick = tokio::time::interval(Duration::from_secs(1));
         metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        // JMT garbage collection tick interval (30 seconds)
-        // GC deletes stale JMT nodes older than state_version_history_length.
-        // Runs in spawn_blocking to avoid blocking the async runtime.
-        let mut gc_tick = tokio::time::interval(Duration::from_secs(30));
-        gc_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut shutdown_rx = self.shutdown_rx.take().expect("shutdown_rx already taken");
 
         loop {
-            // Use biased select for priority ordering:
-            // 1. Shutdown (always first)
-            // 2. Timers (Critical priority - dedicated channel, never blocked by network)
-            // 3. Callbacks (Internal priority - crypto/execution results that unblock our consensus)
-            // 4. Consensus (Network priority - BFT messages from network)
-            // 5. Transactions (Client priority - submissions, gossip)
-            // 6. Sync requests (background)
-            // 7. Status events (non-critical)
-            // 8. Ticks (periodic maintenance)
-            //
-            // NOTE: Fetch requests (cert/tx) are now handled by a dedicated fetch handler task
-            // that reads from SharedReadState with lock-free DashMap lookups. This achieves
-            // P99 < 10ms response times without blocking the main event loop.
             tokio::select! {
                 biased;
-
-                // SHUTDOWN: Always check shutdown first (highest priority)
-                _ = &mut self.shutdown_rx => {
-                    tracing::info!("Shutdown signal received");
+                _ = &mut shutdown_rx => {
+                    info!("Shutdown signal received");
                     break;
                 }
-
-                // METRICS: Check early to avoid starvation under load (non-blocking, fast)
                 _ = metrics_tick.tick() => {
-                    // Update thread pool queue depths (non-blocking)
-                    metrics::set_pool_queue_depths(
-                        self.dispatch.consensus_crypto_queue_depth(),
-                        self.dispatch.crypto_queue_depth(),
-                        self.dispatch.tx_validation_queue_depth(),
-                        self.dispatch.execution_queue_depth(),
-                    );
-
-                    // Update event channel depths (non-blocking)
-                    // Note: inbound requests are handled by InboundRouter task
-                    metrics::set_channel_depths(&metrics::ChannelDepths {
-                        callback: self.callback_rx.len(),
-                        consensus: self.consensus_rx.len(),
-                        validated_tx: self.validated_tx_rx.len(),
-                        rpc_tx: self.rpc_tx_rx.len(),
-                        status: self.status_rx.len(),
-                        sync_request: 0, // Handled by InboundRouter
-                        tx_request: 0,   // Handled by InboundRouter
-                        cert_request: 0, // Handled by InboundRouter
-                    });
-
-                    // Update sync status (non-blocking)
-                    metrics::set_sync_status(
-                        self.sync_manager.blocks_behind(),
-                        self.sync_manager.is_syncing(),
-                    );
-
-                    // Update fetch status (non-blocking)
-                    let fetch_status = self.fetch_manager.status();
-                    metrics::set_fetch_in_flight(fetch_status.in_flight_operations);
-
-                    // Update peer count using cached value (non-blocking)
-                    let peer_count = self.network.cached_peer_count();
-                    metrics::set_libp2p_peers(peer_count);
-
-                    // Update RPC status with peer count (non-blocking: skip if contended)
-                    if let Some(ref rpc_status) = self.rpc_status {
-                        if let Ok(mut status) = rpc_status.try_write() {
-                            status.connected_peers = peer_count;
-                        }
-                    }
-
-                    // Update BFT metrics (view changes, round)
-                    let bft_stats = self.state.bft().stats();
-                    metrics::set_bft_round(bft_stats.current_round);
-                    metrics::set_view_changes(bft_stats.view_changes);
-
-                    // Update speculative execution metrics
-                    let (started, hits, late_hits, misses, invalidated) =
-                        self.state.execution_mut().take_speculative_metrics();
-                    if started > 0 {
-                        metrics::record_speculative_execution_started(started);
-                    }
-                    if hits > 0 {
-                        metrics::record_speculative_execution_cache_hit(hits);
-                    }
-                    if late_hits > 0 {
-                        metrics::record_speculative_execution_late_hit(late_hits);
-                    }
-                    if misses > 0 {
-                        metrics::record_speculative_execution_cache_miss(misses);
-                    }
-                    if invalidated > 0 {
-                        metrics::record_speculative_execution_invalidated(invalidated);
-                    }
-
-                    // Update mempool snapshot for RPC queries (non-blocking: skip if contended)
-                    if let Some(ref snapshot) = self.mempool_snapshot {
-                        let mempool = self.state.mempool();
-                        let stats = mempool.lock_contention_stats();
-                        let total = mempool.len();
-
-                        // RPC back-pressure: reject when hard-limit is reached
-                        let accepting = !mempool.at_in_flight_hard_limit();
-
-                        // RPC back-pressure: reject when pending count is too high
-                        let at_pending_limit = mempool.at_pending_limit();
-
-                        // Update Prometheus metrics
-                        metrics::set_mempool_size(total);
-                        metrics::set_lock_contention(stats.deferred_count, stats.contention_ratio());
-
-                        // Backpressure metrics - use mempool's view of in-flight TXs
-                        let in_flight = mempool.in_flight();
-                        metrics::set_in_flight(in_flight);
-                        metrics::set_backpressure_active(mempool.at_in_flight_limit());
-
-                        if let Ok(mut snap) = snapshot.try_write() {
-                            snap.pending_count = stats.pending_count as usize;
-                            snap.committed_count = stats.committed_count as usize;
-                            snap.executed_count = stats.executed_count as usize;
-                            snap.deferred_count = stats.deferred_count as usize;
-                            snap.total_count = total;
-                            snap.updated_at = Some(std::time::Instant::now());
-                            snap.accepting_rpc_transactions = accepting;
-                            snap.at_pending_limit = at_pending_limit;
-                        }
-                    }
-
-                    // Clean up old RPC-submitted transaction entries to prevent unbounded growth.
-                    // Transactions that don't finalize within RPC_SUBMITTED_TX_TIMEOUT are removed.
-                    let now = std::time::Instant::now();
-                    let rpc_expiry_threshold = now - RPC_SUBMITTED_TX_TIMEOUT;
-                    let before_count = self.rpc_submitted_txs.len();
-                    self.rpc_submitted_txs
-                        .retain(|_, submitted_at| *submitted_at >= rpc_expiry_threshold);
-                    let cleaned = before_count - self.rpc_submitted_txs.len();
-                    if cleaned > 0 {
-                        tracing::debug!(
-                            cleaned,
-                            remaining = self.rpc_submitted_txs.len(),
-                            "Cleaned up stale RPC-submitted transaction tracking"
-                        );
-                    }
-
-                    // Clean up stale pending gossip certificate verifications.
-                    // These can leak if verification callbacks never arrive (e.g., thread pool issues).
-                    // Each entry holds a full TransactionCertificate (~2-10KB), so this is critical.
-                    let before_gossip = self.pending_gossip_cert_verifications.len();
-                    let expiry_threshold = now - PENDING_GOSSIP_CERT_TIMEOUT;
-                    self.pending_gossip_cert_verifications
-                        .retain(|_, pending| pending.created_at >= expiry_threshold);
-                    let cleaned_gossip = before_gossip - self.pending_gossip_cert_verifications.len();
-                    if cleaned_gossip > 0 {
-                        tracing::warn!(
-                            cleaned_gossip,
-                            remaining = self.pending_gossip_cert_verifications.len(),
-                            "Cleaned up stale pending gossip cert verifications - possible crypto pool issue"
-                        );
-                    }
-                }
-
-                // CRITICAL PRIORITY: Timer events (proposal, cleanup)
-                // Timers have their own dedicated channel to ensure they are NEVER blocked
-                // by network floods. This is critical for liveness - if timers stop firing,
-                // the validator cannot make progress.
-                Some(event) = self.timer_rx.recv() => {
-                    // Update time
-                    let now = self.wall_clock_time();
-                    self.state.set_time(now);
-
-                    // Process timer event (span created by state.handle())
-                    let actions = self.dispatch_event(event).await;
-
-                    for action in actions {
-                        if let Err(e) = self.process_action(action).await {
-                            tracing::error!(error = ?e, "Error processing action from timer");
-                        }
-                    }
-                }
-
-                // NOTE: Fetch requests (cert_request_rx, tx_request_rx) are now handled by
-                // the dedicated fetch handler task using SharedReadState for lock-free reads.
-                // This eliminates event loop blocking and achieves P99 < 10ms response times.
-
-                // HIGH PRIORITY: Callback events (crypto/execution results)
-                // These unblock our own in-flight consensus work.
-                //
-                // IMPORTANT: ProvisioningComplete events come through this channel and
-                // produce ExecuteCrossShardTransaction actions. These must be accumulated
-                // for batch parallel execution, not sent directly to process_action().
-                Some(event) = self.callback_rx.recv() => {
-                    // Update time
-                    let now = self.wall_clock_time();
-                    self.state.set_time(now);
-
-                    // Dispatch event through unified handler (span created by state.handle())
-                    let actions = self.dispatch_event(event).await;
-
-                    // Process actions, accumulating cross-shard executions and vote signings for batching
-                    for action in actions {
-                        match action {
-                            Action::ExecuteCrossShardTransaction { tx_hash, transaction, provisions } => {
-                                // Accumulate cross-shard executions for batch parallel execution
-                                if self.pending_cross_shard_executions.is_empty() {
-                                    // Start the 5ms deadline on first cross-shard execution
-                                    self.cross_shard_execution_deadline = Some(
-                                        tokio::time::Instant::now() + Duration::from_millis(5)
-                                    );
-                                }
-                                self.pending_cross_shard_executions.requests.push(
-                                    hyperscale_core::CrossShardExecutionRequest {
-                                        tx_hash,
-                                        transaction,
-                                        provisions,
-                                    }
-                                );
-                                // Flush early if batch is full to cap p99 latency
-                                if self.pending_cross_shard_executions.is_full() {
-                                    let requests = self.pending_cross_shard_executions.take();
-                                    self.cross_shard_execution_deadline = None;
-                                    self.dispatch_cross_shard_executions(requests);
-                                }
-                            }
-                            other => {
-                                if let Err(e) = self.process_action(other).await {
-                                    tracing::error!(error = ?e, "Error processing action from callback");
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // HIGH PRIORITY: Handle incoming consensus events (BFT network messages)
-                event = self.consensus_rx.recv() => {
-                    match event {
-                        Some(event) => {
-                            // Update time
-                            let now = self.wall_clock_time();
-                            self.state.set_time(now);
-
-                            // Handle TransactionCertificateReceived - verify before persisting.
-                            // This is a certificate gossiped from another validator. We verify all
-                            // embedded StateCertificate BLS signatures before persisting to prevent
-                            // malicious peers from filling our storage with invalid certificates.
-                            //
-                            // BATCHING: Instead of spawning one crypto task per shard, we accumulate
-                            // certificates for batch verification. This significantly reduces crypto
-                            // pool pressure under high gossip load.
-                            if let Event::TransactionCertificateReceived { certificate } = &event {
-                                let tx_hash = certificate.transaction_hash;
-
-                                // Skip if we built this certificate locally (O(1) memory check).
-                                // This is the fast path - avoids storage I/O and verification work.
-                                if self.recently_built_certs.get(&tx_hash).is_some() {
-                                    continue;
-                                }
-
-                                // Skip if already in verification pipeline or storage
-                                if self.pending_gossip_cert_verifications.contains_key(&tx_hash) {
-                                    continue;
-                                }
-                                if self.storage.get_certificate(&tx_hash).is_some() {
-                                    continue;
-                                }
-
-                                // Collect shards that need verification
-                                let pending_shards: std::collections::HashSet<ShardGroupId> =
-                                    certificate.shard_proofs.keys().copied().collect();
-
-                                if pending_shards.is_empty() {
-                                    // Empty certificate (no shard proofs) - persist directly
-                                    // This shouldn't happen in practice but handle it gracefully
-                                    self.persist_and_notify_gossiped_certificate(certificate.clone());
-                                    continue;
-                                }
-
-                                // Track pending verification
-                                self.pending_gossip_cert_verifications.insert(
-                                    tx_hash,
-                                    PendingGossipCertVerification {
-                                        certificate: certificate.clone(),
-                                        pending_shards: pending_shards.clone(),
-                                        failed: false,
-                                        created_at: std::time::Instant::now(),
-                                    },
-                                );
-
-                                // Add each shard's state cert to the batch for verification
-                                for (shard_id, state_cert) in &certificate.shard_proofs {
-                                    let committee = self.topology.committee_for_shard(*shard_id);
-                                    let public_keys: Vec<Bls12381G1PublicKey> = committee
-                                        .iter()
-                                        .filter_map(|&vid| self.topology.public_key(vid))
-                                        .collect();
-
-                                    if public_keys.len() != committee.len() {
-                                        tracing::warn!(
-                                            tx_hash = ?tx_hash,
-                                            shard = shard_id.0,
-                                            "Could not resolve all public keys for gossiped certificate"
-                                        );
-                                        // Mark as failed
-                                        if let Some(pending) =
-                                            self.pending_gossip_cert_verifications.get_mut(&tx_hash)
-                                        {
-                                            pending.failed = true;
-                                            pending.pending_shards.remove(shard_id);
-                                        }
-                                        continue;
-                                    }
-
-                                    // Start batching deadline on first item
-                                    if self.pending_gossiped_cert_batch.is_empty() {
-                                        self.gossiped_cert_batch_deadline = Some(
-                                            tokio::time::Instant::now() + Duration::from_millis(15),
-                                        );
-                                    }
-
-                                    // Add to batch
-                                    self.pending_gossiped_cert_batch.items.push((
-                                        tx_hash,
-                                        certificate.clone(),
-                                        *shard_id,
-                                        state_cert.clone(),
-                                        public_keys,
-                                    ));
-
-                                    // Flush early if batch is full to cap p99 latency
-                                    if self.pending_gossiped_cert_batch.is_full() {
-                                        let batch = self.pending_gossiped_cert_batch.take();
-                                        self.gossiped_cert_batch_deadline = None;
-                                        self.dispatch_gossiped_cert_batch_verifications(batch);
-                                    }
-                                }
-
-                                // Don't dispatch to state machine yet - wait for verification
-                                continue;
-                            }
-
-                            // Handle GossipedCertificateSignatureVerified callbacks
-                            if let Event::GossipedCertificateSignatureVerified {
-                                tx_hash,
-                                shard,
-                                valid,
-                            } = &event
-                            {
-                                if let Some(pending) =
-                                    self.pending_gossip_cert_verifications.get_mut(tx_hash)
-                                {
-                                    if !valid {
-                                        pending.failed = true;
-                                        tracing::warn!(
-                                            tx_hash = ?tx_hash,
-                                            shard = shard.0,
-                                            "Gossiped certificate signature verification failed"
-                                        );
-                                    }
-                                    pending.pending_shards.remove(shard);
-
-                                    // Check if all shards verified
-                                    if pending.pending_shards.is_empty() {
-                                        let pending = self
-                                            .pending_gossip_cert_verifications
-                                            .remove(tx_hash)
-                                            .unwrap();
-
-                                        if !pending.failed {
-                                            // All verified - persist and notify state machine
-                                            self.persist_and_notify_gossiped_certificate(
-                                                pending.certificate,
-                                            );
-                                        }
-                                        // If failed, just drop - don't persist invalid certificate
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // Process event synchronously (span created by state.handle())
-                            // Note: Runner I/O requests (StartSync, FetchTransactions, FetchCertificates)
-                            // are now Actions emitted by the state machine and handled in process_action().
-                            //
-                            // Block vote verification is now deferred in the BFT state machine until
-                            // quorum is possible, then emitted as a single VerifyAndBuildQuorumCertificate
-                            // action. No runner-level vote batching is needed.
-                            let actions = self.state.handle(event);
-
-                            for action in actions {
-                                match action {
-                                    Action::VerifyStateCertificateSignature { certificate, public_keys } => {
-                                        // Add to accumulated state certs with 15ms batching window
-                                        if self.pending_state_certs.is_empty() {
-                                            self.state_cert_deadline = Some(
-                                                tokio::time::Instant::now() + Duration::from_millis(15)
-                                            );
-                                        }
-                                        self.pending_state_certs.certs.push((certificate, public_keys));
-                                        // Flush early if batch is full to cap p99 latency
-                                        if self.pending_state_certs.is_full() {
-                                            let certs = self.pending_state_certs.take();
-                                            self.state_cert_deadline = None;
-                                            self.dispatch_state_cert_verifications(certs);
-                                        }
-                                    }
-                                    other => {
-                                        if let Err(e) = self.process_action(other).await {
-                                            tracing::error!(error = ?e, "Error processing action");
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        None => {
-                            // Channel closed, exit loop
-                            break;
-                        }
-                    }
-                }
-
-                // CROSS-SHARD EXECUTION BATCHING: Flush accumulated executions when deadline expires.
-                // Uses a short batching window (5ms) to balance latency vs throughput.
-                // These are executed in parallel using rayon's par_iter.
-                _ = async {
-                    match self.cross_shard_execution_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                }, if self.cross_shard_execution_deadline.is_some() => {
-                    let requests = self.pending_cross_shard_executions.take();
-                    let batch_size = requests.len();
-                    self.cross_shard_execution_deadline = None;
-
-                    if !requests.is_empty() {
-                        tracing::debug!(
-                            batch_size,
-                            "Flushing cross-shard execution batch after 5ms window"
-                        );
-                        self.dispatch_cross_shard_executions(requests);
-                    }
-                }
-
-                // STATE CERTIFICATE BATCHING: Flush accumulated state certs when deadline expires.
-                // Uses a 15ms batching window - state certs are the highest volume crypto operation
-                // and benefit significantly from batch BLS verification (~40% faster).
-                _ = async {
-                    match self.state_cert_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                }, if self.state_cert_deadline.is_some() => {
-                    let certs = self.pending_state_certs.take();
-                    let batch_size = certs.len();
-                    self.state_cert_deadline = None;
-
-                    if !certs.is_empty() {
-                        tracing::debug!(
-                            batch_size,
-                            "Flushing state cert batch after 15ms window"
-                        );
-                        self.dispatch_state_cert_verifications(certs);
-                    }
-                }
-
-                // STATE VOTE BATCHING: Flush accumulated state votes when deadline expires.
-                // Uses a 20ms batching window - longer than state certs since state votes are
-                // part of cross-shard execution which has inherent network latency.
-                // Cross-tx batching uses batch_verify_bls_different_messages for ~2 pairings
-                // regardless of batch size (vs 2 pairings per tx with separate batches).
-                _ = async {
-                    match self.state_vote_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                }, if self.state_vote_deadline.is_some() => {
-                    let votes = self.pending_state_votes.take();
-                    let tx_count = votes.len();
-                    self.state_vote_deadline = None;
-
-                    if !votes.is_empty() {
-                        tracing::debug!(
-                            tx_count,
-                            "Flushing state vote batch after 20ms window"
-                        );
-                        self.dispatch_state_vote_verifications(votes);
-                    }
-                }
-
-                // GOSSIPED CERTIFICATE BATCHING: Flush accumulated gossiped certs when deadline expires.
-                // Uses a 15ms batching window - same as state certs since gossiped certs are not
-                // latency-critical (they can be re-fetched if needed). Batching significantly
-                // reduces crypto pool pressure under high gossip load.
-                _ = async {
-                    match self.gossiped_cert_batch_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending().await,
-                    }
-                }, if self.gossiped_cert_batch_deadline.is_some() => {
-                    let batch = self.pending_gossiped_cert_batch.take();
-                    let batch_size = batch.len();
-                    self.gossiped_cert_batch_deadline = None;
-
-                    if !batch.is_empty() {
-                        tracing::debug!(
-                            batch_size,
-                            "Flushing gossiped cert batch after 15ms window"
-                        );
-                        self.dispatch_gossiped_cert_batch_verifications(batch);
-                    }
-                }
-
-                // Handle validated transactions from batcher (unbounded channel)
-                // These are transactions that passed crypto validation in the batcher.
-                // Process before direct submissions since they've already been validated.
-                Some(event) = self.validated_tx_rx.recv() => {
-                    // Filter out transactions that are already in terminal state
-                    if let Event::TransactionGossipReceived { ref tx } = event {
-                        if let Some(ref cache) = self.tx_status_cache {
-                            if let Ok(cache_guard) = cache.try_read() {
-                                if let Some(cached) = cache_guard.get(&tx.hash()) {
-                                    if cached.status.is_final() {
-                                        tracing::trace!(
-                                            tx_hash = ?tx.hash(),
-                                            status = %cached.status,
-                                            "Ignoring validated tx for already-finalized transaction"
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Cache the transaction so peers can fetch it before block commit.
-                        // Previously this eagerly wrote to RocksDB, causing 2-3x write
-                        // amplification (gossip + block commit). Now we cache in memory
-                        // and let put_block handle the single atomic write.
-                        self.recently_received_txs.insert(tx.hash(), Arc::clone(tx));
-                    }
-
-                    let now = self.wall_clock_time();
-                    self.state.set_time(now);
-
-                    // Span created by state.handle()
-                    let actions = self.state.handle(event);
-
-                    for action in actions {
-                        if let Err(e) = self.process_action(action).await {
-                            tracing::error!(error = ?e, "Error processing validated tx action");
-                        }
-                    }
-                }
-
-                // Handle RPC-submitted transactions
-                // These need to be gossiped to all relevant shards BEFORE validation,
-                // unlike gossip-received transactions which are already gossiped.
-                Some(tx) = self.rpc_tx_rx.recv() => {
-                    let tx_hash = tx.hash();
-                    let tx_span = span!(
-                        Level::DEBUG,
-                        "handle_rpc_tx",
-                        tx_hash = ?tx_hash,
-                        node = self.state.node_index(),
-                        shard = ?self.state.shard(),
-                    );
-                    let _tx_guard = tx_span.enter();
-
-                    // Track this as an RPC-submitted transaction for latency metrics
-                    self.rpc_submitted_txs.insert(tx_hash, std::time::Instant::now());
-
-                    // Step 1: Gossip to all relevant shards FIRST
-                    // This ensures other validators see the transaction even if we fail later
-                    let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(&tx));
-                    for shard in self.topology.all_shards_for_transaction(&tx) {
-                        let _ = self.dispatch_tx.send(DispatchableAction::BroadcastTransaction {
-                            shard,
-                            gossip: Box::new(gossip.clone()),
-                        });
-                    }
-
-                    // Step 2: Submit to batcher for validation
-                    // After validation, it will come back through validated_tx_rx
-                    // and get dispatched to the state machine
-                    if !self.tx_validation_handle.submit(tx) {
-                        tracing::debug!("RPC transaction deduplicated or batcher closed");
-                    }
-                }
-
-                // Periodic sync and fetch manager tick
-                // This drives outbound sync/fetch operations, so give it some priority
-                _ = sync_tick.tick() => {
-                    let tick_span = span!(Level::TRACE, "sync_tick");
-                    let _tick_guard = tick_span.enter();
-
-                    // Tick both managers to process pending fetches
-                    self.sync_manager.tick().await;
-                    self.fetch_manager.tick().await;
-                }
-
-                // Periodic JMT garbage collection (low priority, runs in background)
-                // Deletes stale JMT nodes older than state_version_history_length.
-                _ = gc_tick.tick() => {
-                    let storage = self.storage.clone();
-                    tokio::task::spawn_blocking(move || {
-                        storage.run_jmt_gc();
-                    });
-                }
-
-                // Transaction status updates (non-consensus-critical)
-                // These update mempool status for RPC queries but don't affect consensus
-                Some(event) = self.status_rx.recv() => {
-                    // Update time
-                    let now = self.wall_clock_time();
-                    self.state.set_time(now);
-
-                    // Process status event (span created by state.handle())
-                    let actions = self.state.handle(event);
-
-                    for action in actions {
-                        if let Err(e) = self.process_action(action).await {
-                            tracing::error!(error = ?e, "Error processing status action");
-                        }
-                    }
+                    self.collect_metrics();
                 }
             }
         }
 
-        tracing::info!("Production runner stopped");
+        // ── 6. Shutdown pinned thread ────────────────────────────────────
+        info!("Sending shutdown to pinned thread");
+        let _ = self.xb_shutdown_tx.send(());
+
+        // Wait for the pinned thread to exit.
+        if let Err(e) = loop_handle.join() {
+            warn!("Pinned thread panicked: {:?}", e);
+        }
+
+        info!("Production runner stopped");
         Ok(())
     }
 
-    /// Process an action.
-    async fn process_action(&mut self, action: Action) -> Result<(), RunnerError> {
-        match action {
-            // Network I/O - dispatch to action dispatcher task (fire-and-forget)
-            // This prevents network latency from blocking the event loop.
-            Action::BroadcastBlockHeader { shard, header } => {
-                let _ = self
-                    .dispatch_tx
-                    .send(DispatchableAction::BroadcastBlockHeader { shard, header });
-            }
-
-            Action::BroadcastBlockVote { shard, vote } => {
-                let _ = self
-                    .dispatch_tx
-                    .send(DispatchableAction::BroadcastBlockVote { shard, vote });
-            }
-
-            Action::BroadcastTransaction { shard, gossip } => {
-                let _ = self
-                    .dispatch_tx
-                    .send(DispatchableAction::BroadcastTransaction { shard, gossip });
-            }
-
-            Action::BroadcastTransactionCertificate { shard, gossip } => {
-                let _ = self
-                    .dispatch_tx
-                    .send(DispatchableAction::BroadcastTransactionCertificate { shard, gossip });
-            }
-
-            // Domain-specific execution broadcasts - dispatch to action dispatcher
-            // The batcher accumulates items and flushes periodically to reduce network overhead.
-            // These are critical cross-shard messages - log errors if dispatch fails.
-            Action::BroadcastStateVote { shard, vote } => {
-                if self
-                    .dispatch_tx
-                    .send(DispatchableAction::QueueStateVote {
-                        shard,
-                        vote: vote.clone(),
-                    })
-                    .is_err()
-                {
-                    tracing::error!(
-                        shard = shard.0,
-                        tx_hash = ?vote.transaction_hash,
-                        "CRITICAL: Failed to dispatch state vote - dispatcher channel closed"
-                    );
-                    metrics::increment_dispatch_failures("state_vote");
-                }
-            }
-
-            Action::BroadcastStateCertificate { shard, certificate } => {
-                if self
-                    .dispatch_tx
-                    .send(DispatchableAction::QueueStateCertificate {
-                        shard,
-                        certificate: Arc::clone(&certificate),
-                    })
-                    .is_err()
-                {
-                    tracing::error!(
-                        shard = shard.0,
-                        tx_hash = ?certificate.transaction_hash,
-                        "CRITICAL: Failed to dispatch state certificate - dispatcher channel closed"
-                    );
-                    metrics::increment_dispatch_failures("state_certificate");
-                }
-            }
-
-            Action::BroadcastStateProvision { shard, provision } => {
-                if self
-                    .dispatch_tx
-                    .send(DispatchableAction::QueueStateProvision {
-                        shard,
-                        provision: provision.clone(),
-                    })
-                    .is_err()
-                {
-                    tracing::error!(
-                        shard = shard.0,
-                        tx_hash = ?provision.transaction_hash,
-                        "CRITICAL: Failed to dispatch state provision - dispatcher channel closed"
-                    );
-                    metrics::increment_dispatch_failures("state_provision");
-                }
-            }
-
-            // Timers via timer manager
-            Action::SetTimer { id, duration } => {
-                self.timer_manager.set_timer(id, duration);
-            }
-
-            Action::CancelTimer { id } => {
-                self.timer_manager.cancel_timer(id);
-            }
-
-            // Block vote verification + QC building on CONSENSUS crypto pool (liveness-critical)
-            //
-            // With deferred verification, votes are buffered until quorum is possible, then
-            // batch-verified and aggregated in a single operation. This avoids wasting CPU
-            // on votes that will never be used (e.g., view change, leader failure).
-            Action::VerifyAndBuildQuorumCertificate {
-                block_hash,
-                height,
-                round,
-                parent_block_hash,
-                signing_message,
-                votes_to_verify,
-                verified_votes: already_verified,
-                total_voting_power,
-            } => {
-                let event_tx = self.callback_tx.clone();
-                self.dispatch.spawn_consensus_crypto(move || {
-                    let start = std::time::Instant::now();
-                    let result = hyperscale_bft::handlers::verify_and_build_qc(
-                        block_hash,
-                        height,
-                        round,
-                        parent_block_hash,
-                        &signing_message,
-                        votes_to_verify,
-                        already_verified,
-                        total_voting_power,
-                    );
-                    metrics::record_signature_verification_latency(
-                        if result.qc.is_some() {
-                            "qc_build"
-                        } else {
-                            "vote_batch"
-                        },
-                        start.elapsed().as_secs_f64(),
-                    );
-                    event_tx
-                        .send(Event::QuorumCertificateResult {
-                            block_hash: result.block_hash,
-                            qc: result.qc,
-                            verified_votes: result.verified_votes,
-                        })
-                        .expect("callback channel closed");
-                });
-            }
-
-            Action::VerifyAndAggregateProvisions {
-                tx_hash,
-                source_shard,
-                block_height,
-                block_timestamp,
-                entries,
-                provisions,
-                public_keys,
-                committee_size,
-            } => {
-                let event_tx = self.callback_tx.clone();
-                let topology = self.topology.clone();
-                self.dispatch.spawn_crypto(move || {
-                    let start = std::time::Instant::now();
-                    let result = hyperscale_provisions::handlers::verify_and_aggregate_provisions(
-                        tx_hash,
-                        source_shard,
-                        block_height,
-                        block_timestamp,
-                        entries,
-                        provisions,
-                        &public_keys,
-                        committee_size,
-                        topology.as_ref(),
-                    );
-                    metrics::record_signature_verification_latency(
-                        "provision_batch_verify_aggregate",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    event_tx
-                        .send(Event::ProvisionsVerifiedAndAggregated {
-                            tx_hash,
-                            source_shard,
-                            verified_provisions: result.verified_provisions,
-                            commitment_proof: result.commitment_proof,
-                        })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
-            }
-
-            Action::AggregateStateCertificate {
-                tx_hash,
-                shard,
-                merkle_root,
-                votes,
-                read_nodes,
-                voting_power,
-                committee_size,
-            } => {
-                let event_tx = self.callback_tx.clone();
-                let topology = self.topology.clone();
-                self.dispatch.spawn_crypto(move || {
-                    let start = std::time::Instant::now();
-                    let certificate = hyperscale_execution::handlers::aggregate_state_certificate(
-                        tx_hash,
-                        shard,
-                        merkle_root,
-                        &votes,
-                        read_nodes,
-                        voting_power,
-                        committee_size,
-                        topology.as_ref(),
-                    );
-                    metrics::record_signature_verification_latency(
-                        "state_cert_aggregation",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    event_tx
-                        .send(Event::StateCertificateAggregated {
-                            tx_hash,
-                            certificate,
-                        })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
-            }
-
-            Action::VerifyAndAggregateStateVotes { tx_hash, votes } => {
-                // Accumulate state votes for cross-transaction batch verification.
-                // Uses a 20ms batching window with batch_verify_bls_different_messages
-                // which achieves ~2 pairings regardless of batch size.
-                //
-                // NOTE: State votes should normally be batched via the event loop's
-                // pending_state_votes accumulator. This fallback handles any votes
-                // that come through process_action (e.g., from callback channel events).
-                if self.pending_state_votes.is_empty() {
-                    self.state_vote_deadline =
-                        Some(tokio::time::Instant::now() + Duration::from_millis(20));
-                }
-                self.pending_state_votes.push(tx_hash, votes);
-                // Flush early if batch is full to cap p99 latency
-                if self.pending_state_votes.is_full() {
-                    let votes = self.pending_state_votes.take();
-                    self.state_vote_deadline = None;
-                    self.dispatch_state_vote_verifications(votes);
-                }
-            }
-
-            Action::VerifyStateCertificateSignature {
-                certificate,
-                public_keys,
-            } => {
-                // NOTE: State certs should normally be batched via the event loop's
-                // pending_state_certs accumulator. This fallback handles any certs
-                // that come through process_action (e.g., from callback channel events).
-                if self.pending_state_certs.is_empty() {
-                    self.state_cert_deadline =
-                        Some(tokio::time::Instant::now() + Duration::from_millis(15));
-                }
-                self.pending_state_certs
-                    .certs
-                    .push((certificate, public_keys));
-                // Flush early if batch is full to cap p99 latency
-                if self.pending_state_certs.is_full() {
-                    let certs = self.pending_state_certs.take();
-                    self.state_cert_deadline = None;
-                    self.dispatch_state_cert_verifications(certs);
-                }
-            }
-
-            Action::VerifyQcSignature {
-                qc,
-                public_keys,
-                block_hash,
-                signing_message,
-            } => {
-                let event_tx = self.callback_tx.clone();
-                // QC verification is LIVENESS-CRITICAL - use consensus crypto pool
-                self.dispatch.spawn_consensus_crypto(move || {
-                    let start = std::time::Instant::now();
-                    let valid = hyperscale_bft::handlers::verify_qc_signature(
-                        &qc,
-                        &public_keys,
-                        &signing_message,
-                    );
-                    metrics::record_signature_verification_latency(
-                        "qc",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        metrics::record_signature_verification_failure();
-                    }
-                    event_tx
-                        .send(Event::QcSignatureVerified { block_hash, valid })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
-            }
-
-            Action::VerifyCycleProof {
-                block_hash,
-                deferral_index,
-                cycle_proof,
-                public_keys,
-                signing_message,
-                quorum_threshold,
-            } => {
-                let event_tx = self.callback_tx.clone();
-                // CycleProof verification is LIVENESS-CRITICAL - use consensus crypto pool
-                self.dispatch.spawn_consensus_crypto(move || {
-                    let start = std::time::Instant::now();
-                    let valid = hyperscale_bft::handlers::verify_cycle_proof(
-                        &cycle_proof,
-                        &public_keys,
-                        &signing_message,
-                        quorum_threshold,
-                    );
-                    metrics::record_signature_verification_latency(
-                        "cycle_proof",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        metrics::record_signature_verification_failure();
-                    }
-                    event_tx
-                        .send(Event::CycleProofVerified {
-                            block_hash,
-                            deferral_index,
-                            valid,
-                        })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
-            }
-
-            Action::VerifyStateRoot {
-                block_hash,
-                parent_state_root,
-                expected_root,
-                certificates,
-            } => {
-                let event_tx = self.callback_tx.clone();
-                let storage = self.storage.clone();
-                let local_shard = self.local_shard;
-                let prepared_commits = self.prepared_commits.clone();
-
-                // State root verification can be expensive for large blocks.
-                // Use consensus crypto pool since this is on the critical voting path.
-                self.dispatch.spawn_consensus_crypto(move || {
-                    let start = std::time::Instant::now();
-                    let result = hyperscale_bft::handlers::verify_state_root(
-                        &*storage,
-                        parent_state_root,
-                        expected_root,
-                        &certificates,
-                        local_shard,
-                    );
-                    let elapsed = start.elapsed().as_secs_f64();
-                    if result.valid {
-                        tracing::debug!(
-                            block_hash = ?block_hash,
-                            elapsed_ms = elapsed * 1000.0,
-                            cert_count = certificates.len(),
-                            "State root verified and commit work prepared"
-                        );
-                        // Store prepared handle for use at commit time.
-                        if let Some(prepared) = result.prepared_commit {
-                            prepared_commits
-                                .lock()
-                                .unwrap()
-                                .insert(block_hash, prepared);
-                        }
-                    }
-
-                    event_tx
-                        .send(Event::StateRootVerified {
-                            block_hash,
-                            valid: result.valid,
-                        })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
-            }
-
-            Action::VerifyTransactionRoot {
-                block_hash,
-                expected_root,
-                retry_transactions,
-                priority_transactions,
-                transactions,
-            } => {
-                let event_tx = self.callback_tx.clone();
-
-                // Transaction root verification is a pure CPU computation (merkle tree).
-                // Use consensus crypto pool since it's on the critical voting path.
-                self.dispatch.spawn_consensus_crypto(move || {
-                    let start = std::time::Instant::now();
-                    let valid = hyperscale_bft::handlers::verify_transaction_root(
-                        expected_root, &retry_transactions,
-                        &priority_transactions, &transactions,
-                    );
-                    let elapsed = start.elapsed().as_secs_f64();
-                    if valid {
-                        tracing::debug!(
-                            block_hash = ?block_hash,
-                            elapsed_ms = elapsed * 1000.0,
-                            total_txs = retry_transactions.len() + priority_transactions.len() + transactions.len(),
-                            "Transaction root verified"
-                        );
-                    }
-
-                    event_tx
-                        .send(Event::TransactionRootVerified { block_hash, valid })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
-            }
-
-            Action::BuildProposal {
-                proposer,
-                height,
-                round,
-                parent_hash,
-                parent_qc,
-                timestamp,
-                is_fallback,
-                parent_state_root,
-                parent_state_version,
-                retry_transactions,
-                priority_transactions,
-                transactions,
-                certificates,
-                commitment_proofs,
-                deferred,
-                aborted,
-            } => {
-                let event_tx = self.callback_tx.clone();
-                let storage = self.storage.clone();
-                let local_shard = self.local_shard;
-                let prepared_commits = self.prepared_commits.clone();
-
-                // Build proposal block. Check if JMT is ready, compute state root if so,
-                // build the block, and store the PreparedCommit for efficient commit.
-                self.dispatch.spawn_consensus_crypto(move || {
-                    let start = std::time::Instant::now();
-                    let result = hyperscale_bft::handlers::build_proposal(
-                        &*storage, proposer, height, round, parent_hash, parent_qc,
-                        timestamp, is_fallback, parent_state_root, parent_state_version,
-                        retry_transactions, priority_transactions, transactions,
-                        certificates, commitment_proofs, deferred, aborted, local_shard,
-                    );
-
-                    // Store prepared handle under the real block hash.
-                    if let Some(prepared) = result.prepared_commit {
-                        prepared_commits.lock().unwrap().insert(result.block_hash, prepared);
-                    }
-
-                    let elapsed = start.elapsed().as_secs_f64();
-                    tracing::info!(
-                        height = height.0,
-                        round = round,
-                        block_hash = ?result.block_hash,
-                        certificates = result.block.certificates.len(),
-                        transactions = result.block.retry_transactions.len() + result.block.priority_transactions.len() + result.block.transactions.len(),
-                        state_root = ?result.block.header.state_root,
-                        elapsed_ms = elapsed * 1000.0,
-                        "Built proposal"
-                    );
-
-                    event_tx
-                        .send(Event::ProposalBuilt {
-                            height,
-                            round,
-                            block: std::sync::Arc::new(result.block),
-                            block_hash: result.block_hash,
-                        })
-                        .expect("callback channel closed");
-                });
-            }
-
-            // Transaction execution (single-shard and speculative) on dedicated pool.
-            // Uses shared handle_delegated_action for the execute+sign algorithm,
-            // with map_execution providing parallel execution on the rayon pool.
-            action @ Action::ExecuteTransactions { .. }
-            | action @ Action::SpeculativeExecute { .. } => {
-                let is_speculative = matches!(action, Action::SpeculativeExecute { .. });
-                let event_tx = self.callback_tx.clone();
-                let dispatch_tx = self.dispatch_tx.clone();
-                let dispatch = self.dispatch.clone();
-                let storage = self.storage.clone();
-                let executor = self.executor.clone();
-                let topology = self.topology.clone();
-                let key_bytes = self.signing_key.to_bytes();
-                let signing_key =
-                    Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
-                let local_shard = self.local_shard;
-                let validator_id = self.topology.local_validator_id();
-
-                self.dispatch.spawn_execution(move || {
-                    let start = std::time::Instant::now();
-                    let ctx = hyperscale_node::action_handler::ActionContext {
-                        storage: &*storage,
-                        executor: &executor,
-                        topology: topology.as_ref(),
-                        signing_key: &signing_key,
-                        local_shard,
-                        validator_id,
-                        dispatch: &*dispatch,
-                    };
-
-                    if let Some(result) =
-                        hyperscale_node::action_handler::handle_delegated_action(action, &ctx)
-                    {
-                        if is_speculative {
-                            metrics::record_speculative_execution_latency(
-                                start.elapsed().as_secs_f64(),
-                            );
-                        } else {
-                            metrics::record_execution_latency(start.elapsed().as_secs_f64());
-                        }
-
-                        for event in result.events {
-                            // Broadcast votes to shard peers via network
-                            if let Event::StateVoteReceived { ref vote } = event {
-                                let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
-                                    shard: local_shard,
-                                    vote: vote.clone(),
-                                });
-                            }
-                            event_tx.send(event).expect(
-                                "callback channel closed - Loss of this event would cause a deadlock",
-                            );
-                        }
-                    }
-                });
-            }
-
-            // Cross-shard transaction execution is handled by the event loop's batching mechanism.
-            // The ExecuteCrossShardTransaction action is accumulated and executed in parallel batches.
-            // See dispatch_cross_shard_executions() for the parallel execution implementation.
-            Action::ExecuteCrossShardTransaction { .. } => {
-                // This should never be reached - the action is intercepted in the event loop
-                // and accumulated for batch execution.
-                tracing::error!("ExecuteCrossShardTransaction reached process_action - should be handled by event loop batching");
-            }
-
-            // Merkle computation on execution pool (can be parallelized internally)
-            // Note: This action is currently not emitted by any state machine.
-            Action::ComputeMerkleRoot { tx_hash, writes } => {
-                let event_tx = self.callback_tx.clone();
-
-                self.dispatch.spawn_execution(move || {
-                    let root = hyperscale_bft::handlers::compute_merkle_root(&writes);
-                    event_tx
-                        .send(Event::MerkleRootComputed { tx_hash, root })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
-            }
-
-            // Internal events are routed based on criticality:
-            // - Status events (TransactionStatusChanged, TransactionExecuted) go to status channel
-            // - All other internal events (QC formed, block committed, etc.) go to callback channel
-            //   for highest priority processing
-            Action::EnqueueInternal { event } => {
-                let is_status_event = matches!(
-                    &event,
-                    Event::TransactionStatusChanged { .. } | Event::TransactionExecuted { .. }
-                );
-
-                if is_status_event {
-                    // Non-consensus-critical: route to status channel
-                    self.status_tx
-                        .send(event)
-                        .await
-                        .map_err(|e| RunnerError::SendError(e.to_string()))?;
-                } else {
-                    // Consensus-critical internal event: route to callback channel
-                    // This ensures internal events (QC formed, block ready, etc.) are
-                    // processed before new network events
-                    self.callback_tx
-                        .send(event)
-                        .map_err(|e| RunnerError::SendError(e.to_string()))?;
-                }
-            }
-
-            Action::EmitTransactionStatus {
-                tx_hash,
-                status,
-                added_at,
-                cross_shard,
-                submitted_locally: _,
-            } => {
-                tracing::debug!(?tx_hash, ?status, cross_shard, "Transaction status update");
-
-                // Record transaction metrics for terminal states, but only for transactions
-                // that were submitted via RPC to THIS node. This avoids polluting latency
-                // metrics with transactions received via gossip/sync which would have
-                // artificially high latencies on lagging nodes.
-                //
-                // Note: We use rpc_submitted_txs instead of the submitted_locally field
-                // because the field tracks mempool insertion, not RPC origin. In production,
-                // RPC transactions go through gossip before reaching the mempool, so
-                // submitted_locally would always be false.
-                if status.is_final() {
-                    // Check if this was an RPC-submitted transaction
-                    if let Some(_submitted_at) = self.rpc_submitted_txs.remove(&tx_hash) {
-                        // Calculate latency from submission to finalization
-                        let now = self.state.now();
-                        let latency_secs = now.saturating_sub(added_at).as_secs_f64();
-                        metrics::record_transaction_finalized(latency_secs, cross_shard);
-                    }
-                }
-
-                // Update transaction status cache for RPC queries
-                if let Some(ref cache) = self.tx_status_cache {
-                    let cache = cache.clone();
-                    let status_clone = status.clone();
-                    // Use spawn to avoid blocking - cache update is fast but we don't want
-                    // to await on the write lock in the hot path
-                    tokio::spawn(async move {
-                        let mut cache = cache.write().await;
-                        cache.update(tx_hash, status_clone);
-                    });
-                }
-            }
-
-            Action::EmitCommittedBlock { block, qc } => {
-                let height = block.header.height.0;
-                let current_view = self.state.bft().view();
-                tracing::info!(
-                    block_hash = ?block.hash(),
-                    height = height,
-                    view = current_view,
-                    certificates = block.certificates.len(),
-                    "Block committed"
-                );
-
-                // Record block committed metric with latency from proposal to commit.
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-                let commit_latency_secs =
-                    (now_ms.saturating_sub(block.header.timestamp)) as f64 / 1000.0;
-                metrics::record_block_committed(height, commit_latency_secs);
-
-                // Record livelock metrics for deferrals in this block.
-                for _deferral in &block.deferred {
-                    metrics::record_livelock_deferral();
-                    metrics::record_livelock_cycle_detected();
-                }
-
-                // Update deferred transaction count gauge.
-                let livelock_stats = self.state.livelock().stats();
-                metrics::set_livelock_deferred_count(livelock_stats.pending_deferrals);
-
-                // Update sync manager's committed height - critical for correct sync behavior.
-                // If sync completes, notify the state machine so it can resume view changes.
-                if let Some(sync_height) = self.sync_manager.set_committed_height(height) {
-                    tracing::info!(
-                        sync_height,
-                        committed_height = height,
-                        "Sync completed, sending SyncComplete event to resume consensus"
-                    );
-                    let sync_complete_event = Event::SyncComplete {
-                        height: sync_height,
-                    };
-                    // SyncComplete handler just clears the syncing flag and resets timeout,
-                    // it doesn't return any actions that need processing.
-                    let _ = self.state.handle(sync_complete_event);
-                }
-
-                // Update RPC status with new block height and view
-                if let Some(ref rpc_status) = self.rpc_status {
-                    let rpc_status = rpc_status.clone();
-                    tokio::spawn(async move {
-                        let mut status = rpc_status.write().await;
-                        status.block_height = height;
-                        status.view = current_view;
-                    });
-                }
-
-                // IMPORTANT: Apply state writes for committed certificates IN ORDER.
-                // This is the canonical point where state is committed - not when
-                // certificates are built, gossiped, or the block is certified.
-                // This ensures deterministic JMT state across all nodes.
-                //
-                // EmitCommittedBlock is emitted when a block commits (not when certified),
-                // so this is the correct place for state application.
-                //
-                // SERIALIZATION: Commits are sent to a dedicated task that processes them
-                // sequentially. This prevents race conditions where concurrent spawn_blocking
-                // tasks complete out of order, causing JMT version mismatches.
-                //
-                // OPTIMIZATION: If we have a cached JMT snapshot from verification,
-                // the commit task applies it directly (fast path). Otherwise it falls back
-                // to per-certificate commits (slow path).
-                //
-                // After commit completes, the commit task persists committed metadata
-                // (set_committed_state, prune_own_votes) guaranteeing that on recovery
-                // committed_height never exceeds the actual JMT state.
-                if !block.certificates.is_empty() {
-                    let block_hash = block.hash();
-                    let prepared = self.prepared_commits.lock().unwrap().remove(&block_hash);
-                    let request = BlockCommitRequest {
-                        block: block.clone(),
-                        height,
-                        block_hash,
-                        qc,
-                        prepared,
-                    };
-
-                    // Send to dedicated commit task for sequential processing.
-                    // try_send to avoid blocking the event loop - if channel is full,
-                    // we're severely backlogged and should log a warning.
-                    if let Err(e) = self.block_commit_task.tx.try_send(request) {
-                        tracing::error!(
-                            height,
-                            error = %e,
-                            "Failed to send block commit request - commit channel full or closed"
-                        );
-                    }
-                } else {
-                    // Empty block (no certificates) - no state changes to apply,
-                    // but still update committed metadata so recovery knows this height.
-                    let storage = self.storage.clone();
-                    let block_hash = block.hash();
-                    tokio::task::spawn_blocking(move || {
-                        storage.set_committed_state(BlockHeight(height), block_hash, &qc);
-                        storage.prune_own_votes(height);
-                    });
-                }
-            }
-
-            // ═══════════════════════════════════════════════════════════════════════
-            // Storage writes
-            // ═══════════════════════════════════════════════════════════════════════
-            Action::PersistBlock { block, qc } => {
-                // Fire-and-forget block persistence - not latency critical
-                // RocksDB is internally thread-safe, no lock needed
-                //
-                // Uses denormalized storage: block metadata stored separately from
-                // transactions and certificates. This eliminates duplication and
-                // enables storage-backed fetch requests.
-                //
-                // NOTE: State writes are NOT applied here. This action is emitted when
-                // a block is certified (has QC), but state should only be applied when
-                // the block commits. State application happens in EmitCommittedBlock.
-                //
-                // NOTE: Committed metadata (set_committed_state, prune_own_votes) is NOT
-                // set here. PersistBlock fires at certification time, not commit time.
-                // Committed metadata is set after JMT state is applied in the commit task
-                // (or directly for empty blocks) to prevent state divergence on recovery.
-                let storage = self.storage.clone();
-                let height = block.height();
-                tokio::task::spawn_blocking(move || {
-                    storage.put_block(height, &block, &qc);
-                });
-            }
-
-            Action::PersistTransactionCertificate { certificate } => {
-                // Persist certificate bytes for peer fetching.
-                // NOTE: State writes are NOT applied here - they are applied in PersistBlock
-                // when the certificate is included in a committed block. This ensures
-                // deterministic state ordering across all nodes.
-                let storage = self.storage.clone();
-                let local_shard = self.local_shard;
-
-                // Cache the certificate BEFORE spawning the storage write.
-                // This fixes a race condition where:
-                // 1. We build a cert and include it in a block proposal
-                // 2. Peer receives the block and tries to fetch the cert from us
-                // 3. But our async storage write hasn't completed yet
-                // The fetch handler checks this cache first, so we can serve the cert
-                // even before storage write completes.
-                let tx_hash = certificate.transaction_hash;
-                let cert_arc = Arc::new(certificate.clone());
-                self.recently_built_certs.insert(tx_hash, cert_arc);
-
-                // Persist certificate bytes only (no state writes)
-                // Fire-and-forget: RocksDB WAL ensures durability
-                let cert_for_persist = certificate.clone();
-                tokio::task::spawn_blocking(move || {
-                    storage.store_certificate(&cert_for_persist);
-                });
-
-                // Only gossip cross-shard certificates where it provides more value.
-                // Single-shard: all validators start at same time, gossip is mostly redundant.
-                // Cross-shard: validators receive provisions at different times, gossip helps
-                // slower validators skip redundant certificate building.
-                if certificate.shard_proofs.len() > 1 {
-                    let gossip =
-                        hyperscale_messages::TransactionCertificateGossip::new(certificate);
-                    let _ = self.dispatch_tx.send(
-                        DispatchableAction::BroadcastTransactionCertificate {
-                            shard: local_shard,
-                            gossip,
-                        },
-                    );
-                }
-            }
-
-            Action::PersistAndBroadcastVote {
-                height,
-                round,
-                block_hash,
-                shard,
-                vote,
-            } => {
-                // **BFT Safety Critical**: Must persist before broadcasting vote
-                // Prevents equivocation after crash/restart.
-                //
-                // Fire-and-forget pattern with callback:
-                // 1. Spawn blocking task for RocksDB write
-                // 2. After persist completes, dispatch broadcast to action dispatcher
-                // 3. Main event loop continues immediately (no blocking)
-                let storage = self.storage.clone();
-                let dispatch_tx = self.dispatch_tx.clone();
-
-                tokio::task::spawn_blocking(move || {
-                    // Persist vote (sync write with WAL)
-                    storage.put_own_vote(height.0, round, block_hash);
-
-                    // After persist completes, send broadcast to action dispatcher
-                    // This ensures persist-before-broadcast ordering without blocking the event loop
-                    let _ =
-                        dispatch_tx.send(DispatchableAction::BroadcastBlockVote { shard, vote });
-                });
-                // Note: No .await - we don't block the event loop
-            }
-
-            // ═══════════════════════════════════════════════════════════════════════
-            // Storage reads - RocksDB is internally thread-safe, no lock needed
-            // Results go to callback channel as they unblock consensus progress
-            // ═══════════════════════════════════════════════════════════════════════
-            Action::FetchStateEntries { tx_hash, nodes } => {
-                let event_tx = self.callback_tx.clone();
-                let storage = self.storage.clone();
-                let executor = self.executor.clone();
-
-                tokio::task::spawn_blocking(move || {
-                    let entries = executor.fetch_state_entries(&*storage, &nodes);
-                    event_tx
-                        .send(Event::StateEntriesFetched { tx_hash, entries })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
-            }
-
-            Action::FetchBlock { height } => {
-                let event_tx = self.callback_tx.clone();
-                let storage = self.storage.clone();
-
-                tokio::task::spawn_blocking(move || {
-                    let block = storage.get_block(height).map(|(b, _qc)| b);
-                    event_tx.send(Event::BlockFetched { height, block }).expect(
-                        "callback channel closed - Loss of this event would cause a deadlock",
-                    );
-                });
-            }
-
-            Action::FetchChainMetadata => {
-                let event_tx = self.callback_tx.clone();
-                let storage = self.storage.clone();
-
-                tokio::task::spawn_blocking(move || {
-                    let height = storage.committed_height();
-                    let hash = storage.committed_hash();
-                    let qc = storage.latest_qc();
-                    event_tx
-                        .send(Event::ChainMetadataFetched { height, hash, qc })
-                        .expect(
-                            "callback channel closed - Loss of this event would cause a deadlock",
-                        );
-                });
-            }
-
-            // ═══════════════════════════════════════════════════════════════════════
-            // Global Consensus Actions (TODO: implement when GlobalConsensusState exists)
-            // ═══════════════════════════════════════════════════════════════════════
-            Action::ProposeGlobalBlock { epoch, height, .. } => {
-                tracing::trace!(?epoch, ?height, "ProposeGlobalBlock - not yet implemented");
-            }
-            Action::BroadcastGlobalBlockVote {
-                block_hash, shard, ..
-            } => {
-                tracing::trace!(
-                    ?block_hash,
-                    ?shard,
-                    "BroadcastGlobalBlockVote - not yet implemented"
-                );
-            }
-            Action::TransitionEpoch {
-                from_epoch,
-                to_epoch,
-                ..
-            } => {
-                tracing::debug!(
-                    ?from_epoch,
-                    ?to_epoch,
-                    "TransitionEpoch - not yet implemented"
-                );
-            }
-            Action::MarkValidatorReady { epoch, shard } => {
-                tracing::debug!(?epoch, ?shard, "MarkValidatorReady - not yet implemented");
-            }
-            Action::InitiateShardSplit {
-                source_shard,
-                new_shard,
-                split_point,
-            } => {
-                tracing::info!(
-                    ?source_shard,
-                    ?new_shard,
-                    split_point,
-                    "InitiateShardSplit - not yet implemented"
-                );
-            }
-            Action::CompleteShardSplit {
-                source_shard,
-                new_shard,
-            } => {
-                tracing::info!(
-                    ?source_shard,
-                    ?new_shard,
-                    "CompleteShardSplit - not yet implemented"
-                );
-            }
-            Action::InitiateShardMerge {
-                shard_a,
-                shard_b,
-                merged_shard,
-            } => {
-                tracing::info!(
-                    ?shard_a,
-                    ?shard_b,
-                    ?merged_shard,
-                    "InitiateShardMerge - not yet implemented"
-                );
-            }
-            Action::CompleteShardMerge { merged_shard } => {
-                tracing::info!(?merged_shard, "CompleteShardMerge - not yet implemented");
-            }
-            Action::PersistEpochConfig { .. } => {
-                tracing::debug!("PersistEpochConfig - not yet implemented");
-            }
-            Action::FetchEpochConfig { epoch } => {
-                tracing::debug!(?epoch, "FetchEpochConfig - not yet implemented");
-            }
-
-            // ═══════════════════════════════════════════════════════════════════════
-            // Runner I/O Requests (network fetches)
-            // These are requests from the state machine for the runner to perform
-            // network I/O. Results are delivered back as Events.
-            // ═══════════════════════════════════════════════════════════════════════
-            Action::StartSync {
-                target_height,
-                target_hash,
-            } => {
-                // Cancel pending fetches to free up request slots for sync.
-                // Sync delivers complete blocks that supersede the gossip blocks
-                // we were fetching for, so there's no point continuing those fetches.
-                self.fetch_manager.cancel_all();
-                self.sync_manager.start_sync(target_height, target_hash);
-            }
-
-            Action::FetchTransactions {
-                block_hash,
-                proposer,
-                tx_hashes,
-            } => {
-                // Delegate to FetchManager for parallel, retry-capable fetching
-                self.fetch_manager
-                    .request_transactions(block_hash, proposer, tx_hashes);
-            }
-
-            Action::FetchCertificates {
-                block_hash,
-                proposer,
-                cert_hashes,
-            } => {
-                // Delegate to FetchManager for parallel, retry-capable fetching
-                self.fetch_manager
-                    .request_certificates(block_hash, proposer, cert_hashes);
-            }
-
-            Action::CancelFetch { block_hash } => {
-                // Cancel any pending fetch operations for this block.
-                // This is called when the block is committed, removed as stale,
-                // or superseded by sync.
-                self.fetch_manager
-                    .cancel_fetch(block_hash, crate::fetch::FetchKind::Transaction);
-                self.fetch_manager
-                    .cancel_fetch(block_hash, crate::fetch::FetchKind::Certificate);
+    // ═══════════════════════════════════════════════════════════════════
+    // Metrics Collection
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Collect and export metrics.
+    ///
+    /// Called every 1 second from the metrics loop. Collects pool queue depths,
+    /// peer count, and cleans up stale RPC tracking entries.
+    fn collect_metrics(&self) {
+        // ── Thread pool queue depths ─────────────────────────────────────
+        metrics::set_pool_queue_depths(
+            self.dispatch.consensus_crypto_queue_depth(),
+            self.dispatch.crypto_queue_depth(),
+            self.dispatch.tx_validation_queue_depth(),
+            self.dispatch.execution_queue_depth(),
+        );
+
+        // ── Peer count ───────────────────────────────────────────────────
+        let peer_count = self.network.cached_peer_count();
+        metrics::set_libp2p_peers(peer_count);
+
+        // ── Update RPC status with peer count ────────────────────────────
+        if let Some(ref rpc_status) = self.rpc_status {
+            if let Ok(mut status) = rpc_status.try_write() {
+                status.connected_peers = peer_count;
             }
         }
-
-        Ok(())
-    }
-
-    /// Dispatch state certificate verifications to the crypto thread pool.
-    ///
-    /// State certificates contain aggregated BLS signatures that are expensive to verify.
-    /// By batching them with a 15ms window, we can use BLS batch verification which is
-    /// ~40% faster than individual verification. This is the highest volume crypto operation.
-    ///
-    /// The verification process:
-    /// 1. For each certificate, aggregate signer public keys based on bitfield (parallel via map_crypto)
-    /// 2. Batch verify all (aggregated_pk, message, aggregated_sig) tuples
-    /// 3. Send individual results back as events
-    fn dispatch_state_cert_verifications(
-        &self,
-        certs: Vec<(hyperscale_types::StateCertificate, Vec<Bls12381G1PublicKey>)>,
-    ) {
-        if certs.is_empty() {
-            return;
-        }
-
-        let event_tx = self.callback_tx.clone();
-        let batch_size = certs.len();
-        let dispatch = self.dispatch.clone();
-
-        self.dispatch.spawn_crypto(move || {
-            let start = std::time::Instant::now();
-
-            // Step 1: Pre-process certificates in parallel - aggregate signer keys and build messages
-            // This is the expensive part that benefits from parallelization
-            let prepared: Vec<_> = dispatch.map_crypto(&certs, |(cert, public_keys)| {
-                let msg = cert.signing_message();
-
-                // Get signer keys based on bitfield
-                let signer_keys: Vec<_> = public_keys
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| cert.signers.is_set(*i))
-                    .map(|(_, pk)| *pk)
-                    .collect();
-
-                // Pre-aggregate the public keys (skip validation - keys from trusted topology)
-                let aggregated_pk = if signer_keys.is_empty() {
-                    None // Will check for zero signature
-                } else {
-                    Bls12381G1PublicKey::aggregate(&signer_keys, false).ok()
-                };
-
-                (cert.clone(), msg, aggregated_pk)
-            });
-
-            // Step 2: Batch verify all signatures
-            // Separate into verifiable (have aggregated_pk) and special cases (empty signers)
-            let mut verifiable: Vec<(
-                hyperscale_types::StateCertificate,
-                Vec<u8>,
-                Bls12381G1PublicKey,
-            )> = Vec::new();
-            let mut zero_sig_certs: Vec<hyperscale_types::StateCertificate> = Vec::new();
-            let mut failed_aggregation: Vec<hyperscale_types::StateCertificate> = Vec::new();
-
-            for (cert, msg, maybe_pk) in prepared {
-                match maybe_pk {
-                    Some(pk) => verifiable.push((cert, msg, pk)),
-                    None => {
-                        // No signers - check if it's a valid zero signature case
-                        if cert.aggregated_signature == zero_bls_signature() {
-                            zero_sig_certs.push(cert);
-                        } else {
-                            failed_aggregation.push(cert);
-                        }
-                    }
-                }
-            }
-
-            // Batch verify the aggregated signatures
-            let verification_results = if !verifiable.is_empty() {
-                let messages: Vec<&[u8]> =
-                    verifiable.iter().map(|(_, m, _)| m.as_slice()).collect();
-                let signatures: Vec<Bls12381G2Signature> = verifiable
-                    .iter()
-                    .map(|(c, _, _)| c.aggregated_signature)
-                    .collect();
-                let pubkeys: Vec<Bls12381G1PublicKey> =
-                    verifiable.iter().map(|(_, _, pk)| *pk).collect();
-
-                batch_verify_bls_different_messages(&messages, &signatures, &pubkeys)
-            } else {
-                vec![]
-            };
-
-            // Step 3: Send results
-            // Verified certs
-            for ((cert, _, _), valid) in verifiable.into_iter().zip(verification_results) {
-                if !valid {
-                    metrics::record_signature_verification_failure();
-                }
-                let _ = event_tx.send(Event::StateCertificateSignatureVerified {
-                    certificate: cert,
-                    valid,
-                });
-            }
-
-            // Zero signature certs (valid)
-            for cert in zero_sig_certs {
-                let _ = event_tx.send(Event::StateCertificateSignatureVerified {
-                    certificate: cert,
-                    valid: true,
-                });
-            }
-
-            // Failed aggregation certs (invalid)
-            for cert in failed_aggregation {
-                metrics::record_signature_verification_failure();
-                let _ = event_tx.send(Event::StateCertificateSignatureVerified {
-                    certificate: cert,
-                    valid: false,
-                });
-            }
-
-            metrics::record_signature_verification_latency(
-                "state_cert",
-                start.elapsed().as_secs_f64(),
-            );
-
-            if batch_size > 1 {
-                tracing::debug!(
-                    batch_size,
-                    "Batch verified state cert signatures (15ms window)"
-                );
-            }
-        });
-    }
-
-    /// Dispatch state vote verifications to the crypto thread pool.
-    ///
-    /// State votes from multiple transactions are batched together for verification
-    /// using `batch_verify_bls_different_messages`, which achieves ~2 pairings
-    /// regardless of batch size. This is significantly faster than verifying
-    /// each transaction's votes separately (which would be 2 pairings per tx).
-    ///
-    /// Uses a 20ms batching window (longer than state certs) since state votes
-    /// are part of cross-shard execution which has inherent network latency.
-    fn dispatch_state_vote_verifications(&self, batched_votes: BatchedStateVotes) {
-        if batched_votes.is_empty() {
-            return;
-        }
-
-        let event_tx = self.callback_tx.clone();
-        let tx_count = batched_votes.len();
-        let vote_count: usize = batched_votes.iter().map(|(_, v)| v.len()).sum();
-
-        self.dispatch.spawn_crypto(move || {
-            let start = std::time::Instant::now();
-
-            // Flatten all votes into a single list for batch verification
-            // Track which tx each vote belongs to for result correlation
-            let mut all_votes: Vec<(Hash, StateVoteBlock, Bls12381G1PublicKey, u64)> = Vec::new();
-            for (tx_hash, votes) in batched_votes {
-                for (vote, pk, power) in votes {
-                    all_votes.push((tx_hash, vote, pk, power));
-                }
-            }
-
-            // Build arrays for batch verification
-            let messages: Vec<Vec<u8>> = all_votes
-                .iter()
-                .map(|(_, vote, _, _)| vote.signing_message())
-                .collect();
-            let message_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
-            let signatures: Vec<Bls12381G2Signature> = all_votes
-                .iter()
-                .map(|(_, vote, _, _)| vote.signature)
-                .collect();
-            let pubkeys: Vec<Bls12381G1PublicKey> =
-                all_votes.iter().map(|(_, _, pk, _)| *pk).collect();
-
-            // Batch verify all signatures at once (~2 pairings regardless of count)
-            let results = batch_verify_bls_different_messages(&message_refs, &signatures, &pubkeys);
-
-            // Group verified votes by tx_hash for result events
-            use std::collections::HashMap;
-            let mut verified_by_tx: HashMap<Hash, Vec<(StateVoteBlock, u64)>> = HashMap::new();
-
-            for ((tx_hash, vote, _, power), valid) in all_votes.into_iter().zip(results) {
-                if valid {
-                    verified_by_tx
-                        .entry(tx_hash)
-                        .or_default()
-                        .push((vote, power));
-                } else {
-                    metrics::record_signature_verification_failure();
-                }
-            }
-
-            // Send results grouped by transaction
-            for (tx_hash, verified_votes) in verified_by_tx {
-                event_tx
-                    .send(Event::StateVotesVerifiedAndAggregated {
-                        tx_hash,
-                        verified_votes,
-                    })
-                    .expect("callback channel closed - Loss of this event would cause a deadlock");
-            }
-
-            metrics::record_signature_verification_latency(
-                "state_vote_batch",
-                start.elapsed().as_secs_f64(),
-            );
-
-            if tx_count > 1 {
-                tracing::debug!(
-                    tx_count,
-                    vote_count,
-                    elapsed_ms = start.elapsed().as_millis(),
-                    "Batch verified state votes across transactions (20ms window)"
-                );
-            }
-        });
-    }
-
-    /// Dispatch batched gossiped certificate verifications to the crypto thread pool.
-    ///
-    /// Uses batch BLS verification for efficiency and backpressure to prevent
-    /// crypto pool saturation under high gossip load.
-    fn dispatch_gossiped_cert_batch_verifications(
-        &self,
-        batch: Vec<(
-            Hash,
-            TransactionCertificate,
-            ShardGroupId,
-            hyperscale_types::StateCertificate,
-            Vec<Bls12381G1PublicKey>,
-        )>,
-    ) {
-        if batch.is_empty() {
-            return;
-        }
-
-        let event_tx = self.callback_tx.clone();
-        let batch_size = batch.len();
-        let dispatch = self.dispatch.clone();
-
-        // Check backpressure before spawning - if crypto pool is overloaded,
-        // these gossiped certs will timeout and be cleaned up by TTL.
-        // This is acceptable since gossiped certs are non-critical and can be re-fetched.
-        if !self.dispatch.try_spawn_crypto(move || {
-            let start = std::time::Instant::now();
-
-            // Step 1: Pre-process certificates in parallel - aggregate signer keys and build messages
-            let prepared: Vec<_> =
-                dispatch.map_crypto(&batch, |(tx_hash, _tx_cert, shard, cert, public_keys)| {
-                    let msg = cert.signing_message();
-
-                    // Get signer keys based on bitfield
-                    let signer_keys: Vec<_> = public_keys
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| cert.signers.is_set(*i))
-                        .map(|(_, pk)| *pk)
-                        .collect();
-
-                    // Pre-aggregate the public keys (skip validation - keys from trusted topology)
-                    let aggregated_pk = if signer_keys.is_empty() {
-                        None // Will check for zero signature
-                    } else {
-                        Bls12381G1PublicKey::aggregate(&signer_keys, false).ok()
-                    };
-
-                    (*tx_hash, *shard, cert.clone(), msg, aggregated_pk)
-                });
-
-            // Step 2: Batch verify all signatures
-            // Separate into verifiable (have aggregated_pk) and special cases
-            let mut verifiable: Vec<(
-                Hash,
-                ShardGroupId,
-                hyperscale_types::StateCertificate,
-                Vec<u8>,
-                Bls12381G1PublicKey,
-            )> = Vec::new();
-            let mut zero_sig_certs: Vec<(Hash, ShardGroupId)> = Vec::new();
-            let mut failed_aggregation: Vec<(Hash, ShardGroupId)> = Vec::new();
-
-            for (tx_hash, shard, cert, msg, maybe_pk) in prepared {
-                match maybe_pk {
-                    Some(pk) => verifiable.push((tx_hash, shard, cert, msg, pk)),
-                    None => {
-                        // No signers - check if it's a valid zero signature case
-                        if cert.aggregated_signature == zero_bls_signature() {
-                            zero_sig_certs.push((tx_hash, shard));
-                        } else {
-                            failed_aggregation.push((tx_hash, shard));
-                        }
-                    }
-                }
-            }
-
-            // Batch verify the aggregated signatures
-            let verification_results = if !verifiable.is_empty() {
-                let messages: Vec<&[u8]> = verifiable
-                    .iter()
-                    .map(|(_, _, _, m, _)| m.as_slice())
-                    .collect();
-                let signatures: Vec<Bls12381G2Signature> = verifiable
-                    .iter()
-                    .map(|(_, _, c, _, _)| c.aggregated_signature)
-                    .collect();
-                let pubkeys: Vec<Bls12381G1PublicKey> =
-                    verifiable.iter().map(|(_, _, _, _, pk)| *pk).collect();
-
-                batch_verify_bls_different_messages(&messages, &signatures, &pubkeys)
-            } else {
-                vec![]
-            };
-
-            // Step 3: Send results
-            // Verified certs
-            for ((tx_hash, shard, _, _, _), valid) in
-                verifiable.into_iter().zip(verification_results)
-            {
-                if !valid {
-                    metrics::record_signature_verification_failure();
-                }
-                let _ = event_tx.send(Event::GossipedCertificateSignatureVerified {
-                    tx_hash,
-                    shard,
-                    valid,
-                });
-            }
-
-            // Zero signature certs (valid)
-            for (tx_hash, shard) in zero_sig_certs {
-                let _ = event_tx.send(Event::GossipedCertificateSignatureVerified {
-                    tx_hash,
-                    shard,
-                    valid: true,
-                });
-            }
-
-            // Failed aggregation certs (invalid)
-            for (tx_hash, shard) in failed_aggregation {
-                metrics::record_signature_verification_failure();
-                let _ = event_tx.send(Event::GossipedCertificateSignatureVerified {
-                    tx_hash,
-                    shard,
-                    valid: false,
-                });
-            }
-
-            metrics::record_signature_verification_latency(
-                "gossiped_cert",
-                start.elapsed().as_secs_f64(),
-            );
-
-            if batch_size > 1 {
-                tracing::debug!(
-                    batch_size,
-                    "Batch verified gossiped cert signatures (15ms window)"
-                );
-            }
-        }) {
-            // Backpressure triggered - crypto pool queue > 100
-            // Log and let TTL cleanup handle these certs
-            tracing::warn!(
-                batch_size,
-                crypto_queue_depth = self.dispatch.crypto_queue_depth(),
-                "Gossiped cert batch rejected due to crypto pool backpressure"
-            );
-            metrics::record_backpressure_event("gossiped_cert_verification");
-        }
-    }
-
-    /// Dispatch cross-shard executions to the execution thread pool.
-    ///
-    /// Uses the shared `handle_cross_shard_batch` for the execute+sign algorithm,
-    /// with `map_execution` providing parallel execution on the rayon pool.
-    /// After execution, broadcasts votes and sends to state machine directly.
-    fn dispatch_cross_shard_executions(
-        &self,
-        requests: Vec<hyperscale_core::CrossShardExecutionRequest>,
-    ) {
-        if requests.is_empty() {
-            return;
-        }
-
-        let event_tx = self.callback_tx.clone();
-        let dispatch_tx = self.dispatch_tx.clone();
-        let dispatch = self.dispatch.clone();
-        let storage = self.storage.clone();
-        let executor = self.executor.clone();
-        let topology = self.topology.clone();
-        let local_shard = self.local_shard;
-        let batch_size = requests.len();
-        let key_bytes = self.signing_key.to_bytes();
-        let signing_key = Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
-        let validator_id = topology.local_validator_id();
-
-        self.dispatch.spawn_execution(move || {
-            let start = std::time::Instant::now();
-            let ctx = hyperscale_node::action_handler::ActionContext {
-                storage: &*storage,
-                executor: &executor,
-                topology: topology.as_ref(),
-                signing_key: &signing_key,
-                local_shard,
-                validator_id,
-                dispatch: &*dispatch,
-            };
-
-            let events = hyperscale_node::action_handler::handle_cross_shard_batch(&requests, &ctx);
-            metrics::record_execution_latency(start.elapsed().as_secs_f64());
-
-            if batch_size > 1 {
-                tracing::debug!(
-                    batch_size,
-                    "Batch executed cross-shard transactions (5ms window)"
-                );
-            }
-
-            for event in events {
-                if let Event::StateVoteReceived { ref vote } = event {
-                    let _ = dispatch_tx.send(DispatchableAction::QueueStateVote {
-                        shard: local_shard,
-                        vote: vote.clone(),
-                    });
-                }
-                event_tx
-                    .send(event)
-                    .expect("callback channel closed - Loss of this event would cause a deadlock");
-            }
-        });
-    }
-
-    /// Persist a verified gossiped certificate and notify the state machine.
-    ///
-    /// Called after all StateCertificate signatures in a gossiped TransactionCertificate
-    /// have been verified. Persists certificate bytes to storage and sends
-    /// GossipedCertificateVerified to the state machine to cancel local certificate building.
-    ///
-    /// NOTE: State writes are NOT applied here - they are applied in PersistBlock
-    /// when the certificate is included in a committed block. This ensures
-    /// deterministic state ordering across all nodes.
-    fn persist_and_notify_gossiped_certificate(&self, certificate: TransactionCertificate) {
-        let storage = self.storage.clone();
-        let callback_tx = self.callback_tx.clone();
-
-        let cert_for_persist = certificate.clone();
-
-        // Fire-and-forget persist of certificate bytes only (no state writes)
-        tokio::task::spawn_blocking(move || {
-            storage.store_certificate(&cert_for_persist);
-        });
-
-        // Notify state machine to cancel local building and add to finalized
-        let _ = callback_tx.send(Event::GossipedCertificateVerified { certificate });
-    }
-
-    /// Submit a transaction.
-    ///
-    /// The transaction is gossiped to all relevant shards and then submitted
-    /// to the validation batcher for crypto verification. The transaction status
-    /// can be queried via the RPC status cache.
-    pub async fn submit_transaction(&mut self, tx: RoutableTransaction) -> Result<(), RunnerError> {
-        let tx = std::sync::Arc::new(tx);
-
-        // Gossip to all relevant shards first
-        let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(&tx));
-        for shard in self.topology.all_shards_for_transaction(&tx) {
-            let _ = self
-                .dispatch_tx
-                .send(DispatchableAction::BroadcastTransaction {
-                    shard,
-                    gossip: Box::new(gossip.clone()),
-                });
-        }
-
-        // Submit to batcher for validation
-        self.tx_validation_handle.submit(tx);
-        Ok(())
-    }
-
-    // NOTE: All inbound request handling (sync, transactions, certificates) is now
-    // handled by the InboundRouter task in network/inbound_router.rs.
-
-    /// Dispatch an event to the state machine.
-    ///
-    /// All events are now passed directly to the state machine. Runner I/O requests
-    /// (sync, transaction fetch, certificate fetch) are now Actions emitted by the
-    /// state machine and handled in process_action().
-    async fn dispatch_event(&mut self, event: Event) -> Vec<Action> {
-        self.state.handle(event)
     }
 }

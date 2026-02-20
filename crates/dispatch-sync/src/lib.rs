@@ -9,7 +9,7 @@ use hyperscale_dispatch::Dispatch;
 ///
 /// Used by simulation runners for deterministic execution.
 /// All work runs on the calling thread in the order dispatched.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SyncDispatch;
 
 impl SyncDispatch {
@@ -73,6 +73,14 @@ impl Dispatch for SyncDispatch {
     }
 
     fn map_crypto<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
+    where
+        T: Sync,
+        R: Send,
+    {
+        items.iter().map(f).collect()
+    }
+
+    fn map_tx_validation<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
     where
         T: Sync,
         R: Send,

@@ -7,9 +7,11 @@
 //! statistics for real-world deployment estimates.
 
 mod network;
+pub mod sim_network;
 mod traffic;
 
 pub use network::{NetworkConfig, SimulatedNetwork};
+pub use sim_network::{BroadcastTarget, OutboxEntry, PendingRequest, SimNetworkAdapter};
 pub use traffic::{
     AggregateBandwidth, BandwidthEstimates, BandwidthReport, MessageTypeReport, MessageTypeStats,
     NetworkTrafficAnalyzer, NodeBandwidthReport, NodeTrafficStats,

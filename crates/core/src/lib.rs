@@ -35,25 +35,7 @@ pub use event::{Event, EventPriority};
 pub use timer::TimerScheduler;
 pub use traits::{NoOpStateRootComputer, StateMachine, StateRootComputer};
 
-use hyperscale_types::RoutableTransaction;
-use std::sync::Arc;
-
-/// Trait for submitting transactions to a validation pipeline.
-///
-/// The network layer calls this when it receives transaction gossip.
-/// Implementations handle deduplication, validation, and delivery.
-pub trait TransactionSink: Send + Sync {
-    /// Submit a transaction for validation.
-    ///
-    /// Returns `true` if the transaction was accepted for processing,
-    /// `false` if it was rejected (e.g., duplicate or channel closed).
-    fn submit(&self, tx: Arc<RoutableTransaction>) -> bool;
-}
-
-/// Type alias for timer identification.
-///
-/// Note: Transaction/certificate fetch timers were removed - retries are now
-/// handled by the runner, not by BFT timers.
+/// Timer identification for scheduled events.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TimerId {
     /// Block proposal timer (also used for implicit round advancement)
@@ -62,4 +44,6 @@ pub enum TimerId {
     Cleanup,
     /// Global consensus timer (epoch management)
     GlobalConsensus,
+    /// Periodic tick for the fetch protocol (retry pending fetches)
+    FetchTick,
 }

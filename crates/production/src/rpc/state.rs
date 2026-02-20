@@ -1,14 +1,20 @@
 //! Shared state types for RPC handlers.
 
-use crate::sync::SyncStatus;
+use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
-use hyperscale_core::TransactionStatus;
-use hyperscale_types::{Hash, RoutableTransaction};
+use hyperscale_core::{Event, TransactionStatus};
+use hyperscale_types::Hash;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
+
+/// Type alias for the transaction submission channel.
+///
+/// RPC handlers send `Event::SubmitTransaction` directly to the NodeLoop's
+/// crossbeam event channel, bypassing tokio mpsc bridges entirely.
+pub type TxSubmissionSender = crossbeam::channel::Sender<Event>;
 
 /// Shared state for RPC handlers.
 #[derive(Clone)]
@@ -19,16 +25,14 @@ pub struct RpcState {
     pub sync_status: Arc<ArcSwap<SyncStatus>>,
     /// Node status provider.
     pub node_status: Arc<RwLock<NodeStatusState>>,
-    /// Channel to submit transactions to the runner.
+    /// Channel to submit transactions to the NodeLoop.
     ///
-    /// RPC-submitted transactions go through this channel to the runner, which:
-    /// 1. Validates the transaction (via the batcher)
-    /// 2. Gossips to all relevant shards (RPC transactions need gossiping)
-    /// 3. Dispatches to the mempool
-    ///
-    /// This is different from gossip-received transactions which skip the gossip
-    /// step since they've already been gossiped by the sender.
-    pub tx_submission_tx: mpsc::UnboundedSender<Arc<RoutableTransaction>>,
+    /// RPC-submitted transactions are sent as `Event::SubmitTransaction` directly
+    /// to the NodeLoop's crossbeam event channel, which:
+    /// 1. Gossips to all relevant shards
+    /// 2. Queues for batch validation (via Dispatch)
+    /// 3. Dispatches to the mempool after validation
+    pub tx_submission_tx: TxSubmissionSender,
     /// Server start time for uptime calculation.
     pub start_time: Instant,
     /// Transaction status cache for querying transaction state.

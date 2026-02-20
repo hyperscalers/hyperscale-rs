@@ -34,6 +34,7 @@ use crate::adapter::{Libp2pAdapter, NetworkError};
 use crate::peer_health::{PeerHealthConfig, PeerHealthTracker};
 use bytes::Bytes;
 use futures::{AsyncReadExt, AsyncWriteExt};
+use hyperscale_metrics as metrics;
 use hyperscale_network::wire;
 use hyperscale_types::{BlockHeight, Hash};
 use libp2p::PeerId;
@@ -390,6 +391,7 @@ impl RequestManager {
                     // Retry same peer first before rotating.
                     current_peer_attempts += 1;
                     attempts += 1;
+                    metrics::record_request_retry("timeout");
 
                     self.health.record_failure(&current_peer, true);
 
@@ -436,6 +438,7 @@ impl RequestManager {
                 Err(e) => {
                     // Other error—record and rotate.
                     attempts += 1;
+                    metrics::record_request_retry("error");
                     self.health.record_failure(&current_peer, false);
 
                     warn!(
@@ -455,6 +458,7 @@ impl RequestManager {
 
             // Check if we've exhausted all attempts
             if attempts >= self.config.max_total_attempts {
+                metrics::increment_dispatch_failures(&request_desc);
                 warn!(
                     attempts,
                     max = self.config.max_total_attempts,

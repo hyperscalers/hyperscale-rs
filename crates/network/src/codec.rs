@@ -21,10 +21,8 @@ use hyperscale_messages::gossip::{
     TransactionCertificateGossip, TransactionGossip,
 };
 use hyperscale_messages::TraceContext;
-use hyperscale_types::RoutableTransaction;
-use std::sync::Arc;
 use thiserror::Error;
-use tracing::{trace, warn};
+use tracing::warn;
 
 /// Errors that can occur during message encoding/decoding.
 #[derive(Debug, Error)]
@@ -170,6 +168,7 @@ pub fn decode_message(parsed_topic: &Topic, data: &[u8]) -> Result<DecodedMessag
             Ok(DecodedMessage {
                 events: vec![Event::TransactionGossipReceived {
                     tx: gossip.transaction,
+                    submitted_locally: false,
                 }],
                 trace_context: trace_ctx,
             })
@@ -190,40 +189,28 @@ pub fn decode_message(parsed_topic: &Topic, data: &[u8]) -> Result<DecodedMessag
 
 /// Decode a gossipsub message and route the resulting events.
 ///
-/// Transaction gossips are routed to `tx_sink`; all other consensus events
-/// are sent via `event_sink`.
+/// All decoded events (including transactions) are sent via `event_sink`.
 ///
 /// # Arguments
 ///
 /// * `topic` - The parsed gossipsub topic (determines message type)
 /// * `data` - Raw (compressed) message bytes
 /// * `peer_label` - Human-readable peer identifier for logging (not tied to libp2p)
-/// * `event_sink` - Callback for consensus events. Returns `true` if accepted.
-/// * `tx_sink` - Callback for transaction gossips. Returns `true` if accepted.
+/// * `event_sink` - Callback for all decoded events. Returns `true` if accepted.
 pub fn decode_and_route(
     topic: &Topic,
     data: &[u8],
     peer_label: &str,
     event_sink: &dyn Fn(Event) -> bool,
-    tx_sink: &dyn Fn(Arc<RoutableTransaction>) -> bool,
 ) -> Result<(), CodecError> {
     let decoded = decode_message(topic, data)?;
 
     for event in decoded.events {
-        match event {
-            Event::TransactionGossipReceived { tx } => {
-                if !tx_sink(tx) {
-                    trace!(peer = peer_label, "Transaction deduplicated or sink closed");
-                }
-            }
-            event => {
-                if !event_sink(event) {
-                    warn!(
-                        peer = peer_label,
-                        "Failed to send decoded event to consensus"
-                    );
-                }
-            }
+        if !event_sink(event) {
+            warn!(
+                peer = peer_label,
+                "Failed to send decoded event to consensus"
+            );
         }
     }
 

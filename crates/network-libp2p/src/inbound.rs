@@ -7,6 +7,7 @@ use hyperscale_messages::request::{
     GetCertificatesRequest, GetTransactionsRequest, FETCH_TYPE_CERTIFICATE, FETCH_TYPE_TRANSACTION,
 };
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
+use hyperscale_metrics as metrics;
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
     Block, BlockHeight, Hash, QuorumCertificate, RoutableTransaction, TransactionCertificate,
@@ -174,6 +175,7 @@ impl<S: ConsensusStore> InboundHandler<S> {
             found = found_count,
             "Responding to transaction fetch request"
         );
+        metrics::record_fetch_response_sent("transaction", found_count);
 
         let response = GetTransactionsResponse::new(found_transactions);
         sbor::basic_encode(&response).unwrap_or_default()
@@ -226,6 +228,7 @@ impl<S: ConsensusStore> InboundHandler<S> {
             found = found_count,
             "Responding to certificate fetch request"
         );
+        metrics::record_fetch_response_sent("certificate", found_count);
 
         let response = GetCertificatesResponse::new(found_certificates);
         sbor::basic_encode(&response).unwrap_or_default()
