@@ -25,6 +25,7 @@ hyperscale-dispatch-sync.workspace = true
 # Radix dependencies for real execution
 radix-common.workspace = true
 
+sbor.workspace = true
 crossbeam.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

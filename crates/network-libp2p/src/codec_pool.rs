@@ -15,20 +15,19 @@
 //!                                               │
 //!                                               ▼
 //!                                      ┌─────────────────┐
-//!                                      │ Consensus TX    │
-//!                                      │ (Event channel) │
+//!                                      │ HandlerRegistry  │
+//!                                      │ → Event channel  │
 //!                                      └─────────────────┘
 //! ```
 //!
 //! The event loop remains non-blocking - after basic validation (peer, shard),
-//! decode work is spawned to the shared codec pool which sends results directly to
-//! the consensus channel.
+//! decode work is spawned to the shared codec pool which dispatches through the
+//! handler registry.
 
-use hyperscale_core::Event;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
-use hyperscale_network::{decode_and_route, Topic};
+use hyperscale_network::{HandlerRegistry, Topic};
 use libp2p::PeerId as Libp2pPeerId;
 use std::sync::Arc;
 use tracing::warn;
@@ -40,51 +39,51 @@ use tracing::warn;
 /// thread pool in production, inline in simulation).
 pub struct CodecPoolHandle<D: Dispatch = PooledDispatch> {
     dispatch: Arc<D>,
+    registry: Arc<HandlerRegistry>,
 }
 
 impl<D: Dispatch> Clone for CodecPoolHandle<D> {
     fn clone(&self) -> Self {
         Self {
             dispatch: self.dispatch.clone(),
+            registry: self.registry.clone(),
         }
     }
 }
 
 impl<D: Dispatch> CodecPoolHandle<D> {
-    /// Create a new handle wrapping the dispatch implementation.
-    pub fn new(dispatch: Arc<D>) -> Self {
-        Self { dispatch }
+    /// Create a new handle wrapping the dispatch implementation and handler registry.
+    pub fn new(dispatch: Arc<D>, registry: Arc<HandlerRegistry>) -> Self {
+        Self { dispatch, registry }
     }
 
-    /// Decode a message asynchronously and send results to the consensus channel.
+    /// Decode a message asynchronously and dispatch through the handler registry.
     ///
     /// This method returns immediately - the actual decode work happens on the
-    /// dispatch's codec pool, and decoded events are sent directly to the consensus
-    /// channel.
+    /// dispatch's codec pool, and decoded events are sent through the handlers
+    /// registered on the `HandlerRegistry`.
     ///
     /// # Arguments
     ///
     /// * `topic` - The parsed gossipsub topic (determines message type)
     /// * `data` - Raw message bytes from the network
     /// * `propagation_source` - Peer that sent the message (for logging)
-    /// * `consensus_tx` - Crossbeam channel to send decoded events to
-    pub fn decode_async(
-        &self,
-        topic: Topic,
-        data: Vec<u8>,
-        propagation_source: Libp2pPeerId,
-        consensus_tx: crossbeam::channel::Sender<Event>,
-    ) {
+    pub fn decode_async(&self, topic: Topic, data: Vec<u8>, propagation_source: Libp2pPeerId) {
+        let registry = self.registry.clone();
         self.dispatch.spawn_codec(move || {
             let peer_label = propagation_source.to_string();
 
-            let result = decode_and_route(&topic, &data, &peer_label, &|event| {
-                consensus_tx.send(event).is_ok()
-            });
-
-            match result {
-                Ok(()) => {
+            match registry.dispatch_gossip(&topic, &data) {
+                Ok(true) => {
                     metrics::record_network_message_received();
+                }
+                Ok(false) => {
+                    warn!(
+                        topic = %topic,
+                        peer = %peer_label,
+                        "No handlers registered for gossip topic"
+                    );
+                    metrics::record_invalid_message();
                 }
                 Err(e) => {
                     warn!(
@@ -113,7 +112,8 @@ mod tests {
     #[test]
     fn test_codec_pool_handle_creation() {
         let dispatch = Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap());
-        let handle = CodecPoolHandle::new(dispatch);
+        let registry = Arc::new(HandlerRegistry::new());
+        let handle = CodecPoolHandle::new(dispatch, registry);
         assert_eq!(handle.queue_depth(), 0);
     }
 

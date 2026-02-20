@@ -12,12 +12,12 @@ use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_execution::{DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_network::RequestError;
-use hyperscale_network::{decode_message, Topic};
+use hyperscale_network::{RequestError, Topic};
 use hyperscale_network_memory::{
     BroadcastTarget, NetworkConfig, NetworkTrafficAnalyzer, PendingRequest, SimNetworkAdapter,
     SimulatedNetwork,
 };
+use hyperscale_node::gossip_dispatch::decode_gossip_to_events;
 use hyperscale_node::node_loop::{NodeLoop, StepOutput};
 use hyperscale_node::TimerOp;
 use hyperscale_node::{NodeStateMachine, SyncConfig, SyncProtocol};
@@ -711,12 +711,12 @@ impl SimulationRunner {
         };
 
         // Decode wire bytes back to events
-        let decoded = decode_message(&topic, &entry.data)
+        let events = decode_gossip_to_events(&topic, &entry.data)
             .expect("SimNetworkAdapter: encode/decode roundtrip failed");
 
         for to in peers {
             if to != from {
-                for event in &decoded.events {
+                for event in &events {
                     self.try_deliver_event(from, to, event.clone());
                 }
             }
@@ -782,32 +782,58 @@ impl SimulationRunner {
 
     /// Fulfill a pending network request from NodeLoop.
     ///
-    /// Looks up data from peer nodes, applies partition/latency simulation,
-    /// and calls the callback to deliver results via SimEventSender.
+    /// Dispatches on `type_id` to decode the request, looks up data from peer
+    /// nodes, applies partition/latency simulation, SBOR-encodes the response,
+    /// and calls the callback with raw bytes.
     fn fulfill_pending_request(&mut self, node: NodeIndex, request: PendingRequest) {
-        match request {
-            PendingRequest::Block {
-                height,
-                on_response,
-            } => {
-                if let Some((peer, block, qc)) = self.find_block_from_any_peer(height.0) {
+        use hyperscale_messages::request::{
+            GetBlockRequest, GetCertificatesRequest, GetTransactionsRequest,
+        };
+        use hyperscale_messages::response::{
+            GetBlockResponse, GetCertificatesResponse, GetTransactionsResponse,
+        };
+
+        let PendingRequest {
+            preferred_peer,
+            type_id,
+            request_bytes,
+            on_response,
+        } = request;
+
+        match type_id {
+            "block.request" => {
+                let req: GetBlockRequest = match sbor::basic_decode(&request_bytes) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(node = node, error = ?e, "Failed to decode block request");
+                        (on_response)(Err(RequestError::PeerError(format!("{e:?}"))));
+                        return;
+                    }
+                };
+                if let Some((peer, block, qc)) = self.find_block_from_any_peer(req.height.0) {
                     if self.simulate_request_response(node, peer).is_some() {
-                        (on_response)(Ok(Some((block, qc))));
+                        let resp = GetBlockResponse::found(block, qc);
+                        let bytes = sbor::basic_encode(&resp).unwrap();
+                        (on_response)(Ok(bytes));
                     } else {
-                        // Partition — fail the request, protocol will retry
                         (on_response)(Err(RequestError::PeerUnreachable(ValidatorId(peer as u64))));
                     }
                 } else {
-                    // Block not available yet — return None, protocol retries
-                    (on_response)(Ok(None));
+                    let resp = GetBlockResponse::not_found();
+                    let bytes = sbor::basic_encode(&resp).unwrap();
+                    (on_response)(Ok(bytes));
                 }
             }
-            PendingRequest::Transactions {
-                proposer,
-                block_hash,
-                hashes,
-                on_response,
-            } => {
+            "transaction.request" => {
+                let req: GetTransactionsRequest = match sbor::basic_decode(&request_bytes) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(node = node, error = ?e, "Failed to decode tx request");
+                        (on_response)(Err(RequestError::PeerError(format!("{e:?}"))));
+                        return;
+                    }
+                };
+                let proposer = preferred_peer.unwrap_or(ValidatorId(0));
                 let proposer_node = proposer.0 as NodeIndex;
                 if proposer_node as usize >= self.node_loops.len() {
                     warn!(
@@ -826,7 +852,6 @@ impl SimulationRunner {
                     trace!(
                         node = node,
                         proposer = proposer_node,
-                        block_hash = ?block_hash,
                         "Transaction fetch: request dropped (partition or packet loss)"
                     );
                     (on_response)(Err(RequestError::PeerUnreachable(proposer)));
@@ -837,7 +862,7 @@ impl SimulationRunner {
                 {
                     let proposer_state = self.node_loops[proposer_node as usize].state();
                     let mempool = proposer_state.mempool();
-                    for tx_hash in &hashes {
+                    for tx_hash in &req.tx_hashes {
                         if let Some(tx) = mempool.get_transaction(tx_hash) {
                             found.push(tx);
                         }
@@ -846,19 +871,24 @@ impl SimulationRunner {
 
                 debug!(
                     node = node,
-                    block_hash = ?block_hash,
                     found_count = found.len(),
-                    missing_count = hashes.len(),
+                    requested = req.tx_hashes.len(),
                     "Transaction fetch: fulfilled"
                 );
-                (on_response)(Ok(found));
+                let resp = GetTransactionsResponse::new(found);
+                let bytes = sbor::basic_encode(&resp).unwrap();
+                (on_response)(Ok(bytes));
             }
-            PendingRequest::Certificates {
-                proposer,
-                block_hash,
-                hashes,
-                on_response,
-            } => {
+            "certificate.request" => {
+                let req: GetCertificatesRequest = match sbor::basic_decode(&request_bytes) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(node = node, error = ?e, "Failed to decode cert request");
+                        (on_response)(Err(RequestError::PeerError(format!("{e:?}"))));
+                        return;
+                    }
+                };
+                let proposer = preferred_peer.unwrap_or(ValidatorId(0));
                 let proposer_node = proposer.0 as NodeIndex;
                 if proposer_node as usize >= self.node_loops.len() {
                     warn!(
@@ -877,7 +907,6 @@ impl SimulationRunner {
                     trace!(
                         node = node,
                         proposer = proposer_node,
-                        block_hash = ?block_hash,
                         "Certificate fetch: request dropped (partition or packet loss)"
                     );
                     (on_response)(Err(RequestError::PeerUnreachable(proposer)));
@@ -886,7 +915,7 @@ impl SimulationRunner {
 
                 let mut found = Vec::new();
                 let proposer_storage = self.node_loops[proposer_node as usize].storage();
-                for cert_hash in &hashes {
+                for cert_hash in &req.cert_hashes {
                     if let Some(cert) = proposer_storage.get_certificate(cert_hash) {
                         found.push(cert);
                     }
@@ -894,12 +923,19 @@ impl SimulationRunner {
 
                 debug!(
                     node = node,
-                    block_hash = ?block_hash,
                     found_count = found.len(),
-                    missing_count = hashes.len(),
+                    requested = req.cert_hashes.len(),
                     "Certificate fetch: fulfilled"
                 );
-                (on_response)(Ok(found));
+                let resp = GetCertificatesResponse::new(found);
+                let bytes = sbor::basic_encode(&resp).unwrap();
+                (on_response)(Ok(bytes));
+            }
+            _ => {
+                warn!(node = node, type_id = type_id, "Unknown request type");
+                (on_response)(Err(RequestError::PeerError(format!(
+                    "unknown request type: {type_id}"
+                ))));
             }
         }
     }

@@ -22,8 +22,9 @@
 //! ```ignore
 //! let manager = RequestManager::new(adapter.clone(), RequestManagerConfig::default());
 //!
-//! // Send a request with automatic retry
-//! match manager.request_block(&peers, height, RequestPriority::Background).await {
+//! // Send a request with automatic retry (opaque bytes)
+//! let data = frame_request("block.request", &sbor_bytes);
+//! match manager.request(&peers, None, "block.request".into(), data, RequestPriority::Background).await {
 //!     Ok((peer, response)) => { /* success */ }
 //!     Err(RequestError::Exhausted { attempts }) => { /* all retries failed */ }
 //!     Err(RequestError::NoPeers) => { /* no peers available */ }
@@ -36,7 +37,6 @@ use bytes::Bytes;
 use futures::{AsyncReadExt, AsyncWriteExt};
 use hyperscale_metrics as metrics;
 use hyperscale_network::wire;
-use hyperscale_types::{BlockHeight, Hash};
 use libp2p::PeerId;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -162,34 +162,6 @@ impl Default for RequestManagerConfig {
     }
 }
 
-/// Request types that can be sent through the manager.
-#[derive(Debug, Clone)]
-pub enum Request {
-    /// Request a block at a given height.
-    Block { height: BlockHeight },
-    /// Request transactions for a block.
-    Transactions {
-        block_hash: Hash,
-        tx_hashes: Vec<Hash>,
-    },
-    /// Request certificates for a block.
-    Certificates {
-        block_hash: Hash,
-        cert_hashes: Vec<Hash>,
-    },
-}
-
-impl Request {
-    /// Get a short description for logging.
-    fn description(&self) -> String {
-        match self {
-            Request::Block { height } => format!("block@{}", height.0),
-            Request::Transactions { tx_hashes, .. } => format!("{}txs", tx_hashes.len()),
-            Request::Certificates { cert_hashes, .. } => format!("{}certs", cert_hashes.len()),
-        }
-    }
-}
-
 /// Request manager with intelligent retry and peer selection.
 ///
 /// Wraps the network adapter and provides:
@@ -226,12 +198,17 @@ impl RequestManager {
 
     /// Send a request with automatic retry and peer failover.
     ///
+    /// The request manager is transport-generic: it operates on opaque bytes
+    /// (already framed with type_id + SBOR payload by the caller). All retry,
+    /// peer selection, and backoff logic applies uniformly regardless of request type.
+    ///
     /// # Arguments
     /// * `peers` - Candidate peers to try (caller provides based on topology)
     /// * `preferred_peer` - Optional hint for which peer to try first. This peer
     ///   is likely to have the data (e.g., the block proposer for fetch requests).
     ///   If `None`, uses health-weighted random selection.
-    /// * `request` - The request to send
+    /// * `description` - Short description for logging (e.g., "block.request(12B)")
+    /// * `data` - Opaque request bytes (not yet compressed)
     /// * `priority` - Request priority (affects timeout and retry behavior)
     ///
     /// # Returns
@@ -240,7 +217,8 @@ impl RequestManager {
         &self,
         peers: &[PeerId],
         preferred_peer: Option<PeerId>,
-        request: Request,
+        description: String,
+        data: Vec<u8>,
         priority: RequestPriority,
     ) -> Result<(PeerId, Bytes), RequestError> {
         if peers.is_empty() {
@@ -251,7 +229,7 @@ impl RequestManager {
         self.acquire_slot().await?;
 
         let result = self
-            .request_inner(peers, preferred_peer, request, priority)
+            .request_inner(peers, preferred_peer, &description, &data, priority)
             .await;
 
         // Release concurrency slot
@@ -260,75 +238,16 @@ impl RequestManager {
         result
     }
 
-    /// Convenience method for block requests.
-    pub async fn request_block(
-        &self,
-        peers: &[PeerId],
-        height: BlockHeight,
-        priority: RequestPriority,
-    ) -> Result<(PeerId, Bytes), RequestError> {
-        self.request(peers, None, Request::Block { height }, priority)
-            .await
-    }
-
-    /// Convenience method for transaction requests.
-    ///
-    /// # Arguments
-    /// * `preferred_peer` - Optional peer to try first (typically the block proposer).
-    pub async fn request_transactions(
-        &self,
-        peers: &[PeerId],
-        preferred_peer: Option<PeerId>,
-        block_hash: Hash,
-        tx_hashes: Vec<Hash>,
-        priority: RequestPriority,
-    ) -> Result<(PeerId, Bytes), RequestError> {
-        self.request(
-            peers,
-            preferred_peer,
-            Request::Transactions {
-                block_hash,
-                tx_hashes,
-            },
-            priority,
-        )
-        .await
-    }
-
-    /// Convenience method for certificate requests.
-    ///
-    /// # Arguments
-    /// * `preferred_peer` - Optional peer to try first (typically the block proposer).
-    pub async fn request_certificates(
-        &self,
-        peers: &[PeerId],
-        preferred_peer: Option<PeerId>,
-        block_hash: Hash,
-        cert_hashes: Vec<Hash>,
-        priority: RequestPriority,
-    ) -> Result<(PeerId, Bytes), RequestError> {
-        self.request(
-            peers,
-            preferred_peer,
-            Request::Certificates {
-                block_hash,
-                cert_hashes,
-            },
-            priority,
-        )
-        .await
-    }
-
     async fn request_inner(
         &self,
         peers: &[PeerId],
         preferred_peer: Option<PeerId>,
-        request: Request,
+        request_desc: &str,
+        data: &[u8],
         priority: RequestPriority,
     ) -> Result<(PeerId, Bytes), RequestError> {
         let mut attempts: u32 = 0;
         let mut current_peer_attempts: u32 = 0;
-        let request_desc = request.description();
 
         // Select initial peer.
         // Use the preferred peer if provided and it's in our peer list,
@@ -357,7 +276,7 @@ impl RequestManager {
 
             // Use speculative retry to race against packet loss
             let result = self
-                .send_request_with_speculative_retry(&current_peer, &request, priority)
+                .send_request_with_speculative_retry(&current_peer, data, priority)
                 .await;
 
             debug!(
@@ -458,7 +377,7 @@ impl RequestManager {
 
             // Check if we've exhausted all attempts
             if attempts >= self.config.max_total_attempts {
-                metrics::increment_dispatch_failures(&request_desc);
+                metrics::increment_dispatch_failures(request_desc);
                 warn!(
                     attempts,
                     max = self.config.max_total_attempts,
@@ -478,11 +397,11 @@ impl RequestManager {
     async fn send_request(
         &self,
         peer: &PeerId,
-        request: &Request,
+        data: &[u8],
         _priority: RequestPriority,
     ) -> Result<Vec<u8>, NetworkError> {
         let timeout = self.compute_stream_timeout(peer);
-        Self::send_request_static(&self.adapter, peer, request, timeout).await
+        Self::send_request_static(&self.adapter, peer, data, timeout).await
     }
 
     /// Send a request with speculative retry based on RTT.
@@ -496,7 +415,7 @@ impl RequestManager {
     async fn send_request_with_speculative_retry(
         &self,
         peer: &PeerId,
-        request: &Request,
+        data: &[u8],
         priority: RequestPriority,
     ) -> Result<(Vec<u8>, Duration), NetworkError> {
         let start = Instant::now();
@@ -508,7 +427,7 @@ impl RequestManager {
         if self.config.speculative_retry_multiplier == 0.0
             || speculative_timeout >= self.config.speculative_retry_max
         {
-            let result = self.send_request(peer, request, priority).await?;
+            let result = self.send_request(peer, data, priority).await?;
             return Ok((result, start.elapsed()));
         }
 
@@ -523,12 +442,12 @@ impl RequestManager {
 
         // Send initial request (as a spawned task so it keeps running even if we move on)
         let adapter_clone = self.adapter.clone();
-        let request_clone = request.clone();
+        let data_owned = data.to_vec();
         let peer_clone = *peer;
 
         // Spawn the first request so it continues running independently
         let mut first_handle = tokio::spawn(async move {
-            Self::send_request_static(&adapter_clone, &peer_clone, &request_clone, stream_timeout)
+            Self::send_request_static(&adapter_clone, &peer_clone, &data_owned, stream_timeout)
                 .await
         });
 
@@ -558,17 +477,12 @@ impl RequestManager {
 
         // If we get here, speculative timeout fired. Send second request and race both.
         let adapter_clone2 = self.adapter.clone();
-        let request_clone2 = request.clone();
+        let data_owned2 = data.to_vec();
         let peer_clone2 = *peer;
 
         let mut second_handle = tokio::spawn(async move {
-            Self::send_request_static(
-                &adapter_clone2,
-                &peer_clone2,
-                &request_clone2,
-                stream_timeout,
-            )
-            .await
+            Self::send_request_static(&adapter_clone2, &peer_clone2, &data_owned2, stream_timeout)
+                .await
         });
 
         // Race both requests - first SUCCESS wins.
@@ -625,35 +539,16 @@ impl RequestManager {
     /// 5. Close stream
     ///
     /// All I/O operations are wrapped with the provided timeout (RTT-based).
+    /// The `request_data` is opaque bytes (already framed by the caller),
+    /// not yet compressed.
     async fn send_request_static(
         adapter: &Arc<Libp2pAdapter>,
         peer: &PeerId,
-        request: &Request,
+        request_data: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, NetworkError> {
-        use hyperscale_messages::request::{GetCertificatesRequest, GetTransactionsRequest};
-
-        // Encode request data (SBOR)
-        let sbor_data: Vec<u8> = match request {
-            Request::Block { height } => height.0.to_le_bytes().to_vec(),
-            Request::Transactions {
-                block_hash,
-                tx_hashes,
-            } => {
-                let req = GetTransactionsRequest::new(*block_hash, tx_hashes.clone());
-                sbor::basic_encode(&req).unwrap_or_default()
-            }
-            Request::Certificates {
-                block_hash,
-                cert_hashes,
-            } => {
-                let req = GetCertificatesRequest::new(*block_hash, cert_hashes.clone());
-                sbor::basic_encode(&req).unwrap_or_default()
-            }
-        };
-
         // Compress request
-        let data = wire::compress(&sbor_data);
+        let data = wire::compress(request_data);
 
         // Open stream with timeout
         let mut stream = tokio::time::timeout(timeout, adapter.open_stream(*peer))
@@ -940,28 +835,6 @@ mod tests {
         assert_eq!(config.retries_before_rotation, 3); // Good for packet loss
         assert_eq!(config.max_total_attempts, 15); // More attempts for lossy networks
         assert_eq!(config.initial_backoff, Duration::from_millis(100));
-    }
-
-    #[test]
-    fn test_request_description() {
-        let block_req = Request::Block {
-            height: BlockHeight(100),
-        };
-        assert_eq!(block_req.description(), "block@100");
-
-        let test_hash = Hash::from_bytes(b"test_hash_data_here!");
-
-        let tx_req = Request::Transactions {
-            block_hash: test_hash,
-            tx_hashes: vec![test_hash; 5],
-        };
-        assert_eq!(tx_req.description(), "5txs");
-
-        let cert_req = Request::Certificates {
-            block_hash: test_hash,
-            cert_hashes: vec![test_hash; 3],
-        };
-        assert_eq!(cert_req.description(), "3certs");
     }
 
     #[test]

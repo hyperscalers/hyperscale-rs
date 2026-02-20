@@ -18,6 +18,7 @@ hyperscale-network.workspace = true
 hyperscale-provisions.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
+sbor.workspace = true
 crossbeam.workspace = true
 quick_cache = "0.6"
 thiserror.workspace = true

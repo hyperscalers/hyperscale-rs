@@ -1091,11 +1091,19 @@ where
         for output in outputs {
             match output {
                 SyncOutput::FetchBlock { height } => {
+                    use hyperscale_messages::request::GetBlockRequest;
                     let es = self.event_sender.clone();
-                    self.network.request_block(
-                        hyperscale_types::BlockHeight(height),
+                    self.network.request(
+                        None,
+                        GetBlockRequest {
+                            height: hyperscale_types::BlockHeight(height),
+                        },
                         Box::new(move |result| match result {
-                            Ok(block) => {
+                            Ok(resp) => {
+                                let block = match (resp.block, resp.qc) {
+                                    (Some(b), Some(q)) => Some((b, q)),
+                                    _ => None,
+                                };
                                 let _ = es.send(Event::SyncBlockResponseReceived {
                                     height,
                                     block: Box::new(block),
@@ -1142,18 +1150,18 @@ where
                     proposer,
                     tx_hashes,
                 } => {
+                    use hyperscale_messages::request::GetTransactionsRequest;
                     let es = self.event_sender.clone();
                     let bh = block_hash;
                     let hs = tx_hashes.clone();
-                    self.network.request_transactions(
-                        proposer,
-                        block_hash,
-                        tx_hashes,
+                    self.network.request(
+                        Some(proposer),
+                        GetTransactionsRequest::new(block_hash, tx_hashes),
                         Box::new(move |result| match result {
-                            Ok(txs) => {
+                            Ok(resp) => {
                                 let _ = es.send(Event::TransactionReceived {
                                     block_hash: bh,
-                                    transactions: txs,
+                                    transactions: resp.into_transactions(),
                                 });
                             }
                             Err(_) => {
@@ -1170,18 +1178,18 @@ where
                     proposer,
                     cert_hashes,
                 } => {
+                    use hyperscale_messages::request::GetCertificatesRequest;
                     let es = self.event_sender.clone();
                     let bh = block_hash;
                     let hs = cert_hashes.clone();
-                    self.network.request_certificates(
-                        proposer,
-                        block_hash,
-                        cert_hashes,
+                    self.network.request(
+                        Some(proposer),
+                        GetCertificatesRequest::new(block_hash, cert_hashes),
                         Box::new(move |result| match result {
-                            Ok(certs) => {
+                            Ok(resp) => {
                                 let _ = es.send(Event::CertificateReceived {
                                     block_hash: bh,
-                                    certificates: certs,
+                                    certificates: resp.into_certificates(),
                                 });
                             }
                             Err(_) => {

@@ -5,14 +5,9 @@
 
 use crate::adapter::{compute_peer_id_for_validator, Libp2pAdapter};
 use crate::request_manager::{RequestManager, RequestPriority};
-use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
-use hyperscale_network::{
-    encode_to_wire, BlockResponseCallback, CertificatesResponseCallback, Network, RequestError,
-    Topic, TransactionsResponseCallback,
-};
+use hyperscale_network::{encode_to_wire, frame_request, Network, RequestError, Topic};
 use hyperscale_types::{
-    Block, BlockHeight, Hash, NetworkMessage, QuorumCertificate, Request, ShardGroupId,
-    ShardMessage, Topology, ValidatorId,
+    NetworkMessage, Request, ShardGroupId, ShardMessage, Topology, ValidatorId,
 };
 use libp2p::PeerId;
 use std::sync::Arc;
@@ -29,9 +24,9 @@ use tracing::{debug, warn};
 /// is sync-safe (non-blocking channel send), so this works from the
 /// pinned state machine thread without a tokio runtime context.
 ///
-/// Also owns a `RequestManager` for typed request methods (`request_block`,
-/// `request_transactions`, `request_certificates`). These spawn async tasks
-/// via `tokio_handle` since the pinned thread has no tokio runtime.
+/// Also owns a `RequestManager` for request-response operations.
+/// The generic `request<R>()` method SBOR-encodes the request, dispatches
+/// to the RequestManager, and SBOR-decodes the response.
 pub struct ProdNetwork {
     adapter: Arc<Libp2pAdapter>,
     request_manager: Arc<RequestManager>,
@@ -108,132 +103,70 @@ impl Network for ProdNetwork {
     }
 
     fn send_to<M: NetworkMessage>(&self, _peer: ValidatorId, _message: &M) {
-        // Point-to-point sends are not used by NodeLoop.
-        // Sync/fetch use RunnerRequest which goes through the async output handler.
         unimplemented!("ProdNetwork::send_to is not used by NodeLoop")
     }
 
-    fn subscribe_shard(&self, _shard: ShardGroupId) {
-        // Subscription is handled during runner setup via adapter.subscribe_shard().
-        // Not called from NodeLoop.
-    }
+    fn subscribe_shard(&self, _shard: ShardGroupId) {}
 
     fn on_message<M: NetworkMessage + 'static>(
         &self,
         _handler: Box<dyn Fn(ValidatorId, M) + Send + Sync>,
     ) {
-        // Message handlers are registered during runner setup.
-        // The Libp2p adapter has its own internal routing.
-        // Not called from NodeLoop.
     }
 
     fn request<R: Request + 'static>(
         &self,
-        _peer: ValidatorId,
-        _request: &R,
-        _on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,
+        preferred_peer: Option<ValidatorId>,
+        request: R,
+        on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,
     ) {
-        // Low-level request/response is not used by NodeLoop.
-        // Use typed request methods (request_block, etc.) instead.
-        unimplemented!("ProdNetwork::request is not used; use typed request methods")
-    }
-
-    fn request_block(&self, height: BlockHeight, on_response: BlockResponseCallback) {
         let peers = self.get_committee_peers();
         if peers.is_empty() {
-            on_response(Err(RequestError::PeerUnreachable(ValidatorId(0))));
+            on_response(Err(RequestError::PeerUnreachable(
+                preferred_peer.unwrap_or(ValidatorId(0)),
+            )));
             return;
         }
+
+        let preferred_libp2p = preferred_peer.and_then(|v| self.validator_peer_id(v));
+        let priority = if R::priority() == hyperscale_types::MessagePriority::Background {
+            RequestPriority::Background
+        } else {
+            RequestPriority::Critical
+        };
+
+        // SBOR-encode the request
+        let request_bytes = match sbor::basic_encode(&request) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(error = ?e, "ProdNetwork: failed to encode request");
+                on_response(Err(RequestError::PeerError(format!("encode error: {e:?}"))));
+                return;
+            }
+        };
+
+        // Frame with type_id for dispatch by the receiver's InboundHandler
+        let framed = frame_request(R::message_type_id(), &request_bytes);
+        let description = format!("{}({}B)", R::message_type_id(), request_bytes.len());
         let rm = self.request_manager.clone();
+
         self.tokio_handle.spawn(async move {
-            match rm.request_block(&peers, height, RequestPriority::Background).await {
+            match rm
+                .request(&peers, preferred_libp2p, description, framed, priority)
+                .await
+            {
                 Ok((_peer, bytes)) => {
-                    match sbor::basic_decode::<Option<(Block, QuorumCertificate)>>(&bytes) {
-                        Ok(block) => on_response(Ok(block)),
+                    // RequestManager returns decompressed SBOR response bytes
+                    match sbor::basic_decode::<R::Response>(&bytes) {
+                        Ok(response) => on_response(Ok(response)),
                         Err(e) => {
-                            warn!(height = height.0, error = ?e, "Failed to decode sync block response");
-                            on_response(Err(RequestError::PeerError(format!("decode error: {e:?}"))));
+                            warn!(error = ?e, "Failed to decode response");
+                            on_response(Err(RequestError::PeerError(format!(
+                                "decode error: {e:?}"
+                            ))));
                         }
                     }
                 }
-                Err(e) => {
-                    on_response(Err(RequestError::PeerError(format!("{e}"))));
-                }
-            }
-        });
-    }
-
-    fn request_transactions(
-        &self,
-        proposer: ValidatorId,
-        block_hash: Hash,
-        hashes: Vec<Hash>,
-        on_response: TransactionsResponseCallback,
-    ) {
-        let peers = self.get_committee_peers();
-        if peers.is_empty() {
-            on_response(Err(RequestError::PeerUnreachable(proposer)));
-            return;
-        }
-        let preferred = self.validator_peer_id(proposer);
-        let rm = self.request_manager.clone();
-        self.tokio_handle.spawn(async move {
-            match rm
-                .request_transactions(
-                    &peers,
-                    preferred,
-                    block_hash,
-                    hashes.clone(),
-                    RequestPriority::Critical,
-                )
-                .await
-            {
-                Ok((_peer, bytes)) => match sbor::basic_decode::<GetTransactionsResponse>(&bytes) {
-                    Ok(response) => on_response(Ok(response.into_transactions())),
-                    Err(e) => {
-                        warn!(?block_hash, error = ?e, "Failed to decode transaction response");
-                        on_response(Err(RequestError::PeerError(format!("decode error: {e:?}"))));
-                    }
-                },
-                Err(e) => {
-                    on_response(Err(RequestError::PeerError(format!("{e}"))));
-                }
-            }
-        });
-    }
-
-    fn request_certificates(
-        &self,
-        proposer: ValidatorId,
-        block_hash: Hash,
-        hashes: Vec<Hash>,
-        on_response: CertificatesResponseCallback,
-    ) {
-        let peers = self.get_committee_peers();
-        if peers.is_empty() {
-            on_response(Err(RequestError::PeerUnreachable(proposer)));
-            return;
-        }
-        let preferred = self.validator_peer_id(proposer);
-        let rm = self.request_manager.clone();
-        self.tokio_handle.spawn(async move {
-            match rm
-                .request_certificates(
-                    &peers,
-                    preferred,
-                    block_hash,
-                    hashes.clone(),
-                    RequestPriority::Critical,
-                )
-                .await
-            {
-                Ok((_peer, bytes)) => match sbor::basic_decode::<GetCertificatesResponse>(&bytes) {
-                    Ok(response) => on_response(Ok(response.into_certificates())),
-                    Err(e) => {
-                        warn!(?block_hash, error = ?e, "Failed to decode certificate response");
-                        on_response(Err(RequestError::PeerError(format!("decode error: {e:?}"))));
-                    }
-                },
                 Err(e) => {
                     on_response(Err(RequestError::PeerError(format!("{e}"))));
                 }

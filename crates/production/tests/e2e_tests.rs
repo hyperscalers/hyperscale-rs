@@ -30,7 +30,8 @@ fn test_dispatch() -> Arc<PooledDispatch> {
 
 /// Create a test codec pool handle for network adapter tests.
 fn test_codec_pool_handle() -> hyperscale_network_libp2p::CodecPoolHandle {
-    hyperscale_network_libp2p::CodecPoolHandle::new(test_dispatch())
+    let registry = std::sync::Arc::new(hyperscale_network::HandlerRegistry::new());
+    hyperscale_network_libp2p::CodecPoolHandle::new(test_dispatch(), registry)
 }
 
 /// Test timeout values (from design spec).
@@ -122,19 +123,10 @@ async fn test_network_adapter_starts() {
         ..Default::default()
     };
 
-    let (consensus_tx, _consensus_rx) = crossbeam::channel::unbounded();
-
     let codec_pool = test_codec_pool_handle();
     let result = timeout(
         CONNECTION_TIMEOUT,
-        Libp2pAdapter::new(
-            config,
-            keypair,
-            validator_id,
-            shard,
-            consensus_tx,
-            codec_pool,
-        ),
+        Libp2pAdapter::new(config, keypair, validator_id, shard, codec_pool),
     )
     .await;
 
@@ -167,7 +159,6 @@ async fn test_two_node_connection() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let (consensus_tx1, _consensus_rx1) = crossbeam::channel::unbounded();
     let codec_pool1 = test_codec_pool_handle();
 
     let adapter1 = Libp2pAdapter::new(
@@ -175,7 +166,6 @@ async fn test_two_node_connection() {
         keypair1,
         ValidatorId(0),
         ShardGroupId(0),
-        consensus_tx1,
         codec_pool1,
     )
     .await
@@ -195,7 +185,6 @@ async fn test_two_node_connection() {
         bootstrap_peers: vec![node1_addr.clone()],
         ..Default::default()
     };
-    let (consensus_tx2, _consensus_rx2) = crossbeam::channel::unbounded();
     let codec_pool2 = test_codec_pool_handle();
 
     let adapter2 = Libp2pAdapter::new(
@@ -203,7 +192,6 @@ async fn test_two_node_connection() {
         keypair2,
         ValidatorId(1),
         ShardGroupId(0),
-        consensus_tx2,
         codec_pool2,
     )
     .await
@@ -251,19 +239,11 @@ async fn test_topic_subscription() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let (consensus_tx, _consensus_rx) = crossbeam::channel::unbounded();
     let codec_pool = test_codec_pool_handle();
 
-    let adapter = Libp2pAdapter::new(
-        config,
-        keypair,
-        ValidatorId(0),
-        ShardGroupId(0),
-        consensus_tx,
-        codec_pool,
-    )
-    .await
-    .unwrap();
+    let adapter = Libp2pAdapter::new(config, keypair, ValidatorId(0), ShardGroupId(0), codec_pool)
+        .await
+        .unwrap();
 
     // Subscribe to shard topics
     let result = adapter.subscribe_shard(ShardGroupId(0)).await;

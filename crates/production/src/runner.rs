@@ -50,8 +50,8 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics as metrics;
 use hyperscale_network_libp2p::ProdNetwork;
 use hyperscale_network_libp2p::{
-    compute_peer_id_for_validator, InboundRouter, InboundRouterConfig, InboundRouterHandle,
-    Libp2pAdapter, Libp2pConfig, Libp2pKeypair, NetworkError,
+    compute_peer_id_for_validator, spawn_inbound_router, InboundRouterHandle, Libp2pAdapter,
+    Libp2pConfig, Libp2pKeypair, NetworkError,
 };
 use hyperscale_storage::{
     CommittableSubstateDatabase, ConsensusStore, DatabaseUpdates, DbPartitionKey, DbSortKey,
@@ -419,19 +419,27 @@ impl ProductionRunnerBuilder {
             network_definition.clone(),
         ));
 
+        // ── Register gossip handlers via HandlerRegistry ────────────────
+        //
+        // The HandlerRegistry dispatches decoded gossip messages to typed
+        // handlers. Each handler constructs an Event and sends it via the
+        // consensus crossbeam channel to the pinned NodeLoop thread.
+        let gossip_registry = Arc::new(hyperscale_network::HandlerRegistry::new());
+        hyperscale_node::gossip_dispatch::register_gossip_handlers(
+            &gossip_registry,
+            xb_consensus_tx.clone(),
+        );
+
         // ── Create codec pool handle ─────────────────────────────────────
-        let codec_pool_handle = hyperscale_network_libp2p::CodecPoolHandle::new(dispatch.clone());
+        let codec_pool_handle =
+            hyperscale_network_libp2p::CodecPoolHandle::new(dispatch.clone(), gossip_registry);
 
         // ── Create Libp2p network adapter ────────────────────────────────
-        // Pass the crossbeam channel directly — decoded events (including
-        // transactions) flow straight to the pinned NodeLoop thread, bypassing
-        // the tokio mpsc bridge.
         let adapter = Libp2pAdapter::new(
             network_config,
             ed25519_keypair,
             validator_id,
             local_shard,
-            xb_consensus_tx.clone(),
             codec_pool_handle,
         )
         .await?;
@@ -457,8 +465,9 @@ impl ProductionRunnerBuilder {
 
         // ── Now create ProdNetwork wrapping the adapter ──────────────────
         //
-        // ProdNetwork owns the RequestManager for typed request methods
-        // (request_block, request_transactions, request_certificates).
+        // ProdNetwork owns the RequestManager for generic request-response.
+        // It SBOR-encodes requests, frames them with type_id, and dispatches
+        // through the RequestManager's retry/peer-selection logic.
         let prod_network = ProdNetwork::new(
             adapter.clone(),
             request_manager.clone(),
@@ -507,13 +516,15 @@ impl ProductionRunnerBuilder {
         //
         // Handles all inbound requests (block sync, tx fetch, cert fetch) from peers.
         // Hot data is served from in-memory caches, falling back to RocksDB.
-        let inbound_router = InboundRouter::spawn(
-            InboundRouterConfig::default(),
-            adapter.clone(),
+        // The InboundHandler lives in the node crate; the transport router
+        // in network-libp2p is generic over InboundRequestHandler.
+        let inbound_handler = hyperscale_node::InboundHandler::new(
+            hyperscale_node::InboundHandlerConfig::default(),
             storage.clone(),
             recently_received_txs.clone(),
             recently_built_certs.clone(),
         );
+        let inbound_router = spawn_inbound_router(adapter.clone(), inbound_handler);
 
         // ── Build ProductionRunner ───────────────────────────────────────
 

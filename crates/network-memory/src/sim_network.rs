@@ -7,15 +7,10 @@
 //!
 //! Messages are wire-encoded (SBOR + LZ4) in the outbox, matching the production
 //! path and catching serialization bugs. The harness decodes them back to events
-//! using [`hyperscale_network::decode_message`].
+//! using [`hyperscale_node::gossip_dispatch::decode_gossip_to_events`].
 
-use hyperscale_network::{
-    encode_to_wire, BlockResponseCallback, CertificatesResponseCallback, Network, RequestError,
-    TransactionsResponseCallback,
-};
-use hyperscale_types::{
-    BlockHeight, Hash, NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId,
-};
+use hyperscale_network::{encode_to_wire, Network, RequestError};
+use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use std::sync::Mutex;
 
 /// Target for an outbound message.
@@ -40,30 +35,22 @@ pub struct OutboxEntry {
     pub data: Vec<u8>,
 }
 
-/// A buffered high-level request from NodeLoop, awaiting harness fulfillment.
+/// A buffered request from NodeLoop, awaiting harness fulfillment.
 ///
-/// The simulation harness drains these after each step, looks up the data from
-/// peer nodes, and calls the `on_response` callback to deliver the result.
-pub enum PendingRequest {
-    /// Fetch a block by height.
-    Block {
-        height: BlockHeight,
-        on_response: BlockResponseCallback,
-    },
-    /// Fetch transactions by hash.
-    Transactions {
-        proposer: ValidatorId,
-        block_hash: Hash,
-        hashes: Vec<Hash>,
-        on_response: TransactionsResponseCallback,
-    },
-    /// Fetch certificates by hash.
-    Certificates {
-        proposer: ValidatorId,
-        block_hash: Hash,
-        hashes: Vec<Hash>,
-        on_response: CertificatesResponseCallback,
-    },
+/// The simulation harness drains these after each step, dispatches on
+/// `type_id` to decode the request, looks up data from peer nodes,
+/// SBOR-encodes the response, and calls `on_response` with raw bytes.
+/// The generic `request<R>()` wrapper decodes `R::Response` before calling
+/// the user's typed callback.
+pub struct PendingRequest {
+    /// Optional preferred peer (e.g., block proposer for fetch).
+    pub preferred_peer: Option<ValidatorId>,
+    /// Message type ID for dispatch (e.g., "block.request").
+    pub type_id: &'static str,
+    /// SBOR-encoded request bytes.
+    pub request_bytes: Vec<u8>,
+    /// Callback that receives SBOR-encoded response bytes (or error).
+    pub on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) + Send>,
 }
 
 /// Network implementation for simulation.
@@ -79,7 +66,7 @@ pub enum PendingRequest {
 /// 2. Drains the adapter's outbox via [`drain_outbox()`](Self::drain_outbox)
 /// 3. For each entry, determines target peers from shard topology
 /// 4. Applies partition/loss/latency from `SimulatedNetwork`
-/// 5. Decodes the entry via [`hyperscale_network::decode_message`] to get events
+/// 5. Decodes the entry via `decode_gossip_to_events` to get events
 /// 6. Schedules those events for delivery to target nodes
 pub struct SimNetworkAdapter {
     outbox: Mutex<Vec<OutboxEntry>>,
@@ -102,7 +89,7 @@ impl SimNetworkAdapter {
         std::mem::take(&mut self.outbox.lock().unwrap())
     }
 
-    /// Drain all buffered high-level requests (block, tx, cert fetches).
+    /// Drain all buffered requests.
     ///
     /// The harness calls this after each `NodeLoop::step()` to fulfill
     /// requests by looking up data from peer nodes and calling the callbacks.
@@ -160,58 +147,30 @@ impl Network for SimNetworkAdapter {
 
     fn request<R: Request + 'static>(
         &self,
-        _peer: ValidatorId,
-        _request: &R,
-        _on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,
+        preferred_peer: Option<ValidatorId>,
+        request: R,
+        on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,
     ) {
-        // Low-level request/response is not used in simulation.
-        // Use request_block/request_transactions/request_certificates instead.
-        unimplemented!("SimNetworkAdapter::request() is not used; use typed request methods")
-    }
+        let request_bytes =
+            sbor::basic_encode(&request).expect("SimNetworkAdapter: failed to encode request");
 
-    fn request_block(&self, height: BlockHeight, on_response: BlockResponseCallback) {
-        self.pending_requests
-            .lock()
-            .unwrap()
-            .push(PendingRequest::Block {
-                height,
-                on_response,
+        // Wrap the typed callback: decode raw response bytes → R::Response
+        let typed_callback: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) + Send> =
+            Box::new(move |result| match result {
+                Ok(bytes) => match sbor::basic_decode::<R::Response>(&bytes) {
+                    Ok(response) => on_response(Ok(response)),
+                    Err(e) => {
+                        on_response(Err(RequestError::PeerError(format!("decode error: {e:?}"))))
+                    }
+                },
+                Err(e) => on_response(Err(e)),
             });
-    }
 
-    fn request_transactions(
-        &self,
-        proposer: ValidatorId,
-        block_hash: Hash,
-        hashes: Vec<Hash>,
-        on_response: TransactionsResponseCallback,
-    ) {
-        self.pending_requests
-            .lock()
-            .unwrap()
-            .push(PendingRequest::Transactions {
-                proposer,
-                block_hash,
-                hashes,
-                on_response,
-            });
-    }
-
-    fn request_certificates(
-        &self,
-        proposer: ValidatorId,
-        block_hash: Hash,
-        hashes: Vec<Hash>,
-        on_response: CertificatesResponseCallback,
-    ) {
-        self.pending_requests
-            .lock()
-            .unwrap()
-            .push(PendingRequest::Certificates {
-                proposer,
-                block_hash,
-                hashes,
-                on_response,
-            });
+        self.pending_requests.lock().unwrap().push(PendingRequest {
+            preferred_peer,
+            type_id: R::message_type_id(),
+            request_bytes,
+            on_response: typed_callback,
+        });
     }
 }

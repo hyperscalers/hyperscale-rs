@@ -6,16 +6,12 @@ description = "Production libp2p network transport"
 
 [features]
 default = []
-trace-propagation = ["hyperscale-messages/trace-propagation"]
 
 [dependencies]
-hyperscale-core.workspace = true
 hyperscale-dispatch.workspace = true
 hyperscale-dispatch-pooled.workspace = true
 hyperscale-metrics.workspace = true
-hyperscale-messages.workspace = true
 hyperscale-network.workspace = true
-hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
 
 # Networking - libp2p with QUIC transport
@@ -23,7 +19,6 @@ libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "quic", "tcp", "n
 libp2p-stream = "0.4.0-alpha"
 futures = "0.3"
 bytes = "1.9"
-async-trait = "0.1"
 
 # Serialization
 sbor.workspace = true
@@ -43,7 +38,6 @@ rayon.workspace = true
 
 # Lock-free concurrent data structures
 dashmap = "6.1.0"
-quick_cache = "0.6"
 
 # Cryptographic primitives for deterministic PeerId derivation
 sha2 = "0.10"
@@ -51,3 +45,4 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 rand = "0.8"
 
 [dev-dependencies]
+hyperscale-messages.workspace = true

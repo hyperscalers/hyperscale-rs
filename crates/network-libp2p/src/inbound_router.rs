@@ -19,28 +19,24 @@
 //!                                    │
 //!                                    ▼
 //! ┌────────────────────────────────────────────────────────────────────────────┐
-//! │                         InboundRouter<S>                                   │
+//! │                         InboundRouter<H>                                   │
 //! │                                                                            │
 //! │  Transport: read/write length-prefixed, compressed streams                │
-//! │  Logic:     delegates to InboundHandler<S> from hyperscale-network        │
+//! │  Logic:     delegates to H: InboundRequestHandler                         │
 //! │                                                                            │
 //! └────────────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
 //! # Design Goals
 //!
-//! 1. **Separation of Concerns**: Transport handles framing/compression, `InboundHandler` handles request logic
+//! 1. **Separation of Concerns**: Transport handles framing/compression, handler handles request logic
 //! 2. **Request-Response via Streams**: Uses raw libp2p streams with length-prefixed framing
-//! 3. **Generic over Storage**: Parameterized over `ConsensusStore`, no concrete storage dependency
+//! 3. **Generic over Handler**: Parameterized over `InboundRequestHandler`, no app-type dependency
 
 use crate::adapter::{Libp2pAdapter, STREAM_PROTOCOL};
-use crate::inbound::{InboundHandler, InboundHandlerConfig};
 use futures::{AsyncReadExt, AsyncWriteExt, StreamExt};
-use hyperscale_network::wire;
-use hyperscale_storage::ConsensusStore;
-use hyperscale_types::{Hash, RoutableTransaction, TransactionCertificate};
+use hyperscale_network::{wire, InboundRequestHandler};
 use libp2p::{PeerId, Stream};
-use quick_cache::sync::Cache as QuickCache;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
@@ -50,9 +46,6 @@ const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum request size (10MB).
 const MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024;
-
-/// Configuration for the inbound router.
-pub type InboundRouterConfig = InboundHandlerConfig;
 
 /// Handle for the inbound router task.
 pub struct InboundRouterHandle {
@@ -71,55 +64,27 @@ impl InboundRouterHandle {
     }
 }
 
-/// Routes inbound requests to appropriate handlers.
+/// Routes inbound requests to an application-level handler.
 ///
 /// The router accepts incoming streams and for each:
 /// 1. Reads the length-prefixed compressed request
-/// 2. Decompresses and delegates to `InboundHandler<S>` for processing
+/// 2. Decompresses and delegates to `H` for processing
 /// 3. Compresses and writes the length-prefixed response
 /// 4. Closes the stream
 ///
-/// Generic over `S: ConsensusStore` — the concrete storage type is supplied
+/// Generic over `H: InboundRequestHandler` — the concrete handler is supplied
 /// by the production runner when constructing the router.
-pub struct InboundRouter<S: ConsensusStore> {
-    handler: InboundHandler<S>,
+struct InboundRouter<H: InboundRequestHandler> {
+    handler: H,
 }
 
-impl<S: ConsensusStore + 'static> InboundRouter<S> {
-    /// Create a new inbound router.
-    pub fn new(
-        config: InboundRouterConfig,
-        storage: Arc<S>,
-        recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
-        recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
-    ) -> Self {
-        Self {
-            handler: InboundHandler::new(
-                config,
-                storage,
-                recently_received_txs,
-                recently_built_certs,
-            ),
-        }
-    }
-
+impl<H: InboundRequestHandler> InboundRouter<H> {
     /// Spawn the inbound router as a background task.
     ///
     /// The router will accept incoming streams until the stream control is dropped.
-    pub fn spawn(
-        config: InboundRouterConfig,
-        adapter: Arc<Libp2pAdapter>,
-        storage: Arc<S>,
-        recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
-        recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
-    ) -> InboundRouterHandle {
+    fn spawn(adapter: Arc<Libp2pAdapter>, handler: H) -> InboundRouterHandle {
         let join_handle = tokio::spawn(async move {
-            let router = Arc::new(Self::new(
-                config,
-                storage,
-                recently_received_txs,
-                recently_built_certs,
-            ));
+            let router = Arc::new(InboundRouter { handler });
             let mut control = adapter.stream_control();
 
             // Register to accept incoming streams for our protocol
@@ -152,7 +117,7 @@ impl<S: ConsensusStore + 'static> InboundRouter<S> {
     }
 
     /// Handle a single incoming stream.
-    async fn handle_stream(&self, peer: PeerId, mut stream: Stream) -> Result<(), StreamError> {
+    async fn handle_stream(&self, _peer: PeerId, mut stream: Stream) -> Result<(), StreamError> {
         // Read length-prefixed compressed request with timeout
         let compressed_request = tokio::time::timeout(STREAM_IO_TIMEOUT, async {
             let mut len_bytes = [0u8; 4];
@@ -182,14 +147,8 @@ impl<S: ConsensusStore + 'static> InboundRouter<S> {
             ))
         })?;
 
-        // Delegate to InboundHandler for request processing
-        let response_sbor = match self.handler.process_request(&request_data) {
-            Ok(data) => data,
-            Err(e) => {
-                debug!(peer = %peer, error = %e, "Request processing failed");
-                vec![]
-            }
-        };
+        // Delegate to handler for request processing
+        let response_sbor = self.handler.handle_request(&request_data);
 
         // Compress response
         let response_data = wire::compress(&response_sbor);
@@ -211,6 +170,17 @@ impl<S: ConsensusStore + 'static> InboundRouter<S> {
     }
 }
 
+/// Spawn an inbound router with the given handler.
+///
+/// This is the public API for creating an inbound router. The `InboundRouter`
+/// struct is private — callers only interact with the returned handle.
+pub fn spawn_inbound_router<H: InboundRequestHandler>(
+    adapter: Arc<Libp2pAdapter>,
+    handler: H,
+) -> InboundRouterHandle {
+    InboundRouter::spawn(adapter, handler)
+}
+
 /// Errors that can occur during stream handling.
 #[derive(Debug)]
 enum StreamError {
@@ -224,16 +194,5 @@ impl std::fmt::Display for StreamError {
             StreamError::Timeout => write!(f, "stream timeout"),
             StreamError::Io(e) => write!(f, "stream I/O error: {}", e),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_config_defaults() {
-        let config = InboundRouterConfig::default();
-        assert_eq!(config.max_items_per_response, 500);
     }
 }

@@ -3,11 +3,7 @@
 //! Defines the `Network` interface implemented by both production (`network-libp2p`)
 //! and simulation (`network-memory`) backends.
 
-use hyperscale_types::{
-    Block, BlockHeight, Hash, NetworkMessage, QuorumCertificate, Request, RoutableTransaction,
-    ShardGroupId, ShardMessage, TransactionCertificate, ValidatorId,
-};
-use std::sync::Arc;
+use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 
 /// Error returned when a network request fails.
 #[derive(Debug, thiserror::Error)]
@@ -22,17 +18,20 @@ pub enum RequestError {
     Shutdown,
 }
 
-/// Callback for block fetch responses.
-pub type BlockResponseCallback =
-    Box<dyn FnOnce(Result<Option<(Block, QuorumCertificate)>, RequestError>) + Send>;
-
-/// Callback for transaction fetch responses.
-pub type TransactionsResponseCallback =
-    Box<dyn FnOnce(Result<Vec<Arc<RoutableTransaction>>, RequestError>) + Send>;
-
-/// Callback for certificate fetch responses.
-pub type CertificatesResponseCallback =
-    Box<dyn FnOnce(Result<Vec<TransactionCertificate>, RequestError>) + Send>;
+/// Trait for handling inbound request-response payloads.
+///
+/// Implementations decode request bytes, process them (e.g., look up blocks,
+/// transactions, certificates from storage), and return SBOR-encoded response bytes.
+///
+/// The transport layer (`InboundRouter`) handles stream I/O, framing, and
+/// compression. This trait contains only the application-level logic.
+pub trait InboundRequestHandler: Send + Sync + 'static {
+    /// Process a request payload and return response bytes.
+    ///
+    /// Both input and output are uncompressed SBOR-encoded bytes.
+    /// The transport layer handles compression/decompression.
+    fn handle_request(&self, payload: &[u8]) -> Vec<u8>;
+}
 
 /// Network interface for sending typed messages and registering listeners.
 ///
@@ -76,46 +75,20 @@ pub trait Network: Send + Sync {
 
     // ── Request-response ──
 
-    /// Send a typed request to a specific peer and receive the response via callback.
+    /// Send a typed request and receive the response via callback.
+    ///
+    /// * `preferred_peer` — `Some(proposer)` hints that this peer likely has
+    ///   the data (e.g., the block proposer for fetch requests). `None` means
+    ///   any available peer (e.g., sync).
+    /// * Implementation handles peer selection, retry, and failover internally.
     ///
     /// The callback is called on a network thread when the response arrives,
     /// or with an error on timeout/failure. Compatible with sync main loops —
     /// the callback typically pushes into the main loop's event channel.
-    ///
-    /// Retry logic and peer selection live outside this trait (in the
-    /// sync/fetch protocol state machines and their runner wrappers).
     fn request<R: Request + 'static>(
         &self,
-        peer: ValidatorId,
-        request: &R,
+        preferred_peer: Option<ValidatorId>,
+        request: R,
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,
-    );
-
-    // ── High-level request methods ──
-    //
-    // These provide typed, peer-selecting request APIs that NodeLoop calls
-    // directly. Implementations handle peer selection and async dispatch.
-    // In production, these spawn tokio tasks via a RequestManager.
-    // In simulation, these buffer requests for the harness to fulfill.
-
-    /// Fetch a block by height. Implementation handles peer selection and retry.
-    fn request_block(&self, height: BlockHeight, on_response: BlockResponseCallback);
-
-    /// Fetch transactions by hash. Implementation prefers proposer, handles retry.
-    fn request_transactions(
-        &self,
-        proposer: ValidatorId,
-        block_hash: Hash,
-        hashes: Vec<Hash>,
-        on_response: TransactionsResponseCallback,
-    );
-
-    /// Fetch certificates by hash. Implementation prefers proposer, handles retry.
-    fn request_certificates(
-        &self,
-        proposer: ValidatorId,
-        block_hash: Hash,
-        hashes: Vec<Hash>,
-        on_response: CertificatesResponseCallback,
     );
 }

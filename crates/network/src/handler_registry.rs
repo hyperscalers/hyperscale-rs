@@ -4,6 +4,9 @@
 //! of the `Network` trait. Stores typed handlers keyed by message type ID and
 //! dispatches incoming bytes to the correct handler after decoding.
 
+use crate::codec::CodecError;
+use crate::wire;
+use crate::Topic;
 use hyperscale_types::{NetworkMessage, ValidatorId};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -52,7 +55,9 @@ impl HandlerRegistry {
     ///
     /// Called from the network's decode/delivery thread with the sender's identity,
     /// the message type ID (from the wire format), and the raw SBOR-encoded bytes.
-    pub fn dispatch(&self, sender: ValidatorId, type_id: &str, bytes: &[u8]) {
+    /// Returns `true` if any handlers were called, `false` if no handlers are
+    /// registered for this type_id.
+    pub fn dispatch(&self, sender: ValidatorId, type_id: &str, bytes: &[u8]) -> bool {
         let handlers = self
             .handlers
             .read()
@@ -61,7 +66,27 @@ impl HandlerRegistry {
             for handler in handlers {
                 handler(sender, bytes);
             }
+            true
+        } else {
+            false
         }
+    }
+
+    /// Dispatch a gossip message from wire format.
+    ///
+    /// Decompresses the LZ4-encoded data, extracts the message type from the
+    /// topic, and dispatches to registered handlers. This is the main entry
+    /// point for gossip message processing.
+    ///
+    /// Returns `Ok(true)` if handlers were called, `Ok(false)` if no handlers
+    /// are registered for this topic's message type.
+    pub fn dispatch_gossip(&self, topic: &Topic, data: &[u8]) -> Result<bool, CodecError> {
+        if data.is_empty() {
+            return Err(CodecError::MessageTooShort);
+        }
+        let payload = wire::decompress(data).map_err(|e| CodecError::Decompress(e.to_string()))?;
+        let type_id = topic.message_type();
+        Ok(self.dispatch(ValidatorId(0), type_id, &payload))
     }
 }
 

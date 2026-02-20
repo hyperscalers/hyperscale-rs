@@ -11,7 +11,6 @@ use crate::config::{Libp2pConfig, VersionInteroperabilityMode};
 use dashmap::DashMap;
 use futures::future::Either;
 use futures::{FutureExt, StreamExt};
-use hyperscale_core::Event;
 use hyperscale_metrics as metrics;
 use hyperscale_network::{CodecError, Topic};
 use hyperscale_types::{Bls12381G1PublicKey, MessagePriority, ShardGroupId, ValidatorId};
@@ -29,11 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-#[cfg(feature = "trace-propagation")]
-use tracing::Instrument;
 use tracing::{debug, info, trace, warn};
-#[cfg(feature = "trace-propagation")]
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Domain separator for deriving libp2p identity from validator public key.
 const LIBP2P_IDENTITY_DOMAIN: &[u8] = b"hyperscale-libp2p-identity-v1:";
@@ -290,10 +285,6 @@ pub struct Libp2pAdapter {
     /// Commands are routed to the appropriate channel based on message priority.
     priority_channels: PriorityCommandChannels,
 
-    /// Consensus event channel for high-priority BFT messages (sent to runner).
-    #[allow(dead_code)]
-    consensus_tx: crossbeam::channel::Sender<Event>,
-
     /// Known validators (ValidatorId -> PeerId).
     /// Built from Topology at startup.
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
@@ -327,7 +318,6 @@ impl Libp2pAdapter {
     /// * `keypair` - Ed25519 keypair for libp2p identity (derived from validator key)
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
-    /// * `consensus_tx` - Crossbeam channel for all decoded events (consensus + transactions)
     /// * `codec_pool` - Handle for async message encoding/decoding
     ///
     /// # Returns
@@ -338,7 +328,6 @@ impl Libp2pAdapter {
         keypair: identity::Keypair,
         validator_id: ValidatorId,
         shard: ShardGroupId,
-        consensus_tx: crossbeam::channel::Sender<Event>,
         codec_pool: CodecPoolHandle,
     ) -> Result<Arc<Self>, NetworkError> {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
@@ -583,7 +572,6 @@ impl Libp2pAdapter {
             local_validator_id: validator_id,
             local_shard: shard,
             priority_channels,
-            consensus_tx: consensus_tx.clone(),
             validator_peers: validator_peers.clone(),
             peer_validators: peer_validators.clone(),
             shutdown_tx: Some(shutdown_tx),
@@ -602,7 +590,6 @@ impl Libp2pAdapter {
                 finalization_rx,
                 propagation_rx,
                 background_rx,
-                consensus_tx,
                 peer_validators,
                 shutdown_rx,
                 cached_peer_count,
@@ -825,7 +812,6 @@ impl Libp2pAdapter {
         mut finalization_rx: mpsc::UnboundedReceiver<SwarmCommand>,
         mut propagation_rx: mpsc::UnboundedReceiver<SwarmCommand>,
         mut background_rx: mpsc::UnboundedReceiver<SwarmCommand>,
-        consensus_tx: crossbeam::channel::Sender<Event>,
         peer_validators: Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         mut shutdown_rx: mpsc::Receiver<()>,
         cached_peer_count: Arc<AtomicUsize>,
@@ -1127,7 +1113,6 @@ impl Libp2pAdapter {
 
                     Self::handle_swarm_event(
                         event,
-                        &consensus_tx,
                         &peer_validators,
                         local_shard,
                         &codec_pool,
@@ -1264,7 +1249,6 @@ impl Libp2pAdapter {
     /// Outbound requests are handled via raw streams by RequestManager.
     async fn handle_swarm_event(
         event: SwarmEvent<BehaviourEvent>,
-        consensus_tx: &crossbeam::channel::Sender<Event>,
         peer_validators: &Arc<DashMap<Libp2pPeerId, ValidatorId>>,
         local_shard: ShardGroupId,
         codec_pool: &CodecPoolHandle,
@@ -1340,12 +1324,7 @@ impl Libp2pAdapter {
                 // The codec pool handles SBOR decoding on a separate thread pool,
                 // then sends decoded events directly to the consensus channel.
                 // This prevents large messages (state batches) from blocking the event loop.
-                codec_pool.decode_async(
-                    parsed_topic,
-                    message.data,
-                    propagation_source,
-                    consensus_tx.clone(),
-                );
+                codec_pool.decode_async(parsed_topic, message.data, propagation_source);
             }
 
             // Handle subscription events

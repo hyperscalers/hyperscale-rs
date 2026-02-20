@@ -22,9 +22,8 @@ pub struct NetworkConfig {
     pub num_shards: u32,
     /// Packet loss rate (0.0 - 1.0). Messages are dropped with this probability.
     pub packet_loss_rate: f64,
-    /// When enabled, messages are encoded via `hyperscale_network::codec::encode_message()`
-    /// then decoded via `decode_message()` on delivery, exercising the same serialization
-    /// path as production.
+    /// When enabled, messages are wire-encoded (SBOR + LZ4) in the outbox and
+    /// decoded on delivery, exercising the same serialization path as production.
     pub codec_roundtrip: bool,
 }
 
