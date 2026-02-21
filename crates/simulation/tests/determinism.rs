@@ -4,7 +4,7 @@
 //! given the same seed, which is the core property we need for debugging
 //! and replay.
 
-use hyperscale_core::Event;
+use hyperscale_core::NodeInput;
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,7 +44,11 @@ fn test_schedule_initial_events() {
 
     // Schedule proposal timers for all nodes
     for node in 0..4 {
-        runner.schedule_initial_event(node, Duration::from_millis(100), Event::ProposalTimer);
+        runner.schedule_initial_event(
+            node,
+            Duration::from_millis(100),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+        );
     }
 
     // Run for a short time
@@ -67,7 +71,11 @@ fn test_determinism_same_seed() {
     // Run simulation with seed
     let mut runner1 = SimulationRunner::new(config.clone(), seed);
     for node in 0..4 {
-        runner1.schedule_initial_event(node, Duration::from_millis(100), Event::ProposalTimer);
+        runner1.schedule_initial_event(
+            node,
+            Duration::from_millis(100),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+        );
     }
     runner1.run_until(Duration::from_secs(1));
     let stats1 = runner1.stats().clone();
@@ -75,7 +83,11 @@ fn test_determinism_same_seed() {
     // Run simulation again with same seed
     let mut runner2 = SimulationRunner::new(config.clone(), seed);
     for node in 0..4 {
-        runner2.schedule_initial_event(node, Duration::from_millis(100), Event::ProposalTimer);
+        runner2.schedule_initial_event(
+            node,
+            Duration::from_millis(100),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+        );
     }
     runner2.run_until(Duration::from_secs(1));
     let stats2 = runner2.stats().clone();
@@ -107,14 +119,22 @@ fn test_different_seeds_diverge() {
     // Run simulation with seed 1
     let mut runner1 = SimulationRunner::new(config.clone(), 111);
     for node in 0..4 {
-        runner1.schedule_initial_event(node, Duration::from_millis(100), Event::ProposalTimer);
+        runner1.schedule_initial_event(
+            node,
+            Duration::from_millis(100),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+        );
     }
     runner1.run_until(Duration::from_secs(1));
 
     // Run simulation with seed 2
     let mut runner2 = SimulationRunner::new(config.clone(), 222);
     for node in 0..4 {
-        runner2.schedule_initial_event(node, Duration::from_millis(100), Event::ProposalTimer);
+        runner2.schedule_initial_event(
+            node,
+            Duration::from_millis(100),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+        );
     }
     runner2.run_until(Duration::from_secs(1));
 
@@ -147,7 +167,11 @@ fn test_multi_shard_simulation() {
 
     // Schedule proposal timers for all nodes
     for node in 0..6 {
-        runner.schedule_initial_event(node, Duration::from_millis(100), Event::ProposalTimer);
+        runner.schedule_initial_event(
+            node,
+            Duration::from_millis(100),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+        );
     }
 
     runner.run_until(Duration::from_secs(1));
@@ -170,7 +194,11 @@ fn test_round_advancement_via_proposal_timer() {
 
     // Schedule proposal timers - these handle both proposals AND round advancement
     for node in 0..4 {
-        runner.schedule_initial_event(node, Duration::from_millis(100), Event::ProposalTimer);
+        runner.schedule_initial_event(
+            node,
+            Duration::from_millis(100),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+        );
     }
 
     runner.run_until(Duration::from_secs(10));
@@ -190,7 +218,11 @@ fn test_extended_simulation() {
 
     // Schedule initial proposal timers
     for node in 0..4 {
-        runner.schedule_initial_event(node, Duration::from_millis(100), Event::ProposalTimer);
+        runner.schedule_initial_event(
+            node,
+            Duration::from_millis(100),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+        );
     }
 
     // Run for 10 seconds of simulated time
@@ -223,7 +255,11 @@ fn test_extended_simulation_determinism() {
     // First run
     let mut runner1 = SimulationRunner::new(config.clone(), seed);
     for node in 0..4 {
-        runner1.schedule_initial_event(node, Duration::from_millis(100), Event::ProposalTimer);
+        runner1.schedule_initial_event(
+            node,
+            Duration::from_millis(100),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+        );
     }
     runner1.run_until(Duration::from_secs(5));
     let stats1 = runner1.stats().clone();
@@ -231,7 +267,11 @@ fn test_extended_simulation_determinism() {
     // Second run with same seed
     let mut runner2 = SimulationRunner::new(config.clone(), seed);
     for node in 0..4 {
-        runner2.schedule_initial_event(node, Duration::from_millis(100), Event::ProposalTimer);
+        runner2.schedule_initial_event(
+            node,
+            Duration::from_millis(100),
+            NodeInput::Protocol(hyperscale_core::ProtocolEvent::ProposalTimer),
+        );
     }
     runner2.run_until(Duration::from_secs(5));
     let stats2 = runner2.stats().clone();
@@ -1127,7 +1167,7 @@ fn test_consensus_throughput() {
 /// 3. Verify transactions appear in committed blocks
 #[test]
 fn test_mempool_to_block_integration() {
-    use hyperscale_core::Event;
+    use hyperscale_core::NodeInput;
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
@@ -1149,17 +1189,17 @@ fn test_mempool_to_block_integration() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(50),
-        Event::SubmitTransaction { tx: Arc::new(tx1) },
+        NodeInput::SubmitTransaction { tx: Arc::new(tx1) },
     );
     runner.schedule_initial_event(
         0,
         Duration::from_millis(51),
-        Event::SubmitTransaction { tx: Arc::new(tx2) },
+        NodeInput::SubmitTransaction { tx: Arc::new(tx2) },
     );
     runner.schedule_initial_event(
         0,
         Duration::from_millis(52),
-        Event::SubmitTransaction { tx: Arc::new(tx3) },
+        NodeInput::SubmitTransaction { tx: Arc::new(tx3) },
     );
 
     // Run for 100ms - before first proposal timer fires (100ms default)
@@ -1222,7 +1262,7 @@ fn test_mempool_to_block_integration() {
 /// 5. Execution runs and creates certificates
 #[test]
 fn test_execution_flow() {
-    use hyperscale_core::Event;
+    use hyperscale_core::NodeInput;
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
@@ -1237,7 +1277,7 @@ fn test_execution_flow() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(50),
-        Event::SubmitTransaction { tx: Arc::new(tx) },
+        NodeInput::SubmitTransaction { tx: Arc::new(tx) },
     );
 
     // Run for 2 seconds - should commit blocks and execute transactions
@@ -1276,7 +1316,7 @@ fn test_execution_flow() {
 /// it eventually appears in other validators' mempools via gossip.
 #[test]
 fn test_transaction_gossip() {
-    use hyperscale_core::Event;
+    use hyperscale_core::NodeInput;
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
@@ -1291,7 +1331,7 @@ fn test_transaction_gossip() {
     runner.schedule_initial_event(
         0,
         Duration::from_millis(10),
-        Event::SubmitTransaction { tx: Arc::new(tx) },
+        NodeInput::SubmitTransaction { tx: Arc::new(tx) },
     );
 
     // Run briefly - transaction should be in node 0's mempool

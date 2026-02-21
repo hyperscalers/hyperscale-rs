@@ -11,7 +11,7 @@
 //! TXs with verified provisions bypass the soft limit (other shards waiting on us).
 //! These tests verify the system behavior without hitting that limit.
 
-use hyperscale_core::{Event, TransactionStatus};
+use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
 use hyperscale_types::{
     ed25519_keypair_from_seed, sign_and_notarize, Ed25519PrivateKey, RoutableTransaction,
@@ -100,7 +100,7 @@ fn test_single_shard_unaffected_by_backpressure() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        Event::SubmitTransaction {
+        NodeInput::SubmitTransaction {
             tx: Arc::new(transaction),
         },
     );
@@ -172,7 +172,7 @@ fn test_provision_coordinator_tracking() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        Event::SubmitTransaction {
+        NodeInput::SubmitTransaction {
             tx: Arc::new(transaction),
         },
     );
@@ -229,7 +229,7 @@ fn test_mempool_backpressure_integration() {
         runner.schedule_initial_event(
             0,
             Duration::from_millis(i as u64 * 10),
-            Event::SubmitTransaction {
+            NodeInput::SubmitTransaction {
                 tx: Arc::new(transaction),
             },
         );
@@ -381,7 +381,7 @@ fn test_completed_tx_cleanup() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        Event::SubmitTransaction {
+        NodeInput::SubmitTransaction {
             tx: Arc::new(transaction),
         },
     );

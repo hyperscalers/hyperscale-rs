@@ -12,7 +12,7 @@
 //! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
 //! the complete block data, making it recoverable from any honest validator in that set.
 
-use hyperscale_core::{Action, Event, TimerId};
+use hyperscale_core::{Action, ProtocolEvent, TimerId};
 
 /// BFT statistics for monitoring.
 #[derive(Clone, Copy, Debug, Default)]
@@ -2806,9 +2806,9 @@ impl BftState {
                 vote_set.on_qc_built();
             }
 
-            return vec![Action::EnqueueInternal {
-                event: Event::QuorumCertificateFormed { block_hash, qc },
-            }];
+            return vec![Action::Continuation(
+                ProtocolEvent::QuorumCertificateFormed { block_hash, qc },
+            )];
         }
 
         // Process verified votes: view sync, equivocation detection, and recording.
@@ -3632,12 +3632,10 @@ impl BftState {
             {
                 // Only commit if we haven't already committed this height
                 if committable_height.0 > self.committed_height {
-                    actions.push(Action::EnqueueInternal {
-                        event: Event::BlockReadyToCommit {
-                            block_hash: committable_hash,
-                            qc: qc.clone(),
-                        },
-                    });
+                    actions.push(Action::Continuation(ProtocolEvent::BlockReadyToCommit {
+                        block_hash: committable_hash,
+                        qc: qc.clone(),
+                    }));
                 }
             }
         }
@@ -3884,13 +3882,11 @@ impl BftState {
                 block: block.clone(),
                 qc: qc.unwrap_or_else(QuorumCertificate::genesis),
             });
-            actions.push(Action::EnqueueInternal {
-                event: Event::BlockCommitted {
-                    block_hash: current_hash,
-                    height,
-                    block: block.clone(),
-                },
-            });
+            actions.push(Action::Continuation(ProtocolEvent::BlockCommitted {
+                block_hash: current_hash,
+                height,
+                block: block.clone(),
+            }));
 
             // Check if the next height is buffered
             let next_height = height + 1;
@@ -4178,13 +4174,11 @@ impl BftState {
                 block: block.clone(),
                 qc,
             },
-            Action::EnqueueInternal {
-                event: Event::BlockCommitted {
-                    block_hash,
-                    height,
-                    block: block.clone(),
-                },
-            },
+            Action::Continuation(ProtocolEvent::BlockCommitted {
+                block_hash,
+                height,
+                block: block.clone(),
+            }),
         ];
 
         // Cancel any pending fetches for removed blocks
@@ -8561,7 +8555,7 @@ mod tests {
         let signer_keys: Vec<_> = qc
             .signers
             .set_indices()
-            .map(|idx| committee.public_key(idx).clone())
+            .map(|idx| *committee.public_key(idx))
             .collect();
 
         // Aggregate public keys (what the runner does)
@@ -8579,7 +8573,7 @@ mod tests {
         let signatures: Vec<_> = (0..3)
             .map(|i| committee.keypair(i).sign_v1(&signing_message))
             .collect();
-        let pubkeys: Vec<_> = (0..3).map(|i| committee.public_key(i).clone()).collect();
+        let pubkeys: Vec<_> = (0..3).map(|i| *committee.public_key(i)).collect();
 
         let batch_valid = batch_verify_bls_same_message(&signing_message, &signatures, &pubkeys);
         assert!(batch_valid, "Batch verification should also succeed");
@@ -8630,8 +8624,7 @@ mod tests {
             .map(|i| committee.keypair(i).sign_v1(&message))
             .collect();
 
-        let pubkeys: Vec<Bls12381G1PublicKey> =
-            (0..3).map(|i| committee.public_key(i).clone()).collect();
+        let pubkeys: Vec<Bls12381G1PublicKey> = (0..3).map(|i| *committee.public_key(i)).collect();
 
         // Batch verify all signatures at once (same message optimization)
         let valid = batch_verify_bls_same_message(&message, &signatures, &pubkeys);
@@ -8661,9 +8654,9 @@ mod tests {
         ];
 
         let pubkeys: Vec<Bls12381G1PublicKey> = vec![
-            committee.public_key(0).clone(),
-            committee.public_key(1).clone(),
-            committee.public_key(2).clone(), // But we're verifying with key 2
+            *committee.public_key(0),
+            *committee.public_key(1),
+            *committee.public_key(2), // But we're verifying with key 2
         ];
 
         // Batch verification should fail
@@ -8701,7 +8694,7 @@ mod tests {
         // Aggregate public keys of signers
         let signer_pks: Vec<Bls12381G1PublicKey> = voter_indices
             .iter()
-            .map(|&i| committee.public_key(i).clone())
+            .map(|&i| *committee.public_key(i))
             .collect();
         let aggregated_pk = Bls12381G1PublicKey::aggregate(&signer_pks, true)
             .expect("PK aggregation should succeed");

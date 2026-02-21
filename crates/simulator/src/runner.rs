@@ -5,7 +5,7 @@
 
 use crate::config::SimulatorConfig;
 use crate::metrics::{MetricsCollector, SimulationReport};
-use hyperscale_core::Event;
+use hyperscale_core::NodeInput;
 use hyperscale_mempool::LockContentionStats;
 use hyperscale_simulation::NodeIndex;
 use hyperscale_simulation::SimulationRunner;
@@ -179,7 +179,7 @@ impl Simulator {
                     self.runner.schedule_initial_event(
                         node_idx,
                         Duration::ZERO,
-                        Event::SubmitTransaction {
+                        NodeInput::SubmitTransaction {
                             tx: std::sync::Arc::clone(&tx),
                         },
                     );

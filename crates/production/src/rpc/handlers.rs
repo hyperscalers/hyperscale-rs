@@ -8,7 +8,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use hyperscale_core::{Event, TransactionStatus};
+use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_metrics as metrics;
 use hyperscale_types::{Hash, RoutableTransaction, TransactionDecision};
 use std::sync::atomic::Ordering;
@@ -231,7 +231,7 @@ pub async fn submit_transaction_handler(
     // 3. Dispatch to mempool after validation
     if state
         .tx_submission_tx
-        .send(Event::SubmitTransaction { tx: tx_arc })
+        .send(NodeInput::SubmitTransaction { tx: tx_arc })
         .is_err()
     {
         return (

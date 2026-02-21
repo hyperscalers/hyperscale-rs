@@ -1,6 +1,6 @@
 //! Core traits for state machines.
 
-use crate::{Action, Event};
+use crate::{Action, ProtocolEvent};
 use hyperscale_types::{Hash, SubstateWrite};
 use std::time::Duration;
 
@@ -17,11 +17,11 @@ use std::time::Duration;
 ///
 /// ```ignore
 /// impl StateMachine for NodeStateMachine {
-///     fn handle(&mut self, event: Event) -> Vec<Action> {
+///     fn handle(&mut self, event: ProtocolEvent) -> Vec<Action> {
 ///         match event {
-///             Event::ProposalTimer => self.bft.on_proposal_timer(),
-///             Event::BlockVoteReceived { from, vote } => {
-///                 self.bft.on_block_vote(from, vote)
+///             ProtocolEvent::ProposalTimer => self.bft.on_proposal_timer(),
+///             ProtocolEvent::BlockVoteReceived { vote } => {
+///                 self.bft.on_block_vote(vote)
 ///             }
 ///             // ... etc
 ///         }
@@ -33,7 +33,7 @@ use std::time::Duration;
 /// }
 /// ```
 pub trait StateMachine {
-    /// Process an event, returning actions to perform.
+    /// Process a protocol event, returning actions to perform.
     ///
     /// # Guarantees
     ///
@@ -43,16 +43,16 @@ pub trait StateMachine {
     ///
     /// # Arguments
     ///
-    /// * `event` - The event to process
+    /// * `event` - The protocol event to process
     ///
     /// # Returns
     ///
     /// A list of actions for the runner to execute. Actions may include:
     /// - Sending network messages
     /// - Setting timers
-    /// - Enqueueing internal events
+    /// - Continuation events for further processing
     /// - Emitting notifications to clients
-    fn handle(&mut self, event: Event) -> Vec<Action>;
+    fn handle(&mut self, event: ProtocolEvent) -> Vec<Action>;
 
     /// Set the current time.
     ///

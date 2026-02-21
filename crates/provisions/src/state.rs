@@ -16,7 +16,7 @@
 //! This avoids wasting CPU on provisions we'll never use (e.g., if we only
 //! receive 2 of 3 needed provisions, we don't verify any).
 
-use hyperscale_core::{Action, Event};
+use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof, Hash, NodeId,
     ShardGroupId, SignerBitfield, StateEntry, StateProvision, Topology, ValidatorId,
@@ -445,13 +445,13 @@ impl ProvisionCoordinator {
                     );
 
                     // Emit quorum event with the pre-aggregated proof
-                    actions.push(Action::EnqueueInternal {
-                        event: Event::ProvisionQuorumReached {
+                    actions.push(Action::Continuation(
+                        ProtocolEvent::ProvisionQuorumReached {
                             tx_hash,
                             source_shard,
                             commitment_proof: proof,
                         },
-                    });
+                    ));
                 }
 
                 // Check if ALL required shards have quorum (ready for execution)
@@ -465,12 +465,10 @@ impl ProvisionCoordinator {
                     );
 
                     // Emit event for ExecutionState to trigger cross-shard execution
-                    actions.push(Action::EnqueueInternal {
-                        event: Event::ProvisioningComplete {
-                            tx_hash,
-                            provisions: all_provisions,
-                        },
-                    });
+                    actions.push(Action::Continuation(ProtocolEvent::ProvisioningComplete {
+                        tx_hash,
+                        provisions: all_provisions,
+                    }));
                 }
             }
         } else {

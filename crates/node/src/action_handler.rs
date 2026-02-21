@@ -8,7 +8,7 @@
 //! Production wraps calls in dispatch pools (thread pools) and delivers results
 //! via channels. Simulation calls inline and schedules events directly.
 
-use hyperscale_core::{Action, CrossShardExecutionRequest, Event};
+use hyperscale_core::{Action, CrossShardExecutionRequest, NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
@@ -32,7 +32,7 @@ pub struct ActionContext<'a, S: CommitStore + SubstateStore, D: Dispatch> {
 /// Result of handling a delegated action.
 pub struct DelegatedResult<P: Send> {
     /// Events to deliver to the state machine.
-    pub events: Vec<Event>,
+    pub events: Vec<NodeInput>,
     /// Prepared commit handle to cache (block_hash -> handle).
     pub prepared_commit: Option<(Hash, P)>,
 }
@@ -83,7 +83,7 @@ pub fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// that the runner must handle directly.
 ///
 /// For execution actions (ExecuteTransactions, SpeculativeExecute, ExecuteCrossShardTransaction),
-/// the returned events include `Event::StateVoteReceived` for each vote. The runner is
+/// the returned events include `ProtocolEvent::StateVoteReceived` for each vote. The runner is
 /// responsible for additionally broadcasting votes to shard peers (network-specific).
 #[allow(clippy::too_many_lines)]
 pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
@@ -113,11 +113,13 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
                 total_voting_power,
             );
             Some(DelegatedResult {
-                events: vec![Event::QuorumCertificateResult {
-                    block_hash: result.block_hash,
-                    qc: result.qc,
-                    verified_votes: result.verified_votes,
-                }],
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::QuorumCertificateResult {
+                        block_hash: result.block_hash,
+                        qc: result.qc,
+                        verified_votes: result.verified_votes,
+                    },
+                )],
                 prepared_commit: None,
             })
         }
@@ -131,7 +133,10 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
             let valid =
                 hyperscale_bft::handlers::verify_qc_signature(&qc, &public_keys, &signing_message);
             Some(DelegatedResult {
-                events: vec![Event::QcSignatureVerified { block_hash, valid }],
+                events: vec![NodeInput::Protocol(ProtocolEvent::QcSignatureVerified {
+                    block_hash,
+                    valid,
+                })],
                 prepared_commit: None,
             })
         }
@@ -151,11 +156,11 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
                 quorum_threshold,
             );
             Some(DelegatedResult {
-                events: vec![Event::CycleProofVerified {
+                events: vec![NodeInput::Protocol(ProtocolEvent::CycleProofVerified {
                     block_hash,
                     deferral_index,
                     valid,
-                }],
+                })],
                 prepared_commit: None,
             })
         }
@@ -174,7 +179,9 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
                 &transactions,
             );
             Some(DelegatedResult {
-                events: vec![Event::TransactionRootVerified { block_hash, valid }],
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::TransactionRootVerified { block_hash, valid },
+                )],
                 prepared_commit: None,
             })
         }
@@ -195,10 +202,10 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
             );
             let prepared = result.prepared_commit.map(|p| (block_hash, p));
             Some(DelegatedResult {
-                events: vec![Event::StateRootVerified {
+                events: vec![NodeInput::Protocol(ProtocolEvent::StateRootVerified {
                     block_hash,
                     valid: result.valid,
-                }],
+                })],
                 prepared_commit: prepared,
             })
         }
@@ -243,12 +250,12 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
             );
             let prepared = result.prepared_commit.map(|p| (result.block_hash, p));
             Some(DelegatedResult {
-                events: vec![Event::ProposalBuilt {
+                events: vec![NodeInput::Protocol(ProtocolEvent::ProposalBuilt {
                     height,
                     round,
                     block: Arc::new(result.block),
                     block_hash: result.block_hash,
-                }],
+                })],
                 prepared_commit: prepared,
             })
         }
@@ -274,10 +281,12 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
                 ctx.topology,
             );
             Some(DelegatedResult {
-                events: vec![Event::StateCertificateAggregated {
-                    tx_hash,
-                    certificate,
-                }],
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::StateCertificateAggregated {
+                        tx_hash,
+                        certificate,
+                    },
+                )],
                 prepared_commit: None,
             })
         }
@@ -286,10 +295,12 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
             let verified_votes =
                 hyperscale_execution::handlers::verify_and_aggregate_state_votes(votes);
             Some(DelegatedResult {
-                events: vec![Event::StateVotesVerifiedAndAggregated {
-                    tx_hash,
-                    verified_votes,
-                }],
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::StateVotesVerifiedAndAggregated {
+                        tx_hash,
+                        verified_votes,
+                    },
+                )],
                 prepared_commit: None,
             })
         }
@@ -303,7 +314,9 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
                 &public_keys,
             );
             Some(DelegatedResult {
-                events: vec![Event::StateCertificateSignatureVerified { certificate, valid }],
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::StateCertificateSignatureVerified { certificate, valid },
+                )],
                 prepared_commit: None,
             })
         }
@@ -331,12 +344,14 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
                 ctx.topology,
             );
             Some(DelegatedResult {
-                events: vec![Event::ProvisionsVerifiedAndAggregated {
-                    tx_hash,
-                    source_shard,
-                    verified_provisions: result.verified_provisions,
-                    commitment_proof: result.commitment_proof,
-                }],
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::ProvisionsVerifiedAndAggregated {
+                        tx_hash,
+                        source_shard,
+                        verified_provisions: result.verified_provisions,
+                        commitment_proof: result.commitment_proof,
+                    },
+                )],
                 prepared_commit: None,
             })
         }
@@ -362,7 +377,7 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
 
             let events = votes
                 .into_iter()
-                .map(|vote| Event::StateVoteReceived { vote })
+                .map(|vote| NodeInput::Protocol(ProtocolEvent::StateVoteReceived { vote }))
                 .collect();
 
             Some(DelegatedResult {
@@ -387,14 +402,16 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
             });
 
             let tx_hashes: Vec<Hash> = votes.iter().map(|v| v.transaction_hash).collect();
-            let mut events: Vec<Event> = votes
+            let mut events: Vec<NodeInput> = votes
                 .into_iter()
-                .map(|vote| Event::StateVoteReceived { vote })
+                .map(|vote| NodeInput::Protocol(ProtocolEvent::StateVoteReceived { vote }))
                 .collect();
-            events.push(Event::SpeculativeExecutionComplete {
-                block_hash,
-                tx_hashes,
-            });
+            events.push(NodeInput::Protocol(
+                ProtocolEvent::SpeculativeExecutionComplete {
+                    block_hash,
+                    tx_hashes,
+                },
+            ));
 
             Some(DelegatedResult {
                 events,
@@ -419,16 +436,18 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
                 ctx.topology,
             );
             Some(DelegatedResult {
-                events: vec![Event::StateVoteReceived { vote }],
+                events: vec![NodeInput::Protocol(ProtocolEvent::StateVoteReceived {
+                    vote,
+                })],
                 prepared_commit: None,
             })
         }
 
         // --- Merkle root computation ---
-        Action::ComputeMerkleRoot { tx_hash, writes } => {
-            let root = hyperscale_bft::handlers::compute_merkle_root(&writes);
+        Action::ComputeMerkleRoot { tx_hash: _, writes } => {
+            let _root = hyperscale_bft::handlers::compute_merkle_root(&writes);
             Some(DelegatedResult {
-                events: vec![Event::MerkleRootComputed { tx_hash, root }],
+                events: vec![],
                 prepared_commit: None,
             })
         }
@@ -445,7 +464,7 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
 pub fn handle_cross_shard_batch<S: CommitStore + SubstateStore, D: Dispatch>(
     requests: &[CrossShardExecutionRequest],
     ctx: &ActionContext<'_, S, D>,
-) -> Vec<Event> {
+) -> Vec<NodeInput> {
     let votes: Vec<StateVoteBlock> = ctx.dispatch.map_execution(requests, |req| {
         hyperscale_execution::handlers::execute_and_sign_cross_shard(
             ctx.executor,
@@ -462,7 +481,7 @@ pub fn handle_cross_shard_batch<S: CommitStore + SubstateStore, D: Dispatch>(
 
     votes
         .into_iter()
-        .map(|vote| Event::StateVoteReceived { vote })
+        .map(|vote| NodeInput::Protocol(ProtocolEvent::StateVoteReceived { vote }))
         .collect()
 }
 
@@ -472,7 +491,7 @@ pub fn handle_cross_shard_batch<S: CommitStore + SubstateStore, D: Dispatch>(
 /// recomputes from certificates (slow path). Updates committed state
 /// metadata and prunes old votes after state is applied.
 ///
-/// Returns `Some(Event::StateCommitComplete)` if certificates were committed,
+/// Returns `Some(NodeInput::Protocol(ProtocolEvent::StateCommitComplete))` if certificates were committed,
 /// `None` if the block had no certificates.
 pub fn commit_block<S: CommitStore + ConsensusStore>(
     storage: &S,
@@ -482,7 +501,7 @@ pub fn commit_block<S: CommitStore + ConsensusStore>(
     qc: &QuorumCertificate,
     local_shard: ShardGroupId,
     prepared_commit: Option<S::PreparedCommit>,
-) -> Option<Event> {
+) -> Option<NodeInput> {
     if !block.certificates.is_empty() {
         let result = if let Some(prepared) = prepared_commit {
             storage.commit_prepared_block(prepared)
@@ -494,11 +513,11 @@ pub fn commit_block<S: CommitStore + ConsensusStore>(
         ConsensusStore::set_committed_state(storage, height, block_hash, qc);
         ConsensusStore::prune_own_votes(storage, height.0);
 
-        Some(Event::StateCommitComplete {
+        Some(NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
             height: height.0,
             state_version: result.state_version,
             state_root: result.state_root,
-        })
+        }))
     } else {
         // Empty block - no state changes, but still update committed metadata.
         ConsensusStore::set_committed_state(storage, height, block_hash, qc);

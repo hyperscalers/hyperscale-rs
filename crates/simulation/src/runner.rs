@@ -7,7 +7,7 @@ use crate::event_queue::EventKey;
 use crate::NodeIndex;
 use crate::SimStorage;
 use hyperscale_bft::{BftConfig, RecoveredState};
-use hyperscale_core::{Event, TimerId};
+use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_execution::{DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};
@@ -51,10 +51,10 @@ pub struct SimulationRunner {
     node_loops: Vec<SimNodeLoop>,
 
     /// Per-node event receivers (from crossbeam channels passed to NodeLoop).
-    event_rxs: Vec<crossbeam::channel::Receiver<Event>>,
+    event_rxs: Vec<crossbeam::channel::Receiver<NodeInput>>,
 
     /// Global event queue, ordered deterministically.
-    event_queue: BTreeMap<EventKey, Event>,
+    event_queue: BTreeMap<EventKey, NodeInput>,
 
     /// Sequence counter for deterministic ordering.
     sequence: u64,
@@ -357,7 +357,7 @@ impl SimulationRunner {
     }
 
     /// Schedule an initial event (e.g., to start the simulation).
-    pub fn schedule_initial_event(&mut self, node: NodeIndex, delay: Duration, event: Event) {
+    pub fn schedule_initial_event(&mut self, node: NodeIndex, delay: Duration, event: NodeInput) {
         let time = self.now + delay;
         self.schedule_event(node, time, event);
     }
@@ -442,11 +442,12 @@ impl SimulationRunner {
                 self.process_step_output(node_index, output);
 
                 // Sync state machine with actual JMT state after genesis bootstrap
-                let genesis_commit_event = Event::StateCommitComplete {
-                    height: 0,
-                    state_version: genesis_jmt_version,
-                    state_root: genesis_jmt_root,
-                };
+                let genesis_commit_event =
+                    NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
+                        height: 0,
+                        state_version: genesis_jmt_version,
+                        state_root: genesis_jmt_root,
+                    });
                 self.schedule_event(node_index, self.now, genesis_commit_event);
             }
 
@@ -548,11 +549,12 @@ impl SimulationRunner {
                 self.drain_node_io(node_index);
                 self.process_step_output(node_index, output);
 
-                let genesis_commit_event = Event::StateCommitComplete {
-                    height: 0,
-                    state_version: genesis_jmt_version,
-                    state_root: genesis_jmt_root,
-                };
+                let genesis_commit_event =
+                    NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
+                        height: 0,
+                        state_version: genesis_jmt_version,
+                        state_root: genesis_jmt_root,
+                    });
                 self.schedule_event(node_index, self.now, genesis_commit_event);
             }
 
@@ -600,14 +602,14 @@ impl SimulationRunner {
             self.stats.events_by_priority[event.priority() as usize] += 1;
 
             // For SubmitTransaction events, gossip to all relevant shards first.
-            if let Event::SubmitTransaction { ref tx } = event {
+            if let NodeInput::SubmitTransaction { ref tx } = event {
                 let topology = self.node_loops[node_index as usize].state().topology();
                 let shards: Vec<ShardGroupId> = topology.all_shards_for_transaction(tx);
                 for shard in shards {
-                    let event = Event::TransactionGossipReceived {
+                    let event = NodeInput::Protocol(ProtocolEvent::TransactionGossipReceived {
                         tx: Arc::clone(tx),
                         submitted_locally: false,
-                    };
+                    });
                     let peers = self.network.peers_in_shard(shard);
                     for to in peers {
                         if to != node_index {
@@ -724,7 +726,7 @@ impl SimulationRunner {
     }
 
     /// Try to deliver an event, accounting for partitions and packet loss.
-    fn try_deliver_event(&mut self, from: NodeIndex, to: NodeIndex, event: Event) {
+    fn try_deliver_event(&mut self, from: NodeIndex, to: NodeIndex, event: NodeInput) {
         if self.network.is_partitioned(from, to) {
             self.stats.messages_dropped_partition += 1;
             trace!(from = from, to = to, "Event dropped due to partition");
@@ -767,12 +769,12 @@ impl SimulationRunner {
     }
 
     /// Convert a timer ID to an event.
-    fn timer_to_event(&self, id: TimerId) -> Event {
+    fn timer_to_event(&self, id: TimerId) -> NodeInput {
         match id {
-            TimerId::Proposal => Event::ProposalTimer,
-            TimerId::Cleanup => Event::CleanupTimer,
-            TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
-            TimerId::FetchTick => Event::FetchTick,
+            TimerId::Proposal => NodeInput::Protocol(ProtocolEvent::ProposalTimer),
+            TimerId::Cleanup => NodeInput::Protocol(ProtocolEvent::CleanupTimer),
+            TimerId::GlobalConsensus => NodeInput::Protocol(ProtocolEvent::GlobalConsensusTimer),
+            TimerId::FetchTick => NodeInput::FetchTick,
         }
     }
 
@@ -965,7 +967,7 @@ impl SimulationRunner {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Schedule an event.
-    fn schedule_event(&mut self, node: NodeIndex, time: Duration, event: Event) -> EventKey {
+    fn schedule_event(&mut self, node: NodeIndex, time: Duration, event: NodeInput) -> EventKey {
         self.sequence += 1;
         let key = EventKey::new(time, &event, node, self.sequence);
         self.event_queue.insert(key, event);

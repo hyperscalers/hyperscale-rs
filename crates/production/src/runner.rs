@@ -61,7 +61,7 @@ use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use hyperscale_types::BlockHeight;
 use quick_cache::sync::Cache as QuickCache;
 
-use hyperscale_core::Event;
+use hyperscale_core::NodeInput;
 use hyperscale_node::node_loop::{NodeLoop, TimerOp};
 use hyperscale_node::sync_protocol::SyncProtocol;
 use hyperscale_node::NodeStateMachine;
@@ -575,22 +575,22 @@ pub struct ProductionRunner {
     // ── Crossbeam senders (async → pinned thread) ────────────────────────
     /// Timer events to pinned thread (for external timer injection if needed).
     #[allow(dead_code)]
-    xb_timer_tx: crossbeam::channel::Sender<Event>,
+    xb_timer_tx: crossbeam::channel::Sender<NodeInput>,
     /// Consensus events to pinned thread (from Libp2p adapter routing).
-    xb_consensus_tx: crossbeam::channel::Sender<Event>,
+    xb_consensus_tx: crossbeam::channel::Sender<NodeInput>,
     /// Callback events to pinned thread (from bridge tasks, direct sends).
     #[allow(dead_code)] // Kept alive to prevent crossbeam channel closure
-    xb_callback_tx: crossbeam::channel::Sender<Event>,
+    xb_callback_tx: crossbeam::channel::Sender<NodeInput>,
     /// Shutdown signal to pinned thread.
     xb_shutdown_tx: crossbeam::channel::Sender<()>,
 
     // ── Crossbeam receivers (extracted for PinnedLoopConfig) ─────────────
     /// Timer receiver (moved to PinnedLoopConfig).
-    xb_timer_rx: Option<crossbeam::channel::Receiver<Event>>,
+    xb_timer_rx: Option<crossbeam::channel::Receiver<NodeInput>>,
     /// Callback receiver (moved to PinnedLoopConfig).
-    xb_callback_rx: Option<crossbeam::channel::Receiver<Event>>,
+    xb_callback_rx: Option<crossbeam::channel::Receiver<NodeInput>>,
     /// Consensus receiver (moved to PinnedLoopConfig).
-    xb_consensus_rx: Option<crossbeam::channel::Receiver<Event>>,
+    xb_consensus_rx: Option<crossbeam::channel::Receiver<NodeInput>>,
     /// Shutdown receiver (moved to PinnedLoopConfig).
     xb_shutdown_rx: Option<crossbeam::channel::Receiver<()>>,
 
@@ -665,7 +665,7 @@ impl ProductionRunner {
     ///
     /// Events sent through this sender are forwarded to the pinned NodeLoop
     /// thread via the crossbeam consensus channel.
-    pub fn event_sender(&self) -> crossbeam::channel::Sender<Event> {
+    pub fn event_sender(&self) -> crossbeam::channel::Sender<NodeInput> {
         self.xb_consensus_tx.clone()
     }
 
@@ -674,7 +674,7 @@ impl ProductionRunner {
     /// Returns a crossbeam channel sender that feeds directly into the NodeLoop.
     /// RPC handlers wrap transactions in `Event::SubmitTransaction` before sending.
     /// NodeLoop handles gossip, validation, and mempool dispatch.
-    pub fn tx_submission_sender(&self) -> crossbeam::channel::Sender<Event> {
+    pub fn tx_submission_sender(&self) -> crossbeam::channel::Sender<NodeInput> {
         self.xb_consensus_tx.clone()
     }
 
@@ -807,11 +807,13 @@ impl ProductionRunner {
         // The state machine was created BEFORE genesis bootstrap ran, so it has
         // stale/zero state. We need to sync it with the actual JMT state from
         // genesis so future blocks compute state_root from the correct base.
-        let genesis_commit_output = node_loop.step(Event::StateCommitComplete {
-            height: 0,
-            state_version: genesis_jmt_version,
-            state_root: genesis_jmt_root,
-        });
+        let genesis_commit_output = node_loop.step(NodeInput::Protocol(
+            hyperscale_core::ProtocolEvent::StateCommitComplete {
+                height: 0,
+                state_version: genesis_jmt_version,
+                state_root: genesis_jmt_root,
+            },
+        ));
 
         info!(
             genesis_jmt_version,

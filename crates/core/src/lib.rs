@@ -2,17 +2,18 @@
 //!
 //! This crate provides the foundational types for the consensus architecture:
 //!
-//! - [`Event`]: All possible inputs to the state machine
+//! - [`NodeInput`]: All possible inputs to the node loop
+//! - [`ProtocolEvent`]: Events processed by the state machine
 //! - [`Action`]: All possible outputs from the state machine
 //! - [`EventPriority`]: Ordering priority for events at the same timestamp
 //! - [`StateMachine`]: The trait that all state machines implement
 //!
 //! # Architecture
 //!
-//! The core is built on a simple event-driven model:
+//! The core is built on a two-level event model:
 //!
 //! ```text
-//! Events → StateMachine::handle() → Actions
+//! NodeInput → NodeLoop (intercepts I/O events) → ProtocolEvent → StateMachine::handle() → Actions
 //! ```
 //!
 //! The state machine is:
@@ -21,29 +22,20 @@
 //! - **Pure-ish**: Mutates self, but performs no I/O
 //!
 //! All I/O is handled by the runner (simulation or production) which:
-//! 1. Delivers events to the state machine
-//! 2. Executes the returned actions
-//! 3. Converts action results back into events
+//! 1. Delivers NodeInputs to the node loop
+//! 2. NodeLoop intercepts I/O events (sync, fetch, validation) and forwards
+//!    ProtocolEvents to the state machine
+//! 3. Executes the returned actions
+//! 4. Converts action results back into NodeInputs
 
 mod action;
-mod event;
+mod input;
+mod protocol_event;
 mod timer;
 mod traits;
 
 pub use action::{Action, CrossShardExecutionRequest, TransactionStatus};
-pub use event::{Event, EventPriority};
-pub use timer::TimerScheduler;
+pub use input::{Event, EventPriority, NodeInput};
+pub use protocol_event::ProtocolEvent;
+pub use timer::{TimerId, TimerScheduler};
 pub use traits::{NoOpStateRootComputer, StateMachine, StateRootComputer};
-
-/// Timer identification for scheduled events.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum TimerId {
-    /// Block proposal timer (also used for implicit round advancement)
-    Proposal,
-    /// Periodic cleanup timer
-    Cleanup,
-    /// Global consensus timer (epoch management)
-    GlobalConsensus,
-    /// Periodic tick for the fetch protocol (retry pending fetches)
-    FetchTick,
-}

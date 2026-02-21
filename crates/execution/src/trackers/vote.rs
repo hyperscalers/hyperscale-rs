@@ -330,10 +330,10 @@ mod tests {
         };
 
         // First buffer should succeed
-        assert!(tracker.buffer_unverified_vote(vote.clone(), pk.clone(), 1));
+        assert!(tracker.buffer_unverified_vote(vote.clone(), pk, 1));
 
         // Duplicate should fail
-        assert!(!tracker.buffer_unverified_vote(vote.clone(), pk.clone(), 1));
+        assert!(!tracker.buffer_unverified_vote(vote.clone(), pk, 1));
 
         // Different validator should succeed
         let vote2 = StateVoteBlock {
@@ -385,7 +385,7 @@ mod tests {
                 validator: ValidatorId(i),
                 signature: zero_bls_signature(),
             };
-            tracker.buffer_unverified_vote(vote, pk.clone(), 1);
+            tracker.buffer_unverified_vote(vote, pk, 1);
         }
 
         assert!(tracker.should_trigger_verification());
@@ -410,7 +410,7 @@ mod tests {
                 validator: ValidatorId(i),
                 signature: zero_bls_signature(),
             };
-            tracker.buffer_unverified_vote(vote, pk.clone(), 1);
+            tracker.buffer_unverified_vote(vote, pk, 1);
         }
 
         // Take votes
@@ -451,7 +451,7 @@ mod tests {
             validator: ValidatorId(1),
             ..tracker.votes_by_root.values().next().unwrap()[0].clone()
         };
-        tracker.buffer_unverified_vote(vote2, pk.clone(), 1);
+        tracker.buffer_unverified_vote(vote2, pk, 1);
         assert!(!tracker.should_trigger_verification());
 
         // Add another unverified - now 1 verified + 2 unverified = 3, should trigger

@@ -1,7 +1,7 @@
 //! Node state machine.
 
 use hyperscale_bft::{BftConfig, BftState, RecoveredState};
-use hyperscale_core::{Action, Event, StateMachine, TimerId};
+use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
@@ -281,14 +281,14 @@ impl StateMachine for NodeStateMachine {
         event = %event.type_name(),
         height = self.bft.committed_height(),
     ))]
-    fn handle(&mut self, event: Event) -> Vec<Action> {
+    fn handle(&mut self, event: ProtocolEvent) -> Vec<Action> {
         // Route event to appropriate sub-state machine
         match &event {
             // Timer events
-            Event::CleanupTimer => return self.on_cleanup_timer(),
+            ProtocolEvent::CleanupTimer => self.on_cleanup_timer(),
 
             // ProposalTimer handles both proposal AND implicit round advancement
-            Event::ProposalTimer => {
+            ProtocolEvent::ProposalTimer => {
                 // Check if we should advance the round due to timeout.
                 // This is now handled in BftState which owns the timeout tracking.
                 if let Some(actions) = self.bft.check_round_timeout() {
@@ -330,17 +330,17 @@ impl StateMachine for NodeStateMachine {
                 );
 
                 // BftState handles state_root computation internally after filtering certificates
-                return self.bft.on_proposal_timer(
+                self.bft.on_proposal_timer(
                     &ready_txs,
                     deferred,
                     aborted,
                     certificates,
                     commitment_proofs,
-                );
+                )
             }
 
             // BlockHeaderReceived needs mempool for transaction lookup and certificates
-            Event::BlockHeaderReceived {
+            ProtocolEvent::BlockHeaderReceived {
                 header,
                 retry_hashes,
                 priority_hashes,
@@ -441,11 +441,11 @@ impl StateMachine for NodeStateMachine {
                     &local_certs,
                 );
                 actions.extend(spec_actions);
-                return actions;
+                actions
             }
 
             // QuorumCertificateFormed may trigger immediate proposal, so pass mempool
-            Event::QuorumCertificateFormed { block_hash, qc } => {
+            ProtocolEvent::QuorumCertificateFormed { block_hash, qc } => {
                 // Count transactions and certificates in the block that will be committed.
                 // This is critical for respecting in-flight limits: the BlockCommitted
                 // event won't be processed until after we select transactions, so we
@@ -469,7 +469,7 @@ impl StateMachine for NodeStateMachine {
                 let certificates = self.execution.get_finalized_certificates();
 
                 // BftState handles state_root computation internally after filtering certificates
-                return self.bft.on_qc_formed(
+                self.bft.on_qc_formed(
                     *block_hash,
                     qc.clone(),
                     &ready_txs,
@@ -477,57 +477,49 @@ impl StateMachine for NodeStateMachine {
                     aborted,
                     certificates,
                     commitment_proofs,
-                );
+                )
             }
 
             // Self-contained BFT events - direct delegation
-            Event::BlockVoteReceived { vote } => {
-                return self.bft.on_block_vote(vote.clone());
+            ProtocolEvent::BlockVoteReceived { vote } => self.bft.on_block_vote(vote.clone()),
+            ProtocolEvent::BlockReadyToCommit { block_hash, qc } => {
+                self.bft.on_block_ready_to_commit(*block_hash, qc.clone())
             }
-            Event::BlockReadyToCommit { block_hash, qc } => {
-                return self.bft.on_block_ready_to_commit(*block_hash, qc.clone());
-            }
-            Event::QuorumCertificateResult {
+            ProtocolEvent::QuorumCertificateResult {
                 block_hash,
                 qc,
                 verified_votes,
-            } => {
-                return self
-                    .bft
-                    .on_qc_result(*block_hash, qc.clone(), verified_votes.clone());
+            } => self
+                .bft
+                .on_qc_result(*block_hash, qc.clone(), verified_votes.clone()),
+            ProtocolEvent::QcSignatureVerified { block_hash, valid } => {
+                self.bft.on_qc_signature_verified(*block_hash, *valid)
             }
-            Event::QcSignatureVerified { block_hash, valid } => {
-                return self.bft.on_qc_signature_verified(*block_hash, *valid);
-            }
-            Event::CycleProofVerified {
+            ProtocolEvent::CycleProofVerified {
                 block_hash,
                 deferral_index,
                 valid,
-            } => {
-                return self
-                    .bft
-                    .on_cycle_proof_verified(*block_hash, *deferral_index, *valid);
+            } => self
+                .bft
+                .on_cycle_proof_verified(*block_hash, *deferral_index, *valid),
+            ProtocolEvent::StateRootVerified { block_hash, valid } => {
+                self.bft.on_state_root_verified(*block_hash, *valid)
             }
-            Event::StateRootVerified { block_hash, valid } => {
-                return self.bft.on_state_root_verified(*block_hash, *valid);
-            }
-            Event::TransactionRootVerified { block_hash, valid } => {
-                return self.bft.on_transaction_root_verified(*block_hash, *valid);
+            ProtocolEvent::TransactionRootVerified { block_hash, valid } => {
+                self.bft.on_transaction_root_verified(*block_hash, *valid)
             }
 
-            Event::ProposalBuilt {
+            ProtocolEvent::ProposalBuilt {
                 height,
                 round,
                 block,
                 block_hash,
-            } => {
-                return self
-                    .bft
-                    .on_proposal_built(*height, *round, block.clone(), *block_hash);
-            }
+            } => self
+                .bft
+                .on_proposal_built(*height, *round, block.clone(), *block_hash),
 
             // JMT state commit completed - update tracked state and notify BFT
-            Event::StateCommitComplete {
+            ProtocolEvent::StateCommitComplete {
                 height,
                 state_version,
                 state_root,
@@ -556,13 +548,12 @@ impl StateMachine for NodeStateMachine {
                 // Notify BFT so it can update its committed state tracking.
                 // BFT uses this as the source of truth for state_version in block headers,
                 // preventing speculative version propagation that causes deadlocks.
-                return self
-                    .bft
-                    .on_state_commit_complete(*state_version, *state_root);
+                self.bft
+                    .on_state_commit_complete(*state_version, *state_root)
             }
 
             // Block committed needs special handling - notify multiple subsystems
-            Event::BlockCommitted {
+            ProtocolEvent::BlockCommitted {
                 block_hash,
                 height,
                 block,
@@ -619,7 +610,7 @@ impl StateMachine for NodeStateMachine {
 
                 // Pass all transactions from block to execution (no need for mempool lookup)
                 // NOTE: execution.on_block_committed emits CrossShardTxRegistered events, which
-                // will be processed by the coordinator via EnqueueInternal actions.
+                // will be processed by the coordinator via Continuation actions.
                 let all_txs: Vec<_> = block.all_transactions().cloned().collect();
                 let exec_actions = self.execution.on_block_committed(
                     *block_hash,
@@ -632,15 +623,12 @@ impl StateMachine for NodeStateMachine {
                 // registrations before any subsequent provisions arrive.
                 // This ensures ProvisionQuorumReached can be emitted for livelock.
                 for action in &exec_actions {
-                    if let Action::EnqueueInternal {
-                        event:
-                            Event::CrossShardTxRegistered {
-                                tx_hash,
-                                required_shards,
-                                quorum_thresholds,
-                                committed_height,
-                            },
-                    } = action
+                    if let Action::Continuation(ProtocolEvent::CrossShardTxRegistered {
+                        tx_hash,
+                        required_shards,
+                        quorum_thresholds,
+                        committed_height,
+                    }) = action
                     {
                         let registration = hyperscale_provisions::TxRegistration {
                             required_shards: required_shards.clone(),
@@ -659,7 +647,7 @@ impl StateMachine for NodeStateMachine {
                 // Let provisions coordinator handle cleanup (certificates, aborts, deferrals)
                 actions.extend(self.provisions.on_block_committed(block));
 
-                return actions;
+                actions
             }
 
             // ═══════════════════════════════════════════════════════════════════════
@@ -674,12 +662,12 @@ impl StateMachine for NodeStateMachine {
             // ExecutionState listens to ProvisioningComplete to trigger execution.
             // LivelockState listens to ProvisionQuorumReached for cycle detection.
             // ═══════════════════════════════════════════════════════════════════════
-            Event::StateProvisionReceived { provision } => {
-                return self.provisions.on_provision_received(provision.clone());
+            ProtocolEvent::StateProvisionReceived { provision } => {
+                self.provisions.on_provision_received(provision.clone())
             }
 
             // ProvisionsVerifiedAndAggregated: callback from batch verification + aggregation
-            Event::ProvisionsVerifiedAndAggregated {
+            ProtocolEvent::ProvisionsVerifiedAndAggregated {
                 tx_hash,
                 source_shard,
                 verified_provisions,
@@ -691,16 +679,16 @@ impl StateMachine for NodeStateMachine {
                 self.mempool.on_provision_verified(*tx_hash);
 
                 // Route to provision coordinator to handle verified provisions and quorum
-                return self.provisions.on_provisions_verified_and_aggregated(
+                self.provisions.on_provisions_verified_and_aggregated(
                     *tx_hash,
                     *source_shard,
                     verified_provisions.clone(),
                     commitment_proof.clone(),
-                );
+                )
             }
 
             // CrossShardTxRegistered: route to coordinator for tracking
-            Event::CrossShardTxRegistered {
+            ProtocolEvent::CrossShardTxRegistered {
                 tx_hash,
                 required_shards,
                 quorum_thresholds,
@@ -712,17 +700,17 @@ impl StateMachine for NodeStateMachine {
                     registered_at: *committed_height,
                     nodes_by_shard: std::collections::HashMap::new(),
                 };
-                return self.provisions.on_tx_registered(*tx_hash, registration);
+                self.provisions.on_tx_registered(*tx_hash, registration)
             }
 
             // CrossShardTxCompleted: route to coordinator for cleanup
-            Event::CrossShardTxCompleted { tx_hash } => {
-                return self.provisions.on_tx_completed(tx_hash);
+            ProtocolEvent::CrossShardTxCompleted { tx_hash } => {
+                self.provisions.on_tx_completed(tx_hash)
             }
 
             // CrossShardTxAborted: route to coordinator for cleanup
-            Event::CrossShardTxAborted { tx_hash } => {
-                return self.provisions.on_tx_aborted(tx_hash);
+            ProtocolEvent::CrossShardTxAborted { tx_hash } => {
+                self.provisions.on_tx_aborted(tx_hash)
             }
 
             // ProvisionQuorumReached: Byzantine-safe cycle detection (per-shard)
@@ -731,7 +719,7 @@ impl StateMachine for NodeStateMachine {
             // Only verified provisions that have reached quorum trigger this event.
             // This prevents Byzantine validators from triggering false deferrals
             // by sending forged provisions.
-            Event::ProvisionQuorumReached {
+            ProtocolEvent::ProvisionQuorumReached {
                 tx_hash,
                 source_shard,
                 commitment_proof,
@@ -744,77 +732,47 @@ impl StateMachine for NodeStateMachine {
                 );
 
                 // No actions needed - execution waits for ProvisioningComplete
-                return vec![];
+                vec![]
             }
 
             // ProvisioningComplete: All shards have quorum, trigger execution
-            Event::ProvisioningComplete {
+            ProtocolEvent::ProvisioningComplete {
                 tx_hash,
                 provisions,
-            } => {
-                return self
-                    .execution
-                    .on_provisioning_complete(*tx_hash, provisions.clone());
-            }
+            } => self
+                .execution
+                .on_provisioning_complete(*tx_hash, provisions.clone()),
 
             // Execution events - direct delegation
-            Event::TransactionsExecuted { .. } | Event::CrossShardTransactionsExecuted { .. } => {
-                // These are deprecated - runners now sign votes directly
-                return vec![];
+            ProtocolEvent::StateVoteReceived { vote } => self.execution.on_vote(vote.clone()),
+            ProtocolEvent::StateCertificateReceived { cert } => {
+                self.execution.on_certificate(cert.clone())
             }
-            Event::StateVoteReceived { vote } => {
-                return self.execution.on_vote(vote.clone());
-            }
-            Event::StateCertificateReceived { cert } => {
-                return self.execution.on_certificate(cert.clone());
-            }
-            Event::MerkleRootComputed { .. } => {
-                // Not yet implemented
-                return vec![];
-            }
-            Event::StateVotesVerifiedAndAggregated {
+            ProtocolEvent::StateVotesVerifiedAndAggregated {
                 tx_hash,
                 verified_votes,
-            } => {
-                return self
-                    .execution
-                    .on_state_votes_verified(*tx_hash, verified_votes.clone());
-            }
-            Event::StateCertificateSignatureVerified { certificate, valid } => {
-                return self
-                    .execution
-                    .on_certificate_verified(certificate.clone(), *valid);
-            }
-            Event::StateCertificateAggregated {
+            } => self
+                .execution
+                .on_state_votes_verified(*tx_hash, verified_votes.clone()),
+            ProtocolEvent::StateCertificateSignatureVerified { certificate, valid } => self
+                .execution
+                .on_certificate_verified(certificate.clone(), *valid),
+            ProtocolEvent::StateCertificateAggregated {
                 tx_hash,
                 certificate,
-            } => {
-                return self
-                    .execution
-                    .on_state_certificate_aggregated(*tx_hash, certificate.clone());
-            }
-            Event::SpeculativeExecutionComplete {
+            } => self
+                .execution
+                .on_state_certificate_aggregated(*tx_hash, certificate.clone()),
+            ProtocolEvent::SpeculativeExecutionComplete {
                 block_hash,
                 tx_hashes,
-            } => {
-                return self
-                    .execution
-                    .on_speculative_execution_complete(*block_hash, tx_hashes.clone());
-            }
-
-            // SubmitTransaction is intercepted by NodeLoop — gossips to shards,
-            // queues for validation, and the validated callback enters the mempool
-            // via TransactionGossipReceived. Should never reach the state machine.
-            Event::SubmitTransaction { .. } => {
-                tracing::warn!(
-                    "SubmitTransaction reached state machine — should be intercepted by NodeLoop"
-                );
-                return vec![];
-            }
+            } => self
+                .execution
+                .on_speculative_execution_complete(*block_hash, tx_hashes.clone()),
 
             // TransactionExecuted is emitted by execution, handled by mempool AND BFT
             // BFT might have pending blocks waiting for this certificate
-            Event::TransactionExecuted { tx_hash, accepted } => {
+            ProtocolEvent::TransactionExecuted { tx_hash, accepted } => {
                 // Notify mempool
                 let mut actions = self.mempool.on_transaction_executed(*tx_hash, *accepted);
 
@@ -825,12 +783,12 @@ impl StateMachine for NodeStateMachine {
                         .check_pending_blocks_for_certificate(*tx_hash, &local_certs),
                 );
 
-                return actions;
+                actions
             }
 
             // TransactionGossipReceived: add to mempool AND notify BFT
             // The BFT might have pending blocks waiting for this transaction
-            Event::TransactionGossipReceived {
+            ProtocolEvent::TransactionGossipReceived {
                 tx,
                 submitted_locally,
             } => {
@@ -852,36 +810,27 @@ impl StateMachine for NodeStateMachine {
                         .check_pending_blocks_for_transaction(tx_hash, &mempool_map),
                 );
 
-                return actions;
+                actions
             }
 
             // Storage callback events - route to appropriate handler
-            Event::StateEntriesFetched { tx_hash, entries } => {
-                return self
-                    .execution
-                    .on_state_entries_fetched(*tx_hash, entries.clone());
-            }
+            ProtocolEvent::StateEntriesFetched { tx_hash, entries } => self
+                .execution
+                .on_state_entries_fetched(*tx_hash, entries.clone()),
 
-            Event::BlockFetched { .. } => {
+            ProtocolEvent::BlockFetched { .. } => {
                 // This is for local storage fetch, not sync
                 // For now, this is a no-op
+                vec![]
             }
 
             // Sync protocol events - routed to BFT
             // Note: SyncNeeded is now Action::StartSync (emitted by BFT, handled by runner).
-            // SyncBlockReceived is handled by the runner's SyncManager.
             // The runner sends SyncBlockReadyToApply and SyncComplete to the state machine.
-            Event::SyncBlockReceived { .. } => {
-                // Runner handles this - should not reach state machine
-                tracing::warn!("SyncBlockReceived event reached NodeStateMachine - should be handled by runner");
-            }
-
-            Event::SyncBlockReadyToApply { block, qc } => {
-                return self
-                    .bft
-                    .on_sync_block_ready_to_apply(block.clone(), qc.clone());
-            }
-            Event::SyncComplete { .. } => {
+            ProtocolEvent::SyncBlockReadyToApply { block, qc } => self
+                .bft
+                .on_sync_block_ready_to_apply(block.clone(), qc.clone()),
+            ProtocolEvent::SyncComplete { .. } => {
                 let mut actions = self.bft.on_sync_complete();
                 // Reschedule the cleanup timer. During sync, the cleanup timer
                 // fires StartSync actions which don't reschedule the timer.
@@ -891,33 +840,33 @@ impl StateMachine for NodeStateMachine {
                     id: TimerId::Cleanup,
                     duration: self.bft.config().cleanup_interval,
                 });
-                return actions;
+                actions
             }
-            Event::ChainMetadataFetched { height, hash, qc } => {
-                return self
-                    .bft
-                    .on_chain_metadata_fetched(*height, *hash, qc.clone());
-            }
+            ProtocolEvent::ChainMetadataFetched { height, hash, qc } => self
+                .bft
+                .on_chain_metadata_fetched(*height, *hash, qc.clone()),
 
             // Transaction status changes from execution state machine
-            Event::TransactionStatusChanged { tx_hash, status } => {
-                return self.mempool.update_status(tx_hash, status.clone());
+            ProtocolEvent::TransactionStatusChanged { tx_hash, status } => {
+                self.mempool.update_status(tx_hash, status.clone())
             }
 
             // ═══════════════════════════════════════════════════════════════════════
             // Global Consensus / Epoch Events
             // TODO: Route to GlobalConsensusState when implemented
             // ═══════════════════════════════════════════════════════════════════════
-            Event::GlobalConsensusTimer => {
+            ProtocolEvent::GlobalConsensusTimer => {
                 // Will be handled by GlobalConsensusState
                 tracing::trace!("GlobalConsensusTimer - not yet implemented");
+                vec![]
             }
 
-            Event::GlobalBlockReceived { epoch, height, .. } => {
+            ProtocolEvent::GlobalBlockReceived { epoch, height, .. } => {
                 tracing::debug!(?epoch, ?height, "GlobalBlockReceived - not yet implemented");
+                vec![]
             }
 
-            Event::GlobalBlockVoteReceived {
+            ProtocolEvent::GlobalBlockVoteReceived {
                 block_hash, shard, ..
             } => {
                 tracing::debug!(
@@ -925,13 +874,15 @@ impl StateMachine for NodeStateMachine {
                     ?shard,
                     "GlobalBlockVoteReceived - not yet implemented"
                 );
+                vec![]
             }
 
-            Event::GlobalQcFormed { block_hash, epoch } => {
+            ProtocolEvent::GlobalQcFormed { block_hash, epoch } => {
                 tracing::info!(?block_hash, ?epoch, "GlobalQcFormed - not yet implemented");
+                vec![]
             }
 
-            Event::EpochEndApproaching {
+            ProtocolEvent::EpochEndApproaching {
                 current_epoch,
                 end_height,
             } => {
@@ -941,9 +892,10 @@ impl StateMachine for NodeStateMachine {
                     "EpochEndApproaching - not yet implemented"
                 );
                 // TODO: Stop accepting new transactions, drain in-flight
+                vec![]
             }
 
-            Event::EpochTransitionReady {
+            ProtocolEvent::EpochTransitionReady {
                 from_epoch,
                 to_epoch,
                 ..
@@ -954,9 +906,10 @@ impl StateMachine for NodeStateMachine {
                     "EpochTransitionReady - not yet implemented"
                 );
                 // TODO: Update DynamicTopology, notify subsystems
+                vec![]
             }
 
-            Event::EpochTransitionComplete {
+            ProtocolEvent::EpochTransitionComplete {
                 new_epoch,
                 new_shard,
                 is_waiting,
@@ -967,18 +920,20 @@ impl StateMachine for NodeStateMachine {
                     is_waiting,
                     "EpochTransitionComplete - not yet implemented"
                 );
+                vec![]
             }
 
-            Event::ValidatorSyncComplete { epoch, shard } => {
+            ProtocolEvent::ValidatorSyncComplete { epoch, shard } => {
                 tracing::info!(
                     ?epoch,
                     ?shard,
                     "ValidatorSyncComplete - not yet implemented"
                 );
                 // TODO: Transition from Waiting to Active state
+                vec![]
             }
 
-            Event::ShardSplitInitiated {
+            ProtocolEvent::ShardSplitInitiated {
                 source_shard,
                 new_shard,
                 split_point,
@@ -990,9 +945,10 @@ impl StateMachine for NodeStateMachine {
                     "ShardSplitInitiated - not yet implemented"
                 );
                 // TODO: Mark shard as splitting in topology
+                vec![]
             }
 
-            Event::ShardSplitComplete {
+            ProtocolEvent::ShardSplitComplete {
                 source_shard,
                 new_shard,
             } => {
@@ -1001,9 +957,10 @@ impl StateMachine for NodeStateMachine {
                     ?new_shard,
                     "ShardSplitComplete - not yet implemented"
                 );
+                vec![]
             }
 
-            Event::ShardMergeInitiated {
+            ProtocolEvent::ShardMergeInitiated {
                 shard_a,
                 shard_b,
                 merged_shard,
@@ -1014,30 +971,30 @@ impl StateMachine for NodeStateMachine {
                     ?merged_shard,
                     "ShardMergeInitiated - not yet implemented"
                 );
+                vec![]
             }
 
-            Event::ShardMergeComplete { merged_shard } => {
+            ProtocolEvent::ShardMergeComplete { merged_shard } => {
                 tracing::info!(?merged_shard, "ShardMergeComplete - not yet implemented");
+                vec![]
             }
 
             // ═══════════════════════════════════════════════════════════════════════
             // Transaction Fetch Protocol
             // BFT emits Action::FetchTransactions; runner handles retries and delivers results.
             // ═══════════════════════════════════════════════════════════════════════
-            Event::TransactionReceived {
+            ProtocolEvent::TransactionFetchDelivered {
                 block_hash,
                 transactions,
-            } => {
-                return self
-                    .bft
-                    .on_transaction_fetch_received(*block_hash, transactions.clone());
-            }
+            } => self
+                .bft
+                .on_transaction_fetch_received(*block_hash, transactions.clone()),
 
             // ═══════════════════════════════════════════════════════════════════════
             // Certificate Fetch Protocol
             // BFT emits Action::FetchCertificates; runner handles retries and delivers results.
             // ═══════════════════════════════════════════════════════════════════════
-            Event::CertificateReceived {
+            ProtocolEvent::CertificateFetchDelivered {
                 block_hash,
                 certificates,
             } => {
@@ -1051,10 +1008,10 @@ impl StateMachine for NodeStateMachine {
                             .verify_fetched_certificate(*block_hash, cert.clone()),
                     );
                 }
-                return actions;
+                actions
             }
 
-            Event::FetchedCertificateVerified {
+            ProtocolEvent::FetchedCertificateVerified {
                 block_hash,
                 certificate,
             } => {
@@ -1063,23 +1020,15 @@ impl StateMachine for NodeStateMachine {
                     .cancel_certificate_building(&certificate.transaction_hash);
 
                 // Certificate has been verified - add to pending block
-                return self.bft.on_certificate_fetch_received(
+                self.bft.on_certificate_fetch_received(
                     *block_hash,
                     vec![std::sync::Arc::new(certificate.clone())],
-                );
-            }
-
-            // TransactionCertificateReceived is handled directly by the production runner
-            // (verified and persisted to storage without going through the state machine).
-            // In simulation, we handle it in the simulator's runner, not here.
-            Event::TransactionCertificateReceived { .. } => {
-                // No action needed - runner handles verification and persistence
-                return vec![];
+                )
             }
 
             // GossipedCertificateVerified - a gossiped certificate has been verified and persisted.
             // Cancel local certificate building and add to finalized certificates.
-            Event::GossipedCertificateVerified { certificate } => {
+            ProtocolEvent::GossipedCertificateVerified { certificate } => {
                 let tx_hash = certificate.transaction_hash;
 
                 // Cancel any ongoing local certificate building
@@ -1089,33 +1038,12 @@ impl StateMachine for NodeStateMachine {
                 self.execution.add_verified_certificate(certificate.clone());
 
                 // Notify mempool that transaction is finalized
-                return vec![Action::EnqueueInternal {
-                    event: Event::TransactionExecuted {
-                        tx_hash,
-                        accepted: certificate.is_accepted(),
-                    },
-                }];
-            }
-
-            // GossipedCertificateSignatureVerified is handled by the runner, not here
-            Event::GossipedCertificateSignatureVerified { .. } => {
-                return vec![];
-            }
-
-            // These events are intercepted by NodeLoop before reaching the state machine.
-            // They are handled by the sync/fetch protocol state machines inside NodeLoop.
-            Event::SyncBlockResponseReceived { .. }
-            | Event::SyncBlockFetchFailed { .. }
-            | Event::FetchTransactionsFailed { .. }
-            | Event::FetchCertificatesFailed { .. }
-            | Event::FetchTick => {
-                return vec![];
+                vec![Action::Continuation(ProtocolEvent::TransactionExecuted {
+                    tx_hash,
+                    accepted: certificate.is_accepted(),
+                })]
             }
         }
-
-        // Event not handled by any sub-machine
-        tracing::warn!(?event, "Unhandled event");
-        vec![]
     }
 
     fn set_time(&mut self, now: Duration) {

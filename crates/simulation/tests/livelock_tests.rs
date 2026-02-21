@@ -10,7 +10,7 @@
 //! 4. Timeout aborts for N-way cycles (when deadlock cannot be broken by deferral)
 //! 5. Stress testing with many cross-shard transactions
 
-use hyperscale_core::{Event, TransactionStatus};
+use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
 use hyperscale_types::{
     ed25519_keypair_from_seed, shard_for_node, sign_and_notarize, Ed25519PrivateKey, NodeId,
@@ -184,12 +184,12 @@ fn test_two_shard_cycle_detection() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        Event::SubmitTransaction { tx: Arc::new(tx_a) },
+        NodeInput::SubmitTransaction { tx: Arc::new(tx_a) },
     );
     runner.schedule_initial_event(
         3,
         Duration::from_millis(5),
-        Event::SubmitTransaction { tx: Arc::new(tx_b) },
+        NodeInput::SubmitTransaction { tx: Arc::new(tx_b) },
     );
 
     println!("\n✓ Conflicting transactions submitted\n");
@@ -366,7 +366,7 @@ fn test_retry_completion_after_winner() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        Event::SubmitTransaction { tx: Arc::new(tx) },
+        NodeInput::SubmitTransaction { tx: Arc::new(tx) },
     );
 
     // Run and monitor
@@ -485,7 +485,7 @@ fn test_many_cross_shard_transactions() {
         runner.schedule_initial_event(
             0,
             runner.now() + Duration::from_millis(i as u64 * 100),
-            Event::SubmitTransaction { tx: Arc::new(tx) },
+            NodeInput::SubmitTransaction { tx: Arc::new(tx) },
         );
     }
 
@@ -645,12 +645,12 @@ fn test_resolves_livelocks_in_under_x_seconds() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        Event::SubmitTransaction { tx: Arc::new(tx_a) },
+        NodeInput::SubmitTransaction { tx: Arc::new(tx_a) },
     );
     runner.schedule_initial_event(
         3,
         Duration::from_millis(1), // Near-simultaneous
-        Event::SubmitTransaction { tx: Arc::new(tx_b) },
+        NodeInput::SubmitTransaction { tx: Arc::new(tx_b) },
     );
 
     println!("✓ Conflicting transactions submitted simultaneously");
@@ -909,7 +909,7 @@ fn test_timeout_abort_mechanism() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        Event::SubmitTransaction { tx: Arc::new(tx) },
+        NodeInput::SubmitTransaction { tx: Arc::new(tx) },
     );
 
     // Run for extended period to allow timeout detection

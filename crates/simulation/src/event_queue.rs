@@ -1,7 +1,7 @@
 //! Event queue with deterministic ordering.
 
 use crate::NodeIndex;
-use hyperscale_core::{Event, EventPriority};
+use hyperscale_core::{EventPriority, NodeInput};
 use std::cmp::Ordering;
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ pub struct EventKey {
 
 impl EventKey {
     /// Create a new event key.
-    pub fn new(time: Duration, event: &Event, node_index: NodeIndex, sequence: u64) -> Self {
+    pub fn new(time: Duration, event: &NodeInput, node_index: NodeIndex, sequence: u64) -> Self {
         Self {
             time,
             priority: event.priority(),

@@ -10,7 +10,7 @@
 //! - Deterministic - same seed always produces same results
 //! - Inline execution - Radix Engine runs synchronously (not in thread pool)
 
-use hyperscale_core::{Event, TransactionStatus};
+use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
 use hyperscale_types::{
     ed25519_keypair_from_seed, shard_for_node, sign_and_notarize, Ed25519PrivateKey, NodeId,
@@ -143,7 +143,7 @@ fn test_e2e_single_shard_transaction() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        Event::SubmitTransaction {
+        NodeInput::SubmitTransaction {
             tx: Arc::new(transaction.clone()),
         },
     );
@@ -370,7 +370,7 @@ fn test_e2e_single_shard_determinism() {
     runner1.schedule_initial_event(
         0,
         Duration::from_millis(100),
-        Event::SubmitTransaction {
+        NodeInput::SubmitTransaction {
             tx: Arc::new(transaction.clone()),
         },
     );
@@ -387,7 +387,7 @@ fn test_e2e_single_shard_determinism() {
     runner2.schedule_initial_event(
         0,
         Duration::from_millis(100),
-        Event::SubmitTransaction {
+        NodeInput::SubmitTransaction {
             tx: Arc::new(transaction.clone()),
         },
     );
@@ -588,7 +588,7 @@ fn test_e2e_cross_shard_transaction() {
     runner.schedule_initial_event(
         0,
         Duration::ZERO,
-        Event::SubmitTransaction {
+        NodeInput::SubmitTransaction {
             tx: Arc::new(cross_shard_tx),
         },
     );
@@ -782,7 +782,7 @@ fn test_e2e_cross_shard_determinism() {
     runner1.schedule_initial_event(
         0,
         Duration::from_millis(100),
-        Event::SubmitTransaction {
+        NodeInput::SubmitTransaction {
             tx: Arc::new(transaction.clone()),
         },
     );
@@ -799,7 +799,7 @@ fn test_e2e_cross_shard_determinism() {
     runner2.schedule_initial_event(
         0,
         Duration::from_millis(100),
-        Event::SubmitTransaction {
+        NodeInput::SubmitTransaction {
             tx: Arc::new(transaction.clone()),
         },
     );
@@ -865,7 +865,7 @@ fn test_e2e_transaction_throughput() {
         runner.schedule_initial_event(
             (i % 4) as u32, // Distribute across validators
             Duration::from_millis(i as u64 * 50),
-            Event::SubmitTransaction { tx: Arc::new(tx) },
+            NodeInput::SubmitTransaction { tx: Arc::new(tx) },
         );
     }
 

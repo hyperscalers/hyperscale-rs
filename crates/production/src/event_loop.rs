@@ -14,7 +14,7 @@
 
 use crate::rpc::state::TransactionStatusCache;
 use crossbeam::channel::Receiver;
-use hyperscale_core::{Event, TimerId};
+use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network_libp2p::ProdNetwork;
@@ -38,13 +38,13 @@ pub type ProdNodeLoop = NodeLoop<SharedStorage, ProdNetwork, PooledDispatch>;
 /// Configuration for the pinned event loop.
 pub struct PinnedLoopConfig {
     /// Timer-fired events sender (for ProdTimerManager to send timer events).
-    pub timer_tx: crossbeam::channel::Sender<Event>,
+    pub timer_tx: crossbeam::channel::Sender<NodeInput>,
     /// Timer-fired events (highest priority).
-    pub timer_rx: Receiver<Event>,
+    pub timer_rx: Receiver<NodeInput>,
     /// Crypto/execution callback events + internal events.
-    pub callback_rx: Receiver<Event>,
+    pub callback_rx: Receiver<NodeInput>,
     /// BFT consensus messages from network peers.
-    pub consensus_rx: Receiver<Event>,
+    pub consensus_rx: Receiver<NodeInput>,
     /// Graceful shutdown signal.
     pub shutdown_rx: Receiver<()>,
     /// Shared transaction status cache for RPC queries.
@@ -62,12 +62,12 @@ pub struct PinnedLoopConfig {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Convert a TimerId to the corresponding Event.
-fn timer_event(id: TimerId) -> Event {
+fn timer_event(id: TimerId) -> NodeInput {
     match id {
-        TimerId::Proposal => Event::ProposalTimer,
-        TimerId::Cleanup => Event::CleanupTimer,
-        TimerId::GlobalConsensus => Event::GlobalConsensusTimer,
-        TimerId::FetchTick => Event::FetchTick,
+        TimerId::Proposal => NodeInput::Protocol(ProtocolEvent::ProposalTimer),
+        TimerId::Cleanup => NodeInput::Protocol(ProtocolEvent::CleanupTimer),
+        TimerId::GlobalConsensus => NodeInput::Protocol(ProtocolEvent::GlobalConsensusTimer),
+        TimerId::FetchTick => NodeInput::FetchTick,
     }
 }
 
@@ -77,14 +77,14 @@ fn timer_event(id: TimerId) -> Event {
 /// into the crossbeam timer channel. Replaces the former `ProdTimer` trait impl.
 struct ProdTimerManager {
     tokio_handle: tokio::runtime::Handle,
-    timer_tx: crossbeam::channel::Sender<Event>,
+    timer_tx: crossbeam::channel::Sender<NodeInput>,
     active: HashMap<TimerId, JoinHandle<()>>,
 }
 
 impl ProdTimerManager {
     fn new(
         tokio_handle: tokio::runtime::Handle,
-        timer_tx: crossbeam::channel::Sender<Event>,
+        timer_tx: crossbeam::channel::Sender<NodeInput>,
     ) -> Self {
         Self {
             tokio_handle,
@@ -215,7 +215,10 @@ pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, config: PinnedLoopConfig) {
         // Skip gossip-received transactions that are already in terminal state
         // (avoids unnecessary validation batching for already-completed txs).
         let event = event.and_then(|event| {
-            if let Event::TransactionGossipReceived { ref tx, .. } = event {
+            if let NodeInput::Protocol(ProtocolEvent::TransactionGossipReceived {
+                ref tx, ..
+            }) = event
+            {
                 if let Some(ref cache) = config.tx_status_cache {
                     if let Ok(guard) = cache.try_read() {
                         if guard.get(&tx.hash()).is_some_and(|c| c.status.is_final()) {

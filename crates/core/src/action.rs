@@ -1,6 +1,6 @@
 //! Action types for the deterministic state machine.
 
-use crate::{Event, TimerId};
+use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{
     BlockHeaderGossip, BlockVoteGossip, TransactionCertificateGossip, TransactionGossip,
 };
@@ -101,13 +101,14 @@ pub enum Action {
     CancelTimer { id: TimerId },
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Internal (fed back as events with Internal priority)
+    // Continuation (fed back as ProtocolEvent with Internal priority)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Enqueue an internal event for immediate processing.
+    /// A continuation event to be fed back into the state machine.
     ///
-    /// Internal events are processed at the same timestamp with higher
-    /// priority than external events, preserving causality.
-    EnqueueInternal { event: Event },
+    /// The state machine emits this when processing one event produces
+    /// a follow-on protocol event that should be processed immediately
+    /// (at the same timestamp with Internal priority).
+    Continuation(ProtocolEvent),
 
     // ═══════════════════════════════════════════════════════════════════════
     // Delegated Work (async, returns callback event)
@@ -124,7 +125,7 @@ pub enum Action {
     /// block never reaches quorum due to view change or leader failure).
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::QuorumCertificateResult` when complete.
+    /// Returns `ProtocolEvent::QuorumCertificateResult` when complete.
     VerifyAndBuildQuorumCertificate {
         /// Block hash the QC would be for.
         block_hash: Hash,
@@ -154,7 +155,7 @@ pub enum Action {
     /// wasted work on provisions that might never reach quorum.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::ProvisionsVerifiedAndAggregated` when complete.
+    /// Returns `ProtocolEvent::ProvisionsVerifiedAndAggregated` when complete.
     VerifyAndAggregateProvisions {
         /// Transaction hash for correlation.
         tx_hash: Hash,
@@ -178,7 +179,7 @@ pub enum Action {
     ///
     /// Performs BLS signature aggregation which is compute-intensive.
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::StateCertificateAggregated` when complete.
+    /// Returns `ProtocolEvent::StateCertificateAggregated` when complete.
     AggregateStateCertificate {
         /// Transaction hash for correlation.
         tx_hash: Hash,
@@ -207,7 +208,7 @@ pub enum Action {
     /// 2. Reports which votes passed verification with their voting power
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::StateVotesVerifiedAndAggregated` when complete.
+    /// Returns `ProtocolEvent::StateVotesVerifiedAndAggregated` when complete.
     VerifyAndAggregateStateVotes {
         /// Transaction hash for correlation.
         tx_hash: Hash,
@@ -219,7 +220,7 @@ pub enum Action {
     /// Verify a state certificate's aggregated signature (cross-shard Phase 5).
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::StateCertificateSignatureVerified` when complete.
+    /// Returns `ProtocolEvent::StateCertificateSignatureVerified` when complete.
     VerifyStateCertificateSignature {
         /// The certificate to verify.
         certificate: StateCertificate,
@@ -234,7 +235,7 @@ pub enum Action {
     /// could include a fake QC with invalid signatures.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::QcSignatureVerified` when complete.
+    /// Returns `ProtocolEvent::QcSignatureVerified` when complete.
     VerifyQcSignature {
         /// The QC to verify.
         qc: QuorumCertificate,
@@ -256,7 +257,7 @@ pub enum Action {
     /// with forged CycleProofs, causing honest validators to incorrectly defer transactions.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::CycleProofVerified` when complete.
+    /// Returns `ProtocolEvent::CycleProofVerified` when complete.
     VerifyCycleProof {
         /// Block hash containing this deferral (for correlation).
         block_hash: Hash,
@@ -275,7 +276,7 @@ pub enum Action {
     /// Verify a block's state root against the JMT.
     ///
     /// Computes the speculative state root from certificates and compares
-    /// against the block header's claimed state_root. Returns `Event::StateRootVerified`.
+    /// against the block header's claimed state_root. Returns `ProtocolEvent::StateRootVerified`.
     ///
     /// Each inner Vec represents one certificate's writes. They must be applied
     /// incrementally (one JMT version per certificate) to match commit-time behavior.
@@ -301,7 +302,7 @@ pub enum Action {
     ///
     /// Computes the merkle root from the block's transactions (retry, priority, normal)
     /// and compares against the block header's claimed transaction_root.
-    /// Returns `Event::TransactionRootVerified`.
+    /// Returns `ProtocolEvent::TransactionRootVerified`.
     ///
     /// This is a pure CPU operation (no JMT dependency) so it can be verified
     /// in parallel with state root verification.
@@ -323,7 +324,7 @@ pub enum Action {
     /// new state root, builds the complete block, and caches the WriteBatch for
     /// efficient commit later.
     ///
-    /// Returns `Event::ProposalBuilt` with either the complete block or a
+    /// Returns `ProtocolEvent::ProposalBuilt` with either the complete block or a
     /// timeout if the JMT doesn't catch up within the specified duration.
     ///
     /// This combines state root computation and block building into a single
@@ -352,7 +353,7 @@ pub enum Action {
     /// Execute a batch of single-shard transactions.
     ///
     /// Delegated to the engine thread pool in production, instant in simulation.
-    /// Returns `Event::TransactionsExecuted` when complete.
+    /// Returns `ProtocolEvent::TransactionsExecuted` when complete.
     ExecuteTransactions {
         block_hash: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
@@ -368,7 +369,7 @@ pub enum Action {
     /// read set), the cached vote is discarded and the transaction falls back
     /// to normal execution on commit.
     ///
-    /// Returns `Event::SpeculativeExecutionComplete` when complete (for cache tracking).
+    /// Returns `ProtocolEvent::SpeculativeExecutionComplete` when complete (for cache tracking).
     SpeculativeExecute {
         /// Block hash where these transactions appear.
         block_hash: Hash,
@@ -380,7 +381,7 @@ pub enum Action {
     ///
     /// Used after 2PC provisioning completes. The runner accumulates these actions
     /// and executes them in parallel batches for efficiency.
-    /// Returns `Event::CrossShardTransactionsExecuted` when the batch completes.
+    /// Returns `ProtocolEvent::CrossShardTransactionsExecuted` when the batch completes.
     ExecuteCrossShardTransaction {
         /// Transaction hash (for correlation).
         tx_hash: Hash,
@@ -393,7 +394,7 @@ pub enum Action {
     /// Compute a merkle root from state changes.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `Event::MerkleRootComputed` when complete.
+    /// Returns `ProtocolEvent::MerkleRootComputed` when complete.
     ComputeMerkleRoot {
         tx_hash: Hash,
         writes: Vec<(NodeId, Vec<u8>)>,
@@ -585,18 +586,18 @@ pub enum Action {
 
     /// Fetch the latest epoch configuration from storage.
     ///
-    /// Returns via Event (to be added) when complete.
+    /// Returns via ProtocolEvent (to be added) when complete.
     FetchEpochConfig {
         /// Optional epoch ID to fetch (None = latest).
         epoch: Option<EpochId>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Storage: Read Requests (returns callback Event)
+    // Storage: Read Requests (returns callback ProtocolEvent)
     // ═══════════════════════════════════════════════════════════════════════
     /// Fetch state entries for nodes (for cross-shard provisioning).
     ///
-    /// Returns `Event::StateEntriesFetched { tx_hash, entries }`.
+    /// Returns `ProtocolEvent::StateEntriesFetched { tx_hash, entries }`.
     FetchStateEntries {
         /// Transaction hash (for correlation in callback).
         tx_hash: Hash,
@@ -606,25 +607,25 @@ pub enum Action {
 
     /// Fetch a block by height.
     ///
-    /// Returns `Event::BlockFetched { height, block }`.
+    /// Returns `ProtocolEvent::BlockFetched { height, block }`.
     FetchBlock { height: BlockHeight },
 
     /// Fetch chain metadata (latest height, hash, QC).
     ///
-    /// Returns `Event::ChainMetadataFetched { height, hash, qc }`.
+    /// Returns `ProtocolEvent::ChainMetadataFetched { height, hash, qc }`.
     FetchChainMetadata,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Runner I/O Requests (network fetches handled by the runner)
     // These request the runner to perform network I/O and deliver results
-    // back as Events (TransactionReceived, CertificateReceived, SyncBlockReadyToApply)
+    // back as NodeInputs (TransactionReceived, CertificateReceived, SyncBlockResponseReceived)
     // ═══════════════════════════════════════════════════════════════════════
     /// Request the runner to start syncing to a target height.
     ///
     /// Emitted when the state machine detects it's behind (e.g., receives a
     /// block header or QC ahead of committed height). The runner handles
     /// peer selection, fetching, validation, and delivers blocks via
-    /// `Event::SyncBlockReadyToApply`.
+    /// `ProtocolEvent::SyncBlockReadyToApply`.
     StartSync {
         /// The height we need to sync to.
         target_height: u64,
@@ -636,7 +637,7 @@ pub enum Action {
     ///
     /// Emitted when a block header arrives but transactions are missing from
     /// mempool. The runner fetches from the proposer or peers and delivers
-    /// results via `Event::TransactionReceived`.
+    /// results via `ProtocolEvent::TransactionFetchDelivered`.
     FetchTransactions {
         /// Hash of the block that needs these transactions.
         block_hash: Hash,
@@ -650,7 +651,7 @@ pub enum Action {
     ///
     /// Emitted when a block header arrives but certificates are missing locally.
     /// The runner fetches from the proposer or peers and delivers results via
-    /// `Event::CertificateReceived`.
+    /// `ProtocolEvent::CertificateFetchDelivered`.
     FetchCertificates {
         /// Hash of the block that needs these certificates.
         block_hash: Hash,
@@ -713,9 +714,9 @@ impl Action {
         )
     }
 
-    /// Check if this is an internal event action.
-    pub fn is_internal(&self) -> bool {
-        matches!(self, Action::EnqueueInternal { .. })
+    /// Check if this is a continuation action.
+    pub fn is_continuation(&self) -> bool {
+        matches!(self, Action::Continuation(_))
     }
 
     /// Check if this is a storage write action.
@@ -758,8 +759,8 @@ impl Action {
             Action::SetTimer { .. } => "SetTimer",
             Action::CancelTimer { .. } => "CancelTimer",
 
-            // Internal
-            Action::EnqueueInternal { .. } => "EnqueueInternal",
+            // Continuation
+            Action::Continuation(_) => "Continuation",
 
             // Delegated Work - Crypto Verification
             Action::VerifyAndBuildQuorumCertificate { .. } => "VerifyAndBuildQuorumCertificate",

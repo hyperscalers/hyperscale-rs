@@ -22,7 +22,9 @@ use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::fetch_protocol::{FetchConfig, FetchInput, FetchKind, FetchOutput, FetchProtocol};
 use crate::sync_protocol::{SyncInput, SyncOutput, SyncProtocol};
 use crate::NodeStateMachine;
-use hyperscale_core::{Action, CrossShardExecutionRequest, Event, StateMachine, TimerId};
+use hyperscale_core::{
+    Action, CrossShardExecutionRequest, Event, ProtocolEvent, StateMachine, TimerId,
+};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{RadixExecutor, TransactionValidation};
 use hyperscale_messages::{
@@ -443,31 +445,36 @@ where
         //
         // Intercept TransactionGossipReceived and SubmitTransaction to route
         // through the validation batch pipeline before reaching the state
-        // machine. Validated transactions re-enter as TransactionGossipReceived
-        // with their hash in pending_validation, allowing pass-through.
+        // machine. Validated transactions re-enter as TransactionValidated,
+        // which NodeLoop converts into TransactionGossipReceived for the
+        // state machine.
 
-        if let Event::TransactionGossipReceived {
+        // Handle validated transaction callback from dispatch.
+        if let Event::TransactionValidated {
             ref tx,
             submitted_locally,
         } = event
         {
             let tx_hash = tx.hash();
+            self.pending_validation.remove(&tx_hash);
+            let is_local = submitted_locally || self.locally_submitted.remove(&tx_hash);
+            self.tx_cache.insert(tx_hash, Arc::clone(tx));
+            let pe = ProtocolEvent::TransactionGossipReceived {
+                tx: Arc::clone(tx),
+                submitted_locally: is_local,
+            };
+            let actions = self.state.handle(pe);
+            self.actions_generated = actions.len();
+            for action in actions {
+                self.process_action(action);
+            }
+            return self.drain_pending_output();
+        }
 
-            if self.pending_validation.remove(&tx_hash) {
-                // Validated callback from dispatch — pass through to state machine.
-                let is_local = submitted_locally || self.locally_submitted.remove(&tx_hash);
-                self.tx_cache.insert(tx_hash, Arc::clone(tx));
-                let validated_event = Event::TransactionGossipReceived {
-                    tx: Arc::clone(tx),
-                    submitted_locally: is_local,
-                };
-                let actions = self.state.handle(validated_event);
-                self.actions_generated = actions.len();
-                for action in actions {
-                    self.process_action(action);
-                }
-                return self.drain_pending_output();
-            } else if self.tx_cache.get(&tx_hash).is_some() {
+        // Intercept TransactionGossipReceived from network for validation pipeline.
+        if let Event::Protocol(ProtocolEvent::TransactionGossipReceived { ref tx, .. }) = event {
+            let tx_hash = tx.hash();
+            if self.tx_cache.get(&tx_hash).is_some() {
                 // Duplicate — already validated and cached, skip.
                 return self.drain_pending_output();
             } else {
@@ -602,13 +609,26 @@ where
 
         // Broadcast self-generated state votes returning from dispatch pools.
         // Votes from peers arrive via different event types (network gossip).
-        if let Event::StateVoteReceived { ref vote } = event {
+        if let Event::Protocol(ProtocolEvent::StateVoteReceived { ref vote }) = event {
             if vote.validator == self.validator_id {
                 self.accumulate_broadcast_vote(self.local_shard, vote.clone());
             }
         }
 
-        let actions = self.state.handle(event);
+        // Extract ProtocolEvent from NodeInput for the state machine.
+        // All NodeInput-specific variants have been intercepted above.
+        let pe = match event {
+            Event::Protocol(pe) => pe,
+            other => {
+                warn!(
+                    event_type = other.type_name(),
+                    "Unexpected NodeInput at state machine boundary"
+                );
+                return self.drain_pending_output();
+            }
+        };
+
+        let actions = self.state.handle(pe);
         self.actions_generated = actions.len();
         for action in actions {
             self.process_action(action);
@@ -687,8 +707,8 @@ where
             // ═══════════════════════════════════════════════════════════
             // Internal events
             // ═══════════════════════════════════════════════════════════
-            Action::EnqueueInternal { event } => {
-                let _ = self.event_sender.send(event);
+            Action::Continuation(pe) => {
+                let _ = self.event_sender.send(Event::Protocol(pe));
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -808,24 +828,33 @@ where
                     entries = entries.len(),
                     "Fetched state entries"
                 );
-                let _ = self
-                    .event_sender
-                    .send(Event::StateEntriesFetched { tx_hash, entries });
+                let _ =
+                    self.event_sender
+                        .send(Event::Protocol(ProtocolEvent::StateEntriesFetched {
+                            tx_hash,
+                            entries,
+                        }));
             }
             Action::FetchBlock { height } => {
                 let block = self.storage.get_block(height);
-                let _ = self.event_sender.send(Event::BlockFetched {
-                    height,
-                    block: block.map(|(b, _)| b),
-                });
+                let _ = self
+                    .event_sender
+                    .send(Event::Protocol(ProtocolEvent::BlockFetched {
+                        height,
+                        block: block.map(|(b, _)| b),
+                    }));
             }
             Action::FetchChainMetadata => {
                 let height = self.storage.committed_height();
                 let hash = self.storage.committed_hash();
                 let qc = self.storage.latest_qc();
-                let _ = self
-                    .event_sender
-                    .send(Event::ChainMetadataFetched { height, hash, qc });
+                let _ =
+                    self.event_sender
+                        .send(Event::Protocol(ProtocolEvent::ChainMetadataFetched {
+                            height,
+                            hash,
+                            qc,
+                        }));
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -1118,7 +1147,7 @@ where
                 SyncOutput::DeliverBlock { block, qc } => {
                     metrics::record_sync_block_received_by_bft();
                     metrics::record_sync_block_submitted_for_verification();
-                    let actions = self.state.handle(Event::SyncBlockReadyToApply {
+                    let actions = self.state.handle(ProtocolEvent::SyncBlockReadyToApply {
                         block: *block,
                         qc: *qc,
                     });
@@ -1128,7 +1157,7 @@ where
                     }
                 }
                 SyncOutput::SyncComplete { height } => {
-                    let actions = self.state.handle(Event::SyncComplete { height });
+                    let actions = self.state.handle(ProtocolEvent::SyncComplete { height });
                     self.actions_generated += actions.len();
                     for action in actions {
                         self.process_action(action);
@@ -1205,7 +1234,7 @@ where
                     block_hash,
                     transactions,
                 } => {
-                    let actions = self.state.handle(Event::TransactionReceived {
+                    let actions = self.state.handle(ProtocolEvent::TransactionFetchDelivered {
                         block_hash,
                         transactions,
                     });
@@ -1222,7 +1251,7 @@ where
                     for cert in &certificates {
                         self.storage.store_certificate(cert);
                     }
-                    let actions = self.state.handle(Event::CertificateReceived {
+                    let actions = self.state.handle(ProtocolEvent::CertificateFetchDelivered {
                         block_hash,
                         certificates,
                     });
@@ -1296,7 +1325,7 @@ where
 
             for (tx, valid) in batch.into_iter().zip(results) {
                 if valid {
-                    let _ = event_tx.send(Event::TransactionGossipReceived {
+                    let _ = event_tx.send(Event::TransactionValidated {
                         tx,
                         submitted_locally: false, // NodeLoop sets from locally_submitted
                     });
@@ -1505,7 +1534,7 @@ where
         // Feed GossipedCertificateVerified directly to state machine.
         let actions = self
             .state
-            .handle(Event::GossipedCertificateVerified { certificate });
+            .handle(ProtocolEvent::GossipedCertificateVerified { certificate });
         self.actions_generated += actions.len();
         for action in actions {
             self.process_action(action);

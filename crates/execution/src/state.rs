@@ -29,7 +29,7 @@
 //! Validators collect StateCertificates from all participating shards. When all
 //! certificates are received, an TransactionCertificate is created.
 
-use hyperscale_core::{Action, Event};
+use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Hash, NodeId,
     RoutableTransaction, ShardGroupId, StateCertificate, StateEntry, StateProvision,
@@ -637,14 +637,14 @@ impl ExecutionState {
 
             // Emit registration event for ProvisionCoordinator
             // The coordinator will handle provision tracking centrally
-            actions.push(Action::EnqueueInternal {
-                event: Event::CrossShardTxRegistered {
+            actions.push(Action::Continuation(
+                ProtocolEvent::CrossShardTxRegistered {
                     tx_hash,
                     required_shards: remote_shards,
                     quorum_thresholds,
                     committed_height: BlockHeight(height),
                 },
-            });
+            ));
 
             // Store transaction for later execution (will execute when ProvisioningComplete arrives)
             self.pending_provisioning
@@ -1315,12 +1315,12 @@ impl ExecutionState {
         );
 
         // Emit event so NodeStateMachine can route to BFT
-        vec![Action::EnqueueInternal {
-            event: Event::FetchedCertificateVerified {
+        vec![Action::Continuation(
+            ProtocolEvent::FetchedCertificateVerified {
                 block_hash: pending.block_hash,
                 certificate: pending.certificate,
             },
-        }]
+        )]
     }
 
     /// Verify a fetched TransactionCertificate by checking all embedded StateCertificates.
@@ -1346,12 +1346,12 @@ impl ExecutionState {
                 block_hash = ?block_hash,
                 "Fetched certificate has no shard proofs - accepting directly"
             );
-            return vec![Action::EnqueueInternal {
-                event: Event::FetchedCertificateVerified {
+            return vec![Action::Continuation(
+                ProtocolEvent::FetchedCertificateVerified {
                     block_hash,
                     certificate,
                 },
-            }];
+            )];
         }
 
         // Track the pending verification
@@ -1450,9 +1450,10 @@ impl ExecutionState {
                     .insert(tx_hash, Arc::new(tx_cert));
 
                 // Notify mempool that transaction execution is complete
-                actions.push(Action::EnqueueInternal {
-                    event: Event::TransactionExecuted { tx_hash, accepted },
-                });
+                actions.push(Action::Continuation(ProtocolEvent::TransactionExecuted {
+                    tx_hash,
+                    accepted,
+                }));
             } else {
                 tracing::warn!(
                     tx_hash = ?tx_hash,
@@ -2554,7 +2555,7 @@ mod tests {
         let signer_keys: Vec<_> = cert
             .signers
             .set_indices()
-            .map(|idx| committee.public_key(idx).clone())
+            .map(|idx| *committee.public_key(idx))
             .collect();
 
         // Aggregate public keys (what the runner does)
@@ -2593,7 +2594,7 @@ mod tests {
 
         let messages: Vec<&[u8]> = vec![&msg1, &msg2, &msg3];
         let signatures = vec![sig1, sig2, sig3];
-        let pubkeys: Vec<_> = (0..3).map(|i| committee.public_key(i).clone()).collect();
+        let pubkeys: Vec<_> = (0..3).map(|i| *committee.public_key(i)).collect();
 
         // Batch verify with different messages (what dispatch_state_vote_verifications does)
         let results =
@@ -2627,8 +2628,8 @@ mod tests {
         let messages: Vec<&[u8]> = vec![&msg1, &msg2];
         let signatures = vec![sig1, sig2];
         let pubkeys = vec![
-            committee.public_key(0).clone(),
-            committee.public_key(1).clone(), // Verifying with key 1
+            *committee.public_key(0),
+            *committee.public_key(1), // Verifying with key 1
         ];
 
         let results =

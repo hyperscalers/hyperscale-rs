@@ -5,8 +5,20 @@
 //! - Production: `TimerManager` spawns tokio tasks
 //! - Simulation: inserts into a deterministic event queue
 
-use crate::TimerId;
 use std::time::Duration;
+
+/// Timer identification for scheduled events.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TimerId {
+    /// Block proposal timer (also used for implicit round advancement)
+    Proposal,
+    /// Periodic cleanup timer
+    Cleanup,
+    /// Global consensus timer (epoch management)
+    GlobalConsensus,
+    /// Periodic tick for the fetch protocol (retry pending fetches)
+    FetchTick,
+}
 
 /// Abstraction for scheduling and cancelling timers.
 ///

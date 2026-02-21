@@ -2,7 +2,7 @@
 
 use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
-use hyperscale_core::{Event, TransactionStatus};
+use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_types::Hash;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::atomic::AtomicBool;
@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 ///
 /// RPC handlers send `Event::SubmitTransaction` directly to the NodeLoop's
 /// crossbeam event channel, bypassing tokio mpsc bridges entirely.
-pub type TxSubmissionSender = crossbeam::channel::Sender<Event>;
+pub type TxSubmissionSender = crossbeam::channel::Sender<NodeInput>;
 
 /// Shared state for RPC handlers.
 #[derive(Clone)]

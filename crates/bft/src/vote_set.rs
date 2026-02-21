@@ -336,7 +336,7 @@ impl VoteSet {
         let signatures: Vec<Bls12381G2Signature> = self
             .verified_votes
             .iter()
-            .map(|(_, v, _)| v.signature.clone())
+            .map(|(_, v, _)| v.signature)
             .collect();
 
         // Aggregate BLS signatures
