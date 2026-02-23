@@ -1432,7 +1432,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Per-shard transaction throughput (avg across validators in each shard)",
+      "description": "Per-shard transaction throughput (summed across validators in each shard)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1510,7 +1510,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg by (shard) (rate(hyperscale_transaction_latency_seconds_count[1m]))",
+          "expr": "sum by (shard) (rate(hyperscale_transaction_latency_seconds_count[1m]))",
           "legendFormat": "Shard {{shard}}",
           "refId": "A"
         }
