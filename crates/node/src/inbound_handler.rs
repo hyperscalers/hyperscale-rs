@@ -17,13 +17,13 @@
 use hyperscale_messages::request::{
     GetBlockRequest, GetCertificatesRequest, GetTransactionsRequest,
 };
-use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
+use hyperscale_messages::response::{
+    GetBlockResponse, GetCertificatesResponse, GetTransactionsResponse,
+};
 use hyperscale_metrics as metrics;
 use hyperscale_network::{parse_request_frame, InboundRequestHandler};
 use hyperscale_storage::ConsensusStore;
-use hyperscale_types::{
-    Block, Hash, QuorumCertificate, RoutableTransaction, TransactionCertificate,
-};
+use hyperscale_types::{Hash, RoutableTransaction, TransactionCertificate};
 use quick_cache::sync::Cache as QuickCache;
 use std::sync::Arc;
 use thiserror::Error;
@@ -113,10 +113,12 @@ impl<S: ConsensusStore> InboundHandler<S> {
 
         trace!(height = req.height.0, "Handling block sync request");
 
-        let sync_response: Option<(Block, QuorumCertificate)> =
-            self.storage.get_block_for_sync(req.height);
+        let response = match self.storage.get_block_for_sync(req.height) {
+            Some((block, qc)) => GetBlockResponse::found(block, qc),
+            None => GetBlockResponse::not_found(),
+        };
 
-        sbor::basic_encode(&sync_response).map_err(|e| InboundError::EncodeError(format!("{e:?}")))
+        sbor::basic_encode(&response).map_err(|e| InboundError::EncodeError(format!("{e:?}")))
     }
 
     /// Handle a transaction fetch request.

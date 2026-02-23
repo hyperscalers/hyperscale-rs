@@ -4,9 +4,6 @@ use hyperscale_types::{Block, MessagePriority, NetworkMessage, QuorumCertificate
 use sbor::prelude::BasicSbor;
 
 /// Response to a block fetch request containing the full Block and its QC.
-///
-/// Note: The wire format encodes this as `sbor_encode((Option<Block>, Option<QC>))`.
-/// This type exists for documentation and type-safety in the message layer.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetBlockResponse {
     /// The requested block (None if not found).
