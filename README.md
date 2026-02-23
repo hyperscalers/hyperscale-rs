@@ -26,9 +26,21 @@ Rust implementation of Hyperscale consensus protocol.
 | `hyperscale-node` | Composes all sub-state machines into the main `NodeStateMachine` |
 | `hyperscale-provisions` | Centralized provision coordination for cross-shard transactions |
 | `hyperscale-engine` | Radix Engine integration for smart contract execution |
-| `hyperscale-simulation` | Deterministic simulator with configurable network conditions |
+| `hyperscale-dispatch` | Abstract trait for scheduling CPU-intensive work across priority-isolated pools |
+| `hyperscale-dispatch-pooled` | Production dispatch using rayon thread pools with core allocation and pinning |
+| `hyperscale-dispatch-sync` | Deterministic inline dispatch for simulation (runs closures on calling thread) |
+| `hyperscale-network` | Shared network protocol logic: Network trait, handler registry, wire framing |
+| `hyperscale-network-libp2p` | Production libp2p transport with gossipsub broadcast and QUIC/TCP streams |
+| `hyperscale-network-memory` | Deterministic in-memory network for simulation with configurable latency and partitions |
+| `hyperscale-storage` | Storage trait abstractions (SubstateStore, CommitStore, ConsensusStore) and JMT integration |
+| `hyperscale-storage-rocksdb` | Production RocksDB storage with JMT state roots and snapshot isolation |
+| `hyperscale-storage-memory` | In-memory storage using persistent data structures for deterministic simulation |
+| `hyperscale-metrics` | Metrics facade with domain-specific trait and global singleton recorder |
+| `hyperscale-metrics-noop` | No-op metrics backend that silently discards all recorded metrics |
+| `hyperscale-metrics-prometheus` | Prometheus metrics backend with counters, gauges, and histograms |
+| `hyperscale-simulation` | Deterministic simulation runner with event queue and multi-node orchestration |
 | `hyperscale-simulator` | CLI tool for running simulations with metrics |
-| `hyperscale-production` | Production runner: libp2p networking, RocksDB storage, thread pools |
+| `hyperscale-production` | Production runner: async event loop, RPC server, telemetry |
 | `hyperscale-spammer` | Transaction spammer CLI and library for load testing |
 | `hyperscale-test-helpers` | Test helpers providing properly-signed fixtures for crypto testing |
 
