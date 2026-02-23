@@ -42,6 +42,7 @@
 
 use crate::event_loop::{spawn_pinned_loop, PinnedLoopConfig, ProdNodeLoop};
 use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
+use arc_swap::ArcSwap;
 use hyperscale_bft::BftConfig;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_dispatch_pooled::PooledDispatch;
@@ -184,12 +185,10 @@ pub struct ProductionRunnerBuilder {
     network_config: Option<Libp2pConfig>,
     ed25519_keypair: Option<Libp2pKeypair>,
     channel_capacity: usize,
-    /// Optional RPC status state to update on block commits and view changes.
     rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
-    /// Optional transaction status cache for RPC queries.
     tx_status_cache: Option<Arc<TokioRwLock<TransactionStatusCache>>>,
-    /// Optional mempool snapshot for RPC queries.
     mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
+    sync_status: Option<Arc<ArcSwap<crate::status::SyncStatus>>>,
     /// Optional genesis configuration for initial state.
     genesis_config: Option<hyperscale_engine::GenesisConfig>,
     /// Radix network definition for transaction validation.
@@ -224,6 +223,7 @@ impl ProductionRunnerBuilder {
             rpc_status: None,
             tx_status_cache: None,
             mempool_snapshot: None,
+            sync_status: None,
             genesis_config: None,
             network_definition: None,
             speculative_max_txs: 500,
@@ -299,21 +299,23 @@ impl ProductionRunnerBuilder {
         self
     }
 
-    /// Set the RPC status state to update on block commits and view changes.
     pub fn rpc_status(mut self, status: Arc<TokioRwLock<NodeStatusState>>) -> Self {
         self.rpc_status = Some(status);
         self
     }
 
-    /// Set the transaction status cache for RPC queries.
     pub fn tx_status_cache(mut self, cache: Arc<TokioRwLock<TransactionStatusCache>>) -> Self {
         self.tx_status_cache = Some(cache);
         self
     }
 
-    /// Set the mempool snapshot for RPC queries.
     pub fn mempool_snapshot(mut self, snapshot: Arc<TokioRwLock<MempoolSnapshot>>) -> Self {
         self.mempool_snapshot = Some(snapshot);
+        self
+    }
+
+    pub fn sync_status(mut self, status: Arc<ArcSwap<crate::status::SyncStatus>>) -> Self {
+        self.sync_status = Some(status);
         self
     }
 
@@ -546,6 +548,7 @@ impl ProductionRunnerBuilder {
             rpc_status: self.rpc_status,
             tx_status_cache: self.tx_status_cache,
             mempool_snapshot: self.mempool_snapshot,
+            sync_status: self.sync_status,
             genesis_config: self.genesis_config,
             local_shard,
             recently_received_txs,
@@ -611,13 +614,10 @@ pub struct ProductionRunner {
     local_shard: ShardGroupId,
 
     // ── RPC state ────────────────────────────────────────────────────────
-    /// Optional RPC status state.
     rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
-    /// Optional transaction status cache for RPC queries.
     tx_status_cache: Option<Arc<TokioRwLock<TransactionStatusCache>>>,
-    /// Optional mempool snapshot for RPC queries.
-    #[allow(dead_code)]
     mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
+    sync_status: Option<Arc<ArcSwap<crate::status::SyncStatus>>>,
 
     // ── Genesis ──────────────────────────────────────────────────────────
     /// Optional genesis configuration for initial state.
@@ -880,6 +880,9 @@ impl ProductionRunner {
             tx_status_cache: self.tx_status_cache.clone(),
             tokio_handle: tokio::runtime::Handle::current(),
             initial_timer_ops,
+            rpc_status: self.rpc_status.clone(),
+            sync_status: self.sync_status.clone(),
+            mempool_snapshot: self.mempool_snapshot.clone(),
         };
 
         // ── 3. Spawn pinned thread ───────────────────────────────────────
@@ -941,6 +944,16 @@ impl ProductionRunner {
         if let Some(ref rpc_status) = self.rpc_status {
             if let Ok(mut status) = rpc_status.try_write() {
                 status.connected_peers = peer_count;
+            }
+        }
+
+        // ── Update sync_peers on the sync status (only runner has ProdNetwork) ──
+        if let Some(ref sync_status) = self.sync_status {
+            let current = sync_status.load();
+            if current.sync_peers != peer_count {
+                let mut updated = (**current).clone();
+                updated.sync_peers = peer_count;
+                sync_status.store(Arc::new(updated));
             }
         }
     }

@@ -1252,6 +1252,7 @@ async fn main() -> Result<()> {
         .rpc_status(rpc_node_status.clone())
         .tx_status_cache(rpc_tx_status_cache.clone())
         .mempool_snapshot(rpc_mempool_snapshot.clone())
+        .sync_status(rpc_sync_status.clone())
         .speculative_max_txs(config.consensus.speculative_max_txs)
         .view_change_cooldown_rounds(config.consensus.view_change_cooldown_rounds)
         .mempool_config(config.mempool.clone());

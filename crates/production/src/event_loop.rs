@@ -12,13 +12,15 @@
 //! the shared `TransactionStatusCache` on the pinned thread, avoiding a channel
 //! round-trip back to the async runtime.
 
-use crate::rpc::state::TransactionStatusCache;
+use crate::rpc::state::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
+use crate::status::SyncStatus;
+use arc_swap::ArcSwap;
 use crossbeam::channel::Receiver;
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network_libp2p::ProdNetwork;
-use hyperscale_node::node_loop::{NodeLoop, TimerOp};
+use hyperscale_node::node_loop::{NodeLoop, NodeStatusSnapshot, TimerOp};
 use hyperscale_storage_rocksdb::SharedStorage;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,6 +57,9 @@ pub struct PinnedLoopConfig {
     /// Timer ops from genesis initialization that need to be processed
     /// before the event loop starts (e.g. the initial ProposalTimer).
     pub initial_timer_ops: Vec<TimerOp>,
+    pub rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
+    pub sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
+    pub mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -143,6 +148,47 @@ fn wall_clock_duration() -> Duration {
         .expect("system clock before UNIX epoch")
 }
 
+/// Push a [`NodeStatusSnapshot`] into the shared RPC state objects.
+///
+/// Called once per metrics tick (~1s) on the pinned thread. Uses `try_write()`
+/// so it never blocks — if an RPC handler holds a read lock, the update is
+/// simply skipped and retried next tick.
+fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
+    if let Some(ref rpc_status) = config.rpc_status {
+        if let Ok(mut status) = rpc_status.try_write() {
+            status.block_height = snapshot.committed_height;
+            status.view = snapshot.view;
+            status.state_version = snapshot.state_version;
+            status.state_root_hash = hex::encode(snapshot.state_root.as_bytes());
+        }
+    }
+
+    if let Some(ref sync_status) = config.sync_status {
+        sync_status.store(Arc::new(SyncStatus {
+            state: snapshot.sync.state.clone(),
+            current_height: snapshot.sync.current_height,
+            target_height: snapshot.sync.target_height,
+            blocks_behind: snapshot.sync.blocks_behind,
+            sync_peers: 0, // Set by runner's collect_metrics (has ProdNetwork access)
+            pending_fetches: snapshot.sync.pending_fetches,
+            queued_heights: snapshot.sync.queued_heights,
+        }));
+    }
+
+    if let Some(ref mempool_snapshot) = config.mempool_snapshot {
+        if let Ok(mut snapshot_guard) = mempool_snapshot.try_write() {
+            snapshot_guard.pending_count = snapshot.mempool_pending;
+            snapshot_guard.committed_count = snapshot.mempool_committed;
+            snapshot_guard.executed_count = snapshot.mempool_executed;
+            snapshot_guard.total_count = snapshot.mempool_total;
+            snapshot_guard.deferred_count = snapshot.mempool_deferred;
+            snapshot_guard.accepting_rpc_transactions = snapshot.accepting_rpc_transactions;
+            snapshot_guard.at_pending_limit = snapshot.at_pending_limit;
+            snapshot_guard.updated_at = Some(Instant::now());
+        }
+    }
+}
+
 /// Run the NodeLoop on a pinned thread.
 ///
 /// This function blocks the calling thread until shutdown. It should be called
@@ -157,13 +203,13 @@ fn wall_clock_duration() -> Duration {
 /// 6. Writes emitted statuses to tx_status_cache and records RPC latency
 /// 7. Flushes expired batches
 /// 8. Periodic metrics collection and JMT garbage collection
-pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, config: PinnedLoopConfig) {
+pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, mut config: PinnedLoopConfig) {
     info!("Pinned event loop starting");
 
     let mut timer_mgr = ProdTimerManager::new(config.tokio_handle.clone(), config.timer_tx.clone());
 
     // Process timer ops from genesis initialization (e.g. ProposalTimer).
-    for op in config.initial_timer_ops {
+    for op in std::mem::take(&mut config.initial_timer_ops) {
         timer_mgr.process_op(op);
     }
 
@@ -254,7 +300,7 @@ pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, config: PinnedLoopConfig) {
         // ── Flush expired batches ──
         node_loop.flush_expired_batches(wall_clock_duration());
 
-        // ── Periodic metrics ──
+        // ── Periodic metrics + RPC status snapshot ──
         if last_metrics.elapsed() >= METRICS_INTERVAL {
             last_metrics = Instant::now();
             node_loop.collect_metrics();
@@ -268,6 +314,9 @@ pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, config: PinnedLoopConfig) {
                 tx_request: 0,
                 cert_request: 0,
             });
+
+            // Push status snapshot to shared RPC state.
+            update_rpc_state(&config, &node_loop.status_snapshot());
         }
 
         // ── Periodic JMT GC ──

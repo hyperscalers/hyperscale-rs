@@ -17,7 +17,7 @@ pub use fetch_protocol::{
     FetchConfig, FetchInput, FetchKind, FetchOutput, FetchProtocol, FetchStatus,
 };
 pub use inbound_handler::{InboundHandler, InboundHandlerConfig};
-pub use node_loop::TimerOp;
+pub use node_loop::{NodeStatusSnapshot, TimerOp};
 pub use state::NodeStateMachine;
 pub use sync_protocol::{
     SyncConfig, SyncInput, SyncOutput, SyncProtocol, SyncStateKind, SyncStatus,

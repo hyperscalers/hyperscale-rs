@@ -20,7 +20,7 @@
 
 use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::fetch_protocol::{FetchConfig, FetchInput, FetchKind, FetchOutput, FetchProtocol};
-use crate::sync_protocol::{SyncInput, SyncOutput, SyncProtocol};
+use crate::sync_protocol::{SyncInput, SyncOutput, SyncProtocol, SyncStatus};
 use crate::NodeStateMachine;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, Event, ProtocolEvent, StateMachine, TimerId,
@@ -196,6 +196,33 @@ pub struct StepOutput {
     pub actions_generated: usize,
     /// Timer operations (set/cancel) to be processed by the runner.
     pub timer_ops: Vec<TimerOp>,
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// NodeStatusSnapshot — periodic status for external APIs
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Snapshot of node state for external status APIs.
+///
+/// Produced by [`NodeLoop::status_snapshot()`] on the periodic metrics tick.
+/// The production runner maps this into its RPC shared state types.
+#[derive(Debug, Clone)]
+pub struct NodeStatusSnapshot {
+    pub committed_height: u64,
+    pub view: u64,
+    pub state_version: u64,
+    pub state_root: Hash,
+    pub sync: SyncStatus,
+    pub mempool_pending: usize,
+    /// Block committed, being executed.
+    pub mempool_committed: usize,
+    /// Execution done, awaiting certificate.
+    pub mempool_executed: usize,
+    pub mempool_total: usize,
+    /// Waiting for winner.
+    pub mempool_deferred: usize,
+    pub accepting_rpc_transactions: bool,
+    pub at_pending_limit: bool,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1770,6 +1797,28 @@ where
 
         // ── Gossip cert verification tracking ──
         metrics::set_pending_gossiped_cert_batch_size(self.pending_gossip_verifications.len());
+    }
+
+    /// Capture a snapshot of node state for external status APIs.
+    pub fn status_snapshot(&self) -> NodeStatusSnapshot {
+        let (_, state_version, state_root) = self.state.last_committed_state();
+        let mempool = self.state.mempool();
+        let contention = mempool.lock_contention_stats();
+
+        NodeStatusSnapshot {
+            committed_height: self.state.bft().committed_height(),
+            view: self.state.bft().view(),
+            state_version,
+            state_root,
+            sync: self.sync_protocol.status(),
+            mempool_pending: contention.pending_count as usize,
+            mempool_committed: contention.committed_count as usize,
+            mempool_executed: contention.executed_count as usize,
+            mempool_total: mempool.len(),
+            mempool_deferred: contention.deferred_count as usize,
+            accepting_rpc_transactions: !mempool.at_in_flight_hard_limit(),
+            at_pending_limit: mempool.at_pending_limit(),
+        }
     }
 
     /// Flush ALL pending batches immediately, regardless of deadlines.
