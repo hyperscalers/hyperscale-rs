@@ -1,13 +1,14 @@
 //! Network trait implementation for deterministic simulation.
 //!
 //! [`SimNetworkAdapter`] buffers outgoing messages in an outbox. After each
-//! `NodeLoop::step()`, the simulation harness drains the outbox and applies
-//! partition/latency/loss from [`SimulatedNetwork`](crate::SimulatedNetwork)
-//! before scheduling delivery to target nodes.
+//! `NodeLoop::step()`, the simulation harness drains the outbox and routes
+//! entries through [`SimulatedNetwork::deliver_and_dispatch_gossip`](crate::SimulatedNetwork::deliver_and_dispatch_gossip),
+//! which applies partition/latency/loss and eagerly dispatches through each
+//! target node's `HandlerRegistry` — the same decode path as production.
 //!
 //! Messages are wire-encoded (SBOR + LZ4) in the outbox, matching the production
-//! path and catching serialization bugs. The harness decodes them back to events
-//! using [`hyperscale_node::gossip_dispatch::decode_gossip_to_events`].
+//! encoding path. Decoded events are returned to the harness for scheduling with
+//! the sampled latency.
 
 use hyperscale_network::{encode_to_wire, Network, RequestError};
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
@@ -64,10 +65,8 @@ pub struct PendingRequest {
 /// Each simulated node owns a `SimNetworkAdapter`. The harness:
 /// 1. Calls `NodeLoop::step(event)` which may produce network sends
 /// 2. Drains the adapter's outbox via [`drain_outbox()`](Self::drain_outbox)
-/// 3. For each entry, determines target peers from shard topology
-/// 4. Applies partition/loss/latency from `SimulatedNetwork`
-/// 5. Decodes the entry via `decode_gossip_to_events` to get events
-/// 6. Schedules those events for delivery to target nodes
+/// 3. Routes entries through `SimulatedNetwork::deliver_and_dispatch_gossip()`
+/// 4. Decoded events are scheduled with the sampled latency offset
 pub struct SimNetworkAdapter {
     outbox: Mutex<Vec<OutboxEntry>>,
     pending_requests: Mutex<Vec<PendingRequest>>,

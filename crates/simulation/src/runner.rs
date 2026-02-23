@@ -12,11 +12,11 @@ use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_execution::{DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_network::Topic;
+use hyperscale_network::HandlerRegistry;
 use hyperscale_network_memory::{
-    BroadcastTarget, NetworkConfig, NetworkTrafficAnalyzer, SimNetworkAdapter, SimulatedNetwork,
+    NetworkConfig, NetworkTrafficAnalyzer, SimNetworkAdapter, SimulatedNetwork,
 };
-use hyperscale_node::gossip_dispatch::decode_gossip_to_events;
+use hyperscale_node::gossip_dispatch::register_gossip_handlers;
 use hyperscale_node::node_loop::{NodeLoop, StepOutput};
 use hyperscale_node::TimerOp;
 use hyperscale_node::{InboundHandler, InboundHandlerConfig};
@@ -386,6 +386,10 @@ impl SimulationRunner {
             "Radix Engine genesis complete on all nodes"
         );
 
+        // Register handlers between engine genesis (needs sole Arc) and
+        // state-machine genesis (calls drain_node_io which needs gossip registries).
+        self.register_handlers();
+
         let num_shards = self.network.config().num_shards;
         let validators_per_shard = self.network.config().validators_per_shard;
 
@@ -457,8 +461,6 @@ impl SimulationRunner {
                 "Initialized genesis for shard"
             );
         }
-
-        self.register_inbound_handlers();
     }
 
     /// Initialize genesis with pre-funded accounts.
@@ -496,6 +498,10 @@ impl SimulationRunner {
             num_funded_accounts = balances.len(),
             "Radix Engine genesis complete with funded accounts"
         );
+
+        // Register handlers between engine genesis (needs sole Arc) and
+        // state-machine genesis (calls drain_node_io which needs gossip registries).
+        self.register_handlers();
 
         let num_shards = self.network.config().num_shards;
         let validators_per_shard = self.network.config().validators_per_shard;
@@ -566,17 +572,20 @@ impl SimulationRunner {
                 "Initialized genesis for shard"
             );
         }
-
-        self.register_inbound_handlers();
     }
 
-    /// Register InboundHandlers for each node with SimulatedNetwork.
+    /// Register per-node handlers with [`SimulatedNetwork`].
     ///
-    /// Must be called after genesis (which requires sole Arc ownership of storage
-    /// via `with_storage_and_executor`). After this, request fulfillment goes
-    /// through the same InboundHandler code path as production.
-    fn register_inbound_handlers(&mut self) {
+    /// Must be called after engine genesis (which requires sole Arc ownership of
+    /// storage via `with_storage_and_executor`) and before state-machine genesis
+    /// (which calls `drain_node_io`, requiring gossip registries to exist).
+    ///
+    /// Registers both:
+    /// - [`InboundHandler`] for request fulfillment (block/tx/cert fetches)
+    /// - [`HandlerRegistry`] for gossip dispatch (same setup as production)
+    fn register_handlers(&mut self) {
         for (i, node_loop) in self.node_loops.iter().enumerate() {
+            // Request handler (needs storage Arc, so post-engine-genesis).
             let handler = Arc::new(InboundHandler::new(
                 InboundHandlerConfig::default(),
                 node_loop.storage_arc(),
@@ -584,6 +593,12 @@ impl SimulationRunner {
                 node_loop.cert_cache().clone(),
             ));
             self.network.register_handler(i as NodeIndex, handler);
+
+            // Gossip handler registry — same setup function production uses.
+            let registry = HandlerRegistry::new();
+            register_gossip_handlers(&registry, node_loop.event_sender().clone());
+            self.network
+                .register_gossip_registry(i as NodeIndex, registry);
         }
     }
 
@@ -617,29 +632,9 @@ impl SimulationRunner {
                 "Processing event"
             );
 
-            // Update stats
             self.stats.events_processed += 1;
             self.stats.events_by_priority[event.priority() as usize] += 1;
 
-            // For SubmitTransaction events, gossip to all relevant shards first.
-            if let NodeInput::SubmitTransaction { ref tx } = event {
-                let topology = self.node_loops[node_index as usize].state().topology();
-                let shards: Vec<ShardGroupId> = topology.all_shards_for_transaction(tx);
-                for shard in shards {
-                    let event = NodeInput::Protocol(ProtocolEvent::TransactionGossipReceived {
-                        tx: Arc::clone(tx),
-                        submitted_locally: false,
-                    });
-                    let peers = self.network.peers_in_shard(shard);
-                    for to in peers {
-                        if to != node_index {
-                            self.try_deliver_event(node_index, to, event.clone());
-                        }
-                    }
-                }
-            }
-
-            // Normal event processing through NodeLoop
             self.node_loops[node_index as usize].set_time(self.now);
             let output = self.node_loops[node_index as usize].step(event);
             self.node_loops[node_index as usize].flush_all_batches();
@@ -690,7 +685,7 @@ impl SimulationRunner {
             self.stats.messages_dropped_loss += stats.messages_dropped_loss;
         }
 
-        // Drain buffered events (includes events from callbacks above).
+        // Drain buffered events (includes events from request callbacks above).
         while let Ok(event) = self.event_rxs[i].try_recv() {
             self.schedule_event(node, self.now, event);
         }
@@ -711,63 +706,30 @@ impl SimulationRunner {
     // Network Delivery
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Decode an outbox entry and deliver to target peers with partition/latency/loss.
+    /// Fan out an outbox entry via [`SimulatedNetwork::deliver_and_dispatch_gossip`],
+    /// which eagerly dispatches through each target's `HandlerRegistry`. Decoded
+    /// events are drained from each target's channel and scheduled with latency.
     fn deliver_outbox_entry(
         &mut self,
         from: NodeIndex,
         entry: hyperscale_network_memory::OutboxEntry,
     ) {
-        // Build topic for codec decoding
-        let (topic, peers) = match entry.target {
-            BroadcastTarget::Shard(shard) => {
-                let topic = Topic::shard(entry.message_type, shard);
-                let peers = self.network.peers_in_shard(shard);
-                (topic, peers)
-            }
-            BroadcastTarget::Global => {
-                let topic = Topic::global(entry.message_type);
-                let total = self.network.total_nodes();
-                let peers: Vec<NodeIndex> = (0..total as NodeIndex).collect();
-                (topic, peers)
-            }
-            BroadcastTarget::Peer(peer) => {
-                let topic = Topic::global(entry.message_type);
-                let peers = vec![peer.0 as NodeIndex];
-                (topic, peers)
-            }
-        };
+        let (results, stats) = self
+            .network
+            .deliver_and_dispatch_gossip(from, entry, &mut self.rng);
 
-        // Decode wire bytes back to events
-        let events = decode_gossip_to_events(&topic, &entry.data)
-            .expect("SimNetworkAdapter: encode/decode roundtrip failed");
+        self.stats.messages_sent += stats.messages_sent;
+        self.stats.messages_dropped_partition += stats.messages_dropped_partition;
+        self.stats.messages_dropped_loss += stats.messages_dropped_loss;
 
-        for to in peers {
-            if to != from {
-                for event in &events {
-                    self.try_deliver_event(from, to, event.clone());
-                }
+        // Drain decoded events from each target node's channel and schedule
+        // with the sampled latency offset.
+        for result in results {
+            let deliver_at = self.now + result.latency;
+            while let Ok(event) = self.event_rxs[result.to as usize].try_recv() {
+                self.schedule_event(result.to, deliver_at, event);
             }
         }
-    }
-
-    /// Try to deliver an event, accounting for partitions and packet loss.
-    fn try_deliver_event(&mut self, from: NodeIndex, to: NodeIndex, event: NodeInput) {
-        if self.network.is_partitioned(from, to) {
-            self.stats.messages_dropped_partition += 1;
-            trace!(from = from, to = to, "Event dropped due to partition");
-            return;
-        }
-
-        if self.network.should_drop_packet(&mut self.rng) {
-            self.stats.messages_dropped_loss += 1;
-            trace!(from = from, to = to, "Event dropped due to packet loss");
-            return;
-        }
-
-        let latency = self.network.sample_latency(from, to, &mut self.rng);
-        let delivery_time = self.now + latency;
-        self.schedule_event(to, delivery_time, event);
-        self.stats.messages_sent += 1;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -807,7 +769,7 @@ impl SimulationRunner {
     // Helpers
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Schedule an event.
+    /// Schedule a [`NodeInput`] event for delivery at the given time.
     fn schedule_event(&mut self, node: NodeIndex, time: Duration, event: NodeInput) -> EventKey {
         self.sequence += 1;
         let key = EventKey::new(time, &event, node, self.sequence);

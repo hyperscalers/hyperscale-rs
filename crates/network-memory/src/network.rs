@@ -1,8 +1,10 @@
 //! Simulated network with deterministic latency, packet loss, and partitions.
 
-use crate::sim_network::PendingRequest;
+use crate::sim_network::{BroadcastTarget, OutboxEntry, PendingRequest};
 use crate::NodeIndex;
-use hyperscale_network::{frame_request, InboundRequestHandler, RequestError};
+use hyperscale_network::{
+    frame_request, HandlerRegistry, InboundRequestHandler, RequestError, Topic,
+};
 use hyperscale_types::{ShardGroupId, ValidatorId};
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -46,12 +48,26 @@ impl Default for NetworkConfig {
     }
 }
 
-/// Stats returned by [`SimulatedNetwork::fulfill_requests`].
+/// Stats returned by [`SimulatedNetwork::fulfill_requests`] and
+/// [`SimulatedNetwork::deliver_and_dispatch_gossip`].
 #[derive(Debug, Default)]
 pub struct FulfillmentStats {
     pub messages_sent: u64,
     pub messages_dropped_partition: u64,
     pub messages_dropped_loss: u64,
+}
+
+/// Result of a single gossip dispatch to a target node.
+///
+/// Returned by [`SimulatedNetwork::deliver_and_dispatch_gossip`]. The caller
+/// drains the target node's event channel and schedules the decoded events
+/// with the indicated latency offset.
+#[derive(Debug)]
+pub struct GossipDispatchResult {
+    /// Target node that received the dispatch.
+    pub to: NodeIndex,
+    /// Sampled one-way latency for scheduling the decoded events.
+    pub latency: Duration,
 }
 
 /// Simulated network for deterministic message delivery.
@@ -69,6 +85,9 @@ pub struct SimulatedNetwork {
     /// Per-node inbound request handlers. Registered after node construction.
     /// Index = NodeIndex, value = handler (None if not yet registered).
     handlers: Vec<Option<Arc<dyn InboundRequestHandler>>>,
+    /// Per-node gossip handler registries. Registered after node construction.
+    /// Index = NodeIndex, value = registry (None if not yet registered).
+    gossip_registries: Vec<Option<HandlerRegistry>>,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -77,6 +96,7 @@ impl std::fmt::Debug for SimulatedNetwork {
             .field("config", &self.config)
             .field("partitions", &self.partitions)
             .field("handlers", &self.handlers.len())
+            .field("gossip_registries", &self.gossip_registries.len())
             .finish()
     }
 }
@@ -88,6 +108,7 @@ impl SimulatedNetwork {
             config,
             partitions: HashSet::new(),
             handlers: Vec::new(),
+            gossip_registries: Vec::new(),
         }
     }
 
@@ -362,6 +383,98 @@ impl SimulatedNetwork {
         }
 
         stats
+    }
+
+    // ─── Gossip Dispatch ───
+
+    /// Register a [`HandlerRegistry`] for gossip dispatch on a node.
+    ///
+    /// Called once per node during setup. The registry's handlers decode
+    /// gossip wire bytes and push events into the node's crossbeam channel.
+    pub fn register_gossip_registry(&mut self, node: NodeIndex, registry: HandlerRegistry) {
+        let idx = node as usize;
+        if idx >= self.gossip_registries.len() {
+            self.gossip_registries.resize_with(idx + 1, || None);
+        }
+        self.gossip_registries[idx] = Some(registry);
+    }
+
+    /// Fan out a gossip outbox entry, eagerly dispatching through each target's
+    /// [`HandlerRegistry`].
+    ///
+    /// For each target peer (excluding the sender):
+    /// 1. Check partition and packet loss
+    /// 2. Sample one-way latency
+    /// 3. Dispatch wire bytes through the target's `HandlerRegistry::dispatch_gossip()`
+    ///
+    /// Returns a [`GossipDispatchResult`] per node that received the dispatch.
+    /// The caller drains each target node's event channel and schedules the
+    /// decoded events with the latency offset.
+    ///
+    /// This exercises the same `dispatch_gossip()` code path as production:
+    /// LZ4 decompress → SBOR decode → typed handler closure → event channel.
+    pub fn deliver_and_dispatch_gossip(
+        &self,
+        from: NodeIndex,
+        entry: OutboxEntry,
+        rng: &mut ChaCha8Rng,
+    ) -> (Vec<GossipDispatchResult>, FulfillmentStats) {
+        let mut stats = FulfillmentStats::default();
+        let mut results = Vec::new();
+
+        // Build topic and determine target peers from broadcast target.
+        let (topic, peers) = match entry.target {
+            BroadcastTarget::Shard(shard) => {
+                let topic = Topic::shard(entry.message_type, shard);
+                let peers = self.peers_in_shard(shard);
+                (topic, peers)
+            }
+            BroadcastTarget::Global => {
+                let topic = Topic::global(entry.message_type);
+                let total = self.total_nodes();
+                let peers: Vec<NodeIndex> = (0..total as NodeIndex).collect();
+                (topic, peers)
+            }
+            BroadcastTarget::Peer(peer) => {
+                let topic = Topic::global(entry.message_type);
+                let peers = vec![peer.0 as NodeIndex];
+                (topic, peers)
+            }
+        };
+
+        for to in peers {
+            if to == from {
+                continue;
+            }
+
+            match self.should_deliver(from, to, rng) {
+                None => {
+                    if self.is_partitioned(from, to) {
+                        stats.messages_dropped_partition += 1;
+                    } else {
+                        stats.messages_dropped_loss += 1;
+                    }
+                }
+                Some(latency) => {
+                    stats.messages_sent += 1;
+
+                    // Eagerly dispatch through the target's HandlerRegistry.
+                    if let Some(Some(registry)) = self.gossip_registries.get(to as usize) {
+                        if let Err(e) = registry.dispatch_gossip(&topic, &entry.data) {
+                            tracing::warn!(from, to, ?topic, ?e, "Gossip dispatch error");
+                            continue;
+                        }
+                    } else {
+                        tracing::warn!(from, to, "No gossip registry for target node");
+                        continue;
+                    }
+
+                    results.push(GossipDispatchResult { to, latency });
+                }
+            }
+        }
+
+        (results, stats)
     }
 }
 

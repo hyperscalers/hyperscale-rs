@@ -10,7 +10,7 @@ mod network;
 pub mod sim_network;
 mod traffic;
 
-pub use network::{FulfillmentStats, NetworkConfig, SimulatedNetwork};
+pub use network::{FulfillmentStats, GossipDispatchResult, NetworkConfig, SimulatedNetwork};
 pub use sim_network::{BroadcastTarget, OutboxEntry, PendingRequest, SimNetworkAdapter};
 pub use traffic::{
     AggregateBandwidth, BandwidthEstimates, BandwidthReport, MessageTypeReport, MessageTypeStats,
