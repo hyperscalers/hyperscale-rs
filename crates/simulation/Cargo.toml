@@ -10,7 +10,6 @@ hyperscale-bft.workspace = true
 hyperscale-engine.workspace = true
 hyperscale-execution.workspace = true
 hyperscale-mempool.workspace = true
-hyperscale-messages.workspace = true
 hyperscale-network.workspace = true
 hyperscale-network-memory.workspace = true
 hyperscale-node.workspace = true
@@ -25,7 +24,6 @@ hyperscale-dispatch-sync.workspace = true
 # Radix dependencies for real execution
 radix-common.workspace = true
 
-sbor.workspace = true
 crossbeam.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

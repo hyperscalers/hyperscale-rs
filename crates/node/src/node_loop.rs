@@ -426,6 +426,15 @@ where
         &self.tx_cache
     }
 
+    /// Get a shared reference to the storage (Arc clone).
+    ///
+    /// Used by the simulation harness to construct an `InboundHandler` that
+    /// shares the same storage instance as this NodeLoop (same pattern as
+    /// production, where both NodeLoop and InboundRouter share `Arc<Storage>`).
+    pub fn storage_arc(&self) -> Arc<S> {
+        Arc::clone(&self.storage)
+    }
+
     /// Access the sync protocol.
     pub fn sync_protocol(&self) -> &SyncProtocol {
         &self.sync_protocol

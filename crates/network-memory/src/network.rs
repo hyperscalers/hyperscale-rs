@@ -1,11 +1,16 @@
 //! Simulated network with deterministic latency, packet loss, and partitions.
 
+use crate::sim_network::PendingRequest;
 use crate::NodeIndex;
-use hyperscale_types::ShardGroupId;
+use hyperscale_network::{frame_request, InboundRequestHandler, RequestError};
+use hyperscale_types::{ShardGroupId, ValidatorId};
+use rand::seq::SliceRandom;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
+use tracing::trace;
 
 /// Configuration for simulated network.
 #[derive(Debug, Clone)]
@@ -41,18 +46,39 @@ impl Default for NetworkConfig {
     }
 }
 
+/// Stats returned by [`SimulatedNetwork::fulfill_requests`].
+#[derive(Debug, Default)]
+pub struct FulfillmentStats {
+    pub messages_sent: u64,
+    pub messages_dropped_partition: u64,
+    pub messages_dropped_loss: u64,
+}
+
 /// Simulated network for deterministic message delivery.
 ///
 /// Supports:
 /// - Configurable latency with jitter
 /// - Packet loss (probabilistic message drops)
 /// - Network partitions (blocking communication between node pairs)
-#[derive(Debug)]
+/// - Request fulfillment via registered [`InboundRequestHandler`]s (one per node)
 pub struct SimulatedNetwork {
     config: NetworkConfig,
     /// Partitioned node pairs. If (a, b) is in this set, messages from a to b are dropped.
     /// Partitions are directional - add both (a, b) and (b, a) for bidirectional partition.
     partitions: HashSet<(NodeIndex, NodeIndex)>,
+    /// Per-node inbound request handlers. Registered after node construction.
+    /// Index = NodeIndex, value = handler (None if not yet registered).
+    handlers: Vec<Option<Arc<dyn InboundRequestHandler>>>,
+}
+
+impl std::fmt::Debug for SimulatedNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimulatedNetwork")
+            .field("config", &self.config)
+            .field("partitions", &self.partitions)
+            .field("handlers", &self.handlers.len())
+            .finish()
+    }
 }
 
 impl SimulatedNetwork {
@@ -61,6 +87,7 @@ impl SimulatedNetwork {
         Self {
             config,
             partitions: HashSet::new(),
+            handlers: Vec::new(),
         }
     }
 
@@ -219,6 +246,122 @@ impl SimulatedNetwork {
     /// Get network configuration.
     pub fn config(&self) -> &NetworkConfig {
         &self.config
+    }
+
+    // ─── Request Fulfillment ───
+
+    /// Register an [`InboundRequestHandler`] for a node.
+    ///
+    /// Called once per node after construction. The handler processes inbound
+    /// request bytes (framed with type_id) and returns SBOR-encoded response bytes,
+    /// exercising the exact same code path as production.
+    pub fn register_handler(&mut self, node: NodeIndex, handler: Arc<dyn InboundRequestHandler>) {
+        let idx = node as usize;
+        if idx >= self.handlers.len() {
+            self.handlers.resize_with(idx + 1, || None);
+        }
+        self.handlers[idx] = Some(handler);
+    }
+
+    /// Fulfill pending requests by routing them through peer InboundRequestHandlers.
+    ///
+    /// For each request:
+    /// 1. Select a peer (preferred_peer if set, otherwise random non-self peer)
+    /// 2. Check partition and packet loss (request + response directions)
+    /// 3. Frame the request bytes with type_id and call the peer's handler
+    /// 4. Invoke the callback with the response bytes
+    ///
+    /// This ensures simulation exercises the same encode/decode/dispatch path
+    /// as production (via `InboundHandler`).
+    pub fn fulfill_requests(
+        &self,
+        requester: NodeIndex,
+        requests: Vec<PendingRequest>,
+        rng: &mut ChaCha8Rng,
+    ) -> FulfillmentStats {
+        let mut stats = FulfillmentStats::default();
+
+        for request in requests {
+            let PendingRequest {
+                preferred_peer,
+                type_id,
+                request_bytes,
+                on_response,
+            } = request;
+
+            // Select target peer.
+            let peer = match preferred_peer {
+                Some(vid) => vid.0 as NodeIndex,
+                None => {
+                    // Pick a random peer (excluding self) for block sync.
+                    let mut candidates: Vec<NodeIndex> = self
+                        .all_nodes()
+                        .into_iter()
+                        .filter(|&n| n != requester)
+                        .collect();
+                    candidates.shuffle(rng);
+                    match candidates.first() {
+                        Some(&p) => p,
+                        None => {
+                            on_response(Err(RequestError::PeerUnreachable(ValidatorId(
+                                requester as u64,
+                            ))));
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            // Partition check.
+            if self.is_partitioned(requester, peer) {
+                stats.messages_dropped_partition += 1;
+                trace!(requester, peer, "Request dropped: partition");
+                on_response(Err(RequestError::PeerUnreachable(ValidatorId(peer as u64))));
+                continue;
+            }
+
+            // Packet loss (request direction).
+            if self.should_drop_packet(rng) {
+                stats.messages_dropped_loss += 1;
+                trace!(requester, peer, "Request dropped: packet loss");
+                on_response(Err(RequestError::PeerUnreachable(ValidatorId(peer as u64))));
+                continue;
+            }
+
+            // Packet loss (response direction).
+            if self.should_drop_packet(rng) {
+                stats.messages_dropped_loss += 1;
+                trace!(requester, peer, "Response dropped: packet loss");
+                on_response(Err(RequestError::PeerUnreachable(ValidatorId(peer as u64))));
+                continue;
+            }
+
+            stats.messages_sent += 2; // request + response
+
+            // Frame the request and dispatch through the peer's handler.
+            let handler = match self.handlers.get(peer as usize).and_then(|h| h.as_ref()) {
+                Some(h) => h,
+                None => {
+                    on_response(Err(RequestError::PeerError(format!(
+                        "no handler for node {peer}"
+                    ))));
+                    continue;
+                }
+            };
+
+            let framed = frame_request(type_id, &request_bytes);
+            let response_bytes = handler.handle_request(&framed);
+
+            if response_bytes.is_empty() {
+                on_response(Err(RequestError::PeerError(
+                    "handler returned empty response".to_string(),
+                )));
+            } else {
+                on_response(Ok(response_bytes));
+            }
+        }
+
+        stats
     }
 }
 
