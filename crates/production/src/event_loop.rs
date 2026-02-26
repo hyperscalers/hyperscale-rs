@@ -257,25 +257,6 @@ pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, mut config: PinnedLoopConfig
             }
         };
 
-        // ── Pre-step filtering ──
-        // Skip gossip-received transactions that are already in terminal state
-        // (avoids unnecessary validation batching for already-completed txs).
-        let event = event.and_then(|event| {
-            if let NodeInput::Protocol(ProtocolEvent::TransactionGossipReceived {
-                ref tx, ..
-            }) = event
-            {
-                if let Some(ref cache) = config.tx_status_cache {
-                    if let Ok(guard) = cache.try_read() {
-                        if guard.get(&tx.hash()).is_some_and(|c| c.status.is_final()) {
-                            return None;
-                        }
-                    }
-                }
-            }
-            Some(event)
-        });
-
         // ── Process event ──
         if let Some(event) = event {
             let output = node_loop.step(event);

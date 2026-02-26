@@ -513,12 +513,16 @@ where
             if self.tx_cache.get(&tx_hash).is_some() {
                 // Duplicate — already validated and cached, skip.
                 return self.drain_pending_output();
-            } else {
-                // New unvalidated transaction — queue for batch validation.
-                self.pending_validation.insert(tx_hash);
-                self.queue_validation(Arc::clone(tx));
+            }
+            // Skip transactions already in a terminal state (executed, aborted, etc.)
+            // to avoid unnecessary validation batching for already-completed txs.
+            if self.state.mempool().is_tombstoned(&tx_hash) {
                 return self.drain_pending_output();
             }
+            // New unvalidated transaction — queue for batch validation.
+            self.pending_validation.insert(tx_hash);
+            self.queue_validation(Arc::clone(tx));
+            return self.drain_pending_output();
         }
 
         if let Event::SubmitTransaction { ref tx } = event {
