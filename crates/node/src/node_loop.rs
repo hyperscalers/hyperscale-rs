@@ -373,6 +373,20 @@ where
     ///
     /// Needed for operations like genesis that require both references.
     /// Rust's borrow checker can't split borrows through separate method calls.
+    ///
+    /// # Genesis initialization ordering
+    ///
+    /// Runners must follow this sequence:
+    /// 1. **Engine genesis** via `with_storage_and_executor()` (requires sole Arc ownership)
+    /// 2. **Handler registration** using [`storage_arc()`], [`tx_cache()`], [`cert_cache()`],
+    ///    and [`event_sender()`] (clones the Arc, so must happen after step 1)
+    /// 3. **State-machine genesis** via `state_mut().initialize_genesis()` followed by
+    ///    `handle_actions()`, `flush_all_batches()`, and a `StateCommitComplete` event
+    ///
+    /// # Panics
+    ///
+    /// Panics if the storage `Arc` has been cloned (e.g., by handler registration
+    /// or dispatch closures), since `Arc::get_mut` requires sole ownership.
     pub fn with_storage_and_executor<R>(
         &mut self,
         f: impl FnOnce(&mut S, &RadixExecutor) -> R,
@@ -469,9 +483,18 @@ where
 
     /// Process a single event through the state machine and handle all resulting actions.
     ///
-    /// Returns a `StepOutput` containing emitted transaction statuses.
-    /// Sync/fetch I/O is handled internally via the Network trait.
+    /// Returns a [`StepOutput`] containing emitted transaction statuses and timer
+    /// operations. Sync/fetch I/O is handled internally via the Network trait.
     ///
+    /// # Caller protocol
+    ///
+    /// After each call to `step()`, the runner should:
+    /// 1. Flush batches — either [`flush_all_batches()`] (simulation) or
+    ///    [`flush_expired_batches()`] (production, with wall-clock time)
+    /// 2. Process `timer_ops` from the returned [`StepOutput`]
+    /// 3. Process `emitted_statuses` from the returned [`StepOutput`]
+    /// 4. Drain any events produced through the event channel (simulation only —
+    ///    production receives these via its crossbeam channel receivers)
     pub fn step(&mut self, event: Event) -> StepOutput {
         self.emitted_statuses.clear();
         self.actions_generated = 0;
