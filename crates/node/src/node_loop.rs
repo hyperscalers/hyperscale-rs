@@ -315,11 +315,11 @@ where
         event_sender: crossbeam::channel::Sender<Event>,
         signing_key: Bls12381G1PrivateKey,
         topology: Arc<dyn Topology>,
-        local_shard: ShardGroupId,
-        validator_id: ValidatorId,
         sync_protocol: SyncProtocol,
         tx_validator: Arc<TransactionValidation>,
     ) -> Self {
+        let local_shard = topology.local_shard();
+        let validator_id = topology.local_validator_id();
         Self {
             state,
             storage: Arc::new(storage),

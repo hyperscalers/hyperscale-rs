@@ -491,8 +491,6 @@ impl ProductionRunnerBuilder {
             xb_callback_tx.clone(),
             node_loop_signing_key,
             topology.clone(),
-            local_shard,
-            validator_id,
             sync_protocol,
             tx_validator.clone(),
         );

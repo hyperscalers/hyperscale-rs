@@ -219,8 +219,6 @@ impl SimulationRunner {
                     event_tx,
                     signing_key,
                     topology,
-                    shard,
-                    validator_id,
                     SyncProtocol::new(SyncConfig::default()),
                     tx_validator,
                 );
