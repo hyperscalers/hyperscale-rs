@@ -4,10 +4,10 @@ use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
 use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_types::Hash;
-use std::collections::{BinaryHeap, HashMap};
+use quick_cache::sync::Cache as QuickCache;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::RwLock;
 
 /// Type alias for the transaction submission channel.
@@ -36,7 +36,10 @@ pub struct RpcState {
     /// Server start time for uptime calculation.
     pub start_time: Instant,
     /// Transaction status cache for querying transaction state.
-    pub tx_status_cache: Arc<RwLock<TransactionStatusCache>>,
+    ///
+    /// Shared directly from NodeLoop's internal QuickCache — writes happen on
+    /// the pinned thread, reads happen here on the RPC thread, no locking needed.
+    pub tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
     /// Mempool snapshot for querying mempool stats.
     pub mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
     /// Number of blocks behind before rejecting transaction submissions.
@@ -44,179 +47,6 @@ pub struct RpcState {
     /// When set and the node is this many blocks behind, new transaction
     /// submissions are rejected to allow the node to catch up.
     pub sync_backpressure_threshold: Option<u64>,
-}
-
-/// Cached transaction status entry.
-#[derive(Debug, Clone)]
-pub struct CachedTransactionStatus {
-    /// Current status of the transaction.
-    pub status: TransactionStatus,
-    /// When this entry was last updated.
-    pub updated_at: Instant,
-}
-
-impl CachedTransactionStatus {
-    /// Create a new cached status entry.
-    pub fn new(status: TransactionStatus) -> Self {
-        Self {
-            status,
-            updated_at: Instant::now(),
-        }
-    }
-}
-
-/// Entry in the terminal entries min-heap for O(log n) eviction.
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct TerminalHeapEntry {
-    updated_at: Instant,
-    hash: Hash,
-}
-
-impl Ord for TerminalHeapEntry {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Reverse ordering so oldest entries are at the top (min-heap behavior)
-        other.updated_at.cmp(&self.updated_at)
-    }
-}
-
-impl PartialOrd for TerminalHeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-/// Cache of transaction statuses for RPC queries.
-///
-/// This cache is updated by the runner when processing `EmitTransactionStatus` actions.
-/// Entries are kept for a configurable TTL to allow status queries after completion.
-///
-/// Uses a min-heap to track terminal entries by timestamp for O(log n) eviction
-/// instead of O(n log n) sorting on every eviction.
-#[derive(Debug)]
-pub struct TransactionStatusCache {
-    /// Map of transaction hash to cached status.
-    entries: HashMap<Hash, CachedTransactionStatus>,
-    /// Min-heap of terminal entries ordered by updated_at (oldest first).
-    /// Enables O(log n) eviction of oldest terminal entries.
-    terminal_heap: BinaryHeap<TerminalHeapEntry>,
-    /// Maximum number of entries to keep (prevents unbounded growth).
-    max_entries: usize,
-    /// TTL for completed transaction entries.
-    completed_ttl: Duration,
-}
-
-impl Default for TransactionStatusCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TransactionStatusCache {
-    /// Create a new cache with default settings.
-    pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            terminal_heap: BinaryHeap::new(),
-            max_entries: 100_000,
-            completed_ttl: Duration::from_secs(300), // 5 minutes
-        }
-    }
-
-    /// Create a new cache with custom settings.
-    pub fn with_config(max_entries: usize, completed_ttl: Duration) -> Self {
-        Self {
-            entries: HashMap::new(),
-            terminal_heap: BinaryHeap::new(),
-            max_entries,
-            completed_ttl,
-        }
-    }
-
-    /// Update or insert a transaction status.
-    pub fn update(&mut self, tx_hash: Hash, status: TransactionStatus) {
-        let is_new_entry = !self.entries.contains_key(&tx_hash);
-
-        // If at capacity and this is a new entry, evict old completed entries first
-        if self.entries.len() >= self.max_entries && is_new_entry {
-            self.evict_old_entries();
-        }
-
-        let is_terminal = status.is_final();
-        let entry = CachedTransactionStatus::new(status);
-        let updated_at = entry.updated_at;
-
-        self.entries.insert(tx_hash, entry);
-
-        // Track terminal entries in the heap for efficient eviction
-        if is_terminal {
-            self.terminal_heap.push(TerminalHeapEntry {
-                updated_at,
-                hash: tx_hash,
-            });
-        }
-    }
-
-    /// Get the status of a transaction.
-    pub fn get(&self, tx_hash: &Hash) -> Option<&CachedTransactionStatus> {
-        self.entries.get(tx_hash)
-    }
-
-    /// Evict old completed entries to make room for new ones.
-    /// Uses a min-heap for O(log n) per-eviction instead of O(n log n) sort.
-    fn evict_old_entries(&mut self) {
-        let now = Instant::now();
-        let ttl = self.completed_ttl;
-
-        // First pass: evict entries older than TTL using the heap
-        // This is O(k log n) where k is the number of entries evicted
-        while let Some(heap_entry) = self.terminal_heap.peek() {
-            // Check if oldest entry is past TTL
-            if now.duration_since(heap_entry.updated_at) <= ttl {
-                break; // All remaining entries are within TTL
-            }
-
-            let heap_entry = self.terminal_heap.pop().unwrap();
-
-            // Verify the entry still exists and matches (might have been updated)
-            if let Some(cached) = self.entries.get(&heap_entry.hash) {
-                if cached.updated_at == heap_entry.updated_at && cached.status.is_final() {
-                    self.entries.remove(&heap_entry.hash);
-                }
-            }
-            // If entry doesn't exist or was updated, the heap entry is stale - just drop it
-        }
-
-        // Second pass: if still at capacity, evict oldest 10% of terminal entries
-        if self.entries.len() >= self.max_entries {
-            let to_remove = self.terminal_heap.len() / 10 + 1;
-            let mut removed = 0;
-
-            while removed < to_remove {
-                let Some(heap_entry) = self.terminal_heap.pop() else {
-                    break;
-                };
-
-                // Verify the entry still exists and matches
-                if let Some(cached) = self.entries.get(&heap_entry.hash) {
-                    if cached.updated_at == heap_entry.updated_at && cached.status.is_final() {
-                        self.entries.remove(&heap_entry.hash);
-                        removed += 1;
-                    }
-                }
-                // Stale heap entries don't count toward removal quota
-            }
-        }
-    }
-
-    /// Get the number of cached entries.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Check if the cache is empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
 }
 
 /// Snapshot of mempool state for RPC queries.
@@ -289,48 +119,51 @@ mod tests {
     use super::*;
     use hyperscale_types::{BlockHeight, TransactionDecision};
 
+    fn new_cache() -> QuickCache<Hash, TransactionStatus> {
+        QuickCache::new(100)
+    }
+
     #[test]
     fn test_cache_new() {
-        let cache = TransactionStatusCache::new();
-        assert!(cache.is_empty());
-        assert_eq!(cache.len(), 0);
+        let cache = new_cache();
+        let tx_hash = Hash::from_bytes(&[1u8; 32]);
+        assert!(cache.get(&tx_hash).is_none());
     }
 
     #[test]
     fn test_cache_update_and_get() {
-        let mut cache = TransactionStatusCache::new();
+        let cache = new_cache();
         let tx_hash = Hash::from_bytes(&[1u8; 32]);
 
-        cache.update(tx_hash, TransactionStatus::Pending);
-        assert_eq!(cache.len(), 1);
+        cache.insert(tx_hash, TransactionStatus::Pending);
 
-        let cached = cache.get(&tx_hash).unwrap();
-        assert!(matches!(cached.status, TransactionStatus::Pending));
+        let status = cache.get(&tx_hash).unwrap();
+        assert!(matches!(status, TransactionStatus::Pending));
     }
 
     #[test]
     fn test_cache_status_transitions() {
-        let mut cache = TransactionStatusCache::new();
+        let cache = new_cache();
         let tx_hash = Hash::from_bytes(&[2u8; 32]);
 
         // Pending -> Committed
-        cache.update(tx_hash, TransactionStatus::Pending);
-        cache.update(tx_hash, TransactionStatus::Committed(BlockHeight(10)));
+        cache.insert(tx_hash, TransactionStatus::Pending);
+        cache.insert(tx_hash, TransactionStatus::Committed(BlockHeight(10)));
 
-        let cached = cache.get(&tx_hash).unwrap();
-        assert!(matches!(cached.status, TransactionStatus::Committed(h) if h.0 == 10));
+        let status = cache.get(&tx_hash).unwrap();
+        assert!(matches!(status, TransactionStatus::Committed(h) if h.0 == 10));
 
         // Committed -> Executed
-        cache.update(
+        cache.insert(
             tx_hash,
             TransactionStatus::Executed {
                 decision: TransactionDecision::Accept,
                 committed_at: BlockHeight(1),
             },
         );
-        let cached = cache.get(&tx_hash).unwrap();
+        let status = cache.get(&tx_hash).unwrap();
         assert!(matches!(
-            cached.status,
+            status,
             TransactionStatus::Executed {
                 decision: TransactionDecision::Accept,
                 ..
@@ -338,27 +171,27 @@ mod tests {
         ));
 
         // Executed -> Completed
-        cache.update(
+        cache.insert(
             tx_hash,
             TransactionStatus::Completed(TransactionDecision::Accept),
         );
-        let cached = cache.get(&tx_hash).unwrap();
+        let status = cache.get(&tx_hash).unwrap();
         assert!(matches!(
-            cached.status,
+            status,
             TransactionStatus::Completed(TransactionDecision::Accept)
         ));
     }
 
     #[test]
     fn test_cache_blocked_status() {
-        let mut cache = TransactionStatusCache::new();
+        let cache = new_cache();
         let tx_hash = Hash::from_bytes(&[3u8; 32]);
         let blocker_hash = Hash::from_bytes(&[4u8; 32]);
 
-        cache.update(tx_hash, TransactionStatus::Deferred { by: blocker_hash });
+        cache.insert(tx_hash, TransactionStatus::Deferred { by: blocker_hash });
 
-        let cached = cache.get(&tx_hash).unwrap();
-        if let TransactionStatus::Deferred { by } = &cached.status {
+        let status = cache.get(&tx_hash).unwrap();
+        if let TransactionStatus::Deferred { by } = &status {
             assert_eq!(*by, blocker_hash);
         } else {
             panic!("Expected Deferred status");
@@ -367,14 +200,14 @@ mod tests {
 
     #[test]
     fn test_cache_retried_status() {
-        let mut cache = TransactionStatusCache::new();
+        let cache = new_cache();
         let tx_hash = Hash::from_bytes(&[5u8; 32]);
         let retry_hash = Hash::from_bytes(&[6u8; 32]);
 
-        cache.update(tx_hash, TransactionStatus::Retried { new_tx: retry_hash });
+        cache.insert(tx_hash, TransactionStatus::Retried { new_tx: retry_hash });
 
-        let cached = cache.get(&tx_hash).unwrap();
-        if let TransactionStatus::Retried { new_tx } = &cached.status {
+        let status = cache.get(&tx_hash).unwrap();
+        if let TransactionStatus::Retried { new_tx } = &status {
             assert_eq!(*new_tx, retry_hash);
         } else {
             panic!("Expected Retried status");
@@ -383,14 +216,8 @@ mod tests {
 
     #[test]
     fn test_cache_get_unknown() {
-        let cache = TransactionStatusCache::new();
+        let cache = new_cache();
         let tx_hash = Hash::from_bytes(&[7u8; 32]);
         assert!(cache.get(&tx_hash).is_none());
-    }
-
-    #[test]
-    fn test_cache_with_config() {
-        let cache = TransactionStatusCache::with_config(10, Duration::from_secs(60));
-        assert!(cache.is_empty());
     }
 }

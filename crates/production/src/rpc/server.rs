@@ -1,11 +1,12 @@
 //! RPC server implementation.
 
 use super::routes::create_router;
-use super::state::{
-    MempoolSnapshot, NodeStatusState, RpcState, TransactionStatusCache, TxSubmissionSender,
-};
+use super::state::{MempoolSnapshot, NodeStatusState, RpcState, TxSubmissionSender};
 use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
+use hyperscale_core::TransactionStatus;
+use hyperscale_types::Hash;
+use quick_cache::sync::Cache as QuickCache;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -60,8 +61,8 @@ pub struct RpcServerHandle {
     sync_status: Arc<ArcSwap<SyncStatus>>,
     /// Node status provider for updates.
     node_status: Arc<RwLock<NodeStatusState>>,
-    /// Transaction status cache for updates.
-    tx_status_cache: Arc<RwLock<TransactionStatusCache>>,
+    /// Transaction status cache (shared from NodeLoop's QuickCache).
+    tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
     /// Mempool snapshot for updates.
     mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
 }
@@ -82,8 +83,8 @@ impl RpcServerHandle {
         &self.node_status
     }
 
-    /// Get a reference to the transaction status cache for updates.
-    pub fn tx_status_cache(&self) -> &Arc<RwLock<TransactionStatusCache>> {
+    /// Get a reference to the transaction status cache.
+    pub fn tx_status_cache(&self) -> &Arc<QuickCache<Hash, TransactionStatus>> {
         &self.tx_status_cache
     }
 
@@ -116,7 +117,12 @@ impl RpcServer {
     ///
     /// * `config` - Server configuration
     /// * `tx_submission_tx` - Crossbeam channel to submit transactions directly to NodeLoop
-    pub fn new(config: RpcServerConfig, tx_submission_tx: TxSubmissionSender) -> Self {
+    /// * `tx_status_cache` - Transaction status cache shared from NodeLoop
+    pub fn new(
+        config: RpcServerConfig,
+        tx_submission_tx: TxSubmissionSender,
+        tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
+    ) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;
         let state = RpcState {
             ready: Arc::new(AtomicBool::new(false)),
@@ -124,7 +130,7 @@ impl RpcServer {
             node_status: Arc::new(RwLock::new(NodeStatusState::default())),
             tx_submission_tx,
             start_time: Instant::now(),
-            tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
+            tx_status_cache,
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
             sync_backpressure_threshold,
         };
@@ -142,7 +148,7 @@ impl RpcServer {
         sync_status: Arc<ArcSwap<SyncStatus>>,
         node_status: Arc<RwLock<NodeStatusState>>,
         tx_submission_tx: TxSubmissionSender,
-        tx_status_cache: Arc<RwLock<TransactionStatusCache>>,
+        tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
         mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
     ) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;
@@ -213,7 +219,8 @@ mod tests {
     async fn test_server_creation() {
         let config = RpcServerConfig::default();
         let (tx_submission_tx, _rx) = crossbeam::channel::unbounded();
-        let server = RpcServer::new(config, tx_submission_tx);
+        let tx_status_cache = Arc::new(QuickCache::new(1000));
+        let server = RpcServer::new(config, tx_submission_tx, tx_status_cache);
 
         // Server should be created successfully
         assert!(!server.state.ready.load(Ordering::SeqCst));

@@ -8,11 +8,10 @@
 //! ```
 //!
 //! When nothing is ready, blocks on `crossbeam::select!` with a timeout derived
-//! from the nearest batch deadline. Transaction statuses are written directly to
-//! the shared `TransactionStatusCache` on the pinned thread, avoiding a channel
-//! round-trip back to the async runtime.
+//! from the nearest batch deadline. Transaction statuses are written to
+//! NodeLoop's internal `QuickCache`, shared with RPC handlers via `Arc`.
 
-use crate::rpc::state::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
+use crate::rpc::state::{MempoolSnapshot, NodeStatusState};
 use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
 use crossbeam::channel::Receiver;
@@ -49,9 +48,6 @@ pub struct PinnedLoopConfig {
     pub consensus_rx: Receiver<NodeInput>,
     /// Graceful shutdown signal.
     pub shutdown_rx: Receiver<()>,
-    /// Shared transaction status cache for RPC queries.
-    /// Updated directly on the pinned thread after each step.
-    pub tx_status_cache: Option<Arc<TokioRwLock<TransactionStatusCache>>>,
     /// Tokio runtime handle for spawning timer sleep tasks.
     pub tokio_handle: tokio::runtime::Handle,
     /// Timer ops from genesis initialization that need to be processed
@@ -254,17 +250,6 @@ pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, mut config: PinnedLoopConfig
             // Process timer operations from this step.
             for op in output.timer_ops {
                 timer_mgr.process_op(op);
-            }
-
-            // Write emitted statuses directly to the shared cache.
-            if !output.emitted_statuses.is_empty() {
-                if let Some(ref cache) = config.tx_status_cache {
-                    if let Ok(mut guard) = cache.try_write() {
-                        for (tx_hash, status) in &output.emitted_statuses {
-                            guard.update(*tx_hash, status.clone());
-                        }
-                    }
-                }
             }
         }
 

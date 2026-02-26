@@ -79,10 +79,6 @@ pub struct SimulationRunner {
 
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
-
-    /// Per-node transaction status cache. Captures all emitted statuses.
-    /// Maps (node_index, tx_hash) -> status for querying final transaction states.
-    tx_status_cache: HashMap<(NodeIndex, TxHash), TransactionStatus>,
 }
 
 /// Statistics collected during simulation.
@@ -254,7 +250,6 @@ impl SimulationRunner {
             stats: SimulationStats::default(),
             genesis_executed: vec![false; num_nodes],
             traffic_analyzer: None,
-            tx_status_cache: HashMap::new(),
         }
     }
 
@@ -294,8 +289,10 @@ impl SimulationRunner {
     }
 
     /// Get the last emitted transaction status for a node.
-    pub fn tx_status(&self, node: NodeIndex, tx_hash: &TxHash) -> Option<&TransactionStatus> {
-        self.tx_status_cache.get(&(node, *tx_hash))
+    pub fn tx_status(&self, node: NodeIndex, tx_hash: &TxHash) -> Option<TransactionStatus> {
+        self.node_loops
+            .get(node as usize)
+            .and_then(|nl| nl.tx_status(tx_hash))
     }
 
     /// Get simulation statistics.
@@ -605,12 +602,9 @@ impl SimulationRunner {
         }
     }
 
-    /// Process StepOutput: statuses, stats, and timer ops.
+    /// Process StepOutput: stats and timer ops.
     fn process_step_output(&mut self, node: NodeIndex, output: StepOutput) {
         self.stats.actions_generated += output.actions_generated as u64;
-        for (hash, status) in output.emitted_statuses {
-            self.tx_status_cache.insert((node, hash), status);
-        }
         for op in output.timer_ops {
             self.process_timer_op(node, op);
         }

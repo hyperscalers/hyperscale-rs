@@ -41,7 +41,7 @@
 //! ```
 
 use crate::event_loop::{spawn_pinned_loop, PinnedLoopConfig, ProdNodeLoop};
-use crate::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
+use crate::rpc::{MempoolSnapshot, NodeStatusState};
 use arc_swap::ArcSwap;
 use hyperscale_bft::BftConfig;
 use hyperscale_dispatch::Dispatch;
@@ -185,7 +185,6 @@ pub struct ProductionRunnerBuilder {
     ed25519_keypair: Option<Libp2pKeypair>,
     channel_capacity: usize,
     rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
-    tx_status_cache: Option<Arc<TokioRwLock<TransactionStatusCache>>>,
     mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
     sync_status: Option<Arc<ArcSwap<crate::status::SyncStatus>>>,
     /// Optional genesis configuration for initial state.
@@ -220,7 +219,6 @@ impl ProductionRunnerBuilder {
             ed25519_keypair: None,
             channel_capacity: 10_000,
             rpc_status: None,
-            tx_status_cache: None,
             mempool_snapshot: None,
             sync_status: None,
             genesis_config: None,
@@ -300,11 +298,6 @@ impl ProductionRunnerBuilder {
 
     pub fn rpc_status(mut self, status: Arc<TokioRwLock<NodeStatusState>>) -> Self {
         self.rpc_status = Some(status);
-        self
-    }
-
-    pub fn tx_status_cache(mut self, cache: Arc<TokioRwLock<TransactionStatusCache>>) -> Self {
-        self.tx_status_cache = Some(cache);
         self
     }
 
@@ -512,6 +505,7 @@ impl ProductionRunnerBuilder {
             Arc::clone(node_loop.cert_cache());
         let recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>> =
             Arc::clone(node_loop.tx_cache());
+        let tx_status_cache = Arc::clone(node_loop.tx_status_cache());
 
         // ── Spawn InboundRouter ──────────────────────────────────────────
         //
@@ -545,11 +539,11 @@ impl ProductionRunnerBuilder {
             dispatch,
             inbound_router,
             rpc_status: self.rpc_status,
-            tx_status_cache: self.tx_status_cache,
             mempool_snapshot: self.mempool_snapshot,
             sync_status: self.sync_status,
             genesis_config: self.genesis_config,
             local_shard,
+            tx_status_cache,
             recently_received_txs,
             recently_built_certs,
             shutdown_rx: Some(shutdown_rx),
@@ -614,7 +608,6 @@ pub struct ProductionRunner {
 
     // ── RPC state ────────────────────────────────────────────────────────
     rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
-    tx_status_cache: Option<Arc<TokioRwLock<TransactionStatusCache>>>,
     mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
     sync_status: Option<Arc<ArcSwap<crate::status::SyncStatus>>>,
 
@@ -623,6 +616,9 @@ pub struct ProductionRunner {
     genesis_config: Option<hyperscale_engine::GenesisConfig>,
 
     // ── Caches ───────────────────────────────────────────────────────────
+    /// Transaction status cache, shared from NodeLoop.
+    /// Provided to the RPC server for lock-free status queries.
+    tx_status_cache: Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>>,
     /// LRU cache of recently received transactions (via gossip or RPC).
     /// Shared with InboundRouter for serving peer fetch requests from memory.
     #[allow(dead_code)] // Kept alive to maintain Arc reference for InboundRouter
@@ -658,6 +654,15 @@ impl ProductionRunner {
     /// Get the local shard ID.
     pub fn local_shard(&self) -> ShardGroupId {
         self.local_shard
+    }
+
+    /// Get the transaction status cache shared from NodeLoop.
+    ///
+    /// This `Arc<QuickCache>` is the same instance used by NodeLoop on the
+    /// pinned thread. It can be passed directly to the RPC server for
+    /// lock-free status queries.
+    pub fn tx_status_cache(&self) -> Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>> {
+        Arc::clone(&self.tx_status_cache)
     }
 
     /// Get a crossbeam sender for submitting consensus events.
@@ -854,7 +859,6 @@ impl ProductionRunner {
                 .xb_shutdown_rx
                 .take()
                 .expect("shutdown_rx already taken"),
-            tx_status_cache: self.tx_status_cache.clone(),
             tokio_handle: tokio::runtime::Handle::current(),
             initial_timer_ops,
             rpc_status: self.rpc_status.clone(),

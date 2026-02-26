@@ -1221,7 +1221,7 @@ async fn main() -> Result<()> {
     // Create shared RPC state objects that will be used by both runner and RPC server.
     // These are created first so they can be wired into both components.
     use arc_swap::ArcSwap;
-    use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
+    use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState};
     use std::sync::atomic::AtomicBool;
     use tokio::sync::RwLock;
 
@@ -1236,7 +1236,6 @@ async fn main() -> Result<()> {
         num_shards: config.node.num_shards,
         ..Default::default()
     }));
-    let rpc_tx_status_cache = Arc::new(RwLock::new(TransactionStatusCache::new()));
     let rpc_mempool_snapshot = Arc::new(RwLock::new(MempoolSnapshot::default()));
 
     // Create production runner first (before RPC server)
@@ -1250,7 +1249,6 @@ async fn main() -> Result<()> {
         .storage(storage)
         .network(network_config, p2p_identity)
         .rpc_status(rpc_node_status.clone())
-        .tx_status_cache(rpc_tx_status_cache.clone())
         .mempool_snapshot(rpc_mempool_snapshot.clone())
         .sync_status(rpc_sync_status.clone())
         .speculative_max_txs(config.consensus.speculative_max_txs)
@@ -1275,6 +1273,7 @@ async fn main() -> Result<()> {
     // 2. Validate via the shared batcher
     // 3. Dispatch to mempool
     let tx_submission_sender = runner.tx_submission_sender();
+    let rpc_tx_status_cache = runner.tx_status_cache();
 
     // Start RPC server with the transaction submission channel and state
     let rpc_handle = if config.metrics.enabled {

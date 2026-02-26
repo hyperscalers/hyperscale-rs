@@ -48,6 +48,8 @@ use tracing::{debug, trace, warn};
 const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
 /// Default transaction cache capacity.
 const DEFAULT_TX_CACHE_SIZE: usize = 50_000;
+/// Default transaction status cache capacity.
+const DEFAULT_TX_STATUS_CACHE_SIZE: usize = 100_000;
 /// Maximum age for pending gossip certificate verifications before cleanup.
 const PENDING_GOSSIP_CERT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -285,6 +287,11 @@ where
     pending_broadcast_provisions: PendingBroadcastProvisions,
     batch_deadlines: HashMap<BatchType, Duration>,
 
+    // Transaction status cache — retains the latest status for every transaction
+    // that has emitted a status notification. Bounded LRU cache shared (via Arc)
+    // with external consumers (e.g. RPC handlers in production).
+    tx_status_cache: Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>>,
+
     // Accumulated outputs from this step (for caller to drain)
     emitted_statuses: Vec<(Hash, hyperscale_types::TransactionStatus)>,
     actions_generated: usize,
@@ -341,6 +348,7 @@ where
             pending_broadcast_certs: PendingBroadcastStateCerts::default(),
             pending_broadcast_provisions: PendingBroadcastProvisions::default(),
             batch_deadlines: HashMap::new(),
+            tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             emitted_statuses: Vec::new(),
             actions_generated: 0,
             pending_timer_ops: Vec::new(),
@@ -477,6 +485,24 @@ where
     /// Access the topology.
     pub fn topology(&self) -> &Arc<dyn Topology> {
         &self.topology
+    }
+
+    /// Look up the latest emitted status for a transaction.
+    ///
+    /// Returns the most recent status notification for the given transaction
+    /// hash, if any status has been emitted. Unlike the per-step
+    /// `StepOutput::emitted_statuses`, this cache persists across steps and
+    /// survives mempool eviction.
+    pub fn tx_status(&self, hash: &Hash) -> Option<hyperscale_types::TransactionStatus> {
+        self.tx_status_cache.get(hash)
+    }
+
+    /// Access the transaction status cache.
+    ///
+    /// The cache is an `Arc<QuickCache>` so it can be shared with external
+    /// consumers (e.g. RPC handlers) across threads without locking.
+    pub fn tx_status_cache(&self) -> &Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>> {
+        &self.tx_status_cache
     }
 
     // ─── Event Processing ───────────────────────────────────────────────
@@ -986,6 +1012,7 @@ where
                     let latency_secs = now.saturating_sub(added_at).as_secs_f64();
                     metrics::record_transaction_finalized(latency_secs, cross_shard);
                 }
+                self.tx_status_cache.insert(tx_hash, status.clone());
                 self.emitted_statuses.push((tx_hash, status));
             }
 

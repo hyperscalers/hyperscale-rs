@@ -240,7 +240,7 @@ impl Simulator {
             if let Some((submit_time, shard)) = self.in_flight.get(&hash).copied() {
                 // Check status from the status cache (survives eviction from mempool)
                 let node_idx = self.get_node_for_shard(shard);
-                if let Some(status) = self.runner.tx_status(node_idx, &hash).cloned() {
+                if let Some(status) = self.runner.tx_status(node_idx, &hash) {
                     // Only remove from in_flight when reaching a terminal state
                     if status.is_final() {
                         self.in_flight.remove(&hash);

@@ -280,12 +280,11 @@ pub async fn get_transaction_handler(
         }
     };
 
-    // Look up in cache
-    let cache = state.tx_status_cache.read().await;
-    match cache.get(&tx_hash) {
-        Some(cached) => {
+    // Look up in cache (QuickCache is lock-free, no await needed)
+    match state.tx_status_cache.get(&tx_hash) {
+        Some(status) => {
             let (status_str, committed_height, decision, deferred_by, retry_tx) =
-                format_transaction_status(&cached.status);
+                format_transaction_status(&status);
 
             (
                 StatusCode::OK,
@@ -402,7 +401,7 @@ pub async fn mempool_handler(State(state): State<RpcState>) -> impl IntoResponse
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::state::{MempoolSnapshot, NodeStatusState, TransactionStatusCache};
+    use crate::rpc::state::{MempoolSnapshot, NodeStatusState};
     use crate::status::SyncStatus;
     use arc_swap::ArcSwap;
     use axum::{body::Body, http::Request, Router};
@@ -421,7 +420,7 @@ mod tests {
             node_status: Arc::new(RwLock::new(NodeStatusState::default())),
             tx_submission_tx,
             start_time: Instant::now(),
-            tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
+            tx_status_cache: Arc::new(quick_cache::sync::Cache::new(1000)),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
             sync_backpressure_threshold: Some(10),
         }
@@ -644,10 +643,9 @@ mod tests {
         let tx_hash_hex = hex::encode(tx_hash.as_bytes());
 
         // Insert a transaction into the cache
-        {
-            let mut cache = state.tx_status_cache.write().await;
-            cache.update(tx_hash, TransactionStatus::Pending);
-        }
+        state
+            .tx_status_cache
+            .insert(tx_hash, TransactionStatus::Pending);
 
         let app = Router::new()
             .route("/tx/{hash}", axum::routing::get(get_transaction_handler))
@@ -766,7 +764,7 @@ mod tests {
             node_status: Arc::new(RwLock::new(NodeStatusState::default())),
             tx_submission_tx,
             start_time: Instant::now(),
-            tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
+            tx_status_cache: Arc::new(quick_cache::sync::Cache::new(1000)),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
             sync_backpressure_threshold: Some(10),
         };
@@ -829,7 +827,7 @@ mod tests {
             node_status: Arc::new(RwLock::new(NodeStatusState::default())),
             tx_submission_tx,
             start_time: Instant::now(),
-            tx_status_cache: Arc::new(RwLock::new(TransactionStatusCache::new())),
+            tx_status_cache: Arc::new(quick_cache::sync::Cache::new(1000)),
             mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
             sync_backpressure_threshold: Some(10),
         };
