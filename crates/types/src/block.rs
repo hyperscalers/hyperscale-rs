@@ -107,6 +107,22 @@ pub struct BlockHeader {
 }
 
 impl BlockHeader {
+    /// Create a genesis block header (height 0) with the given proposer and JMT state.
+    pub fn genesis(proposer: ValidatorId, state_root: Hash, state_version: u64) -> Self {
+        Self {
+            height: BlockHeight(0),
+            parent_hash: Hash::from_bytes(&[0u8; 32]),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer,
+            timestamp: 0,
+            round: 0,
+            is_fallback: false,
+            state_root,
+            state_version,
+            transaction_root: Hash::ZERO,
+        }
+    }
+
     /// Compute hash of this block header.
     pub fn hash(&self) -> Hash {
         let bytes = basic_encode(self).expect("BlockHeader serialization should never fail");
@@ -361,6 +377,20 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for Block {
 }
 
 impl Block {
+    /// Create an empty genesis block with the given proposer and JMT state.
+    pub fn genesis(proposer: ValidatorId, state_root: Hash, state_version: u64) -> Self {
+        Self {
+            header: BlockHeader::genesis(proposer, state_root, state_version),
+            retry_transactions: vec![],
+            priority_transactions: vec![],
+            transactions: vec![],
+            certificates: vec![],
+            deferred: vec![],
+            aborted: vec![],
+            commitment_proofs: HashMap::new(),
+        }
+    }
+
     /// Compute hash of this block (hashes the header).
     pub fn hash(&self) -> Hash {
         self.header.hash()
@@ -415,31 +445,6 @@ impl Block {
     /// Check if this is the genesis block.
     pub fn is_genesis(&self) -> bool {
         self.header.is_genesis()
-    }
-
-    /// Create a genesis block.
-    pub fn genesis(genesis_qc: QuorumCertificate) -> Self {
-        Self {
-            header: BlockHeader {
-                height: BlockHeight(0),
-                parent_hash: Hash::ZERO,
-                parent_qc: genesis_qc,
-                proposer: ValidatorId(0),
-                timestamp: 0,
-                round: 0,
-                is_fallback: false,
-                state_root: Hash::ZERO,
-                state_version: 0,
-                transaction_root: Hash::ZERO,
-            },
-            retry_transactions: vec![],
-            priority_transactions: vec![],
-            transactions: vec![],
-            certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
-            commitment_proofs: HashMap::new(),
-        }
     }
 
     /// Check if a transaction has a commitment proof in this block.
@@ -635,13 +640,13 @@ mod tests {
 
     #[test]
     fn test_genesis_block() {
-        let genesis_qc = QuorumCertificate::genesis();
-        let genesis = Block::genesis(genesis_qc);
+        let genesis = Block::genesis(ValidatorId(0), Hash::ZERO, 0);
 
         assert!(genesis.is_genesis());
         assert_eq!(genesis.height(), BlockHeight(0));
         assert_eq!(genesis.transaction_count(), 0);
         assert_eq!(genesis.header.transaction_root, Hash::ZERO);
+        assert_eq!(genesis.header.parent_qc, QuorumCertificate::genesis());
     }
 
     #[test]

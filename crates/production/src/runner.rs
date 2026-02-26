@@ -59,7 +59,6 @@ use hyperscale_storage::{
     DbSubstateValue, PartitionEntry, SubstateDatabase,
 };
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
-use hyperscale_types::BlockHeight;
 use quick_cache::sync::Cache as QuickCache;
 
 use hyperscale_core::NodeInput;
@@ -67,8 +66,8 @@ use hyperscale_node::node_loop::{NodeLoop, TimerOp};
 use hyperscale_node::sync_protocol::SyncProtocol;
 use hyperscale_node::NodeStateMachine;
 use hyperscale_types::{
-    Block, BlockHeader, Bls12381G1PrivateKey, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, Topology, TransactionCertificate, ValidatorId,
+    Block, Bls12381G1PrivateKey, Hash, RoutableTransaction, ShardGroupId, Topology,
+    TransactionCertificate, ValidatorId,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -760,29 +759,7 @@ impl ProductionRunner {
             .copied()
             .unwrap_or(ValidatorId(0));
 
-        let genesis_header = BlockHeader {
-            height: BlockHeight(0),
-            parent_hash: Hash::from_bytes(&[0u8; 32]),
-            parent_qc: QuorumCertificate::genesis(),
-            proposer: first_validator,
-            timestamp: 0,
-            round: 0,
-            is_fallback: false,
-            state_root: genesis_jmt_root,
-            state_version: genesis_jmt_version,
-            transaction_root: Hash::ZERO,
-        };
-
-        let genesis_block = Block {
-            header: genesis_header,
-            retry_transactions: vec![],
-            priority_transactions: vec![],
-            transactions: vec![],
-            certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
-            commitment_proofs: std::collections::HashMap::new(),
-        };
+        let genesis_block = Block::genesis(first_validator, genesis_jmt_root, genesis_jmt_version);
 
         let genesis_hash = genesis_block.hash();
         info!(

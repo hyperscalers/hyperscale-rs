@@ -368,7 +368,7 @@ impl SimulationRunner {
     /// Initialize all nodes with genesis blocks and start consensus.
     pub fn initialize_genesis(&mut self) {
         use hyperscale_storage::SubstateStore;
-        use hyperscale_types::{Block, BlockHeader, BlockHeight, Hash, QuorumCertificate};
+        use hyperscale_types::Block;
 
         // Run Radix Engine genesis on each node's storage
         for node_idx in 0..self.node_loops.len() {
@@ -406,29 +406,8 @@ impl SimulationRunner {
                 "JMT state after genesis bootstrap"
             );
 
-            let genesis_header = BlockHeader {
-                height: BlockHeight(0),
-                parent_hash: Hash::from_bytes(&[0u8; 32]),
-                parent_qc: QuorumCertificate::genesis(),
-                proposer: ValidatorId((shard_id * validators_per_shard) as u64),
-                timestamp: 0,
-                round: 0,
-                is_fallback: false,
-                state_root: genesis_jmt_root,
-                state_version: genesis_jmt_version,
-                transaction_root: Hash::ZERO,
-            };
-
-            let genesis_block = Block {
-                header: genesis_header,
-                retry_transactions: vec![],
-                priority_transactions: vec![],
-                transactions: vec![],
-                certificates: vec![],
-                deferred: vec![],
-                aborted: vec![],
-                commitment_proofs: std::collections::HashMap::new(),
-            };
+            let proposer = ValidatorId((shard_id * validators_per_shard) as u64);
+            let genesis_block = Block::genesis(proposer, genesis_jmt_root, genesis_jmt_version);
 
             let shard_end = shard_start + validators_per_shard;
             for node_index in shard_start..shard_end {
@@ -473,7 +452,7 @@ impl SimulationRunner {
     ) {
         use hyperscale_engine::GenesisConfig;
         use hyperscale_storage::SubstateStore;
-        use hyperscale_types::{Block, BlockHeader, BlockHeight, Hash, QuorumCertificate};
+        use hyperscale_types::Block;
 
         // Run Radix Engine genesis on each node's storage with balances
         for node_idx in 0..self.node_loops.len() {
@@ -519,29 +498,8 @@ impl SimulationRunner {
                 "JMT state after genesis bootstrap"
             );
 
-            let genesis_header = BlockHeader {
-                height: BlockHeight(0),
-                parent_hash: Hash::from_bytes(&[0u8; 32]),
-                parent_qc: QuorumCertificate::genesis(),
-                proposer: ValidatorId((shard_id * validators_per_shard) as u64),
-                timestamp: 0,
-                round: 0,
-                is_fallback: false,
-                state_root: genesis_jmt_root,
-                state_version: genesis_jmt_version,
-                transaction_root: Hash::ZERO,
-            };
-
-            let genesis_block = Block {
-                header: genesis_header,
-                retry_transactions: vec![],
-                priority_transactions: vec![],
-                transactions: vec![],
-                certificates: vec![],
-                deferred: vec![],
-                aborted: vec![],
-                commitment_proofs: std::collections::HashMap::new(),
-            };
+            let proposer = ValidatorId((shard_id * validators_per_shard) as u64);
+            let genesis_block = Block::genesis(proposer, genesis_jmt_root, genesis_jmt_version);
 
             let shard_end = shard_start + validators_per_shard;
             for node_index in shard_start..shard_end {
