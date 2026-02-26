@@ -367,10 +367,7 @@ impl SimulationRunner {
 
     /// Initialize all nodes with genesis blocks and start consensus.
     pub fn initialize_genesis(&mut self) {
-        use hyperscale_storage::SubstateStore;
-        use hyperscale_types::Block;
-
-        // Run Radix Engine genesis on each node's storage
+        // Run Radix Engine genesis on each node's storage.
         for node_idx in 0..self.node_loops.len() {
             if !self.genesis_executed[node_idx] {
                 let result = self.node_loops[node_idx]
@@ -385,6 +382,55 @@ impl SimulationRunner {
             num_nodes = self.node_loops.len(),
             "Radix Engine genesis complete on all nodes"
         );
+
+        self.finalize_genesis();
+    }
+
+    /// Initialize genesis with pre-funded accounts.
+    pub fn initialize_genesis_with_balances(
+        &mut self,
+        balances: Vec<(
+            radix_common::types::ComponentAddress,
+            radix_common::math::Decimal,
+        )>,
+    ) {
+        use hyperscale_engine::GenesisConfig;
+
+        // Run Radix Engine genesis on each node's storage with balances.
+        for node_idx in 0..self.node_loops.len() {
+            if !self.genesis_executed[node_idx] {
+                let balances = balances.clone();
+                let result =
+                    self.node_loops[node_idx].with_storage_and_executor(|storage, executor| {
+                        let config = GenesisConfig {
+                            xrd_balances: balances,
+                            ..GenesisConfig::test_default()
+                        };
+                        executor.run_genesis_with_config(storage, config)
+                    });
+                if let Err(e) = result {
+                    warn!(node = node_idx, "Radix Engine genesis failed: {:?}", e);
+                }
+                self.genesis_executed[node_idx] = true;
+            }
+        }
+        info!(
+            num_nodes = self.node_loops.len(),
+            num_funded_accounts = balances.len(),
+            "Radix Engine genesis complete with funded accounts"
+        );
+
+        self.finalize_genesis();
+    }
+
+    /// Register handlers and initialize state-machine genesis on all nodes.
+    ///
+    /// Called after engine genesis (which requires sole Arc ownership via
+    /// `with_storage_and_executor`). Registers network handlers, creates
+    /// genesis blocks per shard, and initializes each node's state machine.
+    fn finalize_genesis(&mut self) {
+        use hyperscale_storage::SubstateStore;
+        use hyperscale_types::Block;
 
         // Register handlers between engine genesis (needs sole Arc) and
         // state-machine genesis (calls drain_node_io which needs gossip registries).
@@ -424,96 +470,6 @@ impl SimulationRunner {
                 self.process_step_output(node_index, output);
 
                 // Sync state machine with actual JMT state after genesis bootstrap
-                let genesis_commit_event =
-                    NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
-                        height: 0,
-                        state_version: genesis_jmt_version,
-                        state_root: genesis_jmt_root,
-                    });
-                self.schedule_event(node_index, self.now, genesis_commit_event);
-            }
-
-            info!(
-                shard = shard_id,
-                genesis_hash = ?genesis_block.hash(),
-                validators = validators_per_shard,
-                "Initialized genesis for shard"
-            );
-        }
-    }
-
-    /// Initialize genesis with pre-funded accounts.
-    pub fn initialize_genesis_with_balances(
-        &mut self,
-        balances: Vec<(
-            radix_common::types::ComponentAddress,
-            radix_common::math::Decimal,
-        )>,
-    ) {
-        use hyperscale_engine::GenesisConfig;
-        use hyperscale_storage::SubstateStore;
-        use hyperscale_types::Block;
-
-        // Run Radix Engine genesis on each node's storage with balances
-        for node_idx in 0..self.node_loops.len() {
-            if !self.genesis_executed[node_idx] {
-                let balances = balances.clone();
-                let result =
-                    self.node_loops[node_idx].with_storage_and_executor(|storage, executor| {
-                        let config = GenesisConfig {
-                            xrd_balances: balances,
-                            ..GenesisConfig::test_default()
-                        };
-                        executor.run_genesis_with_config(storage, config)
-                    });
-                if let Err(e) = result {
-                    warn!(node = node_idx, "Radix Engine genesis failed: {:?}", e);
-                }
-                self.genesis_executed[node_idx] = true;
-            }
-        }
-        info!(
-            num_nodes = self.node_loops.len(),
-            num_funded_accounts = balances.len(),
-            "Radix Engine genesis complete with funded accounts"
-        );
-
-        // Register handlers between engine genesis (needs sole Arc) and
-        // state-machine genesis (calls drain_node_io which needs gossip registries).
-        self.register_handlers();
-
-        let num_shards = self.network.config().num_shards;
-        let validators_per_shard = self.network.config().validators_per_shard;
-
-        for shard_id in 0..num_shards {
-            let shard_start = shard_id * validators_per_shard;
-            let first_node_storage = self.node_loops[shard_start as usize].storage();
-            let genesis_jmt_version = first_node_storage.state_version();
-            let genesis_jmt_root = first_node_storage.state_root_hash();
-
-            info!(
-                shard = shard_id,
-                genesis_jmt_version,
-                genesis_jmt_root = ?genesis_jmt_root,
-                "JMT state after genesis bootstrap"
-            );
-
-            let proposer = ValidatorId((shard_id * validators_per_shard) as u64);
-            let genesis_block = Block::genesis(proposer, genesis_jmt_root, genesis_jmt_version);
-
-            let shard_end = shard_start + validators_per_shard;
-            for node_index in shard_start..shard_end {
-                let i = node_index as usize;
-                let actions = self.node_loops[i]
-                    .state_mut()
-                    .initialize_genesis(genesis_block.clone());
-                self.node_loops[i].handle_actions(actions);
-                self.node_loops[i].flush_all_batches();
-
-                let output = self.node_loops[i].drain_pending_output();
-                self.drain_node_io(node_index);
-                self.process_step_output(node_index, output);
-
                 let genesis_commit_event =
                     NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
                         height: 0,
