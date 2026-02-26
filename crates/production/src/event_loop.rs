@@ -16,7 +16,7 @@ use crate::rpc::state::{MempoolSnapshot, NodeStatusState, TransactionStatusCache
 use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
 use crossbeam::channel::Receiver;
-use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
+use hyperscale_core::{NodeInput, TimerId};
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network_libp2p::ProdNetwork;
@@ -66,16 +66,6 @@ pub struct PinnedLoopConfig {
 // ProdTimerManager — manages tokio-based timers on the pinned thread
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Convert a TimerId to the corresponding Event.
-fn timer_event(id: TimerId) -> NodeInput {
-    match id {
-        TimerId::Proposal => NodeInput::Protocol(ProtocolEvent::ProposalTimer),
-        TimerId::Cleanup => NodeInput::Protocol(ProtocolEvent::CleanupTimer),
-        TimerId::GlobalConsensus => NodeInput::Protocol(ProtocolEvent::GlobalConsensusTimer),
-        TimerId::FetchTick => NodeInput::FetchTick,
-    }
-}
-
 /// Manages tokio-based timers for the production pinned event loop.
 ///
 /// Spawns async sleep tasks via the tokio handle that fire timer events
@@ -109,7 +99,7 @@ impl ProdTimerManager {
                 let timer_id = id.clone();
                 let handle = self.tokio_handle.spawn(async move {
                     tokio::time::sleep(duration).await;
-                    let _ = timer_tx.send(timer_event(timer_id));
+                    let _ = timer_tx.send(timer_id.into_event());
                 });
                 self.active.insert(id, handle);
             }

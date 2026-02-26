@@ -5,6 +5,8 @@
 //! - Production: `TimerManager` spawns tokio tasks
 //! - Simulation: inserts into a deterministic event queue
 
+use crate::input::NodeInput;
+use crate::protocol_event::ProtocolEvent;
 use std::time::Duration;
 
 /// Timer identification for scheduled events.
@@ -18,6 +20,18 @@ pub enum TimerId {
     GlobalConsensus,
     /// Periodic tick for the fetch protocol (retry pending fetches)
     FetchTick,
+}
+
+impl TimerId {
+    /// Convert this timer ID to the corresponding [`NodeInput`] event.
+    pub fn into_event(self) -> NodeInput {
+        match self {
+            TimerId::Proposal => NodeInput::Protocol(ProtocolEvent::ProposalTimer),
+            TimerId::Cleanup => NodeInput::Protocol(ProtocolEvent::CleanupTimer),
+            TimerId::GlobalConsensus => NodeInput::Protocol(ProtocolEvent::GlobalConsensusTimer),
+            TimerId::FetchTick => NodeInput::FetchTick,
+        }
+    }
 }
 
 /// Abstraction for scheduling and cancelling timers.

@@ -699,7 +699,7 @@ impl SimulationRunner {
         match op {
             TimerOp::Set { id, duration } => {
                 let fire_time = self.now + duration;
-                let event = self.timer_to_event(id.clone());
+                let event = id.clone().into_event();
                 let key = self.schedule_event(node, fire_time, event);
                 self.timers.insert((node, id), key);
                 self.stats.timers_set += 1;
@@ -710,16 +710,6 @@ impl SimulationRunner {
                     self.stats.timers_cancelled += 1;
                 }
             }
-        }
-    }
-
-    /// Convert a timer ID to an event.
-    fn timer_to_event(&self, id: TimerId) -> NodeInput {
-        match id {
-            TimerId::Proposal => NodeInput::Protocol(ProtocolEvent::ProposalTimer),
-            TimerId::Cleanup => NodeInput::Protocol(ProtocolEvent::CleanupTimer),
-            TimerId::GlobalConsensus => NodeInput::Protocol(ProtocolEvent::GlobalConsensusTimer),
-            TimerId::FetchTick => NodeInput::FetchTick,
         }
     }
 
