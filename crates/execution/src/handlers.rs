@@ -7,20 +7,23 @@
 //! Each execution function is the single-transaction unit of work. Production
 //! wraps calls in `rayon::par_iter()` for parallelism; simulation calls sequentially.
 //!
-//! Note: Production's time-windowed batching (20ms state votes, 15ms state certs)
-//! uses `batch_verify_bls_different_messages` across transactions — a different
-//! algorithm that stays in the production runner.
+//! The `batch_verify_*` functions use [`batch_verify_bls_different_messages`] to
+//! verify accumulated signatures across multiple transactions in ~2 pairing
+//! operations. These are called from the node loop's time-windowed batch flush.
 
 use hyperscale_engine::RadixExecutor;
 use hyperscale_storage::SubstateStore;
 use hyperscale_types::{
-    batch_verify_bls_same_message, exec_vote_message, verify_bls12381_v1, zero_bls_signature,
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Hash, NodeId,
-    RoutableTransaction, ShardGroupId, SignerBitfield, StateCertificate, StateProvision,
-    StateVoteBlock, Topology, ValidatorId, VotePower,
+    batch_verify_bls_different_messages, batch_verify_bls_same_message, exec_vote_message,
+    verify_bls12381_v1, zero_bls_signature, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    Bls12381G2Signature, Hash, NodeId, RoutableTransaction, ShardGroupId, SignerBitfield,
+    StateCertificate, StateProvision, StateVoteBlock, Topology, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// A state vote with its signer's public key and voting power, awaiting verification.
+pub type UnverifiedStateVote = (StateVoteBlock, Bls12381G1PublicKey, u64);
 
 /// Aggregate verified state votes into a `StateCertificate`.
 ///
@@ -90,14 +93,12 @@ pub fn aggregate_state_certificate(
 /// sign the same message), then uses BLS same-message batch verification for
 /// each group. Falls back to individual verification on batch failure.
 ///
-/// Note: Production's cross-transaction 20ms batching accumulator uses
-/// `batch_verify_bls_different_messages` instead — that optimization stays
-/// in the production runner.
+/// For cross-transaction batching, see [`batch_verify_and_aggregate_state_votes`]
+/// which uses `batch_verify_bls_different_messages` across accumulated items.
 pub fn verify_and_aggregate_state_votes(
-    votes: Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>,
+    votes: Vec<UnverifiedStateVote>,
 ) -> Vec<(StateVoteBlock, u64)> {
-    let mut by_message: HashMap<Vec<u8>, Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>> =
-        HashMap::new();
+    let mut by_message: HashMap<Vec<u8>, Vec<UnverifiedStateVote>> = HashMap::new();
     for (vote, pk, power) in votes {
         let msg = vote.signing_message();
         by_message.entry(msg).or_default().push((vote, pk, power));
@@ -170,6 +171,130 @@ pub fn verify_state_certificate_signature(
             Err(_) => false,
         }
     }
+}
+
+/// Batch verify state votes across multiple transactions.
+///
+/// Collects all individual (message, signature, pubkey) triples across all
+/// tx_hashes and verifies them in ~2 pairing operations via
+/// [`batch_verify_bls_different_messages`]. Falls back to individual
+/// verification when the batch check fails (to identify which votes failed).
+///
+/// For a single tx_hash, delegates to [`verify_and_aggregate_state_votes`]
+/// which applies same-message grouping (cheaper when many votes share a
+/// merkle root).
+pub fn batch_verify_and_aggregate_state_votes(
+    items: Vec<(Hash, Vec<UnverifiedStateVote>)>,
+) -> Vec<(Hash, Vec<(StateVoteBlock, u64)>)> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    // Single tx_hash — use the per-tx function which does same-message optimisation.
+    if items.len() == 1 {
+        let (tx_hash, votes) = items.into_iter().next().unwrap();
+        let verified = verify_and_aggregate_state_votes(votes);
+        return vec![(tx_hash, verified)];
+    }
+
+    // Flatten all votes across tx_hashes.
+    let total_votes: usize = items.iter().map(|(_, v)| v.len()).sum();
+    let mut messages = Vec::with_capacity(total_votes);
+    let mut signatures = Vec::with_capacity(total_votes);
+    let mut pubkeys = Vec::with_capacity(total_votes);
+    let mut vote_data: Vec<(usize, StateVoteBlock, u64)> = Vec::with_capacity(total_votes);
+    let mut tx_hashes = Vec::with_capacity(items.len());
+
+    for (tx_idx, (tx_hash, votes)) in items.into_iter().enumerate() {
+        tx_hashes.push(tx_hash);
+        for (vote, pk, power) in votes {
+            messages.push(vote.signing_message());
+            signatures.push(vote.signature);
+            pubkeys.push(pk);
+            vote_data.push((tx_idx, vote, power));
+        }
+    }
+
+    // Cross-transaction batch verification.
+    let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+    let results = batch_verify_bls_different_messages(&msg_refs, &signatures, &pubkeys);
+
+    // Reconstruct per-tx results.
+    let num_items = tx_hashes.len();
+    let mut per_tx: Vec<Vec<(StateVoteBlock, u64)>> = (0..num_items).map(|_| Vec::new()).collect();
+    for (valid, (tx_idx, vote, power)) in results.into_iter().zip(vote_data) {
+        if valid {
+            per_tx[tx_idx].push((vote, power));
+        }
+    }
+
+    tx_hashes.into_iter().zip(per_tx).collect()
+}
+
+/// Batch verify state certificate signatures.
+///
+/// Pre-aggregates signer public keys per certificate (cheap), then verifies
+/// all aggregated signatures in ~2 pairing operations via
+/// [`batch_verify_bls_different_messages`]. Falls back to individual
+/// verification when the batch check fails.
+///
+/// Certificates with no signers are handled inline (zero-signature check).
+pub fn batch_verify_state_certificate_signatures(
+    items: &[(StateCertificate, Vec<Bls12381G1PublicKey>)],
+) -> Vec<bool> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+
+    if items.len() == 1 {
+        return vec![verify_state_certificate_signature(&items[0].0, &items[0].1)];
+    }
+
+    let mut results = vec![false; items.len()];
+
+    // Pre-process: aggregate signer keys per cert, collect for batch verify.
+    let mut messages = Vec::with_capacity(items.len());
+    let mut signatures = Vec::with_capacity(items.len());
+    let mut agg_pubkeys = Vec::with_capacity(items.len());
+    let mut batch_indices = Vec::with_capacity(items.len());
+
+    for (i, (cert, public_keys)) in items.iter().enumerate() {
+        let signer_keys: Vec<_> = public_keys
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| cert.signers.is_set(*j))
+            .map(|(_, pk)| *pk)
+            .collect();
+
+        if signer_keys.is_empty() {
+            // No signers — valid only if zero signature (single-shard case).
+            results[i] = cert.aggregated_signature == zero_bls_signature();
+            continue;
+        }
+
+        match Bls12381G1PublicKey::aggregate(&signer_keys, false) {
+            Ok(agg_pk) => {
+                messages.push(cert.signing_message());
+                signatures.push(cert.aggregated_signature);
+                agg_pubkeys.push(agg_pk);
+                batch_indices.push(i);
+            }
+            Err(_) => {
+                results[i] = false;
+            }
+        }
+    }
+
+    if !messages.is_empty() {
+        let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+        let batch_results =
+            batch_verify_bls_different_messages(&msg_refs, &signatures, &agg_pubkeys);
+        for (valid, &orig_idx) in batch_results.into_iter().zip(&batch_indices) {
+            results[orig_idx] = valid;
+        }
+    }
+
+    results
 }
 
 /// Execute a single-shard transaction and sign the vote.

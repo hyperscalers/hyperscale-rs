@@ -109,8 +109,10 @@ const BATCH_MAX_TX_VALIDATION: usize = 128;
 /// Batch window for transaction validation.
 const BATCH_WINDOW_TX_VALIDATION: Duration = Duration::from_millis(20);
 
-/// A single state-vote verification item: (tx_hash, votes with public keys and voting power).
-type StateVoteVerificationItem = (Hash, Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>);
+use hyperscale_execution::handlers::UnverifiedStateVote;
+
+/// A single state-vote verification item: tx_hash with its unverified votes.
+type StateVoteVerificationItem = (Hash, Vec<UnverifiedStateVote>);
 
 // ═══════════════════════════════════════════════════════════════════════
 // TimerOp — buffered timer operations for the runner
@@ -1396,36 +1398,42 @@ where
         });
     }
 
-    /// Flush a batch of state vote verifications.
+    /// Flush accumulated state vote verifications as a single batch.
+    ///
+    /// Spawns one closure on the crypto pool that uses cross-transaction BLS
+    /// batch verification (~2 pairings) instead of N individual dispatches.
     fn flush_state_vote_verifications(&mut self) {
         let items = self.state_vote_batch.take();
         if items.is_empty() {
             return;
         }
 
-        // Dispatch each item individually through handle_delegated_action.
-        // In production, these would be batched into a single BLS verify call.
-        // For now, process individually.
-        for (tx_hash, votes) in items {
-            let action = Action::VerifyAndAggregateStateVotes { tx_hash, votes };
-            self.dispatch_delegated_action(action);
-        }
+        let event_tx = self.event_sender.clone();
+        self.dispatch.spawn_crypto(move || {
+            let events = action_handler::handle_state_vote_batch(items);
+            for event in events {
+                let _ = event_tx.send(event);
+            }
+        });
     }
 
-    /// Flush a batch of state certificate verifications.
+    /// Flush accumulated state certificate verifications as a single batch.
+    ///
+    /// Spawns one closure on the crypto pool that uses cross-certificate BLS
+    /// batch verification (~2 pairings) instead of N individual dispatches.
     fn flush_state_cert_verifications(&mut self) {
         let items = self.state_cert_batch.take();
         if items.is_empty() {
             return;
         }
 
-        for (certificate, public_keys) in items {
-            let action = Action::VerifyStateCertificateSignature {
-                certificate,
-                public_keys,
-            };
-            self.dispatch_delegated_action(action);
-        }
+        let event_tx = self.event_sender.clone();
+        self.dispatch.spawn_crypto(move || {
+            let events = action_handler::handle_state_cert_batch(items);
+            for event in events {
+                let _ = event_tx.send(event);
+            }
+        });
     }
 
     // ─── Gossip Certificate Verification ─────────────────────────────────

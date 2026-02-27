@@ -11,10 +11,11 @@
 use hyperscale_core::{Action, CrossShardExecutionRequest, NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
+use hyperscale_execution::handlers::UnverifiedStateVote;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
-    Block, BlockHeight, Bls12381G1PrivateKey, Hash, QuorumCertificate, ShardGroupId,
-    StateVoteBlock, Topology, ValidatorId,
+    Block, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Hash, QuorumCertificate,
+    ShardGroupId, StateCertificate, StateVoteBlock, Topology, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -482,6 +483,42 @@ pub fn handle_cross_shard_batch<S: CommitStore + SubstateStore, D: Dispatch>(
     votes
         .into_iter()
         .map(|vote| NodeInput::Protocol(ProtocolEvent::StateVoteReceived { vote }))
+        .collect()
+}
+
+/// Batch verify state votes across multiple transactions and return events.
+///
+/// Uses cross-transaction BLS batch verification (~2 pairings for the whole
+/// batch). Emits one `StateVotesVerifiedAndAggregated` event per tx_hash.
+pub fn handle_state_vote_batch(items: Vec<(Hash, Vec<UnverifiedStateVote>)>) -> Vec<NodeInput> {
+    hyperscale_execution::handlers::batch_verify_and_aggregate_state_votes(items)
+        .into_iter()
+        .map(|(tx_hash, verified_votes)| {
+            NodeInput::Protocol(ProtocolEvent::StateVotesVerifiedAndAggregated {
+                tx_hash,
+                verified_votes,
+            })
+        })
+        .collect()
+}
+
+/// Batch verify state certificate signatures and return events.
+///
+/// Uses cross-certificate BLS batch verification (~2 pairings for the whole
+/// batch). Emits one `StateCertificateSignatureVerified` event per certificate.
+pub fn handle_state_cert_batch(
+    items: Vec<(StateCertificate, Vec<Bls12381G1PublicKey>)>,
+) -> Vec<NodeInput> {
+    let results = hyperscale_execution::handlers::batch_verify_state_certificate_signatures(&items);
+    items
+        .into_iter()
+        .zip(results)
+        .map(|((certificate, _), valid)| {
+            NodeInput::Protocol(ProtocolEvent::StateCertificateSignatureVerified {
+                certificate,
+                valid,
+            })
+        })
         .collect()
 }
 
