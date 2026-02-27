@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Deterministic in-memory network transport for simulation"
 
 [dependencies]
+hyperscale-core.workspace = true
 hyperscale-network.workspace = true
 hyperscale-types.workspace = true
 

@@ -77,9 +77,6 @@ pub fn compute_peer_id_for_validator(public_key: &Bls12381G1PublicKey) -> Libp2p
 /// Commands are processed in priority order when using priority channels.
 /// Non-broadcast commands (Subscribe, Dial, etc.) are always processed
 /// with high priority since they're control operations.
-///
-/// NOTE: Request/response is now handled via raw streams (libp2p_stream).
-/// The adapter is a "dumb pipe" - RequestManager owns all timeout logic.
 #[derive(Debug)]
 pub enum SwarmCommand {
     /// Subscribe to a gossipsub topic.
@@ -240,7 +237,6 @@ pub enum NetworkError {
 }
 
 /// Protocol identifier for raw stream requests.
-/// Version 2.0.0 indicates the switch from request-response to raw streams.
 pub const STREAM_PROTOCOL: StreamProtocol = StreamProtocol::new("/hyperscale/req/2.0.0");
 
 /// libp2p network behaviour combining gossipsub, Kademlia, and raw streams.
@@ -277,10 +273,6 @@ pub struct Libp2pAdapter {
     /// Local validator ID (from topology).
     local_validator_id: ValidatorId,
 
-    /// Local shard assignment (passed to event loop for shard validation).
-    #[allow(dead_code)]
-    local_shard: ShardGroupId,
-
     /// Priority-based command channels to swarm task.
     /// Commands are routed to the appropriate channel based on message priority.
     priority_channels: PriorityCommandChannels,
@@ -299,8 +291,6 @@ pub struct Libp2pAdapter {
     /// This avoids blocking the consensus loop to query peer count.
     cached_peer_count: Arc<AtomicUsize>,
 
-    /// Codec pool handle for decoding in the event loop.
-    /// Encoding is now done inline by callers via `hyperscale_network::encode_to_wire`.
     #[allow(dead_code)]
     codec_pool: CodecPoolHandle,
 
@@ -570,7 +560,6 @@ impl Libp2pAdapter {
         let adapter = Arc::new(Self {
             local_peer_id,
             local_validator_id: validator_id,
-            local_shard: shard,
             priority_channels,
             validator_peers: validator_peers.clone(),
             peer_validators: peer_validators.clone(),
@@ -650,7 +639,6 @@ impl Libp2pAdapter {
         let topics = [
             Topic::block_header(shard),
             Topic::block_vote(shard),
-            // Note: view_change topics removed - using HotStuff-2 implicit rounds
             Topic::transaction_gossip(shard),
             Topic::transaction_certificate(shard),
             Topic::state_provision_batch(shard),
@@ -800,10 +788,6 @@ impl Libp2pAdapter {
     /// 3. Finalization priority (certificate gossip)
     /// 4. Propagation priority (transaction gossip)
     /// 5. Background priority (sync operations)
-    ///
-    /// NOTE: Request/response is now handled via raw streams (libp2p_stream).
-    /// Inbound streams are accepted by InboundRouter, not this event loop.
-    /// Outbound streams are opened via open_stream() by RequestManager.
     #[allow(clippy::too_many_arguments)]
     async fn event_loop(
         mut swarm: Swarm<Behaviour>,
@@ -1243,10 +1227,6 @@ impl Libp2pAdapter {
 
 impl Libp2pAdapter {
     /// Handle a single swarm event.
-    ///
-    /// NOTE: Request/response handling has been removed from this event loop.
-    /// Inbound requests are now handled via raw streams by InboundRouter.
-    /// Outbound requests are handled via raw streams by RequestManager.
     async fn handle_swarm_event(
         event: SwarmEvent<BehaviourEvent>,
         peer_validators: &Arc<DashMap<Libp2pPeerId, ValidatorId>>,

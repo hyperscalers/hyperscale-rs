@@ -171,11 +171,6 @@ impl SyncProtocol {
         self.sync_target.is_some()
     }
 
-    /// Get the sync target height (for metrics).
-    pub fn sync_target_height(&self) -> Option<u64> {
-        self.sync_target.map(|(h, _)| h)
-    }
-
     /// Number of blocks behind target (for metrics).
     pub fn blocks_behind(&self) -> u64 {
         self.sync_target

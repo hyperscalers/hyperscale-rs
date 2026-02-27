@@ -7415,10 +7415,6 @@ mod tests {
         );
     }
 
-    // NOTE: test_clear_vote_tracking_preserves_current_round_votes was removed when
-    // switching to deferred vote verification - pending_vote_verifications no longer exists.
-    // Votes are now buffered in VoteSet until quorum is possible.
-
     #[test]
     fn test_clear_vote_tracking_preserves_current_round_vote_sets() {
         // Test that vote sets at the current/higher round are preserved.

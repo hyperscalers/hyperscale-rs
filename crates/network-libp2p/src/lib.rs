@@ -20,7 +20,6 @@ pub use adapter::{
 };
 pub use codec_pool::CodecPoolHandle;
 pub use config::{Libp2pConfig, VersionInteroperabilityMode};
-pub use inbound_router::{spawn_inbound_router, InboundRouterHandle};
 pub use network::ProdNetwork;
 pub use request_manager::{RequestManager, RequestManagerConfig};
 

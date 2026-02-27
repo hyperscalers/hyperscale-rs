@@ -3,9 +3,6 @@
 //! These structs track in-flight signature verifications that have been
 //! delegated to the runner. When verification completes, the runner sends
 //! an event back and we look up the pending state to continue processing.
-//!
-//! Note: Provision signature verification is now handled by ProvisionCoordinator
-//! in the `hyperscale-provisions` crate.
 
 use hyperscale_types::{BlockHeight, Hash, ShardGroupId, StateCertificate, TransactionCertificate};
 use std::collections::HashSet;

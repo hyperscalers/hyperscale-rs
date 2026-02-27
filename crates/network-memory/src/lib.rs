@@ -10,7 +10,7 @@ mod network;
 mod sim_network;
 mod traffic;
 
-pub use network::{NetworkConfig, SimulatedNetwork};
+pub use network::{GossipDelivery, NetworkConfig, SimulatedNetwork};
 pub use sim_network::{OutboxEntry, SimNetworkAdapter};
 pub use traffic::{BandwidthReport, NetworkTrafficAnalyzer};
 

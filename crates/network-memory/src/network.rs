@@ -1,16 +1,17 @@
 //! Simulated network with deterministic latency, packet loss, and partitions.
 
-use crate::sim_network::{BroadcastTarget, OutboxEntry, PendingRequest};
-use crate::NodeIndex;
-use hyperscale_network::{
-    frame_request, HandlerRegistry, InboundRequestHandler, RequestError, Topic,
+use crate::sim_network::{
+    BroadcastTarget, HandlerSlot, OutboxEntry, PendingRequest, SimNetworkAdapter,
 };
+use crate::NodeIndex;
+use hyperscale_core::NodeInput;
+use hyperscale_network::{frame_request, InboundRequestHandler, RequestError};
 use hyperscale_types::{ShardGroupId, ValidatorId};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tracing::trace;
 
@@ -49,7 +50,7 @@ impl Default for NetworkConfig {
 }
 
 /// Stats returned by [`SimulatedNetwork::fulfill_requests`] and
-/// [`SimulatedNetwork::deliver_and_dispatch_gossip`].
+/// [`SimulatedNetwork::deliver_gossip`].
 #[derive(Debug, Default)]
 pub struct FulfillmentStats {
     pub messages_sent: u64,
@@ -57,17 +58,18 @@ pub struct FulfillmentStats {
     pub messages_dropped_loss: u64,
 }
 
-/// Result of a single gossip dispatch to a target node.
+/// A single gossip delivery to a target node.
 ///
-/// Returned by [`SimulatedNetwork::deliver_and_dispatch_gossip`]. The caller
-/// drains the target node's event channel and schedules the decoded events
-/// with the indicated latency offset.
+/// Returned by [`SimulatedNetwork::deliver_gossip`]. The caller schedules the
+/// contained event directly — no channel draining required.
 #[derive(Debug)]
-pub struct GossipDispatchResult {
-    /// Target node that received the dispatch.
+pub struct GossipDelivery {
+    /// Target node.
     pub to: NodeIndex,
-    /// Sampled one-way latency for scheduling the decoded events.
+    /// Sampled one-way latency.
     pub latency: Duration,
+    /// The event to deliver.
+    pub event: NodeInput,
 }
 
 /// Simulated network for deterministic message delivery.
@@ -82,12 +84,11 @@ pub struct SimulatedNetwork {
     /// Partitioned node pairs. If (a, b) is in this set, messages from a to b are dropped.
     /// Partitions are directional - add both (a, b) and (b, a) for bidirectional partition.
     partitions: HashSet<(NodeIndex, NodeIndex)>,
-    /// Per-node inbound request handlers. Registered after node construction.
-    /// Index = NodeIndex, value = handler (None if not yet registered).
-    handlers: Vec<Option<Arc<dyn InboundRequestHandler>>>,
-    /// Per-node gossip handler registries. Registered after node construction.
-    /// Index = NodeIndex, value = registry (None if not yet registered).
-    gossip_registries: Vec<Option<HandlerRegistry>>,
+    /// Per-node handler slots, shared with each node's [`SimNetworkAdapter`].
+    ///
+    /// Populated when [`Network::register_inbound_handler`] is called on the
+    /// adapter; read during [`fulfill_requests`](Self::fulfill_requests).
+    handler_slots: Vec<HandlerSlot>,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -95,21 +96,30 @@ impl std::fmt::Debug for SimulatedNetwork {
         f.debug_struct("SimulatedNetwork")
             .field("config", &self.config)
             .field("partitions", &self.partitions)
-            .field("handlers", &self.handlers.len())
-            .field("gossip_registries", &self.gossip_registries.len())
+            .field("handler_slots", &self.handler_slots.len())
             .finish()
     }
 }
 
 impl SimulatedNetwork {
-    /// Create a new simulated network.
+    /// Create a new simulated network with pre-allocated handler slots.
     pub fn new(config: NetworkConfig) -> Self {
+        let num_nodes = (config.num_shards * config.validators_per_shard) as usize;
+        let handler_slots = (0..num_nodes).map(|_| Arc::new(OnceLock::new())).collect();
         Self {
             config,
             partitions: HashSet::new(),
-            handlers: Vec::new(),
-            gossip_registries: Vec::new(),
+            handler_slots,
         }
+    }
+
+    /// Create a [`SimNetworkAdapter`] for a node, sharing its handler slot.
+    ///
+    /// The returned adapter's [`Network::register_inbound_handler`] call
+    /// will populate the shared slot, making the handler visible to
+    /// [`fulfill_requests`](Self::fulfill_requests).
+    pub fn create_adapter(&self, node: NodeIndex) -> SimNetworkAdapter {
+        SimNetworkAdapter::new(Arc::clone(&self.handler_slots[node as usize]))
     }
 
     // ─── Partition Management ───
@@ -271,20 +281,10 @@ impl SimulatedNetwork {
 
     // ─── Request Fulfillment ───
 
-    /// Register an [`InboundRequestHandler`] for a node.
-    ///
-    /// Called once per node after construction. The handler processes inbound
-    /// request bytes (framed with type_id) and returns SBOR-encoded response bytes,
-    /// exercising the exact same code path as production.
-    pub fn register_handler(&mut self, node: NodeIndex, handler: Arc<dyn InboundRequestHandler>) {
-        let idx = node as usize;
-        if idx >= self.handlers.len() {
-            self.handlers.resize_with(idx + 1, || None);
-        }
-        self.handlers[idx] = Some(handler);
-    }
-
     /// Fulfill pending requests by routing them through peer InboundRequestHandlers.
+    ///
+    /// Handlers are obtained from the shared [`HandlerSlot`]s populated by each
+    /// node's [`Network::register_inbound_handler`] call.
     ///
     /// For each request:
     /// 1. Select a peer (preferred_peer if set, otherwise random non-self peer)
@@ -360,7 +360,7 @@ impl SimulatedNetwork {
             stats.messages_sent += 2; // request + response
 
             // Frame the request and dispatch through the peer's handler.
-            let handler = match self.handlers.get(peer as usize).and_then(|h| h.as_ref()) {
+            let handler = match self.handler_slots.get(peer as usize).and_then(|s| s.get()) {
                 Some(h) => h,
                 None => {
                     on_response(Err(RequestError::PeerError(format!(
@@ -385,62 +385,50 @@ impl SimulatedNetwork {
         stats
     }
 
-    // ─── Gossip Dispatch ───
+    // ─── Gossip Delivery ───
 
-    /// Register a [`HandlerRegistry`] for gossip dispatch on a node.
-    ///
-    /// Called once per node during setup. The registry's handlers decode
-    /// gossip wire bytes and push events into the node's crossbeam channel.
-    pub fn register_gossip_registry(&mut self, node: NodeIndex, registry: HandlerRegistry) {
-        let idx = node as usize;
-        if idx >= self.gossip_registries.len() {
-            self.gossip_registries.resize_with(idx + 1, || None);
-        }
-        self.gossip_registries[idx] = Some(registry);
-    }
-
-    /// Fan out a gossip outbox entry, eagerly dispatching through each target's
-    /// [`HandlerRegistry`].
+    /// Fan out a gossip outbox entry, LZ4-decompressing once and producing a
+    /// [`GossipDelivery`] per target peer.
     ///
     /// For each target peer (excluding the sender):
     /// 1. Check partition and packet loss
     /// 2. Sample one-way latency
-    /// 3. Dispatch wire bytes through the target's `HandlerRegistry::dispatch_gossip()`
+    /// 3. Create a `NodeInput::GossipReceived` event with the decompressed payload
     ///
-    /// Returns a [`GossipDispatchResult`] per node that received the dispatch.
-    /// The caller drains each target node's event channel and schedules the
-    /// decoded events with the latency offset.
-    ///
-    /// This exercises the same `dispatch_gossip()` code path as production:
-    /// LZ4 decompress → SBOR decode → typed handler closure → event channel.
-    pub fn deliver_and_dispatch_gossip(
+    /// The caller schedules each delivery directly — no channel draining needed.
+    pub fn deliver_gossip(
         &self,
         from: NodeIndex,
         entry: OutboxEntry,
         rng: &mut ChaCha8Rng,
-    ) -> (Vec<GossipDispatchResult>, FulfillmentStats) {
+    ) -> (Vec<GossipDelivery>, FulfillmentStats) {
         let mut stats = FulfillmentStats::default();
-        let mut results = Vec::new();
+        let mut deliveries = Vec::new();
 
-        // Build topic and determine target peers from broadcast target.
-        let (topic, peers) = match entry.target {
-            BroadcastTarget::Shard(shard) => {
-                let topic = Topic::shard(entry.message_type, shard);
-                let peers = self.peers_in_shard(shard);
-                (topic, peers)
-            }
+        // Determine target peers from broadcast target.
+        let peers = match &entry.target {
+            BroadcastTarget::Shard(shard) => self.peers_in_shard(*shard),
             BroadcastTarget::Global => {
-                let topic = Topic::global(entry.message_type);
                 let total = self.total_nodes();
-                let peers: Vec<NodeIndex> = (0..total as NodeIndex).collect();
-                (topic, peers)
-            }
-            BroadcastTarget::Peer(peer) => {
-                let topic = Topic::global(entry.message_type);
-                let peers = vec![peer.0 as NodeIndex];
-                (topic, peers)
+                (0..total as NodeIndex).collect()
             }
         };
+
+        // LZ4-decompress once; each target gets a clone of the decompressed payload.
+        let payload = match hyperscale_network::wire::decompress(&entry.data) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    from,
+                    message_type = entry.message_type,
+                    ?e,
+                    "Gossip decompress error"
+                );
+                return (deliveries, stats);
+            }
+        };
+
+        let message_type = entry.message_type.to_string();
 
         for to in peers {
             if to == from {
@@ -458,23 +446,19 @@ impl SimulatedNetwork {
                 Some(latency) => {
                     stats.messages_sent += 1;
 
-                    // Eagerly dispatch through the target's HandlerRegistry.
-                    if let Some(Some(registry)) = self.gossip_registries.get(to as usize) {
-                        if let Err(e) = registry.dispatch_gossip(&topic, &entry.data) {
-                            tracing::warn!(from, to, ?topic, ?e, "Gossip dispatch error");
-                            continue;
-                        }
-                    } else {
-                        tracing::warn!(from, to, "No gossip registry for target node");
-                        continue;
-                    }
-
-                    results.push(GossipDispatchResult { to, latency });
+                    deliveries.push(GossipDelivery {
+                        to,
+                        latency,
+                        event: NodeInput::GossipReceived {
+                            message_type: message_type.clone(),
+                            payload: payload.clone(),
+                        },
+                    });
                 }
             }
         }
 
-        (results, stats)
+        (deliveries, stats)
     }
 }
 

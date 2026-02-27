@@ -4,13 +4,16 @@
 //! the [`Network`] interface used by `NodeLoop` in the production runner.
 
 use crate::adapter::{compute_peer_id_for_validator, Libp2pAdapter};
+use crate::inbound_router::{spawn_inbound_router, InboundRouterHandle};
 use crate::request_manager::{RequestManager, RequestPriority};
-use hyperscale_network::{encode_to_wire, frame_request, Network, RequestError, Topic};
+use hyperscale_network::{
+    encode_to_wire, frame_request, InboundRequestHandler, Network, RequestError, Topic,
+};
 use hyperscale_types::{
     NetworkMessage, Request, ShardGroupId, ShardMessage, Topology, ValidatorId,
 };
 use libp2p::PeerId;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -32,6 +35,9 @@ pub struct ProdNetwork {
     request_manager: Arc<RequestManager>,
     topology: Arc<dyn Topology>,
     tokio_handle: tokio::runtime::Handle,
+    /// Inbound router handle — set once via `register_inbound_handler`.
+    /// Kept alive to prevent the background task from being aborted.
+    inbound_router: OnceLock<InboundRouterHandle>,
 }
 
 impl ProdNetwork {
@@ -46,6 +52,7 @@ impl ProdNetwork {
             request_manager,
             topology,
             tokio_handle,
+            inbound_router: OnceLock::new(),
         }
     }
 
@@ -102,16 +109,13 @@ impl Network for ProdNetwork {
         }
     }
 
-    fn send_to<M: NetworkMessage>(&self, _peer: ValidatorId, _message: &M) {
-        unimplemented!("ProdNetwork::send_to is not used by NodeLoop")
-    }
-
-    fn subscribe_shard(&self, _shard: ShardGroupId) {}
-
-    fn on_message<M: NetworkMessage + 'static>(
-        &self,
-        _handler: Box<dyn Fn(ValidatorId, M) + Send + Sync>,
-    ) {
+    fn register_inbound_handler(&self, handler: Arc<dyn InboundRequestHandler>) {
+        // Enter the tokio runtime context so spawn_inbound_router can use
+        // tokio::spawn (this may be called from the main thread before the
+        // NodeLoop is moved to its pinned thread).
+        let _guard = self.tokio_handle.enter();
+        let handle = spawn_inbound_router(self.adapter.clone(), handler);
+        let _ = self.inbound_router.set(handle);
     }
 
     fn request<R: Request + 'static>(

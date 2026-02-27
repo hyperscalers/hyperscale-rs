@@ -15,19 +15,20 @@
 //!                                               │
 //!                                               ▼
 //!                                      ┌─────────────────┐
-//!                                      │ HandlerRegistry  │
-//!                                      │ → Event channel  │
+//!                                      │ LZ4 decompress   │
+//!                                      │ → NodeInput chan  │
 //!                                      └─────────────────┘
 //! ```
 //!
 //! The event loop remains non-blocking - after basic validation (peer, shard),
-//! decode work is spawned to the shared codec pool which dispatches through the
-//! handler registry.
+//! decode work is spawned to the shared codec pool which decompresses and
+//! forwards the raw payload to the NodeLoop via the event channel.
 
+use hyperscale_core::NodeInput;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
-use hyperscale_network::{HandlerRegistry, Topic};
+use hyperscale_network::Topic;
 use libp2p::PeerId as Libp2pPeerId;
 use std::sync::Arc;
 use tracing::warn;
@@ -39,58 +40,57 @@ use tracing::warn;
 /// thread pool in production, inline in simulation).
 pub struct CodecPoolHandle<D: Dispatch = PooledDispatch> {
     dispatch: Arc<D>,
-    registry: Arc<HandlerRegistry>,
+    event_tx: crossbeam::channel::Sender<NodeInput>,
 }
 
 impl<D: Dispatch> Clone for CodecPoolHandle<D> {
     fn clone(&self) -> Self {
         Self {
             dispatch: self.dispatch.clone(),
-            registry: self.registry.clone(),
+            event_tx: self.event_tx.clone(),
         }
     }
 }
 
 impl<D: Dispatch> CodecPoolHandle<D> {
-    /// Create a new handle wrapping the dispatch implementation and handler registry.
-    pub fn new(dispatch: Arc<D>, registry: Arc<HandlerRegistry>) -> Self {
-        Self { dispatch, registry }
+    /// Create a new handle wrapping the dispatch implementation and event sender.
+    pub fn new(dispatch: Arc<D>, event_tx: crossbeam::channel::Sender<NodeInput>) -> Self {
+        Self { dispatch, event_tx }
     }
 
-    /// Decode a message asynchronously and dispatch through the handler registry.
+    /// Decode a message asynchronously and forward to the NodeLoop event channel.
     ///
-    /// This method returns immediately - the actual decode work happens on the
-    /// dispatch's codec pool, and decoded events are sent through the handlers
-    /// registered on the `HandlerRegistry`.
+    /// This method returns immediately - the actual decompress work happens on the
+    /// dispatch's codec pool. The decompressed payload is sent as a
+    /// `NodeInput::GossipReceived` to the NodeLoop, which handles SBOR decoding
+    /// and type dispatch internally.
     ///
     /// # Arguments
     ///
     /// * `topic` - The parsed gossipsub topic (determines message type)
-    /// * `data` - Raw message bytes from the network
+    /// * `data` - Raw LZ4-compressed message bytes from the network
     /// * `propagation_source` - Peer that sent the message (for logging)
     pub fn decode_async(&self, topic: Topic, data: Vec<u8>, propagation_source: Libp2pPeerId) {
-        let registry = self.registry.clone();
+        let event_tx = self.event_tx.clone();
         self.dispatch.spawn_codec(move || {
             let peer_label = propagation_source.to_string();
 
-            match registry.dispatch_gossip(&topic, &data) {
-                Ok(true) => {
+            // LZ4 decompress, then forward raw SBOR payload to NodeLoop.
+            match hyperscale_network::wire::decompress(&data) {
+                Ok(payload) => {
+                    let message_type = topic.message_type().to_string();
+                    let _ = event_tx.send(NodeInput::GossipReceived {
+                        message_type,
+                        payload,
+                    });
                     metrics::record_network_message_received();
-                }
-                Ok(false) => {
-                    warn!(
-                        topic = %topic,
-                        peer = %peer_label,
-                        "No handlers registered for gossip topic"
-                    );
-                    metrics::record_invalid_message();
                 }
                 Err(e) => {
                     warn!(
                         error = %e,
                         topic = %topic,
                         peer = %peer_label,
-                        "Failed to decode message in codec pool"
+                        "Failed to decompress message in codec pool"
                     );
                     metrics::record_invalid_message();
                 }
@@ -112,8 +112,8 @@ mod tests {
     #[test]
     fn test_codec_pool_handle_creation() {
         let dispatch = Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap());
-        let registry = Arc::new(HandlerRegistry::new());
-        let handle = CodecPoolHandle::new(dispatch, registry);
+        let (event_tx, _event_rx) = crossbeam::channel::unbounded();
+        let handle = CodecPoolHandle::new(dispatch, event_tx);
         assert_eq!(handle.queue_depth(), 0);
     }
 

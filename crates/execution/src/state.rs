@@ -2398,11 +2398,6 @@ mod tests {
         assert!(actions2.is_empty());
     }
 
-    // Note: Tracker-specific tests have been moved to their respective modules:
-    // - trackers/provisioning.rs
-    // - trackers/vote.rs
-    // - trackers/certificate.rs
-
     #[test]
     fn test_speculative_hit_before_commit() {
         // Scenario: Speculation completes BEFORE block commits (normal HIT)

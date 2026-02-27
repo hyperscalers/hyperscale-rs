@@ -586,7 +586,7 @@ mod tests {
 
     #[test]
     fn test_tracker_loaded_peer_still_selectable() {
-        // Per-peer in_flight is now a soft weight factor, not a hard gate.
+        // Per-peer in_flight is a soft weight factor, not a hard gate.
         // Loaded peers should still be selectable, just with lower weight.
         let config = PeerHealthConfig {
             max_in_flight_per_peer: 2,

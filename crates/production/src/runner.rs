@@ -51,8 +51,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics as metrics;
 use hyperscale_network_libp2p::ProdNetwork;
 use hyperscale_network_libp2p::{
-    compute_peer_id_for_validator, spawn_inbound_router, InboundRouterHandle, Libp2pAdapter,
-    Libp2pConfig, Libp2pKeypair, NetworkError,
+    compute_peer_id_for_validator, Libp2pAdapter, Libp2pConfig, Libp2pKeypair, NetworkError,
 };
 use hyperscale_storage::{
     CommittableSubstateDatabase, ConsensusStore, DatabaseUpdates, DbPartitionKey, DbSortKey,
@@ -63,12 +62,8 @@ use quick_cache::sync::Cache as QuickCache;
 
 use hyperscale_core::NodeInput;
 use hyperscale_node::node_loop::{NodeLoop, TimerOp};
-use hyperscale_node::sync_protocol::SyncProtocol;
-use hyperscale_node::NodeStateMachine;
-use hyperscale_types::{
-    Block, Bls12381G1PrivateKey, Hash, RoutableTransaction, ShardGroupId, Topology,
-    TransactionCertificate, ValidatorId,
-};
+use hyperscale_node::{NodeConfig, NodeStateMachine};
+use hyperscale_types::{Block, Bls12381G1PrivateKey, Hash, ShardGroupId, Topology, ValidatorId};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -413,20 +408,15 @@ impl ProductionRunnerBuilder {
             network_definition.clone(),
         ));
 
-        // ── Register gossip handlers via HandlerRegistry ────────────────
+        // ── Create codec pool handle ─────────────────────────────────────
         //
-        // The HandlerRegistry dispatches decoded gossip messages to typed
-        // handlers. Each handler constructs an Event and sends it via the
-        // consensus crossbeam channel to the pinned NodeLoop thread.
-        let gossip_registry = Arc::new(hyperscale_network::HandlerRegistry::new());
-        hyperscale_node::gossip_dispatch::register_gossip_handlers(
-            &gossip_registry,
+        // The codec pool decompresses gossip wire bytes and forwards them as
+        // NodeInput::GossipReceived to the consensus channel. NodeLoop handles
+        // SBOR decoding and type dispatch internally.
+        let codec_pool_handle = hyperscale_network_libp2p::CodecPoolHandle::new(
+            dispatch.clone(),
             xb_consensus_tx.clone(),
         );
-
-        // ── Create codec pool handle ─────────────────────────────────────
-        let codec_pool_handle =
-            hyperscale_network_libp2p::CodecPoolHandle::new(dispatch.clone(), gossip_registry);
 
         // ── Create Libp2p network adapter ────────────────────────────────
         let adapter = Libp2pAdapter::new(
@@ -472,9 +462,6 @@ impl ProductionRunnerBuilder {
         // ── Create RadixExecutor ─────────────────────────────────────────
         let executor = RadixExecutor::new(network_definition);
 
-        // ── Create SyncProtocol for NodeLoop ─────────────────────────────
-        let sync_protocol = SyncProtocol::new(hyperscale_node::SyncConfig::default());
-
         // ── Create NodeLoop ──────────────────────────────────────────────
         //
         // The NodeLoop owns the state machine, storage, executor, network,
@@ -491,33 +478,12 @@ impl ProductionRunnerBuilder {
             xb_callback_tx.clone(),
             node_loop_signing_key,
             topology.clone(),
-            sync_protocol,
+            NodeConfig::default(),
             tx_validator.clone(),
         );
 
-        // ── Get cache handles from NodeLoop ──────────────────────────────
-        //
-        // Caches live inside NodeLoop. Get Arc clones before moving to pinned thread.
-        // These are shared with InboundRouter for serving peer fetch requests.
-        let recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>> =
-            Arc::clone(node_loop.cert_cache());
-        let recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>> =
-            Arc::clone(node_loop.tx_cache());
+        // ── Get cache/status handles from NodeLoop ────────────────────────
         let tx_status_cache = Arc::clone(node_loop.tx_status_cache());
-
-        // ── Spawn InboundRouter ──────────────────────────────────────────
-        //
-        // Handles all inbound requests (block sync, tx fetch, cert fetch) from peers.
-        // Hot data is served from in-memory caches, falling back to RocksDB.
-        // The InboundHandler lives in the node crate; the transport router
-        // in network-libp2p is generic over InboundRequestHandler.
-        let inbound_handler = hyperscale_node::InboundHandler::new(
-            hyperscale_node::InboundHandlerConfig::default(),
-            storage.clone(),
-            recently_received_txs.clone(),
-            recently_built_certs.clone(),
-        );
-        let inbound_router = spawn_inbound_router(adapter.clone(), inbound_handler);
 
         // ── Build ProductionRunner ───────────────────────────────────────
 
@@ -535,15 +501,12 @@ impl ProductionRunnerBuilder {
             topology,
             storage,
             dispatch,
-            inbound_router,
             rpc_status: self.rpc_status,
             mempool_snapshot: self.mempool_snapshot,
             sync_status: self.sync_status,
             genesis_config: self.genesis_config,
             local_shard,
             tx_status_cache,
-            recently_received_txs,
-            recently_built_certs,
             shutdown_rx: Some(shutdown_rx),
             shutdown_tx: Some(shutdown_tx),
         })
@@ -598,9 +561,6 @@ pub struct ProductionRunner {
     storage: Arc<RocksDbStorage>,
     /// Thread pool dispatch.
     dispatch: Arc<PooledDispatch>,
-    /// Handle for the InboundRouter task.
-    #[allow(dead_code)]
-    inbound_router: InboundRouterHandle,
     /// Local shard for network broadcasts.
     local_shard: ShardGroupId,
 
@@ -617,14 +577,6 @@ pub struct ProductionRunner {
     /// Transaction status cache, shared from NodeLoop.
     /// Provided to the RPC server for lock-free status queries.
     tx_status_cache: Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>>,
-    /// LRU cache of recently received transactions (via gossip or RPC).
-    /// Shared with InboundRouter for serving peer fetch requests from memory.
-    #[allow(dead_code)] // Kept alive to maintain Arc reference for InboundRouter
-    recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
-    /// LRU cache of recently built certificates.
-    /// Shared with InboundRouter for serving peer fetch requests from memory.
-    #[allow(dead_code)]
-    recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
 
     // ── Shutdown ─────────────────────────────────────────────────────────
     /// Shutdown signal receiver (external shutdown request).

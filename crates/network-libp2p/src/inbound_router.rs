@@ -48,20 +48,12 @@ const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_SIZE: usize = 10 * 1024 * 1024;
 
 /// Handle for the inbound router task.
-pub struct InboundRouterHandle {
+///
+/// Kept alive inside `ProdNetwork` to prevent the tokio task from being
+/// aborted when the `JoinHandle` is dropped.
+pub(crate) struct InboundRouterHandle {
+    #[allow(dead_code)]
     join_handle: tokio::task::JoinHandle<()>,
-}
-
-impl InboundRouterHandle {
-    /// Check if the router task is still running.
-    pub fn is_running(&self) -> bool {
-        !self.join_handle.is_finished()
-    }
-
-    /// Wait for the router task to complete.
-    pub async fn wait(self) {
-        let _ = self.join_handle.await;
-    }
 }
 
 /// Routes inbound requests to an application-level handler.
@@ -172,9 +164,8 @@ impl<H: InboundRequestHandler> InboundRouter<H> {
 
 /// Spawn an inbound router with the given handler.
 ///
-/// This is the public API for creating an inbound router. The `InboundRouter`
-/// struct is private — callers only interact with the returned handle.
-pub fn spawn_inbound_router<H: InboundRequestHandler>(
+/// Used internally by `ProdNetwork::register_inbound_handler`.
+pub(crate) fn spawn_inbound_router<H: InboundRequestHandler>(
     adapter: Arc<Libp2pAdapter>,
     handler: H,
 ) -> InboundRouterHandle {

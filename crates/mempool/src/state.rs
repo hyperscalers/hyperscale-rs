@@ -395,8 +395,8 @@ impl MempoolState {
 
         tracing::debug!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
 
-        // Note: We don't emit TransactionAccepted as an event - it was purely informational
-        // and would flood the consensus channel under high transaction load.
+        // No events emitted — gossip acceptance is silent to avoid flooding
+        // the consensus channel under high transaction load.
         vec![]
     }
 

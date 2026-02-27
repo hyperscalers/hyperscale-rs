@@ -197,7 +197,7 @@ impl LatencyTracker {
 
     /// Track a submitted transaction for latency measurement.
     ///
-    /// This is now lock-free and can be called from the hot path with minimal overhead.
+    /// Lock-free — can be called from the hot path with minimal overhead.
     #[inline]
     pub fn track(&self, tx_hash: String, client_idx: usize) {
         // DashMap insert is lock-free (uses fine-grained sharding)

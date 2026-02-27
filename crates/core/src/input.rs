@@ -93,6 +93,16 @@ pub enum NodeInput {
         tx: Arc<RoutableTransaction>,
         submitted_locally: bool,
     },
+
+    /// Raw gossip payload received from the network layer.
+    ///
+    /// Network handles decompression; NodeLoop SBOR-decodes based on
+    /// message_type and converts to typed ProtocolEvents.
+    GossipReceived {
+        message_type: String,
+        /// Decompressed SBOR payload bytes.
+        payload: Vec<u8>,
+    },
 }
 
 impl NodeInput {
@@ -134,6 +144,7 @@ impl NodeInput {
             NodeInput::TransactionReceived { .. } => EventPriority::Network,
             NodeInput::CertificateReceived { .. } => EventPriority::Network,
             NodeInput::TransactionValidated { .. } => EventPriority::Internal,
+            NodeInput::GossipReceived { .. } => EventPriority::Network,
         }
     }
 
@@ -169,15 +180,10 @@ impl NodeInput {
             NodeInput::TransactionReceived { .. } => "TransactionReceived",
             NodeInput::CertificateReceived { .. } => "CertificateReceived",
             NodeInput::TransactionValidated { .. } => "TransactionValidated",
+            NodeInput::GossipReceived { .. } => "GossipReceived",
         }
     }
 }
-
-/// Type alias for backward compatibility.
-///
-/// Code that previously used `Event` can continue to do so.
-/// New code should use `NodeInput` directly.
-pub type Event = NodeInput;
 
 impl From<ProtocolEvent> for NodeInput {
     fn from(event: ProtocolEvent) -> Self {

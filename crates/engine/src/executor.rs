@@ -326,11 +326,6 @@ impl RadixExecutor {
         }
     }
 
-    // NOTE: commit_all_writes and commit_local_writes have been removed.
-    // The executor is now READ-ONLY. State writes are collected in the
-    // ExecutionOutput and committed later by the runner when a
-    // TransactionCertificate is included in a committed block.
-
     /// Fetch state entries for the given nodes from storage.
     ///
     /// Returns `StateEntry` with pre-computed storage keys. This is efficient

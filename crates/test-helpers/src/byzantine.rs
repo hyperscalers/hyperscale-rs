@@ -5,9 +5,8 @@
 
 use crate::TestCommittee;
 use hyperscale_types::{
-    batch_verify_bls_same_message, block_vote_message, exec_vote_message, BlockHeight, BlockVote,
-    Bls12381G1PublicKey, Bls12381G2Signature, Hash, QuorumCertificate, ShardGroupId,
-    SignerBitfield, StateVoteBlock, VotePower,
+    block_vote_message, exec_vote_message, BlockHeight, BlockVote, Bls12381G2Signature, Hash,
+    ShardGroupId, StateVoteBlock,
 };
 
 /// Create a block vote with an invalid signature (signed with wrong key).
@@ -64,67 +63,6 @@ pub fn make_wrong_message_block_vote(
     }
 }
 
-/// Create a QC where one signature is invalid (signed with wrong key).
-///
-/// Returns the QC and the index of the bad voter.
-/// This tests the batch verification fallback path.
-#[allow(clippy::too_many_arguments)]
-pub fn make_partially_invalid_qc(
-    committee: &TestCommittee,
-    valid_voter_indices: &[usize],
-    bad_voter_idx: usize,
-    wrong_signer_idx: usize,
-    block_hash: Hash,
-    height: BlockHeight,
-    round: u64,
-    parent_hash: Hash,
-    shard: ShardGroupId,
-) -> (QuorumCertificate, usize) {
-    let message = block_vote_message(shard, height.0, round, &block_hash);
-
-    let mut all_indices: Vec<usize> = valid_voter_indices.to_vec();
-    all_indices.push(bad_voter_idx);
-    all_indices.sort();
-
-    // Collect signatures - one is signed with wrong key
-    let signatures: Vec<Bls12381G2Signature> = all_indices
-        .iter()
-        .map(|&idx| {
-            if idx == bad_voter_idx {
-                // Sign with wrong key
-                committee.keypair(wrong_signer_idx).sign_v1(&message)
-            } else {
-                committee.keypair(idx).sign_v1(&message)
-            }
-        })
-        .collect();
-
-    // Aggregate all signatures (including the bad one)
-    let aggregated_signature =
-        Bls12381G2Signature::aggregate(&signatures, true).expect("BLS aggregation should succeed");
-
-    // Build signer bitfield
-    let mut signers = SignerBitfield::new(committee.size());
-    for &idx in &all_indices {
-        signers.set(idx);
-    }
-
-    let voting_power = VotePower(all_indices.len() as u64);
-
-    let qc = QuorumCertificate {
-        block_hash,
-        height,
-        parent_block_hash: parent_hash,
-        round,
-        signers,
-        aggregated_signature,
-        voting_power,
-        weighted_timestamp_ms: 1000,
-    };
-
-    (qc, bad_voter_idx)
-}
-
 /// Create a state vote with an invalid signature.
 pub fn make_wrong_key_state_vote(
     committee: &TestCommittee,
@@ -145,30 +83,6 @@ pub fn make_wrong_key_state_vote(
         success,
         state_writes: vec![],
         validator: committee.validator_id(claimed_voter_idx),
-        signature,
-    }
-}
-
-/// Create a state vote signed for a different writes commitment.
-pub fn make_wrong_writes_commitment_vote(
-    committee: &TestCommittee,
-    voter_idx: usize,
-    tx_hash: Hash,
-    claimed_commitment: Hash,
-    actual_signed_commitment: Hash,
-    shard: ShardGroupId,
-    success: bool,
-) -> StateVoteBlock {
-    let message = exec_vote_message(&tx_hash, &actual_signed_commitment, shard, success);
-    let signature = committee.keypair(voter_idx).sign_v1(&message);
-
-    StateVoteBlock {
-        transaction_hash: tx_hash,
-        shard_group_id: shard,
-        writes_commitment: claimed_commitment,
-        success,
-        state_writes: vec![],
-        validator: committee.validator_id(voter_idx),
         signature,
     }
 }
@@ -197,17 +111,6 @@ pub fn make_garbage_signature_vote(
         signature: make_garbage_signature(),
         timestamp: 1000,
     }
-}
-
-/// Verify that batch verification correctly identifies bad signatures.
-///
-/// Returns true if batch verification rejects the set (as expected).
-pub fn batch_verification_rejects(
-    message: &[u8],
-    signatures: &[Bls12381G2Signature],
-    pubkeys: &[Bls12381G1PublicKey],
-) -> bool {
-    !batch_verify_bls_same_message(message, signatures, pubkeys)
 }
 
 #[cfg(test)]

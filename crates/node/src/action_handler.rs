@@ -18,7 +18,7 @@ use hyperscale_types::{
 use std::sync::Arc;
 
 /// Context for executing delegated actions.
-pub struct ActionContext<'a, S: CommitStore + SubstateStore, D: Dispatch> {
+pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore, D: Dispatch> {
     pub storage: &'a S,
     pub executor: &'a RadixExecutor,
     pub topology: &'a dyn Topology,
@@ -29,7 +29,7 @@ pub struct ActionContext<'a, S: CommitStore + SubstateStore, D: Dispatch> {
 }
 
 /// Result of handling a delegated action.
-pub struct DelegatedResult<P: Send> {
+pub(crate) struct DelegatedResult<P: Send> {
     /// Events to deliver to the state machine.
     pub events: Vec<NodeInput>,
     /// Prepared commit handle to cache (block_hash -> handle).
@@ -37,7 +37,7 @@ pub struct DelegatedResult<P: Send> {
 }
 
 /// Which dispatch pool an action should run on in production.
-pub enum DispatchPool {
+pub(crate) enum DispatchPool {
     /// Liveness-critical consensus crypto (QC, state root, proposal).
     ConsensusCrypto,
     /// General crypto verification (cert aggregation, provisions).
@@ -50,7 +50,7 @@ pub enum DispatchPool {
 ///
 /// Returns `None` for actions that are not delegated (network, timers, etc.)
 /// and should be handled by the runner directly.
-pub fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
+pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
     match action {
         // Consensus-critical crypto
         Action::VerifyAndBuildQuorumCertificate { .. } => Some(DispatchPool::ConsensusCrypto),
@@ -81,7 +81,7 @@ pub fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// The runner is responsible for additionally broadcasting votes to shard
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
-pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
+pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
     action: Action,
     ctx: &ActionContext<'_, S, D>,
 ) -> Option<DelegatedResult<S::PreparedCommit>> {

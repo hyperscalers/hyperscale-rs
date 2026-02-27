@@ -20,17 +20,18 @@
 
 use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::batch_accumulator::{BatchAccumulator, ShardedBatchAccumulator};
-use crate::fetch_protocol::{FetchConfig, FetchInput, FetchKind, FetchOutput, FetchProtocol};
+use crate::config::NodeConfig;
+use crate::fetch_protocol::{FetchInput, FetchKind, FetchOutput, FetchProtocol};
 use crate::sync_protocol::{SyncInput, SyncOutput, SyncProtocol, SyncStatus};
 use crate::NodeStateMachine;
 use hyperscale_core::{
-    Action, CrossShardExecutionRequest, Event, NodeInput, ProtocolEvent, StateMachine, TimerId,
+    Action, CrossShardExecutionRequest, NodeInput, ProtocolEvent, StateMachine, TimerId,
 };
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{RadixExecutor, TransactionValidation};
 use hyperscale_messages::{
-    StateCertificateBatch, StateProvisionBatch, StateVoteBatch, TransactionCertificateGossip,
-    TransactionGossip,
+    BlockHeaderGossip, BlockVoteGossip, StateCertificateBatch, StateProvisionBatch, StateVoteBatch,
+    TransactionCertificateGossip, TransactionGossip,
 };
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
@@ -69,45 +70,6 @@ struct PendingGossipVerification {
     /// When this verification started (logical time from state.now()).
     created_at: Duration,
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-// Batching configuration
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Maximum items in a cross-shard execution batch before forced flush.
-const BATCH_MAX_CROSS_SHARD_EXECUTIONS: usize = 256;
-/// Batch window for cross-shard executions.
-const BATCH_WINDOW_CROSS_SHARD_EXECUTIONS: Duration = Duration::from_millis(5);
-
-/// Maximum items in a state vote verification batch before forced flush.
-const BATCH_MAX_STATE_VOTES: usize = 64;
-/// Batch window for state vote verification.
-const BATCH_WINDOW_STATE_VOTES: Duration = Duration::from_millis(20);
-
-/// Maximum items in a state cert verification batch before forced flush.
-const BATCH_MAX_STATE_CERTS: usize = 64;
-/// Batch window for state certificate verification.
-const BATCH_WINDOW_STATE_CERTS: Duration = Duration::from_millis(15);
-
-/// Maximum items in a broadcast state vote batch before forced flush.
-const BATCH_MAX_BROADCAST_STATE_VOTES: usize = 64;
-/// Batch window for broadcast state votes.
-const BATCH_WINDOW_BROADCAST_STATE_VOTES: Duration = Duration::from_millis(15);
-
-/// Maximum items in a broadcast state cert batch before forced flush.
-const BATCH_MAX_BROADCAST_STATE_CERTS: usize = 64;
-/// Batch window for broadcast state certificates.
-const BATCH_WINDOW_BROADCAST_STATE_CERTS: Duration = Duration::from_millis(15);
-
-/// Maximum items in a broadcast state provision batch before forced flush.
-const BATCH_MAX_BROADCAST_PROVISIONS: usize = 64;
-/// Batch window for broadcast state provisions.
-const BATCH_WINDOW_BROADCAST_PROVISIONS: Duration = Duration::from_millis(15);
-
-/// Maximum transactions in a validation batch before forced flush.
-const BATCH_MAX_TX_VALIDATION: usize = 128;
-/// Batch window for transaction validation.
-const BATCH_WINDOW_TX_VALIDATION: Duration = Duration::from_millis(20);
 
 use hyperscale_execution::handlers::UnverifiedStateVote;
 
@@ -192,7 +154,10 @@ where
     executor: RadixExecutor,
     network: N,
     dispatch: D,
-    event_sender: crossbeam::channel::Sender<Event>,
+    event_sender: crossbeam::channel::Sender<NodeInput>,
+
+    // Configuration (retained for creating InboundHandler)
+    config: NodeConfig,
 
     // Identity
     signing_key: Arc<Bls12381G1PrivateKey>,
@@ -255,14 +220,17 @@ where
         executor: RadixExecutor,
         network: N,
         dispatch: D,
-        event_sender: crossbeam::channel::Sender<Event>,
+        event_sender: crossbeam::channel::Sender<NodeInput>,
         signing_key: Bls12381G1PrivateKey,
         topology: Arc<dyn Topology>,
-        sync_protocol: SyncProtocol,
+        config: NodeConfig,
         tx_validator: Arc<TransactionValidation>,
     ) -> Self {
         let local_shard = topology.local_shard();
         let validator_id = topology.local_validator_id();
+        let b = &config.batch;
+        let sync_protocol = SyncProtocol::new(config.sync.clone());
+        let fetch_protocol = FetchProtocol::new(config.fetch.clone());
         Self {
             state,
             storage: Arc::new(storage),
@@ -282,35 +250,24 @@ where
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
             sync_protocol,
-            fetch_protocol: FetchProtocol::new(FetchConfig::default()),
-            validation_batch: BatchAccumulator::new(
-                BATCH_MAX_TX_VALIDATION,
-                BATCH_WINDOW_TX_VALIDATION,
-            ),
-            cross_shard_batch: BatchAccumulator::new(
-                BATCH_MAX_CROSS_SHARD_EXECUTIONS,
-                BATCH_WINDOW_CROSS_SHARD_EXECUTIONS,
-            ),
-            state_vote_batch: BatchAccumulator::new(
-                BATCH_MAX_STATE_VOTES,
-                BATCH_WINDOW_STATE_VOTES,
-            ),
-            state_cert_batch: BatchAccumulator::new(
-                BATCH_MAX_STATE_CERTS,
-                BATCH_WINDOW_STATE_CERTS,
-            ),
+            fetch_protocol,
+            validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
+            cross_shard_batch: BatchAccumulator::new(b.cross_shard_max, b.cross_shard_window),
+            state_vote_batch: BatchAccumulator::new(b.state_vote_max, b.state_vote_window),
+            state_cert_batch: BatchAccumulator::new(b.state_cert_max, b.state_cert_window),
             broadcast_vote_batch: ShardedBatchAccumulator::new(
-                BATCH_MAX_BROADCAST_STATE_VOTES,
-                BATCH_WINDOW_BROADCAST_STATE_VOTES,
+                b.broadcast_vote_max,
+                b.broadcast_vote_window,
             ),
             broadcast_cert_batch: ShardedBatchAccumulator::new(
-                BATCH_MAX_BROADCAST_STATE_CERTS,
-                BATCH_WINDOW_BROADCAST_STATE_CERTS,
+                b.broadcast_cert_max,
+                b.broadcast_cert_window,
             ),
             broadcast_provision_batch: ShardedBatchAccumulator::new(
-                BATCH_MAX_BROADCAST_PROVISIONS,
-                BATCH_WINDOW_BROADCAST_PROVISIONS,
+                b.broadcast_provision_max,
+                b.broadcast_provision_window,
             ),
+            config,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             emitted_statuses: Vec::new(),
             actions_generated: 0,
@@ -345,13 +302,15 @@ where
     /// Needed for operations like genesis that require both references.
     /// Rust's borrow checker can't split borrows through separate method calls.
     ///
+    /// After the closure returns (releasing sole Arc ownership), the inbound
+    /// request handler is automatically registered with the network.
+    ///
     /// # Genesis initialization ordering
     ///
     /// Runners must follow this sequence:
-    /// 1. **Engine genesis** via `with_storage_and_executor()` (requires sole Arc ownership)
-    /// 2. **Handler registration** using [`storage_arc()`], [`tx_cache()`], [`cert_cache()`],
-    ///    and [`event_sender()`] (clones the Arc, so must happen after step 1)
-    /// 3. **State-machine genesis** via `state_mut().initialize_genesis()` followed by
+    /// 1. **Engine genesis** via `with_storage_and_executor()` — requires sole Arc
+    ///    ownership, then registers the inbound handler automatically
+    /// 2. **State-machine genesis** via `state_mut().initialize_genesis()` followed by
     ///    `handle_actions()`, `flush_all_batches()`, and a `StateCommitComplete` event
     ///
     /// # Panics
@@ -365,7 +324,12 @@ where
         let storage = Arc::get_mut(&mut self.storage).expect(
             "with_storage_and_executor must be called before any spawned closures clone the Arc",
         );
-        f(storage, &self.executor)
+        let result = f(storage, &self.executor);
+
+        // Now sole ownership is released — register the inbound handler.
+        self.register_inbound_handler();
+
+        result
     }
 
     // ─── Accessors ──────────────────────────────────────────────────────
@@ -391,63 +355,9 @@ where
             .expect("storage_mut must be called before any spawned closures clone the Arc")
     }
 
-    /// Access the event sender.
-    pub fn event_sender(&self) -> &crossbeam::channel::Sender<Event> {
-        &self.event_sender
-    }
-
     /// Access the network.
     pub fn network(&self) -> &N {
         &self.network
-    }
-
-    /// Access the certificate cache.
-    pub fn cert_cache(&self) -> &Arc<QuickCache<Hash, Arc<TransactionCertificate>>> {
-        &self.cert_cache
-    }
-
-    /// Access the transaction cache.
-    pub fn tx_cache(&self) -> &Arc<QuickCache<Hash, Arc<RoutableTransaction>>> {
-        &self.tx_cache
-    }
-
-    /// Get a shared reference to the storage (Arc clone).
-    ///
-    /// Used by the simulation harness to construct an `InboundHandler` that
-    /// shares the same storage instance as this NodeLoop (same pattern as
-    /// production, where both NodeLoop and InboundRouter share `Arc<Storage>`).
-    pub fn storage_arc(&self) -> Arc<S> {
-        Arc::clone(&self.storage)
-    }
-
-    /// Access the sync protocol.
-    pub fn sync_protocol(&self) -> &SyncProtocol {
-        &self.sync_protocol
-    }
-
-    /// Mutably access the sync protocol.
-    pub fn sync_protocol_mut(&mut self) -> &mut SyncProtocol {
-        &mut self.sync_protocol
-    }
-
-    /// Access the dispatch.
-    pub fn dispatch(&self) -> &D {
-        &self.dispatch
-    }
-
-    /// Access the executor.
-    pub fn executor(&self) -> &RadixExecutor {
-        &self.executor
-    }
-
-    /// Access the signing key.
-    pub fn signing_key(&self) -> &Bls12381G1PrivateKey {
-        &self.signing_key
-    }
-
-    /// Access the topology.
-    pub fn topology(&self) -> &Arc<dyn Topology> {
-        &self.topology
     }
 
     /// Look up the latest emitted status for a transaction.
@@ -468,6 +378,18 @@ where
         &self.tx_status_cache
     }
 
+    /// Create and register the inbound request handler with the network.
+    fn register_inbound_handler(&self) {
+        let handler: Arc<dyn hyperscale_network::InboundRequestHandler> =
+            Arc::new(crate::inbound_handler::InboundHandler::new(
+                self.config.inbound.clone(),
+                Arc::clone(&self.storage),
+                Arc::clone(&self.tx_cache),
+                Arc::clone(&self.cert_cache),
+            ));
+        self.network.register_inbound_handler(handler);
+    }
+
     // ─── Event Processing ───────────────────────────────────────────────
 
     /// Process a single event through the state machine and handle all resulting actions.
@@ -484,7 +406,7 @@ where
     /// 3. Process `emitted_statuses` from the returned [`StepOutput`]
     /// 4. Drain any events produced through the event channel (simulation only —
     ///    production receives these via its crossbeam channel receivers)
-    pub fn step(&mut self, event: Event) -> StepOutput {
+    pub fn step(&mut self, event: NodeInput) -> StepOutput {
         self.emitted_statuses.clear();
         self.actions_generated = 0;
         self.pending_timer_ops.clear();
@@ -496,7 +418,7 @@ where
             // through the validation batch pipeline. Validated transactions
             // re-enter as TransactionValidated, which is converted into
             // TransactionGossipReceived for the state machine.
-            Event::TransactionValidated {
+            NodeInput::TransactionValidated {
                 tx,
                 submitted_locally,
             } => {
@@ -516,7 +438,7 @@ where
             }
 
             // Intercept gossip-received transactions for validation.
-            Event::Protocol(ProtocolEvent::TransactionGossipReceived { tx, .. }) => {
+            NodeInput::Protocol(ProtocolEvent::TransactionGossipReceived { tx, .. }) => {
                 let tx_hash = tx.hash();
                 if self.tx_cache.get(&tx_hash).is_none()
                     && !self.state.mempool().is_tombstoned(&tx_hash)
@@ -526,7 +448,7 @@ where
                 }
             }
 
-            Event::SubmitTransaction { tx } => {
+            NodeInput::SubmitTransaction { tx } => {
                 let tx_hash = tx.hash();
 
                 // Gossip to all relevant shards.
@@ -547,11 +469,11 @@ where
                 }
             }
 
-            Event::TransactionCertificateReceived { certificate } => {
+            NodeInput::TransactionCertificateReceived { certificate } => {
                 self.handle_gossiped_certificate(certificate);
             }
 
-            Event::GossipedCertificateSignatureVerified {
+            NodeInput::GossipedCertificateSignatureVerified {
                 tx_hash,
                 shard,
                 valid,
@@ -560,14 +482,14 @@ where
             }
 
             // ── Sync protocol ──────────────────────────────────────────
-            Event::SyncBlockResponseReceived { height, block } => {
+            NodeInput::SyncBlockResponseReceived { height, block } => {
                 let outputs = self
                     .sync_protocol
                     .handle(SyncInput::BlockResponseReceived { height, block });
                 self.process_sync_outputs(outputs);
             }
 
-            Event::SyncBlockFetchFailed { height } => {
+            NodeInput::SyncBlockFetchFailed { height } => {
                 let outputs = self
                     .sync_protocol
                     .handle(SyncInput::BlockFetchFailed { height });
@@ -575,7 +497,7 @@ where
             }
 
             // ── Fetch protocol ─────────────────────────────────────────
-            Event::TransactionReceived {
+            NodeInput::TransactionReceived {
                 block_hash,
                 transactions,
             } => {
@@ -588,7 +510,7 @@ where
                 self.process_fetch_outputs(outputs);
             }
 
-            Event::CertificateReceived {
+            NodeInput::CertificateReceived {
                 block_hash,
                 certificates,
             } => {
@@ -601,7 +523,7 @@ where
                 self.process_fetch_outputs(outputs);
             }
 
-            Event::FetchTransactionsFailed { block_hash, hashes } => {
+            NodeInput::FetchTransactionsFailed { block_hash, hashes } => {
                 let outputs = self.fetch_protocol.handle(FetchInput::FetchFailed {
                     block_hash,
                     kind: FetchKind::Transaction,
@@ -613,7 +535,7 @@ where
                 self.process_fetch_outputs(tick_outputs);
             }
 
-            Event::FetchCertificatesFailed { block_hash, hashes } => {
+            NodeInput::FetchCertificatesFailed { block_hash, hashes } => {
                 let outputs = self.fetch_protocol.handle(FetchInput::FetchFailed {
                     block_hash,
                     kind: FetchKind::Certificate,
@@ -626,14 +548,25 @@ where
                 self.update_fetch_tick_timer();
             }
 
-            Event::FetchTick => {
+            NodeInput::FetchTick => {
                 let outputs = self.fetch_protocol.handle(FetchInput::Tick);
                 self.process_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
             }
 
+            // ── Gossip received (raw bytes) ─────────────────────────────
+            //
+            // Network layer decompressed the wire bytes; we SBOR-decode
+            // based on message_type and convert to typed protocol events.
+            NodeInput::GossipReceived {
+                message_type,
+                payload,
+            } => {
+                self.handle_gossip_received(&message_type, &payload);
+            }
+
             // ── Protocol events → state machine ────────────────────────
-            Event::Protocol(pe) => {
+            NodeInput::Protocol(pe) => {
                 // Broadcast self-generated state votes returning from dispatch.
                 // Votes from peers arrive via network gossip.
                 if let ProtocolEvent::StateVoteReceived { ref vote } = pe {
@@ -745,7 +678,7 @@ where
             // Internal events
             // ═══════════════════════════════════════════════════════════
             Action::Continuation(pe) => {
-                let _ = self.event_sender.send(Event::Protocol(pe));
+                let _ = self.event_sender.send(NodeInput::Protocol(pe));
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -863,18 +796,15 @@ where
                     entries = entries.len(),
                     "Fetched state entries"
                 );
-                let _ =
-                    self.event_sender
-                        .send(Event::Protocol(ProtocolEvent::StateEntriesFetched {
-                            tx_hash,
-                            entries,
-                        }));
+                let _ = self.event_sender.send(NodeInput::Protocol(
+                    ProtocolEvent::StateEntriesFetched { tx_hash, entries },
+                ));
             }
             Action::FetchBlock { height } => {
                 let block = self.storage.get_block(height);
                 let _ = self
                     .event_sender
-                    .send(Event::Protocol(ProtocolEvent::BlockFetched {
+                    .send(NodeInput::Protocol(ProtocolEvent::BlockFetched {
                         height,
                         block: block.map(|(b, _)| b),
                     }));
@@ -883,13 +813,9 @@ where
                 let height = self.storage.committed_height();
                 let hash = self.storage.committed_hash();
                 let qc = self.storage.latest_qc();
-                let _ =
-                    self.event_sender
-                        .send(Event::Protocol(ProtocolEvent::ChainMetadataFetched {
-                            height,
-                            hash,
-                            qc,
-                        }));
+                let _ = self.event_sender.send(NodeInput::Protocol(
+                    ProtocolEvent::ChainMetadataFetched { height, hash, qc },
+                ));
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -1185,13 +1111,13 @@ where
                                     (Some(b), Some(q)) => Some((b, q)),
                                     _ => None,
                                 };
-                                let _ = es.send(Event::SyncBlockResponseReceived {
+                                let _ = es.send(NodeInput::SyncBlockResponseReceived {
                                     height,
                                     block: Box::new(block),
                                 });
                             }
                             Err(_) => {
-                                let _ = es.send(Event::SyncBlockFetchFailed { height });
+                                let _ = es.send(NodeInput::SyncBlockFetchFailed { height });
                             }
                         }),
                     );
@@ -1240,13 +1166,13 @@ where
                         GetTransactionsRequest::new(block_hash, tx_hashes),
                         Box::new(move |result| match result {
                             Ok(resp) => {
-                                let _ = es.send(Event::TransactionReceived {
+                                let _ = es.send(NodeInput::TransactionReceived {
                                     block_hash: bh,
                                     transactions: resp.into_transactions(),
                                 });
                             }
                             Err(_) => {
-                                let _ = es.send(Event::FetchTransactionsFailed {
+                                let _ = es.send(NodeInput::FetchTransactionsFailed {
                                     block_hash: bh,
                                     hashes: hs,
                                 });
@@ -1268,13 +1194,13 @@ where
                         GetCertificatesRequest::new(block_hash, cert_hashes),
                         Box::new(move |result| match result {
                             Ok(resp) => {
-                                let _ = es.send(Event::CertificateReceived {
+                                let _ = es.send(NodeInput::CertificateReceived {
                                     block_hash: bh,
                                     certificates: resp.into_certificates(),
                                 });
                             }
                             Err(_) => {
-                                let _ = es.send(Event::FetchCertificatesFailed {
+                                let _ = es.send(NodeInput::FetchCertificatesFailed {
                                     block_hash: bh,
                                     hashes: hs,
                                 });
@@ -1322,7 +1248,7 @@ where
     /// Set or cancel the periodic fetch tick timer based on protocol state.
     ///
     /// When the fetch protocol has pending work, a recurring timer fires
-    /// `Event::FetchTick` to retry deferred or failed fetch operations.
+    /// `NodeInput::FetchTick` to retry deferred or failed fetch operations.
     /// When all fetches are complete, the timer is cancelled.
     fn update_fetch_tick_timer(&mut self) {
         let status = self.fetch_protocol.status();
@@ -1369,7 +1295,7 @@ where
 
             for (tx, valid) in batch.into_iter().zip(results) {
                 if valid {
-                    let _ = event_tx.send(Event::TransactionValidated {
+                    let _ = event_tx.send(NodeInput::TransactionValidated {
                         tx,
                         submitted_locally: false, // NodeLoop sets from locally_submitted
                     });
@@ -1555,7 +1481,7 @@ where
                 if !valid {
                     metrics::record_signature_verification_failure();
                 }
-                let _ = es.send(Event::GossipedCertificateSignatureVerified {
+                let _ = es.send(NodeInput::GossipedCertificateSignatureVerified {
                     tx_hash,
                     shard,
                     valid,
@@ -1607,6 +1533,119 @@ where
         self.actions_generated += actions.len();
         for action in actions {
             self.process_action(action);
+        }
+    }
+
+    // ─── Gossip Decode & Dispatch ──────────────────────────────────────
+
+    /// Decode a raw gossip payload and process the resulting protocol events.
+    ///
+    /// The network layer has already decompressed the LZ4 wire bytes; we
+    /// SBOR-decode based on `message_type` and feed typed events to the
+    /// state machine.
+    fn handle_gossip_received(&mut self, message_type: &str, payload: &[u8]) {
+        match message_type {
+            "block.header" => {
+                let Ok(gossip) = sbor::basic_decode::<BlockHeaderGossip>(payload) else {
+                    warn!("Failed to decode BlockHeaderGossip");
+                    return;
+                };
+                let pe = ProtocolEvent::BlockHeaderReceived {
+                    header: gossip.header,
+                    retry_hashes: gossip.retry_hashes,
+                    priority_hashes: gossip.priority_hashes,
+                    tx_hashes: gossip.transaction_hashes,
+                    cert_hashes: gossip.certificate_hashes,
+                    deferred: gossip.deferred,
+                    aborted: gossip.aborted,
+                    commitment_proofs: gossip.commitment_proofs,
+                };
+                let actions = self.state.handle(pe);
+                self.actions_generated += actions.len();
+                for action in actions {
+                    self.process_action(action);
+                }
+            }
+            "block.vote" => {
+                let Ok(gossip) = sbor::basic_decode::<BlockVoteGossip>(payload) else {
+                    warn!("Failed to decode BlockVoteGossip");
+                    return;
+                };
+                let pe = ProtocolEvent::BlockVoteReceived { vote: gossip.vote };
+                let actions = self.state.handle(pe);
+                self.actions_generated += actions.len();
+                for action in actions {
+                    self.process_action(action);
+                }
+            }
+            "state.provision.batch" => {
+                let Ok(batch) = sbor::basic_decode::<StateProvisionBatch>(payload) else {
+                    warn!("Failed to decode StateProvisionBatch");
+                    return;
+                };
+                for provision in batch.into_provisions() {
+                    let pe = ProtocolEvent::StateProvisionReceived { provision };
+                    let actions = self.state.handle(pe);
+                    self.actions_generated += actions.len();
+                    for action in actions {
+                        self.process_action(action);
+                    }
+                }
+            }
+            "state.vote.batch" => {
+                let Ok(batch) = sbor::basic_decode::<StateVoteBatch>(payload) else {
+                    warn!("Failed to decode StateVoteBatch");
+                    return;
+                };
+                for vote in batch.into_votes() {
+                    let pe = ProtocolEvent::StateVoteReceived { vote };
+                    let actions = self.state.handle(pe);
+                    self.actions_generated += actions.len();
+                    for action in actions {
+                        self.process_action(action);
+                    }
+                }
+            }
+            "state.certificate.batch" => {
+                let Ok(batch) = sbor::basic_decode::<StateCertificateBatch>(payload) else {
+                    warn!("Failed to decode StateCertificateBatch");
+                    return;
+                };
+                for cert in batch.into_certificates() {
+                    let pe = ProtocolEvent::StateCertificateReceived { cert };
+                    let actions = self.state.handle(pe);
+                    self.actions_generated += actions.len();
+                    for action in actions {
+                        self.process_action(action);
+                    }
+                }
+            }
+            "transaction.gossip" => {
+                let Ok(gossip) = sbor::basic_decode::<TransactionGossip>(payload) else {
+                    warn!("Failed to decode TransactionGossip");
+                    return;
+                };
+                let tx = gossip.transaction;
+                let tx_hash = tx.hash();
+                // Same logic as the TransactionGossipReceived arm in step():
+                // route through validation pipeline.
+                if self.tx_cache.get(&tx_hash).is_none()
+                    && !self.state.mempool().is_tombstoned(&tx_hash)
+                {
+                    self.pending_validation.insert(tx_hash);
+                    self.queue_validation(tx);
+                }
+            }
+            "transaction.certificate" => {
+                let Ok(gossip) = sbor::basic_decode::<TransactionCertificateGossip>(payload) else {
+                    warn!("Failed to decode TransactionCertificateGossip");
+                    return;
+                };
+                self.handle_gossiped_certificate(gossip.into_certificate());
+            }
+            _ => {
+                warn!(message_type, "Unknown gossip message type");
+            }
         }
     }
 

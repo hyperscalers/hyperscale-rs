@@ -9,8 +9,8 @@
 //! This module implements **request-centric** retry logic, in contrast to the
 //! traditional **peer-centric** approach:
 //!
-//! - **Peer-centric** (old): Timeout → blame peer → cooldown → try next peer
-//! - **Request-centric** (new): Timeout → retry same peer → rotate after threshold
+//! - **Peer-centric**: Timeout → blame peer → cooldown → try next peer
+//! - **Request-centric**: Timeout → retry same peer → rotate after threshold
 //!
 //! The request-centric approach works better under packet loss because:
 //! 1. Packet loss is probabilistic—the peer that timed out might succeed on retry

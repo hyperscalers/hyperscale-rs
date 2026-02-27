@@ -30,8 +30,8 @@ fn test_dispatch() -> Arc<PooledDispatch> {
 
 /// Create a test codec pool handle for network adapter tests.
 fn test_codec_pool_handle() -> hyperscale_network_libp2p::CodecPoolHandle {
-    let registry = std::sync::Arc::new(hyperscale_network::HandlerRegistry::new());
-    hyperscale_network_libp2p::CodecPoolHandle::new(test_dispatch(), registry)
+    let (event_tx, _event_rx) = crossbeam::channel::unbounded();
+    hyperscale_network_libp2p::CodecPoolHandle::new(test_dispatch(), event_tx)
 }
 
 /// Test timeout values (from design spec).

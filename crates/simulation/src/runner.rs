@@ -11,15 +11,11 @@ use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_execution::{DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_network::HandlerRegistry;
 use hyperscale_network_memory::{
     NetworkConfig, NetworkTrafficAnalyzer, SimNetworkAdapter, SimulatedNetwork,
 };
-use hyperscale_node::gossip_dispatch::register_gossip_handlers;
 use hyperscale_node::node_loop::{NodeLoop, StepOutput};
-use hyperscale_node::TimerOp;
-use hyperscale_node::{InboundHandler, InboundHandlerConfig};
-use hyperscale_node::{NodeStateMachine, SyncConfig, SyncProtocol};
+use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp};
 use hyperscale_storage::ConsensusStore;
 use hyperscale_storage_memory::SimStorage;
 use hyperscale_types::{
@@ -214,12 +210,12 @@ impl SimulationRunner {
                     state,
                     SimStorage::new(),
                     RadixExecutor::new(network_def),
-                    SimNetworkAdapter::new(),
+                    network.create_adapter(node_index),
                     SyncDispatch,
                     event_tx,
                     signing_key,
                     topology,
-                    SyncProtocol::new(SyncConfig::default()),
+                    NodeConfig::default(),
                     tx_validator,
                 );
 
@@ -418,18 +414,14 @@ impl SimulationRunner {
         self.finalize_genesis();
     }
 
-    /// Register handlers and initialize state-machine genesis on all nodes.
+    /// Initialize state-machine genesis on all nodes.
     ///
-    /// Called after engine genesis (which requires sole Arc ownership via
-    /// `with_storage_and_executor`). Registers network handlers, creates
-    /// genesis blocks per shard, and initializes each node's state machine.
+    /// Called after engine genesis via `with_storage_and_executor` (which also
+    /// registers inbound handlers). Creates genesis blocks per shard and
+    /// initializes each node's state machine.
     fn finalize_genesis(&mut self) {
         use hyperscale_storage::SubstateStore;
         use hyperscale_types::Block;
-
-        // Register handlers between engine genesis (needs sole Arc) and
-        // state-machine genesis (calls drain_node_io which needs gossip registries).
-        self.register_handlers();
 
         let num_shards = self.network.config().num_shards;
         let validators_per_shard = self.network.config().validators_per_shard;
@@ -480,34 +472,6 @@ impl SimulationRunner {
                 validators = validators_per_shard,
                 "Initialized genesis for shard"
             );
-        }
-    }
-
-    /// Register per-node handlers with [`SimulatedNetwork`].
-    ///
-    /// Must be called after engine genesis (which requires sole Arc ownership of
-    /// storage via `with_storage_and_executor`) and before state-machine genesis
-    /// (which calls `drain_node_io`, requiring gossip registries to exist).
-    ///
-    /// Registers both:
-    /// - [`InboundHandler`] for request fulfillment (block/tx/cert fetches)
-    /// - [`HandlerRegistry`] for gossip dispatch (same setup as production)
-    fn register_handlers(&mut self) {
-        for (i, node_loop) in self.node_loops.iter().enumerate() {
-            // Request handler (needs storage Arc, so post-engine-genesis).
-            let handler = Arc::new(InboundHandler::new(
-                InboundHandlerConfig::default(),
-                node_loop.storage_arc(),
-                node_loop.tx_cache().clone(),
-                node_loop.cert_cache().clone(),
-            ));
-            self.network.register_handler(i as NodeIndex, handler);
-
-            // Gossip handler registry — same setup function production uses.
-            let registry = HandlerRegistry::new();
-            register_gossip_handlers(&registry, node_loop.event_sender().clone());
-            self.network
-                .register_gossip_registry(i as NodeIndex, registry);
         }
     }
 
@@ -612,29 +576,24 @@ impl SimulationRunner {
     // Network Delivery
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Fan out an outbox entry via [`SimulatedNetwork::deliver_and_dispatch_gossip`],
-    /// which eagerly dispatches through each target's `HandlerRegistry`. Decoded
-    /// events are drained from each target's channel and scheduled with latency.
+    /// Fan out an outbox entry via [`SimulatedNetwork::deliver_gossip`].
+    ///
+    /// Each delivery contains a `NodeInput::GossipReceived` event that is
+    /// scheduled directly — no channel draining needed.
     fn deliver_outbox_entry(
         &mut self,
         from: NodeIndex,
         entry: hyperscale_network_memory::OutboxEntry,
     ) {
-        let (results, stats) = self
-            .network
-            .deliver_and_dispatch_gossip(from, entry, &mut self.rng);
+        let (deliveries, stats) = self.network.deliver_gossip(from, entry, &mut self.rng);
 
         self.stats.messages_sent += stats.messages_sent;
         self.stats.messages_dropped_partition += stats.messages_dropped_partition;
         self.stats.messages_dropped_loss += stats.messages_dropped_loss;
 
-        // Drain decoded events from each target node's channel and schedule
-        // with the sampled latency offset.
-        for result in results {
-            let deliver_at = self.now + result.latency;
-            while let Ok(event) = self.event_rxs[result.to as usize].try_recv() {
-                self.schedule_event(result.to, deliver_at, event);
-            }
+        for delivery in deliveries {
+            let deliver_at = self.now + delivery.latency;
+            self.schedule_event(delivery.to, deliver_at, delivery.event);
         }
     }
 

@@ -8,6 +8,7 @@ description = "Production libp2p network transport"
 default = []
 
 [dependencies]
+hyperscale-core.workspace = true
 hyperscale-dispatch.workspace = true
 hyperscale-dispatch-pooled.workspace = true
 hyperscale-metrics.workspace = true

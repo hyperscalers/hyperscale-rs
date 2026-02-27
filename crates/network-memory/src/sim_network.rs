@@ -2,17 +2,17 @@
 //!
 //! [`SimNetworkAdapter`] buffers outgoing messages in an outbox. After each
 //! `NodeLoop::step()`, the simulation harness drains the outbox and routes
-//! entries through [`SimulatedNetwork::deliver_and_dispatch_gossip`](crate::SimulatedNetwork::deliver_and_dispatch_gossip),
-//! which applies partition/latency/loss and eagerly dispatches through each
-//! target node's `HandlerRegistry` — the same decode path as production.
+//! entries through [`SimulatedNetwork::deliver_gossip`](crate::SimulatedNetwork::deliver_gossip),
+//! which applies partition/latency/loss, LZ4-decompresses the payload once,
+//! and returns a [`GossipDelivery`](crate::GossipDelivery) per target peer.
 //!
 //! Messages are wire-encoded (SBOR + LZ4) in the outbox, matching the production
-//! encoding path. Decoded events are returned to the harness for scheduling with
-//! the sampled latency.
+//! encoding path. The harness schedules the resulting `NodeInput::GossipReceived`
+//! events directly with the sampled latency.
 
-use hyperscale_network::{encode_to_wire, Network, RequestError};
+use hyperscale_network::{encode_to_wire, InboundRequestHandler, Network, RequestError};
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Target for an outbound message.
 #[derive(Debug, Clone)]
@@ -21,8 +21,6 @@ pub enum BroadcastTarget {
     Shard(ShardGroupId),
     /// Broadcast to all connected peers globally.
     Global,
-    /// Send to a specific peer.
-    Peer(ValidatorId),
 }
 
 /// An outbound message buffered for delivery by the simulation harness.
@@ -54,6 +52,13 @@ pub struct PendingRequest {
     pub on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) + Send>,
 }
 
+/// Shared slot for an inbound request handler.
+///
+/// Created by [`SimulatedNetwork::create_adapter`] and shared between the
+/// per-node [`SimNetworkAdapter`] and the central [`SimulatedNetwork`].
+/// [`Network::register_inbound_handler`] sets the slot; request fulfillment reads it.
+pub type HandlerSlot = Arc<OnceLock<Arc<dyn InboundRequestHandler>>>;
+
 /// Network implementation for simulation.
 ///
 /// Buffers outgoing messages in an outbox rather than delivering them immediately.
@@ -65,18 +70,26 @@ pub struct PendingRequest {
 /// Each simulated node owns a `SimNetworkAdapter`. The harness:
 /// 1. Calls `NodeLoop::step(event)` which may produce network sends
 /// 2. Drains the adapter's outbox via [`drain_outbox()`](Self::drain_outbox)
-/// 3. Routes entries through `SimulatedNetwork::deliver_and_dispatch_gossip()`
-/// 4. Decoded events are scheduled with the sampled latency offset
+/// 3. Routes entries through `SimulatedNetwork::deliver_gossip()`
+/// 4. Events are scheduled with the sampled latency offset
 pub struct SimNetworkAdapter {
     outbox: Mutex<Vec<OutboxEntry>>,
     pending_requests: Mutex<Vec<PendingRequest>>,
+    /// Shared handler slot — written by [`Network::register_inbound_handler`],
+    /// read by [`SimulatedNetwork::fulfill_requests`].
+    handler_slot: HandlerSlot,
 }
 
 impl SimNetworkAdapter {
-    pub fn new() -> Self {
+    /// Create a new adapter with a pre-allocated handler slot.
+    ///
+    /// Use [`SimulatedNetwork::create_adapter`] to create adapters with
+    /// shared handler slots for request fulfillment.
+    pub fn new(handler_slot: HandlerSlot) -> Self {
         Self {
             outbox: Mutex::new(Vec::new()),
             pending_requests: Mutex::new(Vec::new()),
+            handler_slot,
         }
     }
 
@@ -99,7 +112,7 @@ impl SimNetworkAdapter {
 
 impl Default for SimNetworkAdapter {
     fn default() -> Self {
-        Self::new()
+        Self::new(Arc::new(OnceLock::new()))
     }
 }
 
@@ -122,26 +135,8 @@ impl Network for SimNetworkAdapter {
         });
     }
 
-    fn send_to<M: NetworkMessage>(&self, peer: ValidatorId, message: &M) {
-        let data = encode_to_wire(message).expect("SimNetworkAdapter: failed to encode message");
-        self.outbox.lock().unwrap().push(OutboxEntry {
-            target: BroadcastTarget::Peer(peer),
-            message_type: M::message_type_id(),
-            data,
-        });
-    }
-
-    fn subscribe_shard(&self, _shard: ShardGroupId) {
-        // No-op in simulation. The harness controls delivery based on
-        // shard topology, not subscriptions.
-    }
-
-    fn on_message<M: NetworkMessage + 'static>(
-        &self,
-        _handler: Box<dyn Fn(ValidatorId, M) + Send + Sync>,
-    ) {
-        // No-op in simulation. Events are delivered directly via
-        // NodeLoop::step(event), not through handler dispatch.
+    fn register_inbound_handler(&self, handler: Arc<dyn InboundRequestHandler>) {
+        let _ = self.handler_slot.set(handler);
     }
 
     fn request<R: Request + 'static>(

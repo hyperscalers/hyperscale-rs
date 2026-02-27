@@ -172,18 +172,13 @@ impl NodeStateMachine {
         &self.bft
     }
 
-    /// Get a mutable reference to the BFT state.
-    pub fn bft_mut(&mut self) -> &mut BftState {
-        &mut self.bft
-    }
-
     /// Get a reference to the execution state.
     pub fn execution(&self) -> &ExecutionState {
         &self.execution
     }
 
     /// Get a mutable reference to the execution state.
-    pub fn execution_mut(&mut self) -> &mut ExecutionState {
+    pub(crate) fn execution_mut(&mut self) -> &mut ExecutionState {
         &mut self.execution
     }
 
@@ -290,7 +285,7 @@ impl StateMachine for NodeStateMachine {
             // ProposalTimer handles both proposal AND implicit round advancement
             ProtocolEvent::ProposalTimer => {
                 // Check if we should advance the round due to timeout.
-                // This is now handled in BftState which owns the timeout tracking.
+                // Delegated to BftState which owns timeout tracking.
                 if let Some(actions) = self.bft.check_round_timeout() {
                     let current_height =
                         hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
@@ -812,9 +807,9 @@ impl StateMachine for NodeStateMachine {
                 vec![]
             }
 
-            // Sync protocol events - routed to BFT
-            // Note: SyncNeeded is now Action::StartSync (emitted by BFT, handled by runner).
-            // The runner sends SyncBlockReadyToApply and SyncComplete to the state machine.
+            // Sync protocol events - routed to BFT.
+            // Action::StartSync is emitted by BFT and handled by the runner,
+            // which sends SyncBlockReadyToApply and SyncComplete back.
             ProtocolEvent::SyncBlockReadyToApply { block, qc } => {
                 self.bft.on_sync_block_ready_to_apply(block, qc)
             }

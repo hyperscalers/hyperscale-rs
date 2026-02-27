@@ -3,6 +3,8 @@
 //! Defines the `Network` interface implemented by both production (`network-libp2p`)
 //! and simulation (`network-memory`) backends.
 
+use std::sync::Arc;
+
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 
 /// Error returned when a network request fails.
@@ -33,15 +35,19 @@ pub trait InboundRequestHandler: Send + Sync + 'static {
     fn handle_request(&self, payload: &[u8]) -> Vec<u8>;
 }
 
-/// Network interface for sending typed messages and registering listeners.
+impl<T: InboundRequestHandler + ?Sized> InboundRequestHandler for std::sync::Arc<T> {
+    fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
+        (**self).handle_request(payload)
+    }
+}
+
+/// Network interface for sending typed messages and handling inbound requests.
 ///
 /// Generic methods make this NOT object-safe — use `N: Network` bounds.
 /// This is consistent with how storage and dispatch are already used:
 /// `ActionContext<S: CommitStore + SubstateStore, D: Dispatch>`.
 ///
 /// All sends are fire-and-forget. Responses to requests arrive via callback.
-/// Listeners are called from the network's decode/delivery thread — handlers
-/// should be lightweight (push into a channel, not do heavy processing).
 pub trait Network: Send + Sync {
     // ── Pub/sub messaging ──
 
@@ -51,27 +57,16 @@ pub trait Network: Send + Sync {
     /// Broadcast a message to all connected peers globally.
     fn broadcast_global<M: NetworkMessage>(&self, message: &M);
 
-    /// Send a message to a specific validator (point-to-point, not gossip).
-    fn send_to<M: NetworkMessage>(&self, peer: ValidatorId, message: &M);
+    // ── Inbound request handling ──
 
-    /// Subscribe to a shard's message topics.
+    /// Register an inbound request handler.
     ///
-    /// After subscribing, messages broadcast to this shard by other peers
-    /// will be delivered to registered listeners.
-    fn subscribe_shard(&self, shard: ShardGroupId);
-
-    /// Register a typed listener for a message type.
+    /// The handler processes incoming request-response payloads (block sync,
+    /// transaction/certificate fetches). Called once during node initialization.
     ///
-    /// When a message of type M arrives (from gossip or point-to-point),
-    /// the handler is called with the sender's identity and the decoded message.
-    ///
-    /// Implementations store handlers type-erased (keyed by `M::message_type_id()`).
-    /// The handler is called on the network's decode thread — keep it lightweight
-    /// (typically: push into a crossbeam channel).
-    fn on_message<M: NetworkMessage + 'static>(
-        &self,
-        handler: Box<dyn Fn(ValidatorId, M) + Send + Sync>,
-    );
+    /// The network layer owns the handler's lifecycle — production spawns an
+    /// `InboundRouter` task, simulation stores it for centralized fulfillment.
+    fn register_inbound_handler(&self, handler: Arc<dyn InboundRequestHandler>);
 
     // ── Request-response ──
 
