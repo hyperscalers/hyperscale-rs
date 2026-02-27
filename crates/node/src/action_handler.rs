@@ -1,21 +1,19 @@
-//! Unified action handler for delegated computation.
+//! Action handler for immediately-dispatched computation.
 //!
-//! This module provides a single entry point for handling actions that require
-//! pure computation (crypto verification, execution, proposal building). Both
-//! the production and simulation runners call these functions instead of
-//! duplicating the algorithms.
+//! [`handle_delegated_action`] bridges individual [`Action`] variants to pure
+//! computation (crypto verification, execution, proposal building). The node
+//! loop's `dispatch_delegated_action` spawns closures that call this function
+//! on the appropriate thread pool.
 //!
-//! Production wraps calls in dispatch pools (thread pools) and delivers results
-//! via channels. Simulation calls inline and schedules events directly.
+//! Batched work (state votes, state certs, cross-shard execution) and block
+//! commits are handled inline by the node loop's flush closures.
 
-use hyperscale_core::{Action, CrossShardExecutionRequest, NodeInput, ProtocolEvent};
+use hyperscale_core::{Action, NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
-use hyperscale_execution::handlers::UnverifiedStateVote;
-use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
+use hyperscale_storage::{CommitStore, SubstateStore};
 use hyperscale_types::{
-    Block, BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Hash, QuorumCertificate,
-    ShardGroupId, StateCertificate, StateVoteBlock, Topology, ValidatorId,
+    Bls12381G1PrivateKey, Hash, ShardGroupId, StateVoteBlock, Topology, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -42,9 +40,9 @@ pub struct DelegatedResult<P: Send> {
 pub enum DispatchPool {
     /// Liveness-critical consensus crypto (QC, state root, proposal).
     ConsensusCrypto,
-    /// General crypto verification (provisions, state votes, state certs).
+    /// General crypto verification (cert aggregation, provisions).
     Crypto,
-    /// Transaction execution (single-shard, cross-shard, merkle).
+    /// Transaction execution (single-shard, merkle).
     Execution,
 }
 
@@ -64,14 +62,11 @@ pub fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 
         // General crypto
         Action::AggregateStateCertificate { .. } => Some(DispatchPool::Crypto),
-        Action::VerifyAndAggregateStateVotes { .. } => Some(DispatchPool::Crypto),
-        Action::VerifyStateCertificateSignature { .. } => Some(DispatchPool::Crypto),
         Action::VerifyAndAggregateProvisions { .. } => Some(DispatchPool::Crypto),
 
         // Execution
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
         Action::SpeculativeExecute { .. } => Some(DispatchPool::Execution),
-        Action::ExecuteCrossShardTransaction { .. } => Some(DispatchPool::Execution),
         Action::ComputeMerkleRoot { .. } => Some(DispatchPool::Execution),
 
         _ => None,
@@ -83,9 +78,10 @@ pub fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// Returns `None` for non-delegated actions (timers, broadcasts, persist, etc.)
 /// that the runner must handle directly.
 ///
-/// For execution actions (ExecuteTransactions, SpeculativeExecute, ExecuteCrossShardTransaction),
-/// the returned events include `ProtocolEvent::StateVoteReceived` for each vote. The runner is
-/// responsible for additionally broadcasting votes to shard peers (network-specific).
+/// For execution actions (`ExecuteTransactions`, `SpeculativeExecute`), the
+/// returned events include `ProtocolEvent::StateVoteReceived` for each vote.
+/// The runner is responsible for additionally broadcasting votes to shard
+/// peers (network-specific).
 #[allow(clippy::too_many_lines)]
 pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
     action: Action,
@@ -292,36 +288,6 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
             })
         }
 
-        Action::VerifyAndAggregateStateVotes { tx_hash, votes } => {
-            let verified_votes =
-                hyperscale_execution::handlers::verify_and_aggregate_state_votes(votes);
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::StateVotesVerifiedAndAggregated {
-                        tx_hash,
-                        verified_votes,
-                    },
-                )],
-                prepared_commit: None,
-            })
-        }
-
-        Action::VerifyStateCertificateSignature {
-            certificate,
-            public_keys,
-        } => {
-            let valid = hyperscale_execution::handlers::verify_state_certificate_signature(
-                &certificate,
-                &public_keys,
-            );
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::StateCertificateSignatureVerified { certificate, valid },
-                )],
-                prepared_commit: None,
-            })
-        }
-
         // --- Provisions ---
         Action::VerifyAndAggregateProvisions {
             tx_hash,
@@ -420,30 +386,6 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
             })
         }
 
-        Action::ExecuteCrossShardTransaction {
-            tx_hash,
-            transaction,
-            provisions,
-        } => {
-            let vote = hyperscale_execution::handlers::execute_and_sign_cross_shard(
-                ctx.executor,
-                ctx.storage,
-                tx_hash,
-                &transaction,
-                &provisions,
-                ctx.signing_key,
-                ctx.local_shard,
-                ctx.validator_id,
-                ctx.topology,
-            );
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::StateVoteReceived {
-                    vote,
-                })],
-                prepared_commit: None,
-            })
-        }
-
         // --- Merkle root computation ---
         Action::ComputeMerkleRoot { tx_hash: _, writes } => {
             let _root = hyperscale_bft::handlers::compute_merkle_root(&writes);
@@ -454,111 +396,5 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
         }
 
         _ => None,
-    }
-}
-
-/// Execute a batch of cross-shard transactions in parallel and return vote events.
-///
-/// Production accumulates `ExecuteCrossShardTransaction` actions (5ms window, up to 256 items)
-/// and dispatches them as a batch. This function runs the batch through `map_execution`
-/// for parallel execution on the dispatch pool.
-pub fn handle_cross_shard_batch<S: CommitStore + SubstateStore, D: Dispatch>(
-    requests: &[CrossShardExecutionRequest],
-    ctx: &ActionContext<'_, S, D>,
-) -> Vec<NodeInput> {
-    let votes: Vec<StateVoteBlock> = ctx.dispatch.map_execution(requests, |req| {
-        hyperscale_execution::handlers::execute_and_sign_cross_shard(
-            ctx.executor,
-            ctx.storage,
-            req.tx_hash,
-            &req.transaction,
-            &req.provisions,
-            ctx.signing_key,
-            ctx.local_shard,
-            ctx.validator_id,
-            ctx.topology,
-        )
-    });
-
-    votes
-        .into_iter()
-        .map(|vote| NodeInput::Protocol(ProtocolEvent::StateVoteReceived { vote }))
-        .collect()
-}
-
-/// Batch verify state votes across multiple transactions and return events.
-///
-/// Uses cross-transaction BLS batch verification (~2 pairings for the whole
-/// batch). Emits one `StateVotesVerifiedAndAggregated` event per tx_hash.
-pub fn handle_state_vote_batch(items: Vec<(Hash, Vec<UnverifiedStateVote>)>) -> Vec<NodeInput> {
-    hyperscale_execution::handlers::batch_verify_and_aggregate_state_votes(items)
-        .into_iter()
-        .map(|(tx_hash, verified_votes)| {
-            NodeInput::Protocol(ProtocolEvent::StateVotesVerifiedAndAggregated {
-                tx_hash,
-                verified_votes,
-            })
-        })
-        .collect()
-}
-
-/// Batch verify state certificate signatures and return events.
-///
-/// Uses cross-certificate BLS batch verification (~2 pairings for the whole
-/// batch). Emits one `StateCertificateSignatureVerified` event per certificate.
-pub fn handle_state_cert_batch(
-    items: Vec<(StateCertificate, Vec<Bls12381G1PublicKey>)>,
-) -> Vec<NodeInput> {
-    let results = hyperscale_execution::handlers::batch_verify_state_certificate_signatures(&items);
-    items
-        .into_iter()
-        .zip(results)
-        .map(|((certificate, _), valid)| {
-            NodeInput::Protocol(ProtocolEvent::StateCertificateSignatureVerified {
-                certificate,
-                valid,
-            })
-        })
-        .collect()
-}
-
-/// Commit a block's state writes and update consensus metadata.
-///
-/// Uses the prepared commit handle (fast path) if available, otherwise
-/// recomputes from certificates (slow path). Updates committed state
-/// metadata and prunes old votes after state is applied.
-///
-/// Returns `Some(NodeInput::Protocol(ProtocolEvent::StateCommitComplete))` if certificates were committed,
-/// `None` if the block had no certificates.
-pub fn commit_block<S: CommitStore + ConsensusStore>(
-    storage: &S,
-    block: &Block,
-    block_hash: Hash,
-    height: BlockHeight,
-    qc: &QuorumCertificate,
-    local_shard: ShardGroupId,
-    prepared_commit: Option<S::PreparedCommit>,
-) -> Option<NodeInput> {
-    if !block.certificates.is_empty() {
-        let result = if let Some(prepared) = prepared_commit {
-            storage.commit_prepared_block(prepared)
-        } else {
-            storage.commit_block(&block.certificates, local_shard)
-        };
-
-        // Persist committed metadata AFTER state is applied.
-        ConsensusStore::set_committed_state(storage, height, block_hash, qc);
-        ConsensusStore::prune_own_votes(storage, height.0);
-
-        Some(NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
-            height: height.0,
-            state_version: result.state_version,
-            state_root: result.state_root,
-        }))
-    } else {
-        // Empty block - no state changes, but still update committed metadata.
-        ConsensusStore::set_committed_state(storage, height, block_hash, qc);
-        ConsensusStore::prune_own_votes(storage, height.0);
-        None
     }
 }

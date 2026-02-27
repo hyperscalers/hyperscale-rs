@@ -24,7 +24,7 @@ use crate::fetch_protocol::{FetchConfig, FetchInput, FetchKind, FetchOutput, Fet
 use crate::sync_protocol::{SyncInput, SyncOutput, SyncProtocol, SyncStatus};
 use crate::NodeStateMachine;
 use hyperscale_core::{
-    Action, CrossShardExecutionRequest, Event, ProtocolEvent, StateMachine, TimerId,
+    Action, CrossShardExecutionRequest, Event, NodeInput, ProtocolEvent, StateMachine, TimerId,
 };
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{RadixExecutor, TransactionValidation};
@@ -920,16 +920,32 @@ where
 
                 let prepared = self.prepared_commits.lock().unwrap().remove(&block_hash);
 
-                if let Some(commit_event) = action_handler::commit_block(
-                    &*self.storage,
-                    &block,
-                    block_hash,
-                    height,
-                    &qc,
-                    self.local_shard,
-                    prepared,
-                ) {
-                    let _ = self.event_sender.send(commit_event);
+                // Commit state writes (fast path uses prepared handle, slow
+                // path recomputes from certificates).
+                if !block.certificates.is_empty() {
+                    let result = if let Some(prepared) = prepared {
+                        self.storage.commit_prepared_block(prepared)
+                    } else {
+                        self.storage
+                            .commit_block(&block.certificates, self.local_shard)
+                    };
+
+                    // Persist committed metadata AFTER state is applied.
+                    ConsensusStore::set_committed_state(&*self.storage, height, block_hash, &qc);
+                    ConsensusStore::prune_own_votes(&*self.storage, height.0);
+
+                    let _ = self.event_sender.send(NodeInput::Protocol(
+                        ProtocolEvent::StateCommitComplete {
+                            height: height.0,
+                            state_version: result.state_version,
+                            state_root: result.state_root,
+                        },
+                    ));
+                } else {
+                    // Empty block — no state changes, but still update
+                    // committed metadata.
+                    ConsensusStore::set_committed_state(&*self.storage, height, block_hash, &qc);
+                    ConsensusStore::prune_own_votes(&*self.storage, height.0);
                 }
 
                 // Feed committed height to sync protocol.
@@ -1381,19 +1397,24 @@ where
 
         self.dispatch.spawn_execution(move || {
             let start = std::time::Instant::now();
-            let ctx = ActionContext {
-                storage: &*storage,
-                executor: &executor,
-                topology: &*topology,
-                signing_key: &signing_key,
-                local_shard,
-                validator_id,
-                dispatch: &dispatch,
-            };
-            let events = action_handler::handle_cross_shard_batch(&requests, &ctx);
+            let votes: Vec<_> = dispatch.map_execution(&requests, |req| {
+                hyperscale_execution::handlers::execute_and_sign_cross_shard(
+                    &executor,
+                    &*storage,
+                    req.tx_hash,
+                    &req.transaction,
+                    &req.provisions,
+                    &signing_key,
+                    local_shard,
+                    validator_id,
+                    &*topology,
+                )
+            });
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
-            for event in events {
-                let _ = event_tx.send(event);
+            for vote in votes {
+                let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::StateVoteReceived {
+                    vote,
+                }));
             }
         });
     }
@@ -1410,9 +1431,15 @@ where
 
         let event_tx = self.event_sender.clone();
         self.dispatch.spawn_crypto(move || {
-            let events = action_handler::handle_state_vote_batch(items);
-            for event in events {
-                let _ = event_tx.send(event);
+            for (tx_hash, verified_votes) in
+                hyperscale_execution::handlers::batch_verify_and_aggregate_state_votes(items)
+            {
+                let _ = event_tx.send(NodeInput::Protocol(
+                    ProtocolEvent::StateVotesVerifiedAndAggregated {
+                        tx_hash,
+                        verified_votes,
+                    },
+                ));
             }
         });
     }
@@ -1429,9 +1456,12 @@ where
 
         let event_tx = self.event_sender.clone();
         self.dispatch.spawn_crypto(move || {
-            let events = action_handler::handle_state_cert_batch(items);
-            for event in events {
-                let _ = event_tx.send(event);
+            let results =
+                hyperscale_execution::handlers::batch_verify_state_certificate_signatures(&items);
+            for ((certificate, _), valid) in items.into_iter().zip(results) {
+                let _ = event_tx.send(NodeInput::Protocol(
+                    ProtocolEvent::StateCertificateSignatureVerified { certificate, valid },
+                ));
             }
         });
     }
