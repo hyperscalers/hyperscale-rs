@@ -67,8 +67,6 @@ pub fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         // Execution
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
         Action::SpeculativeExecute { .. } => Some(DispatchPool::Execution),
-        Action::ComputeMerkleRoot { .. } => Some(DispatchPool::Execution),
-
         _ => None,
     }
 }
@@ -261,7 +259,7 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
         Action::AggregateStateCertificate {
             tx_hash,
             shard,
-            merkle_root,
+            writes_commitment,
             votes,
             read_nodes,
             voting_power,
@@ -270,7 +268,7 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
             let certificate = hyperscale_execution::handlers::aggregate_state_certificate(
                 tx_hash,
                 shard,
-                merkle_root,
+                writes_commitment,
                 &votes,
                 read_nodes,
                 voting_power,
@@ -382,15 +380,6 @@ pub fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
 
             Some(DelegatedResult {
                 events,
-                prepared_commit: None,
-            })
-        }
-
-        // --- Merkle root computation ---
-        Action::ComputeMerkleRoot { tx_hash: _, writes } => {
-            let _root = hyperscale_bft::handlers::compute_merkle_root(&writes);
-            Some(DelegatedResult {
-                events: vec![],
                 prepared_commit: None,
             })
         }

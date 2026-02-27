@@ -50,11 +50,11 @@ pub struct SingleTxResult {
     /// Whether execution succeeded (committed).
     pub success: bool,
 
-    /// Merkle root of the state changes (outputs commitment).
+    /// Deterministic hash-chain commitment over execution output writes.
     ///
     /// Used in the voting protocol to ensure all shards agree on results.
     /// For failed transactions, this is a zero hash.
-    pub outputs_merkle_root: Hash,
+    pub writes_commitment: Hash,
 
     /// State writes from execution (for certificate creation).
     ///
@@ -69,13 +69,13 @@ impl SingleTxResult {
     /// Create a successful result.
     pub fn success(
         tx_hash: Hash,
-        outputs_merkle_root: Hash,
+        writes_commitment: Hash,
         state_writes: Vec<SubstateWrite>,
     ) -> Self {
         Self {
             tx_hash,
             success: true,
-            outputs_merkle_root,
+            writes_commitment,
             state_writes,
             error: None,
         }
@@ -86,7 +86,7 @@ impl SingleTxResult {
         Self {
             tx_hash,
             success: false,
-            outputs_merkle_root: Hash::ZERO,
+            writes_commitment: Hash::ZERO,
             state_writes: vec![],
             error: Some(error.into()),
         }

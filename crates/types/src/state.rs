@@ -304,8 +304,8 @@ pub struct StateVoteBlock {
     /// Shard group that executed.
     pub shard_group_id: ShardGroupId,
 
-    /// Merkle root of the execution outputs.
-    pub state_root: Hash,
+    /// Deterministic hash-chain commitment over execution output writes.
+    pub writes_commitment: Hash,
 
     /// Whether execution succeeded.
     pub success: bool,
@@ -329,7 +329,7 @@ impl StateVoteBlock {
         let mut data = Vec::new();
         data.extend_from_slice(self.transaction_hash.as_bytes());
         data.extend_from_slice(&self.shard_group_id.0.to_le_bytes());
-        data.extend_from_slice(self.state_root.as_bytes());
+        data.extend_from_slice(self.writes_commitment.as_bytes());
         data.push(if self.success { 1 } else { 0 });
 
         Hash::from_bytes(&data)
@@ -345,7 +345,7 @@ impl StateVoteBlock {
     pub fn signing_message(&self) -> Vec<u8> {
         exec_vote_message(
             &self.transaction_hash,
-            &self.state_root,
+            &self.writes_commitment,
             self.shard_group_id,
             self.success,
         )
@@ -367,8 +367,8 @@ pub struct StateCertificate {
     /// Substate data that was WRITTEN during execution.
     pub state_writes: Vec<SubstateWrite>,
 
-    /// Merkle root of the outputs.
-    pub outputs_merkle_root: Hash,
+    /// Deterministic hash-chain commitment over execution output writes.
+    pub writes_commitment: Hash,
 
     /// Whether execution succeeded.
     pub success: bool,
@@ -422,7 +422,7 @@ impl StateCertificate {
     /// Create a certificate for a single-shard transaction.
     pub fn single_shard(
         transaction_hash: Hash,
-        outputs_merkle_root: Hash,
+        writes_commitment: Hash,
         shard_group_id: ShardGroupId,
         success: bool,
     ) -> Self {
@@ -431,7 +431,7 @@ impl StateCertificate {
             shard_group_id,
             read_nodes: vec![],
             state_writes: vec![],
-            outputs_merkle_root,
+            writes_commitment,
             success,
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::empty(),
@@ -450,7 +450,7 @@ impl StateCertificate {
     pub fn signing_message(&self) -> Vec<u8> {
         exec_vote_message(
             &self.transaction_hash,
-            &self.outputs_merkle_root,
+            &self.writes_commitment,
             self.shard_group_id,
             self.success,
         )

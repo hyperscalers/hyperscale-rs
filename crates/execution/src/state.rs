@@ -1061,19 +1061,19 @@ impl ExecutionState {
         };
 
         // Check for quorum
-        let Some((merkle_root, total_power)) = tracker.check_quorum() else {
+        let Some((writes_commitment, total_power)) = tracker.check_quorum() else {
             return vec![];
         };
 
         // Extract data from tracker - use take_votes_for_root to avoid cloning
-        let votes = tracker.take_votes_for_root(&merkle_root);
+        let votes = tracker.take_votes_for_commitment(&writes_commitment);
         let read_nodes = tracker.read_nodes().to_vec();
         let participating_shards = tracker.participating_shards().to_vec();
 
         tracing::debug!(
             tx_hash = ?tx_hash,
             shard = local_shard.0,
-            merkle_root = ?merkle_root,
+            writes_commitment = ?writes_commitment,
             votes = votes.len(),
             power = total_power,
             "Vote quorum reached - delegating BLS aggregation"
@@ -1096,7 +1096,7 @@ impl ExecutionState {
         vec![Action::AggregateStateCertificate {
             tx_hash,
             shard: local_shard,
-            merkle_root,
+            writes_commitment,
             votes,
             read_nodes,
             voting_power: VotePower(total_power),
@@ -2345,20 +2345,20 @@ mod tests {
 
         // In production, the runner executes + signs + sends StateVoteReceived.
         // Simulate that by creating a vote and calling on_vote.
-        let state_root = Hash::ZERO;
+        let writes_commitment = Hash::ZERO;
         let success = true;
         let local_shard = state.local_shard();
         let validator_id = state.validator_id();
 
         // Create a signed vote (simulating what the runner does)
         let message =
-            hyperscale_types::exec_vote_message(&tx_hash, &state_root, local_shard, success);
+            hyperscale_types::exec_vote_message(&tx_hash, &writes_commitment, local_shard, success);
         let signature = state.signing_key.sign_v1(&message);
 
         let vote = StateVoteBlock {
             transaction_hash: tx_hash,
             shard_group_id: local_shard,
-            state_root,
+            writes_commitment,
             success,
             state_writes: vec![],
             validator: validator_id,
@@ -2509,13 +2509,17 @@ mod tests {
 
         let committee = TestCommittee::new(4, 42);
         let tx_hash = Hash::from_bytes(b"test_tx");
-        let state_root = Hash::from_bytes(b"state_root");
+        let writes_commitment = Hash::from_bytes(b"state_root");
         let shard = ShardGroupId(0);
 
         // Create a properly signed state vote
         let vote = fixtures::make_signed_state_vote(
-            &committee, 0, // voter index
-            tx_hash, state_root, shard, true,
+            &committee,
+            0, // voter index
+            tx_hash,
+            writes_commitment,
+            shard,
+            true,
         );
 
         // Verify the signature using the signing_message method
@@ -2534,7 +2538,7 @@ mod tests {
 
         let committee = TestCommittee::new(4, 42);
         let tx_hash = Hash::from_bytes(b"test_tx");
-        let merkle_root = Hash::from_bytes(b"merkle_root");
+        let writes_commitment = Hash::from_bytes(b"commitment");
         let shard = ShardGroupId(0);
 
         // Create a state certificate with real aggregated signatures
@@ -2542,7 +2546,7 @@ mod tests {
             &committee,
             &[0, 1, 2], // 3 voters
             tx_hash,
-            merkle_root,
+            writes_commitment,
             shard,
             true,
         );

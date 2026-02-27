@@ -21,7 +21,7 @@ use tracing::instrument;
 /// Tracks votes for a cross-shard transaction.
 ///
 /// After executing a transaction with provisioned state, validators create
-/// votes on the execution result (merkle root). This tracker collects votes
+/// votes on the execution result (writes commitment). This tracker collects votes
 /// and determines when quorum is reached.
 ///
 /// The tracker now supports deferred verification: unverified votes are buffered
@@ -40,10 +40,10 @@ pub struct VoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
     // Verified votes (passed signature verification)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Verified votes grouped by merkle root.
-    votes_by_root: BTreeMap<Hash, Vec<StateVoteBlock>>,
-    /// Voting power per merkle root (verified votes only).
-    power_by_root: BTreeMap<Hash, u64>,
+    /// Verified votes grouped by writes commitment.
+    votes_by_commitment: BTreeMap<Hash, Vec<StateVoteBlock>>,
+    /// Voting power per writes commitment (verified votes only).
+    power_by_commitment: BTreeMap<Hash, u64>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Unverified votes (buffered until quorum possible)
@@ -79,8 +79,8 @@ impl VoteTracker {
             participating_shards,
             read_nodes,
             quorum,
-            votes_by_root: BTreeMap::new(),
-            power_by_root: BTreeMap::new(),
+            votes_by_commitment: BTreeMap::new(),
+            power_by_commitment: BTreeMap::new(),
             unverified_votes: Vec::new(),
             unverified_power: 0,
             seen_validators: HashSet::new(),
@@ -140,8 +140,13 @@ impl VoteTracker {
             return false;
         }
 
-        // Get the best verified power (highest power for any merkle root)
-        let best_verified_power = self.power_by_root.values().max().copied().unwrap_or(0);
+        // Get the best verified power (highest power for any writes commitment)
+        let best_verified_power = self
+            .power_by_commitment
+            .values()
+            .max()
+            .copied()
+            .unwrap_or(0);
 
         // Total potential power if all unverified votes are valid and agree
         let total_potential = best_verified_power + self.unverified_power;
@@ -183,36 +188,41 @@ impl VoteTracker {
         quorum = self.quorum,
     ))]
     pub fn add_verified_vote(&mut self, vote: StateVoteBlock, power: u64) {
-        let state_root = vote.state_root;
-        self.votes_by_root.entry(state_root).or_default().push(vote);
-        *self.power_by_root.entry(state_root).or_insert(0) += power;
+        let commitment = vote.writes_commitment;
+        self.votes_by_commitment
+            .entry(commitment)
+            .or_default()
+            .push(vote);
+        *self.power_by_commitment.entry(commitment).or_insert(0) += power;
     }
 
-    /// Check if quorum is reached for any merkle root (verified votes only).
+    /// Check if quorum is reached for any writes commitment (verified votes only).
     ///
-    /// Returns `Some((merkle_root, total_power))` if quorum is reached, `None` otherwise.
-    /// Use `votes_for_root()` to get the actual votes after checking quorum.
+    /// Returns `Some((writes_commitment, total_power))` if quorum is reached, `None` otherwise.
+    /// Use `votes_for_commitment()` to get the actual votes after checking quorum.
     pub fn check_quorum(&self) -> Option<(Hash, u64)> {
-        for (merkle_root, power) in &self.power_by_root {
+        for (commitment, power) in &self.power_by_commitment {
             if *power >= self.quorum {
-                return Some((*merkle_root, *power));
+                return Some((*commitment, *power));
             }
         }
         None
     }
 
-    /// Get votes for a specific merkle root (reference).
+    /// Get votes for a specific writes commitment (reference).
     #[cfg(test)]
-    pub fn votes_for_root(&self, merkle_root: &Hash) -> &[StateVoteBlock] {
-        self.votes_by_root
-            .get(merkle_root)
+    pub fn votes_for_commitment(&self, commitment: &Hash) -> &[StateVoteBlock] {
+        self.votes_by_commitment
+            .get(commitment)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
 
-    /// Take votes for a specific merkle root (ownership transfer, avoids clone).
-    pub fn take_votes_for_root(&mut self, merkle_root: &Hash) -> Vec<StateVoteBlock> {
-        self.votes_by_root.remove(merkle_root).unwrap_or_default()
+    /// Take votes for a specific writes commitment (ownership transfer, avoids clone).
+    pub fn take_votes_for_commitment(&mut self, commitment: &Hash) -> Vec<StateVoteBlock> {
+        self.votes_by_commitment
+            .remove(commitment)
+            .unwrap_or_default()
     }
 }
 
@@ -228,7 +238,7 @@ mod tests {
     #[test]
     fn test_vote_tracker_quorum() {
         let tx_hash = Hash::from_bytes(b"test_tx");
-        let merkle_root = Hash::from_bytes(b"merkle_root");
+        let commitment = Hash::from_bytes(b"commitment");
 
         let mut tracker = VoteTracker::new(
             tx_hash,
@@ -240,7 +250,7 @@ mod tests {
         let vote = StateVoteBlock {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            state_root: merkle_root,
+            writes_commitment: commitment,
             success: true,
             state_writes: vec![],
             validator: ValidatorId(0),
@@ -260,8 +270,8 @@ mod tests {
         let result = tracker.check_quorum();
         assert!(result.is_some());
         let (root, power) = result.unwrap();
-        assert_eq!(root, merkle_root);
-        assert_eq!(tracker.votes_for_root(&root).len(), 3);
+        assert_eq!(root, commitment);
+        assert_eq!(tracker.votes_for_commitment(&root).len(), 3);
         assert_eq!(power, 3);
     }
 
@@ -276,7 +286,7 @@ mod tests {
         let vote_a = StateVoteBlock {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            state_root: root_a,
+            writes_commitment: root_a,
             success: true,
             state_writes: vec![],
             validator: ValidatorId(0),
@@ -286,7 +296,7 @@ mod tests {
         let vote_b = StateVoteBlock {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            state_root: root_b,
+            writes_commitment: root_b,
             success: true,
             state_writes: vec![],
             validator: ValidatorId(1),
@@ -314,7 +324,7 @@ mod tests {
     #[test]
     fn test_buffer_unverified_vote() {
         let tx_hash = Hash::from_bytes(b"test_tx");
-        let merkle_root = Hash::from_bytes(b"merkle_root");
+        let commitment = Hash::from_bytes(b"commitment");
         let pk = make_test_public_key();
 
         let mut tracker = VoteTracker::new(tx_hash, vec![ShardGroupId(0)], vec![], 3);
@@ -322,7 +332,7 @@ mod tests {
         let vote = StateVoteBlock {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            state_root: merkle_root,
+            writes_commitment: commitment,
             success: true,
             state_writes: vec![],
             validator: ValidatorId(0),
@@ -346,7 +356,7 @@ mod tests {
     #[test]
     fn test_should_trigger_verification_not_enough_power() {
         let tx_hash = Hash::from_bytes(b"test_tx");
-        let merkle_root = Hash::from_bytes(b"merkle_root");
+        let commitment = Hash::from_bytes(b"commitment");
         let pk = make_test_public_key();
 
         let mut tracker = VoteTracker::new(tx_hash, vec![ShardGroupId(0)], vec![], 3);
@@ -354,7 +364,7 @@ mod tests {
         let vote = StateVoteBlock {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            state_root: merkle_root,
+            writes_commitment: commitment,
             success: true,
             state_writes: vec![],
             validator: ValidatorId(0),
@@ -369,7 +379,7 @@ mod tests {
     #[test]
     fn test_should_trigger_verification_enough_power() {
         let tx_hash = Hash::from_bytes(b"test_tx");
-        let merkle_root = Hash::from_bytes(b"merkle_root");
+        let commitment = Hash::from_bytes(b"commitment");
         let pk = make_test_public_key();
 
         let mut tracker = VoteTracker::new(tx_hash, vec![ShardGroupId(0)], vec![], 3);
@@ -379,7 +389,7 @@ mod tests {
             let vote = StateVoteBlock {
                 transaction_hash: tx_hash,
                 shard_group_id: ShardGroupId(0),
-                state_root: merkle_root,
+                writes_commitment: commitment,
                 success: true,
                 state_writes: vec![],
                 validator: ValidatorId(i),
@@ -394,7 +404,7 @@ mod tests {
     #[test]
     fn test_take_unverified_votes() {
         let tx_hash = Hash::from_bytes(b"test_tx");
-        let merkle_root = Hash::from_bytes(b"merkle_root");
+        let commitment = Hash::from_bytes(b"commitment");
         let pk = make_test_public_key();
 
         let mut tracker = VoteTracker::new(tx_hash, vec![ShardGroupId(0)], vec![], 3);
@@ -404,7 +414,7 @@ mod tests {
             let vote = StateVoteBlock {
                 transaction_hash: tx_hash,
                 shard_group_id: ShardGroupId(0),
-                state_root: merkle_root,
+                writes_commitment: commitment,
                 success: true,
                 state_writes: vec![],
                 validator: ValidatorId(i),
@@ -429,7 +439,7 @@ mod tests {
     #[test]
     fn test_deferred_verification_with_verified_votes() {
         let tx_hash = Hash::from_bytes(b"test_tx");
-        let merkle_root = Hash::from_bytes(b"merkle_root");
+        let commitment = Hash::from_bytes(b"commitment");
         let pk = make_test_public_key();
 
         let mut tracker = VoteTracker::new(tx_hash, vec![ShardGroupId(0)], vec![], 3);
@@ -438,7 +448,7 @@ mod tests {
         let vote1 = StateVoteBlock {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            state_root: merkle_root,
+            writes_commitment: commitment,
             success: true,
             state_writes: vec![],
             validator: ValidatorId(0),
@@ -449,7 +459,7 @@ mod tests {
         // 1 verified + 1 unverified = 2, not enough for quorum 3
         let vote2 = StateVoteBlock {
             validator: ValidatorId(1),
-            ..tracker.votes_by_root.values().next().unwrap()[0].clone()
+            ..tracker.votes_by_commitment.values().next().unwrap()[0].clone()
         };
         tracker.buffer_unverified_vote(vote2, pk, 1);
         assert!(!tracker.should_trigger_verification());
@@ -458,7 +468,7 @@ mod tests {
         let vote3 = StateVoteBlock {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            state_root: merkle_root,
+            writes_commitment: commitment,
             success: true,
             state_writes: vec![],
             validator: ValidatorId(2),

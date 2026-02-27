@@ -809,8 +809,7 @@ where
             | Action::AggregateStateCertificate { .. }
             | Action::VerifyAndAggregateProvisions { .. }
             | Action::ExecuteTransactions { .. }
-            | Action::SpeculativeExecute { .. }
-            | Action::ComputeMerkleRoot { .. } => {
+            | Action::SpeculativeExecute { .. } => {
                 self.dispatch_delegated_action(action);
             }
 

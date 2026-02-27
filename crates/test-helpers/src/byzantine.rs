@@ -131,17 +131,17 @@ pub fn make_wrong_key_state_vote(
     claimed_voter_idx: usize,
     actual_signer_idx: usize,
     tx_hash: Hash,
-    state_root: Hash,
+    writes_commitment: Hash,
     shard: ShardGroupId,
     success: bool,
 ) -> StateVoteBlock {
-    let message = exec_vote_message(&tx_hash, &state_root, shard, success);
+    let message = exec_vote_message(&tx_hash, &writes_commitment, shard, success);
     let signature = committee.keypair(actual_signer_idx).sign_v1(&message);
 
     StateVoteBlock {
         transaction_hash: tx_hash,
         shard_group_id: shard,
-        state_root,
+        writes_commitment,
         success,
         state_writes: vec![],
         validator: committee.validator_id(claimed_voter_idx),
@@ -149,23 +149,23 @@ pub fn make_wrong_key_state_vote(
     }
 }
 
-/// Create a state vote signed for a different state root.
-pub fn make_wrong_state_root_vote(
+/// Create a state vote signed for a different writes commitment.
+pub fn make_wrong_writes_commitment_vote(
     committee: &TestCommittee,
     voter_idx: usize,
     tx_hash: Hash,
-    claimed_state_root: Hash,
-    actual_signed_root: Hash,
+    claimed_commitment: Hash,
+    actual_signed_commitment: Hash,
     shard: ShardGroupId,
     success: bool,
 ) -> StateVoteBlock {
-    let message = exec_vote_message(&tx_hash, &actual_signed_root, shard, success);
+    let message = exec_vote_message(&tx_hash, &actual_signed_commitment, shard, success);
     let signature = committee.keypair(voter_idx).sign_v1(&message);
 
     StateVoteBlock {
         transaction_hash: tx_hash,
         shard_group_id: shard,
-        state_root: claimed_state_root,
+        writes_commitment: claimed_commitment,
         success,
         state_writes: vec![],
         validator: committee.validator_id(voter_idx),
@@ -273,13 +273,17 @@ mod tests {
     fn test_wrong_key_state_vote_rejected() {
         let committee = TestCommittee::new(4, 42);
         let tx_hash = Hash::from_bytes(b"tx");
-        let state_root = Hash::from_bytes(b"state");
+        let writes_commitment = Hash::from_bytes(b"state");
         let shard = ShardGroupId(0);
 
         let bad_vote = make_wrong_key_state_vote(
-            &committee, 0, // claimed
+            &committee,
+            0, // claimed
             1, // actual signer
-            tx_hash, state_root, shard, true,
+            tx_hash,
+            writes_commitment,
+            shard,
+            true,
         );
 
         // Should NOT verify with claimed voter's key

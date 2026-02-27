@@ -144,17 +144,17 @@ pub fn make_signed_state_vote(
     committee: &TestCommittee,
     voter_idx: usize,
     tx_hash: Hash,
-    state_root: Hash,
+    writes_commitment: Hash,
     shard: ShardGroupId,
     success: bool,
 ) -> StateVoteBlock {
-    let message = exec_vote_message(&tx_hash, &state_root, shard, success);
+    let message = exec_vote_message(&tx_hash, &writes_commitment, shard, success);
     let signature = committee.keypair(voter_idx).sign_v1(&message);
 
     StateVoteBlock {
         transaction_hash: tx_hash,
         shard_group_id: shard,
-        state_root,
+        writes_commitment,
         success,
         state_writes: vec![],
         validator: committee.validator_id(voter_idx),
@@ -169,11 +169,11 @@ pub fn make_signed_state_certificate(
     committee: &TestCommittee,
     voter_indices: &[usize],
     tx_hash: Hash,
-    merkle_root: Hash,
+    writes_commitment: Hash,
     shard: ShardGroupId,
     success: bool,
 ) -> StateCertificate {
-    let message = exec_vote_message(&tx_hash, &merkle_root, shard, success);
+    let message = exec_vote_message(&tx_hash, &writes_commitment, shard, success);
 
     // Collect individual signatures
     let signatures: Vec<Bls12381G2Signature> = voter_indices
@@ -196,7 +196,7 @@ pub fn make_signed_state_certificate(
         shard_group_id: shard,
         read_nodes: vec![],
         state_writes: vec![],
-        outputs_merkle_root: merkle_root,
+        writes_commitment,
         success,
         aggregated_signature,
         signers,
@@ -359,10 +359,10 @@ mod tests {
     fn test_signed_state_vote() {
         let committee = TestCommittee::new(4, 42);
         let tx_hash = Hash::from_bytes(b"tx");
-        let state_root = Hash::from_bytes(b"state");
+        let writes_commitment = Hash::from_bytes(b"state");
         let shard = ShardGroupId(0);
 
-        let vote = make_signed_state_vote(&committee, 0, tx_hash, state_root, shard, true);
+        let vote = make_signed_state_vote(&committee, 0, tx_hash, writes_commitment, shard, true);
 
         // Should verify with correct key
         assert!(verify_state_vote(&vote, committee.public_key(0)));
@@ -375,14 +375,14 @@ mod tests {
     fn test_signed_state_certificate() {
         let committee = TestCommittee::new(4, 42);
         let tx_hash = Hash::from_bytes(b"tx");
-        let merkle_root = Hash::from_bytes(b"merkle");
+        let writes_commitment = Hash::from_bytes(b"commitment");
         let shard = ShardGroupId(0);
 
         let cert = make_signed_state_certificate(
             &committee,
             &[0, 1, 2],
             tx_hash,
-            merkle_root,
+            writes_commitment,
             shard,
             true,
         );

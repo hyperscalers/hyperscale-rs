@@ -8,7 +8,7 @@ use hyperscale_storage::{CommitStore, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_transaction_root, verify_bls12381_v1, Block,
     BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
-    CycleProof, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield,
+    CycleProof, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield,
     TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
@@ -382,26 +382,4 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         block_hash,
         prepared_commit: prepared,
     }
-}
-
-/// Compute a merkle root hash over sorted state writes.
-///
-/// Uses a simple hash chain over `(NodeId, value)` pairs sorted by NodeId
-/// for determinism.
-pub fn compute_merkle_root(writes: &[(NodeId, Vec<u8>)]) -> Hash {
-    if writes.is_empty() {
-        return Hash::ZERO;
-    }
-
-    // Sort writes for determinism
-    let mut sorted: Vec<_> = writes.to_vec();
-    sorted.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
-
-    // Hash chain
-    let mut data = Vec::new();
-    for (node_id, value) in &sorted {
-        data.extend_from_slice(&node_id.0);
-        data.extend_from_slice(value);
-    }
-    Hash::from_bytes(&data)
 }

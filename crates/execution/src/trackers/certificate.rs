@@ -103,7 +103,7 @@ impl CertificateTracker {
     ///
     /// Returns `None` if:
     /// - Not all certificates have been collected
-    /// - Certificates have mismatched merkle roots (Byzantine behavior)
+    /// - Certificates have mismatched writes commitments (Byzantine behavior)
     #[instrument(level = "debug", skip(self), fields(
         tx_hash = %self.tx_hash,
         shard_count = self.certificates.len(),
@@ -119,13 +119,13 @@ impl CertificateTracker {
             return None;
         }
 
-        // Verify all shards agree on merkle root (zero-allocation iterator approach)
-        let mut roots_iter = self.certificates.values().map(|c| c.outputs_merkle_root);
-        let first_root = roots_iter.next()?; // Safe: is_complete() guarantees at least one
-        if !roots_iter.all(|r| r == first_root) {
+        // Verify all shards agree on writes commitment (zero-allocation iterator approach)
+        let mut commitments = self.certificates.values().map(|c| c.writes_commitment);
+        let first = commitments.next()?; // Safe: is_complete() guarantees at least one
+        if !commitments.all(|c| c == first) {
             tracing::warn!(
                 tx_hash = ?self.tx_hash,
-                "Merkle root mismatch across shards - cannot create TX certificate"
+                "Writes commitment mismatch across shards - cannot create TX certificate"
             );
             return None;
         }
@@ -133,7 +133,7 @@ impl CertificateTracker {
         tracing::debug!(
             tx_hash = ?self.tx_hash,
             shards = ?self.certificates.keys().collect::<Vec<_>>(),
-            "Creating TX certificate - all certificates collected and merkle roots match"
+            "Creating TX certificate - all certificates collected and writes commitments match"
         );
 
         // Determine decision first (before moving certificates)
@@ -160,13 +160,17 @@ mod tests {
     use super::*;
     use hyperscale_types::{zero_bls_signature, SignerBitfield};
 
-    fn make_certificate(tx_hash: Hash, shard: ShardGroupId, merkle_root: Hash) -> StateCertificate {
+    fn make_certificate(
+        tx_hash: Hash,
+        shard: ShardGroupId,
+        writes_commitment: Hash,
+    ) -> StateCertificate {
         StateCertificate {
             transaction_hash: tx_hash,
             shard_group_id: shard,
             read_nodes: vec![],
             state_writes: vec![],
-            outputs_merkle_root: merkle_root,
+            writes_commitment,
             success: true,
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(4),
@@ -179,17 +183,17 @@ mod tests {
         let tx_hash = Hash::from_bytes(b"test_tx");
         let shard0 = ShardGroupId(0);
         let shard1 = ShardGroupId(1);
-        let merkle_root = Hash::from_bytes(b"merkle_root");
+        let commitment = Hash::from_bytes(b"commitment");
 
         let expected = [shard0, shard1].into_iter().collect();
         let mut tracker = CertificateTracker::new(tx_hash, expected);
 
         assert!(!tracker.is_complete());
 
-        let cert0 = make_certificate(tx_hash, shard0, merkle_root);
+        let cert0 = make_certificate(tx_hash, shard0, commitment);
         assert!(!tracker.add_certificate(cert0));
 
-        let cert1 = make_certificate(tx_hash, shard1, merkle_root);
+        let cert1 = make_certificate(tx_hash, shard1, commitment);
         assert!(tracker.add_certificate(cert1));
 
         assert!(tracker.is_complete());
@@ -225,13 +229,13 @@ mod tests {
     fn test_certificate_tracker_ignores_unknown_shard() {
         let tx_hash = Hash::from_bytes(b"test_tx");
         let shard0 = ShardGroupId(0);
-        let merkle_root = Hash::from_bytes(b"merkle_root");
+        let commitment = Hash::from_bytes(b"commitment");
 
         let expected = [shard0].into_iter().collect();
         let mut tracker = CertificateTracker::new(tx_hash, expected);
 
         // Certificate from unknown shard
-        let unknown_cert = make_certificate(tx_hash, ShardGroupId(99), merkle_root);
+        let unknown_cert = make_certificate(tx_hash, ShardGroupId(99), commitment);
         assert!(!tracker.add_certificate(unknown_cert));
         assert!(!tracker.is_complete());
     }
@@ -240,12 +244,12 @@ mod tests {
     fn test_certificate_tracker_no_duplicate() {
         let tx_hash = Hash::from_bytes(b"test_tx");
         let shard0 = ShardGroupId(0);
-        let merkle_root = Hash::from_bytes(b"merkle_root");
+        let commitment = Hash::from_bytes(b"commitment");
 
         let expected = [shard0].into_iter().collect();
         let mut tracker = CertificateTracker::new(tx_hash, expected);
 
-        let cert = make_certificate(tx_hash, shard0, merkle_root);
+        let cert = make_certificate(tx_hash, shard0, commitment);
         assert!(tracker.add_certificate(cert.clone()));
 
         // Duplicate should not change state

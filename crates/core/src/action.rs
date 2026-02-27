@@ -185,8 +185,8 @@ pub enum Action {
         tx_hash: Hash,
         /// Shard group that executed.
         shard: ShardGroupId,
-        /// Merkle root of the execution outputs.
-        merkle_root: Hash,
+        /// Deterministic hash-chain commitment over execution output writes.
+        writes_commitment: Hash,
         /// Votes to aggregate (with quorum).
         votes: Vec<StateVoteBlock>,
         /// Read nodes (for certificate).
@@ -389,15 +389,6 @@ pub enum Action {
         transaction: Arc<RoutableTransaction>,
         /// State provisions from other shards.
         provisions: Vec<StateProvision>,
-    },
-
-    /// Compute a merkle root from state changes.
-    ///
-    /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::MerkleRootComputed` when complete.
-    ComputeMerkleRoot {
-        tx_hash: Hash,
-        writes: Vec<(NodeId, Vec<u8>)>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -707,7 +698,6 @@ impl Action {
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
-                | Action::ComputeMerkleRoot { .. }
                 | Action::FetchStateEntries { .. }
                 | Action::FetchBlock { .. }
                 | Action::FetchChainMetadata
@@ -778,7 +768,6 @@ impl Action {
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",
             Action::SpeculativeExecute { .. } => "SpeculativeExecute",
             Action::ExecuteCrossShardTransaction { .. } => "ExecuteCrossShardTransaction",
-            Action::ComputeMerkleRoot { .. } => "ComputeMerkleRoot",
 
             // External Notifications
             Action::EmitCommittedBlock { .. } => "EmitCommittedBlock",

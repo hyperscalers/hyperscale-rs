@@ -34,7 +34,7 @@ pub type UnverifiedStateVote = (StateVoteBlock, Bls12381G1PublicKey, u64);
 pub fn aggregate_state_certificate(
     tx_hash: Hash,
     shard: ShardGroupId,
-    merkle_root: Hash,
+    writes_commitment: Hash,
     votes: &[StateVoteBlock],
     read_nodes: Vec<NodeId>,
     voting_power: VotePower,
@@ -79,7 +79,7 @@ pub fn aggregate_state_certificate(
         shard_group_id: shard,
         read_nodes,
         state_writes,
-        outputs_merkle_root: merkle_root,
+        writes_commitment,
         success,
         aggregated_signature,
         signers,
@@ -89,7 +89,7 @@ pub fn aggregate_state_certificate(
 
 /// Verify and aggregate state votes for a single transaction.
 ///
-/// Groups votes by signing message (same `(tx_hash, state_root, shard, success)`
+/// Groups votes by signing message (same `(tx_hash, writes_commitment, shard, success)`
 /// sign the same message), then uses BLS same-message batch verification for
 /// each group. Falls back to individual verification on batch failure.
 ///
@@ -311,14 +311,14 @@ pub fn execute_and_sign_single_shard<S: SubstateStore>(
     local_shard: ShardGroupId,
     validator_id: ValidatorId,
 ) -> StateVoteBlock {
-    let (tx_hash, success, state_root, state_writes) =
+    let (tx_hash, success, writes_commitment, state_writes) =
         match executor.execute_single_shard(storage, std::slice::from_ref(tx)) {
             Ok(output) => {
                 if let Some(r) = output.results().first() {
                     (
                         r.tx_hash,
                         r.success,
-                        r.outputs_merkle_root,
+                        r.writes_commitment,
                         r.state_writes.clone(),
                     )
                 } else {
@@ -332,13 +332,13 @@ pub fn execute_and_sign_single_shard<S: SubstateStore>(
         };
 
     // Sign immediately after execution
-    let message = exec_vote_message(&tx_hash, &state_root, local_shard, success);
+    let message = exec_vote_message(&tx_hash, &writes_commitment, local_shard, success);
     let signature = signing_key.sign_v1(&message);
 
     StateVoteBlock {
         transaction_hash: tx_hash,
         shard_group_id: local_shard,
-        state_root,
+        writes_commitment,
         success,
         state_writes,
         validator: validator_id,
@@ -369,18 +369,19 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
         topology.shard_for_node_id(node_id) == local_shard
     };
 
-    let (result_hash, success, state_root, state_writes) = match executor.execute_cross_shard(
-        storage,
-        std::slice::from_ref(transaction),
-        provisions,
-        is_local_node,
-    ) {
+    let (result_hash, success, writes_commitment, state_writes) = match executor
+        .execute_cross_shard(
+            storage,
+            std::slice::from_ref(transaction),
+            provisions,
+            is_local_node,
+        ) {
         Ok(output) => {
             if let Some(r) = output.results().first() {
                 (
                     r.tx_hash,
                     r.success,
-                    r.outputs_merkle_root,
+                    r.writes_commitment,
                     r.state_writes.clone(),
                 )
             } else {
@@ -394,13 +395,13 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
     };
 
     // Sign immediately after execution
-    let message = exec_vote_message(&result_hash, &state_root, local_shard, success);
+    let message = exec_vote_message(&result_hash, &writes_commitment, local_shard, success);
     let signature = signing_key.sign_v1(&message);
 
     StateVoteBlock {
         transaction_hash: result_hash,
         shard_group_id: local_shard,
-        state_root,
+        writes_commitment,
         success,
         state_writes,
         validator: validator_id,

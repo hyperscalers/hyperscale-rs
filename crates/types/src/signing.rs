@@ -97,14 +97,14 @@ pub fn state_provision_message(
 /// signatures from StateVoteBlocks.
 pub fn exec_vote_message(
     tx_hash: &Hash,
-    state_root: &Hash,
+    writes_commitment: &Hash,
     shard_group: ShardGroupId,
     success: bool,
 ) -> Vec<u8> {
     let mut message = Vec::new();
     message.extend_from_slice(DOMAIN_EXEC_VOTE);
     message.extend_from_slice(tx_hash.as_bytes());
-    message.extend_from_slice(state_root.as_bytes());
+    message.extend_from_slice(writes_commitment.as_bytes());
     message.extend_from_slice(&shard_group.0.to_le_bytes());
     message.push(if success { 1 } else { 0 });
     message
