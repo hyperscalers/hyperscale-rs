@@ -19,6 +19,7 @@
 //! production (wall clock) and simulation (logical clock) use the same paths.
 
 use crate::action_handler::{self, ActionContext, DispatchPool};
+use crate::batch_accumulator::{BatchAccumulator, ShardedBatchAccumulator};
 use crate::fetch_protocol::{FetchConfig, FetchInput, FetchKind, FetchOutput, FetchProtocol};
 use crate::sync_protocol::{SyncInput, SyncOutput, SyncProtocol, SyncStatus};
 use crate::NodeStateMachine;
@@ -108,67 +109,8 @@ const BATCH_MAX_TX_VALIDATION: usize = 128;
 /// Batch window for transaction validation.
 const BATCH_WINDOW_TX_VALIDATION: Duration = Duration::from_millis(20);
 
-// ═══════════════════════════════════════════════════════════════════════
-// Batch accumulators
-// ═══════════════════════════════════════════════════════════════════════
-
-/// Pending cross-shard execution requests awaiting batch dispatch.
-#[derive(Default)]
-struct PendingCrossShardExecutions {
-    requests: Vec<CrossShardExecutionRequest>,
-}
-
-/// Batched state votes: (tx_hash, votes) where each vote is (vote, public_key, voting_power).
-type BatchedStateVotes = Vec<(Hash, Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>)>;
-
-/// Pending state vote verifications awaiting batch dispatch.
-#[derive(Default)]
-struct PendingStateVoteVerifications {
-    /// Each entry: (tx_hash, votes with public keys and voting power).
-    items: BatchedStateVotes,
-    /// Total individual votes across all items (for max check).
-    total_votes: usize,
-}
-
-/// Pending state certificate verifications awaiting batch dispatch.
-#[derive(Default)]
-struct PendingStateCertVerifications {
-    items: Vec<(StateCertificate, Vec<Bls12381G1PublicKey>)>,
-}
-
-/// Pending broadcast state votes awaiting batch send.
-#[derive(Default)]
-struct PendingBroadcastStateVotes {
-    /// Shard → accumulated votes.
-    by_shard: HashMap<ShardGroupId, Vec<StateVoteBlock>>,
-    total: usize,
-}
-
-/// Pending broadcast state certificates awaiting batch send.
-#[derive(Default)]
-struct PendingBroadcastStateCerts {
-    by_shard: HashMap<ShardGroupId, Vec<StateCertificate>>,
-    total: usize,
-}
-
-/// Pending broadcast state provisions awaiting batch send.
-#[derive(Default)]
-struct PendingBroadcastProvisions {
-    by_shard: HashMap<ShardGroupId, Vec<hyperscale_types::StateProvision>>,
-    total: usize,
-}
-
-/// Batch deadline types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum BatchType {
-    TransactionValidation,
-    CrossShardExecution,
-    StateVoteVerification,
-    StateCertVerification,
-    BroadcastStateVotes,
-    BroadcastStateCerts,
-    BroadcastProvisions,
-}
+/// A single state-vote verification item: (tx_hash, votes with public keys and voting power).
+type StateVoteVerificationItem = (Hash, Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>);
 
 // ═══════════════════════════════════════════════════════════════════════
 // TimerOp — buffered timer operations for the runner
@@ -276,16 +218,15 @@ where
     tx_validator: Arc<TransactionValidation>,
     pending_validation: HashSet<Hash>,
     locally_submitted: HashSet<Hash>,
-    validation_batch: Vec<Arc<RoutableTransaction>>,
 
     // Batch accumulators
-    pending_cross_shard: PendingCrossShardExecutions,
-    pending_state_votes: PendingStateVoteVerifications,
-    pending_state_certs: PendingStateCertVerifications,
-    pending_broadcast_votes: PendingBroadcastStateVotes,
-    pending_broadcast_certs: PendingBroadcastStateCerts,
-    pending_broadcast_provisions: PendingBroadcastProvisions,
-    batch_deadlines: HashMap<BatchType, Duration>,
+    validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
+    cross_shard_batch: BatchAccumulator<CrossShardExecutionRequest>,
+    state_vote_batch: BatchAccumulator<StateVoteVerificationItem>,
+    state_cert_batch: BatchAccumulator<(StateCertificate, Vec<Bls12381G1PublicKey>)>,
+    broadcast_vote_batch: ShardedBatchAccumulator<StateVoteBlock>,
+    broadcast_cert_batch: ShardedBatchAccumulator<StateCertificate>,
+    broadcast_provision_batch: ShardedBatchAccumulator<hyperscale_types::StateProvision>,
 
     // Transaction status cache — retains the latest status for every transaction
     // that has emitted a status notification. Bounded LRU cache shared (via Arc)
@@ -338,16 +279,36 @@ where
             tx_validator,
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
-            validation_batch: Vec::new(),
             sync_protocol,
             fetch_protocol: FetchProtocol::new(FetchConfig::default()),
-            pending_cross_shard: PendingCrossShardExecutions::default(),
-            pending_state_votes: PendingStateVoteVerifications::default(),
-            pending_state_certs: PendingStateCertVerifications::default(),
-            pending_broadcast_votes: PendingBroadcastStateVotes::default(),
-            pending_broadcast_certs: PendingBroadcastStateCerts::default(),
-            pending_broadcast_provisions: PendingBroadcastProvisions::default(),
-            batch_deadlines: HashMap::new(),
+            validation_batch: BatchAccumulator::new(
+                BATCH_MAX_TX_VALIDATION,
+                BATCH_WINDOW_TX_VALIDATION,
+            ),
+            cross_shard_batch: BatchAccumulator::new(
+                BATCH_MAX_CROSS_SHARD_EXECUTIONS,
+                BATCH_WINDOW_CROSS_SHARD_EXECUTIONS,
+            ),
+            state_vote_batch: BatchAccumulator::new(
+                BATCH_MAX_STATE_VOTES,
+                BATCH_WINDOW_STATE_VOTES,
+            ),
+            state_cert_batch: BatchAccumulator::new(
+                BATCH_MAX_STATE_CERTS,
+                BATCH_WINDOW_STATE_CERTS,
+            ),
+            broadcast_vote_batch: ShardedBatchAccumulator::new(
+                BATCH_MAX_BROADCAST_STATE_VOTES,
+                BATCH_WINDOW_BROADCAST_STATE_VOTES,
+            ),
+            broadcast_cert_batch: ShardedBatchAccumulator::new(
+                BATCH_MAX_BROADCAST_STATE_CERTS,
+                BATCH_WINDOW_BROADCAST_STATE_CERTS,
+            ),
+            broadcast_provision_batch: ShardedBatchAccumulator::new(
+                BATCH_MAX_BROADCAST_PROVISIONS,
+                BATCH_WINDOW_BROADCAST_PROVISIONS,
+            ),
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             emitted_statuses: Vec::new(),
             actions_generated: 0,
@@ -743,16 +704,26 @@ where
     /// the loop calls this with wall-clock time. In simulation, the harness
     /// calls it with logical time.
     pub fn flush_expired_batches(&mut self, now: Duration) {
-        let expired: Vec<BatchType> = self
-            .batch_deadlines
-            .iter()
-            .filter(|(_, deadline)| now >= **deadline)
-            .map(|(bt, _)| *bt)
-            .collect();
-
-        for batch_type in expired {
-            self.batch_deadlines.remove(&batch_type);
-            self.flush_batch(batch_type);
+        if self.validation_batch.is_expired(now) {
+            self.flush_validation_batch();
+        }
+        if self.cross_shard_batch.is_expired(now) {
+            self.flush_cross_shard_executions();
+        }
+        if self.state_vote_batch.is_expired(now) {
+            self.flush_state_vote_verifications();
+        }
+        if self.state_cert_batch.is_expired(now) {
+            self.flush_state_cert_verifications();
+        }
+        if self.broadcast_vote_batch.is_expired(now) {
+            self.flush_broadcast_votes();
+        }
+        if self.broadcast_cert_batch.is_expired(now) {
+            self.flush_broadcast_certs();
+        }
+        if self.broadcast_provision_batch.is_expired(now) {
+            self.flush_broadcast_provisions();
         }
 
         // Clean up stale pending gossip cert verifications.
@@ -775,7 +746,18 @@ where
     /// Used by the production `run()` loop for `recv_timeout()` and by the
     /// simulation harness to know when to schedule a flush.
     pub fn nearest_batch_deadline(&self) -> Option<Duration> {
-        self.batch_deadlines.values().copied().min()
+        [
+            self.validation_batch.deadline(),
+            self.cross_shard_batch.deadline(),
+            self.state_vote_batch.deadline(),
+            self.state_cert_batch.deadline(),
+            self.broadcast_vote_batch.deadline(),
+            self.broadcast_cert_batch.deadline(),
+            self.broadcast_provision_batch.deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     // ─── Action Processing ──────────────────────────────────────────────
@@ -834,7 +816,7 @@ where
             // Delegated work — batched (accumulated for batch dispatch)
             // ═══════════════════════════════════════════════════════════
             Action::VerifyAndAggregateStateVotes { tx_hash, votes } => {
-                self.accumulate_state_vote_verification(tx_hash, votes);
+                self.accumulate_state_vote_verification((tx_hash, votes));
             }
             Action::VerifyStateCertificateSignature {
                 certificate,
@@ -1380,15 +1362,7 @@ where
 
     /// Queue a transaction for batch validation.
     fn queue_validation(&mut self, tx: Arc<RoutableTransaction>) {
-        if self.validation_batch.is_empty() {
-            let deadline = self.state.now() + BATCH_WINDOW_TX_VALIDATION;
-            self.batch_deadlines
-                .insert(BatchType::TransactionValidation, deadline);
-        }
-        self.validation_batch.push(tx);
-        if self.validation_batch.len() >= BATCH_MAX_TX_VALIDATION {
-            self.batch_deadlines
-                .remove(&BatchType::TransactionValidation);
+        if self.validation_batch.push(tx, self.state.now()) {
             self.flush_validation_batch();
         }
     }
@@ -1399,7 +1373,7 @@ where
     /// through the event channel. NodeLoop recognises them via `pending_validation`
     /// and passes them through to the state machine.
     fn flush_validation_batch(&mut self) {
-        let batch = std::mem::take(&mut self.validation_batch);
+        let batch = self.validation_batch.take();
         if batch.is_empty() {
             return;
         }
@@ -1426,7 +1400,7 @@ where
 
     /// Flush a batch of cross-shard executions to the execution pool.
     fn flush_cross_shard_executions(&mut self) {
-        let requests = std::mem::take(&mut self.pending_cross_shard.requests);
+        let requests = self.cross_shard_batch.take();
         if requests.is_empty() {
             return;
         }
@@ -1461,8 +1435,7 @@ where
 
     /// Flush a batch of state vote verifications.
     fn flush_state_vote_verifications(&mut self) {
-        let items = std::mem::take(&mut self.pending_state_votes.items);
-        self.pending_state_votes.total_votes = 0;
+        let items = self.state_vote_batch.take();
         if items.is_empty() {
             return;
         }
@@ -1478,7 +1451,7 @@ where
 
     /// Flush a batch of state certificate verifications.
     fn flush_state_cert_verifications(&mut self) {
-        let items = std::mem::take(&mut self.pending_state_certs.items);
+        let items = self.state_cert_batch.take();
         if items.is_empty() {
             return;
         }
@@ -1639,39 +1612,22 @@ where
         transaction: Arc<hyperscale_types::RoutableTransaction>,
         provisions: Vec<hyperscale_types::StateProvision>,
     ) {
-        if self.pending_cross_shard.requests.is_empty() {
-            let deadline = self.state.now() + BATCH_WINDOW_CROSS_SHARD_EXECUTIONS;
-            self.batch_deadlines
-                .insert(BatchType::CrossShardExecution, deadline);
-        }
-        self.pending_cross_shard
-            .requests
-            .push(CrossShardExecutionRequest {
-                tx_hash,
-                transaction,
-                provisions,
-            });
-        if self.pending_cross_shard.requests.len() >= BATCH_MAX_CROSS_SHARD_EXECUTIONS {
-            self.batch_deadlines.remove(&BatchType::CrossShardExecution);
+        let req = CrossShardExecutionRequest {
+            tx_hash,
+            transaction,
+            provisions,
+        };
+        if self.cross_shard_batch.push(req, self.state.now()) {
             self.flush_cross_shard_executions();
         }
     }
 
-    fn accumulate_state_vote_verification(
-        &mut self,
-        tx_hash: Hash,
-        votes: Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>,
-    ) {
-        if self.pending_state_votes.items.is_empty() {
-            let deadline = self.state.now() + BATCH_WINDOW_STATE_VOTES;
-            self.batch_deadlines
-                .insert(BatchType::StateVoteVerification, deadline);
-        }
-        self.pending_state_votes.total_votes += votes.len();
-        self.pending_state_votes.items.push((tx_hash, votes));
-        if self.pending_state_votes.total_votes >= BATCH_MAX_STATE_VOTES {
-            self.batch_deadlines
-                .remove(&BatchType::StateVoteVerification);
+    fn accumulate_state_vote_verification(&mut self, item: StateVoteVerificationItem) {
+        let weight = item.1.len();
+        if self
+            .state_vote_batch
+            .push_weighted(item, weight, self.state.now())
+        {
             self.flush_state_vote_verifications();
         }
     }
@@ -1681,53 +1637,28 @@ where
         certificate: StateCertificate,
         public_keys: Vec<Bls12381G1PublicKey>,
     ) {
-        if self.pending_state_certs.items.is_empty() {
-            let deadline = self.state.now() + BATCH_WINDOW_STATE_CERTS;
-            self.batch_deadlines
-                .insert(BatchType::StateCertVerification, deadline);
-        }
-        self.pending_state_certs
-            .items
-            .push((certificate, public_keys));
-        if self.pending_state_certs.items.len() >= BATCH_MAX_STATE_CERTS {
-            self.batch_deadlines
-                .remove(&BatchType::StateCertVerification);
+        if self
+            .state_cert_batch
+            .push((certificate, public_keys), self.state.now())
+        {
             self.flush_state_cert_verifications();
         }
     }
 
     fn accumulate_broadcast_vote(&mut self, shard: ShardGroupId, vote: StateVoteBlock) {
-        if self.pending_broadcast_votes.total == 0 {
-            let deadline = self.state.now() + BATCH_WINDOW_BROADCAST_STATE_VOTES;
-            self.batch_deadlines
-                .insert(BatchType::BroadcastStateVotes, deadline);
-        }
-        self.pending_broadcast_votes
-            .by_shard
-            .entry(shard)
-            .or_default()
-            .push(vote);
-        self.pending_broadcast_votes.total += 1;
-        if self.pending_broadcast_votes.total >= BATCH_MAX_BROADCAST_STATE_VOTES {
-            self.batch_deadlines.remove(&BatchType::BroadcastStateVotes);
+        if self
+            .broadcast_vote_batch
+            .push(shard, vote, self.state.now())
+        {
             self.flush_broadcast_votes();
         }
     }
 
     fn accumulate_broadcast_cert(&mut self, shard: ShardGroupId, cert: StateCertificate) {
-        if self.pending_broadcast_certs.total == 0 {
-            let deadline = self.state.now() + BATCH_WINDOW_BROADCAST_STATE_CERTS;
-            self.batch_deadlines
-                .insert(BatchType::BroadcastStateCerts, deadline);
-        }
-        self.pending_broadcast_certs
-            .by_shard
-            .entry(shard)
-            .or_default()
-            .push(cert);
-        self.pending_broadcast_certs.total += 1;
-        if self.pending_broadcast_certs.total >= BATCH_MAX_BROADCAST_STATE_CERTS {
-            self.batch_deadlines.remove(&BatchType::BroadcastStateCerts);
+        if self
+            .broadcast_cert_batch
+            .push(shard, cert, self.state.now())
+        {
             self.flush_broadcast_certs();
         }
     }
@@ -1737,41 +1668,18 @@ where
         shard: ShardGroupId,
         provision: hyperscale_types::StateProvision,
     ) {
-        if self.pending_broadcast_provisions.total == 0 {
-            let deadline = self.state.now() + BATCH_WINDOW_BROADCAST_PROVISIONS;
-            self.batch_deadlines
-                .insert(BatchType::BroadcastProvisions, deadline);
-        }
-        self.pending_broadcast_provisions
-            .by_shard
-            .entry(shard)
-            .or_default()
-            .push(provision);
-        self.pending_broadcast_provisions.total += 1;
-        if self.pending_broadcast_provisions.total >= BATCH_MAX_BROADCAST_PROVISIONS {
-            self.batch_deadlines.remove(&BatchType::BroadcastProvisions);
+        if self
+            .broadcast_provision_batch
+            .push(shard, provision, self.state.now())
+        {
             self.flush_broadcast_provisions();
         }
     }
 
     // ─── Batch Flushing ─────────────────────────────────────────────────
 
-    fn flush_batch(&mut self, batch_type: BatchType) {
-        match batch_type {
-            BatchType::TransactionValidation => self.flush_validation_batch(),
-            BatchType::CrossShardExecution => self.flush_cross_shard_executions(),
-            BatchType::StateVoteVerification => self.flush_state_vote_verifications(),
-            BatchType::StateCertVerification => self.flush_state_cert_verifications(),
-            BatchType::BroadcastStateVotes => self.flush_broadcast_votes(),
-            BatchType::BroadcastStateCerts => self.flush_broadcast_certs(),
-            BatchType::BroadcastProvisions => self.flush_broadcast_provisions(),
-        }
-    }
-
     fn flush_broadcast_votes(&mut self) {
-        let by_shard = std::mem::take(&mut self.pending_broadcast_votes.by_shard);
-        self.pending_broadcast_votes.total = 0;
-        for (shard, votes) in by_shard {
+        for (shard, votes) in self.broadcast_vote_batch.take() {
             if !votes.is_empty() {
                 let batch = StateVoteBatch::new(votes);
                 self.network.broadcast_to_shard(shard, &batch);
@@ -1780,9 +1688,7 @@ where
     }
 
     fn flush_broadcast_certs(&mut self) {
-        let by_shard = std::mem::take(&mut self.pending_broadcast_certs.by_shard);
-        self.pending_broadcast_certs.total = 0;
-        for (shard, certs) in by_shard {
+        for (shard, certs) in self.broadcast_cert_batch.take() {
             if !certs.is_empty() {
                 let batch = StateCertificateBatch::new(certs);
                 self.network.broadcast_to_shard(shard, &batch);
@@ -1791,9 +1697,7 @@ where
     }
 
     fn flush_broadcast_provisions(&mut self) {
-        let by_shard = std::mem::take(&mut self.pending_broadcast_provisions.by_shard);
-        self.pending_broadcast_provisions.total = 0;
-        for (shard, provisions) in by_shard {
+        for (shard, provisions) in self.broadcast_provision_batch.take() {
             if !provisions.is_empty() {
                 let batch = StateProvisionBatch::new(provisions);
                 self.network.broadcast_to_shard(shard, &batch);
@@ -1888,7 +1792,6 @@ where
     ///
     /// Called during shutdown or when immediate delivery is needed.
     pub fn flush_all_batches(&mut self) {
-        self.batch_deadlines.clear();
         self.flush_validation_batch();
         self.flush_cross_shard_executions();
         self.flush_state_vote_verifications();

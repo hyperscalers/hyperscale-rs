@@ -5,6 +5,7 @@
 //! sync and fetch protocol state machines.
 
 pub mod action_handler;
+mod batch_accumulator;
 pub mod fetch_protocol;
 pub mod gossip_dispatch;
 pub mod inbound_handler;
