@@ -230,7 +230,9 @@ pub enum ProtocolEvent {
     // Gossiped Certificate (verified by NodeLoop)
     // ═══════════════════════════════════════════════════════════════════════
     /// A gossiped TransactionCertificate has been fully verified.
-    GossipedCertificateVerified { certificate: TransactionCertificate },
+    GossipedCertificateVerified {
+        certificate: Arc<TransactionCertificate>,
+    },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Storage Callbacks

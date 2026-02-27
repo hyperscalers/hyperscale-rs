@@ -61,7 +61,7 @@ const PENDING_GOSSIP_CERT_TIMEOUT: Duration = Duration::from_secs(30);
 /// progress for a single certificate.
 struct PendingGossipVerification {
     /// The certificate being verified.
-    certificate: TransactionCertificate,
+    certificate: Arc<TransactionCertificate>,
     /// Shards still awaiting verification callback.
     pending_shards: HashSet<ShardGroupId>,
     /// Whether any verification has failed.
@@ -225,7 +225,7 @@ where
     state_vote_batch: BatchAccumulator<StateVoteVerificationItem>,
     state_cert_batch: BatchAccumulator<(StateCertificate, Vec<Bls12381G1PublicKey>)>,
     broadcast_vote_batch: ShardedBatchAccumulator<StateVoteBlock>,
-    broadcast_cert_batch: ShardedBatchAccumulator<StateCertificate>,
+    broadcast_cert_batch: ShardedBatchAccumulator<Arc<StateCertificate>>,
     broadcast_provision_batch: ShardedBatchAccumulator<hyperscale_types::StateProvision>,
 
     // Transaction status cache — retains the latest status for every transaction
@@ -769,8 +769,7 @@ where
                 self.accumulate_broadcast_vote(shard, vote);
             }
             Action::BroadcastStateCertificate { shard, certificate } => {
-                let cert = Arc::unwrap_or_clone(certificate);
-                self.accumulate_broadcast_cert(shard, cert);
+                self.accumulate_broadcast_cert(shard, certificate);
             }
             Action::BroadcastStateProvision { shard, provision } => {
                 self.accumulate_broadcast_provision(shard, provision);
@@ -1457,6 +1456,8 @@ where
         let pending_shards: HashSet<ShardGroupId> =
             certificate.shard_proofs.keys().copied().collect();
 
+        let certificate = Arc::new(certificate);
+
         if pending_shards.is_empty() {
             // Empty certificate (no shard proofs) - persist directly.
             self.persist_and_notify_gossiped_certificate(certificate);
@@ -1469,8 +1470,8 @@ where
         self.pending_gossip_verifications.insert(
             tx_hash,
             PendingGossipVerification {
-                certificate: certificate.clone(),
-                pending_shards: pending_shards.clone(),
+                certificate: Arc::clone(&certificate),
+                pending_shards,
                 failed: false,
                 created_at: now,
             },
@@ -1550,10 +1551,14 @@ where
     }
 
     /// Persist a verified gossiped certificate and notify the state machine.
-    fn persist_and_notify_gossiped_certificate(&mut self, certificate: TransactionCertificate) {
+    fn persist_and_notify_gossiped_certificate(
+        &mut self,
+        certificate: Arc<TransactionCertificate>,
+    ) {
+        let tx_hash = certificate.transaction_hash;
+
         // Populate cert cache.
-        self.cert_cache
-            .insert(certificate.transaction_hash, Arc::new(certificate.clone()));
+        self.cert_cache.insert(tx_hash, Arc::clone(&certificate));
 
         // Persist to storage.
         self.storage.store_certificate(&certificate);
@@ -1618,7 +1623,7 @@ where
         }
     }
 
-    fn accumulate_broadcast_cert(&mut self, shard: ShardGroupId, cert: StateCertificate) {
+    fn accumulate_broadcast_cert(&mut self, shard: ShardGroupId, cert: Arc<StateCertificate>) {
         if self
             .broadcast_cert_batch
             .push(shard, cert, self.state.now())
@@ -1654,7 +1659,9 @@ where
     fn flush_broadcast_certs(&mut self) {
         for (shard, certs) in self.broadcast_cert_batch.take() {
             if !certs.is_empty() {
-                let batch = StateCertificateBatch::new(certs);
+                let owned: Vec<StateCertificate> =
+                    certs.into_iter().map(Arc::unwrap_or_clone).collect();
+                let batch = StateCertificateBatch::new(owned);
                 self.network.broadcast_to_shard(shard, &batch);
             }
         }

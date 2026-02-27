@@ -1030,17 +1030,19 @@ impl StateMachine for NodeStateMachine {
             // Cancel local certificate building and add to finalized certificates.
             ProtocolEvent::GossipedCertificateVerified { certificate } => {
                 let tx_hash = certificate.transaction_hash;
+                let accepted = certificate.is_accepted();
 
                 // Cancel any ongoing local certificate building
                 self.execution.cancel_certificate_building(&tx_hash);
 
                 // Add to finalized certificates if not already present
-                self.execution.add_verified_certificate(certificate.clone());
+                self.execution
+                    .add_verified_certificate(Arc::clone(certificate));
 
                 // Notify mempool that transaction is finalized
                 vec![Action::Continuation(ProtocolEvent::TransactionExecuted {
                     tx_hash,
-                    accepted: certificate.is_accepted(),
+                    accepted,
                 })]
             }
         }
