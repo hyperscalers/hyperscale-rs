@@ -3,7 +3,7 @@
 pub mod gossip;
 pub mod request;
 pub mod response;
-pub mod trace_context;
+mod trace_context;
 
 // Re-export commonly used types
 pub use gossip::{

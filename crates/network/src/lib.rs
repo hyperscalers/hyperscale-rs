@@ -12,15 +12,15 @@
 //!
 //! No async runtime dependency.
 
-pub mod codec;
-pub mod handler_registry;
-pub mod topic;
-pub mod traits;
+mod codec;
+mod handler_registry;
+mod topic;
+mod traits;
 pub mod wire;
 
 // Re-export key types
-pub use codec::{decode_from_wire, encode_to_wire, CodecError};
+pub use codec::{encode_to_wire, CodecError};
 pub use handler_registry::HandlerRegistry;
-pub use topic::{ProtocolVersion, Topic};
+pub use topic::Topic;
 pub use traits::{InboundRequestHandler, Network, RequestError};
-pub use wire::{compress, decompress, frame_request, parse_request_frame, WireError};
+pub use wire::{frame_request, parse_request_frame};

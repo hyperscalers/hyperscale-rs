@@ -104,8 +104,6 @@ pub enum FetchInput {
     },
     /// Cancel fetch for a specific block.
     CancelFetch { block_hash: Hash },
-    /// Cancel all pending fetches (e.g., when sync starts).
-    CancelAll,
     /// Tick: spawn pending fetch operations.
     Tick,
 }
@@ -247,16 +245,6 @@ impl FetchProtocol {
                 self.tx_fetches.remove(&block_hash);
                 self.cert_fetches.remove(&block_hash);
                 debug!(?block_hash, "Cancelled fetch");
-                vec![]
-            }
-            FetchInput::CancelAll => {
-                let tx_count = self.tx_fetches.len();
-                let cert_count = self.cert_fetches.len();
-                if tx_count > 0 || cert_count > 0 {
-                    info!(tx_count, cert_count, "Cancelling all fetches");
-                }
-                self.tx_fetches.clear();
-                self.cert_fetches.clear();
                 vec![]
             }
             FetchInput::Tick => self.spawn_pending_fetches(),
@@ -547,24 +535,6 @@ mod tests {
         assert!(outputs
             .iter()
             .any(|o| matches!(o, FetchOutput::FetchTransactions { .. })));
-    }
-
-    #[test]
-    fn test_cancel_all() {
-        let mut protocol = FetchProtocol::new(FetchConfig::default());
-        let block_hash = Hash::from_bytes(b"test_block");
-
-        protocol.handle(FetchInput::RequestTransactions {
-            block_hash,
-            proposer: ValidatorId(1),
-            tx_hashes: vec![Hash::from_bytes(b"tx1_hash_data_here")],
-        });
-
-        protocol.handle(FetchInput::CancelAll);
-
-        let status = protocol.status();
-        assert_eq!(status.pending_tx_blocks, 0);
-        assert_eq!(status.pending_cert_blocks, 0);
     }
 
     #[test]

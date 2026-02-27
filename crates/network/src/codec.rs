@@ -47,7 +47,8 @@ pub fn encode_to_wire<T: sbor::BasicEncode>(value: &T) -> Result<Vec<u8>, CodecE
 ///
 /// Inverse of [`encode_to_wire`]. Decompresses LZ4 then SBOR-decodes into
 /// the target type.
-pub fn decode_from_wire<T: sbor::BasicDecode>(data: &[u8]) -> Result<T, CodecError> {
+#[cfg(test)]
+fn decode_from_wire<T: sbor::BasicDecode>(data: &[u8]) -> Result<T, CodecError> {
     if data.is_empty() {
         return Err(CodecError::MessageTooShort);
     }

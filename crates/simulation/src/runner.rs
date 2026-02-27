@@ -5,7 +5,6 @@
 
 use crate::event_queue::EventKey;
 use crate::NodeIndex;
-use crate::SimStorage;
 use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
@@ -22,6 +21,7 @@ use hyperscale_node::TimerOp;
 use hyperscale_node::{InboundHandler, InboundHandlerConfig};
 use hyperscale_node::{NodeStateMachine, SyncConfig, SyncProtocol};
 use hyperscale_storage::ConsensusStore;
+use hyperscale_storage_memory::SimStorage;
 use hyperscale_types::{
     bls_keypair_from_seed, Bls12381G1PrivateKey, Bls12381G1PublicKey, Hash as TxHash, ShardGroupId,
     StaticTopology, Topology, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,

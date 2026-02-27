@@ -7,15 +7,12 @@
 //! statistics for real-world deployment estimates.
 
 mod network;
-pub mod sim_network;
+mod sim_network;
 mod traffic;
 
-pub use network::{FulfillmentStats, GossipDispatchResult, NetworkConfig, SimulatedNetwork};
-pub use sim_network::{BroadcastTarget, OutboxEntry, PendingRequest, SimNetworkAdapter};
-pub use traffic::{
-    AggregateBandwidth, BandwidthEstimates, BandwidthReport, MessageTypeReport, MessageTypeStats,
-    NetworkTrafficAnalyzer, NodeBandwidthReport, NodeTrafficStats,
-};
+pub use network::{NetworkConfig, SimulatedNetwork};
+pub use sim_network::{OutboxEntry, SimNetworkAdapter};
+pub use traffic::{BandwidthReport, NetworkTrafficAnalyzer};
 
 /// Type alias for deterministic node indexing in simulation.
 ///

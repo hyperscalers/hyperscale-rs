@@ -4,22 +4,17 @@
 //! into a complete consensus node. It also contains the transport-independent
 //! sync and fetch protocol state machines.
 
-pub mod action_handler;
+mod action_handler;
 mod batch_accumulator;
-pub mod fetch_protocol;
+mod fetch_protocol;
 pub mod gossip_dispatch;
-pub mod inbound_handler;
+mod inbound_handler;
 pub mod node_loop;
 pub mod sync_protocol;
 
 mod state;
 
-pub use fetch_protocol::{
-    FetchConfig, FetchInput, FetchKind, FetchOutput, FetchProtocol, FetchStatus,
-};
 pub use inbound_handler::{InboundHandler, InboundHandlerConfig};
 pub use node_loop::{NodeStatusSnapshot, TimerOp};
 pub use state::NodeStateMachine;
-pub use sync_protocol::{
-    SyncConfig, SyncInput, SyncOutput, SyncProtocol, SyncStateKind, SyncStatus,
-};
+pub use sync_protocol::{SyncConfig, SyncProtocol, SyncStateKind};
