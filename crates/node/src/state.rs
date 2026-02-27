@@ -283,7 +283,7 @@ impl StateMachine for NodeStateMachine {
     ))]
     fn handle(&mut self, event: ProtocolEvent) -> Vec<Action> {
         // Route event to appropriate sub-state machine
-        match &event {
+        match event {
             // Timer events
             ProtocolEvent::CleanupTimer => self.on_cleanup_timer(),
 
@@ -429,14 +429,14 @@ impl StateMachine for NodeStateMachine {
                         .trigger_speculative_execution(block_hash, height, transactions);
 
                 let mut actions = self.bft.on_block_header(
-                    header.clone(),
-                    retry_hashes.clone(),
-                    priority_hashes.clone(),
-                    tx_hashes.clone(),
-                    cert_hashes.clone(),
-                    deferred.clone(),
-                    aborted.clone(),
-                    commitment_proofs.clone(),
+                    header,
+                    retry_hashes,
+                    priority_hashes,
+                    tx_hashes,
+                    cert_hashes,
+                    deferred,
+                    aborted,
+                    commitment_proofs,
                     &mempool_txs,
                     &local_certs,
                 );
@@ -452,7 +452,7 @@ impl StateMachine for NodeStateMachine {
                 // need to preemptively account for:
                 // - Transactions that will INCREASE in-flight (new commits)
                 // - Certificates that will DECREASE in-flight (completed transactions)
-                let (pending_tx_count, pending_cert_count) = self.bft.pending_commit_counts(qc);
+                let (pending_tx_count, pending_cert_count) = self.bft.pending_commit_counts(&qc);
 
                 let max_txs = self.bft.config().max_transactions_per_block;
                 let ready_txs =
@@ -470,8 +470,8 @@ impl StateMachine for NodeStateMachine {
 
                 // BftState handles state_root computation internally after filtering certificates
                 self.bft.on_qc_formed(
-                    *block_hash,
-                    qc.clone(),
+                    block_hash,
+                    qc,
                     &ready_txs,
                     deferred,
                     aborted,
@@ -481,19 +481,17 @@ impl StateMachine for NodeStateMachine {
             }
 
             // Self-contained BFT events - direct delegation
-            ProtocolEvent::BlockVoteReceived { vote } => self.bft.on_block_vote(vote.clone()),
+            ProtocolEvent::BlockVoteReceived { vote } => self.bft.on_block_vote(vote),
             ProtocolEvent::BlockReadyToCommit { block_hash, qc } => {
-                self.bft.on_block_ready_to_commit(*block_hash, qc.clone())
+                self.bft.on_block_ready_to_commit(block_hash, qc)
             }
             ProtocolEvent::QuorumCertificateResult {
                 block_hash,
                 qc,
                 verified_votes,
-            } => self
-                .bft
-                .on_qc_result(*block_hash, qc.clone(), verified_votes.clone()),
+            } => self.bft.on_qc_result(block_hash, qc, verified_votes),
             ProtocolEvent::QcSignatureVerified { block_hash, valid } => {
-                self.bft.on_qc_signature_verified(*block_hash, *valid)
+                self.bft.on_qc_signature_verified(block_hash, valid)
             }
             ProtocolEvent::CycleProofVerified {
                 block_hash,
@@ -501,12 +499,12 @@ impl StateMachine for NodeStateMachine {
                 valid,
             } => self
                 .bft
-                .on_cycle_proof_verified(*block_hash, *deferral_index, *valid),
+                .on_cycle_proof_verified(block_hash, deferral_index, valid),
             ProtocolEvent::StateRootVerified { block_hash, valid } => {
-                self.bft.on_state_root_verified(*block_hash, *valid)
+                self.bft.on_state_root_verified(block_hash, valid)
             }
             ProtocolEvent::TransactionRootVerified { block_hash, valid } => {
-                self.bft.on_transaction_root_verified(*block_hash, *valid)
+                self.bft.on_transaction_root_verified(block_hash, valid)
             }
 
             ProtocolEvent::ProposalBuilt {
@@ -514,9 +512,7 @@ impl StateMachine for NodeStateMachine {
                 round,
                 block,
                 block_hash,
-            } => self
-                .bft
-                .on_proposal_built(*height, *round, block.clone(), *block_hash),
+            } => self.bft.on_proposal_built(height, round, block, block_hash),
 
             // JMT state commit completed - update tracked state and notify BFT
             ProtocolEvent::StateCommitComplete {
@@ -530,15 +526,15 @@ impl StateMachine for NodeStateMachine {
                 // with a higher version than we started with). The genesis case handles
                 // when Radix Engine bootstrap populates the JMT at height 0 after state
                 // machine initialization.
-                let is_newer_height = *height > prev_height;
-                let is_genesis_bootstrap = *height == 0 && *state_version > prev_version;
+                let is_newer_height = height > prev_height;
+                let is_genesis_bootstrap = height == 0 && state_version > prev_version;
 
                 if is_newer_height || is_genesis_bootstrap {
-                    self.last_committed_state = (*height, *state_version, *state_root);
+                    self.last_committed_state = (height, state_version, state_root);
 
                     tracing::debug!(
-                        height = *height,
-                        state_version = *state_version,
+                        height,
+                        state_version,
                         state_root = ?state_root,
                         is_genesis_bootstrap,
                         "JMT state commit complete"
@@ -548,8 +544,7 @@ impl StateMachine for NodeStateMachine {
                 // Notify BFT so it can update its committed state tracking.
                 // BFT uses this as the source of truth for state_version in block headers,
                 // preventing speculative version propagation that causes deadlocks.
-                self.bft
-                    .on_state_commit_complete(*state_version, *state_root)
+                self.bft.on_state_commit_complete(state_version, state_root)
             }
 
             // Block committed needs special handling - notify multiple subsystems
@@ -559,7 +554,7 @@ impl StateMachine for NodeStateMachine {
                 block,
             } => {
                 let mut actions = Vec::new();
-                let block_height = hyperscale_types::BlockHeight(*height);
+                let block_height = hyperscale_types::BlockHeight(height);
 
                 // Register newly committed cross-shard TXs with livelock for cycle detection.
                 // Must happen BEFORE livelock.on_block_committed() processes deferrals.
@@ -570,7 +565,7 @@ impl StateMachine for NodeStateMachine {
                 }
 
                 // Livelock: process deferrals/aborts/certs, add tombstones, cleanup tracking
-                self.livelock.on_block_committed(block);
+                self.livelock.on_block_committed(&block);
 
                 // Cleanup execution state for deferred transactions
                 // This must happen BEFORE passing new transactions to execution,
@@ -613,8 +608,8 @@ impl StateMachine for NodeStateMachine {
                 // will be processed by the coordinator via Continuation actions.
                 let all_txs: Vec<_> = block.all_transactions().cloned().collect();
                 let exec_actions = self.execution.on_block_committed(
-                    *block_hash,
-                    *height,
+                    block_hash,
+                    height,
                     block.header.timestamp,
                     all_txs,
                 );
@@ -642,10 +637,10 @@ impl StateMachine for NodeStateMachine {
                 actions.extend(exec_actions);
 
                 // Also let mempool handle it (marks transactions as committed, processes deferrals/aborts)
-                actions.extend(self.mempool.on_block_committed_full(block));
+                actions.extend(self.mempool.on_block_committed_full(&block));
 
                 // Let provisions coordinator handle cleanup (certificates, aborts, deferrals)
-                actions.extend(self.provisions.on_block_committed(block));
+                actions.extend(self.provisions.on_block_committed(&block));
 
                 actions
             }
@@ -663,7 +658,7 @@ impl StateMachine for NodeStateMachine {
             // LivelockState listens to ProvisionQuorumReached for cycle detection.
             // ═══════════════════════════════════════════════════════════════════════
             ProtocolEvent::StateProvisionReceived { provision } => {
-                self.provisions.on_provision_received(provision.clone())
+                self.provisions.on_provision_received(provision)
             }
 
             // ProvisionsVerifiedAndAggregated: callback from batch verification + aggregation
@@ -676,14 +671,14 @@ impl StateMachine for NodeStateMachine {
                 // Notify mempool to promote this transaction to priority tier.
                 // This enables cross-shard transactions with verified provisions
                 // to bypass the soft backpressure limit.
-                self.mempool.on_provision_verified(*tx_hash);
+                self.mempool.on_provision_verified(tx_hash);
 
                 // Route to provision coordinator to handle verified provisions and quorum
                 self.provisions.on_provisions_verified_and_aggregated(
-                    *tx_hash,
-                    *source_shard,
-                    verified_provisions.clone(),
-                    commitment_proof.clone(),
+                    tx_hash,
+                    source_shard,
+                    verified_provisions,
+                    commitment_proof,
                 )
             }
 
@@ -695,22 +690,22 @@ impl StateMachine for NodeStateMachine {
                 committed_height,
             } => {
                 let registration = hyperscale_provisions::TxRegistration {
-                    required_shards: required_shards.clone(),
-                    quorum_thresholds: quorum_thresholds.clone(),
-                    registered_at: *committed_height,
+                    required_shards,
+                    quorum_thresholds,
+                    registered_at: committed_height,
                     nodes_by_shard: std::collections::HashMap::new(),
                 };
-                self.provisions.on_tx_registered(*tx_hash, registration)
+                self.provisions.on_tx_registered(tx_hash, registration)
             }
 
             // CrossShardTxCompleted: route to coordinator for cleanup
             ProtocolEvent::CrossShardTxCompleted { tx_hash } => {
-                self.provisions.on_tx_completed(tx_hash)
+                self.provisions.on_tx_completed(&tx_hash)
             }
 
             // CrossShardTxAborted: route to coordinator for cleanup
             ProtocolEvent::CrossShardTxAborted { tx_hash } => {
-                self.provisions.on_tx_aborted(tx_hash)
+                self.provisions.on_tx_aborted(&tx_hash)
             }
 
             // ProvisionQuorumReached: Byzantine-safe cycle detection (per-shard)
@@ -725,11 +720,8 @@ impl StateMachine for NodeStateMachine {
                 commitment_proof,
             } => {
                 // Cycle detection in livelock (may queue a deferral)
-                self.livelock.on_provision_quorum_reached(
-                    *tx_hash,
-                    *source_shard,
-                    commitment_proof,
-                );
+                self.livelock
+                    .on_provision_quorum_reached(tx_hash, source_shard, &commitment_proof);
 
                 // No actions needed - execution waits for ProvisioningComplete
                 vec![]
@@ -739,48 +731,44 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ProvisioningComplete {
                 tx_hash,
                 provisions,
-            } => self
-                .execution
-                .on_provisioning_complete(*tx_hash, provisions.clone()),
+            } => self.execution.on_provisioning_complete(tx_hash, provisions),
 
             // Execution events - direct delegation
-            ProtocolEvent::StateVoteReceived { vote } => self.execution.on_vote(vote.clone()),
-            ProtocolEvent::StateCertificateReceived { cert } => {
-                self.execution.on_certificate(cert.clone())
-            }
+            ProtocolEvent::StateVoteReceived { vote } => self.execution.on_vote(vote),
+            ProtocolEvent::StateCertificateReceived { cert } => self.execution.on_certificate(cert),
             ProtocolEvent::StateVotesVerifiedAndAggregated {
                 tx_hash,
                 verified_votes,
             } => self
                 .execution
-                .on_state_votes_verified(*tx_hash, verified_votes.clone()),
-            ProtocolEvent::StateCertificateSignatureVerified { certificate, valid } => self
-                .execution
-                .on_certificate_verified(certificate.clone(), *valid),
+                .on_state_votes_verified(tx_hash, verified_votes),
+            ProtocolEvent::StateCertificateSignatureVerified { certificate, valid } => {
+                self.execution.on_certificate_verified(certificate, valid)
+            }
             ProtocolEvent::StateCertificateAggregated {
                 tx_hash,
                 certificate,
             } => self
                 .execution
-                .on_state_certificate_aggregated(*tx_hash, certificate.clone()),
+                .on_state_certificate_aggregated(tx_hash, certificate),
             ProtocolEvent::SpeculativeExecutionComplete {
                 block_hash,
                 tx_hashes,
             } => self
                 .execution
-                .on_speculative_execution_complete(*block_hash, tx_hashes.clone()),
+                .on_speculative_execution_complete(block_hash, tx_hashes),
 
             // TransactionExecuted is emitted by execution, handled by mempool AND BFT
             // BFT might have pending blocks waiting for this certificate
             ProtocolEvent::TransactionExecuted { tx_hash, accepted } => {
                 // Notify mempool
-                let mut actions = self.mempool.on_transaction_executed(*tx_hash, *accepted);
+                let mut actions = self.mempool.on_transaction_executed(tx_hash, accepted);
 
                 // Check if any pending blocks are now complete with this certificate
                 let local_certs = self.execution.finalized_certificates_by_hash();
                 actions.extend(
                     self.bft
-                        .check_pending_blocks_for_certificate(*tx_hash, &local_certs),
+                        .check_pending_blocks_for_certificate(tx_hash, &local_certs),
                 );
 
                 actions
@@ -794,14 +782,14 @@ impl StateMachine for NodeStateMachine {
             } => {
                 // Only add to our mempool if this transaction involves our shard.
                 // Cross-shard transactions that don't touch our shard should be ignored.
-                if !self.topology.involves_local_shard(tx) {
+                if !self.topology.involves_local_shard(&tx) {
                     return vec![];
                 }
 
                 let tx_hash = tx.hash();
                 let mut actions = self
                     .mempool
-                    .on_transaction_gossip_arc(Arc::clone(tx), *submitted_locally);
+                    .on_transaction_gossip_arc(tx, submitted_locally);
 
                 // Check if any pending blocks are now complete
                 let mempool_map = self.mempool.as_hash_map();
@@ -814,9 +802,9 @@ impl StateMachine for NodeStateMachine {
             }
 
             // Storage callback events - route to appropriate handler
-            ProtocolEvent::StateEntriesFetched { tx_hash, entries } => self
-                .execution
-                .on_state_entries_fetched(*tx_hash, entries.clone()),
+            ProtocolEvent::StateEntriesFetched { tx_hash, entries } => {
+                self.execution.on_state_entries_fetched(tx_hash, entries)
+            }
 
             ProtocolEvent::BlockFetched { .. } => {
                 // This is for local storage fetch, not sync
@@ -827,9 +815,9 @@ impl StateMachine for NodeStateMachine {
             // Sync protocol events - routed to BFT
             // Note: SyncNeeded is now Action::StartSync (emitted by BFT, handled by runner).
             // The runner sends SyncBlockReadyToApply and SyncComplete to the state machine.
-            ProtocolEvent::SyncBlockReadyToApply { block, qc } => self
-                .bft
-                .on_sync_block_ready_to_apply(block.clone(), qc.clone()),
+            ProtocolEvent::SyncBlockReadyToApply { block, qc } => {
+                self.bft.on_sync_block_ready_to_apply(block, qc)
+            }
             ProtocolEvent::SyncComplete { .. } => {
                 let mut actions = self.bft.on_sync_complete();
                 // Reschedule the cleanup timer. During sync, the cleanup timer
@@ -842,13 +830,13 @@ impl StateMachine for NodeStateMachine {
                 });
                 actions
             }
-            ProtocolEvent::ChainMetadataFetched { height, hash, qc } => self
-                .bft
-                .on_chain_metadata_fetched(*height, *hash, qc.clone()),
+            ProtocolEvent::ChainMetadataFetched { height, hash, qc } => {
+                self.bft.on_chain_metadata_fetched(height, hash, qc)
+            }
 
             // Transaction status changes from execution state machine
             ProtocolEvent::TransactionStatusChanged { tx_hash, status } => {
-                self.mempool.update_status(tx_hash, status.clone())
+                self.mempool.update_status(&tx_hash, status)
             }
 
             // ═══════════════════════════════════════════════════════════════════════
@@ -988,7 +976,7 @@ impl StateMachine for NodeStateMachine {
                 transactions,
             } => self
                 .bft
-                .on_transaction_fetch_received(*block_hash, transactions.clone()),
+                .on_transaction_fetch_received(block_hash, transactions),
 
             // ═══════════════════════════════════════════════════════════════════════
             // Certificate Fetch Protocol
@@ -1003,10 +991,7 @@ impl StateMachine for NodeStateMachine {
                 // from Byzantine peers.
                 let mut actions = Vec::new();
                 for cert in certificates {
-                    actions.extend(
-                        self.execution
-                            .verify_fetched_certificate(*block_hash, cert.clone()),
-                    );
+                    actions.extend(self.execution.verify_fetched_certificate(block_hash, cert));
                 }
                 actions
             }
@@ -1020,10 +1005,8 @@ impl StateMachine for NodeStateMachine {
                     .cancel_certificate_building(&certificate.transaction_hash);
 
                 // Certificate has been verified - add to pending block
-                self.bft.on_certificate_fetch_received(
-                    *block_hash,
-                    vec![std::sync::Arc::new(certificate.clone())],
-                )
+                self.bft
+                    .on_certificate_fetch_received(block_hash, vec![Arc::new(certificate)])
             }
 
             // GossipedCertificateVerified - a gossiped certificate has been verified and persisted.
@@ -1036,8 +1019,7 @@ impl StateMachine for NodeStateMachine {
                 self.execution.cancel_certificate_building(&tx_hash);
 
                 // Add to finalized certificates if not already present
-                self.execution
-                    .add_verified_certificate(Arc::clone(certificate));
+                self.execution.add_verified_certificate(certificate);
 
                 // Notify mempool that transaction is finalized
                 vec![Action::Continuation(ProtocolEvent::TransactionExecuted {
