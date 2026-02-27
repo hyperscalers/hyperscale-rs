@@ -487,201 +487,165 @@ where
         self.actions_generated = 0;
         self.pending_timer_ops.clear();
 
-        // ── Transaction validation interception ──────────────────────────
-        //
-        // Intercept TransactionGossipReceived and SubmitTransaction to route
-        // through the validation batch pipeline before reaching the state
-        // machine. Validated transactions re-enter as TransactionValidated,
-        // which NodeLoop converts into TransactionGossipReceived for the
-        // state machine.
-
-        // Handle validated transaction callback from dispatch.
-        if let Event::TransactionValidated {
-            ref tx,
-            submitted_locally,
-        } = event
-        {
-            let tx_hash = tx.hash();
-            self.pending_validation.remove(&tx_hash);
-            let is_local = submitted_locally || self.locally_submitted.remove(&tx_hash);
-            self.tx_cache.insert(tx_hash, Arc::clone(tx));
-            let pe = ProtocolEvent::TransactionGossipReceived {
-                tx: Arc::clone(tx),
-                submitted_locally: is_local,
-            };
-            let actions = self.state.handle(pe);
-            self.actions_generated = actions.len();
-            for action in actions {
-                self.process_action(action);
-            }
-            return self.drain_pending_output();
-        }
-
-        // Intercept TransactionGossipReceived from network for validation pipeline.
-        if let Event::Protocol(ProtocolEvent::TransactionGossipReceived { ref tx, .. }) = event {
-            let tx_hash = tx.hash();
-            if self.tx_cache.get(&tx_hash).is_some() {
-                // Duplicate — already validated and cached, skip.
-                return self.drain_pending_output();
-            }
-            // Skip transactions already in a terminal state (executed, aborted, etc.)
-            // to avoid unnecessary validation batching for already-completed txs.
-            if self.state.mempool().is_tombstoned(&tx_hash) {
-                return self.drain_pending_output();
-            }
-            // New unvalidated transaction — queue for batch validation.
-            self.pending_validation.insert(tx_hash);
-            self.queue_validation(Arc::clone(tx));
-            return self.drain_pending_output();
-        }
-
-        if let Event::SubmitTransaction { ref tx } = event {
-            let tx_hash = tx.hash();
-
-            // Gossip to all relevant shards.
-            for shard in self.topology.all_shards_for_transaction(tx) {
-                let gossip = TransactionGossip::from_arc(Arc::clone(tx));
-                self.network.broadcast_to_shard(shard, &gossip);
+        match event {
+            // ── Transaction validation pipeline ────────────────────────
+            //
+            // TransactionGossipReceived and SubmitTransaction are routed
+            // through the validation batch pipeline. Validated transactions
+            // re-enter as TransactionValidated, which is converted into
+            // TransactionGossipReceived for the state machine.
+            Event::TransactionValidated {
+                tx,
+                submitted_locally,
+            } => {
+                let tx_hash = tx.hash();
+                self.pending_validation.remove(&tx_hash);
+                let is_local = submitted_locally || self.locally_submitted.remove(&tx_hash);
+                self.tx_cache.insert(tx_hash, Arc::clone(&tx));
+                let pe = ProtocolEvent::TransactionGossipReceived {
+                    tx,
+                    submitted_locally: is_local,
+                };
+                let actions = self.state.handle(pe);
+                self.actions_generated = actions.len();
+                for action in actions {
+                    self.process_action(action);
+                }
             }
 
-            // Track as locally submitted for latency metrics.
-            self.locally_submitted.insert(tx_hash);
-
-            // Queue for validation if not already in pipeline or cached.
-            if !self.pending_validation.contains(&tx_hash) && self.tx_cache.get(&tx_hash).is_none()
-            {
-                self.pending_validation.insert(tx_hash);
-                self.queue_validation(Arc::clone(tx));
+            // Intercept gossip-received transactions for validation.
+            Event::Protocol(ProtocolEvent::TransactionGossipReceived { tx, .. }) => {
+                let tx_hash = tx.hash();
+                if self.tx_cache.get(&tx_hash).is_none()
+                    && !self.state.mempool().is_tombstoned(&tx_hash)
+                {
+                    self.pending_validation.insert(tx_hash);
+                    self.queue_validation(tx);
+                }
             }
 
-            return self.drain_pending_output();
-        }
+            Event::SubmitTransaction { tx } => {
+                let tx_hash = tx.hash();
 
-        // Handle gossiped certificate verification internally.
-        if let Event::TransactionCertificateReceived { ref certificate } = event {
-            self.handle_gossiped_certificate(certificate.clone());
-            return self.drain_pending_output();
-        }
+                // Gossip to all relevant shards.
+                for shard in self.topology.all_shards_for_transaction(&tx) {
+                    let gossip = TransactionGossip::from_arc(Arc::clone(&tx));
+                    self.network.broadcast_to_shard(shard, &gossip);
+                }
 
-        // Handle gossip cert verification callbacks internally.
-        if let Event::GossipedCertificateSignatureVerified {
-            tx_hash,
-            shard,
-            valid,
-        } = event
-        {
-            self.handle_gossip_cert_result(tx_hash, shard, valid);
-            return self.drain_pending_output();
-        }
+                // Track as locally submitted for latency metrics.
+                self.locally_submitted.insert(tx_hash);
 
-        // Handle sync protocol callbacks internally.
-        if let Event::SyncBlockResponseReceived { height, block } = event {
-            let outputs = self
-                .sync_protocol
-                .handle(SyncInput::BlockResponseReceived { height, block });
-            self.process_sync_outputs(outputs);
-            return self.drain_pending_output();
-        }
+                // Queue for validation if not already in pipeline or cached.
+                if !self.pending_validation.contains(&tx_hash)
+                    && self.tx_cache.get(&tx_hash).is_none()
+                {
+                    self.pending_validation.insert(tx_hash);
+                    self.queue_validation(tx);
+                }
+            }
 
-        if let Event::SyncBlockFetchFailed { height } = event {
-            let outputs = self
-                .sync_protocol
-                .handle(SyncInput::BlockFetchFailed { height });
-            self.process_sync_outputs(outputs);
-            return self.drain_pending_output();
-        }
+            Event::TransactionCertificateReceived { certificate } => {
+                self.handle_gossiped_certificate(certificate);
+            }
 
-        // Handle fetch protocol callbacks internally.
-        if let Event::TransactionReceived {
-            block_hash,
-            transactions,
-        } = event
-        {
-            let outputs = self
-                .fetch_protocol
-                .handle(FetchInput::TransactionsReceived {
-                    block_hash,
-                    transactions,
-                });
-            self.process_fetch_outputs(outputs);
-            return self.drain_pending_output();
-        }
+            Event::GossipedCertificateSignatureVerified {
+                tx_hash,
+                shard,
+                valid,
+            } => {
+                self.handle_gossip_cert_result(tx_hash, shard, valid);
+            }
 
-        if let Event::CertificateReceived {
-            block_hash,
-            certificates,
-        } = event
-        {
-            let outputs = self
-                .fetch_protocol
-                .handle(FetchInput::CertificatesReceived {
-                    block_hash,
-                    certificates,
-                });
-            self.process_fetch_outputs(outputs);
-            return self.drain_pending_output();
-        }
+            // ── Sync protocol ──────────────────────────────────────────
+            Event::SyncBlockResponseReceived { height, block } => {
+                let outputs = self
+                    .sync_protocol
+                    .handle(SyncInput::BlockResponseReceived { height, block });
+                self.process_sync_outputs(outputs);
+            }
 
-        if let Event::FetchTransactionsFailed { block_hash, hashes } = event {
-            let outputs = self.fetch_protocol.handle(FetchInput::FetchFailed {
+            Event::SyncBlockFetchFailed { height } => {
+                let outputs = self
+                    .sync_protocol
+                    .handle(SyncInput::BlockFetchFailed { height });
+                self.process_sync_outputs(outputs);
+            }
+
+            // ── Fetch protocol ─────────────────────────────────────────
+            Event::TransactionReceived {
                 block_hash,
-                kind: FetchKind::Transaction,
-                hashes,
-            });
-            self.process_fetch_outputs(outputs);
-            // Tick to retry pending fetches.
-            let tick_outputs = self.fetch_protocol.handle(FetchInput::Tick);
-            self.process_fetch_outputs(tick_outputs);
-            return self.drain_pending_output();
-        }
+                transactions,
+            } => {
+                let outputs = self
+                    .fetch_protocol
+                    .handle(FetchInput::TransactionsReceived {
+                        block_hash,
+                        transactions,
+                    });
+                self.process_fetch_outputs(outputs);
+            }
 
-        if let Event::FetchCertificatesFailed { block_hash, hashes } = event {
-            let outputs = self.fetch_protocol.handle(FetchInput::FetchFailed {
+            Event::CertificateReceived {
                 block_hash,
-                kind: FetchKind::Certificate,
-                hashes,
-            });
-            self.process_fetch_outputs(outputs);
-            // Tick to retry pending fetches.
-            let tick_outputs = self.fetch_protocol.handle(FetchInput::Tick);
-            self.process_fetch_outputs(tick_outputs);
-            self.update_fetch_tick_timer();
-            return self.drain_pending_output();
-        }
-
-        // Periodic fetch tick — retry pending fetches.
-        if matches!(event, Event::FetchTick) {
-            let outputs = self.fetch_protocol.handle(FetchInput::Tick);
-            self.process_fetch_outputs(outputs);
-            self.update_fetch_tick_timer();
-            return self.drain_pending_output();
-        }
-
-        // Broadcast self-generated state votes returning from dispatch pools.
-        // Votes from peers arrive via different event types (network gossip).
-        if let Event::Protocol(ProtocolEvent::StateVoteReceived { ref vote }) = event {
-            if vote.validator == self.validator_id {
-                self.accumulate_broadcast_vote(self.local_shard, vote.clone());
+                certificates,
+            } => {
+                let outputs = self
+                    .fetch_protocol
+                    .handle(FetchInput::CertificatesReceived {
+                        block_hash,
+                        certificates,
+                    });
+                self.process_fetch_outputs(outputs);
             }
-        }
 
-        // Extract ProtocolEvent from NodeInput for the state machine.
-        // All NodeInput-specific variants have been intercepted above.
-        let pe = match event {
-            Event::Protocol(pe) => pe,
-            other => {
-                warn!(
-                    event_type = other.type_name(),
-                    "Unexpected NodeInput at state machine boundary"
-                );
-                return self.drain_pending_output();
+            Event::FetchTransactionsFailed { block_hash, hashes } => {
+                let outputs = self.fetch_protocol.handle(FetchInput::FetchFailed {
+                    block_hash,
+                    kind: FetchKind::Transaction,
+                    hashes,
+                });
+                self.process_fetch_outputs(outputs);
+                // Tick to retry pending fetches.
+                let tick_outputs = self.fetch_protocol.handle(FetchInput::Tick);
+                self.process_fetch_outputs(tick_outputs);
             }
-        };
 
-        let actions = self.state.handle(pe);
-        self.actions_generated = actions.len();
-        for action in actions {
-            self.process_action(action);
+            Event::FetchCertificatesFailed { block_hash, hashes } => {
+                let outputs = self.fetch_protocol.handle(FetchInput::FetchFailed {
+                    block_hash,
+                    kind: FetchKind::Certificate,
+                    hashes,
+                });
+                self.process_fetch_outputs(outputs);
+                // Tick to retry pending fetches.
+                let tick_outputs = self.fetch_protocol.handle(FetchInput::Tick);
+                self.process_fetch_outputs(tick_outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            Event::FetchTick => {
+                let outputs = self.fetch_protocol.handle(FetchInput::Tick);
+                self.process_fetch_outputs(outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            // ── Protocol events → state machine ────────────────────────
+            Event::Protocol(pe) => {
+                // Broadcast self-generated state votes returning from dispatch.
+                // Votes from peers arrive via network gossip.
+                if let ProtocolEvent::StateVoteReceived { ref vote } = pe {
+                    if vote.validator == self.validator_id {
+                        self.accumulate_broadcast_vote(self.local_shard, vote.clone());
+                    }
+                }
+
+                let actions = self.state.handle(pe);
+                self.actions_generated = actions.len();
+                for action in actions {
+                    self.process_action(action);
+                }
+            }
         }
 
         self.drain_pending_output()
