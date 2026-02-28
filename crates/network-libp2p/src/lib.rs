@@ -10,6 +10,7 @@
 mod adapter;
 mod codec_pool;
 mod config;
+mod framing;
 mod inbound_router;
 mod network;
 mod peer_health;
