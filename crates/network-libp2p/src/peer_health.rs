@@ -312,6 +312,11 @@ impl PeerHealthTracker {
         self.peers.get(peer).map(|r| r.clone())
     }
 
+    /// Get the RTT EMA for a specific peer without cloning.
+    pub fn rtt_ema_secs(&self, peer: &PeerId) -> Option<f64> {
+        self.peers.get(peer).map(|r| r.rtt_ema_secs)
+    }
+
     /// Get the number of tracked peers.
     pub fn tracked_peer_count(&self) -> usize {
         self.peers.len()

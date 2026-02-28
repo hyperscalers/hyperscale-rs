@@ -71,14 +71,11 @@ impl<D: Dispatch> CodecPoolHandle<D> {
     /// * `data` - Raw LZ4-compressed message bytes from the network
     /// * `propagation_source` - Peer that sent the message (for logging)
     pub fn decode_async(&self, topic: Topic, data: Vec<u8>, propagation_source: Libp2pPeerId) {
+        let message_type = topic.message_type();
         let event_tx = self.event_tx.clone();
-        self.dispatch.spawn_codec(move || {
-            let peer_label = propagation_source.to_string();
-
-            // LZ4 decompress, then forward raw SBOR payload to NodeLoop.
-            match hyperscale_network::wire::decompress(&data) {
+        self.dispatch
+            .spawn_codec(move || match hyperscale_network::wire::decompress(&data) {
                 Ok(payload) => {
-                    let message_type = topic.message_type().to_string();
                     let _ = event_tx.send(NodeInput::GossipReceived {
                         message_type,
                         payload,
@@ -88,14 +85,12 @@ impl<D: Dispatch> CodecPoolHandle<D> {
                 Err(e) => {
                     warn!(
                         error = %e,
-                        topic = %topic,
-                        peer = %peer_label,
+                        peer = %propagation_source,
                         "Failed to decompress message in codec pool"
                     );
                     metrics::record_invalid_message();
                 }
-            }
-        });
+            });
     }
 
     /// Get current codec pool queue depth (for metrics).

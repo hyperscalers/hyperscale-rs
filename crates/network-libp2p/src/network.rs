@@ -3,7 +3,7 @@
 //! [`ProdNetwork`] wraps [`Libp2pAdapter`] and [`RequestManager`] to provide
 //! the [`Network`] interface used by `NodeLoop` in the production runner.
 
-use crate::adapter::{compute_peer_id_for_validator, Libp2pAdapter};
+use crate::adapter::Libp2pAdapter;
 use crate::inbound_router::{spawn_inbound_router, InboundRouterHandle};
 use crate::request_manager::{RequestManager, RequestPriority};
 use hyperscale_network::{
@@ -33,11 +33,12 @@ use tracing::{debug, warn};
 pub struct ProdNetwork {
     adapter: Arc<Libp2pAdapter>,
     request_manager: Arc<RequestManager>,
-    topology: Arc<dyn Topology>,
     tokio_handle: tokio::runtime::Handle,
     /// Inbound router handle — set once via `register_inbound_handler`.
     /// Kept alive to prevent the background task from being aborted.
     inbound_router: OnceLock<InboundRouterHandle>,
+    /// Cached committee peer IDs (excluding self), built once at construction.
+    committee_peers: Vec<PeerId>,
 }
 
 impl ProdNetwork {
@@ -47,36 +48,30 @@ impl ProdNetwork {
         topology: Arc<dyn Topology>,
         tokio_handle: tokio::runtime::Handle,
     ) -> Self {
+        let committee_peers = Self::build_committee_peers(&adapter, &*topology);
         Self {
             adapter,
             request_manager,
-            topology,
             tokio_handle,
             inbound_router: OnceLock::new(),
+            committee_peers,
         }
     }
 
-    /// Get peer IDs for same-shard committee members (excluding self).
-    fn get_committee_peers(&self) -> Vec<PeerId> {
-        let local_shard = self.topology.local_shard();
-        let local_validator = self.topology.local_validator_id();
+    fn build_committee_peers(adapter: &Libp2pAdapter, topology: &dyn Topology) -> Vec<PeerId> {
+        let local_shard = topology.local_shard();
+        let local_validator = topology.local_validator_id();
 
-        self.topology
+        topology
             .committee_for_shard(local_shard)
             .iter()
             .filter(|&&v| v != local_validator)
-            .filter_map(|&v| {
-                let pk = self.topology.public_key(v)?;
-                Some(compute_peer_id_for_validator(&pk))
-            })
+            .filter_map(|&v| adapter.peer_for_validator(v))
             .collect()
     }
 
-    /// Get the PeerId for a specific validator, if known.
     fn validator_peer_id(&self, validator: ValidatorId) -> Option<PeerId> {
-        self.topology
-            .public_key(validator)
-            .map(|pk| compute_peer_id_for_validator(&pk))
+        self.adapter.peer_for_validator(validator)
     }
 }
 
@@ -124,8 +119,7 @@ impl Network for ProdNetwork {
         request: R,
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,
     ) {
-        let peers = self.get_committee_peers();
-        if peers.is_empty() {
+        if self.committee_peers.is_empty() {
             on_response(Err(RequestError::PeerUnreachable(
                 preferred_peer.unwrap_or(ValidatorId(0)),
             )));
@@ -153,6 +147,7 @@ impl Network for ProdNetwork {
         let framed = frame_request(R::message_type_id(), &request_bytes);
         let description = format!("{}({}B)", R::message_type_id(), request_bytes.len());
         let rm = self.request_manager.clone();
+        let peers = self.committee_peers.clone();
 
         self.tokio_handle.spawn(async move {
             match rm

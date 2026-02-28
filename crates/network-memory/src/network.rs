@@ -428,7 +428,7 @@ impl SimulatedNetwork {
             }
         };
 
-        let message_type = entry.message_type.to_string();
+        let message_type = entry.message_type;
 
         for to in peers {
             if to == from {
@@ -450,7 +450,7 @@ impl SimulatedNetwork {
                         to,
                         latency,
                         event: NodeInput::GossipReceived {
-                            message_type: message_type.clone(),
+                            message_type,
                             payload: payload.clone(),
                         },
                     });

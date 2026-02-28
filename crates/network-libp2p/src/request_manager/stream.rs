@@ -7,6 +7,7 @@
 use super::{RequestManager, RequestPriority};
 use crate::adapter::{Libp2pAdapter, NetworkError};
 use crate::framing::{self, MAX_FRAME_SIZE};
+use bytes::Bytes;
 use futures::AsyncReadExt;
 use hyperscale_network::wire;
 use libp2p::PeerId;
@@ -66,14 +67,17 @@ impl RequestManager {
             "Computed timeouts for request"
         );
 
+        // Share the request data between both tasks via Bytes (O(1) clone).
+        let data_shared: Bytes = Bytes::copy_from_slice(data);
+
         // Send initial request (as a spawned task so it keeps running even if we move on)
         let adapter_clone = self.adapter.clone();
-        let data_owned = data.to_vec();
+        let data_first = data_shared.clone();
         let peer_clone = *peer;
 
         // Spawn the first request so it continues running independently
         let mut first_handle = tokio::spawn(async move {
-            Self::send_request_static(&adapter_clone, &peer_clone, &data_owned, stream_timeout)
+            Self::send_request_static(&adapter_clone, &peer_clone, &data_first, stream_timeout)
                 .await
         });
 
@@ -103,11 +107,10 @@ impl RequestManager {
 
         // If we get here, speculative timeout fired. Send second request and race both.
         let adapter_clone2 = self.adapter.clone();
-        let data_owned2 = data.to_vec();
         let peer_clone2 = *peer;
 
         let mut second_handle = tokio::spawn(async move {
-            Self::send_request_static(&adapter_clone2, &peer_clone2, &data_owned2, stream_timeout)
+            Self::send_request_static(&adapter_clone2, &peer_clone2, &data_shared, stream_timeout)
                 .await
         });
 

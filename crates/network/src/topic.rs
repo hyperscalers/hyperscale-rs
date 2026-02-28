@@ -54,7 +54,7 @@ impl Default for ProtocolVersion {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Topic {
     /// Message type identifier (e.g., "transaction.gossip", "block.header")
-    message_type: String,
+    message_type: &'static str,
     /// Optional shard targeting
     shard: Option<ShardGroupId>,
     /// Protocol version
@@ -65,9 +65,9 @@ impl Topic {
     /// Create a global topic (no shard targeting).
     ///
     /// Global topics reach all validators regardless of shard assignment.
-    pub fn global(message_type: impl Into<String>) -> Self {
+    pub fn global(message_type: &'static str) -> Self {
         Self {
-            message_type: message_type.into(),
+            message_type,
             shard: None,
             version: ProtocolVersion::CURRENT,
         }
@@ -76,9 +76,9 @@ impl Topic {
     /// Create a shard-specific topic.
     ///
     /// Shard topics only reach validators subscribed to that shard.
-    pub fn shard(message_type: impl Into<String>, shard: ShardGroupId) -> Self {
+    pub fn shard(message_type: &'static str, shard: ShardGroupId) -> Self {
         Self {
-            message_type: message_type.into(),
+            message_type,
             shard: Some(shard),
             version: ProtocolVersion::CURRENT,
         }
@@ -91,8 +91,8 @@ impl Topic {
     }
 
     /// Get the message type identifier.
-    pub fn message_type(&self) -> &str {
-        &self.message_type
+    pub fn message_type(&self) -> &'static str {
+        self.message_type
     }
 
     /// Get the optional shard ID.
@@ -133,9 +133,25 @@ impl Topic {
         }
     }
 
+    /// Map a dynamic message type string to its interned `&'static str`.
+    ///
+    /// Returns `None` for unrecognized message types.
+    fn intern_message_type(s: &str) -> Option<&'static str> {
+        match s {
+            "block.header" => Some("block.header"),
+            "block.vote" => Some("block.vote"),
+            "transaction.gossip" => Some("transaction.gossip"),
+            "transaction.certificate" => Some("transaction.certificate"),
+            "state.provision.batch" => Some("state.provision.batch"),
+            "state.vote.batch" => Some("state.vote.batch"),
+            "state.certificate.batch" => Some("state.certificate.batch"),
+            _ => None,
+        }
+    }
+
     /// Parse a topic string back to a Topic.
     ///
-    /// Returns `None` if the format is invalid.
+    /// Returns `None` if the format is invalid or the message type is unknown.
     pub fn parse(topic_str: &str) -> Option<Self> {
         let parts: Vec<&str> = topic_str.split('/').collect();
 
@@ -147,7 +163,7 @@ impl Topic {
         match parts.len() {
             // Global format: hyperscale/{message_type}/{version}
             3 => {
-                let message_type = parts[1].to_string();
+                let message_type = Self::intern_message_type(parts[1])?;
                 let version = Self::parse_version(parts[2])?;
                 Some(Self {
                     message_type,
@@ -157,7 +173,7 @@ impl Topic {
             }
             // Shard format: hyperscale/{message_type}/shard-{id}/{version}
             4 => {
-                let message_type = parts[1].to_string();
+                let message_type = Self::intern_message_type(parts[1])?;
                 let shard_str = parts[2];
 
                 // Check for shard prefix
@@ -287,16 +303,17 @@ mod tests {
         assert!(Topic::parse("hyperscale/msg").is_none());
         assert!(Topic::parse("hyperscale/msg/not-shard/1.0.0").is_none());
         assert!(Topic::parse("other/block.header/1.0.0").is_none());
+        assert!(Topic::parse("hyperscale/unknown.type/1.0.0").is_none());
     }
 
     #[test]
     fn test_roundtrip() {
-        let original = Topic::global("test.message");
+        let original = Topic::global("block.header");
         let string = original.to_string();
         let parsed = Topic::parse(&string).unwrap();
         assert_eq!(original, parsed);
 
-        let original = Topic::shard("test.message", ShardGroupId(42));
+        let original = Topic::shard("transaction.gossip", ShardGroupId(42));
         let string = original.to_string();
         let parsed = Topic::parse(&string).unwrap();
         assert_eq!(original, parsed);

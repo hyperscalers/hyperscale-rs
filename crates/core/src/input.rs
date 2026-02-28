@@ -99,7 +99,7 @@ pub enum NodeInput {
     /// Network handles decompression; NodeLoop SBOR-decodes based on
     /// message_type and converts to typed ProtocolEvents.
     GossipReceived {
-        message_type: String,
+        message_type: &'static str,
         /// Decompressed SBOR payload bytes.
         payload: Vec<u8>,
     },

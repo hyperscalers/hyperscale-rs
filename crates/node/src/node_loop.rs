@@ -562,7 +562,7 @@ where
                 message_type,
                 payload,
             } => {
-                self.handle_gossip_received(&message_type, &payload);
+                self.handle_gossip_received(message_type, &payload);
             }
 
             // ── Protocol events → state machine ────────────────────────

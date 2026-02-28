@@ -11,17 +11,16 @@ impl RequestManager {
     /// Compute the speculative retry timeout based on peer's RTT history.
     pub(super) fn compute_speculative_timeout(&self, peer: &PeerId) -> Duration {
         self.health
-            .get_health(peer)
-            .map(|h| {
-                let rtt_based = Duration::from_secs_f64(
-                    h.rtt_ema_secs * self.config.speculative_retry_multiplier,
-                );
+            .rtt_ema_secs(peer)
+            .map(|rtt| {
+                let rtt_based =
+                    Duration::from_secs_f64(rtt * self.config.speculative_retry_multiplier);
                 rtt_based.clamp(
                     self.config.speculative_retry_min,
                     self.config.speculative_retry_max,
                 )
             })
-            .unwrap_or(self.config.speculative_retry_max) // No RTT data = no speculative retry
+            .unwrap_or(self.config.speculative_retry_max)
     }
 
     /// Compute the stream timeout based on peer's RTT history.
@@ -30,13 +29,12 @@ impl RequestManager {
     /// This ensures we don't wait 5 seconds for a peer with 100ms RTT.
     pub(super) fn compute_stream_timeout(&self, peer: &PeerId) -> Duration {
         self.health
-            .get_health(peer)
-            .map(|h| {
-                let rtt_based =
-                    Duration::from_secs_f64(h.rtt_ema_secs * STREAM_TIMEOUT_RTT_MULTIPLIER);
+            .rtt_ema_secs(peer)
+            .map(|rtt| {
+                let rtt_based = Duration::from_secs_f64(rtt * STREAM_TIMEOUT_RTT_MULTIPLIER);
                 rtt_based.clamp(MIN_STREAM_TIMEOUT, MAX_STREAM_TIMEOUT)
             })
-            .unwrap_or(DEFAULT_STREAM_TIMEOUT) // No RTT data = use 1s default (not 5s)
+            .unwrap_or(DEFAULT_STREAM_TIMEOUT)
     }
 
     /// Compute initial backoff based on peer RTT and priority.
@@ -48,22 +46,19 @@ impl RequestManager {
         peer: &PeerId,
         priority: RequestPriority,
     ) -> Duration {
-        // Get peer RTT if known, otherwise use config default
         let base_backoff = self
             .health
-            .get_health(peer)
-            .map(|h| {
-                // Use 50% of observed RTT as base backoff, clamped to reasonable range
-                let rtt_based = Duration::from_secs_f64(h.rtt_ema_secs * 0.5);
+            .rtt_ema_secs(peer)
+            .map(|rtt| {
+                let rtt_based = Duration::from_secs_f64(rtt * 0.5);
                 rtt_based.clamp(Duration::from_millis(50), Duration::from_secs(1))
             })
             .unwrap_or(self.config.initial_backoff);
 
-        // Adjust based on priority
         match priority {
-            RequestPriority::Critical => base_backoff.mul_f32(0.7), // Faster retry for critical
+            RequestPriority::Critical => base_backoff.mul_f32(0.7),
             RequestPriority::Normal => base_backoff,
-            RequestPriority::Background => base_backoff.mul_f32(1.5), // Slower for background
+            RequestPriority::Background => base_backoff.mul_f32(1.5),
         }
     }
 }
