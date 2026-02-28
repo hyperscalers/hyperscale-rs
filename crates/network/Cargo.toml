@@ -14,3 +14,4 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+hyperscale-messages.workspace = true

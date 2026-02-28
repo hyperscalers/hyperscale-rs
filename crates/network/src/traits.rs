@@ -87,3 +87,23 @@ pub trait Network: Send + Sync {
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inbound_handler_arc_delegation() {
+        struct Echo;
+        impl InboundRequestHandler for Echo {
+            fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
+                payload.to_vec()
+            }
+        }
+
+        let handler: Arc<Echo> = Arc::new(Echo);
+        let input = b"hello";
+        let output = handler.handle_request(input);
+        assert_eq!(output, input);
+    }
+}

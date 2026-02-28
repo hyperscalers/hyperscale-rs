@@ -44,3 +44,49 @@ pub fn derive_libp2p_keypair(public_key: &Bls12381G1PublicKey) -> identity::Keyp
 pub fn compute_peer_id_for_validator(public_key: &Bls12381G1PublicKey) -> Libp2pPeerId {
     derive_libp2p_keypair(public_key).public().to_peer_id()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_key(seed: u8) -> Bls12381G1PublicKey {
+        let mut bytes = [0u8; Bls12381G1PublicKey::LENGTH];
+        bytes[0] = seed;
+        bytes[1] = seed.wrapping_mul(7);
+        Bls12381G1PublicKey(bytes)
+    }
+
+    #[test]
+    fn test_derive_keypair_deterministic() {
+        let key = make_test_key(1);
+        let peer_id_1 = derive_libp2p_keypair(&key).public().to_peer_id();
+        let peer_id_2 = derive_libp2p_keypair(&key).public().to_peer_id();
+        assert_eq!(peer_id_1, peer_id_2);
+    }
+
+    #[test]
+    fn test_derive_keypair_different_keys_differ() {
+        let key_a = make_test_key(1);
+        let key_b = make_test_key(2);
+        let peer_a = derive_libp2p_keypair(&key_a).public().to_peer_id();
+        let peer_b = derive_libp2p_keypair(&key_b).public().to_peer_id();
+        assert_ne!(peer_a, peer_b);
+    }
+
+    #[test]
+    fn test_compute_peer_id_matches_derivation() {
+        let key = make_test_key(42);
+        let from_compute = compute_peer_id_for_validator(&key);
+        let from_derive = derive_libp2p_keypair(&key).public().to_peer_id();
+        assert_eq!(from_compute, from_derive);
+    }
+
+    #[test]
+    fn test_derive_produces_valid_ed25519() {
+        let key = make_test_key(99);
+        let keypair = derive_libp2p_keypair(&key);
+        // Should be an Ed25519 key — verify we can get a PeerId from it
+        let peer_id = keypair.public().to_peer_id();
+        assert!(!peer_id.to_string().is_empty());
+    }
+}

@@ -168,3 +168,191 @@ impl Network for SimNetworkAdapter {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperscale_messages::BlockVoteGossip;
+    use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash};
+    use std::sync::Mutex as StdMutex;
+
+    fn test_vote_gossip() -> BlockVoteGossip {
+        BlockVoteGossip::new(BlockVote {
+            block_hash: Hash::from_bytes(b"test"),
+            height: BlockHeight(1),
+            round: 0,
+            voter: ValidatorId(0),
+            signature: zero_bls_signature(),
+            timestamp: 1_000_000_000_000,
+        })
+    }
+
+    #[test]
+    fn test_broadcast_to_shard_creates_outbox_entry() {
+        let adapter = SimNetworkAdapter::default();
+        let gossip = test_vote_gossip();
+        let shard = ShardGroupId(3);
+
+        adapter.broadcast_to_shard(shard, &gossip);
+
+        let entries = adapter.drain_outbox();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].target, BroadcastTarget::Shard(s) if s == shard));
+        assert_eq!(entries[0].message_type, "block.vote");
+        assert!(!entries[0].data.is_empty());
+    }
+
+    #[test]
+    fn test_broadcast_global_creates_outbox_entry() {
+        let adapter = SimNetworkAdapter::default();
+        let gossip = test_vote_gossip();
+
+        adapter.broadcast_global(&gossip);
+
+        let entries = adapter.drain_outbox();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].target, BroadcastTarget::Global));
+        assert_eq!(entries[0].message_type, "block.vote");
+        assert!(!entries[0].data.is_empty());
+    }
+
+    #[test]
+    fn test_drain_outbox_returns_and_clears() {
+        let adapter = SimNetworkAdapter::default();
+        let gossip = test_vote_gossip();
+
+        adapter.broadcast_global(&gossip);
+        adapter.broadcast_global(&gossip);
+        adapter.broadcast_global(&gossip);
+
+        let first_drain = adapter.drain_outbox();
+        assert_eq!(first_drain.len(), 3);
+
+        let second_drain = adapter.drain_outbox();
+        assert_eq!(second_drain.len(), 0);
+    }
+
+    #[test]
+    fn test_register_inbound_handler_sets_slot() {
+        let handler_slot: HandlerSlot = Arc::new(OnceLock::new());
+        let adapter = SimNetworkAdapter::new(handler_slot.clone());
+
+        struct EchoHandler;
+        impl InboundRequestHandler for EchoHandler {
+            fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
+                payload.to_vec()
+            }
+        }
+
+        assert!(handler_slot.get().is_none());
+        adapter.register_inbound_handler(Arc::new(EchoHandler));
+        assert!(handler_slot.get().is_some());
+    }
+
+    #[test]
+    fn test_register_inbound_handler_idempotent() {
+        let adapter = SimNetworkAdapter::default();
+
+        struct Handler1;
+        impl InboundRequestHandler for Handler1 {
+            fn handle_request(&self, _: &[u8]) -> Vec<u8> {
+                vec![1]
+            }
+        }
+
+        struct Handler2;
+        impl InboundRequestHandler for Handler2 {
+            fn handle_request(&self, _: &[u8]) -> Vec<u8> {
+                vec![2]
+            }
+        }
+
+        adapter.register_inbound_handler(Arc::new(Handler1));
+        adapter.register_inbound_handler(Arc::new(Handler2)); // should be ignored
+
+        // First handler should have won
+        let result = adapter.handler_slot.get().unwrap().handle_request(&[]);
+        assert_eq!(result, vec![1]);
+    }
+
+    #[test]
+    fn test_request_creates_pending_request() {
+        use hyperscale_messages::request::GetBlockRequest;
+
+        let adapter = SimNetworkAdapter::default();
+        let preferred = Some(ValidatorId(7));
+
+        adapter.request(
+            preferred,
+            GetBlockRequest::new(BlockHeight(42)),
+            Box::new(|_| {}),
+        );
+
+        let requests = adapter.drain_pending_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].preferred_peer, preferred);
+        assert_eq!(requests[0].type_id, "block.request");
+        assert!(!requests[0].request_bytes.is_empty());
+
+        // Verify the request bytes decode correctly
+        let decoded: GetBlockRequest = sbor::basic_decode(&requests[0].request_bytes).unwrap();
+        assert_eq!(decoded.height, BlockHeight(42));
+    }
+
+    #[test]
+    fn test_request_callback_decodes_response() {
+        use hyperscale_messages::request::GetBlockRequest;
+        use hyperscale_messages::response::GetBlockResponse;
+
+        let adapter = SimNetworkAdapter::default();
+        let result: Arc<StdMutex<Option<Result<GetBlockResponse, RequestError>>>> =
+            Arc::new(StdMutex::new(None));
+        let result_clone = result.clone();
+
+        adapter.request(
+            None,
+            GetBlockRequest::new(BlockHeight(1)),
+            Box::new(move |r| {
+                *result_clone.lock().unwrap() = Some(r);
+            }),
+        );
+
+        let requests = adapter.drain_pending_requests();
+        let on_response = requests.into_iter().next().unwrap().on_response;
+
+        // Simulate a successful response with SBOR-encoded bytes
+        let response = GetBlockResponse::not_found();
+        let response_bytes = sbor::basic_encode(&response).unwrap();
+        on_response(Ok(response_bytes));
+
+        let captured = result.lock().unwrap().take().unwrap();
+        let decoded_response = captured.unwrap();
+        assert!(!decoded_response.has_block());
+    }
+
+    #[test]
+    fn test_request_callback_propagates_error() {
+        use hyperscale_messages::request::GetBlockRequest;
+        use hyperscale_messages::response::GetBlockResponse;
+
+        let adapter = SimNetworkAdapter::default();
+        let result: Arc<StdMutex<Option<Result<GetBlockResponse, RequestError>>>> =
+            Arc::new(StdMutex::new(None));
+        let result_clone = result.clone();
+
+        adapter.request(
+            None,
+            GetBlockRequest::new(BlockHeight(1)),
+            Box::new(move |r| {
+                *result_clone.lock().unwrap() = Some(r);
+            }),
+        );
+
+        let requests = adapter.drain_pending_requests();
+        let on_response = requests.into_iter().next().unwrap().on_response;
+        on_response(Err(RequestError::Timeout));
+
+        let captured = result.lock().unwrap().take().unwrap();
+        assert!(matches!(captured, Err(RequestError::Timeout)));
+    }
+}

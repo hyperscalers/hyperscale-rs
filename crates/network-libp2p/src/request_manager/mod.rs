@@ -283,16 +283,22 @@ mod tests {
     fn test_default_config() {
         let config = RequestManagerConfig::default();
         assert_eq!(config.max_concurrent, 64);
-        assert_eq!(config.retries_before_rotation, 3); // Good for packet loss
-        assert_eq!(config.max_total_attempts, 15); // More attempts for lossy networks
+        assert_eq!(config.retries_before_rotation, 3);
+        assert_eq!(config.max_total_attempts, 15);
         assert_eq!(config.initial_backoff, Duration::from_millis(100));
+        assert_eq!(config.max_backoff, Duration::from_millis(500));
+        assert_eq!(config.backoff_multiplier, 1.5);
+        assert_eq!(config.target_success_rate, 0.5);
+        assert_eq!(config.min_concurrent, 4);
+        assert!(config.min_concurrent <= config.max_concurrent);
     }
 
     #[test]
-    fn test_priority_values() {
-        // Just verify the enum values exist
-        let _critical = RequestPriority::Critical;
-        let _normal = RequestPriority::Normal;
-        let _background = RequestPriority::Background;
+    fn test_default_config_speculative_retry() {
+        let config = RequestManagerConfig::default();
+        assert_eq!(config.speculative_retry_multiplier, 2.0);
+        assert_eq!(config.speculative_retry_min, Duration::from_millis(200));
+        assert_eq!(config.speculative_retry_max, Duration::from_secs(2));
+        assert!(config.speculative_retry_min < config.speculative_retry_max);
     }
 }

@@ -88,3 +88,103 @@ pub(crate) async fn read_frame_len<S: AsyncReadExt + Unpin>(
 
     Ok(len)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Write a frame into a Vec buffer, then read it back from a cursor.
+    /// `write_frame` calls close() so we can't use the same stream for both.
+    async fn write_to_buf(data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let compressed = wire::compress(data);
+        let len = compressed.len() as u32;
+        // Manually write instead of write_frame (which calls close)
+        futures::AsyncWriteExt::write_all(&mut buf, &len.to_be_bytes())
+            .await
+            .unwrap();
+        futures::AsyncWriteExt::write_all(&mut buf, &compressed)
+            .await
+            .unwrap();
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_write_read_frame_roundtrip() {
+        let original = b"hello world, this is a framing test";
+        let buf = write_to_buf(original).await;
+        let mut cursor = futures::io::Cursor::new(buf);
+        let decoded = read_frame(&mut cursor, MAX_FRAME_SIZE).await.unwrap();
+        assert_eq!(decoded.as_slice(), original);
+    }
+
+    #[tokio::test]
+    async fn test_write_read_frame_large_payload() {
+        let original: Vec<u8> = (0..100_000).map(|i| (i % 251) as u8).collect();
+        let buf = write_to_buf(&original).await;
+        let mut cursor = futures::io::Cursor::new(buf);
+        let decoded = read_frame(&mut cursor, MAX_FRAME_SIZE).await.unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_too_large() {
+        // Write a frame with compressed size > max_size
+        let data = vec![0u8; 10_000];
+        let buf = write_to_buf(&data).await;
+        let mut cursor = futures::io::Cursor::new(buf);
+        // Use a very small max_size
+        let result = read_frame(&mut cursor, 16).await;
+        assert!(matches!(result, Err(FrameError::TooLarge(_))));
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_empty_stream() {
+        let mut cursor = futures::io::Cursor::new(Vec::<u8>::new());
+        let result = read_frame(&mut cursor, MAX_FRAME_SIZE).await;
+        assert!(matches!(result, Err(FrameError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_truncated_body() {
+        // Write length header for 1000 bytes but only 10 bytes of body
+        let mut buf = Vec::new();
+        futures::AsyncWriteExt::write_all(&mut buf, &1000u32.to_be_bytes())
+            .await
+            .unwrap();
+        buf.extend_from_slice(&[0u8; 10]);
+
+        let mut cursor = futures::io::Cursor::new(buf);
+        let result = read_frame(&mut cursor, MAX_FRAME_SIZE).await;
+        assert!(matches!(result, Err(FrameError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_invalid_compressed_data() {
+        // Write valid length prefix + garbage bytes
+        let garbage = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04];
+        let mut buf = Vec::new();
+        futures::AsyncWriteExt::write_all(&mut buf, &(garbage.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        buf.extend_from_slice(&garbage);
+
+        let mut cursor = futures::io::Cursor::new(buf);
+        let result = read_frame(&mut cursor, MAX_FRAME_SIZE).await;
+        assert!(matches!(result, Err(FrameError::Decompress(_))));
+    }
+
+    #[tokio::test]
+    async fn test_read_frame_len_validates_size() {
+        // Write a 4-byte length header for 20MB
+        let large_len = 20 * 1024 * 1024u32;
+        let mut buf = Vec::new();
+        futures::AsyncWriteExt::write_all(&mut buf, &large_len.to_be_bytes())
+            .await
+            .unwrap();
+
+        let mut cursor = futures::io::Cursor::new(buf);
+        let result = read_frame_len(&mut cursor, MAX_FRAME_SIZE).await;
+        assert!(matches!(result, Err(FrameError::TooLarge(len)) if len == large_len as usize));
+    }
+}

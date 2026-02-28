@@ -714,4 +714,495 @@ mod tests {
         });
         assert!(!network.codec_roundtrip());
     }
+
+    // ─── fulfill_requests() Tests ───
+
+    /// Helper: create a simple echo handler that returns the payload as-is.
+    fn echo_handler() -> Arc<dyn InboundRequestHandler> {
+        struct Echo;
+        impl InboundRequestHandler for Echo {
+            fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
+                payload.to_vec()
+            }
+        }
+        Arc::new(Echo)
+    }
+
+    /// Helper: build a PendingRequest with a callback that captures the result.
+    fn make_request_with_capture(
+        preferred_peer: Option<ValidatorId>,
+    ) -> (
+        PendingRequest,
+        Arc<std::sync::Mutex<Option<Result<Vec<u8>, hyperscale_network::RequestError>>>>,
+    ) {
+        let result = Arc::new(std::sync::Mutex::new(None));
+        let result_clone = result.clone();
+        let request = PendingRequest {
+            preferred_peer,
+            type_id: "test.request",
+            request_bytes: vec![1, 2, 3],
+            on_response: Box::new(move |r| {
+                *result_clone.lock().unwrap() = Some(r);
+            }),
+        };
+        (request, result)
+    }
+
+    #[test]
+    fn test_fulfill_requests_happy_path() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 4,
+            num_shards: 1,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Register echo handler on node 1
+        let adapter1 = network.create_adapter(1);
+        hyperscale_network::Network::register_inbound_handler(&adapter1, echo_handler());
+
+        let (request, result) = make_request_with_capture(Some(ValidatorId(1)));
+
+        let stats = network.fulfill_requests(0, vec![request], &mut rng);
+
+        assert_eq!(stats.messages_sent, 2); // request + response
+        assert_eq!(stats.messages_dropped_partition, 0);
+        assert_eq!(stats.messages_dropped_loss, 0);
+
+        // Callback should have been invoked with Ok
+        let captured = result.lock().unwrap().take().unwrap();
+        assert!(captured.is_ok());
+    }
+
+    #[test]
+    fn test_fulfill_requests_partition_drops() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 4,
+            num_shards: 1,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let adapter1 = network.create_adapter(1);
+        hyperscale_network::Network::register_inbound_handler(&adapter1, echo_handler());
+
+        // Partition node 0 → node 1
+        network.partition_unidirectional(0, 1);
+
+        let (request, result) = make_request_with_capture(Some(ValidatorId(1)));
+        let stats = network.fulfill_requests(0, vec![request], &mut rng);
+
+        assert_eq!(stats.messages_dropped_partition, 1);
+        assert_eq!(stats.messages_sent, 0);
+
+        let captured = result.lock().unwrap().take().unwrap();
+        assert!(matches!(
+            captured,
+            Err(hyperscale_network::RequestError::PeerUnreachable(_))
+        ));
+    }
+
+    #[test]
+    fn test_fulfill_requests_packet_loss() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 4,
+            num_shards: 1,
+            packet_loss_rate: 1.0, // 100% loss
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let adapter1 = network.create_adapter(1);
+        hyperscale_network::Network::register_inbound_handler(&adapter1, echo_handler());
+
+        let (request, result) = make_request_with_capture(Some(ValidatorId(1)));
+        let stats = network.fulfill_requests(0, vec![request], &mut rng);
+
+        assert_eq!(stats.messages_dropped_loss, 1);
+        assert_eq!(stats.messages_sent, 0);
+
+        let captured = result.lock().unwrap().take().unwrap();
+        assert!(matches!(
+            captured,
+            Err(hyperscale_network::RequestError::PeerUnreachable(_))
+        ));
+    }
+
+    #[test]
+    fn test_fulfill_requests_no_handler() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 4,
+            num_shards: 1,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Don't register any handler
+        let _adapter1 = network.create_adapter(1);
+
+        let (request, result) = make_request_with_capture(Some(ValidatorId(1)));
+        network.fulfill_requests(0, vec![request], &mut rng);
+
+        let captured = result.lock().unwrap().take().unwrap();
+        assert!(matches!(
+            captured,
+            Err(hyperscale_network::RequestError::PeerError(_))
+        ));
+    }
+
+    #[test]
+    fn test_fulfill_requests_empty_response() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 4,
+            num_shards: 1,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Register handler that returns empty
+        struct EmptyHandler;
+        impl InboundRequestHandler for EmptyHandler {
+            fn handle_request(&self, _: &[u8]) -> Vec<u8> {
+                vec![]
+            }
+        }
+        let adapter1 = network.create_adapter(1);
+        hyperscale_network::Network::register_inbound_handler(&adapter1, Arc::new(EmptyHandler));
+
+        let (request, result) = make_request_with_capture(Some(ValidatorId(1)));
+        network.fulfill_requests(0, vec![request], &mut rng);
+
+        let captured = result.lock().unwrap().take().unwrap();
+        assert!(
+            matches!(captured, Err(hyperscale_network::RequestError::PeerError(ref s)) if s.contains("empty"))
+        );
+    }
+
+    #[test]
+    fn test_fulfill_requests_random_peer_selection() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 4,
+            num_shards: 1,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Register handlers on all nodes
+        for i in 0..4 {
+            let adapter = network.create_adapter(i);
+            hyperscale_network::Network::register_inbound_handler(&adapter, echo_handler());
+        }
+
+        // No preferred peer — should pick a random non-self peer
+        let (request, result) = make_request_with_capture(None);
+        let stats = network.fulfill_requests(0, vec![request], &mut rng);
+
+        assert_eq!(stats.messages_sent, 2);
+        let captured = result.lock().unwrap().take().unwrap();
+        assert!(captured.is_ok());
+    }
+
+    #[test]
+    fn test_fulfill_requests_single_node_no_peers() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 1,
+            num_shards: 1,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let adapter0 = network.create_adapter(0);
+        hyperscale_network::Network::register_inbound_handler(&adapter0, echo_handler());
+
+        // No preferred peer, and the only node is the requester itself
+        let (request, result) = make_request_with_capture(None);
+        network.fulfill_requests(0, vec![request], &mut rng);
+
+        let captured = result.lock().unwrap().take().unwrap();
+        assert!(matches!(
+            captured,
+            Err(hyperscale_network::RequestError::PeerUnreachable(_))
+        ));
+    }
+
+    // ─── deliver_gossip() Tests ───
+
+    /// Helper: create a wire-encoded (LZ4-compressed) outbox entry.
+    fn make_gossip_entry(target: BroadcastTarget) -> OutboxEntry {
+        let data = hyperscale_network::wire::compress(b"test gossip payload");
+        OutboxEntry {
+            target,
+            message_type: "test.gossip",
+            data,
+        }
+    }
+
+    #[test]
+    fn test_deliver_gossip_shard_scoped() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 2,
+            num_shards: 2,
+            packet_loss_rate: 0.0,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Node 0 is in shard 0, along with node 1. Nodes 2,3 are in shard 1.
+        let entry = make_gossip_entry(BroadcastTarget::Shard(ShardGroupId(0)));
+        let (deliveries, stats) = network.deliver_gossip(0, entry, &mut rng);
+
+        // Should deliver only to node 1 (same shard, excluding sender)
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].to, 1);
+        assert_eq!(stats.messages_sent, 1);
+    }
+
+    #[test]
+    fn test_deliver_gossip_global() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 2,
+            num_shards: 2,
+            packet_loss_rate: 0.0,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let entry = make_gossip_entry(BroadcastTarget::Global);
+        let (deliveries, stats) = network.deliver_gossip(0, entry, &mut rng);
+
+        // Should deliver to nodes 1, 2, 3 (everyone except sender node 0)
+        assert_eq!(deliveries.len(), 3);
+        let targets: Vec<NodeIndex> = deliveries.iter().map(|d| d.to).collect();
+        assert!(targets.contains(&1));
+        assert!(targets.contains(&2));
+        assert!(targets.contains(&3));
+        assert_eq!(stats.messages_sent, 3);
+    }
+
+    #[test]
+    fn test_deliver_gossip_excludes_sender() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 4,
+            num_shards: 1,
+            packet_loss_rate: 0.0,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let entry = make_gossip_entry(BroadcastTarget::Global);
+        let (deliveries, _) = network.deliver_gossip(0, entry, &mut rng);
+
+        // Sender should never appear in deliveries
+        assert!(deliveries.iter().all(|d| d.to != 0));
+    }
+
+    #[test]
+    fn test_deliver_gossip_partition_blocks() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 2,
+            num_shards: 2,
+            packet_loss_rate: 0.0,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Partition node 0 → node 1
+        network.partition_unidirectional(0, 1);
+
+        let entry = make_gossip_entry(BroadcastTarget::Global);
+        let (deliveries, stats) = network.deliver_gossip(0, entry, &mut rng);
+
+        // Node 1 should be blocked, nodes 2,3 should receive
+        assert_eq!(deliveries.len(), 2);
+        assert!(deliveries.iter().all(|d| d.to != 1));
+        assert_eq!(stats.messages_dropped_partition, 1);
+        assert_eq!(stats.messages_sent, 2);
+    }
+
+    #[test]
+    fn test_deliver_gossip_100_percent_loss() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 4,
+            num_shards: 1,
+            packet_loss_rate: 1.0,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let entry = make_gossip_entry(BroadcastTarget::Global);
+        let (deliveries, stats) = network.deliver_gossip(0, entry, &mut rng);
+
+        assert!(deliveries.is_empty());
+        assert_eq!(stats.messages_dropped_loss, 3);
+        assert_eq!(stats.messages_sent, 0);
+    }
+
+    #[test]
+    fn test_deliver_gossip_latency_varies() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 4,
+            num_shards: 1,
+            jitter_fraction: 0.5, // High jitter
+            packet_loss_rate: 0.0,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let entry = make_gossip_entry(BroadcastTarget::Global);
+        let (deliveries, _) = network.deliver_gossip(0, entry, &mut rng);
+
+        assert_eq!(deliveries.len(), 3);
+        // With high jitter, latencies should differ
+        let latencies: Vec<Duration> = deliveries.iter().map(|d| d.latency).collect();
+        // At least not all identical (possible but astronomically unlikely with jitter 0.5)
+        assert!(
+            latencies[0] != latencies[1] || latencies[1] != latencies[2],
+            "Expected varying latencies, got {:?}",
+            latencies
+        );
+    }
+
+    #[test]
+    fn test_deliver_gossip_payload_decompressed() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 2,
+            num_shards: 1,
+            packet_loss_rate: 0.0,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let original_payload = b"test gossip payload";
+        let entry = make_gossip_entry(BroadcastTarget::Global);
+        let (deliveries, _) = network.deliver_gossip(0, entry, &mut rng);
+
+        assert_eq!(deliveries.len(), 1);
+        match &deliveries[0].event {
+            NodeInput::GossipReceived {
+                payload,
+                message_type,
+            } => {
+                assert_eq!(payload.as_slice(), original_payload);
+                assert_eq!(*message_type, "test.gossip");
+            }
+            other => panic!("Expected GossipReceived, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_deliver_gossip_invalid_compressed_data() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 2,
+            num_shards: 1,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Pass garbage data that can't be decompressed
+        let entry = OutboxEntry {
+            target: BroadcastTarget::Global,
+            message_type: "test.gossip",
+            data: vec![0xFF, 0xFE, 0xFD],
+        };
+
+        let (deliveries, stats) = network.deliver_gossip(0, entry, &mut rng);
+        assert!(deliveries.is_empty());
+        assert_eq!(stats.messages_sent, 0);
+    }
+
+    #[test]
+    fn test_deliver_gossip_stats_accurate() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 2,
+            num_shards: 2, // nodes 0,1 in shard 0; nodes 2,3 in shard 1
+            packet_loss_rate: 0.0,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Partition node 0 → node 2
+        network.partition_unidirectional(0, 2);
+
+        let entry = make_gossip_entry(BroadcastTarget::Global);
+        let (deliveries, stats) = network.deliver_gossip(0, entry, &mut rng);
+
+        // 3 targets (1, 2, 3), 1 partitioned (node 2), 2 delivered
+        assert_eq!(deliveries.len(), 2);
+        assert_eq!(stats.messages_sent, 2);
+        assert_eq!(stats.messages_dropped_partition, 1);
+        assert_eq!(stats.messages_dropped_loss, 0);
+    }
+
+    // ─── create_adapter and Integration ───
+
+    #[test]
+    fn test_create_adapter_shares_handler_slot() {
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 2,
+            num_shards: 1,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Create adapter for node 1 and register handler through it
+        let adapter1 = network.create_adapter(1);
+        hyperscale_network::Network::register_inbound_handler(&adapter1, echo_handler());
+
+        // fulfill_requests should be able to find the handler
+        let (request, result) = make_request_with_capture(Some(ValidatorId(1)));
+        let stats = network.fulfill_requests(0, vec![request], &mut rng);
+
+        assert_eq!(stats.messages_sent, 2);
+        let captured = result.lock().unwrap().take().unwrap();
+        assert!(captured.is_ok());
+    }
+
+    #[test]
+    fn test_full_gossip_roundtrip() {
+        use hyperscale_messages::BlockVoteGossip;
+        use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash};
+
+        let network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 2,
+            num_shards: 1,
+            packet_loss_rate: 0.0,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let adapter0 = network.create_adapter(0);
+
+        // Node 0 broadcasts a vote via its adapter
+        let gossip = BlockVoteGossip::new(BlockVote {
+            block_hash: Hash::from_bytes(b"test_block"),
+            height: BlockHeight(42),
+            round: 0,
+            voter: ValidatorId(0),
+            signature: zero_bls_signature(),
+            timestamp: 1_000_000_000_000,
+        });
+        hyperscale_network::Network::broadcast_to_shard(&adapter0, ShardGroupId(0), &gossip);
+
+        // Drain and deliver
+        let entries = adapter0.drain_outbox();
+        assert_eq!(entries.len(), 1);
+
+        let (deliveries, stats) =
+            network.deliver_gossip(0, entries.into_iter().next().unwrap(), &mut rng);
+        assert_eq!(stats.messages_sent, 1);
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].to, 1);
+
+        // Verify the event contains valid decompressed payload
+        match &deliveries[0].event {
+            NodeInput::GossipReceived {
+                payload,
+                message_type,
+            } => {
+                assert_eq!(*message_type, "block.vote");
+                assert!(!payload.is_empty());
+            }
+            other => panic!("Expected GossipReceived, got {:?}", other),
+        }
+    }
 }

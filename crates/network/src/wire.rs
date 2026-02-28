@@ -161,4 +161,35 @@ mod tests {
             Err(WireError::FrameTooShort)
         ));
     }
+
+    #[test]
+    fn test_parse_request_frame_invalid_utf8() {
+        // Build a frame with 2-byte type_id containing invalid UTF-8
+        let mut data = vec![2, 0]; // type_id_len = 2
+        data.extend_from_slice(&[0xFF, 0xFE]); // invalid UTF-8
+        data.extend_from_slice(b"payload");
+        assert!(matches!(
+            parse_request_frame(&data),
+            Err(WireError::InvalidTypeId)
+        ));
+    }
+
+    #[test]
+    fn test_compress_decompress_large_payload() {
+        // ~1MB of semi-realistic data
+        let original: Vec<u8> = (0..1_000_000).map(|i| (i % 251) as u8).collect();
+        let compressed = compress(&original);
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(original, decompressed);
+    }
+
+    #[test]
+    fn test_frame_request_long_type_id() {
+        let type_id = "a.very.long.message.type.identifier.for.testing";
+        let payload = b"data";
+        let framed = frame_request(type_id, payload);
+        let (parsed_type_id, parsed_payload) = parse_request_frame(&framed).unwrap();
+        assert_eq!(parsed_type_id, type_id);
+        assert_eq!(parsed_payload, payload);
+    }
 }

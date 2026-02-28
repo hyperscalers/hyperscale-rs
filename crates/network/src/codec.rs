@@ -79,4 +79,33 @@ mod tests {
         let result = decode_from_wire::<Vec<u8>>(&[99, 1, 2, 3]);
         assert!(matches!(result, Err(CodecError::Decompress(_))));
     }
+
+    #[test]
+    fn test_encode_decode_roundtrip_with_real_message() {
+        use hyperscale_messages::BlockVoteGossip;
+        use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash, ValidatorId};
+
+        let gossip = BlockVoteGossip::new(BlockVote {
+            block_hash: Hash::from_bytes(b"test_block"),
+            height: BlockHeight(42),
+            round: 1,
+            voter: ValidatorId(7),
+            signature: zero_bls_signature(),
+            timestamp: 1_000_000_000_000,
+        });
+
+        let encoded = encode_to_wire(&gossip).unwrap();
+        let decoded: BlockVoteGossip = decode_from_wire(&encoded).unwrap();
+        assert_eq!(decoded, gossip);
+    }
+
+    #[test]
+    fn test_decode_truncated_compressed_data() {
+        let original: Vec<u8> = vec![1, 2, 3, 4, 5];
+        let encoded = encode_to_wire(&original).unwrap();
+        // Truncate to half
+        let truncated = &encoded[..encoded.len() / 2];
+        let result = decode_from_wire::<Vec<u8>>(truncated);
+        assert!(matches!(result, Err(CodecError::Decompress(_))));
+    }
 }

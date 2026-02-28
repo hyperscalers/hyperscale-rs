@@ -133,3 +133,136 @@ impl PriorityCommandChannels {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_priority_channels_creation() {
+        let (_channels, (mut crit, mut coord, mut final_, mut prop, mut bg)) =
+            PriorityCommandChannels::new();
+
+        // All receivers should be empty initially
+        assert!(crit.try_recv().is_err());
+        assert!(coord.try_recv().is_err());
+        assert!(final_.try_recv().is_err());
+        assert!(prop.try_recv().is_err());
+        assert!(bg.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_broadcast_routes_by_priority() {
+        let (channels, (mut crit, mut coord, mut final_, mut prop, mut bg)) =
+            PriorityCommandChannels::new();
+
+        channels
+            .send(SwarmCommand::Broadcast {
+                topic: "t".into(),
+                data: vec![1],
+                priority: MessagePriority::Critical,
+            })
+            .unwrap();
+        channels
+            .send(SwarmCommand::Broadcast {
+                topic: "t".into(),
+                data: vec![2],
+                priority: MessagePriority::Coordination,
+            })
+            .unwrap();
+        channels
+            .send(SwarmCommand::Broadcast {
+                topic: "t".into(),
+                data: vec![3],
+                priority: MessagePriority::Finalization,
+            })
+            .unwrap();
+        channels
+            .send(SwarmCommand::Broadcast {
+                topic: "t".into(),
+                data: vec![4],
+                priority: MessagePriority::Propagation,
+            })
+            .unwrap();
+        channels
+            .send(SwarmCommand::Broadcast {
+                topic: "t".into(),
+                data: vec![5],
+                priority: MessagePriority::Background,
+            })
+            .unwrap();
+
+        assert!(
+            matches!(crit.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![1])
+        );
+        assert!(
+            matches!(coord.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![2])
+        );
+        assert!(
+            matches!(final_.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![3])
+        );
+        assert!(
+            matches!(prop.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![4])
+        );
+        assert!(
+            matches!(bg.try_recv().unwrap(), SwarmCommand::Broadcast { data, .. } if data == vec![5])
+        );
+    }
+
+    #[test]
+    fn test_control_commands_use_critical_channel() {
+        let (channels, (mut crit, _, _, _, _)) = PriorityCommandChannels::new();
+
+        channels
+            .send(SwarmCommand::Subscribe {
+                topic: "test".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            crit.try_recv().unwrap(),
+            SwarmCommand::Subscribe { .. }
+        ));
+
+        channels
+            .send(SwarmCommand::Dial {
+                address: "/ip4/127.0.0.1/tcp/1234".parse().unwrap(),
+            })
+            .unwrap();
+        assert!(matches!(
+            crit.try_recv().unwrap(),
+            SwarmCommand::Dial { .. }
+        ));
+    }
+
+    #[test]
+    fn test_send_fails_on_closed_channel() {
+        let (channels, receivers) = PriorityCommandChannels::new();
+        drop(receivers);
+
+        let result = channels.send(SwarmCommand::Subscribe {
+            topic: "test".into(),
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_multiple_messages_preserve_order() {
+        let (channels, (mut crit, _, _, _, _)) = PriorityCommandChannels::new();
+
+        for i in 0..5u8 {
+            channels
+                .send(SwarmCommand::Broadcast {
+                    topic: format!("topic-{}", i),
+                    data: vec![i],
+                    priority: MessagePriority::Critical,
+                })
+                .unwrap();
+        }
+
+        for i in 0..5u8 {
+            let msg = crit.try_recv().unwrap();
+            assert!(matches!(msg, SwarmCommand::Broadcast { data, .. } if data == vec![i]));
+        }
+        assert!(crit.try_recv().is_err());
+    }
+}

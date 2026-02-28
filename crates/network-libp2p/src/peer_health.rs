@@ -684,4 +684,133 @@ mod tests {
         assert_eq!(stats.total_successes, 1);
         assert_eq!(stats.total_failures, 1);
     }
+
+    #[test]
+    fn test_cleanup_stale_removes_old_peers() {
+        let config = PeerHealthConfig {
+            stale_peer_timeout: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let tracker = PeerHealthTracker::new(config);
+        let peer = test_peer();
+
+        tracker.record_success(&peer, Duration::from_millis(10));
+        assert_eq!(tracker.tracked_peer_count(), 1);
+
+        // Wait for the peer to become stale
+        std::thread::sleep(Duration::from_millis(100));
+        tracker.cleanup_stale();
+        assert_eq!(tracker.tracked_peer_count(), 0);
+    }
+
+    #[test]
+    fn test_cleanup_stale_keeps_active_peers() {
+        let config = PeerHealthConfig {
+            stale_peer_timeout: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let tracker = PeerHealthTracker::new(config);
+        let peer = test_peer();
+
+        tracker.record_success(&peer, Duration::from_millis(10));
+        tracker.cleanup_stale();
+        assert_eq!(tracker.tracked_peer_count(), 1);
+    }
+
+    #[test]
+    fn test_cleanup_stale_keeps_new_peers() {
+        let config = PeerHealthConfig {
+            stale_peer_timeout: Duration::from_millis(50),
+            ..Default::default()
+        };
+        let tracker = PeerHealthTracker::new(config);
+        let peer = test_peer();
+
+        // Just start a request — no success/failure recorded yet
+        tracker.record_request_started(&peer);
+        tracker.cleanup_stale();
+        // Peers with no activity timestamps are kept (recently added)
+        assert_eq!(tracker.tracked_peer_count(), 1);
+    }
+
+    #[test]
+    fn test_get_health_unknown_peer() {
+        let tracker = PeerHealthTracker::new(PeerHealthConfig::default());
+        assert!(tracker.get_health(&test_peer()).is_none());
+    }
+
+    #[test]
+    fn test_rtt_ema_secs_unknown_peer() {
+        let tracker = PeerHealthTracker::new(PeerHealthConfig::default());
+        assert!(tracker.rtt_ema_secs(&test_peer()).is_none());
+    }
+
+    #[test]
+    fn test_rtt_ema_converges() {
+        let mut health = PeerHealth::default();
+        for _ in 0..20 {
+            health.record_success(Duration::from_millis(100));
+        }
+        // Should converge close to 0.1s
+        assert!(
+            (health.rtt_ema_secs - 0.1).abs() < 0.01,
+            "Expected ~0.1, got {}",
+            health.rtt_ema_secs
+        );
+    }
+
+    #[test]
+    fn test_rtt_ema_with_varying_rtt() {
+        let mut health = PeerHealth::default();
+        for _ in 0..30 {
+            health.record_success(Duration::from_millis(50));
+            health.record_success(Duration::from_millis(150));
+        }
+        // Should converge near the average (~0.1s)
+        assert!(
+            (health.rtt_ema_secs - 0.1).abs() < 0.03,
+            "Expected ~0.1, got {}",
+            health.rtt_ema_secs
+        );
+    }
+
+    #[test]
+    fn test_global_success_rate_empty() {
+        let tracker = PeerHealthTracker::new(PeerHealthConfig::default());
+        assert!((tracker.global_success_rate() - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_tracked_peer_count() {
+        let tracker = PeerHealthTracker::new(PeerHealthConfig::default());
+        assert_eq!(tracker.tracked_peer_count(), 0);
+
+        let peer_a = test_peer();
+        let peer_b = test_peer();
+        tracker.record_request_started(&peer_a);
+        assert_eq!(tracker.tracked_peer_count(), 1);
+
+        tracker.record_request_started(&peer_b);
+        assert_eq!(tracker.tracked_peer_count(), 2);
+    }
+
+    #[test]
+    fn test_selection_weight_floor() {
+        let mut health = PeerHealth::default();
+        // Drive success rate to near-zero
+        for _ in 0..50 {
+            health.record_failure(false);
+        }
+        // Weight should still be positive (floor of 0.05)
+        assert!(health.selection_weight() > 0.0);
+    }
+
+    #[test]
+    fn test_rtt_getter() {
+        let mut health = PeerHealth::default();
+        health.record_success(Duration::from_millis(200));
+        let rtt = health.rtt();
+        assert!(rtt > Duration::from_millis(100));
+        assert!(rtt < Duration::from_millis(200));
+    }
 }

@@ -130,4 +130,77 @@ mod tests {
         let encoded = hyperscale_network::encode_to_wire(&gossip).unwrap();
         assert!(!encoded.is_empty());
     }
+
+    #[test]
+    fn test_decode_async_sends_gossip_received() {
+        let dispatch = Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap());
+        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        let handle = CodecPoolHandle::new(dispatch, event_tx);
+
+        let original = b"hello world";
+        let compressed = hyperscale_network::wire::compress(original);
+        let topic = Topic::global("test.message");
+        let peer = Libp2pPeerId::random();
+
+        handle.decode_async(topic, compressed, peer);
+
+        let event = event_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        match event {
+            NodeInput::GossipReceived {
+                message_type,
+                payload,
+            } => {
+                assert_eq!(message_type, "test.message");
+                assert_eq!(payload, original);
+            }
+            other => panic!("Expected GossipReceived, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decode_async_invalid_data_no_event() {
+        let dispatch = Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap());
+        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        let handle = CodecPoolHandle::new(dispatch, event_tx);
+
+        let topic = Topic::global("test.message");
+        let peer = Libp2pPeerId::random();
+
+        // Send garbage data that can't be decompressed
+        handle.decode_async(topic, vec![0xFF, 0xFE, 0xFD], peer);
+
+        // Should not receive any event (decompress fails)
+        let result = event_rx.recv_timeout(std::time::Duration::from_millis(500));
+        assert!(result.is_err(), "Should not receive event for invalid data");
+    }
+
+    #[test]
+    fn test_clone_shares_channel() {
+        let dispatch = Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap());
+        let (event_tx, event_rx) = crossbeam::channel::unbounded();
+        let handle = CodecPoolHandle::new(dispatch, event_tx);
+        let handle2 = handle.clone();
+
+        let compressed = hyperscale_network::wire::compress(b"from clone");
+        let topic = Topic::global("test.clone");
+        let peer = Libp2pPeerId::random();
+
+        handle2.decode_async(topic, compressed, peer);
+
+        let event = event_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        match event {
+            NodeInput::GossipReceived {
+                message_type,
+                payload,
+            } => {
+                assert_eq!(message_type, "test.clone");
+                assert_eq!(payload, b"from clone");
+            }
+            other => panic!("Expected GossipReceived, got {:?}", other),
+        }
+    }
 }
