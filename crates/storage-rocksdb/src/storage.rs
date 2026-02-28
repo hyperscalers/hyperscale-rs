@@ -2517,7 +2517,12 @@ impl hyperscale_storage::ConsensusStore for SharedStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_storage::{ConsensusStore, NodeDatabaseUpdates};
+    use hyperscale_storage::test_helpers::{
+        make_database_update, make_substate_write, make_test_block, make_test_certificate,
+        make_test_qc,
+    };
+    use hyperscale_storage::{CommitStore, ConsensusStore, NodeDatabaseUpdates, SubstateStore};
+    use hyperscale_types::ShardGroupId;
     use tempfile::TempDir;
 
     #[test]
@@ -2717,61 +2722,30 @@ mod tests {
     }
 
     #[test]
-    fn test_atomic_certificate_persistence() {
-        use hyperscale_types::{
-            zero_bls_signature, NodeId, PartitionNumber, ShardGroupId, StateCertificate,
-            SubstateWrite, TransactionCertificate, TransactionDecision,
-        };
-        use std::collections::BTreeMap;
-
+    fn test_commit_certificate_with_writes_persists_both() {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-        // Create a certificate with state writes
-        let tx_hash = Hash::from_bytes(&[42; 32]);
-        let shard_group = ShardGroupId(0);
-        let writes = vec![SubstateWrite {
-            node_id: NodeId([1; 30]),
-            partition: PartitionNumber(0),
-            sort_key: vec![10, 20],
-            value: vec![99, 88, 77],
-        }];
+        let writes = vec![make_substate_write(1, 0, vec![10, 20], vec![99, 88, 77])];
+        let cert = make_test_certificate(42, ShardGroupId(0), writes.clone());
+        let tx_hash = cert.transaction_hash;
 
-        let state_cert = StateCertificate {
-            transaction_hash: tx_hash,
-            shard_group_id: shard_group,
-            read_nodes: vec![],
-            state_writes: writes.clone(),
-            writes_commitment: Hash::from_bytes(&[0; 32]),
-            success: true,
-            aggregated_signature: zero_bls_signature(),
-            signers: hyperscale_types::SignerBitfield::new(4),
-            voting_power: 0,
-        };
-
-        let mut shard_proofs = BTreeMap::new();
-        shard_proofs.insert(shard_group, state_cert);
-
-        let certificate = TransactionCertificate {
-            transaction_hash: tx_hash,
-            decision: TransactionDecision::Accept,
-            shard_proofs,
-        };
-
-        // Commit atomically
-        storage.commit_certificate_with_writes(&certificate, &writes);
+        storage.commit_certificate_with_writes(&cert, &writes);
 
         // Verify certificate is stored
         let stored_cert = storage.get_certificate(&tx_hash);
         assert!(stored_cert.is_some());
         assert_eq!(stored_cert.unwrap().transaction_hash, tx_hash);
 
-        // Verify state write was applied by reading the storage key
-        // The commit_certificate_with_writes function converts writes to DatabaseUpdates
-        // and commits them to the "state" column family using hyperscale_engine's key mapper.
-        // We verify by checking if the certificate was stored (atomicity check).
-        // A full state verification would require re-implementing the key mapping logic here,
-        // which is tested more thoroughly in engine crate tests.
+        // Verify the substate value is actually readable via list_substates_for_node
+        let node_id = hyperscale_types::NodeId([1; 30]);
+        let substates: Vec<_> = storage.list_substates_for_node(&node_id).collect();
+        assert_eq!(substates.len(), 1, "should find the committed substate");
+        assert_eq!(
+            substates[0].2,
+            vec![99, 88, 77],
+            "value should match what was written"
+        );
     }
 
     #[test]
@@ -2796,106 +2770,33 @@ mod tests {
 
     #[test]
     fn test_block_storage_and_retrieval() {
-        use hyperscale_types::{
-            zero_bls_signature, Block, BlockHeader, SignerBitfield, ValidatorId, VotePower,
-        };
-
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-        // Create a test block
-        let block = Block {
-            header: BlockHeader {
-                height: BlockHeight(42),
-                parent_hash: Hash::from_bytes(&[1; 32]),
-                parent_qc: QuorumCertificate::genesis(),
-                proposer: ValidatorId(0),
-                timestamp: 12345,
-                round: 0,
-                is_fallback: false,
-                state_root: Hash::ZERO,
-                state_version: 0,
-                transaction_root: Hash::ZERO,
-            },
-            retry_transactions: vec![],
-            priority_transactions: vec![],
-            transactions: vec![],
-            certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
-            commitment_proofs: std::collections::HashMap::new(),
-        };
+        let block = make_test_block(42);
+        let qc = make_test_qc(&block);
 
-        let qc = QuorumCertificate {
-            block_hash: block.hash(),
-            height: BlockHeight(42),
-            parent_block_hash: Hash::from_bytes(&[1; 32]),
-            round: 0,
-            aggregated_signature: zero_bls_signature(),
-            signers: SignerBitfield::new(4),
-            voting_power: VotePower(4),
-            weighted_timestamp_ms: 12345,
-        };
-
-        // Initially no block at height 42
         assert!(storage.get_block(BlockHeight(42)).is_none());
 
-        // Store block
         storage.put_block(BlockHeight(42), &block, &qc);
 
-        // Retrieve block
         let (stored_block, stored_qc) = storage.get_block(BlockHeight(42)).unwrap();
         assert_eq!(stored_block.header.height, BlockHeight(42));
-        assert_eq!(stored_block.header.timestamp, 12345);
+        assert_eq!(stored_block.header.timestamp, 42_000);
         assert_eq!(stored_qc.block_hash, block.hash());
     }
 
     #[test]
     fn test_block_range_retrieval() {
-        use hyperscale_types::{
-            zero_bls_signature, Block, BlockHeader, SignerBitfield, ValidatorId, VotePower,
-        };
-
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-        // Store blocks at heights 10-14
         for h in 10..15u64 {
-            let block = Block {
-                header: BlockHeader {
-                    height: BlockHeight(h),
-                    parent_hash: Hash::from_bytes(&[h as u8; 32]),
-                    parent_qc: QuorumCertificate::genesis(),
-                    proposer: ValidatorId(0),
-                    timestamp: h * 1000,
-                    round: 0,
-                    is_fallback: false,
-                    state_root: Hash::ZERO,
-                    state_version: 0,
-                    transaction_root: Hash::ZERO,
-                },
-                retry_transactions: vec![],
-                priority_transactions: vec![],
-                transactions: vec![],
-                certificates: vec![],
-                deferred: vec![],
-                aborted: vec![],
-                commitment_proofs: std::collections::HashMap::new(),
-            };
-            let qc = QuorumCertificate {
-                block_hash: block.hash(),
-                height: BlockHeight(h),
-                parent_block_hash: Hash::from_bytes(&[h as u8; 32]),
-                round: 0,
-                aggregated_signature: zero_bls_signature(),
-                signers: SignerBitfield::new(4),
-                voting_power: VotePower(4),
-                weighted_timestamp_ms: h * 1000,
-            };
+            let block = make_test_block(h);
+            let qc = make_test_qc(&block);
             storage.put_block(BlockHeight(h), &block, &qc);
         }
 
-        // Get range [11, 14) - should return heights 11, 12, 13
         let blocks = storage.get_blocks_range(BlockHeight(11), BlockHeight(14));
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0].0.header.height, BlockHeight(11));
@@ -2944,50 +2845,17 @@ mod tests {
 
     #[test]
     fn test_certificate_idempotency() {
-        use hyperscale_types::{
-            zero_bls_signature, NodeId, PartitionNumber, ShardGroupId, StateCertificate,
-            SubstateWrite, TransactionCertificate, TransactionDecision,
-        };
-        use std::collections::BTreeMap;
-
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
 
-        let tx_hash = Hash::from_bytes(&[42; 32]);
-        let shard_group = ShardGroupId(0);
-        let writes = vec![SubstateWrite {
-            node_id: NodeId([1; 30]),
-            partition: PartitionNumber(0),
-            sort_key: vec![10, 20],
-            value: vec![99, 88, 77],
-        }];
-
-        let state_cert = StateCertificate {
-            transaction_hash: tx_hash,
-            shard_group_id: shard_group,
-            read_nodes: vec![],
-            state_writes: writes.clone(),
-            writes_commitment: Hash::from_bytes(&[0; 32]),
-            success: true,
-            aggregated_signature: zero_bls_signature(),
-            signers: hyperscale_types::SignerBitfield::new(4),
-            voting_power: 0,
-        };
-
-        let mut shard_proofs = BTreeMap::new();
-        shard_proofs.insert(shard_group, state_cert);
-
-        let certificate = TransactionCertificate {
-            transaction_hash: tx_hash,
-            decision: TransactionDecision::Accept,
-            shard_proofs,
-        };
+        let writes = vec![make_substate_write(1, 0, vec![10, 20], vec![99, 88, 77])];
+        let cert = make_test_certificate(42, ShardGroupId(0), writes.clone());
+        let tx_hash = cert.transaction_hash;
 
         // Commit twice (simulating replay after crash)
-        storage.commit_certificate_with_writes(&certificate, &writes);
-        storage.commit_certificate_with_writes(&certificate, &writes);
+        storage.commit_certificate_with_writes(&cert, &writes);
+        storage.commit_certificate_with_writes(&cert, &writes);
 
-        // Should still have exactly one certificate
         let stored = storage.get_certificate(&tx_hash);
         assert!(stored.is_some());
         assert_eq!(stored.unwrap().transaction_hash, tx_hash);
@@ -3027,5 +2895,365 @@ mod tests {
         assert!(recovered.committed_hash.is_none());
         assert!(recovered.latest_qc.is_none());
         assert!(recovered.voted_heights.is_empty());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // JMT state tracking
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_state_version_increments_on_commit() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+        assert_eq!(storage.state_version(), 0);
+
+        storage
+            .commit(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]))
+            .unwrap();
+        assert_eq!(storage.state_version(), 1);
+
+        storage
+            .commit(&make_database_update(vec![4, 5, 6], 0, vec![20], vec![2]))
+            .unwrap();
+        assert_eq!(storage.state_version(), 2);
+    }
+
+    #[test]
+    fn test_state_root_changes_on_commit() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+        let root0 = storage.state_root_hash();
+
+        storage
+            .commit(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]))
+            .unwrap();
+        let root1 = storage.state_root_hash();
+        assert_ne!(root0, root1, "root should change after first commit");
+
+        storage
+            .commit(&make_database_update(vec![4, 5, 6], 0, vec![20], vec![2]))
+            .unwrap();
+        let root2 = storage.state_root_hash();
+        assert_ne!(root1, root2, "root should change after second commit");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CommitStore
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_commit_block_applies_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+        let shard = ShardGroupId(0);
+        let cert = Arc::new(make_test_certificate(
+            1,
+            shard,
+            vec![make_substate_write(1, 0, vec![10], vec![42])],
+        ));
+
+        let result = storage.commit_block(&[cert], shard);
+        assert_eq!(result.state_version, 1);
+        assert_ne!(result.state_root, Hash::ZERO);
+    }
+
+    #[test]
+    fn test_commit_block_multiple_certs() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+        let shard = ShardGroupId(0);
+        let cert1 = Arc::new(make_test_certificate(
+            1,
+            shard,
+            vec![make_substate_write(1, 0, vec![10], vec![1])],
+        ));
+        let cert2 = Arc::new(make_test_certificate(
+            2,
+            shard,
+            vec![make_substate_write(2, 0, vec![20], vec![2])],
+        ));
+
+        let result = storage.commit_block(&[cert1, cert2], shard);
+        assert_eq!(result.state_version, 2);
+    }
+
+    #[test]
+    fn test_commit_block_empty_certs() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+        let result = storage.commit_block(&[], ShardGroupId(0));
+        assert_eq!(result.state_version, 0);
+        assert_eq!(result.state_root, Hash::ZERO);
+    }
+
+    #[test]
+    fn test_prepare_then_commit_matches_direct() {
+        let shard = ShardGroupId(0);
+        let cert = Arc::new(make_test_certificate(
+            1,
+            shard,
+            vec![make_substate_write(1, 0, vec![10], vec![42])],
+        ));
+
+        // Prepare path
+        let temp_dir1 = TempDir::new().unwrap();
+        let s_prepared = RocksDbStorage::open(temp_dir1.path()).unwrap();
+        let parent_root = s_prepared.state_root_hash();
+        let (spec_root, prepared) =
+            s_prepared.prepare_block_commit(parent_root, &[cert.clone()], shard);
+        let result_prepared = s_prepared.commit_prepared_block(prepared);
+
+        // Direct path
+        let temp_dir2 = TempDir::new().unwrap();
+        let s_direct = RocksDbStorage::open(temp_dir2.path()).unwrap();
+        let result_direct = s_direct.commit_block(&[cert], shard);
+
+        assert_eq!(result_prepared.state_version, result_direct.state_version);
+        assert_eq!(result_prepared.state_root, result_direct.state_root);
+        assert_eq!(spec_root, result_prepared.state_root);
+    }
+
+    #[test]
+    fn test_commit_block_stores_certificates() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+        let shard = ShardGroupId(0);
+        let cert = Arc::new(make_test_certificate(
+            1,
+            shard,
+            vec![make_substate_write(1, 0, vec![10], vec![42])],
+        ));
+        let tx_hash = cert.transaction_hash;
+
+        let _ = storage.commit_block(&[cert], shard);
+
+        assert!(storage.get_certificate(&tx_hash).is_some());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Batch operations
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_transactions_batch_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+        let result = storage.get_transactions_batch(&[Hash::from_bytes(&[1; 32])]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_certificates_batch() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+        let cert1 = make_test_certificate(1, ShardGroupId(0), vec![]);
+        let cert2 = make_test_certificate(2, ShardGroupId(0), vec![]);
+        let hash1 = cert1.transaction_hash;
+        let hash2 = cert2.transaction_hash;
+
+        storage.store_certificate(&cert1);
+        storage.store_certificate(&cert2);
+
+        let result = storage.get_certificates_batch(&[hash1, hash2]);
+        assert_eq!(result.len(), 2);
+
+        // Partial: one present, one missing
+        let missing = Hash::from_bytes(&[99; 32]);
+        let partial = storage.get_certificates_batch(&[hash1, missing]);
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial[0].transaction_hash, hash1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Parity tests with SimStorage
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_initial_state_version_is_zero() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+        assert_eq!(storage.state_version(), 0);
+    }
+
+    #[test]
+    fn test_initial_state_root_is_zero() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+        assert_eq!(storage.state_root_hash(), Hash::ZERO);
+    }
+
+    #[test]
+    fn test_state_root_deterministic() {
+        let updates = make_database_update(vec![1, 2, 3], 0, vec![10], vec![42]);
+
+        let td1 = TempDir::new().unwrap();
+        let s1 = RocksDbStorage::open(td1.path()).unwrap();
+        s1.commit(&updates).unwrap();
+
+        let td2 = TempDir::new().unwrap();
+        let s2 = RocksDbStorage::open(td2.path()).unwrap();
+        s2.commit(&updates).unwrap();
+
+        assert_eq!(s1.state_root_hash(), s2.state_root_hash());
+        assert_eq!(s1.state_version(), s2.state_version());
+    }
+
+    #[test]
+    fn test_state_root_differs_for_different_data() {
+        let td1 = TempDir::new().unwrap();
+        let s1 = RocksDbStorage::open(td1.path()).unwrap();
+        s1.commit(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]))
+            .unwrap();
+
+        let td2 = TempDir::new().unwrap();
+        let s2 = RocksDbStorage::open(td2.path()).unwrap();
+        s2.commit(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![2]))
+            .unwrap();
+
+        assert_ne!(s1.state_root_hash(), s2.state_root_hash());
+    }
+
+    #[test]
+    fn test_certificate_store_and_retrieve() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+        let cert = make_test_certificate(1, ShardGroupId(0), vec![]);
+        let tx_hash = cert.transaction_hash;
+
+        storage.store_certificate(&cert);
+
+        let stored = storage.get_certificate(&tx_hash).unwrap();
+        assert_eq!(stored.transaction_hash, tx_hash);
+    }
+
+    #[test]
+    fn test_certificate_get_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+        assert!(storage
+            .get_certificate(&Hash::from_bytes(&[99; 32]))
+            .is_none());
+    }
+
+    #[test]
+    fn test_get_block_for_sync() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+        let block = make_test_block(5);
+        let qc = make_test_qc(&block);
+        storage.put_block(BlockHeight(5), &block, &qc);
+
+        let result = storage.get_block_for_sync(BlockHeight(5));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.header.height, BlockHeight(5));
+
+        assert!(storage.get_block_for_sync(BlockHeight(999)).is_none());
+    }
+
+    #[test]
+    fn test_commit_certificate_via_commit_store() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+        let writes = vec![make_substate_write(1, 0, vec![10], vec![42])];
+        let cert = make_test_certificate(1, ShardGroupId(0), writes.clone());
+
+        storage.commit_certificate(&cert, &writes);
+
+        assert_eq!(storage.state_version(), 1);
+        assert_ne!(storage.state_root_hash(), Hash::ZERO);
+        assert!(storage.get_certificate(&cert.transaction_hash).is_some());
+    }
+
+    #[test]
+    fn test_empty_commit_still_advances_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+        let updates = hyperscale_storage::DatabaseUpdates::default();
+        storage.commit(&updates).unwrap();
+        assert_eq!(storage.state_version(), 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Persistence across reopen
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_substates_survive_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let node_id = hyperscale_types::NodeId([1; 30]);
+
+        // Session 1: write a substate and a certificate
+        let root_after_write;
+        let version_after_write;
+        let cert_hash;
+        {
+            let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+            let writes = vec![make_substate_write(1, 0, vec![10], vec![42])];
+            let cert = make_test_certificate(1, ShardGroupId(0), writes.clone());
+            cert_hash = cert.transaction_hash;
+            storage.commit_certificate_with_writes(&cert, &writes);
+            root_after_write = storage.state_root_hash();
+            version_after_write = storage.state_version();
+        }
+
+        // Session 2: reopen and verify everything persisted
+        {
+            let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+            // JMT state
+            assert_eq!(storage.state_version(), version_after_write);
+            assert_eq!(storage.state_root_hash(), root_after_write);
+
+            // Certificate
+            let cert = storage.get_certificate(&cert_hash);
+            assert!(cert.is_some(), "certificate should survive reopen");
+            assert_eq!(cert.unwrap().transaction_hash, cert_hash);
+
+            // Substate data
+            let substates: Vec<_> = storage.list_substates_for_node(&node_id).collect();
+            assert_eq!(substates.len(), 1, "substate should survive reopen");
+            assert_eq!(substates[0].2, vec![42]);
+        }
+    }
+
+    #[test]
+    fn test_blocks_and_votes_survive_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let vote_hash = Hash::from_bytes(&[7; 32]);
+
+        // Session 1: write a block and a vote
+        {
+            let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+            let block = make_test_block(10);
+            let qc = make_test_qc(&block);
+            storage.put_block(BlockHeight(10), &block, &qc);
+            storage.put_own_vote(10, 3, vote_hash);
+        }
+
+        // Session 2: reopen and verify
+        {
+            let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
+
+            let (block, qc) = storage
+                .get_block(BlockHeight(10))
+                .expect("block should survive reopen");
+            assert_eq!(block.header.height, BlockHeight(10));
+            assert_eq!(qc.height, BlockHeight(10));
+
+            let vote = storage.get_own_vote(10);
+            assert_eq!(vote, Some((vote_hash, 3)), "vote should survive reopen");
+        }
     }
 }

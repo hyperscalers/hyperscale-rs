@@ -37,6 +37,9 @@ mod overlay;
 mod store;
 mod writes;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_helpers;
+
 pub use commit::{CommitResult, CommitStore};
 pub use consensus::ConsensusStore;
 pub use jmt_snapshot::{JmtSnapshot, LeafSubstateKeyAssociation};

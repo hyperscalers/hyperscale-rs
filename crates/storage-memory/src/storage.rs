@@ -828,7 +828,14 @@ impl SubstateDatabase for SimSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_storage::{NodeDatabaseUpdates, SubstateDatabase};
+    use hyperscale_storage::test_helpers::{
+        make_database_update, make_substate_write, make_test_block, make_test_certificate,
+        make_test_qc,
+    };
+    use hyperscale_storage::{
+        CommitStore, ConsensusStore, NodeDatabaseUpdates, SubstateDatabase, SubstateStore,
+    };
+    use hyperscale_types::{zero_bls_signature, Hash, NodeId, SignerBitfield, VotePower};
 
     #[test]
     fn test_basic_substate_operations() {
@@ -984,5 +991,479 @@ mod tests {
             "5 snapshots took {:?}, expected < 50ms",
             elapsed
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Consensus operations
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_block_storage_and_retrieval() {
+        let storage = SimStorage::new();
+        let block = make_test_block(42);
+        let qc = make_test_qc(&block);
+
+        assert!(storage.get_block(BlockHeight(42)).is_none());
+
+        storage.put_block(BlockHeight(42), &block, &qc);
+
+        let (stored_block, stored_qc) = storage.get_block(BlockHeight(42)).unwrap();
+        assert_eq!(stored_block.header.height, BlockHeight(42));
+        assert_eq!(stored_block.header.timestamp, 42_000);
+        assert_eq!(stored_qc.block_hash, block.hash());
+    }
+
+    #[test]
+    fn test_block_get_nonexistent() {
+        let storage = SimStorage::new();
+        assert!(storage.get_block(BlockHeight(999)).is_none());
+    }
+
+    #[test]
+    fn test_committed_state() {
+        let storage = SimStorage::new();
+        let hash = Hash::from_bytes(&[42; 32]);
+        let qc = QuorumCertificate {
+            block_hash: hash,
+            height: BlockHeight(10),
+            parent_block_hash: Hash::ZERO,
+            round: 3,
+            aggregated_signature: zero_bls_signature(),
+            signers: SignerBitfield::new(4),
+            voting_power: VotePower(4),
+            weighted_timestamp_ms: 10_000,
+        };
+
+        storage.set_committed_state(BlockHeight(10), hash, &qc);
+
+        assert_eq!(storage.committed_height(), BlockHeight(10));
+        assert_eq!(storage.committed_hash(), Some(hash));
+        let stored_qc = storage.latest_qc().unwrap();
+        assert_eq!(stored_qc.height, BlockHeight(10));
+        assert_eq!(stored_qc.round, 3);
+    }
+
+    #[test]
+    fn test_committed_height_default() {
+        let storage = SimStorage::new();
+        assert_eq!(storage.committed_height(), BlockHeight(0));
+        assert!(storage.committed_hash().is_none());
+        assert!(storage.latest_qc().is_none());
+    }
+
+    #[test]
+    fn test_certificate_store_and_retrieve() {
+        let storage = SimStorage::new();
+        let cert = make_test_certificate(1, ShardGroupId(0), vec![]);
+        let tx_hash = cert.transaction_hash;
+
+        storage.store_certificate(&cert);
+
+        let stored = storage.get_certificate(&tx_hash).unwrap();
+        assert_eq!(stored.transaction_hash, tx_hash);
+    }
+
+    #[test]
+    fn test_certificate_get_missing() {
+        let storage = SimStorage::new();
+        assert!(storage
+            .get_certificate(&Hash::from_bytes(&[99; 32]))
+            .is_none());
+    }
+
+    #[test]
+    fn test_vote_persistence() {
+        let storage = SimStorage::new();
+        let block_hash = Hash::from_bytes(&[1; 32]);
+
+        storage.put_own_vote(100, 5, block_hash);
+
+        let vote = storage.get_own_vote(100);
+        assert_eq!(vote, Some((block_hash, 5)));
+    }
+
+    #[test]
+    fn test_vote_get_missing() {
+        let storage = SimStorage::new();
+        assert!(storage.get_own_vote(100).is_none());
+    }
+
+    #[test]
+    fn test_vote_overwrite() {
+        let storage = SimStorage::new();
+        let hash_a = Hash::from_bytes(&[1; 32]);
+        let hash_b = Hash::from_bytes(&[2; 32]);
+
+        storage.put_own_vote(100, 0, hash_a);
+        assert_eq!(storage.get_own_vote(100), Some((hash_a, 0)));
+
+        storage.put_own_vote(100, 1, hash_b);
+        assert_eq!(storage.get_own_vote(100), Some((hash_b, 1)));
+
+        let all = storage.get_all_own_votes();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_vote_pruning() {
+        let storage = SimStorage::new();
+        let hash = Hash::from_bytes(&[1; 32]);
+
+        storage.put_own_vote(10, 0, hash);
+        storage.put_own_vote(20, 0, hash);
+        storage.put_own_vote(30, 0, hash);
+
+        storage.prune_own_votes(20);
+
+        assert!(storage.get_own_vote(10).is_none());
+        assert!(storage.get_own_vote(20).is_none());
+        assert!(storage.get_own_vote(30).is_some());
+    }
+
+    #[test]
+    fn test_get_all_own_votes() {
+        let storage = SimStorage::new();
+        let hash = Hash::from_bytes(&[1; 32]);
+
+        storage.put_own_vote(10, 0, hash);
+        storage.put_own_vote(20, 1, hash);
+
+        let all = storage.get_all_own_votes();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.get(&10), Some(&(hash, 0)));
+        assert_eq!(all.get(&20), Some(&(hash, 1)));
+    }
+
+    #[test]
+    fn test_get_block_for_sync() {
+        let storage = SimStorage::new();
+        let block = make_test_block(5);
+        let qc = make_test_qc(&block);
+        storage.put_block(BlockHeight(5), &block, &qc);
+
+        let result = storage.get_block_for_sync(BlockHeight(5));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0.header.height, BlockHeight(5));
+
+        assert!(storage.get_block_for_sync(BlockHeight(999)).is_none());
+    }
+
+    #[test]
+    fn test_transactions_batch_missing() {
+        let storage = SimStorage::new();
+        let result = storage.get_transactions_batch(&[Hash::from_bytes(&[1; 32])]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_transactions_batch_with_indexed_block() {
+        let storage = SimStorage::new();
+        let mut block = make_test_block(1);
+
+        let tx = Arc::new(hyperscale_types::test_utils::test_transaction(42));
+        let tx_hash = tx.hash();
+        block.transactions = vec![tx];
+
+        let qc = make_test_qc(&block);
+        storage.put_block(BlockHeight(1), &block, &qc);
+
+        let result = storage.get_transactions_batch(&[tx_hash]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].hash(), tx_hash);
+
+        // Missing hash still excluded
+        let missing = Hash::from_bytes(&[99; 32]);
+        let partial = storage.get_transactions_batch(&[tx_hash, missing]);
+        assert_eq!(partial.len(), 1);
+    }
+
+    #[test]
+    fn test_certificates_batch() {
+        let storage = SimStorage::new();
+        let cert1 = make_test_certificate(1, ShardGroupId(0), vec![]);
+        let cert2 = make_test_certificate(2, ShardGroupId(0), vec![]);
+        let hash1 = cert1.transaction_hash;
+        let hash2 = cert2.transaction_hash;
+
+        storage.store_certificate(&cert1);
+        storage.store_certificate(&cert2);
+
+        let result = storage.get_certificates_batch(&[hash1, hash2]);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_certificates_batch_partial() {
+        let storage = SimStorage::new();
+        let cert = make_test_certificate(1, ShardGroupId(0), vec![]);
+        let hash = cert.transaction_hash;
+        storage.store_certificate(&cert);
+
+        let missing = Hash::from_bytes(&[99; 32]);
+        let result = storage.get_certificates_batch(&[hash, missing]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].transaction_hash, hash);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // JMT state tracking
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_initial_state_version_is_zero() {
+        let storage = SimStorage::new();
+        assert_eq!(storage.state_version(), 0);
+    }
+
+    #[test]
+    fn test_initial_state_root_is_zero() {
+        let storage = SimStorage::new();
+        assert_eq!(storage.state_root_hash(), Hash::ZERO);
+    }
+
+    #[test]
+    fn test_state_version_increments_on_commit() {
+        let storage = SimStorage::new();
+        assert_eq!(storage.state_version(), 0);
+
+        storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
+        assert_eq!(storage.state_version(), 1);
+
+        storage.commit_shared(&make_database_update(vec![4, 5, 6], 0, vec![20], vec![2]));
+        assert_eq!(storage.state_version(), 2);
+    }
+
+    #[test]
+    fn test_state_root_changes_on_commit() {
+        let storage = SimStorage::new();
+        let root0 = storage.state_root_hash();
+
+        storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
+        let root1 = storage.state_root_hash();
+        assert_ne!(root0, root1, "root should change after first commit");
+
+        storage.commit_shared(&make_database_update(vec![4, 5, 6], 0, vec![20], vec![2]));
+        let root2 = storage.state_root_hash();
+        assert_ne!(root1, root2, "root should change after second commit");
+    }
+
+    #[test]
+    fn test_state_root_deterministic() {
+        // Two storage instances with identical commits should have identical roots
+        let s1 = SimStorage::new();
+        let s2 = SimStorage::new();
+
+        let updates = make_database_update(vec![1, 2, 3], 0, vec![10], vec![42]);
+        s1.commit_shared(&updates);
+        s2.commit_shared(&updates);
+
+        assert_eq!(s1.state_root_hash(), s2.state_root_hash());
+        assert_eq!(s1.state_version(), s2.state_version());
+    }
+
+    #[test]
+    fn test_state_root_differs_for_different_data() {
+        let s1 = SimStorage::new();
+        let s2 = SimStorage::new();
+
+        s1.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
+        s2.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![2]));
+
+        assert_ne!(s1.state_root_hash(), s2.state_root_hash());
+    }
+
+    #[test]
+    fn test_empty_commit_still_advances_version() {
+        let storage = SimStorage::new();
+        let updates = DatabaseUpdates::default();
+        storage.commit_shared(&updates);
+        assert_eq!(storage.state_version(), 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CommitStore
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_commit_block_single_cert() {
+        let storage = SimStorage::new();
+        let shard = ShardGroupId(0);
+        let writes = vec![make_substate_write(1, 0, vec![10], vec![42])];
+        let cert = Arc::new(make_test_certificate(1, shard, writes));
+
+        let result = storage.commit_block(&[cert], shard);
+        assert_eq!(result.state_version, 1);
+        assert_ne!(result.state_root, Hash::ZERO);
+    }
+
+    #[test]
+    fn test_commit_block_multiple_certs() {
+        let storage = SimStorage::new();
+        let shard = ShardGroupId(0);
+        let cert1 = Arc::new(make_test_certificate(
+            1,
+            shard,
+            vec![make_substate_write(1, 0, vec![10], vec![1])],
+        ));
+        let cert2 = Arc::new(make_test_certificate(
+            2,
+            shard,
+            vec![make_substate_write(2, 0, vec![20], vec![2])],
+        ));
+
+        let result = storage.commit_block(&[cert1, cert2], shard);
+        // Two certificates = two JMT versions
+        assert_eq!(result.state_version, 2);
+    }
+
+    #[test]
+    fn test_commit_block_empty_certs() {
+        let storage = SimStorage::new();
+        let result = storage.commit_block(&[], ShardGroupId(0));
+        assert_eq!(result.state_version, 0);
+        assert_eq!(result.state_root, Hash::ZERO);
+    }
+
+    #[test]
+    fn test_prepare_then_commit_fast_path() {
+        // Two identical storage instances: one uses prepare+commit, other uses commit_block.
+        // Both should produce the same result.
+        let s_prepared = SimStorage::new();
+        let s_direct = SimStorage::new();
+        let shard = ShardGroupId(0);
+        let writes = vec![make_substate_write(1, 0, vec![10], vec![42])];
+        let cert = Arc::new(make_test_certificate(1, shard, writes));
+
+        // Prepare path
+        let parent_root = s_prepared.state_root_hash();
+        let (spec_root, prepared) =
+            s_prepared.prepare_block_commit(parent_root, &[cert.clone()], shard);
+        let result_prepared = s_prepared.commit_prepared_block(prepared);
+
+        // Direct path
+        let result_direct = s_direct.commit_block(&[cert], shard);
+
+        assert_eq!(result_prepared.state_version, result_direct.state_version);
+        assert_eq!(result_prepared.state_root, result_direct.state_root);
+        assert_eq!(spec_root, result_prepared.state_root);
+    }
+
+    #[test]
+    fn test_prepare_commit_state_root_matches() {
+        let storage = SimStorage::new();
+        let shard = ShardGroupId(0);
+        let cert = Arc::new(make_test_certificate(
+            1,
+            shard,
+            vec![make_substate_write(1, 0, vec![10], vec![42])],
+        ));
+
+        let parent_root = storage.state_root_hash();
+        let (spec_root, prepared) = storage.prepare_block_commit(parent_root, &[cert], shard);
+        let result = storage.commit_prepared_block(prepared);
+
+        assert_eq!(spec_root, result.state_root);
+    }
+
+    #[test]
+    fn test_commit_certificate_individual() {
+        let storage = SimStorage::new();
+        let writes = vec![make_substate_write(1, 0, vec![10], vec![42])];
+        let cert = make_test_certificate(1, ShardGroupId(0), writes.clone());
+
+        storage.commit_certificate(&cert, &writes);
+
+        assert_eq!(storage.state_version(), 1);
+        assert_ne!(storage.state_root_hash(), Hash::ZERO);
+        // Certificate should also be stored
+        assert!(storage.get_certificate(&cert.transaction_hash).is_some());
+    }
+
+    #[test]
+    fn test_commit_block_stores_certificates() {
+        let storage = SimStorage::new();
+        let shard = ShardGroupId(0);
+        let cert = Arc::new(make_test_certificate(
+            1,
+            shard,
+            vec![make_substate_write(1, 0, vec![10], vec![42])],
+        ));
+        let tx_hash = cert.transaction_hash;
+
+        let _ = storage.commit_block(&[cert], shard);
+
+        assert!(storage.get_certificate(&tx_hash).is_some());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Utility methods
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_clear() {
+        let mut storage = SimStorage::new();
+
+        // Add some data
+        storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
+        let hash = Hash::from_bytes(&[1; 32]);
+        storage.put_own_vote(10, 0, hash);
+        assert!(storage.state_version() > 0);
+        assert!(!storage.is_empty());
+
+        storage.clear();
+
+        assert_eq!(storage.state_version(), 0);
+        assert_eq!(storage.state_root_hash(), Hash::ZERO);
+        assert!(storage.is_empty());
+        assert!(storage.get_own_vote(10).is_none());
+    }
+
+    #[test]
+    fn test_len_and_is_empty() {
+        let storage = SimStorage::new();
+        assert!(storage.is_empty());
+        assert_eq!(storage.len(), 0);
+
+        storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
+        assert!(!storage.is_empty());
+        assert_eq!(storage.len(), 1);
+
+        storage.commit_shared(&make_database_update(vec![4, 5, 6], 0, vec![20], vec![2]));
+        assert_eq!(storage.len(), 2);
+    }
+
+    #[test]
+    fn test_list_substates_for_node() {
+        let storage = SimStorage::new();
+        let node_id = NodeId([1; 30]);
+
+        // Commit two substates for the same node
+        let write1 = make_substate_write(1, 0, vec![10], vec![100]);
+        let write2 = make_substate_write(1, 0, vec![20], vec![200]);
+        let cert = make_test_certificate(1, ShardGroupId(0), vec![write1, write2]);
+        storage.commit_certificate(
+            &cert,
+            &cert
+                .shard_proofs
+                .get(&ShardGroupId(0))
+                .unwrap()
+                .state_writes,
+        );
+
+        let substates: Vec<_> = storage.list_substates_for_node(&node_id).collect();
+        assert_eq!(substates.len(), 2, "should find exactly 2 substates");
+
+        // Verify actual values
+        let values: Vec<&Vec<u8>> = substates.iter().map(|(_, _, v)| v).collect();
+        assert!(values.contains(&&vec![100u8]), "should contain first value");
+        assert!(
+            values.contains(&&vec![200u8]),
+            "should contain second value"
+        );
+
+        // Different node should have no substates
+        let other_node = NodeId([99; 30]);
+        let other_substates: Vec<_> = storage.list_substates_for_node(&other_node).collect();
+        assert!(other_substates.is_empty());
     }
 }

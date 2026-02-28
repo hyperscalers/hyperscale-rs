@@ -16,4 +16,7 @@ radix-substate-store-impls.workspace = true
 # Key encoding
 indexmap.workspace = true
 
+[features]
+test-utils = []
+
 [dev-dependencies]

@@ -16,4 +16,5 @@ tracing.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+hyperscale-storage = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
