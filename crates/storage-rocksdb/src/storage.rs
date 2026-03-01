@@ -2816,6 +2816,7 @@ mod tests {
             let storage = RocksDbStorage::open(temp_dir.path()).unwrap();
             let qc = QuorumCertificate {
                 block_hash: expected_hash,
+                shard_group_id: ShardGroupId(0),
                 height: BlockHeight(100),
                 parent_block_hash: Hash::from_bytes(&[98; 32]),
                 round: 5,

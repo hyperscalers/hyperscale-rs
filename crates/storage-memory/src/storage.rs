@@ -1025,6 +1025,7 @@ mod tests {
         let hash = Hash::from_bytes(&[42; 32]);
         let qc = QuorumCertificate {
             block_hash: hash,
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(10),
             parent_block_hash: Hash::ZERO,
             round: 3,

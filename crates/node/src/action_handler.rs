@@ -89,20 +89,20 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
         // --- BFT crypto verification ---
         Action::VerifyAndBuildQuorumCertificate {
             block_hash,
+            shard_group_id,
             height,
             round,
             parent_block_hash,
-            signing_message,
             votes_to_verify,
             verified_votes,
             total_voting_power,
         } => {
             let result = hyperscale_bft::handlers::verify_and_build_qc(
                 block_hash,
+                shard_group_id,
                 height,
                 round,
                 parent_block_hash,
-                &signing_message,
                 votes_to_verify,
                 verified_votes,
                 total_voting_power,
@@ -123,10 +123,8 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             qc,
             public_keys,
             block_hash,
-            signing_message,
         } => {
-            let valid =
-                hyperscale_bft::handlers::verify_qc_signature(&qc, &public_keys, &signing_message);
+            let valid = hyperscale_bft::handlers::verify_qc_signature(&qc, &public_keys);
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(ProtocolEvent::QcSignatureVerified {
                     block_hash,

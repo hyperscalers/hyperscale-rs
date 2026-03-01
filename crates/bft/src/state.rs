@@ -1919,20 +1919,11 @@ impl BftState {
                 },
             );
 
-            // Construct signing message with domain separation
-            let signing_message = hyperscale_types::block_vote_message(
-                self.shard_group,
-                header.parent_qc.height.0,
-                header.parent_qc.round,
-                &header.parent_qc.block_hash,
-            );
-
             // Delegate verification to runner
             return vec![Action::VerifyQcSignature {
                 qc: header.parent_qc.clone(),
                 public_keys,
                 block_hash,
-                signing_message,
             }];
         }
 
@@ -2725,16 +2716,12 @@ impl BftState {
             "Triggering batch vote verification (quorum possible)"
         );
 
-        // Construct signing message with domain separation
-        let signing_message =
-            hyperscale_types::block_vote_message(self.shard_group, height.0, round, &block_hash);
-
         vec![Action::VerifyAndBuildQuorumCertificate {
             block_hash,
+            shard_group_id: self.shard_group,
             height,
             round,
             parent_block_hash,
-            signing_message,
             votes_to_verify,
             verified_votes,
             total_voting_power: total_power,
@@ -4016,20 +4003,11 @@ impl BftState {
             },
         );
 
-        // Construct signing message with domain separation
-        let signing_message = hyperscale_types::block_vote_message(
-            self.shard_group,
-            qc.height.0,
-            qc.round,
-            &qc.block_hash,
-        );
-
         // Delegate verification to runner
         vec![Action::VerifyQcSignature {
             qc,
             public_keys,
             block_hash,
-            signing_message,
         }]
     }
 
@@ -5528,6 +5506,7 @@ mod tests {
 
         let parent_qc = QuorumCertificate {
             block_hash: parent_hash,
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
             round: 0,
@@ -5614,6 +5593,7 @@ mod tests {
 
         let parent_qc = QuorumCertificate {
             block_hash: parent_hash,
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
             round: 0,
@@ -5704,6 +5684,7 @@ mod tests {
 
         let parent_qc = QuorumCertificate {
             block_hash: parent_hash,
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
             round: 0,
@@ -5926,6 +5907,7 @@ mod tests {
         // Receive QC at height 2 - should unlock heights 1 and 2
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"qc_block"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(2),
             parent_block_hash: Hash::from_bytes(b"parent"),
             round: 0,
@@ -5961,6 +5943,7 @@ mod tests {
         // Receive QC formed at round 10 - should advance view to 10
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"qc_block"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(2),
             parent_block_hash: Hash::from_bytes(b"parent"),
             round: 10,
@@ -5985,6 +5968,7 @@ mod tests {
         // Receive QC formed at round 10 - should NOT regress view
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"qc_block"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(2),
             parent_block_hash: Hash::from_bytes(b"parent"),
             round: 10,
@@ -6947,6 +6931,7 @@ mod tests {
         let qc_block = Hash::from_bytes(b"qc_block_at_1");
         let qc = QuorumCertificate {
             block_hash: qc_block,
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
             round: 0,
@@ -7005,6 +6990,7 @@ mod tests {
         // Now receive a QC at height 2 (maybe from a different validator's proposal)
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"qc_block_2"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(2),
             parent_block_hash: Hash::from_bytes(b"parent_1"),
             round: 3, // Different round from our votes
@@ -7048,6 +7034,7 @@ mod tests {
         // QC forms for block B (different block at same height)
         let qc = QuorumCertificate {
             block_hash: block_b, // Different from our vote!
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_block_hash: Hash::from_bytes(b"parent"),
             round: 0,
@@ -7312,6 +7299,7 @@ mod tests {
         // QC at height 1 should only unlock height 1
         let qc_h1 = QuorumCertificate {
             block_hash: block_h1,
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
             round: 0,
@@ -7585,6 +7573,7 @@ mod tests {
         // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
@@ -7626,6 +7615,7 @@ mod tests {
         // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
@@ -7710,6 +7700,7 @@ mod tests {
 
         let parent_qc = QuorumCertificate {
             block_hash: parent_hash,
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
             round: 0,
@@ -8165,6 +8156,7 @@ mod tests {
         // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
@@ -8217,6 +8209,7 @@ mod tests {
         // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
@@ -8297,6 +8290,7 @@ mod tests {
 
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
@@ -8371,6 +8365,7 @@ mod tests {
 
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
@@ -8425,6 +8420,7 @@ mod tests {
         // We need to set up a QC so that the next height is 4 (validator 0's turn).
         let parent_qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
@@ -8524,12 +8520,7 @@ mod tests {
         );
 
         // Build the signing message as the runner would
-        let signing_message = hyperscale_types::block_vote_message(
-            ShardGroupId(0),
-            qc.height.0,
-            qc.round,
-            &qc.block_hash,
-        );
+        let signing_message = qc.signing_message();
 
         // Get signer public keys based on bitfield
         let signer_keys: Vec<_> = qc
@@ -8578,7 +8569,7 @@ mod tests {
         );
 
         // Verify the signature manually
-        let message = hyperscale_types::block_vote_message(shard, 1, 0, &block_hash);
+        let message = vote.signing_message();
         let valid = verify_bls12381_v1(&message, committee.public_key(0), &vote.signature);
         assert!(valid, "Block vote signature should verify");
 
@@ -8696,6 +8687,7 @@ mod tests {
         // Set up a QC so we propose for height 4 (validator 0's turn: (4+0)%4=0)
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
@@ -8773,6 +8765,7 @@ mod tests {
         let old_timestamp = 1000u64;
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
@@ -8973,6 +8966,7 @@ mod tests {
         // Set up latest_qc so check_sync_health has a target
         state.latest_qc = Some(QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_5"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(5),
             parent_block_hash: Hash::from_bytes(b"block_4"),
             round: 0,
@@ -9029,6 +9023,7 @@ mod tests {
 
         let qc = QuorumCertificate {
             block_hash: block.hash(),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: Hash::ZERO,
             round: 0,
@@ -9058,6 +9053,7 @@ mod tests {
         // Set up QC so we're the proposer for height 4
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
@@ -9098,6 +9094,7 @@ mod tests {
         let parent_timestamp = 50_000u64;
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,
@@ -9176,6 +9173,7 @@ mod tests {
         // Set up initial QC
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
             parent_block_hash: Hash::from_bytes(b"block_2"),
             round: 0,

@@ -35,14 +35,16 @@ pub struct QcVerificationResult {
 #[allow(clippy::too_many_arguments)]
 pub fn verify_and_build_qc(
     block_hash: Hash,
+    shard_group_id: ShardGroupId,
     height: BlockHeight,
     round: u64,
     parent_block_hash: Hash,
-    signing_message: &[u8],
     votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, u64)>,
     already_verified: Vec<(usize, BlockVote, u64)>,
     total_voting_power: u64,
 ) -> QcVerificationResult {
+    let signing_message =
+        hyperscale_types::block_vote_message(shard_group_id, height.0, round, &block_hash);
     // Start with already-verified votes (e.g., our own vote)
     let mut all_verified: Vec<(usize, BlockVote, u64)> = already_verified;
     let mut all_signatures: Vec<Bls12381G2Signature> =
@@ -60,7 +62,7 @@ pub fn verify_and_build_qc(
     let batch_valid = if votes_to_verify.is_empty() {
         true
     } else {
-        batch_verify_bls_same_message(signing_message, &signatures, &public_keys)
+        batch_verify_bls_same_message(&signing_message, &signatures, &public_keys)
     };
 
     if batch_valid {
@@ -78,7 +80,7 @@ pub fn verify_and_build_qc(
         );
 
         for (idx, vote, pk, power) in &votes_to_verify {
-            if verify_bls12381_v1(signing_message, pk, &vote.signature) {
+            if verify_bls12381_v1(&signing_message, pk, &vote.signature) {
                 all_signatures.push(vote.signature);
                 all_verified.push((*idx, vote.clone(), *power));
             } else {
@@ -124,6 +126,7 @@ pub fn verify_and_build_qc(
 
                 Some(QuorumCertificate {
                     block_hash,
+                    shard_group_id,
                     height,
                     parent_block_hash,
                     round,
@@ -160,11 +163,8 @@ pub fn verify_and_build_qc(
 ///
 /// Filters public keys by the QC's signer bitfield, aggregates the filtered
 /// keys, and verifies the aggregated signature against the signing message.
-pub fn verify_qc_signature(
-    qc: &QuorumCertificate,
-    public_keys: &[Bls12381G1PublicKey],
-    signing_message: &[u8],
-) -> bool {
+pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1PublicKey]) -> bool {
+    let signing_message = qc.signing_message();
     // Get signer keys based on QC's signer bitfield
     let signer_keys: Vec<_> = public_keys
         .iter()
@@ -181,7 +181,7 @@ pub fn verify_qc_signature(
     // Aggregate the public keys and verify (skip PK validation - trusted topology)
     match Bls12381G1PublicKey::aggregate(&signer_keys, false) {
         Ok(aggregated_pk) => {
-            verify_bls12381_v1(signing_message, &aggregated_pk, &qc.aggregated_signature)
+            verify_bls12381_v1(&signing_message, &aggregated_pk, &qc.aggregated_signature)
         }
         Err(_) => false,
     }

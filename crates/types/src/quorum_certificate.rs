@@ -1,7 +1,8 @@
 //! Quorum certificate for BFT consensus.
 
 use crate::{
-    zero_bls_signature, BlockHeight, Bls12381G2Signature, Hash, SignerBitfield, VotePower,
+    block_vote_message, zero_bls_signature, BlockHeight, Bls12381G2Signature, Hash, ShardGroupId,
+    SignerBitfield, VotePower,
 };
 use sbor::prelude::*;
 
@@ -12,6 +13,9 @@ use sbor::prelude::*;
 pub struct QuorumCertificate {
     /// Hash of the block this QC certifies.
     pub block_hash: Hash,
+
+    /// Shard group this QC belongs to (prevents cross-shard replay).
+    pub shard_group_id: ShardGroupId,
 
     /// Height of the certified block.
     pub height: BlockHeight,
@@ -43,6 +47,7 @@ impl QuorumCertificate {
     pub fn genesis() -> Self {
         Self {
             block_hash: Hash::ZERO,
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(0),
             parent_block_hash: Hash::ZERO,
             round: 0,
@@ -51,6 +56,19 @@ impl QuorumCertificate {
             voting_power: VotePower(0),
             weighted_timestamp_ms: 0,
         }
+    }
+
+    /// Build the canonical signing message for this QC.
+    ///
+    /// Uses `DOMAIN_BLOCK_VOTE` tag for domain separation.
+    /// This is the same message used for individual block vote verification.
+    pub fn signing_message(&self) -> Vec<u8> {
+        block_vote_message(
+            self.shard_group_id,
+            self.height.0,
+            self.round,
+            &self.block_hash,
+        )
     }
 
     /// Check if this is a genesis QC.
@@ -125,6 +143,7 @@ mod tests {
         let parent_hash = Hash::from_bytes(b"parent");
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block1"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_block_hash: parent_hash,
             round: 0,

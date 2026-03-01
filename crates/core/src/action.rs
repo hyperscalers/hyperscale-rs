@@ -129,15 +129,14 @@ pub enum Action {
     VerifyAndBuildQuorumCertificate {
         /// Block hash the QC would be for.
         block_hash: Hash,
+        /// Shard group this QC belongs to.
+        shard_group_id: ShardGroupId,
         /// Block height.
         height: BlockHeight,
         /// Round number.
         round: u64,
         /// Parent block hash (from the block's header).
         parent_block_hash: Hash,
-        /// The signing message (domain_tag || shard_group || height || round || block_hash).
-        /// Pre-computed by state machine since it has the shard_group context.
-        signing_message: Vec<u8>,
         /// Votes to verify and potentially aggregate.
         /// Each tuple is (committee_index, vote, public_key, voting_power).
         votes_to_verify: Vec<(usize, BlockVote, Bls12381G1PublicKey, u64)>,
@@ -237,16 +236,13 @@ pub enum Action {
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::QcSignatureVerified` when complete.
     VerifyQcSignature {
-        /// The QC to verify.
+        /// The QC to verify (carries shard_group_id for self-contained verification).
         qc: QuorumCertificate,
         /// Public keys of the signers (pre-resolved by state machine from QC's signer bitfield).
         public_keys: Vec<Bls12381G1PublicKey>,
         /// The block hash this QC verification is associated with (for correlation).
         /// This is the hash of the block whose header contains this QC as parent_qc.
         block_hash: Hash,
-        /// The signing message (domain_tag || shard_group || height || round || qc.block_hash).
-        /// Pre-computed by state machine since it has the shard_group context.
-        signing_message: Vec<u8>,
     },
 
     /// Verify a CycleProof's aggregated BLS signature.

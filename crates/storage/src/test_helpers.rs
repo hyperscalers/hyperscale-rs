@@ -143,6 +143,7 @@ pub fn make_multi_shard_certificate(
 pub fn make_test_qc(block: &Block) -> QuorumCertificate {
     QuorumCertificate {
         block_hash: block.hash(),
+        shard_group_id: ShardGroupId(0),
         height: block.header.height,
         parent_block_hash: block.header.parent_hash,
         round: 0,

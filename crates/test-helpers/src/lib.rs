@@ -26,7 +26,7 @@
 //!
 //! // The vote has a real BLS signature that can be verified
 //! let pk = committee.public_key(0);
-//! let msg = hyperscale_types::block_vote_message(ShardGroupId(0), 1, 0, &block_hash);
+//! let msg = vote.signing_message();
 //! assert!(verify_bls12381_v1(&msg, pk, &vote.signature));
 //! ```
 

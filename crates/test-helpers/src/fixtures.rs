@@ -79,7 +79,7 @@ pub fn make_signed_block_vote(
 /// );
 ///
 /// // Verify the aggregated signature
-/// let msg = hyperscale_types::block_vote_message(ShardGroupId(0), 1, 0, &qc.block_hash);
+/// let msg = qc.signing_message();
 /// let signer_keys: Vec<_> = [0, 1, 2].iter()
 ///     .map(|&i| *committee.public_key(i))
 ///     .collect();
@@ -125,6 +125,7 @@ pub fn make_signed_qc(
 
     QuorumCertificate {
         block_hash,
+        shard_group_id: shard,
         height,
         parent_block_hash: parent_hash,
         round,
@@ -252,8 +253,8 @@ pub fn verify_block_vote(vote: &BlockVote, public_key: &Bls12381G1PublicKey) -> 
 /// Verify a QC's aggregated signature.
 ///
 /// Aggregates the public keys of signers and verifies against the aggregated signature.
-pub fn verify_qc(qc: &QuorumCertificate, committee: &TestCommittee, shard: ShardGroupId) -> bool {
-    let message = block_vote_message(shard, qc.height.0, qc.round, &qc.block_hash);
+pub fn verify_qc(qc: &QuorumCertificate, committee: &TestCommittee) -> bool {
+    let message = qc.signing_message();
 
     // Collect signer public keys
     let signer_keys: Vec<Bls12381G1PublicKey> = qc
@@ -344,7 +345,7 @@ mod tests {
             shard,
         );
 
-        assert!(verify_qc(&qc, &committee, shard));
+        assert!(verify_qc(&qc, &committee));
         assert_eq!(qc.signer_count(), 3);
         assert_eq!(qc.voting_power.0, 3);
     }

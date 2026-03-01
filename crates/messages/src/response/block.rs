@@ -66,7 +66,7 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         test_utils::test_transaction, zero_bls_signature, BlockHeader, BlockHeight, Hash,
-        SignerBitfield, ValidatorId, VotePower,
+        ShardGroupId, SignerBitfield, ValidatorId, VotePower,
     };
 
     fn create_test_block() -> Block {
@@ -98,6 +98,7 @@ mod tests {
     fn create_test_qc(block: &Block) -> QuorumCertificate {
         QuorumCertificate {
             block_hash: block.hash(),
+            shard_group_id: ShardGroupId(0),
             height: block.header.height,
             parent_block_hash: block.header.parent_hash,
             round: block.header.round,

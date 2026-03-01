@@ -13,8 +13,8 @@ fn test_recovered_votes_prevent_equivocation() {
     use hyperscale_bft::{BftConfig, BftState};
     use hyperscale_types::{
         generate_bls_keypair, zero_bls_signature, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
-        QuorumCertificate, SignerBitfield, StaticTopology, ValidatorId, ValidatorInfo,
-        ValidatorSet, VotePower,
+        QuorumCertificate, ShardGroupId, SignerBitfield, StaticTopology, ValidatorId,
+        ValidatorInfo, ValidatorSet, VotePower,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -72,6 +72,7 @@ fn test_recovered_votes_prevent_equivocation() {
     let parent_hash = Hash::from_bytes(b"parent_at_4_aaaaaaaaaaaaaaa");
     let parent_qc = QuorumCertificate {
         block_hash: parent_hash,
+        shard_group_id: ShardGroupId(0),
         height: BlockHeight(4),
         parent_block_hash: Hash::from_bytes(b"grandparent_3_aaaaaaaaaaa"),
         round: 0,
@@ -229,8 +230,8 @@ fn test_chain_metadata_recovery() {
     use hyperscale_bft::{BftConfig, BftState};
     use hyperscale_types::{
         generate_bls_keypair, zero_bls_signature, BlockHeight, Bls12381G1PrivateKey,
-        QuorumCertificate, SignerBitfield, StaticTopology, ValidatorId, ValidatorInfo,
-        ValidatorSet, VotePower,
+        QuorumCertificate, ShardGroupId, SignerBitfield, StaticTopology, ValidatorId,
+        ValidatorInfo, ValidatorSet, VotePower,
     };
     use std::sync::Arc;
 
@@ -256,6 +257,7 @@ fn test_chain_metadata_recovery() {
 
     let latest_qc = QuorumCertificate {
         block_hash: committed_hash,
+        shard_group_id: ShardGroupId(0),
         height: BlockHeight(10),
         parent_block_hash: Hash::from_bytes(b"parent_block_hash_aaaaaaaa"),
         round: 0,

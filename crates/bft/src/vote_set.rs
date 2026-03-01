@@ -304,7 +304,11 @@ impl VoteSet {
     ///
     /// Returns error if called before reaching quorum or with no votes.
     #[cfg(test)]
-    pub fn build_qc(&mut self, block_hash: Hash) -> Result<QuorumCertificate, String> {
+    pub fn build_qc(
+        &mut self,
+        block_hash: Hash,
+        shard_group_id: hyperscale_types::ShardGroupId,
+    ) -> Result<QuorumCertificate, String> {
         use hyperscale_types::{Bls12381G2Signature, SignerBitfield};
 
         if self.verified_votes.is_empty() {
@@ -360,6 +364,7 @@ impl VoteSet {
 
         Ok(QuorumCertificate {
             block_hash,
+            shard_group_id,
             height,
             parent_block_hash,
             round,
@@ -493,13 +498,13 @@ mod tests {
         assert_eq!(vote_set.verified_power(), 3);
 
         // Build QC
-        let qc = vote_set.build_qc(block_hash).unwrap();
+        let qc = vote_set.build_qc(block_hash, test_shard_group()).unwrap();
         assert_eq!(qc.block_hash, block_hash);
         assert_eq!(qc.height.0, 1);
         assert_eq!(qc.voting_power.0, 3);
         assert_eq!(qc.signers.count(), 3);
 
         // Can't build again
-        assert!(vote_set.build_qc(block_hash).is_err());
+        assert!(vote_set.build_qc(block_hash, test_shard_group()).is_err());
     }
 }
