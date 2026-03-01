@@ -42,7 +42,7 @@ impl ShardMessage for BlockVoteGossip {}
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{zero_bls_signature, BlockHeight, Hash, ValidatorId};
+    use hyperscale_types::{zero_bls_signature, BlockHeight, Hash, ShardGroupId, ValidatorId};
 
     use super::*;
 
@@ -50,6 +50,7 @@ mod tests {
     fn test_block_vote_gossip_creation() {
         let vote = BlockVote {
             block_hash: Hash::from_bytes(b"block_hash"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(10),
             round: 0,
             voter: ValidatorId(2),
@@ -65,6 +66,7 @@ mod tests {
     fn test_block_vote_gossip_into_vote() {
         let vote = BlockVote {
             block_hash: Hash::from_bytes(b"test"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(5),
             round: 0,
             voter: ValidatorId(1),

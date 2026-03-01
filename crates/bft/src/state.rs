@@ -798,35 +798,6 @@ impl BftState {
         Some(self.advance_round())
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Signature Message Construction
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Create the message bytes to sign for a block vote.
-    ///
-    /// Includes domain separation to prevent cross-shard replay attacks:
-    /// - Domain tag ("BLOCK_VOTE")
-    /// - Shard group identifier
-    /// - Block height
-    /// - Round number
-    /// - Block hash
-    ///
-    /// This is a public method so the runner can use it for verification.
-    /// Uses the centralized `block_vote_message` from `hyperscale_types::signing`.
-    pub fn block_vote_message(
-        shard_group: ShardGroupId,
-        height: u64,
-        round: u64,
-        block_hash: &Hash,
-    ) -> Vec<u8> {
-        hyperscale_types::block_vote_message(shard_group, height, round, block_hash)
-    }
-
-    /// Get the shard group ID (needed for signing message construction).
-    pub fn shard_group(&self) -> ShardGroupId {
-        self.shard_group
-    }
-
     /// Initialize with genesis block (for fresh start).
     pub fn initialize_genesis(&mut self, genesis: Block) -> Vec<Action> {
         let hash = genesis.hash();
@@ -1949,7 +1920,7 @@ impl BftState {
             );
 
             // Construct signing message with domain separation
-            let signing_message = Self::block_vote_message(
+            let signing_message = hyperscale_types::block_vote_message(
                 self.shard_group,
                 header.parent_qc.height.0,
                 header.parent_qc.round,
@@ -2539,22 +2510,18 @@ impl BftState {
         // QC-based unlock (see `maybe_unlock_for_qc`).
         self.voted_heights.insert(height, (block_hash, round));
 
-        // Create signature with domain separation (prevents cross-shard replay)
-        let signing_message =
-            Self::block_vote_message(self.shard_group, height, round, &block_hash);
-        let sign_start = std::time::Instant::now();
-        let signature = self.signing_key.sign_v1(&signing_message);
-        tracing::Span::current().record("sign_us", sign_start.elapsed().as_micros() as u64);
         let timestamp = self.now.as_millis() as u64;
-
-        let vote = BlockVote {
+        let sign_start = std::time::Instant::now();
+        let vote = BlockVote::new(
             block_hash,
-            height: BlockHeight(height),
+            self.shard_group,
+            BlockHeight(height),
             round,
-            voter: self.validator_id(),
-            signature,
+            self.validator_id(),
+            &self.signing_key,
             timestamp,
-        };
+        );
+        tracing::Span::current().record("sign_us", sign_start.elapsed().as_micros() as u64);
 
         debug!(
             validator = ?self.validator_id(),
@@ -2760,7 +2727,7 @@ impl BftState {
 
         // Construct signing message with domain separation
         let signing_message =
-            Self::block_vote_message(self.shard_group, height.0, round, &block_hash);
+            hyperscale_types::block_vote_message(self.shard_group, height.0, round, &block_hash);
 
         vec![Action::VerifyAndBuildQuorumCertificate {
             block_hash,
@@ -4050,8 +4017,12 @@ impl BftState {
         );
 
         // Construct signing message with domain separation
-        let signing_message =
-            Self::block_vote_message(self.shard_group, qc.height.0, qc.round, &qc.block_hash);
+        let signing_message = hyperscale_types::block_vote_message(
+            self.shard_group,
+            qc.height.0,
+            qc.round,
+            &qc.block_hash,
+        );
 
         // Delegate verification to runner
         vec![Action::VerifyQcSignature {
@@ -6500,6 +6471,7 @@ mod tests {
         // First verified vote for block A - simulate on_qc_result recording it
         let vote_a = BlockVote {
             block_hash: block_a,
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             round,
             voter: byzantine_voter,
@@ -6525,6 +6497,7 @@ mod tests {
         // Second verified vote for DIFFERENT block at SAME height and round - equivocation!
         let vote_b = BlockVote {
             block_hash: block_b,
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             round,
             voter: byzantine_voter,
@@ -6563,6 +6536,7 @@ mod tests {
         // Vote for block A at round 0
         let vote_a = BlockVote {
             block_hash: block_a,
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             round: 0,
             voter,
@@ -6575,6 +6549,7 @@ mod tests {
         // Vote for DIFFERENT block at DIFFERENT round - this is allowed!
         let vote_b = BlockVote {
             block_hash: block_b,
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             round: 1, // Different round
             voter,
@@ -6608,6 +6583,7 @@ mod tests {
         // Vote for block at height 5
         let vote_h5 = BlockVote {
             block_hash: Hash::from_bytes(b"block_at_height_5"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(5),
             round,
             voter,
@@ -6620,6 +6596,7 @@ mod tests {
         // Vote for DIFFERENT block at height 6 - this is fine (different height)
         let vote_h6 = BlockVote {
             block_hash: Hash::from_bytes(b"different_block_at_height_6"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(6),
             round,
             voter,
@@ -6660,10 +6637,11 @@ mod tests {
         // Only the legitimate vote passes verification
         let legitimate_vote = BlockVote {
             block_hash: block_b,
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             round,
             voter: legitimate_voter,
-            signature: zero_bls_signature(), // In reality, this would have valid signature
+            signature: zero_bls_signature(),
             timestamp: 100_000,
         };
 
@@ -7484,18 +7462,21 @@ mod tests {
         };
         let block_hash_h6 = header_height6.hash();
 
+        let shard = ShardGroupId(0);
+
         // Create vote sets with accumulated verified votes
         let mut vote_set_r1 = VoteSet::new(Some(header_round1), 4);
         vote_set_r1.add_verified_vote(
             0,
-            BlockVote {
-                block_hash: block_hash_r1,
-                height: BlockHeight(height),
-                round: 1,
-                voter: ValidatorId(0),
-                signature: keys[0].sign_v1(block_hash_r1.as_bytes()),
-                timestamp: 100_000,
-            },
+            BlockVote::new(
+                block_hash_r1,
+                shard,
+                BlockHeight(height),
+                1,
+                ValidatorId(0),
+                &keys[0],
+                100_000,
+            ),
             1,
         );
         state.vote_sets.insert(block_hash_r1, vote_set_r1);
@@ -7503,14 +7484,15 @@ mod tests {
         let mut vote_set_r2 = VoteSet::new(Some(header_round2), 4);
         vote_set_r2.add_verified_vote(
             1,
-            BlockVote {
-                block_hash: block_hash_r2,
-                height: BlockHeight(height),
-                round: 2,
-                voter: ValidatorId(1),
-                signature: keys[1].sign_v1(block_hash_r2.as_bytes()),
-                timestamp: 100_001,
-            },
+            BlockVote::new(
+                block_hash_r2,
+                shard,
+                BlockHeight(height),
+                2,
+                ValidatorId(1),
+                &keys[1],
+                100_001,
+            ),
             1,
         );
         state.vote_sets.insert(block_hash_r2, vote_set_r2);
@@ -7518,14 +7500,15 @@ mod tests {
         let mut vote_set_r3 = VoteSet::new(Some(header_round3), 4);
         vote_set_r3.add_verified_vote(
             2,
-            BlockVote {
-                block_hash: block_hash_r3,
-                height: BlockHeight(height),
-                round: 3,
-                voter: ValidatorId(2),
-                signature: keys[2].sign_v1(block_hash_r3.as_bytes()),
-                timestamp: 100_002,
-            },
+            BlockVote::new(
+                block_hash_r3,
+                shard,
+                BlockHeight(height),
+                3,
+                ValidatorId(2),
+                &keys[2],
+                100_002,
+            ),
             1,
         );
         state.vote_sets.insert(block_hash_r3, vote_set_r3);
@@ -7533,14 +7516,15 @@ mod tests {
         let mut vote_set_h6 = VoteSet::new(Some(header_height6), 4);
         vote_set_h6.add_verified_vote(
             3,
-            BlockVote {
-                block_hash: block_hash_h6,
-                height: BlockHeight(6),
-                round: 0,
-                voter: ValidatorId(3),
-                signature: keys[3].sign_v1(block_hash_h6.as_bytes()),
-                timestamp: 100_003,
-            },
+            BlockVote::new(
+                block_hash_h6,
+                shard,
+                BlockHeight(6),
+                0,
+                ValidatorId(3),
+                &keys[3],
+                100_003,
+            ),
             1,
         );
         state.vote_sets.insert(block_hash_h6, vote_set_h6);

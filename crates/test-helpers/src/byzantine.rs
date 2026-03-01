@@ -28,6 +28,7 @@ pub fn make_wrong_key_block_vote(
 
     BlockVote {
         block_hash,
+        shard_group_id: shard,
         height,
         round,
         voter: committee.validator_id(claimed_voter_idx), // Claims to be this voter
@@ -55,6 +56,7 @@ pub fn make_wrong_message_block_vote(
 
     BlockVote {
         block_hash: claimed_block_hash, // Claims this block
+        shard_group_id: shard,
         height,
         round,
         voter: committee.validator_id(voter_idx),
@@ -102,9 +104,11 @@ pub fn make_garbage_signature_vote(
     block_hash: Hash,
     height: BlockHeight,
     round: u64,
+    shard: ShardGroupId,
 ) -> BlockVote {
     BlockVote {
         block_hash,
+        shard_group_id: shard,
         height,
         round,
         voter: committee.validator_id(voter_idx),
@@ -136,14 +140,10 @@ mod tests {
         );
 
         // Should NOT verify with claimed voter's key
-        assert!(!verify_block_vote(
-            &bad_vote,
-            committee.public_key(0),
-            shard
-        ));
+        assert!(!verify_block_vote(&bad_vote, committee.public_key(0)));
 
         // Would verify with actual signer's key (but voter ID wouldn't match)
-        assert!(verify_block_vote(&bad_vote, committee.public_key(1), shard));
+        assert!(verify_block_vote(&bad_vote, committee.public_key(1)));
     }
 
     #[test]
@@ -165,11 +165,7 @@ mod tests {
         );
 
         // Should NOT verify (message mismatch)
-        assert!(!verify_block_vote(
-            &bad_vote,
-            committee.public_key(0),
-            shard
-        ));
+        assert!(!verify_block_vote(&bad_vote, committee.public_key(0)));
     }
 
     #[test]
@@ -199,14 +195,11 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block");
         let shard = ShardGroupId(0);
 
-        let bad_vote = make_garbage_signature_vote(&committee, 0, block_hash, BlockHeight(1), 0);
+        let bad_vote =
+            make_garbage_signature_vote(&committee, 0, block_hash, BlockHeight(1), 0, shard);
 
         // Should NOT verify
-        assert!(!verify_block_vote(
-            &bad_vote,
-            committee.public_key(0),
-            shard
-        ));
+        assert!(!verify_block_vote(&bad_vote, committee.public_key(0)));
     }
 
     #[test]
@@ -219,10 +212,6 @@ mod tests {
         let valid_vote =
             make_signed_block_vote(&committee, 0, block_hash, BlockHeight(1), 0, shard);
 
-        assert!(verify_block_vote(
-            &valid_vote,
-            committee.public_key(0),
-            shard
-        ));
+        assert!(verify_block_vote(&valid_vote, committee.public_key(0)));
     }
 }

@@ -34,7 +34,7 @@ use hyperscale_types::{
 /// );
 ///
 /// // Verify the signature is valid
-/// let msg = hyperscale_types::block_vote_message(ShardGroupId(0), 1, 0, &vote.block_hash);
+/// let msg = vote.signing_message();
 /// assert!(verify_bls12381_v1(&msg, committee.public_key(0), &vote.signature));
 /// ```
 pub fn make_signed_block_vote(
@@ -45,17 +45,15 @@ pub fn make_signed_block_vote(
     round: u64,
     shard: ShardGroupId,
 ) -> BlockVote {
-    let message = block_vote_message(shard, height.0, round, &block_hash);
-    let signature = committee.keypair(voter_idx).sign_v1(&message);
-
-    BlockVote {
+    BlockVote::new(
         block_hash,
+        shard,
         height,
         round,
-        voter: committee.validator_id(voter_idx),
-        signature,
-        timestamp: 1000 + voter_idx as u64 * 100, // Deterministic timestamps
-    }
+        committee.validator_id(voter_idx),
+        committee.keypair(voter_idx),
+        1000 + voter_idx as u64 * 100, // Deterministic timestamps
+    )
 }
 
 /// Create a quorum certificate from signed votes.
@@ -246,12 +244,8 @@ pub fn make_signed_provision(
 /// Verify a block vote signature.
 ///
 /// Convenience function for tests.
-pub fn verify_block_vote(
-    vote: &BlockVote,
-    public_key: &Bls12381G1PublicKey,
-    shard: ShardGroupId,
-) -> bool {
-    let message = block_vote_message(shard, vote.height.0, vote.round, &vote.block_hash);
+pub fn verify_block_vote(vote: &BlockVote, public_key: &Bls12381G1PublicKey) -> bool {
+    let message = vote.signing_message();
     verify_bls12381_v1(&message, public_key, &vote.signature)
 }
 
@@ -327,10 +321,10 @@ mod tests {
         let vote = make_signed_block_vote(&committee, 0, block_hash, BlockHeight(1), 0, shard);
 
         // Should verify with correct key
-        assert!(verify_block_vote(&vote, committee.public_key(0), shard));
+        assert!(verify_block_vote(&vote, committee.public_key(0)));
 
         // Should not verify with wrong key
-        assert!(!verify_block_vote(&vote, committee.public_key(1), shard));
+        assert!(!verify_block_vote(&vote, committee.public_key(1)));
     }
 
     #[test]

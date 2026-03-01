@@ -404,20 +404,15 @@ mod tests {
         block_hash: Hash,
         height: u64,
     ) -> BlockVote {
-        // Use centralized domain-separated signing message
-        let shard_group = test_shard_group();
-        let round = 0u64;
-        let signing_message =
-            hyperscale_types::block_vote_message(shard_group, height, round, &block_hash);
-        let signature = keys[voter_index].sign_v1(&signing_message);
-        BlockVote {
+        BlockVote::new(
             block_hash,
-            height: BlockHeight(height),
-            round,
-            voter: ValidatorId(voter_index as u64),
-            signature,
-            timestamp: 1000000000000,
-        }
+            test_shard_group(),
+            BlockHeight(height),
+            0,
+            ValidatorId(voter_index as u64),
+            &keys[voter_index],
+            1000000000000,
+        )
     }
 
     #[test]

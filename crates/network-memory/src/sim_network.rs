@@ -173,12 +173,13 @@ impl Network for SimNetworkAdapter {
 mod tests {
     use super::*;
     use hyperscale_messages::BlockVoteGossip;
-    use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash};
+    use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash, ShardGroupId};
     use std::sync::Mutex as StdMutex;
 
     fn test_vote_gossip() -> BlockVoteGossip {
         BlockVoteGossip::new(BlockVote {
             block_hash: Hash::from_bytes(b"test"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             round: 0,
             voter: ValidatorId(0),

@@ -115,10 +115,13 @@ mod tests {
     #[test]
     fn test_encode_to_wire() {
         use hyperscale_messages::gossip::BlockVoteGossip;
-        use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash, ValidatorId};
+        use hyperscale_types::{
+            zero_bls_signature, BlockHeight, BlockVote, Hash, ShardGroupId, ValidatorId,
+        };
 
         let vote = BlockVote {
             block_hash: Hash::from_bytes(&[1u8; 32]),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             voter: ValidatorId(0),
             round: 0,

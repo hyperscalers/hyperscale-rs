@@ -83,10 +83,13 @@ mod tests {
     #[test]
     fn test_encode_decode_roundtrip_with_real_message() {
         use hyperscale_messages::BlockVoteGossip;
-        use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash, ValidatorId};
+        use hyperscale_types::{
+            zero_bls_signature, BlockHeight, BlockVote, Hash, ShardGroupId, ValidatorId,
+        };
 
         let gossip = BlockVoteGossip::new(BlockVote {
             block_hash: Hash::from_bytes(b"test_block"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(42),
             round: 1,
             voter: ValidatorId(7),

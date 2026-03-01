@@ -1160,7 +1160,7 @@ mod tests {
     #[test]
     fn test_full_gossip_roundtrip() {
         use hyperscale_messages::BlockVoteGossip;
-        use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash};
+        use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash, ShardGroupId};
 
         let network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 2,
@@ -1175,6 +1175,7 @@ mod tests {
         // Node 0 broadcasts a vote via its adapter
         let gossip = BlockVoteGossip::new(BlockVote {
             block_hash: Hash::from_bytes(b"test_block"),
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(42),
             round: 0,
             voter: ValidatorId(0),

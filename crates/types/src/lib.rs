@@ -86,39 +86,57 @@ pub use validator::{ValidatorInfo, ValidatorSet};
 /// Block vote for BFT consensus.
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub struct BlockVote {
-    /// Hash of the block being voted on
+    /// Hash of the block being voted on.
     pub block_hash: Hash,
-    /// Height of the block
+    /// Shard group this vote belongs to (prevents cross-shard replay).
+    pub shard_group_id: ShardGroupId,
+    /// Height of the block.
     pub height: BlockHeight,
-    /// Round number (for view change)
+    /// Round number (for view change).
     pub round: u64,
-    /// Validator who cast this vote
+    /// Validator who cast this vote.
     pub voter: ValidatorId,
-    /// Signature on the block hash (BLS for aggregatable consensus votes)
+    /// BLS signature over the domain-separated signing message.
     pub signature: Bls12381G2Signature,
-    /// Timestamp when this vote was created (milliseconds since epoch)
+    /// Timestamp when this vote was created (milliseconds since epoch).
     pub timestamp: u64,
 }
 
 impl BlockVote {
-    /// Create a new block vote.
+    /// Create a new block vote with domain-separated signing.
     pub fn new(
         block_hash: Hash,
+        shard_group_id: ShardGroupId,
         height: BlockHeight,
         round: u64,
         voter: ValidatorId,
         signing_key: &Bls12381G1PrivateKey,
         timestamp: u64,
     ) -> Self {
-        let signature = signing_key.sign_v1(block_hash.as_bytes());
+        let message = block_vote_message(shard_group_id, height.0, round, &block_hash);
+        let signature = signing_key.sign_v1(&message);
         Self {
             block_hash,
+            shard_group_id,
             height,
             round,
             voter,
             signature,
             timestamp,
         }
+    }
+
+    /// Build the canonical signing message for this vote.
+    ///
+    /// Uses `DOMAIN_BLOCK_VOTE` tag for domain separation.
+    /// This is the same message used for QC aggregated signature verification.
+    pub fn signing_message(&self) -> Vec<u8> {
+        block_vote_message(
+            self.shard_group_id,
+            self.height.0,
+            self.round,
+            &self.block_hash,
+        )
     }
 }
 
