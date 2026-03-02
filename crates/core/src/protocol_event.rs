@@ -131,7 +131,7 @@ pub enum ProtocolEvent {
     CrossShardTxRegistered {
         tx_hash: Hash,
         required_shards: std::collections::BTreeSet<ShardGroupId>,
-        quorum_thresholds: std::collections::HashMap<ShardGroupId, usize>,
+        quorum_thresholds: std::collections::HashMap<ShardGroupId, u64>,
         committed_height: BlockHeight,
     },
 

@@ -264,6 +264,8 @@ pub enum Action {
         public_keys: Vec<Bls12381G1PublicKey>,
         /// Signing message for verification.
         signing_message: Vec<u8>,
+        /// Total voting power of the signers (resolved from SignerBitfield + topology).
+        voting_power: u64,
         /// Quorum threshold for source shard.
         quorum_threshold: u64,
     },

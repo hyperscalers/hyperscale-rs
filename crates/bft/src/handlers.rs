@@ -190,11 +190,15 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
 ///
 /// Aggregates all provided public keys, verifies the signature from
 /// `cycle_proof.winner_commitment.aggregated_signature`, and checks that
-/// the signer count meets the quorum threshold.
+/// the signers' voting power meets the quorum threshold.
+///
+/// `voting_power` is the pre-computed total voting power of the signers
+/// (derived from the signer bitfield and the topology).
 pub fn verify_cycle_proof(
     cycle_proof: &CycleProof,
     public_keys: &[Bls12381G1PublicKey],
     signing_message: &[u8],
+    voting_power: u64,
     quorum_threshold: u64,
 ) -> bool {
     if public_keys.is_empty() {
@@ -211,8 +215,8 @@ pub fn verify_cycle_proof(
         Err(_) => false,
     };
 
-    // Also verify quorum threshold
-    sig_valid && cycle_proof.winner_commitment.signer_count() as u64 >= quorum_threshold
+    // Verify voting power meets quorum threshold
+    sig_valid && voting_power >= quorum_threshold
 }
 
 /// Verify that the computed transaction merkle root matches the expected root.

@@ -7,7 +7,7 @@
 //! ## Deferred Verification Optimization
 //!
 //! Provisions are NOT verified when received. Instead, they are buffered until
-//! we have enough for quorum (threshold count). At that point, we send a single
+//! we have enough for quorum (threshold voting power). At that point, we send a single
 //! `VerifyAndAggregateProvisions` action that:
 //! 1. Batch-verifies all signatures (faster than individual verification)
 //! 2. Aggregates valid signatures into a CommitmentProof
@@ -35,8 +35,8 @@ pub struct TxRegistration {
     /// Shards we need provisions from.
     pub required_shards: BTreeSet<ShardGroupId>,
 
-    /// Quorum threshold per shard (number of provisions needed).
-    pub quorum_thresholds: HashMap<ShardGroupId, usize>,
+    /// Quorum threshold per shard (minimum voting power needed).
+    pub quorum_thresholds: HashMap<ShardGroupId, u64>,
 
     /// Block height when registered (for potential timeout).
     pub registered_at: BlockHeight,
@@ -49,8 +49,8 @@ pub struct TxRegistration {
 ///
 /// Responsibilities:
 /// - Receive provisions from network
-/// - Buffer provisions until quorum count reached (deferred verification)
-/// - Batch verify + aggregate when quorum count reached
+/// - Buffer provisions until quorum voting power reached (deferred verification)
+/// - Batch verify + aggregate when quorum voting power reached
 /// - Track quorum per (tx, shard)
 /// - Notify consumers when provisions are verified/quorum reached
 ///
@@ -166,7 +166,7 @@ impl ProvisionCoordinator {
     /// Handle provision received from network.
     ///
     /// Buffers the provision until we have enough for quorum. Does NOT verify
-    /// until we have threshold count - this avoids wasting CPU on provisions
+    /// until we have threshold voting power - this avoids wasting CPU on provisions
     /// we'll never use.
     pub fn on_provision_received(&mut self, provision: StateProvision) -> Vec<Action> {
         let tx_hash = provision.transaction_hash;
@@ -188,7 +188,7 @@ impl ProvisionCoordinator {
         // based on the source shard's validator count.
         if !is_registered {
             // Auto-register remote TX with default quorum threshold for its source shard
-            let quorum = self.topology.quorum_threshold_for_shard(source_shard) as usize;
+            let quorum = self.topology.quorum_threshold_for_shard(source_shard);
 
             let mut required_shards = BTreeSet::new();
             required_shards.insert(source_shard);
@@ -293,21 +293,33 @@ impl ProvisionCoordinator {
             return vec![];
         }
 
-        // Count how many we already have verified + unverified
-        let verified_count = self
+        // Sum voting power of verified + unverified provisions
+        let verified_power: u64 = self
             .verified_provisions
             .get(&tx_hash)
             .and_then(|by_shard| by_shard.get(&source_shard))
-            .map(|p| p.len())
+            .map(|provisions| {
+                provisions
+                    .iter()
+                    .filter_map(|p| self.topology.voting_power(p.validator_id))
+                    .sum()
+            })
             .unwrap_or(0);
 
-        let unverified = self.unverified_provisions.get(&(tx_hash, source_shard));
+        let unverified_power: u64 = self
+            .unverified_provisions
+            .get(&(tx_hash, source_shard))
+            .map(|provisions| {
+                provisions
+                    .iter()
+                    .filter_map(|(p, _)| self.topology.voting_power(p.validator_id))
+                    .sum()
+            })
+            .unwrap_or(0);
 
-        let unverified_count = unverified.map(|p| p.len()).unwrap_or(0);
-
-        // Do we have enough total to possibly reach quorum?
-        let total_count = verified_count + unverified_count;
-        if total_count < threshold {
+        // Do we have enough total voting power to possibly reach quorum?
+        let total_power = verified_power + unverified_power;
+        if total_power < threshold {
             return vec![];
         }
 
@@ -683,14 +695,19 @@ impl ProvisionCoordinator {
             return false;
         };
 
-        let provision_count = self
+        let verified_power: u64 = self
             .verified_provisions
             .get(&tx_hash)
             .and_then(|by_shard| by_shard.get(&shard))
-            .map(|p| p.len())
+            .map(|provisions| {
+                provisions
+                    .iter()
+                    .filter_map(|p| self.topology.voting_power(p.validator_id))
+                    .sum()
+            })
             .unwrap_or(0);
 
-        provision_count >= threshold
+        verified_power >= threshold
     }
 
     /// Check if we already have quorum for a shard (already emitted quorum event).
@@ -882,7 +899,7 @@ mod tests {
         }
     }
 
-    fn make_registration(required_shards: Vec<ShardGroupId>, threshold: usize) -> TxRegistration {
+    fn make_registration(required_shards: Vec<ShardGroupId>, threshold: u64) -> TxRegistration {
         let quorum_thresholds = required_shards.iter().map(|s| (*s, threshold)).collect();
         TxRegistration {
             required_shards: required_shards.into_iter().collect(),

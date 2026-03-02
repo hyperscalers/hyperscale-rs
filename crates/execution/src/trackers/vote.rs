@@ -6,7 +6,7 @@
 //! ## Deferred Verification Optimization
 //!
 //! Votes are NOT verified when received. Instead, they are buffered until
-//! we have enough for quorum (threshold count). At that point, we send a single
+//! we have enough for quorum (threshold voting power). At that point, we send a single
 //! `VerifyAndAggregateExecutionVotes` action that batch-verifies all signatures.
 //!
 //! This avoids wasting CPU on votes we'll never use (e.g., if we only

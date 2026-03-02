@@ -996,7 +996,7 @@ impl BftState {
         let block_height = BlockHeight(next_height);
 
         // Set block_height on each deferral (proposer fills this in).
-        // Also filter out deferrals whose CycleProof doesn't have enough signers.
+        // Also filter out deferrals whose CycleProof doesn't have enough voting power.
         // This prevents proposing blocks that other validators would reject due to
         // insufficient quorum on the cycle proof.
         let deferred_with_height: Vec<TransactionDefer> = deferred
@@ -1004,13 +1004,14 @@ impl BftState {
             .filter(|d| {
                 let source_shard = d.proof.winner_source_shard();
                 let quorum_threshold = self.topology.quorum_threshold_for_shard(source_shard);
-                let signer_count = d.proof.winner_commitment.signer_count() as u64;
-                if signer_count < quorum_threshold {
+                let (_, voting_power) =
+                    self.resolve_commitment_proof_signers(&d.proof.winner_commitment, source_shard);
+                if voting_power < quorum_threshold {
                     trace!(
                         tx_hash = %d.tx_hash,
-                        signer_count = signer_count,
+                        voting_power = voting_power,
                         quorum_threshold = quorum_threshold,
-                        "Filtering deferral with insufficient CycleProof signers"
+                        "Filtering deferral with insufficient CycleProof voting power"
                     );
                     return false;
                 }
@@ -2096,8 +2097,8 @@ impl BftState {
                 let proof = &deferral.proof;
                 let source_shard = proof.winner_source_shard();
 
-                // Resolve public keys from signer bitfield
-                let public_keys =
+                // Resolve public keys and voting power from signer bitfield
+                let (public_keys, voting_power) =
                     self.resolve_commitment_proof_signers(&proof.winner_commitment, source_shard);
 
                 if public_keys.is_empty() {
@@ -2136,28 +2137,33 @@ impl BftState {
                     cycle_proof: proof.clone(),
                     public_keys,
                     signing_message,
+                    voting_power,
                     quorum_threshold,
                 }
             })
             .collect()
     }
 
-    /// Resolve public keys from a CommitmentProof's signer bitfield.
+    /// Resolve public keys and total voting power from a CommitmentProof's signer bitfield.
     fn resolve_commitment_proof_signers(
         &self,
         proof: &CommitmentProof,
         source_shard: ShardGroupId,
-    ) -> Vec<Bls12381G1PublicKey> {
+    ) -> (Vec<Bls12381G1PublicKey>, u64) {
         let committee = self.topology.committee_for_shard(source_shard);
-        proof
+        let mut voting_power = 0u64;
+        let public_keys = proof
             .signers
             .set_indices()
             .filter_map(|idx| {
-                committee
-                    .get(idx)
-                    .and_then(|vid| self.topology.public_key(*vid))
+                committee.get(idx).and_then(|&vid| {
+                    let pk = self.topology.public_key(vid)?;
+                    voting_power += self.voting_power(vid);
+                    Some(pk)
+                })
             })
-            .collect()
+            .collect();
+        (public_keys, voting_power)
     }
 
     /// Check if all async verifications are complete for a block.

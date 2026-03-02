@@ -389,14 +389,9 @@ impl ExecutionState {
         self.topology.shard_for_node_id(node_id)
     }
 
-    /// Get provisioning quorum for a shard.
-    fn provisioning_quorum_for_shard(&self, shard: ShardGroupId) -> usize {
-        let committee_size = self.topology.committee_size_for_shard(shard);
-        if committee_size == 0 {
-            1
-        } else {
-            (2 * committee_size + 1) / 3
-        }
+    /// Get provisioning quorum threshold (minimum voting power) for a shard.
+    fn provisioning_quorum_for_shard(&self, shard: ShardGroupId) -> u64 {
+        self.topology.quorum_threshold_for_shard(shard)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -629,8 +624,8 @@ impl ExecutionState {
             // but handle gracefully
             tracing::warn!(tx_hash = ?tx_hash, "Cross-shard tx with no remote shards");
         } else {
-            // Build quorum thresholds per shard
-            let quorum_thresholds: HashMap<ShardGroupId, usize> = remote_shards
+            // Build quorum thresholds per shard (voting power based)
+            let quorum_thresholds: HashMap<ShardGroupId, u64> = remote_shards
                 .iter()
                 .map(|&shard| (shard, self.provisioning_quorum_for_shard(shard)))
                 .collect();

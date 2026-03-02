@@ -140,12 +140,14 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             cycle_proof,
             public_keys,
             signing_message,
+            voting_power,
             quorum_threshold,
         } => {
             let valid = hyperscale_bft::handlers::verify_cycle_proof(
                 &cycle_proof,
                 &public_keys,
                 &signing_message,
+                voting_power,
                 quorum_threshold,
             );
             Some(DelegatedResult {
