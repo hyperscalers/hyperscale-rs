@@ -7,13 +7,13 @@
 //!
 //! Votes are NOT verified when received. Instead, they are buffered until
 //! we have enough for quorum (threshold count). At that point, we send a single
-//! `VerifyAndAggregateStateVotes` action that batch-verifies all signatures.
+//! `VerifyAndAggregateExecutionVotes` action that batch-verifies all signatures.
 //!
 //! This avoids wasting CPU on votes we'll never use (e.g., if we only
 //! receive 2 of 3 needed votes, we don't verify any).
 
 use hyperscale_types::{
-    Bls12381G1PublicKey, Hash, NodeId, ShardGroupId, StateVoteBlock, ValidatorId,
+    Bls12381G1PublicKey, ExecutionVote, Hash, NodeId, ShardGroupId, ValidatorId,
 };
 use std::collections::{BTreeMap, HashSet};
 use tracing::instrument;
@@ -41,7 +41,7 @@ pub struct VoteTracker {
     // Verified votes (passed signature verification)
     // ═══════════════════════════════════════════════════════════════════════
     /// Verified votes grouped by writes commitment.
-    votes_by_commitment: BTreeMap<Hash, Vec<StateVoteBlock>>,
+    votes_by_commitment: BTreeMap<Hash, Vec<ExecutionVote>>,
     /// Voting power per writes commitment (verified votes only).
     power_by_commitment: BTreeMap<Hash, u64>,
 
@@ -50,7 +50,7 @@ pub struct VoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
     /// Unverified votes buffered for batch verification.
     /// Each entry is (vote, public_key, voting_power).
-    unverified_votes: Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>,
+    unverified_votes: Vec<(ExecutionVote, Bls12381G1PublicKey, u64)>,
     /// Total voting power of unverified votes.
     unverified_power: u64,
     /// Validators we've already seen votes from (for deduplication).
@@ -112,7 +112,7 @@ impl VoteTracker {
     /// Returns `true` if the vote was buffered, `false` if it was a duplicate.
     pub fn buffer_unverified_vote(
         &mut self,
-        vote: StateVoteBlock,
+        vote: ExecutionVote,
         public_key: Bls12381G1PublicKey,
         voting_power: u64,
     ) -> bool {
@@ -157,7 +157,7 @@ impl VoteTracker {
     /// Take unverified votes for batch verification.
     ///
     /// Marks verification as pending. Call `on_verification_complete` when done.
-    pub fn take_unverified_votes(&mut self) -> Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)> {
+    pub fn take_unverified_votes(&mut self) -> Vec<(ExecutionVote, Bls12381G1PublicKey, u64)> {
         self.pending_verification = true;
         self.unverified_power = 0;
         std::mem::take(&mut self.unverified_votes)
@@ -187,7 +187,7 @@ impl VoteTracker {
         power = power,
         quorum = self.quorum,
     ))]
-    pub fn add_verified_vote(&mut self, vote: StateVoteBlock, power: u64) {
+    pub fn add_verified_vote(&mut self, vote: ExecutionVote, power: u64) {
         let commitment = vote.writes_commitment;
         self.votes_by_commitment
             .entry(commitment)
@@ -211,7 +211,7 @@ impl VoteTracker {
 
     /// Get votes for a specific writes commitment (reference).
     #[cfg(test)]
-    pub fn votes_for_commitment(&self, commitment: &Hash) -> &[StateVoteBlock] {
+    pub fn votes_for_commitment(&self, commitment: &Hash) -> &[ExecutionVote] {
         self.votes_by_commitment
             .get(commitment)
             .map(|v| v.as_slice())
@@ -219,7 +219,7 @@ impl VoteTracker {
     }
 
     /// Take votes for a specific writes commitment (ownership transfer, avoids clone).
-    pub fn take_votes_for_commitment(&mut self, commitment: &Hash) -> Vec<StateVoteBlock> {
+    pub fn take_votes_for_commitment(&mut self, commitment: &Hash) -> Vec<ExecutionVote> {
         self.votes_by_commitment
             .remove(commitment)
             .unwrap_or_default()
@@ -247,7 +247,7 @@ mod tests {
             3, // quorum = 3
         );
 
-        let vote = StateVoteBlock {
+        let vote = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
             writes_commitment: commitment,
@@ -283,7 +283,7 @@ mod tests {
 
         let mut tracker = VoteTracker::new(tx_hash, vec![ShardGroupId(0)], vec![], 3);
 
-        let vote_a = StateVoteBlock {
+        let vote_a = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
             writes_commitment: root_a,
@@ -293,7 +293,7 @@ mod tests {
             signature: zero_bls_signature(),
         };
 
-        let vote_b = StateVoteBlock {
+        let vote_b = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
             writes_commitment: root_b,
@@ -329,7 +329,7 @@ mod tests {
 
         let mut tracker = VoteTracker::new(tx_hash, vec![ShardGroupId(0)], vec![], 3);
 
-        let vote = StateVoteBlock {
+        let vote = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
             writes_commitment: commitment,
@@ -346,7 +346,7 @@ mod tests {
         assert!(!tracker.buffer_unverified_vote(vote.clone(), pk, 1));
 
         // Different validator should succeed
-        let vote2 = StateVoteBlock {
+        let vote2 = ExecutionVote {
             validator: ValidatorId(1),
             ..vote
         };
@@ -361,7 +361,7 @@ mod tests {
 
         let mut tracker = VoteTracker::new(tx_hash, vec![ShardGroupId(0)], vec![], 3);
 
-        let vote = StateVoteBlock {
+        let vote = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
             writes_commitment: commitment,
@@ -386,7 +386,7 @@ mod tests {
 
         // Buffer 3 votes with power 1 each - should trigger
         for i in 0..3 {
-            let vote = StateVoteBlock {
+            let vote = ExecutionVote {
                 transaction_hash: tx_hash,
                 shard_group_id: ShardGroupId(0),
                 writes_commitment: commitment,
@@ -411,7 +411,7 @@ mod tests {
 
         // Buffer votes
         for i in 0..3 {
-            let vote = StateVoteBlock {
+            let vote = ExecutionVote {
                 transaction_hash: tx_hash,
                 shard_group_id: ShardGroupId(0),
                 writes_commitment: commitment,
@@ -445,7 +445,7 @@ mod tests {
         let mut tracker = VoteTracker::new(tx_hash, vec![ShardGroupId(0)], vec![], 3);
 
         // Add 1 verified vote
-        let vote1 = StateVoteBlock {
+        let vote1 = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
             writes_commitment: commitment,
@@ -457,7 +457,7 @@ mod tests {
         tracker.add_verified_vote(vote1, 1);
 
         // 1 verified + 1 unverified = 2, not enough for quorum 3
-        let vote2 = StateVoteBlock {
+        let vote2 = ExecutionVote {
             validator: ValidatorId(1),
             ..tracker.votes_by_commitment.values().next().unwrap()[0].clone()
         };
@@ -465,7 +465,7 @@ mod tests {
         assert!(!tracker.should_trigger_verification());
 
         // Add another unverified - now 1 verified + 2 unverified = 3, should trigger
-        let vote3 = StateVoteBlock {
+        let vote3 = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
             writes_commitment: commitment,

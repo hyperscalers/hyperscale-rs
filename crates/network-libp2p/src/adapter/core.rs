@@ -290,8 +290,8 @@ impl Libp2pAdapter {
             Topic::transaction_gossip(shard),
             Topic::transaction_certificate(shard),
             Topic::state_provision_batch(shard),
-            Topic::state_vote_batch(shard),
-            Topic::state_certificate_batch(shard),
+            Topic::execution_vote_batch(shard),
+            Topic::execution_certificate_batch(shard),
         ];
 
         for topic in &topics {

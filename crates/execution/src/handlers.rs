@@ -16,31 +16,31 @@ use hyperscale_storage::SubstateStore;
 use hyperscale_types::{
     batch_verify_bls_different_messages, batch_verify_bls_same_message, exec_vote_message,
     verify_bls12381_v1, zero_bls_signature, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    Bls12381G2Signature, Hash, NodeId, RoutableTransaction, ShardGroupId, SignerBitfield,
-    StateCertificate, StateProvision, StateVoteBlock, Topology, ValidatorId, VotePower,
+    Bls12381G2Signature, ExecutionCertificate, ExecutionVote, Hash, NodeId, RoutableTransaction,
+    ShardGroupId, SignerBitfield, StateProvision, Topology, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// A state vote with its signer's public key and voting power, awaiting verification.
-pub type UnverifiedStateVote = (StateVoteBlock, Bls12381G1PublicKey, u64);
+/// An execution vote with its signer's public key and voting power, awaiting verification.
+pub type UnverifiedExecutionVote = (ExecutionVote, Bls12381G1PublicKey, u64);
 
-/// Aggregate verified state votes into a `StateCertificate`.
+/// Aggregate verified execution votes into an `ExecutionCertificate`.
 ///
 /// Deduplicates votes by validator, aggregates BLS signatures, builds a signer
 /// bitfield using the topology's committee indices, and extracts state_writes
 /// from the first vote.
 #[allow(clippy::too_many_arguments)]
-pub fn aggregate_state_certificate(
+pub fn aggregate_execution_certificate(
     tx_hash: Hash,
     shard: ShardGroupId,
     writes_commitment: Hash,
-    votes: &[StateVoteBlock],
+    votes: &[ExecutionVote],
     read_nodes: Vec<NodeId>,
     voting_power: VotePower,
     committee_size: usize,
     topology: &dyn Topology,
-) -> StateCertificate {
+) -> ExecutionCertificate {
     // Deduplicate votes by validator to avoid aggregating the same signature multiple times
     let mut seen_validators = std::collections::HashSet::new();
     let unique_votes: Vec<_> = votes
@@ -74,7 +74,7 @@ pub fn aggregate_state_certificate(
         .map(|v| v.state_writes.clone())
         .unwrap_or_default();
 
-    StateCertificate {
+    ExecutionCertificate {
         transaction_hash: tx_hash,
         shard_group_id: shard,
         read_nodes,
@@ -87,24 +87,24 @@ pub fn aggregate_state_certificate(
     }
 }
 
-/// Verify and aggregate state votes for a single transaction.
+/// Verify and aggregate execution votes for a single transaction.
 ///
 /// Groups votes by signing message (same `(tx_hash, writes_commitment, shard, success)`
 /// sign the same message), then uses BLS same-message batch verification for
 /// each group. Falls back to individual verification on batch failure.
 ///
-/// For cross-transaction batching, see [`batch_verify_and_aggregate_state_votes`]
+/// For cross-transaction batching, see [`batch_verify_and_aggregate_execution_votes`]
 /// which uses `batch_verify_bls_different_messages` across accumulated items.
-pub fn verify_and_aggregate_state_votes(
-    votes: Vec<UnverifiedStateVote>,
-) -> Vec<(StateVoteBlock, u64)> {
-    let mut by_message: HashMap<Vec<u8>, Vec<UnverifiedStateVote>> = HashMap::new();
+pub fn verify_and_aggregate_execution_votes(
+    votes: Vec<UnverifiedExecutionVote>,
+) -> Vec<(ExecutionVote, u64)> {
+    let mut by_message: HashMap<Vec<u8>, Vec<UnverifiedExecutionVote>> = HashMap::new();
     for (vote, pk, power) in votes {
         let msg = vote.signing_message();
         by_message.entry(msg).or_default().push((vote, pk, power));
     }
 
-    let mut verified_votes: Vec<(StateVoteBlock, u64)> = Vec::new();
+    let mut verified_votes: Vec<(ExecutionVote, u64)> = Vec::new();
 
     for (message, votes_for_root) in by_message {
         if votes_for_root.len() >= 2 {
@@ -140,13 +140,13 @@ pub fn verify_and_aggregate_state_votes(
     verified_votes
 }
 
-/// Verify a state certificate's aggregated BLS signature.
+/// Verify an execution certificate's aggregated BLS signature.
 ///
 /// Filters public keys by the certificate's signer bitfield, aggregates the
 /// filtered keys, and verifies the aggregated signature. Handles the zero
 /// signature case (single-shard / no signers).
-pub fn verify_state_certificate_signature(
-    certificate: &StateCertificate,
+pub fn verify_execution_certificate_signature(
+    certificate: &ExecutionCertificate,
     public_keys: &[Bls12381G1PublicKey],
 ) -> bool {
     let msg = certificate.signing_message();
@@ -173,19 +173,19 @@ pub fn verify_state_certificate_signature(
     }
 }
 
-/// Batch verify state votes across multiple transactions.
+/// Batch verify execution votes across multiple transactions.
 ///
 /// Collects all individual (message, signature, pubkey) triples across all
 /// tx_hashes and verifies them in ~2 pairing operations via
 /// [`batch_verify_bls_different_messages`]. Falls back to individual
 /// verification when the batch check fails (to identify which votes failed).
 ///
-/// For a single tx_hash, delegates to [`verify_and_aggregate_state_votes`]
+/// For a single tx_hash, delegates to [`verify_and_aggregate_execution_votes`]
 /// which applies same-message grouping (cheaper when many votes share a
 /// merkle root).
-pub fn batch_verify_and_aggregate_state_votes(
-    items: Vec<(Hash, Vec<UnverifiedStateVote>)>,
-) -> Vec<(Hash, Vec<(StateVoteBlock, u64)>)> {
+pub fn batch_verify_and_aggregate_execution_votes(
+    items: Vec<(Hash, Vec<UnverifiedExecutionVote>)>,
+) -> Vec<(Hash, Vec<(ExecutionVote, u64)>)> {
     if items.is_empty() {
         return Vec::new();
     }
@@ -193,7 +193,7 @@ pub fn batch_verify_and_aggregate_state_votes(
     // Single tx_hash — use the per-tx function which does same-message optimisation.
     if items.len() == 1 {
         let (tx_hash, votes) = items.into_iter().next().unwrap();
-        let verified = verify_and_aggregate_state_votes(votes);
+        let verified = verify_and_aggregate_execution_votes(votes);
         return vec![(tx_hash, verified)];
     }
 
@@ -202,7 +202,7 @@ pub fn batch_verify_and_aggregate_state_votes(
     let mut messages = Vec::with_capacity(total_votes);
     let mut signatures = Vec::with_capacity(total_votes);
     let mut pubkeys = Vec::with_capacity(total_votes);
-    let mut vote_data: Vec<(usize, StateVoteBlock, u64)> = Vec::with_capacity(total_votes);
+    let mut vote_data: Vec<(usize, ExecutionVote, u64)> = Vec::with_capacity(total_votes);
     let mut tx_hashes = Vec::with_capacity(items.len());
 
     for (tx_idx, (tx_hash, votes)) in items.into_iter().enumerate() {
@@ -221,7 +221,7 @@ pub fn batch_verify_and_aggregate_state_votes(
 
     // Reconstruct per-tx results.
     let num_items = tx_hashes.len();
-    let mut per_tx: Vec<Vec<(StateVoteBlock, u64)>> = (0..num_items).map(|_| Vec::new()).collect();
+    let mut per_tx: Vec<Vec<(ExecutionVote, u64)>> = (0..num_items).map(|_| Vec::new()).collect();
     for (valid, (tx_idx, vote, power)) in results.into_iter().zip(vote_data) {
         if valid {
             per_tx[tx_idx].push((vote, power));
@@ -231,7 +231,7 @@ pub fn batch_verify_and_aggregate_state_votes(
     tx_hashes.into_iter().zip(per_tx).collect()
 }
 
-/// Batch verify state certificate signatures.
+/// Batch verify execution certificate signatures.
 ///
 /// Pre-aggregates signer public keys per certificate (cheap), then verifies
 /// all aggregated signatures in ~2 pairing operations via
@@ -239,15 +239,18 @@ pub fn batch_verify_and_aggregate_state_votes(
 /// verification when the batch check fails.
 ///
 /// Certificates with no signers are handled inline (zero-signature check).
-pub fn batch_verify_state_certificate_signatures(
-    items: &[(StateCertificate, Vec<Bls12381G1PublicKey>)],
+pub fn batch_verify_execution_certificate_signatures(
+    items: &[(ExecutionCertificate, Vec<Bls12381G1PublicKey>)],
 ) -> Vec<bool> {
     if items.is_empty() {
         return Vec::new();
     }
 
     if items.len() == 1 {
-        return vec![verify_state_certificate_signature(&items[0].0, &items[0].1)];
+        return vec![verify_execution_certificate_signature(
+            &items[0].0,
+            &items[0].1,
+        )];
     }
 
     let mut results = vec![false; items.len()];
@@ -302,7 +305,7 @@ pub fn batch_verify_state_certificate_signatures(
 /// Calls `executor.execute_single_shard()` with the given transaction,
 /// then signs the execution result with the validator's private key.
 ///
-/// Returns a `StateVoteBlock` containing the execution result and signature.
+/// Returns an `ExecutionVote` containing the execution result and signature.
 pub fn execute_and_sign_single_shard<S: SubstateStore>(
     executor: &RadixExecutor,
     storage: &S,
@@ -310,7 +313,7 @@ pub fn execute_and_sign_single_shard<S: SubstateStore>(
     signing_key: &Bls12381G1PrivateKey,
     local_shard: ShardGroupId,
     validator_id: ValidatorId,
-) -> StateVoteBlock {
+) -> ExecutionVote {
     let (tx_hash, success, writes_commitment, state_writes) =
         match executor.execute_single_shard(storage, std::slice::from_ref(tx)) {
             Ok(output) => {
@@ -335,7 +338,7 @@ pub fn execute_and_sign_single_shard<S: SubstateStore>(
     let message = exec_vote_message(&tx_hash, &writes_commitment, local_shard, success);
     let signature = signing_key.sign_v1(&message);
 
-    StateVoteBlock {
+    ExecutionVote {
         transaction_hash: tx_hash,
         shard_group_id: local_shard,
         writes_commitment,
@@ -352,7 +355,7 @@ pub fn execute_and_sign_single_shard<S: SubstateStore>(
 /// using the topology to determine which nodes are local to this shard.
 /// Signs the execution result with the validator's private key.
 ///
-/// Returns a `StateVoteBlock` containing the execution result and signature.
+/// Returns an `ExecutionVote` containing the execution result and signature.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_and_sign_cross_shard<S: SubstateStore>(
     executor: &RadixExecutor,
@@ -364,7 +367,7 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
     local_shard: ShardGroupId,
     validator_id: ValidatorId,
     topology: &dyn Topology,
-) -> StateVoteBlock {
+) -> ExecutionVote {
     let is_local_node = |node_id: &hyperscale_types::NodeId| -> bool {
         topology.shard_for_node_id(node_id) == local_shard
     };
@@ -398,7 +401,7 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
     let message = exec_vote_message(&result_hash, &writes_commitment, local_shard, success);
     let signature = signing_key.sign_v1(&message);
 
-    StateVoteBlock {
+    ExecutionVote {
         transaction_hash: result_hash,
         shard_group_id: local_shard,
         writes_commitment,

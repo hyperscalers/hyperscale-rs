@@ -4,7 +4,9 @@
 //! delegated to the runner. When verification completes, the runner sends
 //! an event back and we look up the pending state to continue processing.
 
-use hyperscale_types::{BlockHeight, Hash, ShardGroupId, StateCertificate, TransactionCertificate};
+use hyperscale_types::{
+    BlockHeight, ExecutionCertificate, Hash, ShardGroupId, TransactionCertificate,
+};
 use std::collections::HashSet;
 
 /// Tracks a pending provision broadcast waiting for state fetch.
@@ -21,9 +23,9 @@ pub struct PendingProvisionBroadcast {
     pub target_shards: Vec<ShardGroupId>,
 }
 
-/// Tracks a pending state certificate signature verification.
+/// Tracks a pending execution certificate signature verification.
 ///
-/// When we receive a state certificate from another shard, we delegate
+/// When we receive an execution certificate from another shard, we delegate
 /// aggregated signature verification to the runner before accepting it.
 ///
 /// The certificate field is kept for debugging/diagnostics even though
@@ -32,13 +34,13 @@ pub struct PendingProvisionBroadcast {
 pub struct PendingCertificateVerification {
     /// The certificate awaiting verification (stored for diagnostics).
     #[allow(dead_code)]
-    pub certificate: StateCertificate,
+    pub certificate: ExecutionCertificate,
 }
 
 /// Tracks a fetched TransactionCertificate awaiting verification.
 ///
-/// A TransactionCertificate contains multiple StateCertificates (one per shard).
-/// We must verify each embedded StateCertificate's signature before using
+/// A TransactionCertificate contains multiple ExecutionCertificates (one per shard).
+/// We must verify each embedded ExecutionCertificate's signature before using
 /// the TransactionCertificate to complete a pending block.
 #[derive(Debug, Clone)]
 pub struct PendingFetchedCertificateVerification {
@@ -46,13 +48,13 @@ pub struct PendingFetchedCertificateVerification {
     pub certificate: TransactionCertificate,
     /// Block hash this certificate is needed for.
     pub block_hash: Hash,
-    /// Shards whose StateCertificates still need verification.
+    /// Shards whose ExecutionCertificates still need verification.
     pub pending_shards: HashSet<ShardGroupId>,
     /// Whether any shard verification has failed.
     pub has_failed: bool,
 }
 
-/// Tracks a pending state certificate BLS aggregation.
+/// Tracks a pending execution certificate BLS aggregation.
 ///
 /// When vote quorum is reached, we delegate BLS signature aggregation to
 /// the crypto pool. This struct stores the state needed to continue

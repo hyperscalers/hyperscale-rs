@@ -4,7 +4,7 @@
 //! priority-isolated rayon thread pools:
 //!
 //! - **Consensus Crypto**: Liveness-critical (block votes, QC verification)
-//! - **Crypto**: General signature verification (provisions, state votes)
+//! - **Crypto**: General signature verification (provisions, execution votes)
 //! - **TX Validation**: Transaction signature verification (isolated from crypto)
 //! - **Execution**: Radix Engine transaction execution
 //! - **Codec**: SBOR message encoding/decoding
@@ -59,17 +59,17 @@ pub enum ThreadPoolError {
 pub struct ThreadPoolConfig {
     /// Number of threads for consensus-critical crypto operations (block votes, QC verification).
     /// This is a dedicated high-priority pool that is never blocked by execution-layer
-    /// crypto work (provisions, state votes). Keeping this pool responsive is critical
+    /// crypto work (provisions, execution votes). Keeping this pool responsive is critical
     /// for consensus liveness - block vote verification delays cause view changes.
     pub consensus_crypto_threads: usize,
 
-    /// Number of threads for general crypto operations (provisions, state votes).
+    /// Number of threads for general crypto operations (provisions, execution votes).
     /// These are CPU-bound but not consensus-critical. They can queue without affecting liveness.
     pub crypto_threads: usize,
 
     /// Number of threads for transaction signature validation.
     /// This is a dedicated pool to prevent transaction floods from blocking
-    /// provision/state vote verification which are needed for execution progress.
+    /// provision/execution vote verification which are needed for execution progress.
     pub tx_validation_threads: usize,
 
     /// Number of threads for transaction execution.
@@ -126,7 +126,7 @@ impl ThreadPoolConfig {
     /// - State Machine: 1 core (always)
     /// - Consensus Crypto: 2 threads (dedicated for block votes/QC - liveness critical)
     /// - After reserving state machine and consensus crypto, remaining cores are split:
-    ///   - Crypto: 35% (provisions, state votes, gossiped cert verification - highest load)
+    ///   - Crypto: 35% (provisions, execution votes, gossiped cert verification - highest load)
     ///   - Execution: 25% (Radix Engine)
     ///   - TX Validation: 15% (transaction signature verification)
     ///   - I/O: 15% (network, storage, timers)
@@ -160,7 +160,7 @@ impl ThreadPoolConfig {
             let consensus_crypto = 2;
 
             // Pool budget split by percentage:
-            // - Crypto: 35% (provisions, state votes, gossiped cert verification - highest load)
+            // - Crypto: 35% (provisions, execution votes, gossiped cert verification - highest load)
             // - Execution: 25% (Radix Engine)
             // - TX Validation: 15% (transaction signature verification, bursty)
             // - I/O: 15% (network, storage, timers)
@@ -318,7 +318,7 @@ impl ThreadPoolConfigBuilder {
         self
     }
 
-    /// Set the number of general crypto verification threads (provisions, state votes).
+    /// Set the number of general crypto verification threads (provisions, execution votes).
     pub fn crypto_threads(mut self, count: usize) -> Self {
         self.config.crypto_threads = count;
         self
@@ -423,7 +423,7 @@ impl Default for ThreadPoolConfigBuilder {
 ///
 /// Creates and owns priority-isolated rayon thread pools:
 /// - Consensus crypto pool (block votes, QC verification) — liveness-critical
-/// - General crypto pool (provisions, state votes)
+/// - General crypto pool (provisions, execution votes)
 /// - TX validation pool (transaction signatures) — isolated from crypto
 /// - Execution pool (Radix Engine)
 /// - Codec pool (SBOR encoding/decoding)

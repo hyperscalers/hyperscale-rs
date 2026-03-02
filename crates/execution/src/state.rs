@@ -19,21 +19,22 @@
 //!
 //! ## Phase 3: Cross-Shard Execution
 //! With provisioned state, validators execute the transaction and create a
-//! StateVoteBlock with merkle root of execution results.
+//! an ExecutionVote with merkle root of execution results.
 //!
 //! ## Phase 4: Vote Aggregation
 //! Validators broadcast votes to their local shard. When 2f+1 voting power agrees
-//! on the same merkle root, a StateCertificate is created and broadcast.
+//! on the same merkle root, an ExecutionCertificate is created and broadcast.
 //!
 //! ## Phase 5: Finalization
-//! Validators collect StateCertificates from all participating shards. When all
-//! certificates are received, an TransactionCertificate is created.
+//! Validators collect ExecutionCertificates from all participating shards. When all
+//! certificates are received, a TransactionCertificate is created.
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, Hash, NodeId,
-    RoutableTransaction, ShardGroupId, StateCertificate, StateEntry, StateProvision,
-    StateVoteBlock, Topology, TransactionCertificate, TransactionDecision, ValidatorId, VotePower,
+    BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
+    ExecutionCertificate, ExecutionVote, Hash, NodeId, RoutableTransaction, ShardGroupId,
+    StateEntry, StateProvision, Topology, TransactionCertificate, TransactionDecision, ValidatorId,
+    VotePower,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -132,9 +133,9 @@ pub struct ExecutionState {
     /// Maps tx_hash -> VoteTracker
     vote_trackers: HashMap<Hash, VoteTracker>,
 
-    /// State certificates from vote aggregation (local shard's certificate).
-    /// Maps tx_hash -> StateCertificate
-    state_certificates: HashMap<Hash, Arc<StateCertificate>>,
+    /// Execution certificates from vote aggregation (local shard's certificate).
+    /// Maps tx_hash -> ExecutionCertificate
+    execution_certificates: HashMap<Hash, Arc<ExecutionCertificate>>,
 
     /// Pending certificate aggregations waiting for BLS aggregation callback.
     /// Maps tx_hash -> PendingCertificateAggregation
@@ -158,11 +159,11 @@ pub struct ExecutionState {
     /// Votes that arrived before tracking started.
     /// Uses HashSet for O(1) deduplication instead of O(n) Vec::contains.
     /// Tracks (votes, first_arrival_height) for cleanup of stale entries.
-    early_votes: HashMap<Hash, (HashSet<StateVoteBlock>, u64)>,
+    early_votes: HashMap<Hash, (HashSet<ExecutionVote>, u64)>,
 
     /// Certificates that arrived before tracking started.
     /// Tracks (certificates, first_arrival_height) for cleanup of stale entries.
-    early_certificates: HashMap<Hash, (Vec<StateCertificate>, u64)>,
+    early_certificates: HashMap<Hash, (Vec<ExecutionCertificate>, u64)>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Pending signature verifications
@@ -174,7 +175,7 @@ pub struct ExecutionState {
     /// Maps (tx_hash, shard_id) -> PendingCertificateVerification
     pending_cert_verifications: HashMap<(Hash, ShardGroupId), PendingCertificateVerification>,
 
-    /// Fetched TransactionCertificates awaiting verification of all embedded StateCertificates.
+    /// Fetched TransactionCertificates awaiting verification of all embedded ExecutionCertificates.
     /// Maps tx_hash -> PendingFetchedCertificateVerification
     pending_fetched_cert_verifications: HashMap<Hash, PendingFetchedCertificateVerification>,
 
@@ -182,12 +183,12 @@ pub struct ExecutionState {
     /// Enables O(k) cleanup instead of O(n) where k = verifications for this tx, n = total.
     pending_verifications_by_tx: HashMap<Hash, HashSet<PendingVerificationKey>>,
 
-    /// Cache of already-verified state vote signatures.
+    /// Cache of already-verified execution vote signatures.
     /// Maps (tx_hash, validator_id) -> height when verified.
     /// When we see the same vote again (e.g., during gossiping or retries),
     /// we can skip re-verification and proceed directly to vote aggregation.
     /// The height is stored to enable cleanup of old entries after finalization.
-    verified_state_votes: HashMap<(Hash, ValidatorId), u64>,
+    verified_execution_votes: HashMap<(Hash, ValidatorId), u64>,
 
     /// Reverse index: tx_hash -> set of validator IDs with verified votes.
     /// Enables O(k) cleanup instead of O(n) where k = verified votes for this tx.
@@ -284,7 +285,7 @@ impl ExecutionState {
             pending_provisioning: HashMap::new(),
             pending_provision_fetches: HashMap::new(),
             vote_trackers: HashMap::new(),
-            state_certificates: HashMap::new(),
+            execution_certificates: HashMap::new(),
             pending_cert_aggregations: HashMap::new(),
             certificate_trackers: HashMap::new(),
             early_provisioning_complete: HashMap::new(),
@@ -293,7 +294,7 @@ impl ExecutionState {
             pending_cert_verifications: HashMap::new(),
             pending_fetched_cert_verifications: HashMap::new(),
             pending_verifications_by_tx: HashMap::new(),
-            verified_state_votes: HashMap::new(),
+            verified_execution_votes: HashMap::new(),
             verified_votes_by_tx: HashMap::new(),
             speculative_results: HashMap::new(),
             speculative_in_flight_txs: HashSet::new(),
@@ -473,7 +474,7 @@ impl ExecutionState {
                     tx_hash = ?tx_hash,
                     "SPECULATIVE HIT: Votes already sent, skipping execution"
                 );
-                // Just start tracking (vote trackers, etc.) - votes will arrive via StateVoteReceived
+                // Just start tracking (vote trackers, etc.) - votes will arrive via ExecutionVoteReceived
                 actions.extend(self.start_single_shard_execution(tx.clone()));
             } else if self.speculative_in_flight_txs.contains(&tx_hash) {
                 // Speculation in-flight - votes will be sent when it completes
@@ -483,7 +484,7 @@ impl ExecutionState {
                     tx_hash = ?tx_hash,
                     "SPECULATIVE IN-FLIGHT: Votes will arrive soon, skipping execution"
                 );
-                // Just start tracking - votes will arrive via StateVoteReceived
+                // Just start tracking - votes will arrive via ExecutionVoteReceived
                 actions.extend(self.start_single_shard_execution(tx.clone()));
             } else {
                 // No speculation at all - execute normally
@@ -844,8 +845,8 @@ impl ExecutionState {
     // Phase 3: Vote Aggregation
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle state vote received.
-    /// Handle a state vote received from another validator.
+    /// Handle execution vote received.
+    /// Handle an execution vote received from another validator.
     ///
     /// Uses deferred verification: votes are buffered until we have enough
     /// voting power to possibly reach quorum. Only then do we batch-verify
@@ -857,14 +858,14 @@ impl ExecutionState {
         validator = ?vote.validator,
         success = vote.success
     ))]
-    pub fn on_vote(&mut self, vote: StateVoteBlock) -> Vec<Action> {
+    pub fn on_vote(&mut self, vote: ExecutionVote) -> Vec<Action> {
         let tx_hash = vote.transaction_hash;
         let validator_id = vote.validator;
 
         // Check if we're tracking this transaction
         if !self.vote_trackers.contains_key(&tx_hash) {
             // Not tracking - check if certificate already exists
-            if self.state_certificates.contains_key(&tx_hash) {
+            if self.execution_certificates.contains_key(&tx_hash) {
                 return vec![];
             }
             // Buffer for later (HashSet provides O(1) deduplication)
@@ -891,13 +892,13 @@ impl ExecutionState {
         // Check if we've already verified this exact vote (by tx_hash + validator).
         // This happens when votes are gossiped multiple times or during retries.
         if self
-            .verified_state_votes
+            .verified_execution_votes
             .contains_key(&(tx_hash, validator_id))
         {
             tracing::trace!(
                 tx_hash = ?tx_hash,
                 validator = validator_id.0,
-                "State vote already verified, skipping re-verification"
+                "Execution vote already verified, skipping re-verification"
             );
             return self.handle_verified_vote(vote);
         }
@@ -907,7 +908,7 @@ impl ExecutionState {
             tracing::warn!(
                 tx_hash = ?tx_hash,
                 validator = validator_id.0,
-                "Unknown validator for state vote"
+                "Unknown validator for execution vote"
             );
             return vec![];
         };
@@ -927,11 +928,11 @@ impl ExecutionState {
         tracker.buffer_unverified_vote(vote, public_key, voting_power);
 
         // Check if we should trigger batch verification
-        self.maybe_trigger_state_vote_verification(tx_hash)
+        self.maybe_trigger_execution_vote_verification(tx_hash)
     }
 
     /// Check if we have enough buffered votes to trigger verification.
-    fn maybe_trigger_state_vote_verification(&mut self, tx_hash: Hash) -> Vec<Action> {
+    fn maybe_trigger_execution_vote_verification(&mut self, tx_hash: Hash) -> Vec<Action> {
         let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
             return vec![];
         };
@@ -950,28 +951,28 @@ impl ExecutionState {
         tracing::debug!(
             tx_hash = ?tx_hash,
             vote_count = votes.len(),
-            "Triggering batch state vote verification (have enough for quorum)"
+            "Triggering batch execution vote verification (have enough for quorum)"
         );
 
-        vec![Action::VerifyAndAggregateStateVotes { tx_hash, votes }]
+        vec![Action::VerifyAndAggregateExecutionVotes { tx_hash, votes }]
     }
 
-    /// Handle batch state vote verification result.
+    /// Handle batch execution vote verification result.
     ///
-    /// Callback from `Action::VerifyAndAggregateStateVotes`.
+    /// Callback from `Action::VerifyAndAggregateExecutionVotes`.
     #[instrument(skip(self, verified_votes), fields(
         tx_hash = ?tx_hash,
         verified_count = verified_votes.len()
     ))]
-    pub fn on_state_votes_verified(
+    pub fn on_execution_votes_verified(
         &mut self,
         tx_hash: Hash,
-        verified_votes: Vec<(StateVoteBlock, u64)>,
+        verified_votes: Vec<(ExecutionVote, u64)>,
     ) -> Vec<Action> {
         let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
             tracing::debug!(
                 tx_hash = ?tx_hash,
-                "State votes verified but no tracker found (tx cleaned up)"
+                "Execution votes verified but no tracker found (tx cleaned up)"
             );
             return vec![];
         };
@@ -982,16 +983,16 @@ impl ExecutionState {
         if verified_votes.is_empty() {
             tracing::warn!(
                 tx_hash = ?tx_hash,
-                "All state votes in batch failed verification"
+                "All execution votes in batch failed verification"
             );
             // Check if more votes arrived while we were verifying
-            return self.maybe_trigger_state_vote_verification(tx_hash);
+            return self.maybe_trigger_execution_vote_verification(tx_hash);
         }
 
         tracing::debug!(
             tx_hash = ?tx_hash,
             verified_count = verified_votes.len(),
-            "Batch state vote verification complete"
+            "Batch execution vote verification complete"
         );
 
         // Add all verified votes to the tracker and cache them
@@ -1000,7 +1001,8 @@ impl ExecutionState {
             let validator_id = vote.validator;
 
             // Cache the verified vote
-            self.verified_state_votes.insert((tx_hash, validator_id), 0);
+            self.verified_execution_votes
+                .insert((tx_hash, validator_id), 0);
             self.verified_votes_by_tx
                 .entry(tx_hash)
                 .or_default()
@@ -1016,7 +1018,7 @@ impl ExecutionState {
         actions.extend(self.check_vote_quorum(tx_hash));
 
         // Check if more votes arrived while we were verifying
-        actions.extend(self.maybe_trigger_state_vote_verification(tx_hash));
+        actions.extend(self.maybe_trigger_execution_vote_verification(tx_hash));
 
         actions
     }
@@ -1024,7 +1026,7 @@ impl ExecutionState {
     /// Handle a verified vote (own vote or already-verified vote).
     ///
     /// Adds the vote to the tracker and checks for quorum.
-    fn handle_verified_vote(&mut self, vote: StateVoteBlock) -> Vec<Action> {
+    fn handle_verified_vote(&mut self, vote: ExecutionVote) -> Vec<Action> {
         let tx_hash = vote.transaction_hash;
         let voting_power = self.voting_power(vote.validator);
 
@@ -1037,8 +1039,9 @@ impl ExecutionState {
         if !tracker.has_seen_validator(validator_id) {
             // We need to mark it as seen even though we're adding it directly
             // Use a dummy public key since we won't actually verify
-            // Actually, we should track this differently - let's just add to verified_state_votes
-            self.verified_state_votes.insert((tx_hash, validator_id), 0);
+            // Actually, we should track this differently - let's just add to verified_execution_votes
+            self.verified_execution_votes
+                .insert((tx_hash, validator_id), 0);
             self.verified_votes_by_tx
                 .entry(tx_hash)
                 .or_default()
@@ -1093,7 +1096,7 @@ impl ExecutionState {
         // Remove vote tracker (we've extracted what we need)
         self.vote_trackers.remove(&tx_hash);
 
-        vec![Action::AggregateStateCertificate {
+        vec![Action::AggregateExecutionCertificate {
             tx_hash,
             shard: local_shard,
             writes_commitment,
@@ -1104,19 +1107,19 @@ impl ExecutionState {
         }]
     }
 
-    /// Handle state certificate aggregation completed.
+    /// Handle execution certificate aggregation completed.
     ///
-    /// Callback from `Action::AggregateStateCertificate`. The crypto pool has
+    /// Callback from `Action::AggregateExecutionCertificate`. The crypto pool has
     /// finished BLS signature aggregation and produced the certificate.
     #[instrument(skip(self, certificate), fields(
         tx_hash = ?tx_hash,
         shard = certificate.shard_group_id.0,
         success = certificate.success
     ))]
-    pub fn on_state_certificate_aggregated(
+    pub fn on_execution_certificate_aggregated(
         &mut self,
         tx_hash: Hash,
-        certificate: StateCertificate,
+        certificate: ExecutionCertificate,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -1133,16 +1136,16 @@ impl ExecutionState {
             tx_hash = ?tx_hash,
             shard = certificate.shard_group_id.0,
             participating_shards = pending.participating_shards.len(),
-            "State certificate aggregation complete"
+            "Execution certificate aggregation complete"
         );
 
         let certificate = Arc::new(certificate);
-        self.state_certificates
+        self.execution_certificates
             .insert(tx_hash, Arc::clone(&certificate));
 
         // Broadcast certificate to all participating shards
         for target_shard in pending.participating_shards {
-            actions.push(Action::BroadcastStateCertificate {
+            actions.push(Action::BroadcastExecutionCertificate {
                 shard: target_shard,
                 certificate: Arc::clone(&certificate),
             });
@@ -1158,16 +1161,16 @@ impl ExecutionState {
     // Phase 4: Finalization
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle state certificate received.
+    /// Handle execution certificate received.
     ///
     /// Delegates signature verification to the runner before processing.
-    /// Handle a state certificate received from another validator.
+    /// Handle an execution certificate received from another validator.
     #[instrument(skip(self, cert), fields(
         tx_hash = ?cert.transaction_hash,
         shard = cert.shard_group_id.0,
         success = cert.success
     ))]
-    pub fn on_certificate(&mut self, cert: StateCertificate) -> Vec<Action> {
+    pub fn on_certificate(&mut self, cert: ExecutionCertificate) -> Vec<Action> {
         let tx_hash = cert.transaction_hash;
         let shard = cert.shard_group_id;
 
@@ -1217,13 +1220,13 @@ impl ExecutionState {
             .insert(PendingVerificationKey::Certificate(shard));
 
         // Delegate signature verification to runner
-        vec![Action::VerifyStateCertificateSignature {
+        vec![Action::VerifyExecutionCertificateSignature {
             certificate: cert,
             public_keys,
         }]
     }
 
-    /// Handle state certificate signature verification result.
+    /// Handle execution certificate signature verification result.
     #[instrument(skip(self, certificate), fields(
         tx_hash = ?certificate.transaction_hash,
         shard = certificate.shard_group_id.0,
@@ -1231,7 +1234,7 @@ impl ExecutionState {
     ))]
     pub fn on_certificate_verified(
         &mut self,
-        certificate: StateCertificate,
+        certificate: ExecutionCertificate,
         valid: bool,
     ) -> Vec<Action> {
         let tx_hash = certificate.transaction_hash;
@@ -1256,7 +1259,7 @@ impl ExecutionState {
             tracing::warn!(
                 tx_hash = ?tx_hash,
                 shard = shard.0,
-                "Invalid state certificate signature"
+                "Invalid execution certificate signature"
             );
             return vec![];
         }
@@ -1264,7 +1267,7 @@ impl ExecutionState {
         self.handle_certificate_internal(Arc::new(certificate))
     }
 
-    /// Handle verification result for a fetched certificate's StateCertificate.
+    /// Handle verification result for a fetched certificate's ExecutionCertificate.
     fn handle_fetched_cert_verified(
         &mut self,
         tx_hash: Hash,
@@ -1282,7 +1285,7 @@ impl ExecutionState {
             tracing::warn!(
                 tx_hash = ?tx_hash,
                 shard = shard.0,
-                "Invalid fetched certificate - StateCertificate signature verification failed"
+                "Invalid fetched certificate - ExecutionCertificate signature verification failed"
             );
             pending.has_failed = true;
         }
@@ -1323,9 +1326,9 @@ impl ExecutionState {
         )]
     }
 
-    /// Verify a fetched TransactionCertificate by checking all embedded StateCertificates.
+    /// Verify a fetched TransactionCertificate by checking all embedded ExecutionCertificates.
     ///
-    /// Each StateCertificate is verified against its shard's committee public keys.
+    /// Each ExecutionCertificate is verified against its shard's committee public keys.
     /// When all verify successfully, a FetchedCertificateVerified event is emitted.
     pub fn verify_fetched_certificate(
         &mut self,
@@ -1365,8 +1368,8 @@ impl ExecutionState {
             },
         );
 
-        // Emit verification action for each embedded StateCertificate
-        for (shard_id, state_cert) in &certificate.shard_proofs {
+        // Emit verification action for each embedded ExecutionCertificate
+        for (shard_id, execution_cert) in &certificate.shard_proofs {
             // Get public keys for this shard's committee
             let committee = self.topology.committee_for_shard(*shard_id);
             let public_keys: Vec<Bls12381G1PublicKey> = committee
@@ -1388,8 +1391,8 @@ impl ExecutionState {
                 continue;
             }
 
-            actions.push(Action::VerifyStateCertificateSignature {
-                certificate: state_cert.clone(),
+            actions.push(Action::VerifyExecutionCertificateSignature {
+                certificate: execution_cert.clone(),
                 public_keys,
             });
         }
@@ -1402,7 +1405,7 @@ impl ExecutionState {
         tx_hash = %cert.transaction_hash,
         cert_shard = cert.shard_group_id.0,
     ))]
-    fn handle_certificate_internal(&mut self, cert: Arc<StateCertificate>) -> Vec<Action> {
+    fn handle_certificate_internal(&mut self, cert: Arc<ExecutionCertificate>) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = cert.transaction_hash;
         let cert_shard = cert.shard_group_id;
@@ -1504,7 +1507,7 @@ impl ExecutionState {
         // Clean up verified vote cache using reverse index for O(k) instead of O(n)
         if let Some(validators) = self.verified_votes_by_tx.remove(tx_hash) {
             for vid in validators {
-                self.verified_state_votes.remove(&(*tx_hash, vid));
+                self.verified_execution_votes.remove(&(*tx_hash, vid));
             }
         }
 
@@ -1517,7 +1520,7 @@ impl ExecutionState {
         self.pending_provisioning.remove(tx_hash);
         self.pending_provision_fetches.remove(tx_hash);
         self.vote_trackers.remove(tx_hash);
-        self.state_certificates.remove(tx_hash);
+        self.execution_certificates.remove(tx_hash);
         self.certificate_trackers.remove(tx_hash);
         self.early_provisioning_complete.remove(tx_hash);
         self.early_votes.remove(tx_hash);
@@ -1597,23 +1600,24 @@ impl ExecutionState {
             .committed_height
             .saturating_sub(VERIFIED_VOTE_RETENTION_BLOCKS);
 
-        // Single-pass: prune old votes directly from verified_state_votes,
+        // Single-pass: prune old votes directly from verified_execution_votes,
         // then clean up verified_votes_by_tx for entries with no remaining votes.
         let mut pruned_count = 0;
 
-        // Remove old votes from verified_state_votes and track which tx_hashes need cleanup
-        self.verified_state_votes.retain(|(tx_hash, vid), height| {
-            if *height <= cutoff {
-                // Vote is old, remove it. Also remove from the by_tx index.
-                if let Some(validators) = self.verified_votes_by_tx.get_mut(tx_hash) {
-                    validators.remove(vid);
+        // Remove old votes from verified_execution_votes and track which tx_hashes need cleanup
+        self.verified_execution_votes
+            .retain(|(tx_hash, vid), height| {
+                if *height <= cutoff {
+                    // Vote is old, remove it. Also remove from the by_tx index.
+                    if let Some(validators) = self.verified_votes_by_tx.get_mut(tx_hash) {
+                        validators.remove(vid);
+                    }
+                    pruned_count += 1;
+                    false
+                } else {
+                    true
                 }
-                pruned_count += 1;
-                false
-            } else {
-                true
-            }
-        });
+            });
 
         // Clean up empty entries in verified_votes_by_tx
         self.verified_votes_by_tx
@@ -1645,15 +1649,15 @@ impl ExecutionState {
         self.vote_trackers.contains_key(tx_hash)
     }
 
-    /// Check if we have a state certificate for a transaction.
-    pub fn has_state_certificate(&self, tx_hash: &Hash) -> bool {
-        self.state_certificates.contains_key(tx_hash)
+    /// Check if we have an execution certificate for a transaction.
+    pub fn has_execution_certificate(&self, tx_hash: &Hash) -> bool {
+        self.execution_certificates.contains_key(tx_hash)
     }
 
     /// Get debug info about certificate tracking state for a transaction.
     pub fn certificate_tracking_debug(&self, tx_hash: &Hash) -> String {
         let has_vote_tracker = self.vote_trackers.contains_key(tx_hash);
-        let has_state_cert = self.state_certificates.contains_key(tx_hash);
+        let has_execution_certificate = self.execution_certificates.contains_key(tx_hash);
         let has_cert_tracker = self.certificate_trackers.contains_key(tx_hash);
         let early_cert_count = self
             .early_certificates
@@ -1672,8 +1676,12 @@ impl ExecutionState {
         };
 
         format!(
-            "vote_tracker={}, state_cert={}, cert_tracker={} ({}), early_certs={}",
-            has_vote_tracker, has_state_cert, has_cert_tracker, cert_tracker_info, early_cert_count
+            "vote_tracker={}, execution_cert={}, cert_tracker={} ({}), early_certs={}",
+            has_vote_tracker,
+            has_execution_certificate,
+            has_cert_tracker,
+            cert_tracker_info,
+            early_cert_count
         )
     }
 
@@ -1703,7 +1711,7 @@ impl ExecutionState {
 
         // Phase 3-4: Vote cleanup
         self.vote_trackers.remove(tx_hash);
-        self.state_certificates.remove(tx_hash);
+        self.execution_certificates.remove(tx_hash);
 
         // Phase 5: Certificate cleanup
         self.certificate_trackers.remove(tx_hash);
@@ -1728,7 +1736,7 @@ impl ExecutionState {
         // Verified vote cache cleanup using reverse index for O(k) instead of O(n)
         if let Some(validators) = self.verified_votes_by_tx.remove(tx_hash) {
             for vid in validators {
-                self.verified_state_votes.remove(&(*tx_hash, vid));
+                self.verified_execution_votes.remove(&(*tx_hash, vid));
             }
         }
 
@@ -1742,21 +1750,21 @@ impl ExecutionState {
     ///
     /// Called when we receive a verified certificate from another node (via fetch or gossip)
     /// instead of building our own. This cleans up all local certificate building state:
-    /// certificate tracking, vote aggregation, our own StateCertificate, and pending verifications.
+    /// certificate tracking, vote aggregation, our own ExecutionCertificate, and pending verifications.
     ///
     /// Note: This keeps `executed_txs` for deduplication.
     pub fn cancel_certificate_building(&mut self, tx_hash: &Hash) {
         let had_tracker = self.certificate_trackers.remove(tx_hash).is_some();
         let had_early = self.early_certificates.remove(tx_hash).is_some();
 
-        // Clean up vote aggregation - we don't need to build our own StateCertificate
+        // Clean up vote aggregation - we don't need to build our own ExecutionCertificate
         let had_vote_tracker = self.vote_trackers.remove(tx_hash).is_some();
         let had_aggregation = self.pending_cert_aggregations.remove(tx_hash).is_some();
         self.early_votes.remove(tx_hash);
 
-        // Clean up our local StateCertificate - peers can't request it, and the
-        // external certificate we received contains all the StateCertificates we need
-        self.state_certificates.remove(tx_hash);
+        // Clean up our local ExecutionCertificate - peers can't request it, and the
+        // external certificate we received contains all the ExecutionCertificates we need
+        self.execution_certificates.remove(tx_hash);
 
         // Clean up pending fetched certificate verifications for this tx
         self.pending_fetched_cert_verifications.remove(tx_hash);
@@ -1777,7 +1785,7 @@ impl ExecutionState {
         // Clean up verified votes cache
         if let Some(validators) = self.verified_votes_by_tx.remove(tx_hash) {
             for vid in validators {
-                self.verified_state_votes.remove(&(*tx_hash, vid));
+                self.verified_execution_votes.remove(&(*tx_hash, vid));
             }
         }
 
@@ -2343,7 +2351,7 @@ mod tests {
         // Vote tracker should be set up
         assert!(state.is_tracking_votes(&tx_hash));
 
-        // In production, the runner executes + signs + sends StateVoteReceived.
+        // In production, the runner executes + signs + sends ExecutionVoteReceived.
         // Simulate that by creating a vote and calling on_vote.
         let writes_commitment = Hash::ZERO;
         let success = true;
@@ -2355,7 +2363,7 @@ mod tests {
             hyperscale_types::exec_vote_message(&tx_hash, &writes_commitment, local_shard, success);
         let signature = state.signing_key.sign_v1(&message);
 
-        let vote = StateVoteBlock {
+        let vote = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: local_shard,
             writes_commitment,
@@ -2365,7 +2373,7 @@ mod tests {
             signature,
         };
 
-        // Simulate runner sending StateVoteReceived for our own vote
+        // Simulate runner sending ExecutionVoteReceived for our own vote
         let actions = state.on_vote(vote);
 
         // Should not emit any broadcast action (runner handles broadcast)
@@ -2499,7 +2507,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_state_vote_with_real_bls_signature() {
+    fn test_execution_vote_with_real_bls_signature() {
         use hyperscale_test_helpers::{fixtures, TestCommittee};
 
         let committee = TestCommittee::new(4, 42);
@@ -2507,8 +2515,8 @@ mod tests {
         let writes_commitment = Hash::from_bytes(b"state_root");
         let shard = ShardGroupId(0);
 
-        // Create a properly signed state vote
-        let vote = fixtures::make_signed_state_vote(
+        // Create a properly signed execution vote
+        let vote = fixtures::make_signed_execution_vote(
             &committee,
             0, // voter index
             tx_hash,
@@ -2520,15 +2528,15 @@ mod tests {
         // Verify the signature using the signing_message method
         let message = vote.signing_message();
         let valid = verify_bls12381_v1(&message, committee.public_key(0), &vote.signature);
-        assert!(valid, "State vote signature should verify");
+        assert!(valid, "Execution vote signature should verify");
 
         // Verify with wrong key fails
         let invalid = verify_bls12381_v1(&message, committee.public_key(1), &vote.signature);
-        assert!(!invalid, "State vote should NOT verify with wrong key");
+        assert!(!invalid, "Execution vote should NOT verify with wrong key");
     }
 
     #[test]
-    fn test_state_certificate_with_real_bls_signatures() {
+    fn test_execution_certificate_with_real_bls_signatures() {
         use hyperscale_test_helpers::{fixtures, TestCommittee};
 
         let committee = TestCommittee::new(4, 42);
@@ -2536,8 +2544,8 @@ mod tests {
         let writes_commitment = Hash::from_bytes(b"commitment");
         let shard = ShardGroupId(0);
 
-        // Create a state certificate with real aggregated signatures
-        let cert = fixtures::make_signed_state_certificate(
+        // Create an execution certificate with real aggregated signatures
+        let cert = fixtures::make_signed_execution_certificate(
             &committee,
             &[0, 1, 2], // 3 voters
             tx_hash,
@@ -2566,11 +2574,11 @@ mod tests {
             &aggregated_pk,
             &cert.aggregated_signature,
         );
-        assert!(valid, "State certificate signature should verify");
+        assert!(valid, "Execution certificate signature should verify");
     }
 
     #[test]
-    fn test_batch_verify_state_votes_different_messages() {
+    fn test_batch_verify_execution_votes_different_messages() {
         use hyperscale_test_helpers::TestCommittee;
 
         let committee = TestCommittee::new(4, 42);
@@ -2594,7 +2602,7 @@ mod tests {
         let signatures = vec![sig1, sig2, sig3];
         let pubkeys: Vec<_> = (0..3).map(|i| *committee.public_key(i)).collect();
 
-        // Batch verify with different messages (what dispatch_state_vote_verifications does)
+        // Batch verify with different messages (what dispatch_execution_vote_verifications does)
         let results =
             hyperscale_types::batch_verify_bls_different_messages(&messages, &signatures, &pubkeys);
 
@@ -2606,7 +2614,7 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_verify_state_votes_partial_failure() {
+    fn test_batch_verify_execution_votes_partial_failure() {
         use hyperscale_test_helpers::TestCommittee;
 
         let committee = TestCommittee::new(4, 42);

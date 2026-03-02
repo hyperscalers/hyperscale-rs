@@ -297,7 +297,7 @@ impl StateProvision {
 
 /// Vote on execution state from a validator.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
-pub struct StateVoteBlock {
+pub struct ExecutionVote {
     /// Hash of the transaction.
     pub transaction_hash: Hash,
 
@@ -312,7 +312,7 @@ pub struct StateVoteBlock {
 
     /// State writes produced by execution.
     ///
-    /// Used to populate StateCertificate.state_writes for speculative
+    /// Used to populate ExecutionCertificate.state_writes for speculative
     /// execution invalidation.
     pub state_writes: Vec<SubstateWrite>,
 
@@ -323,7 +323,7 @@ pub struct StateVoteBlock {
     pub signature: Bls12381G2Signature,
 }
 
-impl StateVoteBlock {
+impl ExecutionVote {
     /// Compute hash of this vote for aggregation.
     pub fn vote_hash(&self) -> Hash {
         let mut data = Vec::new();
@@ -340,8 +340,8 @@ impl StateVoteBlock {
     /// Uses the centralized `exec_vote_message` function with the
     /// `DOMAIN_EXEC_VOTE` tag for domain separation.
     ///
-    /// Note: StateCertificates aggregate signatures from StateVoteBlocks,
-    /// so StateCertificate::signing_message() returns the same format.
+    /// Note: ExecutionCertificates aggregate signatures from ExecutionVotes,
+    /// so ExecutionCertificate::signing_message() returns the same format.
     pub fn signing_message(&self) -> Vec<u8> {
         exec_vote_message(
             &self.transaction_hash,
@@ -354,7 +354,7 @@ impl StateVoteBlock {
 
 /// Certificate proving a shard agreed on execution state.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct StateCertificate {
+pub struct ExecutionCertificate {
     /// Hash of the transaction.
     pub transaction_hash: Hash,
 
@@ -383,7 +383,7 @@ pub struct StateCertificate {
     pub voting_power: u64,
 }
 
-impl StateCertificate {
+impl ExecutionCertificate {
     /// Get number of signers.
     pub fn signer_count(&self) -> usize {
         self.signers.count()
@@ -444,8 +444,8 @@ impl StateCertificate {
     /// Uses the centralized `exec_vote_message` function with the
     /// `DOMAIN_EXEC_VOTE` tag for domain separation.
     ///
-    /// Note: This returns the same message format as StateVoteBlock::signing_message()
-    /// because StateCertificates aggregate signatures from StateVoteBlocks. The
+    /// Note: This returns the same message format as ExecutionVote::signing_message()
+    /// because ExecutionCertificates aggregate signatures from ExecutionVotes. The
     /// aggregated signature is verified against this same message.
     pub fn signing_message(&self) -> Vec<u8> {
         exec_vote_message(
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_single_shard_certificate() {
-        let cert = StateCertificate::single_shard(
+        let cert = ExecutionCertificate::single_shard(
             Hash::from_bytes(b"tx"),
             Hash::from_bytes(b"root"),
             ShardGroupId(0),

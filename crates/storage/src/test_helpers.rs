@@ -6,8 +6,8 @@
 
 use crate::{DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates};
 use hyperscale_types::{
-    zero_bls_signature, Block, BlockHeader, BlockHeight, Hash, NodeId, PartitionNumber,
-    QuorumCertificate, ShardGroupId, SignerBitfield, StateCertificate, SubstateWrite,
+    zero_bls_signature, Block, BlockHeader, BlockHeight, ExecutionCertificate, Hash, NodeId,
+    PartitionNumber, QuorumCertificate, ShardGroupId, SignerBitfield, SubstateWrite,
     TransactionCertificate, TransactionDecision, ValidatorId, VotePower,
 };
 use radix_common::prelude::DatabaseUpdate;
@@ -61,7 +61,7 @@ pub fn make_test_certificate(
     writes: Vec<SubstateWrite>,
 ) -> TransactionCertificate {
     let tx_hash = Hash::from_bytes(&[tx_seed; 32]);
-    let state_cert = StateCertificate {
+    let execution_cert = ExecutionCertificate {
         transaction_hash: tx_hash,
         shard_group_id: shard,
         read_nodes: vec![],
@@ -73,7 +73,7 @@ pub fn make_test_certificate(
         voting_power: 0,
     };
     let mut shard_proofs = BTreeMap::new();
-    shard_proofs.insert(shard, state_cert);
+    shard_proofs.insert(shard, execution_cert);
     TransactionCertificate {
         transaction_hash: tx_hash,
         decision: TransactionDecision::Accept,
@@ -119,7 +119,7 @@ pub fn make_multi_shard_certificate(
     let tx_hash = Hash::from_bytes(&[tx_seed; 32]);
     let mut shard_proofs = BTreeMap::new();
     for (shard, writes) in shard_writes {
-        let state_cert = StateCertificate {
+        let execution_cert = ExecutionCertificate {
             transaction_hash: tx_hash,
             shard_group_id: shard,
             read_nodes: vec![],
@@ -130,7 +130,7 @@ pub fn make_multi_shard_certificate(
             signers: SignerBitfield::new(4),
             voting_power: 0,
         };
-        shard_proofs.insert(shard, state_cert);
+        shard_proofs.insert(shard, execution_cert);
     }
     TransactionCertificate {
         transaction_hash: tx_hash,

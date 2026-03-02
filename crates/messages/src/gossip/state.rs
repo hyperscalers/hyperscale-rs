@@ -5,8 +5,8 @@
 
 use crate::trace_context::TraceContext;
 use hyperscale_types::{
-    MessagePriority, NetworkMessage, ShardMessage, StateCertificate, StateProvision,
-    StateVoteBlock, TransactionCertificate,
+    ExecutionCertificate, ExecutionVote, MessagePriority, NetworkMessage, ShardMessage,
+    StateProvision, TransactionCertificate,
 };
 use sbor::prelude::BasicSbor;
 
@@ -84,31 +84,31 @@ impl ShardMessage for StateProvisionBatch {}
 
 /// Batched votes on transaction execution results within a shard.
 ///
-/// 2f+1 matching votes create a StateCertificate with aggregated BLS signature.
+/// 2f+1 matching votes create an ExecutionCertificate with aggregated BLS signature.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct StateVoteBatch {
-    /// The state votes being gossiped
-    pub votes: Vec<StateVoteBlock>,
+pub struct ExecutionVoteBatch {
+    /// The execution votes being gossiped
+    pub votes: Vec<ExecutionVote>,
 }
 
-impl StateVoteBatch {
-    /// Create a new state vote batch.
-    pub fn new(votes: Vec<StateVoteBlock>) -> Self {
+impl ExecutionVoteBatch {
+    /// Create a new execution vote batch.
+    pub fn new(votes: Vec<ExecutionVote>) -> Self {
         Self { votes }
     }
 
     /// Create a batch from a single vote.
-    pub fn single(vote: StateVoteBlock) -> Self {
+    pub fn single(vote: ExecutionVote) -> Self {
         Self::new(vec![vote])
     }
 
     /// Get the votes.
-    pub fn votes(&self) -> &[StateVoteBlock] {
+    pub fn votes(&self) -> &[ExecutionVote] {
         &self.votes
     }
 
     /// Consume and return the votes.
-    pub fn into_votes(self) -> Vec<StateVoteBlock> {
+    pub fn into_votes(self) -> Vec<ExecutionVote> {
         self.votes
     }
 
@@ -123,9 +123,9 @@ impl StateVoteBatch {
     }
 }
 
-impl NetworkMessage for StateVoteBatch {
+impl NetworkMessage for ExecutionVoteBatch {
     fn message_type_id() -> &'static str {
-        "state.vote.batch"
+        "execution.vote.batch"
     }
 
     fn priority() -> MessagePriority {
@@ -133,22 +133,22 @@ impl NetworkMessage for StateVoteBatch {
     }
 }
 
-impl ShardMessage for StateVoteBatch {}
+impl ShardMessage for ExecutionVoteBatch {}
 
 /// Batched certificates proving execution quorum.
 ///
 /// Contains full state data. Once all shards' certificates collected, transaction is finalized.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct StateCertificateBatch {
-    /// The state certificates being gossiped
-    pub certificates: Vec<StateCertificate>,
+pub struct ExecutionCertificateBatch {
+    /// The execution certificates being gossiped
+    pub certificates: Vec<ExecutionCertificate>,
     /// Trace context for distributed tracing (empty when feature disabled).
     pub trace_context: TraceContext,
 }
 
-impl StateCertificateBatch {
-    /// Create a new state certificate batch.
-    pub fn new(certificates: Vec<StateCertificate>) -> Self {
+impl ExecutionCertificateBatch {
+    /// Create a new execution certificate batch.
+    pub fn new(certificates: Vec<ExecutionCertificate>) -> Self {
         Self {
             certificates,
             trace_context: TraceContext::default(),
@@ -156,12 +156,12 @@ impl StateCertificateBatch {
     }
 
     /// Create a batch from a single certificate.
-    pub fn single(certificate: StateCertificate) -> Self {
+    pub fn single(certificate: ExecutionCertificate) -> Self {
         Self::new(vec![certificate])
     }
 
-    /// Create a new state certificate batch with trace context from current span.
-    pub fn with_trace_context(certificates: Vec<StateCertificate>) -> Self {
+    /// Create a new execution certificate batch with trace context from current span.
+    pub fn with_trace_context(certificates: Vec<ExecutionCertificate>) -> Self {
         Self {
             certificates,
             trace_context: TraceContext::from_current(),
@@ -169,12 +169,12 @@ impl StateCertificateBatch {
     }
 
     /// Get the certificates.
-    pub fn certificates(&self) -> &[StateCertificate] {
+    pub fn certificates(&self) -> &[ExecutionCertificate] {
         &self.certificates
     }
 
     /// Consume and return the certificates.
-    pub fn into_certificates(self) -> Vec<StateCertificate> {
+    pub fn into_certificates(self) -> Vec<ExecutionCertificate> {
         self.certificates
     }
 
@@ -194,9 +194,9 @@ impl StateCertificateBatch {
     }
 }
 
-impl NetworkMessage for StateCertificateBatch {
+impl NetworkMessage for ExecutionCertificateBatch {
     fn message_type_id() -> &'static str {
-        "state.certificate.batch"
+        "execution.certificate.batch"
     }
 
     fn priority() -> MessagePriority {
@@ -204,7 +204,7 @@ impl NetworkMessage for StateCertificateBatch {
     }
 }
 
-impl ShardMessage for StateCertificateBatch {}
+impl ShardMessage for ExecutionCertificateBatch {}
 
 /// Gossip message for a finalized transaction certificate.
 ///
@@ -283,8 +283,8 @@ mod tests {
     }
 
     #[test]
-    fn test_state_vote_batch() {
-        let vote = StateVoteBlock {
+    fn test_execution_vote_batch() {
+        let vote = ExecutionVote {
             transaction_hash: Hash::from_bytes(b"tx"),
             shard_group_id: ShardGroupId(0),
             writes_commitment: Hash::from_bytes(b"commitment"),
@@ -294,7 +294,7 @@ mod tests {
             signature: zero_bls_signature(),
         };
 
-        let batch = StateVoteBatch::single(vote.clone());
+        let batch = ExecutionVoteBatch::single(vote.clone());
         assert_eq!(batch.len(), 1);
         assert!(!batch.is_empty());
         assert_eq!(batch.votes()[0], vote);
@@ -305,13 +305,13 @@ mod tests {
     }
 
     #[test]
-    fn test_state_certificate_batch() {
+    fn test_execution_certificate_batch() {
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
         signers.set(2);
 
-        let cert = StateCertificate {
+        let cert = ExecutionCertificate {
             transaction_hash: Hash::from_bytes(b"tx"),
             shard_group_id: ShardGroupId(0),
             read_nodes: vec![],
@@ -323,7 +323,7 @@ mod tests {
             voting_power: 3,
         };
 
-        let batch = StateCertificateBatch::single(cert.clone());
+        let batch = ExecutionCertificateBatch::single(cert.clone());
         assert_eq!(batch.len(), 1);
         assert!(!batch.is_empty());
         assert_eq!(batch.certificates()[0], cert);
@@ -339,10 +339,13 @@ mod tests {
             StateProvisionBatch::message_type_id(),
             "state.provision.batch"
         );
-        assert_eq!(StateVoteBatch::message_type_id(), "state.vote.batch");
         assert_eq!(
-            StateCertificateBatch::message_type_id(),
-            "state.certificate.batch"
+            ExecutionVoteBatch::message_type_id(),
+            "execution.vote.batch"
+        );
+        assert_eq!(
+            ExecutionCertificateBatch::message_type_id(),
+            "execution.certificate.batch"
         );
     }
 
@@ -352,11 +355,11 @@ mod tests {
         assert!(provisions.is_empty());
         assert_eq!(provisions.len(), 0);
 
-        let votes = StateVoteBatch::new(vec![]);
+        let votes = ExecutionVoteBatch::new(vec![]);
         assert!(votes.is_empty());
         assert_eq!(votes.len(), 0);
 
-        let certs = StateCertificateBatch::new(vec![]);
+        let certs = ExecutionCertificateBatch::new(vec![]);
         assert!(certs.is_empty());
         assert_eq!(certs.len(), 0);
     }
@@ -384,13 +387,13 @@ mod tests {
     }
 
     #[test]
-    fn test_state_certificate_trace_context() {
+    fn test_execution_certificate_trace_context() {
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
         signers.set(2);
 
-        let cert = StateCertificate {
+        let cert = ExecutionCertificate {
             transaction_hash: Hash::from_bytes(b"tx"),
             shard_group_id: ShardGroupId(0),
             read_nodes: vec![],
@@ -403,11 +406,11 @@ mod tests {
         };
 
         // new() should have empty trace context
-        let batch = StateCertificateBatch::single(cert.clone());
+        let batch = ExecutionCertificateBatch::single(cert.clone());
         assert!(!batch.trace_context().has_trace());
 
         // with_trace_context() without active span should also be empty
-        let batch_with_ctx = StateCertificateBatch::with_trace_context(vec![cert]);
+        let batch_with_ctx = ExecutionCertificateBatch::with_trace_context(vec![cert]);
         assert!(!batch_with_ctx.trace_context().has_trace() || TraceContext::is_enabled());
     }
 }

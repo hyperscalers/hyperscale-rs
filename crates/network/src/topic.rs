@@ -143,8 +143,8 @@ impl Topic {
             "transaction.gossip" => Some("transaction.gossip"),
             "transaction.certificate" => Some("transaction.certificate"),
             "state.provision.batch" => Some("state.provision.batch"),
-            "state.vote.batch" => Some("state.vote.batch"),
-            "state.certificate.batch" => Some("state.certificate.batch"),
+            "execution.vote.batch" => Some("execution.vote.batch"),
+            "execution.certificate.batch" => Some("execution.certificate.batch"),
             _ => None,
         }
     }
@@ -236,14 +236,14 @@ impl Topic {
         Self::shard("state.provision.batch", shard)
     }
 
-    /// Topic for state vote batch gossip.
-    pub fn state_vote_batch(shard: ShardGroupId) -> Self {
-        Self::shard("state.vote.batch", shard)
+    /// Topic for execution vote batch gossip.
+    pub fn execution_vote_batch(shard: ShardGroupId) -> Self {
+        Self::shard("execution.vote.batch", shard)
     }
 
-    /// Topic for state certificate batch gossip.
-    pub fn state_certificate_batch(shard: ShardGroupId) -> Self {
-        Self::shard("state.certificate.batch", shard)
+    /// Topic for execution certificate batch gossip.
+    pub fn execution_certificate_batch(shard: ShardGroupId) -> Self {
+        Self::shard("execution.certificate.batch", shard)
     }
 }
 

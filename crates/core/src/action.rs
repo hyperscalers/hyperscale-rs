@@ -6,9 +6,10 @@ use hyperscale_messages::{
 };
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
-    CycleProof, EpochConfig, EpochId, Hash, NodeId, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, SignerBitfield, StateCertificate, StateEntry, StateProvision, StateVoteBlock,
-    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
+    CycleProof, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield, StateEntry,
+    StateProvision, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId,
+    VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -64,22 +65,22 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Network: Execution Layer (domain-specific, batchable by runner)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Broadcast a state vote to the local shard.
+    /// Broadcast an execution vote to the local shard.
     ///
     /// The runner may batch multiple votes into a single network message
     /// for efficiency. State machines emit individual votes.
-    BroadcastStateVote {
+    BroadcastExecutionVote {
         shard: ShardGroupId,
-        vote: StateVoteBlock,
+        vote: ExecutionVote,
     },
 
-    /// Broadcast a state certificate to participating shards.
+    /// Broadcast an execution certificate to participating shards.
     ///
     /// The runner may batch multiple certificates into a single network message
     /// for efficiency. State machines emit individual certificates.
-    BroadcastStateCertificate {
+    BroadcastExecutionCertificate {
         shard: ShardGroupId,
-        certificate: Arc<StateCertificate>,
+        certificate: Arc<ExecutionCertificate>,
     },
 
     /// Broadcast a state provision to a target shard.
@@ -174,12 +175,12 @@ pub enum Action {
         committee_size: usize,
     },
 
-    /// Aggregate state votes into a StateCertificate (vote quorum reached).
+    /// Aggregate execution votes into an ExecutionCertificate (vote quorum reached).
     ///
     /// Performs BLS signature aggregation which is compute-intensive.
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::StateCertificateAggregated` when complete.
-    AggregateStateCertificate {
+    /// Returns `ProtocolEvent::ExecutionCertificateAggregated` when complete.
+    AggregateExecutionCertificate {
         /// Transaction hash for correlation.
         tx_hash: Hash,
         /// Shard group that executed.
@@ -187,7 +188,7 @@ pub enum Action {
         /// Deterministic hash-chain commitment over execution output writes.
         writes_commitment: Hash,
         /// Votes to aggregate (with quorum).
-        votes: Vec<StateVoteBlock>,
+        votes: Vec<ExecutionVote>,
         /// Read nodes (for certificate).
         read_nodes: Vec<NodeId>,
         /// Total voting power of the votes.
@@ -196,7 +197,7 @@ pub enum Action {
         committee_size: usize,
     },
 
-    /// Batch verify state votes and aggregate valid ones (cross-shard Phase 4).
+    /// Batch verify execution votes and aggregate valid ones (cross-shard Phase 4).
     ///
     /// Similar to `VerifyAndAggregateProvisions`, this defers verification until
     /// we have enough votes to possibly reach quorum. This avoids wasting CPU on
@@ -207,22 +208,22 @@ pub enum Action {
     /// 2. Reports which votes passed verification with their voting power
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::StateVotesVerifiedAndAggregated` when complete.
-    VerifyAndAggregateStateVotes {
+    /// Returns `ProtocolEvent::ExecutionVotesVerifiedAndAggregated` when complete.
+    VerifyAndAggregateExecutionVotes {
         /// Transaction hash for correlation.
         tx_hash: Hash,
         /// Votes to verify with their public keys and voting power.
         /// Each tuple is (vote, public_key, voting_power).
-        votes: Vec<(StateVoteBlock, Bls12381G1PublicKey, u64)>,
+        votes: Vec<(ExecutionVote, Bls12381G1PublicKey, u64)>,
     },
 
-    /// Verify a state certificate's aggregated signature (cross-shard Phase 5).
+    /// Verify an execution certificate's aggregated signature (cross-shard Phase 5).
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::StateCertificateSignatureVerified` when complete.
-    VerifyStateCertificateSignature {
+    /// Returns `ProtocolEvent::ExecutionCertificateSignatureVerified` when complete.
+    VerifyExecutionCertificateSignature {
         /// The certificate to verify.
-        certificate: StateCertificate,
+        certificate: ExecutionCertificate,
         /// Public keys of the signers (in committee order, pre-resolved by state machine).
         public_keys: Vec<Bls12381G1PublicKey>,
     },
@@ -668,8 +669,8 @@ impl Action {
                 | Action::BroadcastBlockVote { .. }
                 | Action::BroadcastTransaction { .. }
                 | Action::BroadcastTransactionCertificate { .. }
-                | Action::BroadcastStateVote { .. }
-                | Action::BroadcastStateCertificate { .. }
+                | Action::BroadcastExecutionVote { .. }
+                | Action::BroadcastExecutionCertificate { .. }
                 | Action::BroadcastStateProvision { .. }
                 | Action::PersistBlock { .. }
                 | Action::PersistAndBroadcastVote { .. }
@@ -683,9 +684,9 @@ impl Action {
             self,
             Action::VerifyAndBuildQuorumCertificate { .. }
                 | Action::VerifyAndAggregateProvisions { .. }
-                | Action::AggregateStateCertificate { .. }
-                | Action::VerifyAndAggregateStateVotes { .. }
-                | Action::VerifyStateCertificateSignature { .. }
+                | Action::AggregateExecutionCertificate { .. }
+                | Action::VerifyAndAggregateExecutionVotes { .. }
+                | Action::VerifyExecutionCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
                 | Action::VerifyCycleProof { .. }
                 | Action::VerifyStateRoot { .. }
@@ -737,8 +738,8 @@ impl Action {
             Action::BroadcastTransactionCertificate { .. } => "BroadcastTransactionCertificate",
 
             // Network - Execution Layer (batchable)
-            Action::BroadcastStateVote { .. } => "BroadcastStateVote",
-            Action::BroadcastStateCertificate { .. } => "BroadcastStateCertificate",
+            Action::BroadcastExecutionVote { .. } => "BroadcastExecutionVote",
+            Action::BroadcastExecutionCertificate { .. } => "BroadcastExecutionCertificate",
             Action::BroadcastStateProvision { .. } => "BroadcastStateProvision",
 
             // Timers
@@ -751,9 +752,11 @@ impl Action {
             // Delegated Work - Crypto Verification
             Action::VerifyAndBuildQuorumCertificate { .. } => "VerifyAndBuildQuorumCertificate",
             Action::VerifyAndAggregateProvisions { .. } => "VerifyAndAggregateProvisions",
-            Action::AggregateStateCertificate { .. } => "AggregateStateCertificate",
-            Action::VerifyAndAggregateStateVotes { .. } => "VerifyAndAggregateStateVotes",
-            Action::VerifyStateCertificateSignature { .. } => "VerifyStateCertificateSignature",
+            Action::AggregateExecutionCertificate { .. } => "AggregateExecutionCertificate",
+            Action::VerifyAndAggregateExecutionVotes { .. } => "VerifyAndAggregateExecutionVotes",
+            Action::VerifyExecutionCertificateSignature { .. } => {
+                "VerifyExecutionCertificateSignature"
+            }
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
             Action::VerifyCycleProof { .. } => "VerifyCycleProof",
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",

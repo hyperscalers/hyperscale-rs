@@ -5,7 +5,7 @@
 //! loop's `dispatch_delegated_action` spawns closures that call this function
 //! on the appropriate thread pool.
 //!
-//! Batched work (state votes, state certs, cross-shard execution) and block
+//! Batched work (execution votes, execution certs, cross-shard execution) and block
 //! commits are handled inline by the node loop's flush closures.
 
 use hyperscale_core::{Action, NodeInput, ProtocolEvent};
@@ -13,7 +13,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_storage::{CommitStore, SubstateStore};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Hash, ShardGroupId, StateVoteBlock, Topology, ValidatorId,
+    Bls12381G1PrivateKey, ExecutionVote, Hash, ShardGroupId, Topology, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -61,7 +61,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
 
         // General crypto
-        Action::AggregateStateCertificate { .. } => Some(DispatchPool::Crypto),
+        Action::AggregateExecutionCertificate { .. } => Some(DispatchPool::Crypto),
         Action::VerifyAndAggregateProvisions { .. } => Some(DispatchPool::Crypto),
 
         // Execution
@@ -77,7 +77,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// that the runner must handle directly.
 ///
 /// For execution actions (`ExecuteTransactions`, `SpeculativeExecute`), the
-/// returned events include `ProtocolEvent::StateVoteReceived` for each vote.
+/// returned events include `ProtocolEvent::ExecutionVoteReceived` for each vote.
 /// The runner is responsible for additionally broadcasting votes to shard
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
@@ -254,7 +254,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
         }
 
         // --- Execution aggregation and verification ---
-        Action::AggregateStateCertificate {
+        Action::AggregateExecutionCertificate {
             tx_hash,
             shard,
             writes_commitment,
@@ -263,7 +263,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             voting_power,
             committee_size,
         } => {
-            let certificate = hyperscale_execution::handlers::aggregate_state_certificate(
+            let certificate = hyperscale_execution::handlers::aggregate_execution_certificate(
                 tx_hash,
                 shard,
                 writes_commitment,
@@ -275,7 +275,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             );
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
-                    ProtocolEvent::StateCertificateAggregated {
+                    ProtocolEvent::ExecutionCertificateAggregated {
                         tx_hash,
                         certificate,
                     },
@@ -320,14 +320,14 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
         }
 
         // --- Transaction execution ---
-        // NOTE: The returned events include StateVoteReceived for each vote.
+        // NOTE: The returned events include ExecutionVoteReceived for each vote.
         // The runner must additionally broadcast votes to shard peers (network-specific).
         Action::ExecuteTransactions {
             block_hash: _,
             transactions,
             state_root: _,
         } => {
-            let votes: Vec<StateVoteBlock> = ctx.dispatch.map_execution(&transactions, |tx| {
+            let votes: Vec<ExecutionVote> = ctx.dispatch.map_execution(&transactions, |tx| {
                 hyperscale_execution::handlers::execute_and_sign_single_shard(
                     ctx.executor,
                     ctx.storage,
@@ -340,7 +340,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
 
             let events = votes
                 .into_iter()
-                .map(|vote| NodeInput::Protocol(ProtocolEvent::StateVoteReceived { vote }))
+                .map(|vote| NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived { vote }))
                 .collect();
 
             Some(DelegatedResult {
@@ -353,7 +353,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             block_hash,
             transactions,
         } => {
-            let votes: Vec<StateVoteBlock> = ctx.dispatch.map_execution(&transactions, |tx| {
+            let votes: Vec<ExecutionVote> = ctx.dispatch.map_execution(&transactions, |tx| {
                 hyperscale_execution::handlers::execute_and_sign_single_shard(
                     ctx.executor,
                     ctx.storage,
@@ -367,7 +367,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             let tx_hashes: Vec<Hash> = votes.iter().map(|v| v.transaction_hash).collect();
             let mut events: Vec<NodeInput> = votes
                 .into_iter()
-                .map(|vote| NodeInput::Protocol(ProtocolEvent::StateVoteReceived { vote }))
+                .map(|vote| NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived { vote }))
                 .collect();
             events.push(NodeInput::Protocol(
                 ProtocolEvent::SpeculativeExecutionComplete {

@@ -291,7 +291,7 @@ impl Metrics {
 
             crypto_pool_queue_depth: register_gauge!(
                 "hyperscale_crypto_pool_queue_depth",
-                "Number of pending tasks in general crypto pool (provisions, state votes)"
+                "Number of pending tasks in general crypto pool (provisions, execution votes)"
             )
             .unwrap(),
 

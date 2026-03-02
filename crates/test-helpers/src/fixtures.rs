@@ -8,9 +8,9 @@ use std::sync::Arc;
 use crate::TestCommittee;
 use hyperscale_types::{
     block_vote_message, exec_vote_message, state_provision_message, verify_bls12381_v1,
-    BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, Hash, QuorumCertificate,
-    ShardGroupId, SignerBitfield, StateCertificate, StateEntry, StateProvision, StateVoteBlock,
-    VotePower,
+    BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate,
+    ExecutionVote, Hash, QuorumCertificate, ShardGroupId, SignerBitfield, StateEntry,
+    StateProvision, VotePower,
 };
 
 /// Create a properly-signed block vote.
@@ -136,21 +136,21 @@ pub fn make_signed_qc(
     }
 }
 
-/// Create a properly-signed state vote.
+/// Create a properly-signed execution vote.
 ///
 /// The vote is signed with the keypair at `voter_idx` in the committee.
-pub fn make_signed_state_vote(
+pub fn make_signed_execution_vote(
     committee: &TestCommittee,
     voter_idx: usize,
     tx_hash: Hash,
     writes_commitment: Hash,
     shard: ShardGroupId,
     success: bool,
-) -> StateVoteBlock {
+) -> ExecutionVote {
     let message = exec_vote_message(&tx_hash, &writes_commitment, shard, success);
     let signature = committee.keypair(voter_idx).sign_v1(&message);
 
-    StateVoteBlock {
+    ExecutionVote {
         transaction_hash: tx_hash,
         shard_group_id: shard,
         writes_commitment,
@@ -161,17 +161,17 @@ pub fn make_signed_state_vote(
     }
 }
 
-/// Create a state certificate from signed votes.
+/// Create an execution certificate from signed votes.
 ///
 /// Aggregates BLS signatures from the specified voter indices.
-pub fn make_signed_state_certificate(
+pub fn make_signed_execution_certificate(
     committee: &TestCommittee,
     voter_indices: &[usize],
     tx_hash: Hash,
     writes_commitment: Hash,
     shard: ShardGroupId,
     success: bool,
-) -> StateCertificate {
+) -> ExecutionCertificate {
     let message = exec_vote_message(&tx_hash, &writes_commitment, shard, success);
 
     // Collect individual signatures
@@ -190,7 +190,7 @@ pub fn make_signed_state_certificate(
         signers.set(idx);
     }
 
-    StateCertificate {
+    ExecutionCertificate {
         transaction_hash: tx_hash,
         shard_group_id: shard,
         read_nodes: vec![],
@@ -274,14 +274,17 @@ pub fn verify_qc(qc: &QuorumCertificate, committee: &TestCommittee) -> bool {
     }
 }
 
-/// Verify a state vote signature.
-pub fn verify_state_vote(vote: &StateVoteBlock, public_key: &Bls12381G1PublicKey) -> bool {
+/// Verify an execution vote signature.
+pub fn verify_execution_vote(vote: &ExecutionVote, public_key: &Bls12381G1PublicKey) -> bool {
     let message = vote.signing_message();
     verify_bls12381_v1(&message, public_key, &vote.signature)
 }
 
-/// Verify a state certificate's aggregated signature.
-pub fn verify_state_certificate(cert: &StateCertificate, committee: &TestCommittee) -> bool {
+/// Verify an execution certificate's aggregated signature.
+pub fn verify_execution_certificate(
+    cert: &ExecutionCertificate,
+    committee: &TestCommittee,
+) -> bool {
     let message = cert.signing_message();
 
     // Collect signer public keys
@@ -351,29 +354,30 @@ mod tests {
     }
 
     #[test]
-    fn test_signed_state_vote() {
+    fn test_signed_execution_vote() {
         let committee = TestCommittee::new(4, 42);
         let tx_hash = Hash::from_bytes(b"tx");
         let writes_commitment = Hash::from_bytes(b"state");
         let shard = ShardGroupId(0);
 
-        let vote = make_signed_state_vote(&committee, 0, tx_hash, writes_commitment, shard, true);
+        let vote =
+            make_signed_execution_vote(&committee, 0, tx_hash, writes_commitment, shard, true);
 
         // Should verify with correct key
-        assert!(verify_state_vote(&vote, committee.public_key(0)));
+        assert!(verify_execution_vote(&vote, committee.public_key(0)));
 
         // Should not verify with wrong key
-        assert!(!verify_state_vote(&vote, committee.public_key(1)));
+        assert!(!verify_execution_vote(&vote, committee.public_key(1)));
     }
 
     #[test]
-    fn test_signed_state_certificate() {
+    fn test_signed_execution_certificate() {
         let committee = TestCommittee::new(4, 42);
         let tx_hash = Hash::from_bytes(b"tx");
         let writes_commitment = Hash::from_bytes(b"commitment");
         let shard = ShardGroupId(0);
 
-        let cert = make_signed_state_certificate(
+        let cert = make_signed_execution_certificate(
             &committee,
             &[0, 1, 2],
             tx_hash,
@@ -382,7 +386,7 @@ mod tests {
             true,
         );
 
-        assert!(verify_state_certificate(&cert, &committee));
+        assert!(verify_execution_certificate(&cert, &committee));
         assert_eq!(cert.signer_count(), 3);
     }
 

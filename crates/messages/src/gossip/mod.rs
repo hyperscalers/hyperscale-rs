@@ -4,12 +4,13 @@
 
 mod block_header;
 mod block_vote;
-mod state; // Phase 4: StateProvision, StateCertificate, StateVoteBlock (batched)
+mod state; // Phase 4: StateProvision, ExecutionCertificate, ExecutionVote (batched)
 mod transaction;
 
 pub use block_header::BlockHeaderGossip;
 pub use block_vote::BlockVoteGossip;
 pub use state::{
-    StateCertificateBatch, StateProvisionBatch, StateVoteBatch, TransactionCertificateGossip,
+    ExecutionCertificateBatch, ExecutionVoteBatch, StateProvisionBatch,
+    TransactionCertificateGossip,
 };
 pub use transaction::TransactionGossip;

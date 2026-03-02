@@ -27,19 +27,19 @@ pub struct BatchConfig {
     pub cross_shard_max: usize,
     pub cross_shard_window: Duration,
 
-    /// State vote verification batch.
-    pub state_vote_max: usize,
-    pub state_vote_window: Duration,
+    /// Execution vote verification batch.
+    pub execution_vote_max: usize,
+    pub execution_vote_window: Duration,
 
-    /// State certificate verification batch.
-    pub state_cert_max: usize,
-    pub state_cert_window: Duration,
+    /// Execution certificate verification batch.
+    pub execution_certificate_max: usize,
+    pub execution_certificate_window: Duration,
 
-    /// Broadcast state vote batch.
+    /// Broadcast execution vote batch.
     pub broadcast_vote_max: usize,
     pub broadcast_vote_window: Duration,
 
-    /// Broadcast state certificate batch.
+    /// Broadcast execution certificate batch.
     pub broadcast_cert_max: usize,
     pub broadcast_cert_window: Duration,
 
@@ -58,11 +58,11 @@ impl Default for BatchConfig {
             cross_shard_max: 256,
             cross_shard_window: Duration::from_millis(5),
 
-            state_vote_max: 64,
-            state_vote_window: Duration::from_millis(20),
+            execution_vote_max: 64,
+            execution_vote_window: Duration::from_millis(20),
 
-            state_cert_max: 64,
-            state_cert_window: Duration::from_millis(15),
+            execution_certificate_max: 64,
+            execution_certificate_window: Duration::from_millis(15),
 
             broadcast_vote_max: 64,
             broadcast_vote_window: Duration::from_millis(15),

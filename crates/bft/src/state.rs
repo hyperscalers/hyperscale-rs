@@ -1695,7 +1695,7 @@ impl BftState {
         //
         // This reduces unnecessary network traffic:
         // - Transactions often arrive via gossip before we need to fetch
-        // - Certificates can be created locally from state certificates
+        // - Certificates can be created locally from execution certificates
         if let Some(pending) = self.pending_blocks.get(&block_hash) {
             debug!(
                 validator = ?self.validator_id(),

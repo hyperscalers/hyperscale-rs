@@ -6,10 +6,10 @@
 //! boundary between protocol logic and I/O orchestration.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockVote, CommitmentProof, EpochConfig, EpochId, Hash,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, StateCertificate, StateEntry,
-    StateProvision, StateVoteBlock, TransactionAbort, TransactionCertificate, TransactionDefer,
-    ValidatorId,
+    Block, BlockHeader, BlockHeight, BlockVote, CommitmentProof, EpochConfig, EpochId,
+    ExecutionCertificate, ExecutionVote, Hash, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, StateEntry, StateProvision, TransactionAbort, TransactionCertificate,
+    TransactionDefer, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -157,28 +157,28 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Execution
     // ═══════════════════════════════════════════════════════════════════════
-    /// Received a state vote for cross-shard execution.
-    StateVoteReceived { vote: StateVoteBlock },
+    /// Received an execution vote for cross-shard execution.
+    ExecutionVoteReceived { vote: ExecutionVote },
 
-    /// Received a state certificate for cross-shard execution.
-    StateCertificateReceived { cert: StateCertificate },
+    /// Received an execution certificate for cross-shard execution.
+    ExecutionCertificateReceived { cert: ExecutionCertificate },
 
-    /// Batch state vote verification completed.
-    StateVotesVerifiedAndAggregated {
+    /// Batch execution vote verification completed.
+    ExecutionVotesVerifiedAndAggregated {
         tx_hash: Hash,
-        verified_votes: Vec<(StateVoteBlock, u64)>,
+        verified_votes: Vec<(ExecutionVote, u64)>,
     },
 
-    /// State certificate signature verification completed.
-    StateCertificateSignatureVerified {
-        certificate: StateCertificate,
+    /// Execution certificate signature verification completed.
+    ExecutionCertificateSignatureVerified {
+        certificate: ExecutionCertificate,
         valid: bool,
     },
 
-    /// State certificate aggregation completed.
-    StateCertificateAggregated {
+    /// Execution certificate aggregation completed.
+    ExecutionCertificateAggregated {
         tx_hash: Hash,
-        certificate: StateCertificate,
+        certificate: ExecutionCertificate,
     },
 
     /// Speculative execution of single-shard transactions completed.
@@ -373,15 +373,17 @@ impl ProtocolEvent {
             ProtocolEvent::ProvisioningComplete { .. } => "ProvisioningComplete",
 
             // Execution
-            ProtocolEvent::StateVoteReceived { .. } => "StateVoteReceived",
-            ProtocolEvent::StateCertificateReceived { .. } => "StateCertificateReceived",
-            ProtocolEvent::StateVotesVerifiedAndAggregated { .. } => {
-                "StateVotesVerifiedAndAggregated"
+            ProtocolEvent::ExecutionVoteReceived { .. } => "ExecutionVoteReceived",
+            ProtocolEvent::ExecutionCertificateReceived { .. } => "ExecutionCertificateReceived",
+            ProtocolEvent::ExecutionVotesVerifiedAndAggregated { .. } => {
+                "ExecutionVotesVerifiedAndAggregated"
             }
-            ProtocolEvent::StateCertificateSignatureVerified { .. } => {
-                "StateCertificateSignatureVerified"
+            ProtocolEvent::ExecutionCertificateSignatureVerified { .. } => {
+                "ExecutionCertificateSignatureVerified"
             }
-            ProtocolEvent::StateCertificateAggregated { .. } => "StateCertificateAggregated",
+            ProtocolEvent::ExecutionCertificateAggregated { .. } => {
+                "ExecutionCertificateAggregated"
+            }
             ProtocolEvent::SpeculativeExecutionComplete { .. } => "SpeculativeExecutionComplete",
 
             // Mempool / Transactions

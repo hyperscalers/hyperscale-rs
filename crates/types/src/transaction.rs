@@ -1,6 +1,8 @@
 //! Transaction types for consensus.
 
-use crate::{BlockHeight, CycleProof, Hash, NodeId, ShardGroupId, StateCertificate, SubstateWrite};
+use crate::{
+    BlockHeight, CycleProof, ExecutionCertificate, Hash, NodeId, ShardGroupId, SubstateWrite,
+};
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
 use radix_transactions::validation::TransactionValidator;
@@ -769,13 +771,13 @@ pub enum TransactionStatus {
     /// For cross-shard transactions, this encompasses:
     /// - State provisioning (collecting state from other shards)
     /// - Execution (running the transaction logic)
-    /// - Vote collection (gathering 2f+1 votes for state certificate)
+    /// - Vote collection (gathering 2f+1 votes for execution certificate)
     /// - Certificate collection (gathering certificates from all shards)
     Committed(BlockHeight),
 
     /// Execution complete, TransactionCertificate has been created.
     ///
-    /// All StateCertificates have been collected and aggregated into a
+    /// All ExecutionCertificates have been collected and aggregated into a
     /// TransactionCertificate with Accept or Reject decision.
     ///
     /// **Important**: State is NOT yet updated at this point. The certificate
@@ -1126,9 +1128,9 @@ pub struct TransactionCertificate {
     /// Final decision: ACCEPT if all shards succeeded, REJECT otherwise.
     pub decision: TransactionDecision,
 
-    /// State certificates from all participating shards, keyed by shard ID.
+    /// Execution certificates from all participating shards, keyed by shard ID.
     /// Each certificate contains read_nodes, state_writes, signatures, etc.
-    pub shard_proofs: BTreeMap<ShardGroupId, StateCertificate>,
+    pub shard_proofs: BTreeMap<ShardGroupId, ExecutionCertificate>,
 }
 
 impl TransactionCertificate {
@@ -1163,7 +1165,7 @@ impl TransactionCertificate {
     }
 
     /// Get certificate for a specific shard.
-    pub fn certificate_for_shard(&self, shard_id: ShardGroupId) -> Option<&StateCertificate> {
+    pub fn certificate_for_shard(&self, shard_id: ShardGroupId) -> Option<&ExecutionCertificate> {
         self.shard_proofs.get(&shard_id)
     }
 

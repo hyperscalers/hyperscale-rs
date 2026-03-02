@@ -30,15 +30,15 @@ use hyperscale_core::{
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{RadixExecutor, TransactionValidation};
 use hyperscale_messages::{
-    BlockHeaderGossip, BlockVoteGossip, StateCertificateBatch, StateProvisionBatch, StateVoteBatch,
-    TransactionCertificateGossip, TransactionGossip,
+    BlockHeaderGossip, BlockVoteGossip, ExecutionCertificateBatch, ExecutionVoteBatch,
+    StateProvisionBatch, TransactionCertificateGossip, TransactionGossip,
 };
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, Hash, RoutableTransaction, ShardGroupId,
-    StateCertificate, StateVoteBlock, Topology, TransactionCertificate, ValidatorId,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, ExecutionCertificate, ExecutionVote, Hash,
+    RoutableTransaction, ShardGroupId, Topology, TransactionCertificate, ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -58,7 +58,7 @@ const PENDING_GOSSIP_CERT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Pending verification of a gossiped TransactionCertificate.
 ///
 /// When we receive a TransactionCertificate via gossip, we verify each embedded
-/// StateCertificate's BLS signature before persisting. This tracks the verification
+/// ExecutionCertificate's BLS signature before persisting. This tracks the verification
 /// progress for a single certificate.
 struct PendingGossipVerification {
     /// The certificate being verified.
@@ -71,10 +71,10 @@ struct PendingGossipVerification {
     created_at: Duration,
 }
 
-use hyperscale_execution::handlers::UnverifiedStateVote;
+use hyperscale_execution::handlers::UnverifiedExecutionVote;
 
-/// A single state-vote verification item: tx_hash with its unverified votes.
-type StateVoteVerificationItem = (Hash, Vec<UnverifiedStateVote>);
+/// A single execution-vote verification item: tx_hash with its unverified votes.
+type ExecutionVoteVerificationItem = (Hash, Vec<UnverifiedExecutionVote>);
 
 // ═══════════════════════════════════════════════════════════════════════
 // TimerOp — buffered timer operations for the runner
@@ -189,10 +189,10 @@ where
     // Batch accumulators
     validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
     cross_shard_batch: BatchAccumulator<CrossShardExecutionRequest>,
-    state_vote_batch: BatchAccumulator<StateVoteVerificationItem>,
-    state_cert_batch: BatchAccumulator<(StateCertificate, Vec<Bls12381G1PublicKey>)>,
-    broadcast_vote_batch: ShardedBatchAccumulator<StateVoteBlock>,
-    broadcast_cert_batch: ShardedBatchAccumulator<Arc<StateCertificate>>,
+    execution_vote_batch: BatchAccumulator<ExecutionVoteVerificationItem>,
+    execution_certificate_batch: BatchAccumulator<(ExecutionCertificate, Vec<Bls12381G1PublicKey>)>,
+    broadcast_vote_batch: ShardedBatchAccumulator<ExecutionVote>,
+    broadcast_cert_batch: ShardedBatchAccumulator<Arc<ExecutionCertificate>>,
     broadcast_provision_batch: ShardedBatchAccumulator<hyperscale_types::StateProvision>,
 
     // Transaction status cache — retains the latest status for every transaction
@@ -253,8 +253,14 @@ where
             fetch_protocol,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             cross_shard_batch: BatchAccumulator::new(b.cross_shard_max, b.cross_shard_window),
-            state_vote_batch: BatchAccumulator::new(b.state_vote_max, b.state_vote_window),
-            state_cert_batch: BatchAccumulator::new(b.state_cert_max, b.state_cert_window),
+            execution_vote_batch: BatchAccumulator::new(
+                b.execution_vote_max,
+                b.execution_vote_window,
+            ),
+            execution_certificate_batch: BatchAccumulator::new(
+                b.execution_certificate_max,
+                b.execution_certificate_window,
+            ),
             broadcast_vote_batch: ShardedBatchAccumulator::new(
                 b.broadcast_vote_max,
                 b.broadcast_vote_window,
@@ -567,9 +573,9 @@ where
 
             // ── Protocol events → state machine ────────────────────────
             NodeInput::Protocol(pe) => {
-                // Broadcast self-generated state votes returning from dispatch.
+                // Broadcast self-generated execution votes returning from dispatch.
                 // Votes from peers arrive via network gossip.
-                if let ProtocolEvent::StateVoteReceived { ref vote } = pe {
+                if let ProtocolEvent::ExecutionVoteReceived { ref vote } = pe {
                     if vote.validator == self.validator_id {
                         self.accumulate_broadcast_vote(self.local_shard, vote.clone());
                     }
@@ -609,11 +615,11 @@ where
         if self.cross_shard_batch.is_expired(now) {
             self.flush_cross_shard_executions();
         }
-        if self.state_vote_batch.is_expired(now) {
-            self.flush_state_vote_verifications();
+        if self.execution_vote_batch.is_expired(now) {
+            self.flush_execution_vote_verifications();
         }
-        if self.state_cert_batch.is_expired(now) {
-            self.flush_state_cert_verifications();
+        if self.execution_certificate_batch.is_expired(now) {
+            self.flush_execution_certificate_verifications();
         }
         if self.broadcast_vote_batch.is_expired(now) {
             self.flush_broadcast_votes();
@@ -648,8 +654,8 @@ where
         [
             self.validation_batch.deadline(),
             self.cross_shard_batch.deadline(),
-            self.state_vote_batch.deadline(),
-            self.state_cert_batch.deadline(),
+            self.execution_vote_batch.deadline(),
+            self.execution_certificate_batch.deadline(),
             self.broadcast_vote_batch.deadline(),
             self.broadcast_cert_batch.deadline(),
             self.broadcast_provision_batch.deadline(),
@@ -700,10 +706,10 @@ where
             // ═══════════════════════════════════════════════════════════
             // Network broadcasts — batched
             // ═══════════════════════════════════════════════════════════
-            Action::BroadcastStateVote { shard, vote } => {
+            Action::BroadcastExecutionVote { shard, vote } => {
                 self.accumulate_broadcast_vote(shard, vote);
             }
-            Action::BroadcastStateCertificate { shard, certificate } => {
+            Action::BroadcastExecutionCertificate { shard, certificate } => {
                 self.accumulate_broadcast_cert(shard, certificate);
             }
             Action::BroadcastStateProvision { shard, provision } => {
@@ -713,14 +719,14 @@ where
             // ═══════════════════════════════════════════════════════════
             // Delegated work — batched (accumulated for batch dispatch)
             // ═══════════════════════════════════════════════════════════
-            Action::VerifyAndAggregateStateVotes { tx_hash, votes } => {
-                self.accumulate_state_vote_verification((tx_hash, votes));
+            Action::VerifyAndAggregateExecutionVotes { tx_hash, votes } => {
+                self.accumulate_execution_vote_verification((tx_hash, votes));
             }
-            Action::VerifyStateCertificateSignature {
+            Action::VerifyExecutionCertificateSignature {
                 certificate,
                 public_keys,
             } => {
-                self.accumulate_state_cert_verification(certificate, public_keys);
+                self.accumulate_execution_certificate_verification(certificate, public_keys);
             }
             Action::ExecuteCrossShardTransaction {
                 tx_hash,
@@ -739,7 +745,7 @@ where
             | Action::VerifyStateRoot { .. }
             | Action::VerifyTransactionRoot { .. }
             | Action::BuildProposal { .. }
-            | Action::AggregateStateCertificate { .. }
+            | Action::AggregateExecutionCertificate { .. }
             | Action::VerifyAndAggregateProvisions { .. }
             | Action::ExecuteTransactions { .. }
             | Action::SpeculativeExecute { .. } => {
@@ -1337,19 +1343,19 @@ where
             });
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
             for vote in votes {
-                let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::StateVoteReceived {
+                let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived {
                     vote,
                 }));
             }
         });
     }
 
-    /// Flush accumulated state vote verifications as a single batch.
+    /// Flush accumulated execution vote verifications as a single batch.
     ///
     /// Spawns one closure on the crypto pool that uses cross-transaction BLS
     /// batch verification (~2 pairings) instead of N individual dispatches.
-    fn flush_state_vote_verifications(&mut self) {
-        let items = self.state_vote_batch.take();
+    fn flush_execution_vote_verifications(&mut self) {
+        let items = self.execution_vote_batch.take();
         if items.is_empty() {
             return;
         }
@@ -1357,10 +1363,10 @@ where
         let event_tx = self.event_sender.clone();
         self.dispatch.spawn_crypto(move || {
             for (tx_hash, verified_votes) in
-                hyperscale_execution::handlers::batch_verify_and_aggregate_state_votes(items)
+                hyperscale_execution::handlers::batch_verify_and_aggregate_execution_votes(items)
             {
                 let _ = event_tx.send(NodeInput::Protocol(
-                    ProtocolEvent::StateVotesVerifiedAndAggregated {
+                    ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
                         tx_hash,
                         verified_votes,
                     },
@@ -1369,12 +1375,12 @@ where
         });
     }
 
-    /// Flush accumulated state certificate verifications as a single batch.
+    /// Flush accumulated execution certificate verifications as a single batch.
     ///
     /// Spawns one closure on the crypto pool that uses cross-certificate BLS
     /// batch verification (~2 pairings) instead of N individual dispatches.
-    fn flush_state_cert_verifications(&mut self) {
-        let items = self.state_cert_batch.take();
+    fn flush_execution_certificate_verifications(&mut self) {
+        let items = self.execution_certificate_batch.take();
         if items.is_empty() {
             return;
         }
@@ -1382,10 +1388,12 @@ where
         let event_tx = self.event_sender.clone();
         self.dispatch.spawn_crypto(move || {
             let results =
-                hyperscale_execution::handlers::batch_verify_state_certificate_signatures(&items);
+                hyperscale_execution::handlers::batch_verify_execution_certificate_signatures(
+                    &items,
+                );
             for ((certificate, _), valid) in items.into_iter().zip(results) {
                 let _ = event_tx.send(NodeInput::Protocol(
-                    ProtocolEvent::StateCertificateSignatureVerified { certificate, valid },
+                    ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid },
                 ));
             }
         });
@@ -1395,7 +1403,7 @@ where
 
     /// Handle a gossiped TransactionCertificate.
     ///
-    /// Verifies each embedded StateCertificate's BLS signature before persisting
+    /// Verifies each embedded ExecutionCertificate's BLS signature before persisting
     /// to prevent malicious peers from filling storage with invalid certificates.
     fn handle_gossiped_certificate(&mut self, certificate: TransactionCertificate) {
         let tx_hash = certificate.transaction_hash;
@@ -1441,7 +1449,7 @@ where
         );
 
         // Dispatch BLS signature verification for each shard proof.
-        for (shard_id, state_cert) in &certificate.shard_proofs {
+        for (shard_id, execution_cert) in &certificate.shard_proofs {
             let committee = self.topology.committee_for_shard(*shard_id);
             let public_keys: Vec<Bls12381G1PublicKey> = committee
                 .iter()
@@ -1466,16 +1474,16 @@ where
 
             let es = self.event_sender.clone();
             let shard = *shard_id;
-            let cert = state_cert.clone();
+            let cert = execution_cert.clone();
 
             self.dispatch.spawn_crypto(move || {
                 let start = std::time::Instant::now();
-                let valid = hyperscale_execution::handlers::verify_state_certificate_signature(
+                let valid = hyperscale_execution::handlers::verify_execution_certificate_signature(
                     &cert,
                     &public_keys,
                 );
                 metrics::record_signature_verification_latency(
-                    "bls_state_cert",
+                    "bls_execution_cert",
                     start.elapsed().as_secs_f64(),
                 );
                 if !valid {
@@ -1592,13 +1600,13 @@ where
                     }
                 }
             }
-            "state.vote.batch" => {
-                let Ok(batch) = sbor::basic_decode::<StateVoteBatch>(payload) else {
-                    warn!("Failed to decode StateVoteBatch");
+            "execution.vote.batch" => {
+                let Ok(batch) = sbor::basic_decode::<ExecutionVoteBatch>(payload) else {
+                    warn!("Failed to decode ExecutionVoteBatch");
                     return;
                 };
                 for vote in batch.into_votes() {
-                    let pe = ProtocolEvent::StateVoteReceived { vote };
+                    let pe = ProtocolEvent::ExecutionVoteReceived { vote };
                     let actions = self.state.handle(pe);
                     self.actions_generated += actions.len();
                     for action in actions {
@@ -1606,13 +1614,13 @@ where
                     }
                 }
             }
-            "state.certificate.batch" => {
-                let Ok(batch) = sbor::basic_decode::<StateCertificateBatch>(payload) else {
-                    warn!("Failed to decode StateCertificateBatch");
+            "execution.certificate.batch" => {
+                let Ok(batch) = sbor::basic_decode::<ExecutionCertificateBatch>(payload) else {
+                    warn!("Failed to decode ExecutionCertificateBatch");
                     return;
                 };
                 for cert in batch.into_certificates() {
-                    let pe = ProtocolEvent::StateCertificateReceived { cert };
+                    let pe = ProtocolEvent::ExecutionCertificateReceived { cert };
                     let actions = self.state.handle(pe);
                     self.actions_generated += actions.len();
                     for action in actions {
@@ -1667,30 +1675,30 @@ where
         }
     }
 
-    fn accumulate_state_vote_verification(&mut self, item: StateVoteVerificationItem) {
+    fn accumulate_execution_vote_verification(&mut self, item: ExecutionVoteVerificationItem) {
         let weight = item.1.len();
         if self
-            .state_vote_batch
+            .execution_vote_batch
             .push_weighted(item, weight, self.state.now())
         {
-            self.flush_state_vote_verifications();
+            self.flush_execution_vote_verifications();
         }
     }
 
-    fn accumulate_state_cert_verification(
+    fn accumulate_execution_certificate_verification(
         &mut self,
-        certificate: StateCertificate,
+        certificate: ExecutionCertificate,
         public_keys: Vec<Bls12381G1PublicKey>,
     ) {
         if self
-            .state_cert_batch
+            .execution_certificate_batch
             .push((certificate, public_keys), self.state.now())
         {
-            self.flush_state_cert_verifications();
+            self.flush_execution_certificate_verifications();
         }
     }
 
-    fn accumulate_broadcast_vote(&mut self, shard: ShardGroupId, vote: StateVoteBlock) {
+    fn accumulate_broadcast_vote(&mut self, shard: ShardGroupId, vote: ExecutionVote) {
         if self
             .broadcast_vote_batch
             .push(shard, vote, self.state.now())
@@ -1699,7 +1707,7 @@ where
         }
     }
 
-    fn accumulate_broadcast_cert(&mut self, shard: ShardGroupId, cert: Arc<StateCertificate>) {
+    fn accumulate_broadcast_cert(&mut self, shard: ShardGroupId, cert: Arc<ExecutionCertificate>) {
         if self
             .broadcast_cert_batch
             .push(shard, cert, self.state.now())
@@ -1726,7 +1734,7 @@ where
     fn flush_broadcast_votes(&mut self) {
         for (shard, votes) in self.broadcast_vote_batch.take() {
             if !votes.is_empty() {
-                let batch = StateVoteBatch::new(votes);
+                let batch = ExecutionVoteBatch::new(votes);
                 self.network.broadcast_to_shard(shard, &batch);
             }
         }
@@ -1735,9 +1743,9 @@ where
     fn flush_broadcast_certs(&mut self) {
         for (shard, certs) in self.broadcast_cert_batch.take() {
             if !certs.is_empty() {
-                let owned: Vec<StateCertificate> =
+                let owned: Vec<ExecutionCertificate> =
                     certs.into_iter().map(Arc::unwrap_or_clone).collect();
-                let batch = StateCertificateBatch::new(owned);
+                let batch = ExecutionCertificateBatch::new(owned);
                 self.network.broadcast_to_shard(shard, &batch);
             }
         }
@@ -1841,8 +1849,8 @@ where
     pub fn flush_all_batches(&mut self) {
         self.flush_validation_batch();
         self.flush_cross_shard_executions();
-        self.flush_state_vote_verifications();
-        self.flush_state_cert_verifications();
+        self.flush_execution_vote_verifications();
+        self.flush_execution_certificate_verifications();
         self.flush_broadcast_votes();
         self.flush_broadcast_certs();
         self.flush_broadcast_provisions();

@@ -4254,8 +4254,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"state_vote\"}[1m])) by (le))",
-          "legendFormat": "state_vote p50",
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"bls_execution_vote\"}[1m])) by (le))",
+          "legendFormat": "execution_vote p50",
           "refId": "E"
         },
         {
@@ -4263,8 +4263,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"state_vote\"}[1m])) by (le))",
-          "legendFormat": "state_vote p99",
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"bls_execution_vote\"}[1m])) by (le))",
+          "legendFormat": "execution_vote p99",
           "refId": "F"
         },
         {
@@ -4272,8 +4272,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"state_cert\"}[1m])) by (le))",
-          "legendFormat": "state_cert p50",
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"bls_execution_cert\"}[1m])) by (le))",
+          "legendFormat": "execution_cert p50",
           "refId": "G"
         },
         {
@@ -4281,8 +4281,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"state_cert\"}[1m])) by (le))",
-          "legendFormat": "state_cert p99",
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"bls_execution_cert\"}[1m])) by (le))",
+          "legendFormat": "execution_cert p99",
           "refId": "H"
         }
       ],

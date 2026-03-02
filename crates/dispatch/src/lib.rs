@@ -15,7 +15,7 @@
 //! Work is categorized by priority and isolation requirements:
 //!
 //! - **Consensus Crypto**: Liveness-critical (block votes, QC verification)
-//! - **Crypto**: General signature verification (provisions, state votes)
+//! - **Crypto**: General signature verification (provisions, execution votes)
 //! - **TX Validation**: Transaction signature verification (isolated from crypto)
 //! - **Execution**: Radix Engine transaction execution
 //! - **Codec**: SBOR message encoding/decoding
@@ -40,7 +40,7 @@ pub trait Dispatch: Send + Sync + Clone {
 
     /// Spawn a general crypto verification task.
     ///
-    /// Use for provisions and state votes. Not consensus-critical.
+    /// Use for provisions and execution votes. Not consensus-critical.
     fn spawn_crypto(&self, f: impl FnOnce() + Send + 'static);
 
     /// Spawn a crypto task with backpressure.
@@ -52,7 +52,7 @@ pub trait Dispatch: Send + Sync + Clone {
     /// Spawn a transaction validation task.
     ///
     /// Isolated from general crypto to prevent transaction floods from
-    /// blocking provision/state vote verification.
+    /// blocking provision/execution vote verification.
     fn spawn_tx_validation(&self, f: impl FnOnce() + Send + 'static);
 
     /// Spawn an execution task (Radix Engine).

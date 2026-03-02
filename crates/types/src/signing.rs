@@ -12,7 +12,7 @@
 //! |-----|---------|
 //! | `BLOCK_VOTE` | BFT block votes |
 //! | `STATE_PROVISION` | Cross-shard state provisions |
-//! | `EXEC_VOTE` | Execution state votes |
+//! | `EXEC_VOTE` | Execution votes |
 //!
 //! # Usage
 //!
@@ -32,11 +32,11 @@ pub const DOMAIN_BLOCK_VOTE: &[u8] = b"BLOCK_VOTE";
 /// Format: `STATE_PROVISION` || tx_hash || target_shard || source_shard || height || timestamp || entries_hash
 pub const DOMAIN_STATE_PROVISION: &[u8] = b"STATE_PROVISION";
 
-/// Domain tag for execution state votes.
+/// Domain tag for execution votes.
 ///
 /// Format: `EXEC_VOTE` || tx_hash || state_root || shard_group || success
 ///
-/// Note: StateCertificates aggregate signatures from StateVoteBlocks, so they
+/// Note: ExecutionCertificates aggregate signatures from ExecutionVotes, so they
 /// use the same domain tag since they verify the same underlying message.
 pub const DOMAIN_EXEC_VOTE: &[u8] = b"EXEC_VOTE";
 
@@ -87,14 +87,14 @@ pub fn state_provision_message(
     msg
 }
 
-/// Build the signing message for an execution state vote.
+/// Build the signing message for an execution vote.
 ///
 /// This is used for:
-/// - Individual StateVoteBlock signatures
-/// - StateCertificate aggregated signature verification
+/// - Individual ExecutionVote signatures
+/// - ExecutionCertificate aggregated signature verification
 ///
-/// Note: Both use the same message format because StateCertificates aggregate
-/// signatures from StateVoteBlocks.
+/// Note: Both use the same message format because ExecutionCertificates aggregate
+/// signatures from ExecutionVotes.
 pub fn exec_vote_message(
     tx_hash: &Hash,
     writes_commitment: &Hash,

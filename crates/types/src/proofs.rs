@@ -40,7 +40,7 @@ pub const DOMAIN_COMMITMENT_PROOF: &[u8] = b"COMMITMENT_PROOF";
 /// Before (individual signatures): 67 provisions × 64 bytes = ~4KB signatures + duplicated state
 /// After (aggregated): 48 byte bitfield + 48 byte signature + single copy of state entries
 ///
-/// This follows the same pattern used by `QuorumCertificate` and `StateCertificate`.
+/// This follows the same pattern used by `QuorumCertificate` and `ExecutionCertificate`.
 #[derive(Debug, Clone)]
 pub struct CommitmentProof {
     /// The transaction that was committed elsewhere.

@@ -70,7 +70,7 @@ pub use block::{compute_transaction_root, Block, BlockHeader, BlockMetadata};
 pub use quorum_certificate::QuorumCertificate;
 pub use signer_bitfield::SignerBitfield;
 pub use state::{
-    ExecutionResult, StateCertificate, StateEntry, StateProvision, StateVoteBlock, SubstateWrite,
+    ExecutionCertificate, ExecutionResult, ExecutionVote, StateEntry, StateProvision, SubstateWrite,
 };
 pub use topology::{
     shard_for_node, DynamicTopology, DynamicTopologyError, StaticTopology, Topology, TopologyError,

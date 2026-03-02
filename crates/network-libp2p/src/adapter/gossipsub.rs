@@ -65,12 +65,12 @@ pub(super) async fn handle_gossipsub_event(
             //
             // Cross-shard messages (allowed from any shard):
             // - state.provision: Sent cross-shard to request state for transactions
-            // - state.certificate: Needed for cross-shard transaction execution
+            // - execution.certificate.batch: Needed for cross-shard transaction execution
             // - transaction.gossip: Can be routed to appropriate shard
 
             let msg_type = parsed_topic.message_type();
             let is_shard_local_message =
-                matches!(msg_type, "block.header" | "block.vote" | "state.vote");
+                matches!(msg_type, "block.header" | "block.vote" | "execution.vote");
 
             if is_shard_local_message {
                 if let Some(topic_shard) = parsed_topic.shard_id() {

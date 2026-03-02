@@ -729,23 +729,25 @@ impl StateMachine for NodeStateMachine {
             } => self.execution.on_provisioning_complete(tx_hash, provisions),
 
             // Execution events - direct delegation
-            ProtocolEvent::StateVoteReceived { vote } => self.execution.on_vote(vote),
-            ProtocolEvent::StateCertificateReceived { cert } => self.execution.on_certificate(cert),
-            ProtocolEvent::StateVotesVerifiedAndAggregated {
+            ProtocolEvent::ExecutionVoteReceived { vote } => self.execution.on_vote(vote),
+            ProtocolEvent::ExecutionCertificateReceived { cert } => {
+                self.execution.on_certificate(cert)
+            }
+            ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
                 tx_hash,
                 verified_votes,
             } => self
                 .execution
-                .on_state_votes_verified(tx_hash, verified_votes),
-            ProtocolEvent::StateCertificateSignatureVerified { certificate, valid } => {
+                .on_execution_votes_verified(tx_hash, verified_votes),
+            ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => {
                 self.execution.on_certificate_verified(certificate, valid)
             }
-            ProtocolEvent::StateCertificateAggregated {
+            ProtocolEvent::ExecutionCertificateAggregated {
                 tx_hash,
                 certificate,
             } => self
                 .execution
-                .on_state_certificate_aggregated(tx_hash, certificate),
+                .on_execution_certificate_aggregated(tx_hash, certificate),
             ProtocolEvent::SpeculativeExecutionComplete {
                 block_hash,
                 tx_hashes,
@@ -981,7 +983,7 @@ impl StateMachine for NodeStateMachine {
                 block_hash,
                 certificates,
             } => {
-                // Verify each fetched certificate's embedded StateCertificates against
+                // Verify each fetched certificate's embedded ExecutionCertificates against
                 // our current topology. This ensures we don't accept forged certificates
                 // from Byzantine peers.
                 let mut actions = Vec::new();

@@ -1,17 +1,17 @@
 //! Certificate tracker for cross-shard finalization.
 //!
-//! Tracks the collection of state certificates from all participating shards
+//! Tracks the collection of execution certificates from all participating shards
 //! during Phase 5 of the cross-shard 2PC protocol.
 
 use hyperscale_types::{
-    Hash, ShardGroupId, StateCertificate, TransactionCertificate, TransactionDecision,
+    ExecutionCertificate, Hash, ShardGroupId, TransactionCertificate, TransactionDecision,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use tracing::instrument;
 
 /// Tracks certificates for cross-shard finalization.
 ///
-/// After each shard creates a state certificate (aggregated vote), validators
+/// After each shard creates an execution certificate (aggregated vote), validators
 /// collect certificates from all participating shards. Once all certificates
 /// are received, a final `TransactionCertificate` can be created.
 #[derive(Debug)]
@@ -21,7 +21,7 @@ pub struct CertificateTracker {
     /// Shards we expect certificates from.
     expected_shards: BTreeSet<ShardGroupId>,
     /// Certificates received per shard.
-    certificates: BTreeMap<ShardGroupId, StateCertificate>,
+    certificates: BTreeMap<ShardGroupId, ExecutionCertificate>,
 }
 
 impl CertificateTracker {
@@ -56,7 +56,7 @@ impl CertificateTracker {
         collected = self.certificates.len(),
         expected = self.expected_shards.len(),
     ))]
-    pub fn add_certificate(&mut self, cert: StateCertificate) -> bool {
+    pub fn add_certificate(&mut self, cert: ExecutionCertificate) -> bool {
         let shard = cert.shard_group_id;
 
         if !self.expected_shards.contains(&shard) {
@@ -164,8 +164,8 @@ mod tests {
         tx_hash: Hash,
         shard: ShardGroupId,
         writes_commitment: Hash,
-    ) -> StateCertificate {
-        StateCertificate {
+    ) -> ExecutionCertificate {
+        ExecutionCertificate {
             transaction_hash: tx_hash,
             shard_group_id: shard,
             read_nodes: vec![],
