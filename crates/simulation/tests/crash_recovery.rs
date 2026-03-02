@@ -14,7 +14,7 @@ fn test_recovered_votes_prevent_equivocation() {
     use hyperscale_types::{
         generate_bls_keypair, zero_bls_signature, BlockHeader, BlockHeight, Bls12381G1PrivateKey,
         QuorumCertificate, ShardGroupId, SignerBitfield, StaticTopology, ValidatorId,
-        ValidatorInfo, ValidatorSet, VotePower,
+        ValidatorInfo, ValidatorSet,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -78,7 +78,6 @@ fn test_recovered_votes_prevent_equivocation() {
         round: 0,
         signers: signers.clone(),
         aggregated_signature: zero_bls_signature(),
-        voting_power: VotePower(3),
         weighted_timestamp_ms: 99000,
     };
 
@@ -231,7 +230,7 @@ fn test_chain_metadata_recovery() {
     use hyperscale_types::{
         generate_bls_keypair, zero_bls_signature, BlockHeight, Bls12381G1PrivateKey,
         QuorumCertificate, ShardGroupId, SignerBitfield, StaticTopology, ValidatorId,
-        ValidatorInfo, ValidatorSet, VotePower,
+        ValidatorInfo, ValidatorSet,
     };
     use std::sync::Arc;
 
@@ -263,7 +262,6 @@ fn test_chain_metadata_recovery() {
         round: 0,
         signers,
         aggregated_signature: zero_bls_signature(),
-        voting_power: VotePower(3),
         weighted_timestamp_ms: 12345,
     };
 

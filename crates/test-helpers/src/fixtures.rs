@@ -10,7 +10,7 @@ use hyperscale_types::{
     block_vote_message, exec_vote_message, state_provision_message, verify_bls12381_v1,
     BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate,
     ExecutionVote, Hash, QuorumCertificate, ShardGroupId, SignerBitfield, StateEntry,
-    StateProvision, VotePower,
+    StateProvision,
 };
 
 /// Create a properly-signed block vote.
@@ -113,9 +113,6 @@ pub fn make_signed_qc(
         signers.set(idx);
     }
 
-    // Calculate voting power (1 per voter for simplicity)
-    let voting_power = VotePower(voter_indices.len() as u64);
-
     // Calculate weighted timestamp
     let weighted_timestamp_ms = voter_indices
         .iter()
@@ -131,7 +128,6 @@ pub fn make_signed_qc(
         round,
         signers,
         aggregated_signature,
-        voting_power,
         weighted_timestamp_ms,
     }
 }
@@ -199,7 +195,6 @@ pub fn make_signed_execution_certificate(
         success,
         aggregated_signature,
         signers,
-        voting_power: voter_indices.len() as u64,
     }
 }
 
@@ -350,7 +345,6 @@ mod tests {
 
         assert!(verify_qc(&qc, &committee));
         assert_eq!(qc.signer_count(), 3);
-        assert_eq!(qc.voting_power.0, 3);
     }
 
     #[test]

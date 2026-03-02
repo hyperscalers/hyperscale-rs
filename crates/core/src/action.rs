@@ -191,8 +191,6 @@ pub enum Action {
         votes: Vec<ExecutionVote>,
         /// Read nodes (for certificate).
         read_nodes: Vec<NodeId>,
-        /// Total voting power of the votes.
-        voting_power: VotePower,
         /// Committee size (for SignerBitfield capacity).
         committee_size: usize,
     },

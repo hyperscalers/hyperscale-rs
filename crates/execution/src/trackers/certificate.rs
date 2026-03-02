@@ -174,7 +174,6 @@ mod tests {
             success: true,
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(4),
-            voting_power: 3,
         }
     }
 

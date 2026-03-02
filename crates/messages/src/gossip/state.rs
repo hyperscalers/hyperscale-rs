@@ -320,7 +320,6 @@ mod tests {
             success: true,
             aggregated_signature: zero_bls_signature(),
             signers,
-            voting_power: 3,
         };
 
         let batch = ExecutionCertificateBatch::single(cert.clone());
@@ -402,7 +401,6 @@ mod tests {
             success: true,
             aggregated_signature: zero_bls_signature(),
             signers,
-            voting_power: 3,
         };
 
         // new() should have empty trace context

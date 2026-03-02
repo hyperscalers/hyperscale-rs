@@ -378,9 +378,6 @@ pub struct ExecutionCertificate {
 
     /// Which validators signed.
     pub signers: SignerBitfield,
-
-    /// Total voting power of all signers.
-    pub voting_power: u64,
 }
 
 impl ExecutionCertificate {
@@ -435,7 +432,6 @@ impl ExecutionCertificate {
             success,
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::empty(),
-            voting_power: 0,
         }
     }
 

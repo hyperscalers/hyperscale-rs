@@ -66,7 +66,7 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         test_utils::test_transaction, zero_bls_signature, BlockHeader, BlockHeight, Hash,
-        ShardGroupId, SignerBitfield, ValidatorId, VotePower,
+        ShardGroupId, SignerBitfield, ValidatorId,
     };
 
     fn create_test_block() -> Block {
@@ -104,7 +104,6 @@ mod tests {
             round: block.header.round,
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(0),
-            voting_power: VotePower(u64::MAX),
             weighted_timestamp_ms: 0,
         }
     }

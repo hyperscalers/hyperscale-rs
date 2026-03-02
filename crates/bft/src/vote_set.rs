@@ -370,7 +370,6 @@ impl VoteSet {
             round,
             aggregated_signature,
             signers,
-            voting_power: VotePower(self.verified_power),
             weighted_timestamp_ms,
         })
     }
@@ -501,7 +500,6 @@ mod tests {
         let qc = vote_set.build_qc(block_hash, test_shard_group()).unwrap();
         assert_eq!(qc.block_hash, block_hash);
         assert_eq!(qc.height.0, 1);
-        assert_eq!(qc.voting_power.0, 3);
         assert_eq!(qc.signers.count(), 3);
 
         // Can't build again

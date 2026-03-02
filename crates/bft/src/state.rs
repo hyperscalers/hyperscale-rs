@@ -1765,9 +1765,15 @@ impl BftState {
 
         // Verify parent QC has quorum (if not genesis)
         if !header.parent_qc.is_genesis() {
-            let has_quorum =
-                VotePower::has_quorum(header.parent_qc.voting_power.0, self.total_voting_power());
-            if !has_quorum {
+            let committee = self.committee();
+            let qc_power: u64 = header
+                .parent_qc
+                .signers
+                .set_indices()
+                .filter_map(|i| committee.get(i))
+                .map(|&vid| self.voting_power(vid))
+                .sum();
+            if !VotePower::has_quorum(qc_power, self.total_voting_power()) {
                 return Err("parent QC does not have quorum".to_string());
             }
 
@@ -2751,7 +2757,7 @@ impl BftState {
             info!(
                 block_hash = ?block_hash,
                 height = qc.height.0,
-                voting_power = qc.voting_power.0,
+                signers = qc.signer_count(),
                 "QC built successfully"
             );
 
@@ -5512,7 +5518,7 @@ mod tests {
             round: 0,
             aggregated_signature: zero_bls_signature(), // Dummy for test
             signers,
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 99_000,
         };
 
@@ -5599,7 +5605,7 @@ mod tests {
             round: 0,
             aggregated_signature: zero_bls_signature(),
             signers,
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 99_000,
         };
 
@@ -5690,7 +5696,7 @@ mod tests {
             round: 0,
             aggregated_signature: zero_bls_signature(),
             signers,
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 99_000,
         };
 
@@ -5913,7 +5919,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 100_000,
         };
 
@@ -5949,7 +5955,7 @@ mod tests {
             round: 10,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 100_000,
         };
 
@@ -5974,7 +5980,7 @@ mod tests {
             round: 10,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 100_000,
         };
 
@@ -6937,7 +6943,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 100_000,
         };
         state.latest_qc = Some(qc);
@@ -6996,7 +7002,7 @@ mod tests {
             round: 3, // Different round from our votes
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 100_000,
         };
 
@@ -7040,7 +7046,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 100_000,
         };
 
@@ -7305,7 +7311,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 100_000,
         };
         state.maybe_unlock_for_qc(&qc_h1);
@@ -7579,7 +7585,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 100_000,
         };
 
@@ -7621,7 +7627,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 100_000,
         };
 
@@ -7706,7 +7712,7 @@ mod tests {
             round: 0,
             aggregated_signature: zero_bls_signature(),
             signers: signers.clone(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 99_000,
         };
 
@@ -8162,7 +8168,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 1000,
         };
 
@@ -8215,7 +8221,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 1000,
         };
 
@@ -8296,7 +8302,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 1000,
         };
 
@@ -8371,7 +8377,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 1000,
         };
 
@@ -8426,7 +8432,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 5000,
         };
         state.latest_qc = Some(parent_qc.clone());
@@ -8693,7 +8699,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 100_000,
         };
         state.latest_qc = Some(qc);
@@ -8771,7 +8777,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: old_timestamp,
         };
         state.latest_qc = Some(qc);
@@ -8972,7 +8978,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 1000,
         });
 
@@ -9029,7 +9035,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 1000,
         };
 
@@ -9059,7 +9065,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 100_000,
         };
         state.latest_qc = Some(qc);
@@ -9100,7 +9106,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: parent_timestamp,
         };
         state.latest_qc = Some(qc);
@@ -9179,7 +9185,7 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
+
             weighted_timestamp_ms: 100_000,
         };
         state.latest_qc = Some(qc);

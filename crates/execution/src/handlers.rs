@@ -17,7 +17,7 @@ use hyperscale_types::{
     batch_verify_bls_different_messages, batch_verify_bls_same_message, exec_vote_message,
     verify_bls12381_v1, zero_bls_signature, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     Bls12381G2Signature, ExecutionCertificate, ExecutionVote, Hash, NodeId, RoutableTransaction,
-    ShardGroupId, SignerBitfield, StateProvision, Topology, ValidatorId, VotePower,
+    ShardGroupId, SignerBitfield, StateProvision, Topology, ValidatorId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,7 +37,6 @@ pub fn aggregate_execution_certificate(
     writes_commitment: Hash,
     votes: &[ExecutionVote],
     read_nodes: Vec<NodeId>,
-    voting_power: VotePower,
     committee_size: usize,
     topology: &dyn Topology,
 ) -> ExecutionCertificate {
@@ -83,7 +82,6 @@ pub fn aggregate_execution_certificate(
         success,
         aggregated_signature,
         signers,
-        voting_power: voting_power.0,
     }
 }
 

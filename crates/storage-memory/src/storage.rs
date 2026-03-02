@@ -835,7 +835,7 @@ mod tests {
     use hyperscale_storage::{
         CommitStore, ConsensusStore, NodeDatabaseUpdates, SubstateDatabase, SubstateStore,
     };
-    use hyperscale_types::{zero_bls_signature, Hash, NodeId, SignerBitfield, VotePower};
+    use hyperscale_types::{zero_bls_signature, Hash, NodeId, SignerBitfield};
 
     #[test]
     fn test_basic_substate_operations() {
@@ -1031,7 +1031,6 @@ mod tests {
             round: 3,
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(4),
-            voting_power: VotePower(4),
             weighted_timestamp_ms: 10_000,
         };
 

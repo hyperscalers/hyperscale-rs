@@ -8,7 +8,7 @@ use crate::{DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUp
 use hyperscale_types::{
     zero_bls_signature, Block, BlockHeader, BlockHeight, ExecutionCertificate, Hash, NodeId,
     PartitionNumber, QuorumCertificate, ShardGroupId, SignerBitfield, SubstateWrite,
-    TransactionCertificate, TransactionDecision, ValidatorId, VotePower,
+    TransactionCertificate, TransactionDecision, ValidatorId,
 };
 use radix_common::prelude::DatabaseUpdate;
 use std::collections::BTreeMap;
@@ -70,7 +70,6 @@ pub fn make_test_certificate(
         success: true,
         aggregated_signature: zero_bls_signature(),
         signers: SignerBitfield::new(4),
-        voting_power: 0,
     };
     let mut shard_proofs = BTreeMap::new();
     shard_proofs.insert(shard, execution_cert);
@@ -128,7 +127,6 @@ pub fn make_multi_shard_certificate(
             success: true,
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(4),
-            voting_power: 0,
         };
         shard_proofs.insert(shard, execution_cert);
     }
@@ -149,7 +147,6 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
         round: 0,
         aggregated_signature: zero_bls_signature(),
         signers: SignerBitfield::new(4),
-        voting_power: VotePower(4),
         weighted_timestamp_ms: block.header.timestamp,
     }
 }

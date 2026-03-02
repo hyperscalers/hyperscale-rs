@@ -2806,7 +2806,7 @@ mod tests {
 
     #[test]
     fn test_recovery_with_qc() {
-        use hyperscale_types::{zero_bls_signature, SignerBitfield, VotePower};
+        use hyperscale_types::{zero_bls_signature, SignerBitfield};
 
         let temp_dir = TempDir::new().unwrap();
         let expected_hash = Hash::from_hash_bytes(&[99; 32]);
@@ -2822,7 +2822,6 @@ mod tests {
                 round: 5,
                 aggregated_signature: zero_bls_signature(),
                 signers: SignerBitfield::new(4),
-                voting_power: VotePower(4),
                 weighted_timestamp_ms: 100_000,
             };
             storage.set_chain_metadata(BlockHeight(100), Some(expected_hash), Some(&qc));

@@ -2,7 +2,7 @@
 
 use crate::{
     block_vote_message, zero_bls_signature, BlockHeight, Bls12381G2Signature, Hash, ShardGroupId,
-    SignerBitfield, VotePower,
+    SignerBitfield,
 };
 use sbor::prelude::*;
 
@@ -32,9 +32,6 @@ pub struct QuorumCertificate {
     /// Aggregated BLS signature from all signers.
     pub aggregated_signature: Bls12381G2Signature,
 
-    /// Total voting power represented by this QC.
-    pub voting_power: VotePower,
-
     /// Stake-weighted timestamp in milliseconds.
     /// Computed as: sum(timestamp_i * stake_i) / sum(stake_i)
     pub weighted_timestamp_ms: u64,
@@ -53,7 +50,6 @@ impl QuorumCertificate {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(0),
             weighted_timestamp_ms: 0,
         }
     }
@@ -79,11 +75,6 @@ impl QuorumCertificate {
     /// Get the number of signers.
     pub fn signer_count(&self) -> usize {
         self.signers.count_ones()
-    }
-
-    /// Check if this QC has quorum (> 2/3 voting power).
-    pub fn has_quorum(&self, total_power: u64) -> bool {
-        VotePower::has_quorum(self.voting_power.0, total_power)
     }
 
     /// Two-chain commit rule: Check if this QC enables committing the parent block.
@@ -149,7 +140,6 @@ mod tests {
             round: 0,
             signers,
             aggregated_signature: zero_bls_signature(),
-            voting_power: VotePower(3),
             weighted_timestamp_ms: 1000,
         };
 
@@ -158,7 +148,5 @@ mod tests {
         assert!(qc.has_committable_block());
         assert_eq!(qc.committable_height(), Some(BlockHeight(0)));
         assert_eq!(qc.committable_hash(), Some(parent_hash));
-        assert!(qc.has_quorum(4)); // 3/4 > 2/3
-        assert!(!qc.has_quorum(5)); // 3/5 < 2/3
     }
 }

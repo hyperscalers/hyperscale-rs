@@ -34,7 +34,6 @@ use hyperscale_types::{
     BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
     ExecutionCertificate, ExecutionVote, Hash, NodeId, RoutableTransaction, ShardGroupId,
     StateEntry, StateProvision, Topology, TransactionCertificate, TransactionDecision, ValidatorId,
-    VotePower,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1102,7 +1101,6 @@ impl ExecutionState {
             writes_commitment,
             votes,
             read_nodes,
-            voting_power: VotePower(total_power),
             committee_size,
         }]
     }

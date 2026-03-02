@@ -132,7 +132,6 @@ pub fn verify_and_build_qc(
                     round,
                     aggregated_signature,
                     signers,
-                    voting_power: VotePower(verified_power),
                     weighted_timestamp_ms,
                 })
             }

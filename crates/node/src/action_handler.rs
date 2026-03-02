@@ -260,7 +260,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             writes_commitment,
             votes,
             read_nodes,
-            voting_power,
             committee_size,
         } => {
             let certificate = hyperscale_execution::handlers::aggregate_execution_certificate(
@@ -269,7 +268,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 writes_commitment,
                 &votes,
                 read_nodes,
-                voting_power,
                 committee_size,
                 ctx.topology,
             );
