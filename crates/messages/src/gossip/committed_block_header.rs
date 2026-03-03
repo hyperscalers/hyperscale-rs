@@ -1,6 +1,9 @@
 //! CommittedBlockHeader gossip message for cross-shard header broadcast.
 
-use hyperscale_types::{CommittedBlockHeader, MessagePriority, NetworkMessage};
+use hyperscale_types::{
+    committed_block_header_message, Bls12381G2Signature, CommittedBlockHeader, MessagePriority,
+    NetworkMessage, ValidatorId,
+};
 use sbor::prelude::BasicSbor;
 
 /// Gossips a committed block header globally to all shards.
@@ -14,6 +17,23 @@ use sbor::prelude::BasicSbor;
 pub struct CommittedBlockHeaderGossip {
     /// The committed block header (header + QC).
     pub committed_header: CommittedBlockHeader,
+    /// The validator who sent this gossip (should be the block proposer).
+    pub sender: ValidatorId,
+    /// BLS signature over the domain-separated signing message, by the sender.
+    pub sender_signature: Bls12381G2Signature,
+}
+
+impl CommittedBlockHeaderGossip {
+    /// Build the canonical signing message for this gossip.
+    ///
+    /// Uses `DOMAIN_COMMITTED_BLOCK_HEADER` tag for domain separation.
+    pub fn signing_message(&self) -> Vec<u8> {
+        committed_block_header_message(
+            self.committed_header.header.shard_group_id,
+            self.committed_header.header.height.0,
+            &self.committed_header.header.hash(),
+        )
+    }
 }
 
 impl NetworkMessage for CommittedBlockHeaderGossip {
@@ -41,7 +61,8 @@ mod tests {
     #[test]
     fn test_sbor_roundtrip() {
         use hyperscale_types::{
-            BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, ValidatorId,
+            zero_bls_signature, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId,
+            ValidatorId,
         };
 
         let header = BlockHeader {
@@ -61,6 +82,8 @@ mod tests {
 
         let gossip = CommittedBlockHeaderGossip {
             committed_header: CommittedBlockHeader { header, qc },
+            sender: ValidatorId(0),
+            sender_signature: zero_bls_signature(),
         };
 
         let encoded = sbor::basic_encode(&gossip).unwrap();

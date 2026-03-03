@@ -453,13 +453,13 @@ impl StateMachine for NodeStateMachine {
                 )
             }
 
-            // Remote committed block header (for future provisions light-client pattern)
+            // Remote committed block header — store for light-client provision verification.
             ProtocolEvent::RemoteBlockCommitted {
-                committed_header: _,
-            } => {
-                // TODO: Route to ProvisionCoordinator when implemented
-                vec![]
-            }
+                committed_header,
+                sender,
+            } => self
+                .provisions
+                .on_remote_block_committed(committed_header, sender),
 
             // Self-contained BFT events - direct delegation
             ProtocolEvent::BlockVoteReceived { vote } => self.bft.on_block_vote(vote),

@@ -50,6 +50,10 @@ pub struct BatchConfig {
     /// Transaction validation batch.
     pub tx_validation_max: usize,
     pub tx_validation_window: Duration,
+
+    /// Committed block header sender signature verification batch.
+    pub committed_header_max: usize,
+    pub committed_header_window: Duration,
 }
 
 impl Default for BatchConfig {
@@ -75,6 +79,9 @@ impl Default for BatchConfig {
 
             tx_validation_max: 128,
             tx_validation_window: Duration::from_millis(20),
+
+            committed_header_max: 32,
+            committed_header_window: Duration::from_millis(15),
         }
     }
 }

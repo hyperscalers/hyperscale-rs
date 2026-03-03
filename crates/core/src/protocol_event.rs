@@ -48,8 +48,12 @@ pub enum ProtocolEvent {
     ///
     /// Used for the light-client provisions pattern: remote shards broadcast
     /// committed headers so we can verify state roots via merkle inclusion proofs.
+    ///
+    /// The `sender` field is the authenticated sender identity — NodeLoop
+    /// verified the sender's BLS signature before admitting this event.
     RemoteBlockCommitted {
         committed_header: CommittedBlockHeader,
+        sender: ValidatorId,
     },
 
     /// Received a vote on a block header.

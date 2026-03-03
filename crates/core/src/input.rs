@@ -2,7 +2,8 @@
 
 use crate::ProtocolEvent;
 use hyperscale_types::{
-    Block, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TransactionCertificate,
+    Block, CommittedBlockHeader, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    TransactionCertificate, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -94,6 +95,13 @@ pub enum NodeInput {
         submitted_locally: bool,
     },
 
+    /// A committed block header from a remote shard whose sender signature
+    /// has been verified by the NodeLoop gossip gate.
+    CommittedHeaderValidated {
+        committed_header: CommittedBlockHeader,
+        sender: ValidatorId,
+    },
+
     /// Raw gossip payload received from the network layer.
     ///
     /// Network handles decompression; NodeLoop SBOR-decodes based on
@@ -145,6 +153,7 @@ impl NodeInput {
             NodeInput::TransactionReceived { .. } => EventPriority::Network,
             NodeInput::CertificateReceived { .. } => EventPriority::Network,
             NodeInput::TransactionValidated { .. } => EventPriority::Internal,
+            NodeInput::CommittedHeaderValidated { .. } => EventPriority::Internal,
             NodeInput::GossipReceived { .. } => EventPriority::Network,
         }
     }
@@ -181,6 +190,7 @@ impl NodeInput {
             NodeInput::TransactionReceived { .. } => "TransactionReceived",
             NodeInput::CertificateReceived { .. } => "CertificateReceived",
             NodeInput::TransactionValidated { .. } => "TransactionValidated",
+            NodeInput::CommittedHeaderValidated { .. } => "CommittedHeaderValidated",
             NodeInput::GossipReceived { .. } => "GossipReceived",
         }
     }

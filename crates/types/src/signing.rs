@@ -40,6 +40,14 @@ pub const DOMAIN_STATE_PROVISION: &[u8] = b"STATE_PROVISION";
 /// use the same domain tag since they verify the same underlying message.
 pub const DOMAIN_EXEC_VOTE: &[u8] = b"EXEC_VOTE";
 
+/// Domain tag for committed block header gossip.
+///
+/// Format: `COMMITTED_BLOCK_HEADER` || shard_group_id || height || block_hash
+///
+/// Signed by the sender (proposer) when broadcasting committed block headers
+/// globally. Verified by NodeLoop before admitting to the state machine.
+pub const DOMAIN_COMMITTED_BLOCK_HEADER: &[u8] = b"COMMITTED_BLOCK_HEADER";
+
 /// Build the signing message for a block vote.
 ///
 /// This is used for:
@@ -85,6 +93,23 @@ pub fn state_provision_message(
     }
 
     msg
+}
+
+/// Build the signing message for a committed block header gossip.
+///
+/// This is used for verifying the sender's signature on globally broadcast
+/// committed block headers before admitting them to the state machine.
+pub fn committed_block_header_message(
+    shard_group_id: ShardGroupId,
+    height: u64,
+    block_hash: &Hash,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(64);
+    message.extend_from_slice(DOMAIN_COMMITTED_BLOCK_HEADER);
+    message.extend_from_slice(&shard_group_id.0.to_le_bytes());
+    message.extend_from_slice(&height.to_le_bytes());
+    message.extend_from_slice(block_hash.as_bytes());
+    message
 }
 
 /// Build the signing message for an execution vote.
@@ -163,6 +188,18 @@ mod tests {
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_STATE_PROVISION));
+    }
+
+    #[test]
+    fn test_committed_block_header_message_deterministic() {
+        let shard = ShardGroupId(1);
+        let block = Hash::from_bytes(b"test_block");
+
+        let msg1 = committed_block_header_message(shard, 10, &block);
+        let msg2 = committed_block_header_message(shard, 10, &block);
+
+        assert_eq!(msg1, msg2);
+        assert!(msg1.starts_with(DOMAIN_COMMITTED_BLOCK_HEADER));
     }
 
     #[test]

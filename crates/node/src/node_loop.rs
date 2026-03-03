@@ -37,8 +37,9 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, ExecutionCertificate, ExecutionVote, Hash,
-    RoutableTransaction, ShardGroupId, Topology, TransactionCertificate, ValidatorId,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
+    ExecutionVote, Hash, RoutableTransaction, ShardGroupId, Topology, TransactionCertificate,
+    ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -75,6 +76,14 @@ use hyperscale_execution::handlers::UnverifiedExecutionVote;
 
 /// A single execution-vote verification item: tx_hash with its unverified votes.
 type ExecutionVoteVerificationItem = (Hash, Vec<UnverifiedExecutionVote>);
+
+/// A committed header pending sender-signature verification.
+type CommittedHeaderVerificationItem = (
+    CommittedBlockHeader,
+    ValidatorId,
+    Bls12381G1PublicKey,
+    hyperscale_types::Bls12381G2Signature,
+);
 
 // ═══════════════════════════════════════════════════════════════════════
 // TimerOp — buffered timer operations for the runner
@@ -194,6 +203,7 @@ where
     broadcast_vote_batch: ShardedBatchAccumulator<ExecutionVote>,
     broadcast_cert_batch: ShardedBatchAccumulator<Arc<ExecutionCertificate>>,
     broadcast_provision_batch: ShardedBatchAccumulator<hyperscale_types::StateProvision>,
+    committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
 
     // Transaction status cache — retains the latest status for every transaction
     // that has emitted a status notification. Bounded LRU cache shared (via Arc)
@@ -272,6 +282,10 @@ where
             broadcast_provision_batch: ShardedBatchAccumulator::new(
                 b.broadcast_provision_max,
                 b.broadcast_provision_window,
+            ),
+            committed_header_batch: BatchAccumulator::new(
+                b.committed_header_max,
+                b.committed_header_window,
             ),
             config,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
@@ -560,6 +574,22 @@ where
                 self.update_fetch_tick_timer();
             }
 
+            // ── Committed header validated (sender sig verified) ────────
+            NodeInput::CommittedHeaderValidated {
+                committed_header,
+                sender,
+            } => {
+                let pe = ProtocolEvent::RemoteBlockCommitted {
+                    committed_header,
+                    sender,
+                };
+                let actions = self.state.handle(pe);
+                self.actions_generated = actions.len();
+                for action in actions {
+                    self.process_action(action);
+                }
+            }
+
             // ── Gossip received (raw bytes) ─────────────────────────────
             //
             // Network layer decompressed the wire bytes; we SBOR-decode
@@ -630,6 +660,9 @@ where
         if self.broadcast_provision_batch.is_expired(now) {
             self.flush_broadcast_provisions();
         }
+        if self.committed_header_batch.is_expired(now) {
+            self.flush_committed_header_verifications();
+        }
 
         // Clean up stale pending gossip cert verifications.
         let before = self.pending_gossip_verifications.len();
@@ -659,6 +692,7 @@ where
             self.broadcast_vote_batch.deadline(),
             self.broadcast_cert_batch.deadline(),
             self.broadcast_provision_batch.deadline(),
+            self.committed_header_batch.deadline(),
         ]
         .into_iter()
         .flatten()
@@ -1653,13 +1687,45 @@ where
                     warn!("Failed to decode CommittedBlockHeaderGossip");
                     return;
                 };
-                let pe = ProtocolEvent::RemoteBlockCommitted {
-                    committed_header: gossip.committed_header,
+
+                // Gossip gate: synchronous pre-checks before crypto verification.
+                let sender = gossip.sender;
+                let header_shard = gossip.committed_header.header.shard_group_id;
+
+                // Ignore headers from our own shard (we already have these locally).
+                if header_shard == self.local_shard {
+                    return;
+                }
+
+                // Verify sender is in the source shard's committee.
+                let committee = self.topology.committee_for_shard(header_shard);
+                if !committee.contains(&sender) {
+                    warn!(
+                        sender = sender.0,
+                        header_shard = header_shard.0,
+                        "Committed header sender not in source shard committee"
+                    );
+                    return;
+                }
+
+                // Resolve sender's public key for signature verification.
+                let Some(public_key) = self.topology.public_key(sender) else {
+                    warn!(
+                        sender = sender.0,
+                        "Could not resolve public key for committed header sender"
+                    );
+                    return;
                 };
-                let actions = self.state.handle(pe);
-                self.actions_generated += actions.len();
-                for action in actions {
-                    self.process_action(action);
+
+                // Queue for batched sender-signature verification.
+                let item: CommittedHeaderVerificationItem = (
+                    gossip.committed_header,
+                    sender,
+                    public_key,
+                    gossip.sender_signature,
+                );
+                if self.committed_header_batch.push(item, self.state.now()) {
+                    self.flush_committed_header_verifications();
                 }
             }
             _ => {
@@ -1771,6 +1837,42 @@ where
         }
     }
 
+    /// Flush accumulated committed header sender-signature verifications.
+    ///
+    /// Spawns one closure on the crypto pool that verifies each sender's BLS
+    /// signature. Valid headers are sent back as `CommittedHeaderValidated`.
+    fn flush_committed_header_verifications(&mut self) {
+        let items = self.committed_header_batch.take();
+        if items.is_empty() {
+            return;
+        }
+
+        let event_tx = self.event_sender.clone();
+        self.dispatch.spawn_crypto(move || {
+            for (committed_header, sender, public_key, sender_signature) in items {
+                let msg = hyperscale_types::committed_block_header_message(
+                    committed_header.header.shard_group_id,
+                    committed_header.header.height.0,
+                    &committed_header.header.hash(),
+                );
+                let valid =
+                    hyperscale_types::verify_bls12381_v1(&msg, &public_key, &sender_signature);
+                if valid {
+                    let _ = event_tx.send(NodeInput::CommittedHeaderValidated {
+                        committed_header,
+                        sender,
+                    });
+                } else {
+                    tracing::warn!(
+                        sender = sender.0,
+                        height = committed_header.header.height.0,
+                        "Committed header sender signature verification failed"
+                    );
+                }
+            }
+        });
+    }
+
     // ─── Metrics ────────────────────────────────────────────────────────
 
     /// Collect and export metrics from the state machine.
@@ -1865,5 +1967,6 @@ where
         self.flush_broadcast_votes();
         self.flush_broadcast_certs();
         self.flush_broadcast_provisions();
+        self.flush_committed_header_verifications();
     }
 }

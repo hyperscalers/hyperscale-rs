@@ -29,10 +29,10 @@ pub struct BftStats {
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey,
-    Bls12381G1PublicKey, CommitmentProof, Hash, QuorumCertificate, ReadyTransactions,
-    RoutableTransaction, ShardGroupId, Topology, TransactionAbort, TransactionCertificate,
-    TransactionDefer, ValidatorId, VotePower,
+    committed_block_header_message, Block, BlockHeader, BlockHeight, BlockManifest, BlockVote,
+    Bls12381G1PrivateKey, Bls12381G1PublicKey, CommitmentProof, Hash, QuorumCertificate,
+    ReadyTransactions, RoutableTransaction, ShardGroupId, Topology, TransactionAbort,
+    TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
 };
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -3760,12 +3760,21 @@ impl BftState {
                 block: block.clone(),
                 qc: current_qc.clone(),
             });
+            let committed_header = hyperscale_types::CommittedBlockHeader {
+                header: block.header.clone(),
+                qc: current_qc.clone(),
+            };
+            let cbh_msg = committed_block_header_message(
+                committed_header.header.shard_group_id,
+                committed_header.header.height.0,
+                &committed_header.header.hash(),
+            );
+            let cbh_sig = self.signing_key.sign_v1(&cbh_msg);
             actions.push(Action::BroadcastCommittedBlockHeader {
                 gossip: hyperscale_messages::CommittedBlockHeaderGossip {
-                    committed_header: hyperscale_types::CommittedBlockHeader {
-                        header: block.header.clone(),
-                        qc: current_qc.clone(),
-                    },
+                    committed_header,
+                    sender: self.validator_id(),
+                    sender_signature: cbh_sig,
                 },
             });
             actions.push(Action::Continuation(ProtocolEvent::BlockCommitted {
@@ -4047,6 +4056,16 @@ impl BftState {
         let removed_blocks = self.cleanup_old_state(height);
 
         // Emit actions for the synced block
+        let committed_header = hyperscale_types::CommittedBlockHeader {
+            header: block.header.clone(),
+            qc: qc.clone(),
+        };
+        let cbh_msg = committed_block_header_message(
+            committed_header.header.shard_group_id,
+            committed_header.header.height.0,
+            &committed_header.header.hash(),
+        );
+        let cbh_sig = self.signing_key.sign_v1(&cbh_msg);
         let mut actions = vec![
             Action::PersistBlock {
                 block: block.clone(),
@@ -4054,14 +4073,13 @@ impl BftState {
             },
             Action::EmitCommittedBlock {
                 block: block.clone(),
-                qc: qc.clone(),
+                qc,
             },
             Action::BroadcastCommittedBlockHeader {
                 gossip: hyperscale_messages::CommittedBlockHeaderGossip {
-                    committed_header: hyperscale_types::CommittedBlockHeader {
-                        header: block.header.clone(),
-                        qc,
-                    },
+                    committed_header,
+                    sender: self.validator_id(),
+                    sender_signature: cbh_sig,
                 },
             },
             Action::Continuation(ProtocolEvent::BlockCommitted {

@@ -62,8 +62,8 @@ pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, Valida
 pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
 pub use proofs::CommitmentProof;
 pub use signing::{
-    block_vote_message, exec_vote_message, state_provision_message, DOMAIN_BLOCK_VOTE,
-    DOMAIN_EXEC_VOTE, DOMAIN_STATE_PROVISION,
+    block_vote_message, committed_block_header_message, exec_vote_message, state_provision_message,
+    DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_VOTE, DOMAIN_STATE_PROVISION,
 };
 
 pub use block::{
