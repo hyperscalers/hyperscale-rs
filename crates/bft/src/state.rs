@@ -3500,9 +3500,26 @@ impl BftState {
             {
                 // Only commit if we haven't already committed this height
                 if committable_height.0 > self.committed_height {
+                    // The certifying QC for the committable block (block N-1) is the
+                    // parent_qc of the block whose QC just formed (block N).
+                    // Block N's parent_qc = QC_for_N-1, which directly certifies block N-1.
+                    let certifying_qc = if let Some(pending) = self.pending_blocks.get(&block_hash)
+                    {
+                        pending.header().parent_qc.clone()
+                    } else if let Some((block, _)) = self.certified_blocks.get(&block_hash) {
+                        block.header.parent_qc.clone()
+                    } else {
+                        warn!(
+                            validator = ?self.validator_id(),
+                            block_hash = ?block_hash,
+                            committable_hash = ?committable_hash,
+                            "Cannot find block to extract certifying QC for committable block"
+                        );
+                        qc.clone()
+                    };
                     actions.push(Action::Continuation(ProtocolEvent::BlockReadyToCommit {
                         block_hash: committable_hash,
-                        qc: qc.clone(),
+                        qc: certifying_qc,
                     }));
                 }
             }
@@ -3643,7 +3660,7 @@ impl BftState {
         }
 
         // Commit this block and any buffered subsequent blocks
-        self.commit_block_and_buffered(block_hash)
+        self.commit_block_and_buffered(block_hash, qc)
     }
 
     /// Check if a block that just became complete has a pending commit waiting for it.
@@ -3670,26 +3687,23 @@ impl BftState {
     /// This is called when we have a block at the expected height (committed_height + 1).
     /// After committing, we check for buffered commits at the next height and process
     /// them in order.
-    fn commit_block_and_buffered(&mut self, block_hash: Hash) -> Vec<Action> {
+    fn commit_block_and_buffered(
+        &mut self,
+        block_hash: Hash,
+        certifying_qc: QuorumCertificate,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut current_hash = block_hash;
+        let mut current_qc = certifying_qc;
 
         loop {
-            // Get the block and its certifying QC.
-            // Check certified_blocks first since committed blocks should always
-            // have a QC (they were certified before commit in the two-chain rule).
-            let (block, qc) = if let Some((block, qc)) = self.certified_blocks.get(&current_hash) {
-                (Some(block.clone()), Some(qc.clone()))
+            // Get the block to commit.
+            let block = if let Some((block, _)) = self.certified_blocks.get(&current_hash) {
+                Some(block.clone())
             } else if let Some(pending) = self.pending_blocks.get(&current_hash) {
-                // Fallback: block in pending_blocks but not certified_blocks.
-                // This shouldn't happen for committed blocks but handle gracefully.
-                warn!(
-                    block_hash = ?current_hash,
-                    "Committed block not found in certified_blocks - QC unavailable"
-                );
-                (pending.block().map(|b| (*b).clone()), None)
+                pending.block().map(|b| (*b).clone())
             } else {
-                (None, None)
+                None
             };
 
             let Some(block) = block else {
@@ -3746,16 +3760,15 @@ impl BftState {
                 actions.push(Action::CancelFetch { block_hash });
             }
 
-            let commit_qc = qc.unwrap_or_else(QuorumCertificate::genesis);
             actions.push(Action::EmitCommittedBlock {
                 block: block.clone(),
-                qc: commit_qc.clone(),
+                qc: current_qc.clone(),
             });
             actions.push(Action::BroadcastCommittedBlockHeader {
                 gossip: hyperscale_messages::CommittedBlockHeaderGossip {
                     committed_header: hyperscale_types::CommittedBlockHeader {
                         header: block.header.clone(),
-                        qc: commit_qc,
+                        qc: current_qc.clone(),
                     },
                 },
             });
@@ -3767,12 +3780,13 @@ impl BftState {
 
             // Check if the next height is buffered
             let next_height = height + 1;
-            if let Some((next_hash, _next_qc)) = self.pending_commits.remove(&next_height) {
+            if let Some((next_hash, next_qc)) = self.pending_commits.remove(&next_height) {
                 debug!(
                     "Processing buffered commit for height {} after committing {}",
                     next_height, height
                 );
                 current_hash = next_hash;
+                current_qc = next_qc;
             } else {
                 // No more buffered commits
                 break;
