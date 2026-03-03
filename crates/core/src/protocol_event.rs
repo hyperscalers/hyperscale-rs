@@ -82,8 +82,8 @@ pub enum ProtocolEvent {
     /// QC signature verification completed.
     QcSignatureVerified { block_hash: Hash, valid: bool },
 
-    /// CycleProof signature verification completed.
-    CycleProofVerified {
+    /// CommitmentProof signature verification completed.
+    CommitmentProofVerified {
         block_hash: Hash,
         deferral_index: usize,
         valid: bool,
@@ -353,7 +353,7 @@ impl ProtocolEvent {
             ProtocolEvent::BlockCommitted { .. } => "BlockCommitted",
             ProtocolEvent::QuorumCertificateResult { .. } => "QuorumCertificateResult",
             ProtocolEvent::QcSignatureVerified { .. } => "QcSignatureVerified",
-            ProtocolEvent::CycleProofVerified { .. } => "CycleProofVerified",
+            ProtocolEvent::CommitmentProofVerified { .. } => "CommitmentProofVerified",
             ProtocolEvent::StateRootVerified { .. } => "StateRootVerified",
             ProtocolEvent::TransactionRootVerified { .. } => "TransactionRootVerified",
             ProtocolEvent::ProposalBuilt { .. } => "ProposalBuilt",

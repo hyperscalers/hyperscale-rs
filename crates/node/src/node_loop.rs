@@ -741,7 +741,7 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::VerifyAndBuildQuorumCertificate { .. }
             | Action::VerifyQcSignature { .. }
-            | Action::VerifyCycleProof { .. }
+            | Action::VerifyCommitmentProof { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyTransactionRoot { .. }
             | Action::BuildProposal { .. }

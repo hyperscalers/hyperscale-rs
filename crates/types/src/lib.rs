@@ -60,7 +60,7 @@ pub use epoch::{
 pub use hash::{compute_merkle_root, Hash};
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
 pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
-pub use proofs::{commitment_proof_message, CommitmentProof, CycleProof};
+pub use proofs::CommitmentProof;
 pub use signing::{
     block_vote_message, exec_vote_message, state_provision_message, DOMAIN_BLOCK_VOTE,
     DOMAIN_EXEC_VOTE, DOMAIN_STATE_PROVISION,

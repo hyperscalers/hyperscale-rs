@@ -1,7 +1,7 @@
 //! Transaction types for consensus.
 
 use crate::{
-    BlockHeight, CycleProof, ExecutionCertificate, Hash, NodeId, ShardGroupId, SubstateWrite,
+    BlockHeight, CommitmentProof, ExecutionCertificate, Hash, NodeId, ShardGroupId, SubstateWrite,
 };
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
@@ -410,16 +410,16 @@ pub struct TransactionDefer {
     /// Used for timeout calculations on the retry.
     pub block_height: BlockHeight,
 
-    /// Proof of the cycle that caused this deferral.
+    /// Proof that the winner transaction was committed on another shard.
     ///
     /// Required for block validation. Validators verify this proof to ensure
     /// the deferral is justified without needing to have seen the same provisions.
     /// BFT rejects blocks containing deferrals without valid proofs.
-    pub proof: CycleProof,
+    pub proof: CommitmentProof,
 }
 
 // ============================================================================
-// Manual SBOR implementation for TransactionDefer (CycleProof contains Arc)
+// Manual SBOR implementation for TransactionDefer (CommitmentProof contains Arc)
 // ============================================================================
 
 impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
@@ -459,7 +459,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let tx_hash: Hash = decoder.decode()?;
         let reason: DeferReason = decoder.decode()?;
         let block_height: BlockHeight = decoder.decode()?;
-        let proof: CycleProof = decoder.decode()?;
+        let proof: CommitmentProof = decoder.decode()?;
 
         Ok(Self {
             tx_hash,
@@ -482,35 +482,6 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for TransactionDefer {
 
     fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
         sbor::TypeData::unnamed(sbor::TypeKind::Any)
-    }
-}
-
-impl TransactionDefer {
-    /// Create a new transaction deferral for a livelock cycle.
-    pub fn new(
-        tx_hash: Hash,
-        winner_tx_hash: Hash,
-        block_height: BlockHeight,
-        proof: CycleProof,
-    ) -> Self {
-        Self {
-            tx_hash,
-            reason: DeferReason::LivelockCycle { winner_tx_hash },
-            block_height,
-            proof,
-        }
-    }
-
-    /// Get the winner transaction hash.
-    pub fn winner_hash(&self) -> &Hash {
-        match &self.reason {
-            DeferReason::LivelockCycle { winner_tx_hash } => winner_tx_hash,
-        }
-    }
-
-    /// Get the cycle proof.
-    pub fn cycle_proof(&self) -> &CycleProof {
-        &self.proof
     }
 }
 

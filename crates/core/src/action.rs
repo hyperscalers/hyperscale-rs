@@ -6,10 +6,9 @@ use hyperscale_messages::{
 };
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
-    CycleProof, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield, StateEntry,
-    StateProvision, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId,
-    VotePower,
+    EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, SignerBitfield, StateEntry, StateProvision,
+    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -161,6 +160,8 @@ pub enum Action {
         tx_hash: Hash,
         /// Source shard the provisions are from.
         source_shard: ShardGroupId,
+        /// Target shard that received the provisions (our local shard).
+        target_shard: ShardGroupId,
         /// Block height when provisions were created.
         block_height: BlockHeight,
         /// Unix timestamp (milliseconds) of the block that triggered the provisions.
@@ -244,26 +245,24 @@ pub enum Action {
         block_hash: Hash,
     },
 
-    /// Verify a CycleProof's aggregated BLS signature.
+    /// Verify a CommitmentProof's aggregated BLS signature.
     ///
-    /// This is CRITICAL for BFT safety: we must verify that the CycleProof's embedded
-    /// CommitmentProof has a valid aggregated signature from the claimed signers on the
-    /// source shard. Without this check, a Byzantine proposer could include deferrals
-    /// with forged CycleProofs, causing honest validators to incorrectly defer transactions.
+    /// This is CRITICAL for BFT safety: we must verify that the CommitmentProof
+    /// has a valid aggregated signature from the claimed signers on the source shard.
+    /// Without this check, a Byzantine proposer could include deferrals with forged
+    /// proofs, causing honest validators to incorrectly defer transactions.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::CycleProofVerified` when complete.
-    VerifyCycleProof {
+    /// Returns `ProtocolEvent::CommitmentProofVerified` when complete.
+    VerifyCommitmentProof {
         /// Block hash containing this deferral (for correlation).
         block_hash: Hash,
         /// Index of deferral in block's deferred list.
         deferral_index: usize,
-        /// The CycleProof to verify.
-        cycle_proof: CycleProof,
+        /// The CommitmentProof to verify.
+        commitment_proof: CommitmentProof,
         /// Public keys of signers (resolved from SignerBitfield).
         public_keys: Vec<Bls12381G1PublicKey>,
-        /// Signing message for verification.
-        signing_message: Vec<u8>,
         /// Total voting power of the signers (resolved from SignerBitfield + topology).
         voting_power: u64,
         /// Quorum threshold for source shard.
@@ -688,7 +687,7 @@ impl Action {
                 | Action::VerifyAndAggregateExecutionVotes { .. }
                 | Action::VerifyExecutionCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
-                | Action::VerifyCycleProof { .. }
+                | Action::VerifyCommitmentProof { .. }
                 | Action::VerifyStateRoot { .. }
                 | Action::VerifyTransactionRoot { .. }
                 | Action::BuildProposal { .. }
@@ -758,7 +757,7 @@ impl Action {
                 "VerifyExecutionCertificateSignature"
             }
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
-            Action::VerifyCycleProof { .. } => "VerifyCycleProof",
+            Action::VerifyCommitmentProof { .. } => "VerifyCommitmentProof",
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
             Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
             Action::BuildProposal { .. } => "BuildProposal",

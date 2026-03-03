@@ -55,7 +55,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         // Consensus-critical crypto
         Action::VerifyAndBuildQuorumCertificate { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyQcSignature { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyCycleProof { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::VerifyCommitmentProof { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
@@ -134,28 +134,28 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             })
         }
 
-        Action::VerifyCycleProof {
+        Action::VerifyCommitmentProof {
             block_hash,
             deferral_index,
-            cycle_proof,
+            commitment_proof,
             public_keys,
-            signing_message,
             voting_power,
             quorum_threshold,
         } => {
-            let valid = hyperscale_bft::handlers::verify_cycle_proof(
-                &cycle_proof,
+            let valid = hyperscale_bft::handlers::verify_commitment_proof(
+                &commitment_proof,
                 &public_keys,
-                &signing_message,
                 voting_power,
                 quorum_threshold,
             );
             Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::CycleProofVerified {
-                    block_hash,
-                    deferral_index,
-                    valid,
-                })],
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::CommitmentProofVerified {
+                        block_hash,
+                        deferral_index,
+                        valid,
+                    },
+                )],
                 prepared_commit: None,
             })
         }
@@ -288,6 +288,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
         Action::VerifyAndAggregateProvisions {
             tx_hash,
             source_shard,
+            target_shard,
             block_height,
             block_timestamp,
             entries,
@@ -298,6 +299,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             let result = hyperscale_provisions::handlers::verify_and_aggregate_provisions(
                 tx_hash,
                 source_shard,
+                target_shard,
                 block_height,
                 block_timestamp,
                 entries,

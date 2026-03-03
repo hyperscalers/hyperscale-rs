@@ -5,8 +5,8 @@
 
 use crate::tracker::{CommittedCrossShardTracker, ProvisionTracker, RemoteStateNeeds};
 use hyperscale_types::{
-    BlockHeight, CommitmentProof, CycleProof, DeferReason, Hash, NodeId, RoutableTransaction,
-    ShardGroupId, Topology, TransactionDefer,
+    BlockHeight, CommitmentProof, DeferReason, Hash, NodeId, RoutableTransaction, ShardGroupId,
+    Topology, TransactionDefer,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -65,7 +65,7 @@ pub struct LivelockState {
     deferred_tombstones: HashMap<Hash, Duration>,
 
     /// Commitment proofs from remote transactions.
-    /// Used to build CycleProof when deferring due to livelock cycle.
+    /// Attached to deferrals when a livelock cycle is detected.
     /// Maps tx_hash -> CommitmentProof
     commitment_proofs: HashMap<Hash, CommitmentProof>,
 
@@ -220,7 +220,7 @@ impl LivelockState {
             return;
         }
 
-        // Store the commitment proof for building CycleProof later
+        // Store the commitment proof for attaching to deferrals
         self.commitment_proofs
             .insert(remote_tx_hash, commitment_proof.clone());
 
@@ -321,7 +321,7 @@ impl LivelockState {
 
     /// Queue a deferral for inclusion in the next block.
     ///
-    /// The deferral will only be queued if we have a valid CycleProof for the winner.
+    /// The deferral will only be queued if we have a valid CommitmentProof for the winner.
     /// This is required for BFT safety - blocks with proof-less deferrals are rejected.
     fn queue_deferral(&mut self, loser_tx: Hash, winner_tx: Hash) {
         // Check if already queued
@@ -330,7 +330,7 @@ impl LivelockState {
             return;
         }
 
-        // Build CycleProof from the stored commitment proof for the winner.
+        // Get the stored commitment proof for the winner.
         // The proof MUST be present - BFT validation rejects deferrals without proofs.
         let Some(commitment) = self.commitment_proofs.get(&winner_tx) else {
             // This shouldn't happen in normal operation since we store the commitment
@@ -344,21 +344,19 @@ impl LivelockState {
             return;
         };
 
-        let proof = CycleProof::new(winner_tx, commitment.clone());
-
         let deferral = TransactionDefer {
             tx_hash: loser_tx,
             reason: DeferReason::LivelockCycle {
                 winner_tx_hash: winner_tx,
             },
             block_height: BlockHeight(0), // Will be filled in when included in block
-            proof,
+            proof: commitment.clone(),
         };
 
         debug!(
             loser_tx = %loser_tx,
             winner_tx = %winner_tx,
-            "Queuing deferral with cycle proof"
+            "Queuing deferral with commitment proof"
         );
 
         self.pending_deferral_hashes.insert(loser_tx);
@@ -532,6 +530,7 @@ mod tests {
         CommitmentProof::new(
             tx_hash,
             source_shard,
+            ShardGroupId(0), // target_shard = local shard in tests
             SignerBitfield::new(3),
             zero_bls_signature(),
             BlockHeight(1),
@@ -553,6 +552,7 @@ mod tests {
         CommitmentProof::new(
             tx_hash,
             source_shard,
+            ShardGroupId(0), // target_shard = local shard in tests
             SignerBitfield::new(3),
             zero_bls_signature(),
             BlockHeight(1),
@@ -583,22 +583,20 @@ mod tests {
         Hash::from_hash_bytes(&bytes)
     }
 
-    // Helper to create a minimal CycleProof for testing
-    fn make_test_cycle_proof(winner_tx_hash: Hash) -> CycleProof {
-        use hyperscale_types::{
-            Bls12381G2Signature, CommitmentProof, ShardGroupId, SignerBitfield,
-        };
+    // Helper to create a minimal CommitmentProof for testing
+    fn make_test_commitment_proof(winner_tx_hash: Hash) -> CommitmentProof {
+        use hyperscale_types::{Bls12381G2Signature, ShardGroupId, SignerBitfield};
 
-        let commitment_proof = CommitmentProof {
+        CommitmentProof {
             tx_hash: winner_tx_hash,
             source_shard: ShardGroupId(1),
+            target_shard: ShardGroupId(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: Bls12381G2Signature([0u8; 96]),
             block_height: BlockHeight(1),
             block_timestamp: 1000,
             entries: std::sync::Arc::new(vec![]),
-        };
-        CycleProof::new(winner_tx_hash, commitment_proof)
+        }
     }
 
     #[test]
@@ -809,7 +807,7 @@ mod tests {
                 winner_tx_hash: winner,
             },
             block_height: BlockHeight(5),
-            proof: make_test_cycle_proof(winner),
+            proof: make_test_commitment_proof(winner),
         };
 
         let block = hyperscale_types::Block {

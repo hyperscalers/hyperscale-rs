@@ -488,13 +488,13 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::QcSignatureVerified { block_hash, valid } => {
                 self.bft.on_qc_signature_verified(block_hash, valid)
             }
-            ProtocolEvent::CycleProofVerified {
+            ProtocolEvent::CommitmentProofVerified {
                 block_hash,
                 deferral_index,
                 valid,
             } => self
                 .bft
-                .on_cycle_proof_verified(block_hash, deferral_index, valid),
+                .on_commitment_proof_verified(block_hash, deferral_index, valid),
             ProtocolEvent::StateRootVerified { block_hash, valid } => {
                 self.bft.on_state_root_verified(block_hash, valid)
             }

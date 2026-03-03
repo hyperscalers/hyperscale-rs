@@ -8,8 +8,8 @@ use hyperscale_storage::{CommitStore, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_transaction_root, verify_bls12381_v1, Block,
     BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
-    CycleProof, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield,
-    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
+    Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield, TransactionAbort,
+    TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -186,18 +186,18 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
     }
 }
 
-/// Verify a cycle proof's aggregated BLS signature and quorum threshold.
+/// Verify a commitment proof's aggregated BLS signature and quorum threshold.
 ///
 /// Aggregates all provided public keys, verifies the signature from
-/// `cycle_proof.winner_commitment.aggregated_signature`, and checks that
-/// the signers' voting power meets the quorum threshold.
+/// `proof.aggregated_signature`, and checks that the signers' voting power
+/// meets the quorum threshold. The signing message is computed from the proof
+/// itself, making verification fully self-contained.
 ///
 /// `voting_power` is the pre-computed total voting power of the signers
 /// (derived from the signer bitfield and the topology).
-pub fn verify_cycle_proof(
-    cycle_proof: &CycleProof,
+pub fn verify_commitment_proof(
+    proof: &CommitmentProof,
     public_keys: &[Bls12381G1PublicKey],
-    signing_message: &[u8],
     voting_power: u64,
     quorum_threshold: u64,
 ) -> bool {
@@ -205,12 +205,14 @@ pub fn verify_cycle_proof(
         return false;
     }
 
+    let signing_message = proof.signing_message();
+
     // Verify aggregated BLS signature (skip PK validation - trusted topology)
     let sig_valid = match Bls12381G1PublicKey::aggregate(public_keys, false) {
         Ok(aggregated_pk) => verify_bls12381_v1(
-            signing_message,
+            &signing_message,
             &aggregated_pk,
-            &cycle_proof.winner_commitment.aggregated_signature,
+            &proof.aggregated_signature,
         ),
         Err(_) => false,
     };

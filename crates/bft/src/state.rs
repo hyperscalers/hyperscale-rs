@@ -29,10 +29,9 @@ pub struct BftStats {
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
 use hyperscale_types::{
-    state_provision_message, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PrivateKey,
-    Bls12381G1PublicKey, CommitmentProof, Hash, QuorumCertificate, ReadyTransactions,
-    RoutableTransaction, ShardGroupId, Topology, TransactionAbort, TransactionCertificate,
-    TransactionDefer, ValidatorId, VotePower,
+    Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    CommitmentProof, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
+    Topology, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
 };
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -98,13 +97,13 @@ struct PendingSyncedBlockVerification {
     verified: bool,
 }
 
-/// Tracks pending CycleProof verifications for a block.
+/// Tracks pending CommitmentProof verifications for a block.
 ///
-/// When a block contains deferrals with CycleProofs, we need to verify each
+/// When a block contains deferrals with CommitmentProofs, we need to verify each
 /// proof's BLS signature before voting on the block. This struct tracks the
 /// verification progress for a single block.
 #[derive(Debug, Clone)]
-struct PendingCycleProofVerifications {
+struct PendingCommitmentProofVerifications {
     /// Total number of deferrals needing verification.
     total: usize,
     /// Number of deferrals verified so far.
@@ -247,11 +246,11 @@ pub struct BftState {
     /// When we receive a synced block, we must verify its QC's signature before applying.
     pending_synced_block_verifications: HashMap<Hash, PendingSyncedBlockVerification>,
 
-    /// Blocks waiting for CycleProof verification before voting.
+    /// Blocks waiting for CommitmentProof verification before voting.
     /// Maps block_hash -> pending verification state.
-    /// When a block contains deferrals with CycleProofs, we must verify each proof's
+    /// When a block contains deferrals with CommitmentProofs, we must verify each proof's
     /// BLS signature before voting. This tracks the verification progress.
-    pending_cycle_proof_verifications: HashMap<Hash, PendingCycleProofVerifications>,
+    pending_commitment_proof_verifications: HashMap<Hash, PendingCommitmentProofVerifications>,
 
     /// Blocks where state root verification is currently in-flight (being computed).
     /// When verification completes, the block hash is moved to verified_state_roots
@@ -301,8 +300,8 @@ pub struct BftState {
     /// Blocks where transaction root verification is currently in-flight.
     transaction_root_verifications_in_flight: HashSet<Hash>,
 
-    /// Blocks with verified CycleProofs (prevents re-verification).
-    verified_cycle_proofs: HashSet<Hash>,
+    /// Blocks with verified CommitmentProofs (prevents re-verification).
+    verified_commitment_proofs: HashSet<Hash>,
 
     /// Cache of already-verified QC signatures.
     /// Maps QC's block_hash (the block the QC certifies) -> height.
@@ -437,7 +436,7 @@ impl BftState {
             certified_blocks: HashMap::new(),
             pending_qc_verifications: HashMap::new(),
             pending_synced_block_verifications: HashMap::new(),
-            pending_cycle_proof_verifications: HashMap::new(),
+            pending_commitment_proof_verifications: HashMap::new(),
             state_root_verifications_in_flight: HashSet::new(),
             pending_state_root_verifications: HashMap::new(),
             last_committed_jmt_state: recovered.jmt_state.unwrap_or((0, Hash::ZERO)),
@@ -447,7 +446,7 @@ impl BftState {
             verified_state_roots: HashSet::new(),
             verified_transaction_roots: HashSet::new(),
             transaction_root_verifications_in_flight: HashSet::new(),
-            verified_cycle_proofs: HashSet::new(),
+            verified_commitment_proofs: HashSet::new(),
             verified_qcs: HashMap::new(),
             buffered_synced_blocks: std::collections::BTreeMap::new(),
             pending_commits: std::collections::BTreeMap::new(),
@@ -996,22 +995,22 @@ impl BftState {
         let block_height = BlockHeight(next_height);
 
         // Set block_height on each deferral (proposer fills this in).
-        // Also filter out deferrals whose CycleProof doesn't have enough voting power.
+        // Also filter out deferrals whose CommitmentProof doesn't have enough voting power.
         // This prevents proposing blocks that other validators would reject due to
-        // insufficient quorum on the cycle proof.
+        // insufficient quorum on the commitment proof.
         let deferred_with_height: Vec<TransactionDefer> = deferred
             .into_iter()
             .filter(|d| {
-                let source_shard = d.proof.winner_source_shard();
-                let quorum_threshold = self.topology.quorum_threshold_for_shard(source_shard);
-                let (_, voting_power) =
-                    self.resolve_commitment_proof_signers(&d.proof.winner_commitment, source_shard);
+                let quorum_threshold = self
+                    .topology
+                    .quorum_threshold_for_shard(d.proof.source_shard);
+                let (_, voting_power) = self.resolve_commitment_proof_signers(&d.proof);
                 if voting_power < quorum_threshold {
                     trace!(
                         tx_hash = %d.tx_hash,
                         voting_power = voting_power,
                         quorum_threshold = quorum_threshold,
-                        "Filtering deferral with insufficient CycleProof voting power"
+                        "Filtering deferral with insufficient CommitmentProof voting power"
                     );
                     return false;
                 }
@@ -2003,13 +2002,13 @@ impl BftState {
                 }
 
                 // Initiate all async verifications in parallel.
-                // CycleProof, StateRoot, and TransactionRoot verifications run concurrently.
+                // CommitmentProof, StateRoot, and TransactionRoot verifications run concurrently.
                 let mut verification_actions = Vec::new();
 
-                // If block has deferrals with CycleProofs, initiate async verification.
-                if self.block_needs_cycle_proof_verification(&block) {
+                // If block has deferrals with CommitmentProofs, initiate async verification.
+                if self.block_needs_commitment_proof_verification(&block) {
                     verification_actions
-                        .extend(self.initiate_cycle_proof_verification(block_hash, &block));
+                        .extend(self.initiate_commitment_proof_verification(block_hash, &block));
                 }
 
                 // Verify state root if block has committed certificates.
@@ -2035,11 +2034,11 @@ impl BftState {
         self.create_vote(block_hash, height, round)
     }
 
-    /// Check if a block needs CycleProof verification before voting.
+    /// Check if a block needs CommitmentProof verification before voting.
     ///
-    /// Returns true if the block has any deferrals with CycleProofs that haven't
+    /// Returns true if the block has any deferrals with CommitmentProofs that haven't
     /// been verified yet.
-    fn block_needs_cycle_proof_verification(&self, block: &Block) -> bool {
+    fn block_needs_commitment_proof_verification(&self, block: &Block) -> bool {
         if block.deferred.is_empty() {
             return false;
         }
@@ -2047,9 +2046,9 @@ impl BftState {
         let block_hash = block.hash();
 
         // Skip if already verified or verification in progress
-        if self.verified_cycle_proofs.contains(&block_hash)
+        if self.verified_commitment_proofs.contains(&block_hash)
             || self
-                .pending_cycle_proof_verifications
+                .pending_commitment_proof_verifications
                 .contains_key(&block_hash)
         {
             return false;
@@ -2058,12 +2057,12 @@ impl BftState {
         true
     }
 
-    /// Initiate async CycleProof verification for a block's deferrals.
+    /// Initiate async CommitmentProof verification for a block's deferrals.
     ///
     /// This is called after structural validation passes. For each deferral,
-    /// we emit an `Action::VerifyCycleProof` to verify the BLS signature.
+    /// we emit an `Action::VerifyCommitmentProof` to verify the BLS signature.
     /// Voting is deferred until all verifications complete successfully.
-    fn initiate_cycle_proof_verification(
+    fn initiate_commitment_proof_verification(
         &mut self,
         block_hash: Hash,
         block: &Block,
@@ -2075,13 +2074,13 @@ impl BftState {
         debug!(
             block_hash = ?block_hash,
             deferral_count = block.deferred.len(),
-            "Initiating CycleProof verification for block"
+            "Initiating CommitmentProof verification for block"
         );
 
         // Track pending verification
-        self.pending_cycle_proof_verifications.insert(
+        self.pending_commitment_proof_verifications.insert(
             block_hash,
-            PendingCycleProofVerifications {
+            PendingCommitmentProofVerifications {
                 total: block.deferred.len(),
                 verified: 0,
                 all_valid: true,
@@ -2095,48 +2094,26 @@ impl BftState {
             .enumerate()
             .map(|(idx, deferral)| {
                 let proof = &deferral.proof;
-                let source_shard = proof.winner_source_shard();
 
                 // Resolve public keys and voting power from signer bitfield
-                let (public_keys, voting_power) =
-                    self.resolve_commitment_proof_signers(&proof.winner_commitment, source_shard);
+                let (public_keys, voting_power) = self.resolve_commitment_proof_signers(proof);
 
                 if public_keys.is_empty() {
                     warn!(
                         block_hash = ?block_hash,
                         deferral_index = idx,
-                        "No public keys resolved for CycleProof verification"
+                        "No public keys resolved for CommitmentProof verification"
                     );
                     // Will fail verification with empty keys
                 }
 
-                // Get signing message and quorum threshold
-                // IMPORTANT: The CommitmentProof aggregates signatures from StateProvisions.
-                // StateProvisions are signed with state_provision_message() which includes
-                // target_shard (the shard receiving the provisions = our local shard).
-                // We must use the same message format for verification.
-                let entry_hashes: Vec<Hash> = proof
-                    .winner_commitment
-                    .entries
-                    .iter()
-                    .map(|e| e.hash())
-                    .collect();
-                let signing_message = state_provision_message(
-                    &proof.winner_commitment.tx_hash,
-                    self.shard_group, // target_shard = our local shard (we received these provisions)
-                    source_shard,     // source_shard = where the provisions came from
-                    proof.winner_commitment.block_height,
-                    proof.winner_commitment.block_timestamp,
-                    &entry_hashes,
-                );
-                let quorum_threshold = self.topology.quorum_threshold_for_shard(source_shard);
+                let quorum_threshold = self.topology.quorum_threshold_for_shard(proof.source_shard);
 
-                Action::VerifyCycleProof {
+                Action::VerifyCommitmentProof {
                     block_hash,
                     deferral_index: idx,
-                    cycle_proof: proof.clone(),
+                    commitment_proof: proof.clone(),
                     public_keys,
-                    signing_message,
                     voting_power,
                     quorum_threshold,
                 }
@@ -2148,9 +2125,8 @@ impl BftState {
     fn resolve_commitment_proof_signers(
         &self,
         proof: &CommitmentProof,
-        source_shard: ShardGroupId,
     ) -> (Vec<Bls12381G1PublicKey>, u64) {
-        let committee = self.topology.committee_for_shard(source_shard);
+        let committee = self.topology.committee_for_shard(proof.source_shard);
         let mut voting_power = 0u64;
         let public_keys = proof
             .signers
@@ -2169,7 +2145,7 @@ impl BftState {
     /// Check if all async verifications are complete for a block.
     ///
     /// Returns true if:
-    /// - CycleProof verification is done (or not needed)
+    /// - CommitmentProof verification is done (or not needed)
     /// - State root verification is done (or not needed)
     /// - Transaction root verification is done (or not needed)
     ///
@@ -2177,13 +2153,13 @@ impl BftState {
     fn block_verifications_complete(&self, block: &Block) -> bool {
         let block_hash = block.hash();
 
-        // Check CycleProof verification status
-        let cycle_proof_ok = if block.deferred.is_empty() {
+        // Check CommitmentProof verification status
+        let commitment_proof_ok = if block.deferred.is_empty() {
             // No deferrals - no verification needed
             true
         } else {
             // Has deferrals - must be in verified set
-            self.verified_cycle_proofs.contains(&block_hash)
+            self.verified_commitment_proofs.contains(&block_hash)
         };
 
         // Check state root verification status
@@ -2204,7 +2180,7 @@ impl BftState {
             self.verified_transaction_roots.contains(&block_hash)
         };
 
-        cycle_proof_ok && state_root_ok && transaction_root_ok
+        commitment_proof_ok && state_root_ok && transaction_root_ok
     }
 
     /// Check if a block needs state root verification before voting.
@@ -2314,11 +2290,11 @@ impl BftState {
     /// - Hash ordering: deferred_hash > winner_hash (lower hash wins cycles)
     /// - Staleness: winner cert not in same block
     /// - Staleness: loser cert not in same block (loser already completed)
-    /// - CycleProof required: every deferral must have a CycleProof attached
-    /// - CycleProof consistency: proof's winner hash must match deferral reason
+    /// - CommitmentProof required: every deferral must have a CommitmentProof attached
+    /// - CommitmentProof consistency: proof's winner hash must match deferral reason
     ///
-    /// Note: The CycleProof's BLS signature is verified asynchronously via
-    /// `Action::VerifyCycleProof` after structural validation passes. This method
+    /// Note: The CommitmentProof's BLS signature is verified asynchronously via
+    /// `Action::VerifyCommitmentProof` after structural validation passes. This method
     /// only checks that the proof is present and structurally valid.
     ///
     /// ## Aborts (TransactionAbort)
@@ -2364,21 +2340,21 @@ impl BftState {
                 ));
             }
 
-            // Rule 4: CycleProof must be present
+            // Rule 4: CommitmentProof must be present
             // BFT safety: Without a proof, a Byzantine proposer could cause honest validators
             // to incorrectly defer transactions. The proof contains an aggregated BLS signature
             // from the winner's source shard that will be verified asynchronously.
 
-            // Rule 5: CycleProof winner hash must match deferral reason
-            if deferral.proof.winner_tx_hash != *winner_tx_hash {
+            // Rule 5: CommitmentProof tx_hash must match deferral reason's winner
+            if deferral.proof.tx_hash != *winner_tx_hash {
                 return Err(format!(
-                    "Invalid deferral: CycleProof winner {} != deferral winner {}",
-                    deferral.proof.winner_tx_hash, winner_tx_hash
+                    "Invalid deferral: CommitmentProof tx_hash {} != deferral winner {}",
+                    deferral.proof.tx_hash, winner_tx_hash
                 ));
             }
 
-            // Note: The CycleProof's BLS signature is verified asynchronously via
-            // Action::VerifyCycleProof. We only check structural validity here.
+            // Note: The CommitmentProof's BLS signature is verified asynchronously via
+            // Action::VerifyCommitmentProof. We only check structural validity here.
             // The signature verification happens after this passes.
         }
 
@@ -2949,24 +2925,27 @@ impl BftState {
         self.try_vote_on_block(block_hash, height, round)
     }
 
-    /// Handle CycleProof signature verification result.
+    /// Handle CommitmentProof signature verification result.
     ///
-    /// Called when the runner completes `Action::VerifyCycleProof`.
+    /// Called when the runner completes `Action::VerifyCommitmentProof`.
     /// If all proofs are valid, we proceed to vote on the block.
     /// If any proof is invalid, the block is rejected.
     #[instrument(skip(self), fields(block_hash = ?block_hash, deferral_index = deferral_index, valid = valid))]
-    pub fn on_cycle_proof_verified(
+    pub fn on_commitment_proof_verified(
         &mut self,
         block_hash: Hash,
         deferral_index: usize,
         valid: bool,
     ) -> Vec<Action> {
-        let pending = match self.pending_cycle_proof_verifications.get_mut(&block_hash) {
+        let pending = match self
+            .pending_commitment_proof_verifications
+            .get_mut(&block_hash)
+        {
             Some(p) => p,
             None => {
                 warn!(
                     block_hash = ?block_hash,
-                    "CycleProof verification result for unknown block"
+                    "CommitmentProof verification result for unknown block"
                 );
                 return vec![];
             }
@@ -2979,13 +2958,13 @@ impl BftState {
             warn!(
                 block_hash = ?block_hash,
                 deferral_index = deferral_index,
-                "CycleProof signature verification FAILED - potential Byzantine attack!"
+                "CommitmentProof signature verification FAILED - potential Byzantine attack!"
             );
         } else {
             trace!(
                 block_hash = ?block_hash,
                 deferral_index = deferral_index,
-                "CycleProof verified successfully"
+                "CommitmentProof verified successfully"
             );
         }
 
@@ -2995,35 +2974,36 @@ impl BftState {
                 block_hash = ?block_hash,
                 verified = pending.verified,
                 total = pending.total,
-                "Waiting for more CycleProof verifications"
+                "Waiting for more CommitmentProof verifications"
             );
             return vec![];
         }
 
         // All verifications complete
         let all_valid = pending.all_valid;
-        self.pending_cycle_proof_verifications.remove(&block_hash);
+        self.pending_commitment_proof_verifications
+            .remove(&block_hash);
 
         if !all_valid {
             info!(
                 block_hash = ?block_hash,
-                "Block rejected due to invalid CycleProof(s)"
+                "Block rejected due to invalid CommitmentProof(s)"
             );
             // Remove the pending block since we can't trust it
             self.pending_blocks.remove(&block_hash);
             return vec![];
         }
 
-        self.verified_cycle_proofs.insert(block_hash);
+        self.verified_commitment_proofs.insert(block_hash);
 
         debug!(
             block_hash = ?block_hash,
-            "All CycleProofs verified successfully"
+            "All CommitmentProofs verified successfully"
         );
         let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
             warn!(
                 block_hash = ?block_hash,
-                "CycleProof verification complete but pending block not found"
+                "CommitmentProof verification complete but pending block not found"
             );
             return vec![];
         };
@@ -3037,7 +3017,7 @@ impl BftState {
         if !self.block_verifications_complete(&block) {
             debug!(
                 block_hash = ?block_hash,
-                "CycleProofs done, waiting for other verifications"
+                "CommitmentProofs done, waiting for other verifications"
             );
             return vec![];
         }
@@ -4894,12 +4874,12 @@ impl BftState {
         self.pending_qc_verifications
             .retain(|hash, _| self.pending_blocks.contains_key(hash));
 
-        // Remove pending CycleProof verifications for blocks no longer in pending_blocks.
-        self.pending_cycle_proof_verifications
+        // Remove pending CommitmentProof verifications for blocks no longer in pending_blocks.
+        self.pending_commitment_proof_verifications
             .retain(|hash, _| self.pending_blocks.contains_key(hash));
 
-        // Remove verified CycleProofs for blocks no longer in pending_blocks.
-        self.verified_cycle_proofs
+        // Remove verified CommitmentProofs for blocks no longer in pending_blocks.
+        self.verified_commitment_proofs
             .retain(|hash| self.pending_blocks.contains_key(hash));
 
         // Remove pending state root verifications for blocks no longer in pending_blocks.
@@ -6013,25 +5993,25 @@ mod tests {
     // Deferral and Abort Validation Tests
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Create a dummy CycleProof for testing structural validation.
+    /// Create a dummy CommitmentProof for testing structural validation.
     ///
     /// The proof is structurally valid but the signature is not cryptographically valid.
     /// This is sufficient for testing structural validation logic which doesn't verify
-    /// the BLS signature (that's done asynchronously via Action::VerifyCycleProof).
-    fn make_test_cycle_proof(winner_tx_hash: Hash) -> hyperscale_types::CycleProof {
-        use hyperscale_types::{CommitmentProof, CycleProof, ShardGroupId, SignerBitfield};
+    /// the BLS signature (that's done asynchronously via Action::VerifyCommitmentProof).
+    fn make_test_commitment_proof(winner_tx_hash: Hash) -> hyperscale_types::CommitmentProof {
+        use hyperscale_types::{CommitmentProof, ShardGroupId, SignerBitfield};
         use std::sync::Arc;
 
-        let commitment_proof = CommitmentProof {
+        CommitmentProof {
             tx_hash: winner_tx_hash,
             source_shard: ShardGroupId(1),
+            target_shard: ShardGroupId(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
             block_height: BlockHeight(1),
             block_timestamp: 1000,
             entries: Arc::new(vec![]),
-        };
-        CycleProof::new(winner_tx_hash, commitment_proof)
+        }
     }
 
     /// Create a test deferral with a minimal proof.
@@ -6043,7 +6023,7 @@ mod tests {
                 winner_tx_hash: winner_tx,
             },
             block_height: BlockHeight(0),
-            proof: make_test_cycle_proof(winner_tx),
+            proof: make_test_commitment_proof(winner_tx),
         }
     }
 
@@ -6093,7 +6073,7 @@ mod tests {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_cycle_proof(winner_hash),
+            proof: make_test_commitment_proof(winner_hash),
         };
         let block = make_test_block(5, vec![valid_deferral], vec![], vec![]);
         assert!(state.validate_deferrals_and_aborts(&block).is_ok());
@@ -6105,7 +6085,7 @@ mod tests {
                 winner_tx_hash: loser_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_cycle_proof(loser_hash),
+            proof: make_test_commitment_proof(loser_hash),
         };
         let block = make_test_block(5, vec![invalid_deferral], vec![], vec![]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -6137,7 +6117,7 @@ mod tests {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_cycle_proof(winner_hash),
+            proof: make_test_commitment_proof(winner_hash),
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![winner_cert]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -6169,7 +6149,7 @@ mod tests {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_cycle_proof(winner_hash),
+            proof: make_test_commitment_proof(winner_hash),
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![loser_cert]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -6189,21 +6169,21 @@ mod tests {
         let winner_hash = Hash::from_hash_bytes(&winner_bytes);
         let other_hash = Hash::from_hash_bytes(&other_bytes);
 
-        // Invalid: CycleProof has different winner than deferral reason
+        // Invalid: CommitmentProof has different winner than deferral reason
         let deferral = TransactionDefer {
             tx_hash: loser_hash,
             reason: hyperscale_types::DeferReason::LivelockCycle {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_cycle_proof(other_hash), // Wrong winner!
+            proof: make_test_commitment_proof(other_hash), // Wrong winner!
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![]);
         let result = state.validate_deferrals_and_aborts(&block);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("CycleProof winner"),
-            "Error should mention CycleProof winner mismatch"
+            result.unwrap_err().contains("CommitmentProof tx_hash"),
+            "Error should mention CommitmentProof tx_hash mismatch"
         );
     }
 
@@ -7884,6 +7864,7 @@ mod tests {
             Some(CommitmentProof::new(
                 tx_arc.hash(),
                 ShardGroupId(1),
+                ShardGroupId(0),
                 SignerBitfield::new(4),
                 zero_bls_signature(),
                 BlockHeight(1),

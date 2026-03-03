@@ -2063,19 +2063,19 @@ mod tests {
 
     fn make_test_deferral(loser_tx: Hash, winner_tx: Hash, height: u64) -> TransactionDefer {
         use hyperscale_types::{
-            Bls12381G2Signature, CommitmentProof, CycleProof, ShardGroupId, SignerBitfield,
+            Bls12381G2Signature, CommitmentProof, ShardGroupId, SignerBitfield,
         };
 
-        let commitment_proof = CommitmentProof {
+        let proof = CommitmentProof {
             tx_hash: winner_tx,
             source_shard: ShardGroupId(1),
+            target_shard: ShardGroupId(0),
             signers: SignerBitfield::empty(),
             aggregated_signature: Bls12381G2Signature([0u8; 96]),
             block_height: BlockHeight(1),
             block_timestamp: 1000,
             entries: std::sync::Arc::new(vec![]),
         };
-        let proof = CycleProof::new(winner_tx, commitment_proof);
 
         TransactionDefer {
             tx_hash: loser_tx,

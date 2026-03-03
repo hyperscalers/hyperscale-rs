@@ -370,6 +370,7 @@ impl ProvisionCoordinator {
         vec![Action::VerifyAndAggregateProvisions {
             tx_hash,
             source_shard,
+            target_shard: self.local_shard,
             block_height,
             block_timestamp,
             entries,
@@ -661,6 +662,7 @@ impl ProvisionCoordinator {
         Some(CommitmentProof::new(
             *tx_hash,
             *source_shard,
+            self.local_shard,
             signers,
             aggregated_signature,
             block_height,
@@ -1117,6 +1119,7 @@ mod tests {
         let proof = CommitmentProof::new(
             tx_hash,
             ShardGroupId(1),
+            ShardGroupId(0),
             SignerBitfield::new(4),
             zero_bls_signature(),
             BlockHeight(1),
@@ -1151,6 +1154,7 @@ mod tests {
         let proof = CommitmentProof::new(
             tx_hash,
             ShardGroupId(1),
+            ShardGroupId(0),
             SignerBitfield::new(4),
             zero_bls_signature(),
             BlockHeight(1),

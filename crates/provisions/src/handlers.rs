@@ -32,6 +32,7 @@ pub struct ProvisionVerificationResult {
 pub fn verify_and_aggregate_provisions(
     tx_hash: Hash,
     source_shard: ShardGroupId,
+    target_shard: ShardGroupId,
     block_height: BlockHeight,
     block_timestamp: u64,
     entries: Vec<StateEntry>,
@@ -66,6 +67,7 @@ pub fn verify_and_aggregate_provisions(
         let proof = CommitmentProof::new(
             tx_hash,
             source_shard,
+            target_shard,
             signers,
             aggregated_signature,
             block_height,
@@ -117,6 +119,7 @@ pub fn verify_and_aggregate_provisions(
             Some(CommitmentProof::new(
                 tx_hash,
                 source_shard,
+                target_shard,
                 signers,
                 aggregated_signature,
                 block_height,
