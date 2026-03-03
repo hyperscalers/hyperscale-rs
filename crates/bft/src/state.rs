@@ -233,8 +233,8 @@ pub struct BftState {
     received_votes_by_height: HashMap<(u64, ValidatorId), (Hash, u64)>,
 
     /// Blocks that have been certified (have QC) but not yet committed.
-    /// Maps block_hash -> (Block, QC).
-    certified_blocks: HashMap<Hash, (Block, QuorumCertificate)>,
+    /// Maps block_hash -> Block.
+    certified_blocks: HashMap<Hash, Block>,
 
     /// Block headers pending QC signature verification.
     /// Maps block_hash -> pending verification info.
@@ -550,7 +550,7 @@ impl BftState {
     /// Looks up the block in certified_blocks, pending_blocks, or genesis.
     /// Used to walk the QC chain when computing state_version for proposals.
     fn get_block_by_hash(&self, block_hash: Hash) -> Option<Block> {
-        if let Some((block, _)) = self.certified_blocks.get(&block_hash) {
+        if let Some(block) = self.certified_blocks.get(&block_hash) {
             return Some(block.clone());
         }
 
@@ -1216,7 +1216,7 @@ impl BftState {
             self.pending_blocks.insert(block_hash, pending);
             self.pending_block_created_at.insert(block_hash, self.now);
             self.certified_blocks
-                .insert(block_hash, ((*constructed).clone(), parent_qc));
+                .insert(block_hash, (*constructed).clone());
         }
 
         // Create gossip message (fallback blocks have no transactions, deferrals, or aborts)
@@ -1332,7 +1332,7 @@ impl BftState {
             self.pending_blocks.insert(block_hash, pending);
             self.pending_block_created_at.insert(block_hash, self.now);
             self.certified_blocks
-                .insert(block_hash, ((*constructed).clone(), parent_qc));
+                .insert(block_hash, (*constructed).clone());
         }
 
         // Create gossip message (sync blocks have no transactions, deferrals, or aborts)
@@ -3367,7 +3367,7 @@ impl BftState {
             } else {
                 (0, 0)
             }
-        } else if let Some((block, _)) = self.certified_blocks.get(&committable_hash) {
+        } else if let Some(block) = self.certified_blocks.get(&committable_hash) {
             (block.transactions.len(), block.certificates.len())
         } else {
             (0, 0)
@@ -3464,10 +3464,8 @@ impl BftState {
         // causing sync failures when other validators try to fetch it.
         let block = if let Some(pending) = self.pending_blocks.get(&block_hash) {
             pending.block().map(|b| (*b).clone())
-        } else if let Some((block, _)) = self.certified_blocks.get(&block_hash) {
-            Some(block.clone())
         } else {
-            None
+            self.certified_blocks.get(&block_hash).cloned()
         };
 
         if let Some(block) = block {
@@ -3506,7 +3504,7 @@ impl BftState {
                     let certifying_qc = if let Some(pending) = self.pending_blocks.get(&block_hash)
                     {
                         pending.header().parent_qc.clone()
-                    } else if let Some((block, _)) = self.certified_blocks.get(&block_hash) {
+                    } else if let Some(block) = self.certified_blocks.get(&block_hash) {
                         block.header.parent_qc.clone()
                     } else {
                         warn!(
@@ -3594,10 +3592,8 @@ impl BftState {
         // Get the block to commit
         let block = if let Some(pending) = self.pending_blocks.get(&block_hash) {
             pending.block().map(|b| (*b).clone())
-        } else if let Some((block, _)) = self.certified_blocks.get(&block_hash) {
-            Some(block.clone())
         } else {
-            None
+            self.certified_blocks.get(&block_hash).cloned()
         };
 
         let Some(block) = block else {
@@ -3698,7 +3694,7 @@ impl BftState {
 
         loop {
             // Get the block to commit.
-            let block = if let Some((block, _)) = self.certified_blocks.get(&current_hash) {
+            let block = if let Some(block) = self.certified_blocks.get(&current_hash) {
                 Some(block.clone())
             } else if let Some(pending) = self.pending_blocks.get(&current_hash) {
                 pending.block().map(|b| (*b).clone())
@@ -4804,7 +4800,7 @@ impl BftState {
 
         // Remove certified blocks at or below committed height
         self.certified_blocks
-            .retain(|_, (block, _)| block.header.height.0 > committed_height);
+            .retain(|_, block| block.header.height.0 > committed_height);
 
         // Remove pending commits awaiting data at or below committed height
         self.pending_commits_awaiting_data
@@ -5142,7 +5138,7 @@ impl BftState {
         if self
             .certified_blocks
             .values()
-            .any(|(block, _)| block.header.height.0 == height)
+            .any(|block| block.header.height.0 == height)
         {
             return true;
         }
