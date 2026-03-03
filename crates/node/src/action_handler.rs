@@ -206,6 +206,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
         }
 
         Action::BuildProposal {
+            shard_group_id,
             proposer,
             height,
             round,
@@ -241,7 +242,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 commitment_proofs,
                 deferred,
                 aborted,
-                ctx.local_shard,
+                shard_group_id,
             );
             let prepared = result.prepared_commit.map(|p| (result.block_hash, p));
             Some(DelegatedResult {

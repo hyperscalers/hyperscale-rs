@@ -145,6 +145,7 @@ impl Topic {
             "state.provision.batch" => Some("state.provision.batch"),
             "execution.vote.batch" => Some("execution.vote.batch"),
             "execution.certificate.batch" => Some("execution.certificate.batch"),
+            "block.committed" => Some("block.committed"),
             _ => None,
         }
     }
@@ -244,6 +245,11 @@ impl Topic {
     /// Topic for execution certificate batch gossip.
     pub fn execution_certificate_batch(shard: ShardGroupId) -> Self {
         Self::shard("execution.certificate.batch", shard)
+    }
+
+    /// Topic for committed block header gossip (global, cross-shard).
+    pub fn block_committed() -> Self {
+        Self::global("block.committed")
     }
 }
 

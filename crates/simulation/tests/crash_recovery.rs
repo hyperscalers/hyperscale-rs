@@ -82,6 +82,7 @@ fn test_recovered_votes_prevent_equivocation() {
     };
 
     let header_b = BlockHeader {
+        shard_group_id: ShardGroupId(0),
         height: BlockHeight(5),
         parent_hash,
         parent_qc,
@@ -100,13 +101,7 @@ fn test_recovered_votes_prevent_equivocation() {
     // Process this block - it should NOT result in a vote because we already voted at height 5
     let actions = state.on_block_header(
         header_b,
-        vec![], // retry_hashes
-        vec![], // priority_hashes
-        vec![], // tx_hashes
-        vec![], // cert_hashes
-        vec![], // deferred
-        vec![], // aborted
-        HashMap::new(),
+        hyperscale_types::BlockManifest::default(),
         &HashMap::new(),
         &HashMap::new(),
     );

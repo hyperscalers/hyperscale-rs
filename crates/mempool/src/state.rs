@@ -2032,6 +2032,7 @@ mod tests {
     ) -> Block {
         Block {
             header: BlockHeader {
+                shard_group_id: ShardGroupId(0),
                 height: BlockHeight(height),
                 parent_hash: Hash::from_bytes(b"parent"),
                 parent_qc: QuorumCertificate::genesis(),

@@ -1148,13 +1148,14 @@ impl RocksDbStorage {
             .and_then(|v| sbor::basic_decode(&v).ok())?;
 
         // 2. Batch-fetch transactions for each section (preserving order)
-        let retry_transactions = self.get_transactions_batch_ordered(&metadata.retry_hashes);
-        let priority_transactions = self.get_transactions_batch_ordered(&metadata.priority_hashes);
-        let transactions = self.get_transactions_batch_ordered(&metadata.tx_hashes);
+        let retry_transactions =
+            self.get_transactions_batch_ordered(&metadata.manifest.retry_hashes);
+        let priority_transactions =
+            self.get_transactions_batch_ordered(&metadata.manifest.priority_hashes);
+        let transactions = self.get_transactions_batch_ordered(&metadata.manifest.tx_hashes);
 
         // Verify we got ALL transactions - return None if any are missing
-        let total_expected =
-            metadata.retry_hashes.len() + metadata.priority_hashes.len() + metadata.tx_hashes.len();
+        let total_expected = metadata.manifest.transaction_count();
         let total_found =
             retry_transactions.len() + priority_transactions.len() + transactions.len();
         if total_found != total_expected {
@@ -1168,13 +1169,13 @@ impl RocksDbStorage {
         }
 
         // 3. Batch-fetch certificates (preserving order)
-        let certificates = self.get_certificates_batch_ordered(&metadata.cert_hashes);
+        let certificates = self.get_certificates_batch_ordered(&metadata.manifest.cert_hashes);
 
         // Verify we got ALL certificates - return None if any are missing
-        if certificates.len() != metadata.cert_hashes.len() {
+        if certificates.len() != metadata.manifest.cert_hashes.len() {
             tracing::warn!(
                 height = height.0,
-                expected = metadata.cert_hashes.len(),
+                expected = metadata.manifest.cert_hashes.len(),
                 found = certificates.len(),
                 "Block has missing certificates - cannot serve sync request"
             );
@@ -1188,9 +1189,9 @@ impl RocksDbStorage {
             priority_transactions,
             transactions,
             certificates,
-            deferred: metadata.deferred,
-            aborted: metadata.aborted,
-            commitment_proofs: metadata.commitment_proofs,
+            deferred: metadata.manifest.deferred,
+            aborted: metadata.manifest.aborted,
+            commitment_proofs: metadata.manifest.commitment_proofs,
         };
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -1253,13 +1254,14 @@ impl RocksDbStorage {
             .and_then(|v| sbor::basic_decode(&v).ok())?;
 
         // 2. Try to batch-fetch transactions for each section (preserving order)
-        let retry_transactions = self.get_transactions_batch_ordered(&metadata.retry_hashes);
-        let priority_transactions = self.get_transactions_batch_ordered(&metadata.priority_hashes);
-        let transactions = self.get_transactions_batch_ordered(&metadata.tx_hashes);
+        let retry_transactions =
+            self.get_transactions_batch_ordered(&metadata.manifest.retry_hashes);
+        let priority_transactions =
+            self.get_transactions_batch_ordered(&metadata.manifest.priority_hashes);
+        let transactions = self.get_transactions_batch_ordered(&metadata.manifest.tx_hashes);
 
         // Check if all transactions are present - if not, return None
-        let total_expected =
-            metadata.retry_hashes.len() + metadata.priority_hashes.len() + metadata.tx_hashes.len();
+        let total_expected = metadata.manifest.transaction_count();
         let total_found =
             retry_transactions.len() + priority_transactions.len() + transactions.len();
         if total_found != total_expected {
@@ -1275,13 +1277,13 @@ impl RocksDbStorage {
         }
 
         // 3. Try to batch-fetch certificates (preserving order)
-        let certificates = self.get_certificates_batch_ordered(&metadata.cert_hashes);
+        let certificates = self.get_certificates_batch_ordered(&metadata.manifest.cert_hashes);
 
         // Check if all certificates are present - if not, return None
-        if certificates.len() != metadata.cert_hashes.len() {
+        if certificates.len() != metadata.manifest.cert_hashes.len() {
             tracing::debug!(
                 height = height.0,
-                expected = metadata.cert_hashes.len(),
+                expected = metadata.manifest.cert_hashes.len(),
                 found = certificates.len(),
                 "Block has missing certificates - cannot serve sync request"
             );
@@ -1297,9 +1299,9 @@ impl RocksDbStorage {
             priority_transactions,
             transactions,
             certificates,
-            deferred: metadata.deferred,
-            aborted: metadata.aborted,
-            commitment_proofs: metadata.commitment_proofs,
+            deferred: metadata.manifest.deferred,
+            aborted: metadata.manifest.aborted,
+            commitment_proofs: metadata.manifest.commitment_proofs,
         };
 
         let elapsed = start.elapsed().as_secs_f64();

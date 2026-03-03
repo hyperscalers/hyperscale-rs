@@ -6,10 +6,10 @@
 //! boundary between protocol logic and I/O orchestration.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockVote, CommitmentProof, EpochConfig, EpochId,
-    ExecutionCertificate, ExecutionVote, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, StateEntry, StateProvision, TransactionAbort, TransactionCertificate,
-    TransactionDefer, ValidatorId,
+    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommitmentProof,
+    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, StateEntry, StateProvision,
+    TransactionCertificate, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -41,13 +41,15 @@ pub enum ProtocolEvent {
     /// Received a block header from another node.
     BlockHeaderReceived {
         header: BlockHeader,
-        retry_hashes: Vec<Hash>,
-        priority_hashes: Vec<Hash>,
-        tx_hashes: Vec<Hash>,
-        cert_hashes: Vec<Hash>,
-        deferred: Vec<TransactionDefer>,
-        aborted: Vec<TransactionAbort>,
-        commitment_proofs: std::collections::HashMap<Hash, CommitmentProof>,
+        manifest: BlockManifest,
+    },
+
+    /// Received a committed block header from a remote shard (global broadcast).
+    ///
+    /// Used for the light-client provisions pattern: remote shards broadcast
+    /// committed headers so we can verify state roots via merkle inclusion proofs.
+    RemoteBlockCommitted {
+        committed_header: CommittedBlockHeader,
     },
 
     /// Received a vote on a block header.
@@ -347,6 +349,7 @@ impl ProtocolEvent {
 
             // BFT Consensus
             ProtocolEvent::BlockHeaderReceived { .. } => "BlockHeaderReceived",
+            ProtocolEvent::RemoteBlockCommitted { .. } => "RemoteBlockCommitted",
             ProtocolEvent::BlockVoteReceived { .. } => "BlockVoteReceived",
             ProtocolEvent::QuorumCertificateFormed { .. } => "QuorumCertificateFormed",
             ProtocolEvent::BlockReadyToCommit { .. } => "BlockReadyToCommit",

@@ -714,7 +714,12 @@ impl ProductionRunner {
             .copied()
             .unwrap_or(ValidatorId(0));
 
-        let genesis_block = Block::genesis(first_validator, genesis_jmt_root, genesis_jmt_version);
+        let genesis_block = Block::genesis(
+            self.local_shard,
+            first_validator,
+            genesis_jmt_root,
+            genesis_jmt_version,
+        );
 
         let genesis_hash = genesis_block.hash();
         info!(

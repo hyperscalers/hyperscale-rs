@@ -7,7 +7,7 @@ mod trace_context;
 
 // Re-export commonly used types
 pub use gossip::{
-    BlockHeaderGossip, BlockVoteGossip, ExecutionCertificateBatch, ExecutionVoteBatch,
-    StateProvisionBatch, TransactionCertificateGossip, TransactionGossip,
+    BlockHeaderGossip, BlockVoteGossip, CommittedBlockHeaderGossip, ExecutionCertificateBatch,
+    ExecutionVoteBatch, StateProvisionBatch, TransactionCertificateGossip, TransactionGossip,
 };
 pub use trace_context::TraceContext;

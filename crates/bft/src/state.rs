@@ -29,9 +29,10 @@ pub struct BftStats {
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    CommitmentProof, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
-    Topology, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
+    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey,
+    Bls12381G1PublicKey, CommitmentProof, Hash, QuorumCertificate, ReadyTransactions,
+    RoutableTransaction, ShardGroupId, Topology, TransactionAbort, TransactionCertificate,
+    TransactionDefer, ValidatorId, VotePower,
 };
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -1111,6 +1112,7 @@ impl BftState {
                 duration: self.config.proposal_interval,
             },
             Action::BuildProposal {
+                shard_group_id: self.local_shard(),
                 proposer: self.validator_id(),
                 height: block_height,
                 round,
@@ -1174,6 +1176,7 @@ impl BftState {
         let state_root = parent_state_root;
 
         let header = BlockHeader {
+            shard_group_id: self.local_shard(),
             height: BlockHeight(height),
             parent_hash,
             parent_qc: parent_qc.clone(),
@@ -1208,7 +1211,7 @@ impl BftState {
         );
 
         // Store our own block as pending (already complete since it's empty)
-        let mut pending = PendingBlock::new(header.clone(), vec![], vec![], vec![], vec![]);
+        let mut pending = PendingBlock::from_manifest(header.clone(), BlockManifest::default());
         if let Ok(constructed) = pending.construct_block() {
             self.pending_blocks.insert(block_hash, pending);
             self.pending_block_created_at.insert(block_hash, self.now);
@@ -1217,7 +1220,7 @@ impl BftState {
         }
 
         // Create gossip message (fallback blocks have no transactions, deferrals, or aborts)
-        let gossip = hyperscale_messages::BlockHeaderGossip::new(header, vec![], vec![], vec![]);
+        let gossip = hyperscale_messages::BlockHeaderGossip::new(header, BlockManifest::default());
 
         // Track proposal time for rate limiting
         self.last_proposal_time = self.now;
@@ -1289,6 +1292,7 @@ impl BftState {
         let state_root = parent_state_root;
 
         let header = BlockHeader {
+            shard_group_id: self.local_shard(),
             height: BlockHeight(height),
             parent_hash,
             parent_qc: parent_qc.clone(),
@@ -1323,7 +1327,7 @@ impl BftState {
         );
 
         // Store our own block as pending (already complete since it's empty)
-        let mut pending = PendingBlock::new(header.clone(), vec![], vec![], vec![], vec![]);
+        let mut pending = PendingBlock::from_manifest(header.clone(), BlockManifest::default());
         if let Ok(constructed) = pending.construct_block() {
             self.pending_blocks.insert(block_hash, pending);
             self.pending_block_created_at.insert(block_hash, self.now);
@@ -1332,7 +1336,7 @@ impl BftState {
         }
 
         // Create gossip message (sync blocks have no transactions, deferrals, or aborts)
-        let gossip = hyperscale_messages::BlockHeaderGossip::new(header, vec![], vec![], vec![]);
+        let gossip = hyperscale_messages::BlockHeaderGossip::new(header, BlockManifest::default());
 
         // Track proposal time for rate limiting
         self.last_proposal_time = self.now;
@@ -1408,37 +1412,20 @@ impl BftState {
         let header = pending.header().clone();
         let original_round = header.round;
 
-        // Get all the hashes and metadata needed to reconstruct the gossip message
-        let retry_hashes = pending.retry_hashes().to_vec();
-        let priority_hashes = pending.priority_hashes().to_vec();
-        let tx_hashes = pending.other_hashes().to_vec();
-        let cert_hashes = pending.all_certificate_hashes();
-        let deferred = pending.deferred().to_vec();
-        let aborted = pending.aborted().to_vec();
-        let commitment_proofs = pending.commitment_proofs().clone();
+        let manifest = pending.manifest().clone();
 
-        let total_tx_count = retry_hashes.len() + priority_hashes.len() + tx_hashes.len();
         info!(
             validator = ?self.validator_id(),
             height = height,
             original_round = original_round,
             block_hash = ?block_hash,
-            tx_count = total_tx_count,
-            cert_count = cert_hashes.len(),
+            tx_count = manifest.transaction_count(),
+            cert_count = manifest.cert_hashes.len(),
             "Re-proposing vote-locked block after view change (keeping original round)"
         );
 
         // Create and broadcast the gossip message - include commitment proofs for ordering validation
-        let gossip = hyperscale_messages::BlockHeaderGossip::full(
-            header,
-            retry_hashes,
-            priority_hashes,
-            tx_hashes,
-            cert_hashes,
-            deferred,
-            aborted,
-            commitment_proofs,
-        );
+        let gossip = hyperscale_messages::BlockHeaderGossip::new(header, manifest);
 
         actions.push(Action::BroadcastBlockHeader {
             shard: self.local_shard(),
@@ -1474,23 +1461,16 @@ impl BftState {
     /// Sender identity comes from the header's proposer field (ValidatorId),
     /// which is signed and verified. For sync detection, we don't need
     /// the network peer ID.
-    #[instrument(skip(self, header, retry_hashes, priority_hashes, tx_hashes, cert_hashes, deferred, aborted, mempool, certificates), fields(
+    #[instrument(skip(self, header, manifest, mempool, certificates), fields(
         height = header.height.0,
         round = header.round,
         proposer = ?header.proposer,
-        tx_count = retry_hashes.len() + priority_hashes.len() + tx_hashes.len()
+        tx_count = manifest.transaction_count()
     ))]
-    #[allow(clippy::too_many_arguments)]
     pub fn on_block_header(
         &mut self,
         header: BlockHeader,
-        retry_hashes: Vec<Hash>,
-        priority_hashes: Vec<Hash>,
-        tx_hashes: Vec<Hash>,
-        cert_hashes: Vec<Hash>,
-        deferred: Vec<TransactionDefer>,
-        aborted: Vec<TransactionAbort>,
-        commitment_proofs: HashMap<Hash, CommitmentProof>,
+        manifest: BlockManifest,
         mempool: &HashMap<Hash, Arc<RoutableTransaction>>,
         certificates: &HashMap<Hash, Arc<TransactionCertificate>>,
     ) -> Vec<Action> {
@@ -1606,32 +1586,21 @@ impl BftState {
             return vec![];
         }
 
-        // Create pending block with deferrals, aborts, and commitment proofs
-        let mut pending = PendingBlock::with_proofs(
-            header.clone(),
-            retry_hashes.clone(),
-            priority_hashes.clone(),
-            tx_hashes.clone(),
-            cert_hashes.clone(),
-            deferred,
-            aborted,
-            commitment_proofs,
-        );
+        // Create pending block and fill in transactions/certificates from local stores
+        let mut pending = PendingBlock::from_manifest(header.clone(), manifest);
 
-        // Try to fill in transactions from mempool (all sections)
-        for tx_hash in retry_hashes
-            .iter()
-            .chain(priority_hashes.iter())
-            .chain(tx_hashes.iter())
+        for tx_hash in pending
+            .manifest()
+            .all_tx_hashes()
+            .copied()
+            .collect::<Vec<_>>()
         {
-            if let Some(tx) = mempool.get(tx_hash) {
+            if let Some(tx) = mempool.get(&tx_hash) {
                 pending.add_transaction_arc(Arc::clone(tx));
             }
         }
-
-        // Try to fill in certificates from local certificate store
-        for cert_hash in &cert_hashes {
-            if let Some(cert) = certificates.get(cert_hash) {
+        for cert_hash in pending.manifest().cert_hashes.clone() {
+            if let Some(cert) = certificates.get(&cert_hash) {
                 pending.add_certificate(Arc::clone(cert));
             }
         }
@@ -3233,82 +3202,35 @@ impl BftState {
 
         let has_certificates = !block.certificates.is_empty();
 
-        // Build hashes for gossip and pending block
-        let retry_hashes: Vec<Hash> = block
-            .retry_transactions
-            .iter()
-            .map(|tx| tx.hash())
-            .collect();
-        let priority_hashes: Vec<Hash> = block
-            .priority_transactions
-            .iter()
-            .map(|tx| tx.hash())
-            .collect();
-        let tx_hashes: Vec<Hash> = block.transactions.iter().map(|tx| tx.hash()).collect();
-        let cert_hashes: Vec<Hash> = block
-            .certificates
-            .iter()
-            .map(|c| c.transaction_hash)
-            .collect();
+        // Store our own block as pending
+        let mut pending_block = PendingBlock::from_complete_block(&block);
 
-        let total_tx_count = retry_hashes.len() + priority_hashes.len() + tx_hashes.len();
+        let total_tx_count = pending_block.transaction_count();
         info!(
             validator = ?self.validator_id(),
             height = height.0,
             round = round,
             block_hash = ?block_hash,
             transactions = total_tx_count,
-            certificates = cert_hashes.len(),
+            certificates = pending_block.certificate_count(),
             has_certificates = has_certificates,
             "Broadcasting proposal"
         );
-
-        // Store our own block as pending (already complete)
-        let mut pending_block = PendingBlock::with_proofs(
-            block.header.clone(),
-            retry_hashes.clone(),
-            priority_hashes.clone(),
-            tx_hashes.clone(),
-            cert_hashes.clone(),
-            block.deferred.clone(),
-            block.aborted.clone(),
-            block.commitment_proofs.clone(),
-        );
-
-        for tx in &block.retry_transactions {
-            pending_block.add_transaction_arc(Arc::clone(tx));
-        }
-        for tx in &block.priority_transactions {
-            pending_block.add_transaction_arc(Arc::clone(tx));
-        }
-        for tx in &block.transactions {
-            pending_block.add_transaction_arc(Arc::clone(tx));
-        }
-        for cert in &block.certificates {
-            pending_block.add_certificate(Arc::clone(cert));
-        }
 
         if let Err(e) = pending_block.construct_block() {
             warn!("Failed to construct own proposal block: {}", e);
             return vec![];
         }
 
+        let gossip = hyperscale_messages::BlockHeaderGossip::new(
+            block.header.clone(),
+            pending_block.manifest().clone(),
+        );
+
         self.pending_blocks.insert(block_hash, pending_block);
         self.pending_block_created_at.insert(block_hash, self.now);
         self.last_proposal_time = self.now;
         self.record_leader_activity();
-
-        // Build gossip message with complete block data
-        let gossip = hyperscale_messages::BlockHeaderGossip {
-            header: block.header.clone(),
-            retry_hashes,
-            priority_hashes,
-            transaction_hashes: tx_hashes,
-            certificate_hashes: cert_hashes,
-            deferred: block.deferred.clone(),
-            aborted: block.aborted.clone(),
-            commitment_proofs: block.commitment_proofs.clone(),
-        };
 
         let mut actions = vec![Action::BroadcastBlockHeader {
             shard: self.local_shard(),
@@ -3468,8 +3390,8 @@ impl BftState {
             // Use original_tx_order/original_cert_order which are available even
             // before the block is fully constructed (waiting for tx/cert data).
             // These give us the counts from the block header.
-            total_txs += pending.all_transaction_hashes().len();
-            total_certs += pending.all_certificate_hashes().len();
+            total_txs += pending.transaction_count();
+            total_certs += pending.certificate_count();
         }
 
         (total_txs, total_certs)
@@ -3824,9 +3746,18 @@ impl BftState {
                 actions.push(Action::CancelFetch { block_hash });
             }
 
+            let commit_qc = qc.unwrap_or_else(QuorumCertificate::genesis);
             actions.push(Action::EmitCommittedBlock {
                 block: block.clone(),
-                qc: qc.unwrap_or_else(QuorumCertificate::genesis),
+                qc: commit_qc.clone(),
+            });
+            actions.push(Action::BroadcastCommittedBlockHeader {
+                gossip: hyperscale_messages::CommittedBlockHeaderGossip {
+                    committed_header: hyperscale_types::CommittedBlockHeader {
+                        header: block.header.clone(),
+                        qc: commit_qc,
+                    },
+                },
             });
             actions.push(Action::Continuation(ProtocolEvent::BlockCommitted {
                 block_hash: current_hash,
@@ -4113,7 +4044,15 @@ impl BftState {
             },
             Action::EmitCommittedBlock {
                 block: block.clone(),
-                qc,
+                qc: qc.clone(),
+            },
+            Action::BroadcastCommittedBlockHeader {
+                gossip: hyperscale_messages::CommittedBlockHeaderGossip {
+                    committed_header: hyperscale_types::CommittedBlockHeader {
+                        header: block.header.clone(),
+                        qc,
+                    },
+                },
             },
             Action::Continuation(ProtocolEvent::BlockCommitted {
                 block_hash,
@@ -5299,6 +5238,7 @@ mod tests {
 
     fn make_header_at_height(height: u64, timestamp: u64) -> BlockHeader {
         BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -5319,6 +5259,7 @@ mod tests {
 
         // Genesis block (height 0) should skip timestamp validation even with timestamp 0
         let header = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(0),
             parent_hash: Hash::from_bytes(b"genesis_parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -5413,6 +5354,7 @@ mod tests {
         // This simulates a fallback block inheriting parent's weighted_timestamp after
         // multiple view changes spanning more than max_timestamp_delay_ms (30s)
         let header = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -5433,6 +5375,7 @@ mod tests {
 
         // Verify that a non-fallback block with the same timestamp would fail
         let normal_header = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -5509,6 +5452,7 @@ mod tests {
         };
 
         let header = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(2),
             parent_hash,
             parent_qc: parent_qc.clone(),
@@ -5524,13 +5468,7 @@ mod tests {
         // Process the block header
         let actions = state.on_block_header(
             header,
-            vec![],          // retry_hashes
-            vec![],          // priority_hashes
-            vec![],          // tx_hashes
-            vec![],          // cert_hashes
-            vec![],          // deferred
-            vec![],          // aborted
-            HashMap::new(),  // commitment_proofs
+            BlockManifest::default(),
             &HashMap::new(), // mempool
             &HashMap::new(), // certificates
         );
@@ -5596,6 +5534,7 @@ mod tests {
         };
 
         let header = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(2),
             parent_hash,
             parent_qc: parent_qc.clone(),
@@ -5613,13 +5552,7 @@ mod tests {
         // First, process header to trigger QC verification
         let _ = state.on_block_header(
             header,
-            vec![], // retry_hashes
-            vec![], // priority_hashes
-            vec![], // tx_hashes
-            vec![], // cert_hashes
-            vec![], // deferred
-            vec![], // aborted
-            HashMap::new(),
+            BlockManifest::default(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -5687,6 +5620,7 @@ mod tests {
         };
 
         let header = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(2),
             parent_hash,
             parent_qc: parent_qc.clone(),
@@ -5704,13 +5638,7 @@ mod tests {
         // Process header to add pending verification
         let _ = state.on_block_header(
             header,
-            vec![], // retry_hashes
-            vec![], // priority_hashes
-            vec![], // tx_hashes
-            vec![], // cert_hashes
-            vec![], // deferred
-            vec![], // aborted
-            HashMap::new(),
+            BlockManifest::default(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -5765,6 +5693,7 @@ mod tests {
 
         // Create block at height 1 with genesis QC (no signature to verify)
         let header = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_hash: Hash::ZERO,
             parent_qc: QuorumCertificate::genesis(),
@@ -5780,13 +5709,7 @@ mod tests {
         // Process header
         let actions = state.on_block_header(
             header,
-            vec![], // retry_hashes
-            vec![], // priority_hashes
-            vec![], // tx_hashes
-            vec![], // cert_hashes
-            vec![], // deferred
-            vec![], // aborted
-            HashMap::new(),
+            BlockManifest::default(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -6299,6 +6222,7 @@ mod tests {
 
         // Create two different blocks at the same height
         let block_a = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -6313,6 +6237,7 @@ mod tests {
         let block_a_hash = block_a.hash();
 
         let block_b = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -6356,6 +6281,7 @@ mod tests {
 
         let height = 1u64;
         let block = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -6393,6 +6319,7 @@ mod tests {
         // Vote at heights 1, 2, 3
         for height in 1..=3 {
             let block = BlockHeader {
+                shard_group_id: ShardGroupId(0),
                 height: BlockHeight(height),
                 parent_hash: Hash::from_bytes(b"parent"),
                 parent_qc: QuorumCertificate::genesis(),
@@ -6689,6 +6616,7 @@ mod tests {
         // Create original block from validator 1 at round 0
         // proposer_for(1, 0) = (1 + 0) % 4 = 1 = ValidatorId(1)
         let original_header = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -6703,15 +6631,8 @@ mod tests {
         let original_block_hash = original_header.hash();
 
         // Add to pending_blocks (simulating receiving the header)
-        let pending = PendingBlock::full(
-            original_header.clone(),
-            vec![], // retry_hashes
-            vec![], // priority_hashes
-            vec![], // tx_hashes
-            vec![], // cert_hashes
-            vec![], // deferred
-            vec![], // aborted
-        );
+        let pending =
+            PendingBlock::from_manifest(original_header.clone(), BlockManifest::default());
         state.pending_blocks.insert(original_block_hash, pending);
 
         // Simulate voting for this block
@@ -6733,7 +6654,7 @@ mod tests {
 
         // Extract the header from the broadcast
         if let Some(Action::BroadcastBlockHeader { header: gossip, .. }) = broadcast_action {
-            let reproposed_header = gossip.header();
+            let reproposed_header = &gossip.header;
 
             // CRITICAL: The round should be the ORIGINAL round, not the view change round
             assert_eq!(
@@ -6771,6 +6692,7 @@ mod tests {
         // Create block with original proposer for (height=1, round=0)
         // proposer_for(1, 0) = (1 + 0) % 4 = 1 = ValidatorId(1)
         let header = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -6805,6 +6727,7 @@ mod tests {
         // Create block claiming round=0 but with wrong proposer
         // proposer_for(1, 0) = ValidatorId(1), but we claim ValidatorId(3)
         let header = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -7137,6 +7060,7 @@ mod tests {
 
         // Create a block from round 0 that we voted for
         let original_header = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -7151,7 +7075,7 @@ mod tests {
         let original_block_hash = original_header.hash();
 
         // Add to pending blocks and vote for it
-        let pending = PendingBlock::new(original_header, vec![], vec![], vec![], vec![]);
+        let pending = PendingBlock::from_manifest(original_header, BlockManifest::default());
         state.pending_blocks.insert(original_block_hash, pending);
         state.voted_heights.insert(1, (original_block_hash, 0));
 
@@ -7185,20 +7109,19 @@ mod tests {
 
         // Verify it's a fallback block (not the original)
         if let Some(Action::BroadcastBlockHeader { header: gossip, .. }) = broadcast_action {
-            assert!(gossip.header().is_fallback, "Should be a fallback block");
+            assert!(gossip.header.is_fallback, "Should be a fallback block");
             assert_eq!(
-                gossip.header().round,
-                3,
+                gossip.header.round, 3,
                 "Fallback block should be at new round"
             );
             assert_ne!(
-                gossip.header().hash(),
+                gossip.header.hash(),
                 original_block_hash,
                 "Fallback block should be different from original"
             );
             // Verify the fallback block hash matches what we voted for
             assert_eq!(
-                gossip.header().hash(),
+                gossip.header.hash(),
                 *new_block_hash,
                 "Fallback block hash should match our vote"
             );
@@ -7260,10 +7183,10 @@ mod tests {
         // Extract and verify it's a fallback block
         if let Some(Action::BroadcastBlockHeader { header: gossip, .. }) = broadcast_action {
             assert!(
-                gossip.header().is_fallback,
+                gossip.header.is_fallback,
                 "Block should be marked as fallback"
             );
-            assert_eq!(gossip.header().round, 3, "Block should be at round 3");
+            assert_eq!(gossip.header.round, 3, "Block should be at round 3");
         }
 
         // Should also have a vote action (we vote for our own fallback block)
@@ -7386,6 +7309,7 @@ mod tests {
 
         // Create block headers at different rounds
         let header_round1 = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -7400,6 +7324,7 @@ mod tests {
         let block_hash_r1 = header_round1.hash();
 
         let header_round2 = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -7414,6 +7339,7 @@ mod tests {
         let block_hash_r2 = header_round2.hash();
 
         let header_round3 = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -7429,6 +7355,7 @@ mod tests {
 
         // Different height - should be preserved
         let header_height6 = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(6),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -7704,6 +7631,7 @@ mod tests {
 
         // First block at height 2, round 0
         let header1 = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(2),
             parent_hash,
             parent_qc: parent_qc.clone(),
@@ -7719,13 +7647,7 @@ mod tests {
         // Process first block header
         let actions1 = state.on_block_header(
             header1,
-            vec![], // retry_hashes
-            vec![], // priority_hashes
-            vec![], // tx_hashes
-            vec![], // cert_hashes
-            vec![], // deferred
-            vec![], // aborted
-            HashMap::new(),
+            BlockManifest::default(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -7742,6 +7664,7 @@ mod tests {
 
         // Second block at height 2, round 1 (same parent QC - view change scenario)
         let header2 = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(2),
             parent_hash,
             parent_qc: parent_qc.clone(),
@@ -7757,13 +7680,7 @@ mod tests {
         // Process second block header
         let actions2 = state.on_block_header(
             header2,
-            vec![], // retry_hashes
-            vec![], // priority_hashes
-            vec![], // tx_hashes
-            vec![], // cert_hashes
-            vec![], // deferred
-            vec![], // aborted
-            HashMap::new(),
+            BlockManifest::default(),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -8449,6 +8366,7 @@ mod tests {
         // Simulate the runner completing the proposal build
         let block = Block {
             header: BlockHeader {
+                shard_group_id: ShardGroupId(0),
                 height: BlockHeight(4),
                 parent_hash: Hash::from_bytes(b"block_3"),
                 parent_qc,
@@ -8725,19 +8643,19 @@ mod tests {
 
         let gossip = block_gossip.expect("Should have block header gossip");
         assert!(
-            gossip.transaction_hashes.is_empty(),
+            gossip.manifest.tx_hashes.is_empty(),
             "Sync block should have no transactions"
         );
         assert!(
-            gossip.retry_hashes.is_empty(),
+            gossip.manifest.retry_hashes.is_empty(),
             "Sync block should have no retry transactions"
         );
         assert!(
-            gossip.priority_hashes.is_empty(),
+            gossip.manifest.priority_hashes.is_empty(),
             "Sync block should have no priority transactions"
         );
         assert!(
-            gossip.certificate_hashes.is_empty(),
+            gossip.manifest.cert_hashes.is_empty(),
             "Sync block should have no certificates"
         );
 
@@ -8994,6 +8912,7 @@ mod tests {
         // Create a stale synced block at height 1
         let block = Block {
             header: BlockHeader {
+                shard_group_id: ShardGroupId(0),
                 height: BlockHeight(1),
                 parent_hash: Hash::ZERO,
                 parent_qc: QuorumCertificate::genesis(),

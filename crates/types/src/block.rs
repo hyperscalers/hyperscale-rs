@@ -2,7 +2,8 @@
 
 use crate::{
     compute_merkle_root, BlockHeight, CommitmentProof, Hash, QuorumCertificate,
-    RoutableTransaction, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId,
+    RoutableTransaction, ShardGroupId, TransactionAbort, TransactionCertificate, TransactionDefer,
+    ValidatorId,
 };
 use sbor::prelude::*;
 use std::collections::HashMap;
@@ -65,6 +66,12 @@ pub fn compute_transaction_root(
 /// - Transaction commitment (merkle root of all transactions in the block)
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockHeader {
+    /// Shard group this block belongs to.
+    ///
+    /// Makes headers self-describing for cross-shard verification. A remote shard
+    /// needs to know which shard's committee to verify the QC against.
+    pub shard_group_id: ShardGroupId,
+
     /// Block height in the chain (genesis = 0).
     pub height: BlockHeight,
 
@@ -108,8 +115,14 @@ pub struct BlockHeader {
 
 impl BlockHeader {
     /// Create a genesis block header (height 0) with the given proposer and JMT state.
-    pub fn genesis(proposer: ValidatorId, state_root: Hash, state_version: u64) -> Self {
+    pub fn genesis(
+        shard_group_id: ShardGroupId,
+        proposer: ValidatorId,
+        state_root: Hash,
+        state_version: u64,
+    ) -> Self {
         Self {
+            shard_group_id,
             height: BlockHeight(0),
             parent_hash: Hash::from_bytes(&[0u8; 32]),
             parent_qc: QuorumCertificate::genesis(),
@@ -378,9 +391,14 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for Block {
 
 impl Block {
     /// Create an empty genesis block with the given proposer and JMT state.
-    pub fn genesis(proposer: ValidatorId, state_root: Hash, state_version: u64) -> Self {
+    pub fn genesis(
+        shard_group_id: ShardGroupId,
+        proposer: ValidatorId,
+        state_root: Hash,
+        state_version: u64,
+    ) -> Self {
         Self {
-            header: BlockHeader::genesis(proposer, state_root, state_version),
+            header: BlockHeader::genesis(shard_group_id, proposer, state_root, state_version),
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions: vec![],
@@ -514,6 +532,80 @@ impl Block {
 }
 
 // ============================================================================
+// BlockManifest - Hash-level block contents
+// ============================================================================
+
+/// Hash-level description of a block's contents (transactions, certificates,
+/// deferrals, aborts, and commitment proofs).
+///
+/// This is the common denominator shared by `BlockHeaderGossip`, `BlockMetadata`,
+/// and `ProtocolEvent::BlockHeaderReceived`. Extracting it into a standalone type
+/// eliminates copy-paste of 7 fields across those three sites.
+#[derive(Debug, Clone, Default, PartialEq, Eq, BasicSbor)]
+pub struct BlockManifest {
+    /// Retry transaction hashes (highest priority section).
+    pub retry_hashes: Vec<Hash>,
+
+    /// Priority transaction hashes (cross-shard with proofs).
+    pub priority_hashes: Vec<Hash>,
+
+    /// Other transaction hashes (normal priority section).
+    pub tx_hashes: Vec<Hash>,
+
+    /// Certificate hashes in block order.
+    pub cert_hashes: Vec<Hash>,
+
+    /// Deferred transactions (small, stored inline).
+    pub deferred: Vec<TransactionDefer>,
+
+    /// Aborted transactions (small, stored inline).
+    pub aborted: Vec<TransactionAbort>,
+
+    /// Commitment proofs for priority ordering (stored inline).
+    pub commitment_proofs: HashMap<Hash, CommitmentProof>,
+}
+
+impl BlockManifest {
+    /// Get total transaction count across all sections.
+    pub fn transaction_count(&self) -> usize {
+        self.retry_hashes.len() + self.priority_hashes.len() + self.tx_hashes.len()
+    }
+
+    /// Iterate all transaction hashes in priority order.
+    pub fn all_tx_hashes(&self) -> impl Iterator<Item = &Hash> {
+        self.retry_hashes
+            .iter()
+            .chain(self.priority_hashes.iter())
+            .chain(self.tx_hashes.iter())
+    }
+
+    /// Build a manifest from a full block (extracting hashes).
+    pub fn from_block(block: &Block) -> Self {
+        Self {
+            retry_hashes: block
+                .retry_transactions
+                .iter()
+                .map(|tx| tx.hash())
+                .collect(),
+            priority_hashes: block
+                .priority_transactions
+                .iter()
+                .map(|tx| tx.hash())
+                .collect(),
+            tx_hashes: block.transactions.iter().map(|tx| tx.hash()).collect(),
+            cert_hashes: block
+                .certificates
+                .iter()
+                .map(|c| c.transaction_hash)
+                .collect(),
+            deferred: block.deferred.clone(),
+            aborted: block.aborted.clone(),
+            commitment_proofs: block.commitment_proofs.clone(),
+        }
+    }
+}
+
+// ============================================================================
 // BlockMetadata - Denormalized storage format
 // ============================================================================
 
@@ -536,27 +628,8 @@ pub struct BlockMetadata {
     /// Block header (contains height, parent hash, proposer, etc.)
     pub header: BlockHeader,
 
-    /// Retry transaction hashes (highest priority section).
-    pub retry_hashes: Vec<Hash>,
-
-    /// Priority transaction hashes (cross-shard with proofs).
-    pub priority_hashes: Vec<Hash>,
-
-    /// Other transaction hashes (normal priority section).
-    pub tx_hashes: Vec<Hash>,
-
-    /// Certificate hashes in block order.
-    /// Actual certificates stored in "certificates" CF.
-    pub cert_hashes: Vec<Hash>,
-
-    /// Deferred transactions (small, stored inline).
-    pub deferred: Vec<TransactionDefer>,
-
-    /// Aborted transactions (small, stored inline).
-    pub aborted: Vec<TransactionAbort>,
-
-    /// Commitment proofs for priority ordering (stored inline).
-    pub commitment_proofs: HashMap<Hash, CommitmentProof>,
+    /// Block contents (transaction hashes, certificates, deferrals, etc.)
+    pub manifest: BlockManifest,
 
     /// Quorum certificate that commits this block.
     pub qc: QuorumCertificate,
@@ -567,25 +640,7 @@ impl BlockMetadata {
     pub fn from_block(block: &Block, qc: QuorumCertificate) -> Self {
         Self {
             header: block.header.clone(),
-            retry_hashes: block
-                .retry_transactions
-                .iter()
-                .map(|tx| tx.hash())
-                .collect(),
-            priority_hashes: block
-                .priority_transactions
-                .iter()
-                .map(|tx| tx.hash())
-                .collect(),
-            tx_hashes: block.transactions.iter().map(|tx| tx.hash()).collect(),
-            cert_hashes: block
-                .certificates
-                .iter()
-                .map(|c| c.transaction_hash)
-                .collect(),
-            deferred: block.deferred.clone(),
-            aborted: block.aborted.clone(),
-            commitment_proofs: block.commitment_proofs.clone(),
+            manifest: BlockManifest::from_block(block),
             qc,
         }
     }
@@ -602,15 +657,53 @@ impl BlockMetadata {
 
     /// Get total transaction count across all sections.
     pub fn transaction_count(&self) -> usize {
-        self.retry_hashes.len() + self.priority_hashes.len() + self.tx_hashes.len()
+        self.manifest.transaction_count()
     }
 
     /// Iterate all transaction hashes in priority order.
     pub fn all_tx_hashes(&self) -> impl Iterator<Item = &Hash> {
-        self.retry_hashes
-            .iter()
-            .chain(self.priority_hashes.iter())
-            .chain(self.tx_hashes.iter())
+        self.manifest.all_tx_hashes()
+    }
+}
+
+// ============================================================================
+// CommittedBlockHeader - Cross-shard trust attestation
+// ============================================================================
+
+/// A block header paired with the QC that committed it.
+///
+/// This is the minimal cross-shard trust attestation: given a `CommittedBlockHeader`,
+/// a remote shard can verify the QC against the source shard's validator public keys
+/// (from topology), confirm the `block_hash` matches `hash(header)`, and then trust
+/// the `state_root` in the header for merkle inclusion proof verification.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct CommittedBlockHeader {
+    /// The block header.
+    pub header: BlockHeader,
+
+    /// The quorum certificate that committed this block.
+    pub qc: QuorumCertificate,
+}
+
+impl CommittedBlockHeader {
+    /// Compute the block hash (hashes the header).
+    pub fn block_hash(&self) -> Hash {
+        self.header.hash()
+    }
+
+    /// Get the block height.
+    pub fn height(&self) -> BlockHeight {
+        self.header.height
+    }
+
+    /// Get the shard group this block belongs to.
+    pub fn shard_group_id(&self) -> ShardGroupId {
+        self.header.shard_group_id
+    }
+
+    /// Get the state root committed by this block.
+    pub fn state_root(&self) -> Hash {
+        self.header.state_root
     }
 }
 
@@ -621,6 +714,7 @@ mod tests {
     #[test]
     fn test_block_header_hash_deterministic() {
         let header = BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(1),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -640,7 +734,7 @@ mod tests {
 
     #[test]
     fn test_genesis_block() {
-        let genesis = Block::genesis(ValidatorId(0), Hash::ZERO, 0);
+        let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO, 0);
 
         assert!(genesis.is_genesis());
         assert_eq!(genesis.height(), BlockHeight(0));

@@ -59,6 +59,7 @@ async fn test_storage_operations() {
 
     // Test block storage
     let header = BlockHeader {
+        shard_group_id: ShardGroupId(0),
         height: BlockHeight(1),
         parent_hash: Hash::from_bytes(&[0u8; 32]),
         parent_qc: QuorumCertificate::genesis(),

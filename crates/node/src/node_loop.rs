@@ -702,6 +702,9 @@ where
             Action::BroadcastTransactionCertificate { shard, gossip } => {
                 self.network.broadcast_to_shard(shard, &gossip);
             }
+            Action::BroadcastCommittedBlockHeader { gossip } => {
+                self.network.broadcast_global(&gossip);
+            }
 
             // ═══════════════════════════════════════════════════════════
             // Network broadcasts — batched
@@ -1558,16 +1561,8 @@ where
                     warn!("Failed to decode BlockHeaderGossip");
                     return;
                 };
-                let pe = ProtocolEvent::BlockHeaderReceived {
-                    header: gossip.header,
-                    retry_hashes: gossip.retry_hashes,
-                    priority_hashes: gossip.priority_hashes,
-                    tx_hashes: gossip.transaction_hashes,
-                    cert_hashes: gossip.certificate_hashes,
-                    deferred: gossip.deferred,
-                    aborted: gossip.aborted,
-                    commitment_proofs: gossip.commitment_proofs,
-                };
+                let (header, manifest) = gossip.into_parts();
+                let pe = ProtocolEvent::BlockHeaderReceived { header, manifest };
                 let actions = self.state.handle(pe);
                 self.actions_generated += actions.len();
                 for action in actions {
@@ -1650,6 +1645,22 @@ where
                     return;
                 };
                 self.handle_gossiped_certificate(gossip.into_certificate());
+            }
+            "block.committed" => {
+                let Ok(gossip) =
+                    sbor::basic_decode::<hyperscale_messages::CommittedBlockHeaderGossip>(payload)
+                else {
+                    warn!("Failed to decode CommittedBlockHeaderGossip");
+                    return;
+                };
+                let pe = ProtocolEvent::RemoteBlockCommitted {
+                    committed_header: gossip.committed_header,
+                };
+                let actions = self.state.handle(pe);
+                self.actions_generated += actions.len();
+                for action in actions {
+                    self.process_action(action);
+                }
             }
             _ => {
                 warn!(message_type, "Unknown gossip message type");

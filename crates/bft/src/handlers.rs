@@ -357,6 +357,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
 
     // Build the block
     let header = BlockHeader {
+        shard_group_id: local_shard,
         height,
         parent_hash,
         parent_qc,

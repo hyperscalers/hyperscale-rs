@@ -87,6 +87,7 @@ pub fn make_test_block(height: u64) -> Block {
     parent_bytes[..8].copy_from_slice(&height.to_le_bytes());
     Block {
         header: BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_hash: Hash::from_bytes(&parent_bytes),
             parent_qc: QuorumCertificate::genesis(),

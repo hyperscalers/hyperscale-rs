@@ -3,8 +3,7 @@
 //! Tracks blocks being assembled from headers + gossiped transactions.
 
 use hyperscale_types::{
-    Block, BlockHeader, CommitmentProof, Hash, RoutableTransaction, TransactionAbort,
-    TransactionCertificate, TransactionDefer,
+    Block, BlockHeader, BlockManifest, Hash, RoutableTransaction, TransactionCertificate,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -31,17 +30,8 @@ pub struct PendingBlock {
     /// Block header (received first).
     header: BlockHeader,
 
-    /// Retry transaction hashes in order (highest priority section).
-    retry_order: Vec<Hash>,
-
-    /// Priority transaction hashes in order (cross-shard with proofs).
-    priority_order: Vec<Hash>,
-
-    /// Other transaction hashes in order (normal priority section).
-    other_order: Vec<Hash>,
-
-    /// Original certificate order from the gossip message.
-    original_cert_order: Vec<Hash>,
+    /// Block contents manifest (transaction hashes, certificates, deferrals, etc.)
+    manifest: BlockManifest,
 
     /// Map of transaction hash -> Arc<RoutableTransaction> (for received transactions).
     received_transactions: HashMap<Hash, Arc<RoutableTransaction>>,
@@ -55,100 +45,66 @@ pub struct PendingBlock {
     /// Set of certificate hashes we're still waiting for (HashSet for O(1) lookup).
     missing_certificate_hashes: HashSet<Hash>,
 
-    /// Deferred transactions (from block header gossip).
-    /// These don't need to be fetched - they're included directly in the gossip message.
-    deferred: Vec<TransactionDefer>,
-
-    /// Aborted transactions (from block header gossip).
-    /// These don't need to be fetched - they're included directly in the gossip message.
-    aborted: Vec<TransactionAbort>,
-
-    /// Commitment proofs for priority transaction ordering.
-    /// Included in block gossip to make blocks self-contained for validation.
-    commitment_proofs: HashMap<Hash, CommitmentProof>,
-
     /// The fully constructed block (None until all transactions/certs received).
     constructed_block: Option<Arc<Block>>,
 }
 
 impl PendingBlock {
-    /// Create a new pending block from a header and sectioned transaction hashes.
-    ///
-    /// Initializes the missing sets with all hashes.
-    pub fn new(
-        header: BlockHeader,
-        retry_hashes: Vec<Hash>,
-        priority_hashes: Vec<Hash>,
-        transaction_hashes: Vec<Hash>,
-        certificate_hashes: Vec<Hash>,
-    ) -> Self {
-        Self::full(
-            header,
-            retry_hashes,
-            priority_hashes,
-            transaction_hashes,
-            certificate_hashes,
-            vec![],
-            vec![],
-        )
-    }
-
-    /// Create a new pending block with all fields including deferrals and aborts.
-    #[allow(clippy::too_many_arguments)]
-    pub fn full(
-        header: BlockHeader,
-        retry_hashes: Vec<Hash>,
-        priority_hashes: Vec<Hash>,
-        transaction_hashes: Vec<Hash>,
-        certificate_hashes: Vec<Hash>,
-        deferred: Vec<TransactionDefer>,
-        aborted: Vec<TransactionAbort>,
-    ) -> Self {
-        Self::with_proofs(
-            header,
-            retry_hashes,
-            priority_hashes,
-            transaction_hashes,
-            certificate_hashes,
-            deferred,
-            aborted,
-            HashMap::new(),
-        )
-    }
-
-    /// Create a new pending block with commitment proofs.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_proofs(
-        header: BlockHeader,
-        retry_hashes: Vec<Hash>,
-        priority_hashes: Vec<Hash>,
-        transaction_hashes: Vec<Hash>,
-        certificate_hashes: Vec<Hash>,
-        deferred: Vec<TransactionDefer>,
-        aborted: Vec<TransactionAbort>,
-        commitment_proofs: HashMap<Hash, CommitmentProof>,
-    ) -> Self {
-        let total_tx_count = retry_hashes.len() + priority_hashes.len() + transaction_hashes.len();
-        let mut missing_transaction_hashes = HashSet::with_capacity(total_tx_count);
-        missing_transaction_hashes.extend(retry_hashes.iter().copied());
-        missing_transaction_hashes.extend(priority_hashes.iter().copied());
-        missing_transaction_hashes.extend(transaction_hashes.iter().copied());
+    /// Create a pending block from a header and manifest.
+    pub fn from_manifest(header: BlockHeader, manifest: BlockManifest) -> Self {
+        let total_tx_count = manifest.transaction_count();
+        let missing_transaction_hashes: HashSet<Hash> = manifest.all_tx_hashes().copied().collect();
+        let missing_certificate_hashes: HashSet<Hash> =
+            manifest.cert_hashes.iter().copied().collect();
 
         Self {
             header,
-            retry_order: retry_hashes,
-            priority_order: priority_hashes,
-            other_order: transaction_hashes,
-            original_cert_order: certificate_hashes.clone(),
             received_transactions: HashMap::with_capacity(total_tx_count),
             missing_transaction_hashes,
-            received_certificates: HashMap::with_capacity(certificate_hashes.len()),
-            missing_certificate_hashes: certificate_hashes.into_iter().collect(),
-            deferred,
-            aborted,
-            commitment_proofs,
+            received_certificates: HashMap::with_capacity(manifest.cert_hashes.len()),
+            missing_certificate_hashes,
+            manifest,
             constructed_block: None,
         }
+    }
+
+    /// Create a pending block from a complete block (proposer's own block).
+    ///
+    /// Skips the hash-extraction → re-fill round-trip since we already have
+    /// all transactions and certificates.
+    pub fn from_complete_block(block: &Block) -> Self {
+        let manifest = BlockManifest::from_block(block);
+        let mut pending = Self {
+            header: block.header.clone(),
+            received_transactions: HashMap::new(),
+            missing_transaction_hashes: HashSet::new(),
+            received_certificates: HashMap::new(),
+            missing_certificate_hashes: HashSet::new(),
+            manifest,
+            constructed_block: None,
+        };
+        // Fill in all transactions and certificates so construct_block works
+        for tx in &block.retry_transactions {
+            pending
+                .received_transactions
+                .insert(tx.hash(), Arc::clone(tx));
+        }
+        for tx in &block.priority_transactions {
+            pending
+                .received_transactions
+                .insert(tx.hash(), Arc::clone(tx));
+        }
+        for tx in &block.transactions {
+            pending
+                .received_transactions
+                .insert(tx.hash(), Arc::clone(tx));
+        }
+        for cert in &block.certificates {
+            pending
+                .received_certificates
+                .insert(cert.transaction_hash, Arc::clone(cert));
+        }
+        pending
     }
 
     /// Add a received transaction.
@@ -238,34 +194,37 @@ impl PendingBlock {
         // Build transactions in the ORIGINAL order from the gossip message.
         // Each section is built separately to maintain the correct Block structure.
         let retry_transactions: Vec<Arc<RoutableTransaction>> = self
-            .retry_order
+            .manifest
+            .retry_hashes
             .iter()
             .filter_map(|hash| self.received_transactions.remove(hash))
             .collect();
 
         let priority_transactions: Vec<Arc<RoutableTransaction>> = self
-            .priority_order
+            .manifest
+            .priority_hashes
             .iter()
             .filter_map(|hash| self.received_transactions.remove(hash))
             .collect();
 
         let transactions: Vec<Arc<RoutableTransaction>> = self
-            .other_order
+            .manifest
+            .tx_hashes
             .iter()
             .filter_map(|hash| self.received_transactions.remove(hash))
             .collect();
 
         // Build certificates in the original order from the gossip message.
         let certificates: Vec<Arc<TransactionCertificate>> = self
-            .original_cert_order
+            .manifest
+            .cert_hashes
             .iter()
             .filter_map(|hash| self.received_certificates.remove(hash))
             .collect();
 
-        // Take deferred, aborted, and proofs (replace with empty)
-        let deferred = std::mem::take(&mut self.deferred);
-        let aborted = std::mem::take(&mut self.aborted);
-        let commitment_proofs = std::mem::take(&mut self.commitment_proofs);
+        let deferred = self.manifest.deferred.clone();
+        let aborted = self.manifest.aborted.clone();
+        let commitment_proofs = self.manifest.commitment_proofs.clone();
 
         let block = Arc::new(Block {
             header: self.header.clone(),
@@ -292,64 +251,30 @@ impl PendingBlock {
         &self.header
     }
 
-    /// Get all transaction hashes in priority order (retries, priority, others).
-    ///
-    /// Used for re-broadcasting block headers after view change.
-    pub fn all_transaction_hashes(&self) -> Vec<Hash> {
-        let mut all = Vec::with_capacity(
-            self.retry_order.len() + self.priority_order.len() + self.other_order.len(),
-        );
-        all.extend(self.retry_order.iter().copied());
-        all.extend(self.priority_order.iter().copied());
-        all.extend(self.other_order.iter().copied());
-        all
+    /// Get the block manifest.
+    pub fn manifest(&self) -> &BlockManifest {
+        &self.manifest
     }
 
-    /// Get retry transaction hashes.
-    pub fn retry_hashes(&self) -> &[Hash] {
-        &self.retry_order
+    /// Get total transaction count across all sections.
+    pub fn transaction_count(&self) -> usize {
+        self.manifest.transaction_count()
     }
 
-    /// Get priority transaction hashes.
-    pub fn priority_hashes(&self) -> &[Hash] {
-        &self.priority_order
-    }
-
-    /// Get other transaction hashes.
-    pub fn other_hashes(&self) -> &[Hash] {
-        &self.other_order
-    }
-
-    /// Get all certificate hashes in the original order.
-    ///
-    /// Used for re-broadcasting block headers after view change.
-    pub fn all_certificate_hashes(&self) -> Vec<Hash> {
-        self.original_cert_order.clone()
-    }
-
-    /// Get reference to deferred transactions.
-    pub fn deferred(&self) -> &[TransactionDefer] {
-        &self.deferred
-    }
-
-    /// Get reference to aborted transactions.
-    pub fn aborted(&self) -> &[TransactionAbort] {
-        &self.aborted
-    }
-
-    /// Get reference to commitment proofs.
-    pub fn commitment_proofs(&self) -> &HashMap<Hash, CommitmentProof> {
-        &self.commitment_proofs
+    /// Get certificate count.
+    pub fn certificate_count(&self) -> usize {
+        self.manifest.cert_hashes.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{BlockHeight, QuorumCertificate, ValidatorId};
+    use hyperscale_types::{BlockHeight, QuorumCertificate, ShardGroupId, ValidatorId};
 
     fn make_header(height: u64) -> BlockHeader {
         BlockHeader {
+            shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
             parent_hash: Hash::from_bytes(b"parent"),
             parent_qc: QuorumCertificate::genesis(),
@@ -370,7 +295,14 @@ mod tests {
         let header = make_header(1);
 
         // Put tx1 in retry section, tx2 in other section
-        let pb = PendingBlock::new(header.clone(), vec![tx1], vec![], vec![tx2], vec![]);
+        let pb = PendingBlock::from_manifest(
+            header.clone(),
+            BlockManifest {
+                retry_hashes: vec![tx1],
+                tx_hashes: vec![tx2],
+                ..Default::default()
+            },
+        );
 
         assert_eq!(pb.missing_transactions().len(), 2);
         assert!(pb.missing_transactions().contains(&tx1));
@@ -382,7 +314,7 @@ mod tests {
     #[test]
     fn test_empty_block_is_complete() {
         let header = make_header(1);
-        let pb = PendingBlock::new(header, vec![], vec![], vec![], vec![]);
+        let pb = PendingBlock::from_manifest(header, BlockManifest::default());
 
         assert!(pb.is_complete());
     }
@@ -394,7 +326,14 @@ mod tests {
         let cert2 = Hash::from_bytes(b"cert2");
         let header = make_header(1);
 
-        let pb = PendingBlock::new(header, vec![], vec![], vec![tx1], vec![cert1, cert2]);
+        let pb = PendingBlock::from_manifest(
+            header,
+            BlockManifest {
+                tx_hashes: vec![tx1],
+                cert_hashes: vec![cert1, cert2],
+                ..Default::default()
+            },
+        );
 
         assert_eq!(pb.missing_transaction_count(), 1);
         assert_eq!(pb.missing_certificate_count(), 2);
@@ -409,7 +348,13 @@ mod tests {
         let cert_hash = Hash::from_bytes(b"cert1");
         let header = make_header(1);
 
-        let mut pb = PendingBlock::new(header, vec![], vec![], vec![], vec![cert_hash]);
+        let mut pb = PendingBlock::from_manifest(
+            header,
+            BlockManifest {
+                cert_hashes: vec![cert_hash],
+                ..Default::default()
+            },
+        );
 
         assert_eq!(pb.missing_certificate_count(), 1);
         assert!(!pb.is_complete());
@@ -443,7 +388,14 @@ mod tests {
         let cert_hash = Hash::from_bytes(b"cert1");
         let header = make_header(1);
 
-        let mut pb = PendingBlock::new(header, vec![], vec![], vec![tx_hash], vec![cert_hash]);
+        let mut pb = PendingBlock::from_manifest(
+            header,
+            BlockManifest {
+                tx_hashes: vec![tx_hash],
+                cert_hashes: vec![cert_hash],
+                ..Default::default()
+            },
+        );
 
         assert!(!pb.has_all_transactions());
         assert!(!pb.is_complete());

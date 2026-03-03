@@ -335,18 +335,9 @@ impl StateMachine for NodeStateMachine {
             }
 
             // BlockHeaderReceived needs mempool for transaction lookup and certificates
-            ProtocolEvent::BlockHeaderReceived {
-                header,
-                retry_hashes,
-                priority_hashes,
-                tx_hashes,
-                cert_hashes,
-                deferred,
-                aborted,
-                commitment_proofs,
-            } => {
+            ProtocolEvent::BlockHeaderReceived { header, manifest } => {
                 // Total transaction count across all sections
-                let total_tx_count = retry_hashes.len() + priority_hashes.len() + tx_hashes.len();
+                let total_tx_count = manifest.transaction_count();
 
                 // Validate in-flight limits only for the next block after committed height.
                 // For blocks further ahead, skip validation - validators at different heights
@@ -356,14 +347,14 @@ impl StateMachine for NodeStateMachine {
 
                 if is_next_block {
                     let current_in_flight = self.mempool.in_flight();
-                    let certs_in_block = cert_hashes.len();
+                    let certs_in_block = manifest.cert_hashes.len();
                     let config = self.mempool.config();
                     let soft_limit = config.max_in_flight;
                     let hard_limit = config.max_in_flight_hard_limit;
 
                     // Retry and priority transactions bypass soft limit
                     // Only "other" transactions (tx_hashes) are subject to soft limit
-                    let without_proofs = tx_hashes.len();
+                    let without_proofs = manifest.tx_hashes.len();
 
                     let new_in_flight = current_in_flight
                         .saturating_add(total_tx_count)
@@ -410,11 +401,7 @@ impl StateMachine for NodeStateMachine {
                 // This hides execution latency behind consensus latency
                 let block_hash = header.hash();
                 let height = header.height.0;
-                let all_tx_hashes: Vec<_> = retry_hashes
-                    .iter()
-                    .chain(priority_hashes.iter())
-                    .chain(tx_hashes.iter())
-                    .collect();
+                let all_tx_hashes: Vec<_> = manifest.all_tx_hashes().collect();
                 let transactions: Vec<_> = all_tx_hashes
                     .iter()
                     .filter_map(|h| mempool_txs.get(*h).cloned())
@@ -423,18 +410,9 @@ impl StateMachine for NodeStateMachine {
                     self.execution
                         .trigger_speculative_execution(block_hash, height, transactions);
 
-                let mut actions = self.bft.on_block_header(
-                    header,
-                    retry_hashes,
-                    priority_hashes,
-                    tx_hashes,
-                    cert_hashes,
-                    deferred,
-                    aborted,
-                    commitment_proofs,
-                    &mempool_txs,
-                    &local_certs,
-                );
+                let mut actions =
+                    self.bft
+                        .on_block_header(header, manifest, &mempool_txs, &local_certs);
                 actions.extend(spec_actions);
                 actions
             }
@@ -473,6 +451,14 @@ impl StateMachine for NodeStateMachine {
                     certificates,
                     commitment_proofs,
                 )
+            }
+
+            // Remote committed block header (for future provisions light-client pattern)
+            ProtocolEvent::RemoteBlockCommitted {
+                committed_header: _,
+            } => {
+                // TODO: Route to ProvisionCoordinator when implemented
+                vec![]
             }
 
             // Self-contained BFT events - direct delegation

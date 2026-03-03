@@ -66,7 +66,10 @@ pub use signing::{
     DOMAIN_EXEC_VOTE, DOMAIN_STATE_PROVISION,
 };
 
-pub use block::{compute_transaction_root, Block, BlockHeader, BlockMetadata};
+pub use block::{
+    compute_transaction_root, Block, BlockHeader, BlockManifest, BlockMetadata,
+    CommittedBlockHeader,
+};
 pub use quorum_certificate::QuorumCertificate;
 pub use signer_bitfield::SignerBitfield;
 pub use state::{

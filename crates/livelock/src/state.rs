@@ -812,6 +812,7 @@ mod tests {
 
         let block = hyperscale_types::Block {
             header: hyperscale_types::BlockHeader {
+                shard_group_id: hyperscale_types::ShardGroupId(0),
                 height: BlockHeight(5),
                 parent_hash: Hash::from_bytes(b"parent"),
                 parent_qc: hyperscale_types::QuorumCertificate::genesis(),
@@ -871,6 +872,7 @@ mod tests {
 
         let block = hyperscale_types::Block {
             header: hyperscale_types::BlockHeader {
+                shard_group_id: hyperscale_types::ShardGroupId(0),
                 height: BlockHeight(5),
                 parent_hash: Hash::from_bytes(b"parent"),
                 parent_qc: hyperscale_types::QuorumCertificate::genesis(),

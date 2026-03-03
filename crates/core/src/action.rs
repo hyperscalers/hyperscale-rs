@@ -91,6 +91,14 @@ pub enum Action {
         provision: StateProvision,
     },
 
+    /// Broadcast a committed block header globally to all shards.
+    ///
+    /// Used for the light-client provisions pattern. When a block commits,
+    /// this broadcasts the header + QC so remote shards can verify state roots.
+    BroadcastCommittedBlockHeader {
+        gossip: hyperscale_messages::CommittedBlockHeaderGossip,
+    },
+
     // ═══════════════════════════════════════════════════════════════════════
     // Timers
     // ═══════════════════════════════════════════════════════════════════════
@@ -326,6 +334,7 @@ pub enum Action {
     /// This combines state root computation and block building into a single
     /// round-trip, enabling the proposer to use the fast commit path (1 fsync).
     BuildProposal {
+        shard_group_id: ShardGroupId,
         proposer: ValidatorId,
         height: BlockHeight,
         round: u64,
@@ -671,6 +680,7 @@ impl Action {
                 | Action::BroadcastExecutionVote { .. }
                 | Action::BroadcastExecutionCertificate { .. }
                 | Action::BroadcastStateProvision { .. }
+                | Action::BroadcastCommittedBlockHeader { .. }
                 | Action::PersistBlock { .. }
                 | Action::PersistAndBroadcastVote { .. }
                 | Action::PersistTransactionCertificate { .. }
@@ -740,6 +750,7 @@ impl Action {
             Action::BroadcastExecutionVote { .. } => "BroadcastExecutionVote",
             Action::BroadcastExecutionCertificate { .. } => "BroadcastExecutionCertificate",
             Action::BroadcastStateProvision { .. } => "BroadcastStateProvision",
+            Action::BroadcastCommittedBlockHeader { .. } => "BroadcastCommittedBlockHeader",
 
             // Timers
             Action::SetTimer { .. } => "SetTimer",

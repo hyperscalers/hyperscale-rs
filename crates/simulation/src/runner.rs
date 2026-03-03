@@ -440,7 +440,12 @@ impl SimulationRunner {
             );
 
             let proposer = ValidatorId((shard_id * validators_per_shard) as u64);
-            let genesis_block = Block::genesis(proposer, genesis_jmt_root, genesis_jmt_version);
+            let genesis_block = Block::genesis(
+                hyperscale_types::ShardGroupId(shard_id as u64),
+                proposer,
+                genesis_jmt_root,
+                genesis_jmt_version,
+            );
 
             let shard_end = shard_start + validators_per_shard;
             for node_index in shard_start..shard_end {

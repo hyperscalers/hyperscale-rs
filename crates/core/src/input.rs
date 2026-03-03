@@ -121,6 +121,7 @@ impl NodeInput {
                 | ProtocolEvent::GlobalConsensusTimer => EventPriority::Timer,
 
                 ProtocolEvent::BlockHeaderReceived { .. }
+                | ProtocolEvent::RemoteBlockCommitted { .. }
                 | ProtocolEvent::BlockVoteReceived { .. }
                 | ProtocolEvent::StateProvisionReceived { .. }
                 | ProtocolEvent::ExecutionVoteReceived { .. }
