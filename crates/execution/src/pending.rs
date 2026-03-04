@@ -4,26 +4,8 @@
 //! delegated to the runner. When verification completes, the runner sends
 //! an event back and we look up the pending state to continue processing.
 
-use hyperscale_types::{
-    BlockHeight, ExecutionCertificate, Hash, ShardGroupId, TransactionCertificate,
-};
+use hyperscale_types::{ExecutionCertificate, Hash, ShardGroupId, TransactionCertificate};
 use std::collections::HashSet;
-
-/// Tracks a pending provision broadcast waiting for state fetch.
-///
-/// When starting cross-shard execution, we need to fetch state entries from
-/// storage before we can broadcast provisions to target shards.
-#[derive(Debug)]
-pub struct PendingProvisionBroadcast {
-    /// Block height when the transaction was committed.
-    pub block_height: BlockHeight,
-    /// Unix timestamp (milliseconds) of the block that triggered this provision.
-    pub block_timestamp: u64,
-    /// JMT state version for merkle proofs.
-    pub state_version: u64,
-    /// Target shards to broadcast to.
-    pub target_shards: Vec<ShardGroupId>,
-}
 
 /// Tracks a pending execution certificate signature verification.
 ///

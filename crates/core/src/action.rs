@@ -25,6 +25,19 @@ pub struct CrossShardExecutionRequest {
     pub provisions: Vec<StateProvision>,
 }
 
+/// A single cross-shard transaction's provisioning needs.
+///
+/// Collected per-block and sent as a batch in [`Action::FetchAndBroadcastProvisions`].
+#[derive(Debug, Clone)]
+pub struct ProvisionRequest {
+    /// Transaction hash (for correlation).
+    pub tx_hash: Hash,
+    /// Nodes owned by our shard whose state we need to provision.
+    pub nodes: Vec<NodeId>,
+    /// Shards that need this state.
+    pub target_shards: Vec<ShardGroupId>,
+}
+
 /// Actions the state machine wants to perform.
 ///
 /// Actions are **commands** - they describe something to do.
@@ -82,12 +95,19 @@ pub enum Action {
         certificate: Arc<ExecutionCertificate>,
     },
 
-    /// Broadcast a state provision to a target shard.
+    /// Fetch state entries and broadcast provisions for all cross-shard txs in a block.
     ///
-    /// Only the block proposer sends these (not all validators).
-    BroadcastStateProvision {
-        shard: ShardGroupId,
-        provision: StateProvision,
+    /// Only the block proposer emits this (once per block). Delegated to the
+    /// execution pool where it fetches entries, generates merkle proofs, builds
+    /// `StateProvision`s, groups by target shard, and returns batches via
+    /// `NodeInput::ProvisionsReady` for network broadcast.
+    FetchAndBroadcastProvisions {
+        /// One entry per cross-shard tx that needs provisioning.
+        requests: Vec<ProvisionRequest>,
+        source_shard: ShardGroupId,
+        block_height: BlockHeight,
+        block_timestamp: u64,
+        state_version: u64,
     },
 
     /// Broadcast a committed block header globally to all shards.
@@ -585,18 +605,6 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Storage: Read Requests (returns callback ProtocolEvent)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Fetch state entries for nodes (for cross-shard provisioning).
-    ///
-    /// Returns `ProtocolEvent::StateEntriesFetched { tx_hash, entries }`.
-    FetchStateEntries {
-        /// Transaction hash (for correlation in callback).
-        tx_hash: Hash,
-        /// Nodes to fetch all substates for.
-        nodes: Vec<NodeId>,
-        /// JMT state version for merkle proof generation.
-        state_version: u64,
-    },
-
     /// Fetch a block by height.
     ///
     /// Returns `ProtocolEvent::BlockFetched { height, block }`.
@@ -675,7 +683,6 @@ impl Action {
                 | Action::BroadcastTransactionCertificate { .. }
                 | Action::BroadcastExecutionVote { .. }
                 | Action::BroadcastExecutionCertificate { .. }
-                | Action::BroadcastStateProvision { .. }
                 | Action::BroadcastCommittedBlockHeader { .. }
                 | Action::PersistBlock { .. }
                 | Action::PersistAndBroadcastVote { .. }
@@ -700,7 +707,7 @@ impl Action {
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
-                | Action::FetchStateEntries { .. }
+                | Action::FetchAndBroadcastProvisions { .. }
                 | Action::FetchBlock { .. }
                 | Action::FetchChainMetadata
         )
@@ -709,26 +716,6 @@ impl Action {
     /// Check if this is a continuation action.
     pub fn is_continuation(&self) -> bool {
         matches!(self, Action::Continuation(_))
-    }
-
-    /// Check if this is a storage write action.
-    pub fn is_storage_write(&self) -> bool {
-        matches!(
-            self,
-            Action::PersistBlock { .. }
-                | Action::PersistAndBroadcastVote { .. }
-                | Action::PersistTransactionCertificate { .. }
-        )
-    }
-
-    /// Check if this is a storage read action (delegated, returns event).
-    pub fn is_storage_read(&self) -> bool {
-        matches!(
-            self,
-            Action::FetchStateEntries { .. }
-                | Action::FetchBlock { .. }
-                | Action::FetchChainMetadata
-        )
     }
 
     /// Get the action type name for telemetry.
@@ -745,7 +732,6 @@ impl Action {
             // Network - Execution Layer (batchable)
             Action::BroadcastExecutionVote { .. } => "BroadcastExecutionVote",
             Action::BroadcastExecutionCertificate { .. } => "BroadcastExecutionCertificate",
-            Action::BroadcastStateProvision { .. } => "BroadcastStateProvision",
             Action::BroadcastCommittedBlockHeader { .. } => "BroadcastCommittedBlockHeader",
 
             // Timers
@@ -773,6 +759,7 @@ impl Action {
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",
             Action::SpeculativeExecute { .. } => "SpeculativeExecute",
             Action::ExecuteCrossShardTransaction { .. } => "ExecuteCrossShardTransaction",
+            Action::FetchAndBroadcastProvisions { .. } => "FetchAndBroadcastProvisions",
 
             // External Notifications
             Action::EmitCommittedBlock { .. } => "EmitCommittedBlock",
@@ -786,7 +773,6 @@ impl Action {
             Action::PersistTransactionCertificate { .. } => "PersistTransactionCertificate",
 
             // Storage - Read Requests
-            Action::FetchStateEntries { .. } => "FetchStateEntries",
             Action::FetchBlock { .. } => "FetchBlock",
             Action::FetchChainMetadata => "FetchChainMetadata",
 

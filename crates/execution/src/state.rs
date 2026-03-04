@@ -29,21 +29,21 @@
 //! Validators collect ExecutionCertificates from all participating shards. When all
 //! certificates are received, a TransactionCertificate is created.
 
-use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionVote, Hash, NodeId,
-    RoutableTransaction, ShardGroupId, StateEntry, StateProvision, SubstateInclusionProof,
-    Topology, TransactionCertificate, TransactionDecision, ValidatorId,
+    RoutableTransaction, ShardGroupId, StateProvision, Topology, TransactionCertificate,
+    TransactionDecision, ValidatorId,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, instrument};
+use tracing::instrument;
 
 use crate::pending::{
     PendingCertificateAggregation, PendingCertificateVerification,
-    PendingFetchedCertificateVerification, PendingProvisionBroadcast,
+    PendingFetchedCertificateVerification,
 };
 use crate::trackers::{CertificateTracker, VoteTracker};
 
@@ -117,10 +117,6 @@ pub struct ExecutionState {
     /// Maps tx_hash -> (transaction, block_height)
     /// Note: Provision tracking is handled by ProvisionCoordinator.
     pending_provisioning: HashMap<Hash, (Arc<RoutableTransaction>, u64)>,
-
-    /// Pending provision broadcasts waiting for state fetch.
-    /// Maps tx_hash -> PendingProvisionBroadcast
-    pending_provision_fetches: HashMap<Hash, PendingProvisionBroadcast>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Cross-shard state (Phase 3-4: Voting)
@@ -276,7 +272,6 @@ impl ExecutionState {
             finalized_certificates: BTreeMap::new(),
             committed_height: 0,
             pending_provisioning: HashMap::new(),
-            pending_provision_fetches: HashMap::new(),
             vote_trackers: HashMap::new(),
             execution_certificates: HashMap::new(),
             pending_cert_aggregations: HashMap::new(),
@@ -370,12 +365,6 @@ impl ExecutionState {
             .all_shards_for_transaction(tx)
             .into_iter()
             .collect()
-    }
-
-    /// Get provisioning shards for a transaction (remote shards we need state from).
-    #[allow(dead_code)]
-    fn provisioning_shards_for_tx(&self, tx: &RoutableTransaction) -> Vec<ShardGroupId> {
-        self.topology.provisioning_shards(tx)
     }
 
     /// Determine shard for a node ID.
@@ -499,14 +488,52 @@ impl ExecutionState {
         }
 
         // Handle cross-shard transactions (2PC)
+        let mut provision_requests = Vec::new();
+        let local_shard = self.local_shard();
+        let is_proposer = self.validator_id() == proposer;
+
         for tx in cross_shard {
-            actions.extend(self.start_cross_shard_execution(
-                tx,
-                height,
+            // Collect provision requests (proposer only)
+            if is_proposer {
+                let mut owned_nodes: Vec<_> = tx
+                    .declared_reads
+                    .iter()
+                    .chain(tx.declared_writes.iter())
+                    .filter(|&node_id| self.shard_for_node(node_id) == local_shard)
+                    .copied()
+                    .collect();
+                owned_nodes.sort();
+                owned_nodes.dedup();
+
+                if !owned_nodes.is_empty() {
+                    let target_shards: Vec<_> = self
+                        .all_shards_for_tx(&tx)
+                        .into_iter()
+                        .filter(|&s| s != local_shard)
+                        .collect();
+
+                    if !target_shards.is_empty() {
+                        provision_requests.push(ProvisionRequest {
+                            tx_hash: tx.hash(),
+                            nodes: owned_nodes,
+                            target_shards,
+                        });
+                    }
+                }
+            }
+
+            actions.extend(self.start_cross_shard_execution(tx, height));
+        }
+
+        // Emit a single action for all provision fetches + broadcasts
+        if !provision_requests.is_empty() {
+            actions.push(Action::FetchAndBroadcastProvisions {
+                requests: provision_requests,
+                source_shard: local_shard,
+                block_height: BlockHeight(height),
                 block_timestamp,
-                proposer,
                 state_version,
-            ));
+            });
         }
 
         actions
@@ -581,13 +608,13 @@ impl ExecutionState {
     }
 
     /// Start cross-shard execution (2PC Phase 1: Provisioning).
+    ///
+    /// Provision broadcasting is handled at the block level via
+    /// `FetchAndBroadcastProvisions` — this method only sets up tracking.
     fn start_cross_shard_execution(
         &mut self,
         tx: Arc<RoutableTransaction>,
         height: u64,
-        block_timestamp: u64,
-        proposer: ValidatorId,
-        state_version: u64,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = tx.hash();
@@ -603,17 +630,7 @@ impl ExecutionState {
             "Starting cross-shard execution"
         );
 
-        // Phase 1: Initiate provision broadcast (proposer only sends merkle provisions)
-        if self.validator_id() == proposer {
-            actions.extend(self.initiate_provision_broadcast(
-                &tx,
-                BlockHeight(height),
-                block_timestamp,
-                state_version,
-            ));
-        }
-
-        // Phase 2: Start tracking provisioning
+        // Start tracking provisioning
         // Find remote shards we need provisions from
         let remote_shards: BTreeSet<_> = participating_shards
             .iter()
@@ -690,73 +707,6 @@ impl ExecutionState {
         }
 
         actions
-    }
-
-    /// Initiate provision broadcast for nodes we own in this transaction.
-    ///
-    /// This emits `FetchStateEntries` to load state from storage. When the
-    /// callback arrives, `on_state_entries_fetched` will create and broadcast
-    /// the actual provisions.
-    fn initiate_provision_broadcast(
-        &mut self,
-        tx: &RoutableTransaction,
-        block_height: BlockHeight,
-        block_timestamp: u64,
-        state_version: u64,
-    ) -> Vec<Action> {
-        let local_shard = self.local_shard();
-        let tx_hash = tx.hash();
-
-        // Find all nodes in the transaction that we own (in our shard)
-        let mut owned_nodes: Vec<_> = tx
-            .declared_reads
-            .iter()
-            .chain(tx.declared_writes.iter())
-            .filter(|&node_id| self.shard_for_node(node_id) == local_shard)
-            .copied()
-            .collect();
-        owned_nodes.sort();
-        owned_nodes.dedup();
-
-        if owned_nodes.is_empty() {
-            return vec![];
-        }
-
-        // Find target shards (all participating shards except us)
-        let target_shards: Vec<_> = self
-            .all_shards_for_tx(tx)
-            .into_iter()
-            .filter(|&s| s != local_shard)
-            .collect();
-
-        if target_shards.is_empty() {
-            return vec![];
-        }
-
-        tracing::debug!(
-            tx_hash = ?tx_hash,
-            owned_nodes = owned_nodes.len(),
-            target_shards = ?target_shards,
-            "Initiating provision broadcast - fetching state"
-        );
-
-        // Store pending broadcast info
-        self.pending_provision_fetches.insert(
-            tx_hash,
-            PendingProvisionBroadcast {
-                block_height,
-                block_timestamp,
-                state_version,
-                target_shards,
-            },
-        );
-
-        // Request state from storage
-        vec![Action::FetchStateEntries {
-            tx_hash,
-            nodes: owned_nodes,
-            state_version,
-        }]
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1485,7 +1435,7 @@ impl ExecutionState {
         // This is the same cleanup done by cleanup_transaction() for aborts/deferrals,
         // but we need to do it here for successful completions too.
         self.pending_provisioning.remove(tx_hash);
-        self.pending_provision_fetches.remove(tx_hash);
+
         self.vote_trackers.remove(tx_hash);
         self.execution_certificates.remove(tx_hash);
         self.certificate_trackers.remove(tx_hash);
@@ -1674,7 +1624,6 @@ impl ExecutionState {
         // Phase 1-2: Provisioning cleanup
         // Note: Provision tracking is handled by ProvisionCoordinator
         self.pending_provisioning.remove(tx_hash);
-        self.pending_provision_fetches.remove(tx_hash);
 
         // Phase 3-4: Vote cleanup
         self.vote_trackers.remove(tx_hash);
@@ -1794,80 +1743,6 @@ impl ExecutionState {
         );
 
         self.finalized_certificates.insert(tx_hash, certificate);
-    }
-
-    /// Handle state entries fetched from storage.
-    ///
-    /// This is called when the runner completes a `FetchStateEntries` action
-    /// and returns the state entries (with pre-computed storage keys) for
-    /// cross-shard provisioning.
-    #[instrument(skip(self, entries), fields(
-        tx_hash = ?tx_hash,
-        entry_count = entries.len(),
-    ))]
-    pub fn on_state_entries_fetched(
-        &mut self,
-        tx_hash: Hash,
-        entries: Vec<StateEntry>,
-        merkle_proofs: Vec<SubstateInclusionProof>,
-    ) -> Vec<Action> {
-        debug!(
-            tx_hash = ?tx_hash,
-            entries = entries.len(),
-            "State entries fetched from storage"
-        );
-
-        // Get the pending broadcast info
-        let Some(pending) = self.pending_provision_fetches.remove(&tx_hash) else {
-            tracing::warn!(
-                tx_hash = ?tx_hash,
-                "State entries fetched but no pending provision broadcast"
-            );
-            return vec![];
-        };
-
-        let mut actions = Vec::new();
-        let local_shard = self.local_shard();
-
-        // Entries and merkle proofs must be 1:1.
-        assert_eq!(
-            entries.len(),
-            merkle_proofs.len(),
-            "StateProvision: entries and merkle_proofs must have the same length"
-        );
-
-        // Wrap entries and proofs in Arc once for efficient sharing across multiple target shards.
-        let entries = Arc::new(entries);
-        let merkle_proofs = Arc::new(merkle_proofs);
-
-        // Create and broadcast state provisions to each target shard.
-        // Only the proposer reaches this code path (gated in start_cross_shard_execution).
-        for target_shard in pending.target_shards {
-            let provision = StateProvision {
-                transaction_hash: tx_hash,
-                target_shard,
-                source_shard: local_shard,
-                block_height: pending.block_height,
-                block_timestamp: pending.block_timestamp,
-                state_version: pending.state_version,
-                entries: Arc::clone(&entries),
-                merkle_proofs: Arc::clone(&merkle_proofs),
-            };
-
-            actions.push(Action::BroadcastStateProvision {
-                shard: target_shard,
-                provision,
-            });
-
-            tracing::debug!(
-                tx_hash = ?tx_hash,
-                target_shard = target_shard.0,
-                entries = entries.len(),
-                "Broadcasting state provision with state entries"
-            );
-        }
-
-        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

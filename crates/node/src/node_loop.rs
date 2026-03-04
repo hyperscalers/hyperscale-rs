@@ -596,6 +596,17 @@ where
                 self.handle_gossip_received(message_type, &payload);
             }
 
+            // ── Provisions ready (from execution pool) ─────────────────
+            //
+            // The FetchAndBroadcastProvisions delegated action built provisions
+            // grouped by target shard. Broadcast one batch per shard.
+            NodeInput::ProvisionsReady { batches } => {
+                for (shard, provisions) in batches {
+                    let batch = hyperscale_messages::StateProvisionBatch::new(provisions);
+                    self.network.broadcast_to_shard(shard, &batch);
+                }
+            }
+
             // ── Protocol events → state machine ────────────────────────
             NodeInput::Protocol(pe) => {
                 // Broadcast self-generated execution votes returning from dispatch.
@@ -740,11 +751,6 @@ where
             Action::BroadcastExecutionCertificate { shard, certificate } => {
                 self.accumulate_broadcast_cert(shard, certificate);
             }
-            Action::BroadcastStateProvision { shard, provision } => {
-                let batch = hyperscale_messages::StateProvisionBatch::single(provision);
-                self.network.broadcast_to_shard(shard, &batch);
-            }
-
             // ═══════════════════════════════════════════════════════════
             // Delegated work — batched (accumulated for batch dispatch)
             // ═══════════════════════════════════════════════════════════
@@ -777,7 +783,8 @@ where
             | Action::AggregateExecutionCertificate { .. }
             | Action::VerifyStateProvision { .. }
             | Action::ExecuteTransactions { .. }
-            | Action::SpeculativeExecute { .. } => {
+            | Action::SpeculativeExecute { .. }
+            | Action::FetchAndBroadcastProvisions { .. } => {
                 self.dispatch_delegated_action(action);
             }
 
@@ -822,31 +829,6 @@ where
             // ═══════════════════════════════════════════════════════════
             // Storage reads (dispatched to execution pool)
             // ═══════════════════════════════════════════════════════════
-            Action::FetchStateEntries {
-                tx_hash,
-                nodes,
-                state_version,
-            } => {
-                let storage = &*self.storage;
-                let entries = self.executor.fetch_state_entries(storage, &nodes);
-                let storage_keys: Vec<Vec<u8>> =
-                    entries.iter().map(|e| e.storage_key.clone()).collect();
-                let merkle_proofs = storage.generate_merkle_proofs(&storage_keys, state_version);
-                trace!(
-                    ?tx_hash,
-                    nodes = nodes.len(),
-                    entries = entries.len(),
-                    proofs = merkle_proofs.len(),
-                    "Fetched state entries with merkle proofs"
-                );
-                let _ = self.event_sender.send(NodeInput::Protocol(
-                    ProtocolEvent::StateEntriesFetched {
-                        tx_hash,
-                        entries,
-                        merkle_proofs,
-                    },
-                ));
-            }
             Action::FetchBlock { height } => {
                 let block = self.storage.get_block(height);
                 let _ = self

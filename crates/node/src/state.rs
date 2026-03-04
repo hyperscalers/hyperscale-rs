@@ -774,14 +774,6 @@ impl StateMachine for NodeStateMachine {
             }
 
             // Storage callback events - route to appropriate handler
-            ProtocolEvent::StateEntriesFetched {
-                tx_hash,
-                entries,
-                merkle_proofs,
-            } => self
-                .execution
-                .on_state_entries_fetched(tx_hash, entries, merkle_proofs),
-
             ProtocolEvent::BlockFetched { .. } => {
                 // This is for local storage fetch, not sync
                 // For now, this is a no-op

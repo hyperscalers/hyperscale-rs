@@ -3,7 +3,7 @@
 use crate::ProtocolEvent;
 use hyperscale_types::{
     Block, CommittedBlockHeader, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TransactionCertificate, ValidatorId,
+    StateProvision, TransactionCertificate, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -111,6 +111,14 @@ pub enum NodeInput {
         /// Decompressed SBOR payload bytes.
         payload: Vec<u8>,
     },
+
+    /// Provisions built by the execution pool, ready for network broadcast.
+    ///
+    /// Returned from delegated `FetchAndBroadcastProvisions` action.
+    /// The node loop broadcasts one `StateProvisionBatch` per target shard.
+    ProvisionsReady {
+        batches: Vec<(ShardGroupId, Vec<StateProvision>)>,
+    },
 }
 
 impl NodeInput {
@@ -155,6 +163,7 @@ impl NodeInput {
             NodeInput::TransactionValidated { .. } => EventPriority::Internal,
             NodeInput::CommittedHeaderValidated { .. } => EventPriority::Internal,
             NodeInput::GossipReceived { .. } => EventPriority::Network,
+            NodeInput::ProvisionsReady { .. } => EventPriority::Internal,
         }
     }
 
@@ -192,6 +201,7 @@ impl NodeInput {
             NodeInput::TransactionValidated { .. } => "TransactionValidated",
             NodeInput::CommittedHeaderValidated { .. } => "CommittedHeaderValidated",
             NodeInput::GossipReceived { .. } => "GossipReceived",
+            NodeInput::ProvisionsReady { .. } => "ProvisionsReady",
         }
     }
 }

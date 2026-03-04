@@ -8,8 +8,8 @@
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommitmentProof,
     CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, StateEntry, StateProvision,
-    SubstateInclusionProof, TransactionCertificate, ValidatorId,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, StateProvision, TransactionCertificate,
+    ValidatorId,
 };
 use std::sync::Arc;
 
@@ -242,13 +242,6 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Storage Callbacks
     // ═══════════════════════════════════════════════════════════════════════
-    /// State entries fetched for cross-shard provisioning.
-    StateEntriesFetched {
-        tx_hash: Hash,
-        entries: Vec<StateEntry>,
-        merkle_proofs: Vec<SubstateInclusionProof>,
-    },
-
     /// Block fetched from storage.
     BlockFetched {
         height: BlockHeight,
@@ -405,7 +398,6 @@ impl ProtocolEvent {
             ProtocolEvent::GossipedCertificateVerified { .. } => "GossipedCertificateVerified",
 
             // Storage Callbacks
-            ProtocolEvent::StateEntriesFetched { .. } => "StateEntriesFetched",
             ProtocolEvent::BlockFetched { .. } => "BlockFetched",
             ProtocolEvent::ChainMetadataFetched { .. } => "ChainMetadataFetched",
 

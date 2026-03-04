@@ -30,11 +30,6 @@ impl StateProvisionBatch {
         }
     }
 
-    /// Create a batch from a single provision.
-    pub fn single(provision: hyperscale_types::StateProvision) -> Self {
-        Self::new(vec![provision])
-    }
-
     /// Get the provisions.
     pub fn provisions(&self) -> &[hyperscale_types::StateProvision] {
         &self.provisions

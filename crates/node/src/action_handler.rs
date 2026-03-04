@@ -67,6 +67,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         // Execution
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
         Action::SpeculativeExecute { .. } => Some(DispatchPool::Execution),
+        Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Execution),
         _ => None,
     }
 }
@@ -385,6 +386,61 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
 
             Some(DelegatedResult {
                 events,
+                prepared_commit: None,
+            })
+        }
+
+        // --- Provision fetch + broadcast ---
+        Action::FetchAndBroadcastProvisions {
+            requests,
+            source_shard,
+            block_height,
+            block_timestamp,
+            state_version,
+        } => {
+            use hyperscale_types::StateProvision;
+            use std::collections::HashMap;
+
+            let mut batches: HashMap<ShardGroupId, Vec<StateProvision>> = HashMap::new();
+
+            for req in requests {
+                // Fetch state entries from storage
+                let entries = ctx.executor.fetch_state_entries(ctx.storage, &req.nodes);
+                let storage_keys: Vec<Vec<u8>> =
+                    entries.iter().map(|e| e.storage_key.clone()).collect();
+                let merkle_proofs = ctx
+                    .storage
+                    .generate_merkle_proofs(&storage_keys, state_version);
+
+                assert_eq!(
+                    entries.len(),
+                    merkle_proofs.len(),
+                    "entries and merkle_proofs must have the same length"
+                );
+
+                // Wrap in Arc for efficient sharing across target shards
+                let entries = Arc::new(entries);
+                let merkle_proofs = Arc::new(merkle_proofs);
+
+                // Build a provision per target shard
+                for &target_shard in &req.target_shards {
+                    let provision = StateProvision {
+                        transaction_hash: req.tx_hash,
+                        target_shard,
+                        source_shard,
+                        block_height,
+                        block_timestamp,
+                        state_version,
+                        entries: Arc::clone(&entries),
+                        merkle_proofs: Arc::clone(&merkle_proofs),
+                    };
+                    batches.entry(target_shard).or_default().push(provision);
+                }
+            }
+
+            let batches: Vec<_> = batches.into_iter().collect();
+            Some(DelegatedResult {
+                events: vec![NodeInput::ProvisionsReady { batches }],
                 prepared_commit: None,
             })
         }
