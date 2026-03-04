@@ -31,7 +31,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{RadixExecutor, TransactionValidation};
 use hyperscale_messages::{
     BlockHeaderGossip, BlockVoteGossip, ExecutionCertificateBatch, ExecutionVoteBatch,
-    StateProvisionBatch, TransactionCertificateGossip, TransactionGossip,
+    TransactionCertificateGossip, TransactionGossip,
 };
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
@@ -202,7 +202,6 @@ where
     execution_certificate_batch: BatchAccumulator<(ExecutionCertificate, Vec<Bls12381G1PublicKey>)>,
     broadcast_vote_batch: ShardedBatchAccumulator<ExecutionVote>,
     broadcast_cert_batch: ShardedBatchAccumulator<Arc<ExecutionCertificate>>,
-    broadcast_provision_batch: ShardedBatchAccumulator<hyperscale_types::StateProvision>,
     committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
 
     // Transaction status cache — retains the latest status for every transaction
@@ -278,10 +277,6 @@ where
             broadcast_cert_batch: ShardedBatchAccumulator::new(
                 b.broadcast_cert_max,
                 b.broadcast_cert_window,
-            ),
-            broadcast_provision_batch: ShardedBatchAccumulator::new(
-                b.broadcast_provision_max,
-                b.broadcast_provision_window,
             ),
             committed_header_batch: BatchAccumulator::new(
                 b.committed_header_max,
@@ -657,9 +652,6 @@ where
         if self.broadcast_cert_batch.is_expired(now) {
             self.flush_broadcast_certs();
         }
-        if self.broadcast_provision_batch.is_expired(now) {
-            self.flush_broadcast_provisions();
-        }
         if self.committed_header_batch.is_expired(now) {
             self.flush_committed_header_verifications();
         }
@@ -691,7 +683,6 @@ where
             self.execution_certificate_batch.deadline(),
             self.broadcast_vote_batch.deadline(),
             self.broadcast_cert_batch.deadline(),
-            self.broadcast_provision_batch.deadline(),
             self.committed_header_batch.deadline(),
         ]
         .into_iter()
@@ -750,7 +741,8 @@ where
                 self.accumulate_broadcast_cert(shard, certificate);
             }
             Action::BroadcastStateProvision { shard, provision } => {
-                self.accumulate_broadcast_provision(shard, provision);
+                let batch = hyperscale_messages::StateProvisionBatch::single(provision);
+                self.network.broadcast_to_shard(shard, &batch);
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -783,7 +775,7 @@ where
             | Action::VerifyTransactionRoot { .. }
             | Action::BuildProposal { .. }
             | Action::AggregateExecutionCertificate { .. }
-            | Action::VerifyAndAggregateProvisions { .. }
+            | Action::VerifyStateProvision { .. }
             | Action::ExecuteTransactions { .. }
             | Action::SpeculativeExecute { .. } => {
                 self.dispatch_delegated_action(action);
@@ -830,17 +822,29 @@ where
             // ═══════════════════════════════════════════════════════════
             // Storage reads (dispatched to execution pool)
             // ═══════════════════════════════════════════════════════════
-            Action::FetchStateEntries { tx_hash, nodes } => {
+            Action::FetchStateEntries {
+                tx_hash,
+                nodes,
+                state_version,
+            } => {
                 let storage = &*self.storage;
                 let entries = self.executor.fetch_state_entries(storage, &nodes);
+                let storage_keys: Vec<Vec<u8>> =
+                    entries.iter().map(|e| e.storage_key.clone()).collect();
+                let merkle_proofs = storage.generate_merkle_proofs(&storage_keys, state_version);
                 trace!(
                     ?tx_hash,
                     nodes = nodes.len(),
                     entries = entries.len(),
-                    "Fetched state entries"
+                    proofs = merkle_proofs.len(),
+                    "Fetched state entries with merkle proofs"
                 );
                 let _ = self.event_sender.send(NodeInput::Protocol(
-                    ProtocolEvent::StateEntriesFetched { tx_hash, entries },
+                    ProtocolEvent::StateEntriesFetched {
+                        tx_hash,
+                        entries,
+                        merkle_proofs,
+                    },
                 ));
             }
             Action::FetchBlock { height } => {
@@ -1616,7 +1620,9 @@ where
                 }
             }
             "state.provision.batch" => {
-                let Ok(batch) = sbor::basic_decode::<StateProvisionBatch>(payload) else {
+                let Ok(batch) =
+                    sbor::basic_decode::<hyperscale_messages::StateProvisionBatch>(payload)
+                else {
                     warn!("Failed to decode StateProvisionBatch");
                     return;
                 };
@@ -1793,19 +1799,6 @@ where
         }
     }
 
-    fn accumulate_broadcast_provision(
-        &mut self,
-        shard: ShardGroupId,
-        provision: hyperscale_types::StateProvision,
-    ) {
-        if self
-            .broadcast_provision_batch
-            .push(shard, provision, self.state.now())
-        {
-            self.flush_broadcast_provisions();
-        }
-    }
-
     // ─── Batch Flushing ─────────────────────────────────────────────────
 
     fn flush_broadcast_votes(&mut self) {
@@ -1823,15 +1816,6 @@ where
                 let owned: Vec<ExecutionCertificate> =
                     certs.into_iter().map(Arc::unwrap_or_clone).collect();
                 let batch = ExecutionCertificateBatch::new(owned);
-                self.network.broadcast_to_shard(shard, &batch);
-            }
-        }
-    }
-
-    fn flush_broadcast_provisions(&mut self) {
-        for (shard, provisions) in self.broadcast_provision_batch.take() {
-            if !provisions.is_empty() {
-                let batch = StateProvisionBatch::new(provisions);
                 self.network.broadcast_to_shard(shard, &batch);
             }
         }
@@ -1966,7 +1950,6 @@ where
         self.flush_execution_certificate_verifications();
         self.flush_broadcast_votes();
         self.flush_broadcast_certs();
-        self.flush_broadcast_provisions();
         self.flush_committed_header_verifications();
     }
 }

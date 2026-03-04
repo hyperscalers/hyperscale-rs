@@ -185,15 +185,15 @@ impl LivelockState {
     /// Called when a quorum of verified provisions is reached for a source shard.
     ///
     /// This is the ONLY entry point for cycle detection in the new architecture.
-    /// This method only processes provisions that
-    /// have been signature-verified and have reached quorum threshold. This prevents
-    /// Byzantine validators from triggering false deferrals with forged provisions.
+    /// This method only processes provisions that have been verified (QC + merkle
+    /// proofs). This prevents Byzantine validators from triggering false deferrals
+    /// with forged provisions.
     ///
     /// # Arguments
     /// * `remote_tx_hash` - The remote transaction's hash
-    /// * `source_shard` - The shard that reached quorum
-    /// * `commitment_proof` - The aggregated proof from the source shard
-    pub fn on_provision_quorum_reached(
+    /// * `source_shard` - The shard that sent the verified provision
+    /// * `commitment_proof` - The verified proof from the source shard
+    pub fn on_provision_accepted(
         &mut self,
         remote_tx_hash: Hash,
         source_shard: ShardGroupId,
@@ -202,8 +202,8 @@ impl LivelockState {
         trace!(
             remote_tx = %remote_tx_hash,
             source_shard = source_shard.0,
-            signer_count = commitment_proof.signer_count(),
-            "Processing verified quorum for cycle detection"
+            signer_count = commitment_proof.qc.signer_count(),
+            "Processing verified provision for cycle detection"
         );
 
         // Check tombstone - discard late provisions for deferred TXs
@@ -497,7 +497,7 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         generate_bls_keypair, zero_bls_signature, SignerBitfield, StateEntry, StaticTopology,
-        ValidatorId, ValidatorInfo, ValidatorSet,
+        SubstateInclusionProof, ValidatorId, ValidatorInfo, ValidatorSet,
     };
 
     fn make_test_topology(local_shard: ShardGroupId) -> Arc<dyn Topology> {
@@ -531,10 +531,20 @@ mod tests {
             tx_hash,
             source_shard,
             ShardGroupId(0), // target_shard = local shard in tests
-            SignerBitfield::new(3),
-            zero_bls_signature(),
             BlockHeight(1),
             1000, // block_timestamp
+            Hash::ZERO,
+            hyperscale_types::QuorumCertificate {
+                block_hash: Hash::ZERO,
+                shard_group_id: source_shard,
+                height: BlockHeight(1),
+                parent_block_hash: Hash::ZERO,
+                round: 1,
+                signers: SignerBitfield::new(3),
+                aggregated_signature: zero_bls_signature(),
+                weighted_timestamp_ms: 0,
+            },
+            vec![],
             vec![],
         )
     }
@@ -545,19 +555,33 @@ mod tests {
         node_ids: Vec<NodeId>,
     ) -> CommitmentProof {
         // Create a commitment proof with specific nodes
+        let entry_count = node_ids.len();
         let entries: Vec<_> = node_ids
             .into_iter()
             .map(|node_id| StateEntry::test_entry(node_id, 0, vec![], None))
+            .collect();
+        let merkle_proofs: Vec<_> = (0..entry_count)
+            .map(|_| SubstateInclusionProof::dummy())
             .collect();
         CommitmentProof::new(
             tx_hash,
             source_shard,
             ShardGroupId(0), // target_shard = local shard in tests
-            SignerBitfield::new(3),
-            zero_bls_signature(),
             BlockHeight(1),
             1000, // block_timestamp
+            Hash::ZERO,
+            hyperscale_types::QuorumCertificate {
+                block_hash: Hash::ZERO,
+                shard_group_id: source_shard,
+                height: BlockHeight(1),
+                parent_block_hash: Hash::ZERO,
+                round: 1,
+                signers: SignerBitfield::new(3),
+                aggregated_signature: zero_bls_signature(),
+                weighted_timestamp_ms: 0,
+            },
             entries,
+            merkle_proofs,
         )
     }
 
@@ -585,18 +609,30 @@ mod tests {
 
     // Helper to create a minimal CommitmentProof for testing
     fn make_test_commitment_proof(winner_tx_hash: Hash) -> CommitmentProof {
-        use hyperscale_types::{Bls12381G2Signature, ShardGroupId, SignerBitfield};
+        use hyperscale_types::{
+            Bls12381G2Signature, QuorumCertificate, ShardGroupId, SignerBitfield,
+        };
 
-        CommitmentProof {
-            tx_hash: winner_tx_hash,
-            source_shard: ShardGroupId(1),
-            target_shard: ShardGroupId(0),
-            signers: SignerBitfield::empty(),
-            aggregated_signature: Bls12381G2Signature([0u8; 96]),
-            block_height: BlockHeight(1),
-            block_timestamp: 1000,
-            entries: std::sync::Arc::new(vec![]),
-        }
+        CommitmentProof::new(
+            winner_tx_hash,
+            ShardGroupId(1),
+            ShardGroupId(0),
+            BlockHeight(1),
+            1000,
+            Hash::ZERO,
+            QuorumCertificate {
+                block_hash: Hash::ZERO,
+                shard_group_id: ShardGroupId(1),
+                height: BlockHeight(1),
+                parent_block_hash: Hash::ZERO,
+                round: 1,
+                signers: SignerBitfield::empty(),
+                aggregated_signature: Bls12381G2Signature([0u8; 96]),
+                weighted_timestamp_ms: 0,
+            },
+            vec![],
+            vec![],
+        )
     }
 
     #[test]
@@ -624,7 +660,7 @@ mod tests {
         // This simulates shard 1 having committed a TX that also uses the conflicting node
         let proof =
             make_commitment_proof_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
-        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &proof);
+        state.on_provision_accepted(remote_tx, ShardGroupId(1), &proof);
 
         // Should have queued a deferral (local_tx loses to remote_tx)
         let deferrals = state.get_pending_deferrals();
@@ -659,7 +695,7 @@ mod tests {
         // Receive quorum of provisions from shard 1 for remote_tx with overlapping node
         let proof =
             make_commitment_proof_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
-        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &proof);
+        state.on_provision_accepted(remote_tx, ShardGroupId(1), &proof);
 
         // Should NOT have queued a deferral (we win, remote should defer)
         assert!(state.get_pending_deferrals().is_empty());
@@ -687,7 +723,7 @@ mod tests {
 
         // Receive quorum of provisions from shard 1 for remote_tx with DIFFERENT node
         let proof = make_commitment_proof_with_nodes(remote_tx, ShardGroupId(1), vec![remote_node]);
-        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &proof);
+        state.on_provision_accepted(remote_tx, ShardGroupId(1), &proof);
 
         // Should NOT have queued a deferral - no node overlap means no real conflict
         assert!(state.get_pending_deferrals().is_empty());
@@ -707,7 +743,7 @@ mod tests {
 
         // Receive quorum of provisions for the deferred TX
         let proof = make_commitment_proof(tx, ShardGroupId(1));
-        state.on_provision_quorum_reached(tx, ShardGroupId(1), &proof);
+        state.on_provision_accepted(tx, ShardGroupId(1), &proof);
 
         // Should not have added to provision tracker (tombstone filtered)
         assert!(!state.provision_tracker.has_provision(tx, ShardGroupId(1)));
@@ -759,12 +795,12 @@ mod tests {
         // Receive quorum of provisions - should queue deferral
         let proof =
             make_commitment_proof_with_nodes(remote_tx, ShardGroupId(1), vec![conflicting_node]);
-        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &proof);
+        state.on_provision_accepted(remote_tx, ShardGroupId(1), &proof);
 
         assert_eq!(state.get_pending_deferrals().len(), 1);
 
         // Receive same quorum again - should NOT queue duplicate deferral
-        state.on_provision_quorum_reached(remote_tx, ShardGroupId(1), &proof);
+        state.on_provision_accepted(remote_tx, ShardGroupId(1), &proof);
 
         assert_eq!(
             state.get_pending_deferrals().len(),
@@ -775,7 +811,7 @@ mod tests {
         // Receive quorum from different shard for same cycle - still no duplicate
         let proof2 =
             make_commitment_proof_with_nodes(remote_tx, ShardGroupId(2), vec![conflicting_node]);
-        state.on_provision_quorum_reached(remote_tx, ShardGroupId(2), &proof2);
+        state.on_provision_accepted(remote_tx, ShardGroupId(2), &proof2);
 
         assert_eq!(
             state.get_pending_deferrals().len(),
@@ -923,7 +959,7 @@ mod tests {
         // This means remote_tx needs our state, but we don't need shard 2's state
         // so there's no cycle with our local_tx
         let proof = make_commitment_proof_with_nodes(remote_tx, ShardGroupId(2), vec![node2]);
-        state.on_provision_quorum_reached(remote_tx, ShardGroupId(2), &proof);
+        state.on_provision_accepted(remote_tx, ShardGroupId(2), &proof);
 
         // Should NOT queue a deferral - no cycle exists
         // Our local_tx needs shard 1, provision is from shard 2

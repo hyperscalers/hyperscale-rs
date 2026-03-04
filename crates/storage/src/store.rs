@@ -2,7 +2,7 @@
 //!
 //! This module defines the storage abstraction used by runners to persist Radix state.
 
-use hyperscale_types::{Hash, NodeId};
+use hyperscale_types::{Hash, NodeId, SubstateInclusionProof};
 use radix_substate_store_interface::interface::{
     CommittableSubstateDatabase, DbSortKey, SubstateDatabase,
 };
@@ -60,6 +60,13 @@ pub trait SubstateStore: SubstateDatabase + CommittableSubstateDatabase + Send +
     ///
     /// Returns a zero hash if no commits have occurred.
     fn state_root_hash(&self) -> Hash;
+
+    /// Generate 3-tier JMT inclusion proofs for the given storage keys.
+    fn generate_merkle_proofs(
+        &self,
+        storage_keys: &[Vec<u8>],
+        state_version: u64,
+    ) -> Vec<SubstateInclusionProof>;
 }
 
 /// Prefix for all Radix Engine data in storage.

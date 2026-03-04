@@ -3,14 +3,11 @@
 //! These functions create properly-signed test fixtures that exercise
 //! real cryptographic verification paths.
 
-use std::sync::Arc;
-
 use crate::TestCommittee;
 use hyperscale_types::{
-    block_vote_message, exec_vote_message, state_provision_message, verify_bls12381_v1,
-    BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate,
-    ExecutionVote, Hash, QuorumCertificate, ShardGroupId, SignerBitfield, StateEntry,
-    StateProvision,
+    block_vote_message, exec_vote_message, verify_bls12381_v1, BlockHeight, BlockVote,
+    Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote, Hash,
+    QuorumCertificate, ShardGroupId, SignerBitfield,
 };
 
 /// Create a properly-signed block vote.
@@ -198,45 +195,6 @@ pub fn make_signed_execution_certificate(
     }
 }
 
-/// Create a properly-signed state provision.
-///
-/// The provision is signed with the keypair at `validator_idx` in the committee.
-#[allow(clippy::too_many_arguments)]
-pub fn make_signed_provision(
-    committee: &TestCommittee,
-    validator_idx: usize,
-    tx_hash: Hash,
-    target_shard: ShardGroupId,
-    source_shard: ShardGroupId,
-    block_height: BlockHeight,
-    block_timestamp: u64,
-    entries: Vec<StateEntry>,
-) -> StateProvision {
-    // Compute entry hashes for signing
-    let entry_hashes: Vec<Hash> = entries.iter().map(|e| e.hash()).collect();
-
-    let message = state_provision_message(
-        &tx_hash,
-        target_shard,
-        source_shard,
-        block_height,
-        block_timestamp,
-        &entry_hashes,
-    );
-    let signature = committee.keypair(validator_idx).sign_v1(&message);
-
-    StateProvision {
-        transaction_hash: tx_hash,
-        target_shard,
-        source_shard,
-        block_height,
-        block_timestamp,
-        entries: Arc::new(entries),
-        validator_id: committee.validator_id(validator_idx),
-        signature,
-    }
-}
-
 /// Verify a block vote signature.
 ///
 /// Convenience function for tests.
@@ -300,16 +258,9 @@ pub fn verify_execution_certificate(
     }
 }
 
-/// Verify a state provision signature.
-pub fn verify_provision(provision: &StateProvision, public_key: &Bls12381G1PublicKey) -> bool {
-    let message = provision.signing_message();
-    verify_bls12381_v1(&message, public_key, &provision.signature)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::NodeId;
 
     #[test]
     fn test_signed_block_vote() {
@@ -382,34 +333,5 @@ mod tests {
 
         assert!(verify_execution_certificate(&cert, &committee));
         assert_eq!(cert.signer_count(), 3);
-    }
-
-    #[test]
-    fn test_signed_provision() {
-        let committee = TestCommittee::new(4, 42);
-        let tx_hash = Hash::from_bytes(b"tx");
-        let entries = vec![StateEntry::test_entry(
-            NodeId([1u8; 30]),
-            1,
-            vec![1, 2, 3],
-            Some(vec![4, 5, 6]),
-        )];
-
-        let provision = make_signed_provision(
-            &committee,
-            0,
-            tx_hash,
-            ShardGroupId(1),
-            ShardGroupId(0),
-            BlockHeight(10),
-            1000, // block_timestamp
-            entries,
-        );
-
-        // Should verify with correct key
-        assert!(verify_provision(&provision, committee.public_key(0)));
-
-        // Should not verify with wrong key
-        assert!(!verify_provision(&provision, committee.public_key(1)));
     }
 }

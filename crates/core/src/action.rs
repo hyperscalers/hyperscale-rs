@@ -6,8 +6,8 @@ use hyperscale_messages::{
 };
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
-    EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, SignerBitfield, StateEntry, StateProvision,
+    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision,
     TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
@@ -84,8 +84,7 @@ pub enum Action {
 
     /// Broadcast a state provision to a target shard.
     ///
-    /// The runner may batch multiple provisions into a single network message
-    /// for efficiency. State machines emit individual provisions.
+    /// Only the block proposer sends these (not all validators).
     BroadcastStateProvision {
         shard: ShardGroupId,
         provision: StateProvision,
@@ -155,33 +154,29 @@ pub enum Action {
         total_voting_power: u64,
     },
 
-    /// Batch verify and aggregate provisions (cross-shard Phase 2).
+    /// Verify a state provision's QC and merkle inclusion proofs.
     ///
-    /// Verifies all provision signatures and aggregates valid ones into a CommitmentProof.
-    /// This combines verification and aggregation into a single operation, avoiding
-    /// wasted work on provisions that might never reach quorum.
+    /// Verifies that the committed block header's QC is valid (BLS signature
+    /// from 2f+1 validators) and that each merkle inclusion proof verifies
+    /// against the QC-committed state root.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::ProvisionsVerifiedAndAggregated` when complete.
-    VerifyAndAggregateProvisions {
+    /// Returns `ProtocolEvent::StateProvisionVerified` when complete.
+    VerifyStateProvision {
         /// Transaction hash for correlation.
         tx_hash: Hash,
-        /// Source shard the provisions are from.
+        /// Source shard the provision is from.
         source_shard: ShardGroupId,
-        /// Target shard that received the provisions (our local shard).
-        target_shard: ShardGroupId,
-        /// Block height when provisions were created.
-        block_height: BlockHeight,
-        /// Unix timestamp (milliseconds) of the block that triggered the provisions.
-        block_timestamp: u64,
-        /// State entries (from first provision - all should match).
-        entries: Vec<StateEntry>,
-        /// Provisions to verify and aggregate.
-        provisions: Vec<StateProvision>,
-        /// Public keys for each provision (same order as provisions).
-        public_keys: Vec<Bls12381G1PublicKey>,
-        /// Committee size (for SignerBitfield capacity).
-        committee_size: usize,
+        /// The committed block header (header + certifying QC).
+        committed_header: CommittedBlockHeader,
+        /// The state provision to verify.
+        provision: StateProvision,
+        /// Public keys for the source shard's committee (from topology).
+        committee_public_keys: Vec<Bls12381G1PublicKey>,
+        /// Total voting power of QC signers.
+        total_voting_power: u64,
+        /// Quorum threshold for the source shard.
+        quorum_threshold: u64,
     },
 
     /// Aggregate execution votes into an ExecutionCertificate (vote quorum reached).
@@ -206,9 +201,8 @@ pub enum Action {
 
     /// Batch verify execution votes and aggregate valid ones (cross-shard Phase 4).
     ///
-    /// Similar to `VerifyAndAggregateProvisions`, this defers verification until
-    /// we have enough votes to possibly reach quorum. This avoids wasting CPU on
-    /// votes that will never be used.
+    /// Defers verification until we have enough votes to possibly reach quorum.
+    /// This avoids wasting CPU on votes that will never be used.
     ///
     /// The runner:
     /// 1. Batch-verifies all vote signatures (faster than individual verification)
@@ -599,6 +593,8 @@ pub enum Action {
         tx_hash: Hash,
         /// Nodes to fetch all substates for.
         nodes: Vec<NodeId>,
+        /// JMT state version for merkle proof generation.
+        state_version: u64,
     },
 
     /// Fetch a block by height.
@@ -692,7 +688,7 @@ impl Action {
         matches!(
             self,
             Action::VerifyAndBuildQuorumCertificate { .. }
-                | Action::VerifyAndAggregateProvisions { .. }
+                | Action::VerifyStateProvision { .. }
                 | Action::AggregateExecutionCertificate { .. }
                 | Action::VerifyAndAggregateExecutionVotes { .. }
                 | Action::VerifyExecutionCertificateSignature { .. }
@@ -761,7 +757,7 @@ impl Action {
 
             // Delegated Work - Crypto Verification
             Action::VerifyAndBuildQuorumCertificate { .. } => "VerifyAndBuildQuorumCertificate",
-            Action::VerifyAndAggregateProvisions { .. } => "VerifyAndAggregateProvisions",
+            Action::VerifyStateProvision { .. } => "VerifyStateProvision",
             Action::AggregateExecutionCertificate { .. } => "AggregateExecutionCertificate",
             Action::VerifyAndAggregateExecutionVotes { .. } => "VerifyAndAggregateExecutionVotes",
             Action::VerifyExecutionCertificateSignature { .. } => {

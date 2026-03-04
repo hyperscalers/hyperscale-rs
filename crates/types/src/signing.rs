@@ -11,8 +11,8 @@
 //! | Tag | Purpose |
 //! |-----|---------|
 //! | `BLOCK_VOTE` | BFT block votes |
-//! | `STATE_PROVISION` | Cross-shard state provisions |
 //! | `EXEC_VOTE` | Execution votes |
+//! | `COMMITTED_BLOCK_HEADER` | Committed block header gossip |
 //!
 //! # Usage
 //!
@@ -20,17 +20,12 @@
 //! `signing_message()` method pattern. The signing message is constructed
 //! by prepending the domain tag to the serialized content.
 
-use crate::{BlockHeight, Hash, ShardGroupId};
+use crate::{Hash, ShardGroupId};
 
 /// Domain tag for BFT block votes.
 ///
 /// Format: `BLOCK_VOTE` || shard_group_id || height || round || block_hash
 pub const DOMAIN_BLOCK_VOTE: &[u8] = b"BLOCK_VOTE";
-
-/// Domain tag for cross-shard state provisions.
-///
-/// Format: `STATE_PROVISION` || tx_hash || target_shard || source_shard || height || timestamp || entries_hash
-pub const DOMAIN_STATE_PROVISION: &[u8] = b"STATE_PROVISION";
 
 /// Domain tag for execution votes.
 ///
@@ -67,32 +62,6 @@ pub fn block_vote_message(
     message.extend_from_slice(&round.to_le_bytes());
     message.extend_from_slice(block_hash.as_bytes());
     message
-}
-
-/// Build the signing message for a state provision.
-///
-/// This is used for verifying cross-shard state provisions.
-pub fn state_provision_message(
-    tx_hash: &Hash,
-    target_shard: ShardGroupId,
-    source_shard: ShardGroupId,
-    block_height: BlockHeight,
-    block_timestamp: u64,
-    entries_hashes: &[Hash],
-) -> Vec<u8> {
-    let mut msg = Vec::new();
-    msg.extend_from_slice(DOMAIN_STATE_PROVISION);
-    msg.extend_from_slice(tx_hash.as_bytes());
-    msg.extend_from_slice(&target_shard.0.to_le_bytes());
-    msg.extend_from_slice(&source_shard.0.to_le_bytes());
-    msg.extend_from_slice(&block_height.0.to_le_bytes());
-    msg.extend_from_slice(&block_timestamp.to_le_bytes());
-
-    for hash in entries_hashes {
-        msg.extend_from_slice(hash.as_bytes());
-    }
-
-    msg
 }
 
 /// Build the signing message for a committed block header gossip.
@@ -161,33 +130,6 @@ mod tests {
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_EXEC_VOTE));
-    }
-
-    #[test]
-    fn test_state_provision_message_deterministic() {
-        let tx_hash = Hash::from_bytes(b"tx_hash");
-        let entry1 = Hash::from_bytes(b"entry1");
-        let entry2 = Hash::from_bytes(b"entry2");
-
-        let msg1 = state_provision_message(
-            &tx_hash,
-            ShardGroupId(1),
-            ShardGroupId(0),
-            BlockHeight(10),
-            1234567890,
-            &[entry1, entry2],
-        );
-        let msg2 = state_provision_message(
-            &tx_hash,
-            ShardGroupId(1),
-            ShardGroupId(0),
-            BlockHeight(10),
-            1234567890,
-            &[entry1, entry2],
-        );
-
-        assert_eq!(msg1, msg2);
-        assert!(msg1.starts_with(DOMAIN_STATE_PROVISION));
     }
 
     #[test]

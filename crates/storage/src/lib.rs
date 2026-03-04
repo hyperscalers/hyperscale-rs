@@ -34,6 +34,7 @@ mod consensus;
 mod jmt_snapshot;
 pub mod keys;
 mod overlay;
+pub mod proofs;
 mod store;
 mod writes;
 
@@ -66,4 +67,15 @@ pub mod jmt {
         TreeNode, TypedInMemoryTreeStore, Version as StateVersion, VersionedTreeNode,
         WriteableTreeStore,
     };
+
+    // Re-export types needed for proof generation and verification
+    pub use radix_substate_store_impls::state_tree::types::{
+        IteratedLeafKey, LeafKey, SparseMerkleLeafNode, SparseMerkleProof,
+    };
+
+    // Re-export tier types for proof generation
+    pub use radix_substate_store_impls::state_tree::entity_tier::EntityTier;
+    pub use radix_substate_store_impls::state_tree::partition_tier::PartitionTier;
+    pub use radix_substate_store_impls::state_tree::substate_tier::SubstateTier;
+    pub use radix_substate_store_impls::state_tree::tier_framework::ReadableTier;
 }

@@ -466,6 +466,19 @@ impl SubstateStore for SimStorage {
     fn state_root_hash(&self) -> Hash {
         self.jmt.current_jmt_root()
     }
+
+    fn generate_merkle_proofs(
+        &self,
+        storage_keys: &[Vec<u8>],
+        state_version: u64,
+    ) -> Vec<hyperscale_types::SubstateInclusionProof> {
+        let inner = self.jmt.inner.lock().unwrap();
+        hyperscale_storage::proofs::generate_merkle_proofs(
+            &inner.tree_store,
+            storage_keys,
+            state_version,
+        )
+    }
 }
 
 impl SimStorage {

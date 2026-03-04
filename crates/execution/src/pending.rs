@@ -19,6 +19,8 @@ pub struct PendingProvisionBroadcast {
     pub block_height: BlockHeight,
     /// Unix timestamp (milliseconds) of the block that triggered this provision.
     pub block_timestamp: u64,
+    /// JMT state version for merkle proofs.
+    pub state_version: u64,
     /// Target shards to broadcast to.
     pub target_shards: Vec<ShardGroupId>,
 }

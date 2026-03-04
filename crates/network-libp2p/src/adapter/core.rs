@@ -292,6 +292,7 @@ impl Libp2pAdapter {
             Topic::state_provision_batch(shard),
             Topic::execution_vote_batch(shard),
             Topic::execution_certificate_batch(shard),
+            Topic::block_committed(),
         ];
 
         for topic in &topics {

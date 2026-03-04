@@ -2096,18 +2096,27 @@ impl BftState {
         proof: &CommitmentProof,
     ) -> (Vec<Bls12381G1PublicKey>, u64) {
         let committee = self.topology.committee_for_shard(proof.source_shard);
-        let mut voting_power = 0u64;
-        let public_keys = proof
-            .signers
-            .set_indices()
-            .filter_map(|idx| {
-                committee.get(idx).and_then(|&vid| {
-                    let pk = self.topology.public_key(vid)?;
-                    voting_power += self.voting_power(vid);
-                    Some(pk)
-                })
+
+        // Collect ALL committee public keys in order — verify_qc_signature
+        // uses positional indexing via the signer bitfield, so it needs the
+        // full array (not just signer keys).
+        let public_keys: Vec<_> = committee
+            .iter()
+            .map(|&validator_id| {
+                self.topology
+                    .public_key(validator_id)
+                    .expect("committee member must have a public key")
             })
             .collect();
+
+        // Compute voting power from signers only
+        let mut voting_power = 0u64;
+        for idx in proof.qc.signers.set_indices() {
+            if let Some(&validator_id) = committee.get(idx) {
+                voting_power += self.voting_power(validator_id);
+            }
+        }
+
         (public_keys, voting_power)
     }
 
@@ -5950,18 +5959,19 @@ mod tests {
     /// This is sufficient for testing structural validation logic which doesn't verify
     /// the BLS signature (that's done asynchronously via Action::VerifyCommitmentProof).
     fn make_test_commitment_proof(winner_tx_hash: Hash) -> hyperscale_types::CommitmentProof {
-        use hyperscale_types::{CommitmentProof, ShardGroupId, SignerBitfield};
+        use hyperscale_types::{CommitmentProof, ShardGroupId};
         use std::sync::Arc;
 
         CommitmentProof {
             tx_hash: winner_tx_hash,
             source_shard: ShardGroupId(1),
             target_shard: ShardGroupId(0),
-            signers: SignerBitfield::empty(),
-            aggregated_signature: zero_bls_signature(),
             block_height: BlockHeight(1),
             block_timestamp: 1000,
+            state_root: Hash::ZERO,
+            qc: QuorumCertificate::genesis(),
             entries: Arc::new(vec![]),
+            merkle_proofs: Arc::new(vec![]),
         }
     }
 
@@ -7799,7 +7809,7 @@ mod tests {
         Arc<hyperscale_types::RoutableTransaction>,
         Option<CommitmentProof>,
     ) {
-        use hyperscale_types::{test_utils, ShardGroupId, StateEntry};
+        use hyperscale_types::{test_utils, ShardGroupId, StateEntry, SubstateInclusionProof};
 
         let tx = test_utils::test_transaction(seed);
         let tx_arc = Arc::new(tx);
@@ -7810,11 +7820,12 @@ mod tests {
                 tx_arc.hash(),
                 ShardGroupId(1),
                 ShardGroupId(0),
-                SignerBitfield::new(4),
-                zero_bls_signature(),
                 BlockHeight(1),
                 1000, // block_timestamp
+                Hash::ZERO,
+                QuorumCertificate::genesis(),
                 vec![StateEntry::test_entry(node, 0, vec![], None)],
+                vec![SubstateInclusionProof::dummy()],
             ))
         } else {
             None

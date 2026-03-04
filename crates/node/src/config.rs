@@ -43,10 +43,6 @@ pub struct BatchConfig {
     pub broadcast_cert_max: usize,
     pub broadcast_cert_window: Duration,
 
-    /// Broadcast state provision batch.
-    pub broadcast_provision_max: usize,
-    pub broadcast_provision_window: Duration,
-
     /// Transaction validation batch.
     pub tx_validation_max: usize,
     pub tx_validation_window: Duration,
@@ -73,9 +69,6 @@ impl Default for BatchConfig {
 
             broadcast_cert_max: 64,
             broadcast_cert_window: Duration::from_millis(15),
-
-            broadcast_provision_max: 64,
-            broadcast_provision_window: Duration::from_millis(15),
 
             tx_validation_max: 128,
             tx_validation_window: Duration::from_millis(20),

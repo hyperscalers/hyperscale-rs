@@ -2063,20 +2063,19 @@ mod tests {
     }
 
     fn make_test_deferral(loser_tx: Hash, winner_tx: Hash, height: u64) -> TransactionDefer {
-        use hyperscale_types::{
-            Bls12381G2Signature, CommitmentProof, ShardGroupId, SignerBitfield,
-        };
+        use hyperscale_types::CommitmentProof;
 
-        let proof = CommitmentProof {
-            tx_hash: winner_tx,
-            source_shard: ShardGroupId(1),
-            target_shard: ShardGroupId(0),
-            signers: SignerBitfield::empty(),
-            aggregated_signature: Bls12381G2Signature([0u8; 96]),
-            block_height: BlockHeight(1),
-            block_timestamp: 1000,
-            entries: std::sync::Arc::new(vec![]),
-        };
+        let proof = CommitmentProof::new(
+            winner_tx,
+            ShardGroupId(1),
+            ShardGroupId(0),
+            BlockHeight(1),
+            1000,
+            Hash::ZERO,
+            QuorumCertificate::genesis(),
+            vec![],
+            vec![],
+        );
 
         TransactionDefer {
             tx_hash: loser_tx,
@@ -2986,15 +2985,13 @@ mod tests {
         // First register the TX
         let reg = hyperscale_provisions::TxRegistration {
             required_shards: std::iter::once(ShardGroupId(1)).collect(),
-            quorum_thresholds: std::iter::once((ShardGroupId(1), 1)).collect(),
             registered_at: BlockHeight(1),
-            nodes_by_shard: HashMap::new(),
         };
         coordinator.on_tx_registered(tx_hash, reg);
 
         // Simulate a verified provision being added (need to call internal method)
         // For this test, we'll just verify the logic by checking has_any_verified_provisions
-        // In a real scenario, provisions would be verified via the signature verification flow
+        // In a real scenario, provisions would be verified via the QC + merkle proof verification flow
 
         // Without provisions, TX should be rejected at limit
         let ready = mempool.ready_transactions(10, 0, 0);

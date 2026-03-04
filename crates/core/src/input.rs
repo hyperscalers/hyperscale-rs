@@ -131,14 +131,14 @@ impl NodeInput {
                 ProtocolEvent::BlockHeaderReceived { .. }
                 | ProtocolEvent::RemoteBlockCommitted { .. }
                 | ProtocolEvent::BlockVoteReceived { .. }
-                | ProtocolEvent::StateProvisionReceived { .. }
                 | ProtocolEvent::ExecutionVoteReceived { .. }
                 | ProtocolEvent::ExecutionCertificateReceived { .. }
                 | ProtocolEvent::TransactionGossipReceived { .. }
                 | ProtocolEvent::GlobalBlockReceived { .. }
                 | ProtocolEvent::GlobalBlockVoteReceived { .. }
                 | ProtocolEvent::TransactionFetchDelivered { .. }
-                | ProtocolEvent::CertificateFetchDelivered { .. } => EventPriority::Network,
+                | ProtocolEvent::CertificateFetchDelivered { .. }
+                | ProtocolEvent::StateProvisionReceived { .. } => EventPriority::Network,
 
                 _ => EventPriority::Internal,
             },

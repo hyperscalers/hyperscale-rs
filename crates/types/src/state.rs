@@ -1,8 +1,8 @@
 //! State-related types for cross-shard execution.
 
 use crate::{
-    exec_vote_message, state_provision_message, zero_bls_signature, BlockHeight,
-    Bls12381G2Signature, Hash, NodeId, PartitionNumber, ShardGroupId, SignerBitfield, ValidatorId,
+    exec_vote_message, zero_bls_signature, BlockHeight, Bls12381G2Signature, Hash, NodeId,
+    PartitionNumber, ShardGroupId, SignerBitfield, ValidatorId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -132,166 +132,6 @@ impl StateEntry {
         storage_key.push(partition); // Partition number
         storage_key.extend_from_slice(&sort_key); // Sort key
         Self { storage_key, value }
-    }
-}
-
-/// State provision from a source shard to a target shard.
-///
-/// Contains pre-computed storage keys (`StateEntry`) for efficient execution.
-/// The sending shard computes storage keys once, so the receiving shard can
-/// use them directly without expensive hash computations.
-///
-/// The `entries` field uses `Arc<Vec<StateEntry>>` for efficient sharing when
-/// broadcasting the same provision data to multiple target shards.
-#[derive(Debug, Clone)]
-pub struct StateProvision {
-    /// Hash of the transaction this provision is for.
-    pub transaction_hash: Hash,
-
-    /// Target shard (the shard executing the transaction).
-    pub target_shard: ShardGroupId,
-
-    /// Source shard (the shard providing the state).
-    pub source_shard: ShardGroupId,
-
-    /// Block height when this provision was created.
-    pub block_height: BlockHeight,
-
-    /// Unix timestamp (milliseconds) of the block that triggered this provision.
-    pub block_timestamp: u64,
-
-    /// The state entries with pre-computed storage keys.
-    /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
-    pub entries: Arc<Vec<StateEntry>>,
-
-    /// Validator ID in source shard who created this provision.
-    pub validator_id: ValidatorId,
-
-    /// Signature from the source shard validator.
-    pub signature: Bls12381G2Signature,
-}
-
-// Manual PartialEq (compare Arc contents, not pointer identity)
-impl PartialEq for StateProvision {
-    fn eq(&self, other: &Self) -> bool {
-        self.transaction_hash == other.transaction_hash
-            && self.target_shard == other.target_shard
-            && self.source_shard == other.source_shard
-            && self.block_height == other.block_height
-            && self.block_timestamp == other.block_timestamp
-            && *self.entries == *other.entries
-            && self.validator_id == other.validator_id
-            && self.signature == other.signature
-    }
-}
-
-impl Eq for StateProvision {}
-
-// ============================================================================
-// Manual SBOR implementation (since Arc doesn't derive BasicSbor)
-// We serialize/deserialize the inner Vec<StateEntry> directly.
-// ============================================================================
-
-impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
-    for StateProvision
-{
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_value_kind(sbor::ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(8)?;
-        encoder.encode(&self.transaction_hash)?;
-        encoder.encode(&self.target_shard)?;
-        encoder.encode(&self.source_shard)?;
-        encoder.encode(&self.block_height)?;
-        encoder.encode(&self.block_timestamp)?;
-        // Entries: encode the inner Vec directly (unwrap Arc)
-        encoder.encode(self.entries.as_ref())?;
-        encoder.encode(&self.validator_id)?;
-        encoder.encode(&self.signature)?;
-        Ok(())
-    }
-}
-
-impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
-    for StateProvision
-{
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
-    ) -> Result<Self, sbor::DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-
-        if length != 8 {
-            return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 8,
-                actual: length,
-            });
-        }
-
-        let transaction_hash: Hash = decoder.decode()?;
-        let target_shard: ShardGroupId = decoder.decode()?;
-        let source_shard: ShardGroupId = decoder.decode()?;
-        let block_height: BlockHeight = decoder.decode()?;
-        let block_timestamp: u64 = decoder.decode()?;
-        // Entries: decode Vec and wrap in Arc
-        let entries: Vec<StateEntry> = decoder.decode()?;
-        let validator_id: ValidatorId = decoder.decode()?;
-        let signature: Bls12381G2Signature = decoder.decode()?;
-
-        Ok(Self {
-            transaction_hash,
-            target_shard,
-            source_shard,
-            block_height,
-            block_timestamp,
-            entries: Arc::new(entries),
-            validator_id,
-            signature,
-        })
-    }
-}
-
-impl sbor::Categorize<sbor::NoCustomValueKind> for StateProvision {
-    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
-        sbor::ValueKind::Tuple
-    }
-}
-
-impl sbor::Describe<sbor::NoCustomTypeKind> for StateProvision {
-    const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("StateProvision", &[], &[]);
-
-    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
-        sbor::TypeData::unnamed(sbor::TypeKind::Any)
-    }
-}
-
-impl StateProvision {
-    /// Create the canonical message bytes for signing.
-    ///
-    /// Uses the centralized `state_provision_message` function with the
-    /// `DOMAIN_STATE_PROVISION` tag for domain separation.
-    pub fn signing_message(&self) -> Vec<u8> {
-        let entry_hashes: Vec<Hash> = self.entries.iter().map(|e| e.hash()).collect();
-        state_provision_message(
-            &self.transaction_hash,
-            self.target_shard,
-            self.source_shard,
-            self.block_height,
-            self.block_timestamp,
-            &entry_hashes,
-        )
-    }
-
-    /// Compute a hash of all entries for comparison purposes.
-    pub fn entries_hash(&self) -> Hash {
-        let mut hasher = blake3::Hasher::new();
-        for entry in self.entries.iter() {
-            hasher.update(entry.hash().as_bytes());
-        }
-        Hash::from_bytes(hasher.finalize().as_bytes())
     }
 }
 
@@ -453,6 +293,131 @@ impl ExecutionCertificate {
     }
 }
 
+/// State provision from a source shard to a target shard.
+///
+/// Only the block proposer sends these. Each provision contains merkle
+/// inclusion proofs that verify against the QC-committed state root,
+/// making the provision self-authenticating via the 2f+1 QC signature.
+#[derive(Debug, Clone)]
+pub struct StateProvision {
+    /// Hash of the transaction this provision is for.
+    pub transaction_hash: Hash,
+
+    /// Target shard (the shard executing the transaction).
+    pub target_shard: ShardGroupId,
+
+    /// Source shard (the shard providing the state).
+    pub source_shard: ShardGroupId,
+
+    /// Block height when this provision was created.
+    pub block_height: BlockHeight,
+
+    /// Unix timestamp (milliseconds) of the block that triggered this provision.
+    pub block_timestamp: u64,
+
+    /// JMT version for the merkle proofs.
+    pub state_version: u64,
+
+    /// The state entries with pre-computed storage keys.
+    /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
+    pub entries: Arc<Vec<StateEntry>>,
+
+    /// Merkle inclusion proofs, one per entry.
+    /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
+    pub merkle_proofs: Arc<Vec<crate::SubstateInclusionProof>>,
+}
+
+// Manual PartialEq (compare Arc contents, not pointer identity)
+impl PartialEq for StateProvision {
+    fn eq(&self, other: &Self) -> bool {
+        self.transaction_hash == other.transaction_hash
+            && self.target_shard == other.target_shard
+            && self.source_shard == other.source_shard
+            && self.block_height == other.block_height
+            && self.block_timestamp == other.block_timestamp
+            && self.state_version == other.state_version
+            && *self.entries == *other.entries
+            && *self.merkle_proofs == *other.merkle_proofs
+    }
+}
+
+impl Eq for StateProvision {}
+
+// Manual SBOR implementation (since Arc doesn't derive BasicSbor)
+impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
+    for StateProvision
+{
+    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_value_kind(sbor::ValueKind::Tuple)
+    }
+
+    fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
+        encoder.write_size(8)?;
+        encoder.encode(&self.transaction_hash)?;
+        encoder.encode(&self.target_shard)?;
+        encoder.encode(&self.source_shard)?;
+        encoder.encode(&self.block_height)?;
+        encoder.encode(&self.block_timestamp)?;
+        encoder.encode(&self.state_version)?;
+        encoder.encode(self.entries.as_ref())?;
+        encoder.encode(self.merkle_proofs.as_ref())?;
+        Ok(())
+    }
+}
+
+impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
+    for StateProvision
+{
+    fn decode_body_with_value_kind(
+        decoder: &mut D,
+        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
+    ) -> Result<Self, sbor::DecodeError> {
+        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
+        let length = decoder.read_size()?;
+
+        if length != 8 {
+            return Err(sbor::DecodeError::UnexpectedSize {
+                expected: 8,
+                actual: length,
+            });
+        }
+
+        let transaction_hash: Hash = decoder.decode()?;
+        let target_shard: ShardGroupId = decoder.decode()?;
+        let source_shard: ShardGroupId = decoder.decode()?;
+        let block_height: BlockHeight = decoder.decode()?;
+        let block_timestamp: u64 = decoder.decode()?;
+        let state_version: u64 = decoder.decode()?;
+        let entries: Vec<StateEntry> = decoder.decode()?;
+        let merkle_proofs: Vec<crate::SubstateInclusionProof> = decoder.decode()?;
+
+        Ok(Self {
+            transaction_hash,
+            target_shard,
+            source_shard,
+            block_height,
+            block_timestamp,
+            state_version,
+            entries: Arc::new(entries),
+            merkle_proofs: Arc::new(merkle_proofs),
+        })
+    }
+}
+
+impl sbor::Categorize<sbor::NoCustomValueKind> for StateProvision {
+    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
+        sbor::ValueKind::Tuple
+    }
+}
+
+impl sbor::Describe<sbor::NoCustomTypeKind> for StateProvision {
+    const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("StateProvision", &[], &[]);
+
+    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
+        sbor::TypeData::unnamed(sbor::TypeKind::Any)
+    }
+}
+
 /// Result of executing a transaction.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ExecutionResult {
@@ -501,75 +466,5 @@ mod tests {
 
         assert!(cert.success);
         assert!(cert.signers.is_empty());
-    }
-
-    #[test]
-    fn test_state_provision_sbor_roundtrip_preserves_signature() {
-        use crate::{bls_keypair_from_seed, state_provision_message, verify_bls12381_v1};
-        use std::sync::Arc;
-
-        // Create test entries using StateEntry::test_entry
-        let entries = vec![
-            StateEntry::test_entry(NodeId([1u8; 30]), 1, vec![1, 2, 3], Some(vec![4, 5, 6])),
-            StateEntry::test_entry(NodeId([2u8; 30]), 2, vec![7, 8, 9], None),
-        ];
-
-        // Create keypair
-        let keypair = bls_keypair_from_seed(&[42u8; 32]);
-        let public_key = keypair.public_key();
-
-        let tx_hash = Hash::from_bytes(&[1u8; 32]);
-        let target_shard = ShardGroupId(0);
-        let source_shard = ShardGroupId(1);
-        let block_height = BlockHeight(100);
-        let block_timestamp = 1234567890u64;
-
-        // Compute signing message
-        let entry_hashes: Vec<Hash> = entries.iter().map(|e| e.hash()).collect();
-        let msg = state_provision_message(
-            &tx_hash,
-            target_shard,
-            source_shard,
-            block_height,
-            block_timestamp,
-            &entry_hashes,
-        );
-        let signature = keypair.sign_v1(&msg);
-
-        // Create provision
-        let provision = StateProvision {
-            transaction_hash: tx_hash,
-            target_shard,
-            source_shard,
-            block_height,
-            block_timestamp,
-            entries: Arc::new(entries),
-            validator_id: crate::ValidatorId(5),
-            signature,
-        };
-
-        // Verify original
-        let original_msg = provision.signing_message();
-        assert!(
-            verify_bls12381_v1(&original_msg, &public_key, &provision.signature),
-            "Original should verify"
-        );
-
-        // SBOR encode
-        let encoded = sbor::basic_encode(&provision).expect("encode failed");
-
-        // SBOR decode
-        let decoded: StateProvision = sbor::basic_decode(&encoded).expect("decode failed");
-
-        // Verify decoded
-        let decoded_msg = decoded.signing_message();
-        assert_eq!(
-            original_msg, decoded_msg,
-            "Signing messages should match after roundtrip"
-        );
-        assert!(
-            verify_bls12381_v1(&decoded_msg, &public_key, &decoded.signature),
-            "Decoded should verify"
-        );
     }
 }

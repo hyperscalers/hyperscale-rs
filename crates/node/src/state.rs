@@ -134,7 +134,6 @@ impl NodeStateMachine {
             ),
             execution: ExecutionState::with_speculative_config(
                 topology.clone(),
-                signing_key,
                 speculative_max_txs,
                 view_change_cooldown_rounds,
             ),
@@ -592,25 +591,24 @@ impl StateMachine for NodeStateMachine {
                     block_hash,
                     height,
                     block.header.timestamp,
+                    block.header.proposer,
+                    block.header.state_version,
                     all_txs,
                 );
 
                 // Process CrossShardTxRegistered events immediately so coordinator has
                 // registrations before any subsequent provisions arrive.
-                // This ensures ProvisionQuorumReached can be emitted for livelock.
+                // This ensures ProvisionAccepted can be emitted for livelock.
                 for action in &exec_actions {
                     if let Action::Continuation(ProtocolEvent::CrossShardTxRegistered {
                         tx_hash,
                         required_shards,
-                        quorum_thresholds,
                         committed_height,
                     }) = action
                     {
                         let registration = hyperscale_provisions::TxRegistration {
                             required_shards: required_shards.clone(),
-                            quorum_thresholds: quorum_thresholds.clone(),
                             registered_at: *committed_height,
-                            nodes_by_shard: std::collections::HashMap::new(),
                         };
                         actions.extend(self.provisions.on_tx_registered(*tx_hash, registration));
                     }
@@ -630,51 +628,42 @@ impl StateMachine for NodeStateMachine {
             // Provision Events (Byzantine-safe)
             //
             // Provisions are routed ONLY to ProvisionCoordinator, which:
-            // 1. Verifies signatures
-            // 2. Tracks quorum per source shard
-            // 3. Emits ProvisionQuorumReached when a shard reaches quorum
-            // 4. Emits ProvisioningComplete when ALL required shards reach quorum
+            // 1. Verifies QC + merkle proofs (via VerifyStateProvision action)
+            // 2. Tracks verified provisions per source shard
+            // 3. Emits ProvisionAccepted when a provision is verified
+            // 4. Emits ProvisioningComplete when ALL required shards are verified
             //
             // ExecutionState listens to ProvisioningComplete to trigger execution.
-            // LivelockState listens to ProvisionQuorumReached for cycle detection.
+            // LivelockState listens to ProvisionAccepted for cycle detection.
             // ═══════════════════════════════════════════════════════════════════════
+            // StateProvisionReceived: provision from source shard proposer
             ProtocolEvent::StateProvisionReceived { provision } => {
-                self.provisions.on_provision_received(provision)
+                self.provisions.on_state_provision_received(provision)
             }
 
-            // ProvisionsVerifiedAndAggregated: callback from batch verification + aggregation
-            ProtocolEvent::ProvisionsVerifiedAndAggregated {
+            // StateProvisionVerified: QC + merkle proof verification completed
+            ProtocolEvent::StateProvisionVerified {
                 tx_hash,
                 source_shard,
-                verified_provisions,
-                commitment_proof,
+                valid,
+                provision,
             } => {
-                // Notify mempool to promote this transaction to priority tier.
-                // This enables cross-shard transactions with verified provisions
-                // to bypass the soft backpressure limit.
-                self.mempool.on_provision_verified(tx_hash);
-
-                // Route to provision coordinator to handle verified provisions and quorum
-                self.provisions.on_provisions_verified_and_aggregated(
-                    tx_hash,
-                    source_shard,
-                    verified_provisions,
-                    commitment_proof,
-                )
+                if valid {
+                    self.mempool.on_provision_verified(tx_hash);
+                }
+                self.provisions
+                    .on_state_provision_verified(tx_hash, source_shard, valid, provision)
             }
 
             // CrossShardTxRegistered: route to coordinator for tracking
             ProtocolEvent::CrossShardTxRegistered {
                 tx_hash,
                 required_shards,
-                quorum_thresholds,
                 committed_height,
             } => {
                 let registration = hyperscale_provisions::TxRegistration {
                     required_shards,
-                    quorum_thresholds,
                     registered_at: committed_height,
-                    nodes_by_shard: std::collections::HashMap::new(),
                 };
                 self.provisions.on_tx_registered(tx_hash, registration)
             }
@@ -689,20 +678,20 @@ impl StateMachine for NodeStateMachine {
                 self.provisions.on_tx_aborted(&tx_hash)
             }
 
-            // ProvisionQuorumReached: Byzantine-safe cycle detection (per-shard)
+            // ProvisionAccepted: Byzantine-safe cycle detection (per-shard)
             //
             // This is the ONLY entry point for livelock cycle detection.
-            // Only verified provisions that have reached quorum trigger this event.
-            // This prevents Byzantine validators from triggering false deferrals
+            // Only verified provisions trigger this event. This prevents
+            // Byzantine validators from triggering false deferrals
             // by sending forged provisions.
-            ProtocolEvent::ProvisionQuorumReached {
+            ProtocolEvent::ProvisionAccepted {
                 tx_hash,
                 source_shard,
                 commitment_proof,
             } => {
                 // Cycle detection in livelock (may queue a deferral)
                 self.livelock
-                    .on_provision_quorum_reached(tx_hash, source_shard, &commitment_proof);
+                    .on_provision_accepted(tx_hash, source_shard, &commitment_proof);
 
                 // No actions needed - execution waits for ProvisioningComplete
                 vec![]
@@ -785,9 +774,13 @@ impl StateMachine for NodeStateMachine {
             }
 
             // Storage callback events - route to appropriate handler
-            ProtocolEvent::StateEntriesFetched { tx_hash, entries } => {
-                self.execution.on_state_entries_fetched(tx_hash, entries)
-            }
+            ProtocolEvent::StateEntriesFetched {
+                tx_hash,
+                entries,
+                merkle_proofs,
+            } => self
+                .execution
+                .on_state_entries_fetched(tx_hash, entries, merkle_proofs),
 
             ProtocolEvent::BlockFetched { .. } => {
                 // This is for local storage fetch, not sync

@@ -9,7 +9,7 @@ use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommitmentProof,
     CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash,
     QuorumCertificate, RoutableTransaction, ShardGroupId, StateEntry, StateProvision,
-    TransactionCertificate, ValidatorId,
+    SubstateInclusionProof, TransactionCertificate, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -122,22 +122,10 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Provisions
     // ═══════════════════════════════════════════════════════════════════════
-    /// Received state provision for cross-shard execution.
-    StateProvisionReceived { provision: StateProvision },
-
-    /// Batch provision verification and aggregation completed.
-    ProvisionsVerifiedAndAggregated {
-        tx_hash: Hash,
-        source_shard: ShardGroupId,
-        verified_provisions: Vec<StateProvision>,
-        commitment_proof: Option<CommitmentProof>,
-    },
-
     /// Cross-shard transaction registered for provision tracking.
     CrossShardTxRegistered {
         tx_hash: Hash,
         required_shards: std::collections::BTreeSet<ShardGroupId>,
-        quorum_thresholds: std::collections::HashMap<ShardGroupId, u64>,
         committed_height: BlockHeight,
     },
 
@@ -147,8 +135,8 @@ pub enum ProtocolEvent {
     /// Cross-shard transaction aborted.
     CrossShardTxAborted { tx_hash: Hash },
 
-    /// Quorum of provisions reached for a source shard.
-    ProvisionQuorumReached {
+    /// A provision from a source shard has been verified and accepted.
+    ProvisionAccepted {
         tx_hash: Hash,
         source_shard: ShardGroupId,
         commitment_proof: CommitmentProof,
@@ -158,6 +146,17 @@ pub enum ProtocolEvent {
     ProvisioningComplete {
         tx_hash: Hash,
         provisions: Vec<StateProvision>,
+    },
+
+    /// Received a state provision from a source shard (light-client path).
+    StateProvisionReceived { provision: StateProvision },
+
+    /// State provision QC + proof verification completed.
+    StateProvisionVerified {
+        tx_hash: Hash,
+        source_shard: ShardGroupId,
+        valid: bool,
+        provision: StateProvision,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -247,6 +246,7 @@ pub enum ProtocolEvent {
     StateEntriesFetched {
         tx_hash: Hash,
         entries: Vec<StateEntry>,
+        merkle_proofs: Vec<SubstateInclusionProof>,
     },
 
     /// Block fetched from storage.
@@ -369,15 +369,13 @@ impl ProtocolEvent {
             ProtocolEvent::StateCommitComplete { .. } => "StateCommitComplete",
 
             // Provisions
-            ProtocolEvent::StateProvisionReceived { .. } => "StateProvisionReceived",
-            ProtocolEvent::ProvisionsVerifiedAndAggregated { .. } => {
-                "ProvisionsVerifiedAndAggregated"
-            }
             ProtocolEvent::CrossShardTxRegistered { .. } => "CrossShardTxRegistered",
             ProtocolEvent::CrossShardTxCompleted { .. } => "CrossShardTxCompleted",
             ProtocolEvent::CrossShardTxAborted { .. } => "CrossShardTxAborted",
-            ProtocolEvent::ProvisionQuorumReached { .. } => "ProvisionQuorumReached",
+            ProtocolEvent::ProvisionAccepted { .. } => "ProvisionAccepted",
             ProtocolEvent::ProvisioningComplete { .. } => "ProvisioningComplete",
+            ProtocolEvent::StateProvisionReceived { .. } => "StateProvisionReceived",
+            ProtocolEvent::StateProvisionVerified { .. } => "StateProvisionVerified",
 
             // Execution
             ProtocolEvent::ExecutionVoteReceived { .. } => "ExecutionVoteReceived",

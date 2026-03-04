@@ -648,6 +648,14 @@ impl SubstateStore for RocksDbStorage {
         let (_, root_hash) = self.read_jmt_metadata();
         hyperscale_types::Hash::from_hash_bytes(&root_hash.0)
     }
+
+    fn generate_merkle_proofs(
+        &self,
+        storage_keys: &[Vec<u8>],
+        state_version: u64,
+    ) -> Vec<hyperscale_types::SubstateInclusionProof> {
+        hyperscale_storage::proofs::generate_merkle_proofs(self, storage_keys, state_version)
+    }
 }
 
 impl RocksDbStorage {
@@ -2410,6 +2418,14 @@ impl SubstateStore for SharedStorage {
 
     fn state_root_hash(&self) -> hyperscale_types::Hash {
         self.0.state_root_hash()
+    }
+
+    fn generate_merkle_proofs(
+        &self,
+        storage_keys: &[Vec<u8>],
+        state_version: u64,
+    ) -> Vec<hyperscale_types::SubstateInclusionProof> {
+        self.0.generate_merkle_proofs(storage_keys, state_version)
     }
 }
 

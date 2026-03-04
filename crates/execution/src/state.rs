@@ -10,12 +10,12 @@
 //! # Cross-Shard 2PC Protocol
 //!
 //! ## Phase 1: Provisioning Broadcast
-//! When a block commits with cross-shard transactions, each validator broadcasts
-//! provisions (state entries for nodes they own) to target shards.
+//! When a block commits with cross-shard transactions, the block proposer broadcasts
+//! state provisions (with merkle inclusion proofs) to target shards.
 //!
 //! ## Phase 2: Provisioning Reception
-//! Validators collect provisions from source shards. When (2n+1)/3 quorum is reached
-//! for each source shard, provisioning is complete.
+//! Target shards receive provisions, verify the QC signature and merkle proofs
+//! against the committed state root, then mark provisioning complete.
 //!
 //! ## Phase 3: Cross-Shard Execution
 //! With provisioned state, validators execute the transaction and create a
@@ -31,9 +31,9 @@
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature,
-    ExecutionCertificate, ExecutionVote, Hash, NodeId, RoutableTransaction, ShardGroupId,
-    StateEntry, StateProvision, Topology, TransactionCertificate, TransactionDecision, ValidatorId,
+    BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionVote, Hash, NodeId,
+    RoutableTransaction, ShardGroupId, StateEntry, StateProvision, SubstateInclusionProof,
+    Topology, TransactionCertificate, TransactionDecision, ValidatorId,
 };
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -95,9 +95,6 @@ pub struct SpeculativeResult {
 pub struct ExecutionState {
     /// Network topology (single source of truth for committee/shard info).
     topology: Arc<dyn Topology>,
-
-    /// Signing key for creating votes.
-    signing_key: Bls12381G1PrivateKey,
 
     /// Current time.
     now: Duration,
@@ -167,7 +164,7 @@ pub struct ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════
     // Pending signature verifications
     // ═══════════════════════════════════════════════════════════════════════
-    /// Note: Provision signature verification is handled by ProvisionCoordinator.
+    /// Note: Provision verification (QC + merkle proofs) is delegated via VerifyStateProvision action.
     /// Note: Vote signature verification is handled by VoteTracker with deferred batch verification.
 
     /// Certificates awaiting signature verification.
@@ -254,10 +251,9 @@ pub const DEFAULT_SPECULATIVE_MAX_TXS: usize = 500;
 pub const DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS: u64 = 3;
 impl ExecutionState {
     /// Create a new execution state machine with default settings.
-    pub fn new(topology: Arc<dyn Topology>, signing_key: Bls12381G1PrivateKey) -> Self {
+    pub fn new(topology: Arc<dyn Topology>) -> Self {
         Self::with_speculative_config(
             topology,
-            signing_key,
             DEFAULT_SPECULATIVE_MAX_TXS,
             DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS,
         )
@@ -270,13 +266,11 @@ impl ExecutionState {
     /// * `view_change_cooldown_rounds` - Rounds to pause speculation after a view change
     pub fn with_speculative_config(
         topology: Arc<dyn Topology>,
-        signing_key: Bls12381G1PrivateKey,
         speculative_max_txs: usize,
         view_change_cooldown_rounds: u64,
     ) -> Self {
         Self {
             topology,
-            signing_key,
             now: Duration::ZERO,
             executed_txs: HashMap::new(),
             finalized_certificates: BTreeMap::new(),
@@ -389,11 +383,6 @@ impl ExecutionState {
         self.topology.shard_for_node_id(node_id)
     }
 
-    /// Get provisioning quorum threshold (minimum voting power) for a shard.
-    fn provisioning_quorum_for_shard(&self, shard: ShardGroupId) -> u64 {
-        self.topology.quorum_threshold_for_shard(shard)
-    }
-
     // ═══════════════════════════════════════════════════════════════════════════
     // Block Commit Handling
     // ═══════════════════════════════════════════════════════════════════════════
@@ -409,6 +398,8 @@ impl ExecutionState {
         block_hash: Hash,
         height: u64,
         block_timestamp: u64,
+        proposer: ValidatorId,
+        state_version: u64,
         transactions: Vec<Arc<RoutableTransaction>>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -509,7 +500,13 @@ impl ExecutionState {
 
         // Handle cross-shard transactions (2PC)
         for tx in cross_shard {
-            actions.extend(self.start_cross_shard_execution(tx, height, block_timestamp));
+            actions.extend(self.start_cross_shard_execution(
+                tx,
+                height,
+                block_timestamp,
+                proposer,
+                state_version,
+            ));
         }
 
         actions
@@ -589,6 +586,8 @@ impl ExecutionState {
         tx: Arc<RoutableTransaction>,
         height: u64,
         block_timestamp: u64,
+        proposer: ValidatorId,
+        state_version: u64,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = tx.hash();
@@ -604,12 +603,15 @@ impl ExecutionState {
             "Starting cross-shard execution"
         );
 
-        // Phase 1: Initiate provision broadcast (async - fetches state first)
-        actions.extend(self.initiate_provision_broadcast(
-            &tx,
-            BlockHeight(height),
-            block_timestamp,
-        ));
+        // Phase 1: Initiate provision broadcast (proposer only sends merkle provisions)
+        if self.validator_id() == proposer {
+            actions.extend(self.initiate_provision_broadcast(
+                &tx,
+                BlockHeight(height),
+                block_timestamp,
+                state_version,
+            ));
+        }
 
         // Phase 2: Start tracking provisioning
         // Find remote shards we need provisions from
@@ -624,19 +626,12 @@ impl ExecutionState {
             // but handle gracefully
             tracing::warn!(tx_hash = ?tx_hash, "Cross-shard tx with no remote shards");
         } else {
-            // Build quorum thresholds per shard (voting power based)
-            let quorum_thresholds: HashMap<ShardGroupId, u64> = remote_shards
-                .iter()
-                .map(|&shard| (shard, self.provisioning_quorum_for_shard(shard)))
-                .collect();
-
             // Emit registration event for ProvisionCoordinator
             // The coordinator will handle provision tracking centrally
             actions.push(Action::Continuation(
                 ProtocolEvent::CrossShardTxRegistered {
                     tx_hash,
                     required_shards: remote_shards,
-                    quorum_thresholds,
                     committed_height: BlockHeight(height),
                 },
             ));
@@ -707,6 +702,7 @@ impl ExecutionState {
         tx: &RoutableTransaction,
         block_height: BlockHeight,
         block_timestamp: u64,
+        state_version: u64,
     ) -> Vec<Action> {
         let local_shard = self.local_shard();
         let tx_hash = tx.hash();
@@ -750,6 +746,7 @@ impl ExecutionState {
             PendingProvisionBroadcast {
                 block_height,
                 block_timestamp,
+                state_version,
                 target_shards,
             },
         );
@@ -758,31 +755,8 @@ impl ExecutionState {
         vec![Action::FetchStateEntries {
             tx_hash,
             nodes: owned_nodes,
+            state_version,
         }]
-    }
-
-    /// Sign a provision.
-    ///
-    /// Uses the centralized `state_provision_message` for domain-separated signing.
-    fn sign_provision(
-        &self,
-        tx_hash: &Hash,
-        target_shard: ShardGroupId,
-        source_shard: ShardGroupId,
-        block_height: BlockHeight,
-        block_timestamp: u64,
-        entries: &[StateEntry],
-    ) -> Bls12381G2Signature {
-        let entry_hashes: Vec<Hash> = entries.iter().map(|e| e.hash()).collect();
-        let msg = hyperscale_types::state_provision_message(
-            tx_hash,
-            target_shard,
-            source_shard,
-            block_height,
-            block_timestamp,
-            &entry_hashes,
-        );
-        self.signing_key.sign_v1(&msg)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1715,7 +1689,7 @@ impl ExecutionState {
         self.early_certificates.remove(tx_hash);
 
         // Pending verifications cleanup using reverse index for O(k) instead of O(n)
-        // Note: Provision signature verification is handled by ProvisionCoordinator
+        // Note: Provision verification (QC + merkle proofs) is delegated via VerifyStateProvision action
         if let Some(keys) = self.pending_verifications_by_tx.remove(tx_hash) {
             for key in keys {
                 match key {
@@ -1830,12 +1804,12 @@ impl ExecutionState {
     #[instrument(skip(self, entries), fields(
         tx_hash = ?tx_hash,
         entry_count = entries.len(),
-        sign_us = tracing::field::Empty,
     ))]
     pub fn on_state_entries_fetched(
         &mut self,
         tx_hash: Hash,
         entries: Vec<StateEntry>,
+        merkle_proofs: Vec<SubstateInclusionProof>,
     ) -> Vec<Action> {
         debug!(
             tx_hash = ?tx_hash,
@@ -1855,35 +1829,29 @@ impl ExecutionState {
         let mut actions = Vec::new();
         let local_shard = self.local_shard();
 
-        // Wrap entries in Arc once for efficient sharing across multiple target shards.
-        // This avoids cloning the potentially large Vec<StateEntry> for each broadcast.
+        // Entries and merkle proofs must be 1:1.
+        assert_eq!(
+            entries.len(),
+            merkle_proofs.len(),
+            "StateProvision: entries and merkle_proofs must have the same length"
+        );
+
+        // Wrap entries and proofs in Arc once for efficient sharing across multiple target shards.
         let entries = Arc::new(entries);
+        let merkle_proofs = Arc::new(merkle_proofs);
 
-        // Track total signing time for all provisions
-        let mut total_sign_us = 0u64;
-
-        // Create and broadcast provisions to each target shard
+        // Create and broadcast state provisions to each target shard.
+        // Only the proposer reaches this code path (gated in start_cross_shard_execution).
         for target_shard in pending.target_shards {
-            let sign_start = std::time::Instant::now();
-            let signature = self.sign_provision(
-                &tx_hash,
-                target_shard,
-                local_shard,
-                pending.block_height,
-                pending.block_timestamp,
-                &entries,
-            );
-            total_sign_us += sign_start.elapsed().as_micros() as u64;
-
             let provision = StateProvision {
                 transaction_hash: tx_hash,
                 target_shard,
                 source_shard: local_shard,
                 block_height: pending.block_height,
                 block_timestamp: pending.block_timestamp,
+                state_version: pending.state_version,
                 entries: Arc::clone(&entries),
-                validator_id: self.validator_id(),
-                signature,
+                merkle_proofs: Arc::clone(&merkle_proofs),
             };
 
             actions.push(Action::BroadcastStateProvision {
@@ -1895,11 +1863,10 @@ impl ExecutionState {
                 tx_hash = ?tx_hash,
                 target_shard = target_shard.0,
                 entries = entries.len(),
-                "Broadcasting provision with state entries"
+                "Broadcasting state provision with state entries"
             );
         }
 
-        tracing::Span::current().record("sign_us", total_sign_us);
         actions
     }
 
@@ -2288,7 +2255,8 @@ mod tests {
     use super::*;
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        generate_bls_keypair, verify_bls12381_v1, StaticTopology, ValidatorInfo, ValidatorSet,
+        generate_bls_keypair, verify_bls12381_v1, Bls12381G1PrivateKey, StaticTopology,
+        ValidatorInfo, ValidatorSet,
     };
 
     fn make_test_topology() -> Arc<dyn Topology> {
@@ -2310,8 +2278,7 @@ mod tests {
 
     fn make_test_state() -> ExecutionState {
         let topology = make_test_topology();
-        let signing_key = generate_bls_keypair();
-        ExecutionState::new(topology, signing_key)
+        ExecutionState::new(topology)
     }
 
     #[test]
@@ -2329,7 +2296,14 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block1");
 
         // Block committed with transaction
-        let actions = state.on_block_committed(block_hash, 1, 1000, vec![Arc::new(tx.clone())]);
+        let actions = state.on_block_committed(
+            block_hash,
+            1,
+            1000,
+            ValidatorId(0),
+            1,
+            vec![Arc::new(tx.clone())],
+        );
 
         // Should request execution (single-shard path) - now also sets up vote tracking
         assert!(!actions.is_empty());
@@ -2352,9 +2326,10 @@ mod tests {
         let validator_id = state.validator_id();
 
         // Create a signed vote (simulating what the runner does)
+        let signing_key = generate_bls_keypair();
         let message =
             hyperscale_types::exec_vote_message(&tx_hash, &writes_commitment, local_shard, success);
-        let signature = state.signing_key.sign_v1(&message);
+        let signature = signing_key.sign_v1(&message);
 
         let vote = ExecutionVote {
             transaction_hash: tx_hash,
@@ -2388,12 +2363,20 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block1");
 
         // First commit - should produce status change + execute transaction actions
-        let actions1 = state.on_block_committed(block_hash, 1, 1000, vec![Arc::new(tx.clone())]);
+        let actions1 = state.on_block_committed(
+            block_hash,
+            1,
+            1000,
+            ValidatorId(0),
+            1,
+            vec![Arc::new(tx.clone())],
+        );
         assert!(!actions1.is_empty()); // Status change + execute
 
         // Second commit of same transaction
         let block_hash2 = Hash::from_bytes(b"block2");
-        let actions2 = state.on_block_committed(block_hash2, 2, 2000, vec![Arc::new(tx)]);
+        let actions2 =
+            state.on_block_committed(block_hash2, 2, 2000, ValidatorId(0), 2, vec![Arc::new(tx)]);
 
         // Should be empty (deduplicated)
         assert!(actions2.is_empty());
@@ -2428,7 +2411,14 @@ mod tests {
         assert!(!state.speculative_in_flight_txs.contains(&tx_hash));
 
         // Now block commits - should skip execution (votes already sent)
-        let actions = state.on_block_committed(block_hash, height, 10000, vec![tx]);
+        let actions = state.on_block_committed(
+            block_hash,
+            height,
+            10000,
+            ValidatorId(0),
+            height as u64,
+            vec![tx],
+        );
 
         // Should NOT emit ExecuteTransactions (speculation was used, votes already sent)
         assert!(!actions
@@ -2459,7 +2449,14 @@ mod tests {
         assert!(state.speculative_in_flight_txs.contains(&tx_hash));
 
         // Block commits WHILE speculation is in-flight
-        let commit_actions = state.on_block_committed(block_hash, height, 10000, vec![tx]);
+        let commit_actions = state.on_block_committed(
+            block_hash,
+            height,
+            10000,
+            ValidatorId(0),
+            height as u64,
+            vec![tx],
+        );
 
         // Should NOT emit ExecuteTransactions (votes will arrive from speculation)
         assert!(!commit_actions
@@ -2487,7 +2484,7 @@ mod tests {
         let block_hash = Hash::from_bytes(b"block1");
 
         // Block commits without any speculation
-        let actions = state.on_block_committed(block_hash, 1, 1000, vec![tx]);
+        let actions = state.on_block_committed(block_hash, 1, 1000, ValidatorId(0), 1, vec![tx]);
 
         // Should emit ExecuteTransactions (no speculation to use)
         assert!(actions

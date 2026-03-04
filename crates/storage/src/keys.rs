@@ -67,6 +67,29 @@ pub fn storage_key_from_write(
     to_storage_key(&partition_key, &db_sort_key)
 }
 
+/// Entity key length in storage keys: 20 bytes hash prefix + 30 bytes NodeId.
+const ENTITY_KEY_LEN: usize = 50;
+
+/// Decompose a storage key into its three JMT-tier components.
+///
+/// Storage key layout: `RADIX_PREFIX(6) + entity_key(50) + partition_num(1) + sort_key(var)`
+///
+/// Returns `(entity_key, partition_num, sort_key)` or `None` if the key is malformed.
+pub fn decompose_storage_key(storage_key: &[u8]) -> Option<(&[u8], u8, &[u8])> {
+    let prefix_len = RADIX_PREFIX.len();
+    let min_len = prefix_len + ENTITY_KEY_LEN + 1; // prefix + entity_key + partition_num
+
+    if storage_key.len() < min_len || &storage_key[..prefix_len] != RADIX_PREFIX {
+        return None;
+    }
+
+    let entity_key = &storage_key[prefix_len..prefix_len + ENTITY_KEY_LEN];
+    let partition_num = storage_key[prefix_len + ENTITY_KEY_LEN];
+    let sort_key = &storage_key[min_len..];
+
+    Some((entity_key, partition_num, sort_key))
+}
+
 /// Build the storage key prefix for a given NodeId.
 pub fn node_prefix(node_id: &NodeId) -> Vec<u8> {
     let radix_node_id = radix_common::types::NodeId(node_id.0);

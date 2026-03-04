@@ -186,15 +186,13 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
     }
 }
 
-/// Verify a commitment proof's aggregated BLS signature and quorum threshold.
+/// Verify a commitment proof's QC signature and quorum threshold.
 ///
-/// Aggregates all provided public keys, verifies the signature from
-/// `proof.aggregated_signature`, and checks that the signers' voting power
-/// meets the quorum threshold. The signing message is computed from the proof
-/// itself, making verification fully self-contained.
+/// Verifies the QC's aggregated BLS signature using the provided public keys,
+/// and checks that the signers' voting power meets the quorum threshold.
 ///
 /// `voting_power` is the pre-computed total voting power of the signers
-/// (derived from the signer bitfield and the topology).
+/// (derived from the QC's signer bitfield and the topology).
 pub fn verify_commitment_proof(
     proof: &CommitmentProof,
     public_keys: &[Bls12381G1PublicKey],
@@ -205,20 +203,20 @@ pub fn verify_commitment_proof(
         return false;
     }
 
-    let signing_message = proof.signing_message();
-
-    // Verify aggregated BLS signature (skip PK validation - trusted topology)
-    let sig_valid = match Bls12381G1PublicKey::aggregate(public_keys, false) {
-        Ok(aggregated_pk) => verify_bls12381_v1(
-            &signing_message,
-            &aggregated_pk,
-            &proof.aggregated_signature,
-        ),
-        Err(_) => false,
-    };
+    // Verify the QC's aggregated BLS signature
+    let qc_valid = verify_qc_signature(&proof.qc, public_keys);
 
     // Verify voting power meets quorum threshold
-    sig_valid && voting_power >= quorum_threshold
+    if !qc_valid || voting_power < quorum_threshold {
+        return false;
+    }
+
+    // Verify individual merkle inclusion proofs against proof.state_root
+    hyperscale_storage::proofs::verify_all_merkle_proofs(
+        &proof.entries,
+        &proof.merkle_proofs,
+        proof.state_root,
+    )
 }
 
 /// Verify that the computed transaction merkle root matches the expected root.
