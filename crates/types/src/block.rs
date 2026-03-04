@@ -111,6 +111,20 @@ pub struct BlockHeader {
     ///
     /// For empty blocks (fallback, sync), this is `Hash::ZERO`.
     pub transaction_root: Hash,
+
+    /// Shard groups that need provisions from this block's transactions.
+    ///
+    /// Computed from the block's cross-shard transactions: for each transaction
+    /// that touches remote shards, those remote shard IDs are collected here.
+    /// This is QC-attested (covered by the block hash), so a byzantine proposer
+    /// cannot forge it without the block being rejected by honest validators.
+    ///
+    /// Used by target shards to detect missing provisions: if a remote block's
+    /// `provision_targets` includes our shard but no provisions arrive, we know
+    /// the proposer is withholding them and can initiate fallback recovery.
+    ///
+    /// Empty for genesis, fallback, and sync blocks (no transactions).
+    pub provision_targets: Vec<ShardGroupId>,
 }
 
 impl BlockHeader {
@@ -133,6 +147,7 @@ impl BlockHeader {
             state_root,
             state_version,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         }
     }
 
@@ -725,6 +740,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
 
         let hash1 = header.hash();

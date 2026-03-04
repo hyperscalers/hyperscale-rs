@@ -93,6 +93,7 @@ fn test_recovered_votes_prevent_equivocation() {
         state_root: Hash::ZERO,
         state_version: 0,
         transaction_root: Hash::ZERO,
+        provision_targets: vec![],
     };
 
     // Compute block hash before moving header

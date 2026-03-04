@@ -399,6 +399,7 @@ where
             Arc::new(crate::inbound_handler::InboundHandler::new(
                 self.config.inbound.clone(),
                 Arc::clone(&self.storage),
+                Arc::clone(&self.topology),
                 Arc::clone(&self.tx_cache),
                 Arc::clone(&self.cert_cache),
             ));
@@ -1055,6 +1056,55 @@ where
             Action::FetchEpochConfig { epoch } => {
                 debug!(?epoch, "FetchEpochConfig - not yet implemented");
             }
+
+            // ═══════════════════════════════════════════════════════════
+            // Provision fallback recovery
+            // ═══════════════════════════════════════════════════════════
+            Action::RequestMissingProvisions {
+                source_shard,
+                block_height,
+                proposer,
+            } => {
+                use hyperscale_messages::request::GetProvisionsRequest;
+                let peers: Vec<ValidatorId> =
+                    self.topology.committee_for_shard(source_shard).into_owned();
+                let request = GetProvisionsRequest {
+                    block_height,
+                    target_shard: self.local_shard,
+                };
+                let sender = self.event_sender.clone();
+                debug!(
+                    source_shard = source_shard.0,
+                    block_height = block_height.0,
+                    proposer = proposer.0,
+                    peer_count = peers.len(),
+                    "Requesting missing provisions from source shard"
+                );
+                self.network.request(
+                    &peers,
+                    Some(proposer),
+                    request,
+                    Box::new(move |result| match result {
+                        Ok(response) => {
+                            if !response.provisions.is_empty() {
+                                let _ = sender.send(NodeInput::Protocol(
+                                    ProtocolEvent::StateProvisionsReceived {
+                                        provisions: response.provisions,
+                                    },
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                source_shard = source_shard.0,
+                                block_height = block_height.0,
+                                error = %e,
+                                "Failed to fetch missing provisions"
+                            );
+                        }
+                    }),
+                );
+            }
         }
     }
 
@@ -1119,6 +1169,17 @@ where
         }
     }
 
+    /// Local shard committee excluding self, for use as the `peers` argument
+    /// to `network.request()`.
+    fn local_peers(&self) -> Vec<ValidatorId> {
+        self.topology
+            .committee_for_shard(self.local_shard)
+            .iter()
+            .filter(|&&v| v != self.validator_id)
+            .copied()
+            .collect()
+    }
+
     /// Process SyncProtocol outputs internally.
     ///
     /// DeliverBlock and SyncComplete are fed directly to the state machine
@@ -1129,7 +1190,9 @@ where
                 SyncOutput::FetchBlock { height } => {
                     use hyperscale_messages::request::GetBlockRequest;
                     let es = self.event_sender.clone();
+                    let peers = self.local_peers();
                     self.network.request(
+                        &peers,
                         None,
                         GetBlockRequest {
                             height: hyperscale_types::BlockHeight(height),
@@ -1190,7 +1253,9 @@ where
                     let es = self.event_sender.clone();
                     let bh = block_hash;
                     let hs = tx_hashes.clone();
+                    let peers = self.local_peers();
                     self.network.request(
+                        &peers,
                         Some(proposer),
                         GetTransactionsRequest::new(block_hash, tx_hashes),
                         Box::new(move |result| match result {
@@ -1218,7 +1283,9 @@ where
                     let es = self.event_sender.clone();
                     let bh = block_hash;
                     let hs = cert_hashes.clone();
+                    let peers = self.local_peers();
                     self.network.request(
+                        &peers,
                         Some(proposer),
                         GetCertificatesRequest::new(block_hash, cert_hashes),
                         Box::new(move |result| match result {

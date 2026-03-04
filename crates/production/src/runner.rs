@@ -455,7 +455,6 @@ impl ProductionRunnerBuilder {
         let prod_network = ProdNetwork::new(
             adapter.clone(),
             request_manager.clone(),
-            topology.clone(),
             tokio::runtime::Handle::current(),
         );
 

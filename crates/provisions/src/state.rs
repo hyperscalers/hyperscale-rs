@@ -27,6 +27,29 @@ use tracing::{debug, trace, warn};
 /// and verified header buffers.
 const REMOTE_HEADER_RETENTION_BLOCKS: u64 = 100;
 
+/// Number of local committed blocks to wait before requesting missing provisions.
+/// This gives the source shard proposer time to send provisions normally.
+const PROVISION_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
+
+/// Minimum interval (in local committed blocks) between retry requests for
+/// the same missing provision, to avoid flooding the network.
+const PROVISION_RETRY_INTERVAL_BLOCKS: u64 = 10;
+
+/// Tracks an expected provision that hasn't arrived yet.
+///
+/// Created when a remote block header's `provision_targets` includes our shard,
+/// indicating that provisions should be forthcoming. If they don't arrive within
+/// `PROVISION_FALLBACK_TIMEOUT_BLOCKS`, a `RequestMissingProvisions` action is emitted.
+#[derive(Debug, Clone)]
+struct ExpectedProvision {
+    /// Local committed height when we first discovered this expected provision.
+    discovered_at: BlockHeight,
+    /// Local committed height when we last requested this provision (for retry throttling).
+    last_requested_at: Option<BlockHeight>,
+    /// The block proposer from the remote shard, preferred peer for fallback requests.
+    proposer: ValidatorId,
+}
+
 /// Registration information for a cross-shard transaction.
 ///
 /// Created by ExecutionState when a cross-shard transaction is committed,
@@ -114,6 +137,18 @@ pub struct ProvisionCoordinator {
     verified_provisions: HashMap<Hash, HashMap<ShardGroupId, (StateProvision, CommitmentProof)>>,
 
     // ═══════════════════════════════════════════════════════════════════
+    // Expected Provision Tracking (fallback detection)
+    // ═══════════════════════════════════════════════════════════════════
+    /// Current local committed height (updated on each block commit).
+    local_committed_height: BlockHeight,
+
+    /// Expected provisions that haven't arrived yet.
+    /// Keyed by `(source_shard, block_height)`. Populated when a remote
+    /// header's `provision_targets` includes our shard. Cleared when
+    /// provisions are verified or the associated transactions are cleaned up.
+    expected_provisions: HashMap<(ShardGroupId, BlockHeight), ExpectedProvision>,
+
+    // ═══════════════════════════════════════════════════════════════════
     // Time
     // ═══════════════════════════════════════════════════════════════════
     /// Current time.
@@ -150,6 +185,8 @@ impl ProvisionCoordinator {
             remote_header_tips: HashMap::new(),
             pending_provisions: HashMap::new(),
             verified_provisions: HashMap::new(),
+            local_committed_height: BlockHeight(0),
+            expected_provisions: HashMap::new(),
             now: Duration::ZERO,
         }
     }
@@ -192,7 +229,8 @@ impl ProvisionCoordinator {
         vec![]
     }
 
-    /// Handle block committed - cleanup completed/aborted transactions.
+    /// Handle block committed - cleanup completed/aborted transactions and
+    /// check for timed-out expected provisions.
     pub fn on_block_committed(&mut self, block: &hyperscale_types::Block) -> Vec<Action> {
         // Clean up completed transactions (certificates committed)
         for cert in &block.certificates {
@@ -209,7 +247,43 @@ impl ProvisionCoordinator {
             self.cleanup_tx(&deferral.tx_hash);
         }
 
-        vec![]
+        // Update local committed height
+        self.local_committed_height = block.header.height;
+
+        // Check for timed-out expected provisions and emit fallback requests
+        let mut actions = vec![];
+        let current_height = self.local_committed_height.0;
+
+        for (&(source_shard, block_height), expected) in self.expected_provisions.iter_mut() {
+            let age = current_height.saturating_sub(expected.discovered_at.0);
+            if age < PROVISION_FALLBACK_TIMEOUT_BLOCKS {
+                continue;
+            }
+
+            // Check retry throttling
+            if let Some(last_req) = expected.last_requested_at {
+                let since_last = current_height.saturating_sub(last_req.0);
+                if since_last < PROVISION_RETRY_INTERVAL_BLOCKS {
+                    continue;
+                }
+            }
+
+            warn!(
+                source_shard = source_shard.0,
+                block_height = block_height.0,
+                age_blocks = age,
+                "Provision timeout — requesting missing provisions via fallback"
+            );
+
+            expected.last_requested_at = Some(self.local_committed_height);
+            actions.push(Action::RequestMissingProvisions {
+                source_shard,
+                block_height,
+                proposer: expected.proposer,
+            });
+        }
+
+        actions
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -291,6 +365,31 @@ impl ProvisionCoordinator {
                 .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
             self.verified_remote_headers
                 .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
+        }
+
+        // Track expected provisions: if this block's provision_targets includes
+        // our shard, we expect provisions to arrive. If they don't arrive within
+        // the timeout, we'll request them via fallback.
+        if committed_header
+            .header
+            .provision_targets
+            .contains(&self.local_shard)
+        {
+            let key = (shard, height);
+            let proposer = committed_header.header.proposer;
+            self.expected_provisions.entry(key).or_insert_with(|| {
+                debug!(
+                    shard = shard.0,
+                    height = height.0,
+                    proposer = proposer.0,
+                    "Tracking expected provision (remote block targets our shard)"
+                );
+                ExpectedProvision {
+                    discovered_at: self.local_committed_height,
+                    last_requested_at: None,
+                    proposer,
+                }
+            });
         }
 
         // Check if we have any buffered provisions waiting for this header
@@ -475,6 +574,9 @@ impl ProvisionCoordinator {
                 // Remove unverified entries for this (shard, height)
                 self.unverified_remote_headers.remove(&key);
             }
+
+            // Clear expected provision tracking — provisions arrived and verified
+            self.expected_provisions.remove(&key);
         }
 
         for result in results {
@@ -800,6 +902,7 @@ mod tests {
             state_root: Hash::from_bytes(format!("root_{shard}_{height}").as_bytes()),
             state_version: height,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
         let header_hash = header.hash();
         let mut qc = QuorumCertificate::genesis();
@@ -899,6 +1002,7 @@ mod tests {
             state_root: Hash::from_bytes(b"root"),
             state_version: 10,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
         let mut qc = QuorumCertificate::genesis();
         qc.block_hash = Hash::from_bytes(b"wrong_hash"); // Mismatch!
@@ -928,6 +1032,7 @@ mod tests {
             state_root: Hash::from_bytes(b"root"),
             state_version: 10,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
         let header_hash = header.hash();
         let mut qc = QuorumCertificate::genesis();
@@ -1419,5 +1524,189 @@ mod tests {
 
         // Only height 200 should remain (heights 1-50 are all below cutoff=100)
         assert_eq!(coordinator.unverified_remote_header_count(), 1);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Expected Provision Tracking (Fallback Detection) Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Build a CommittedBlockHeader that claims provisions target the given shards.
+    fn make_committed_header_with_targets(
+        shard: ShardGroupId,
+        height: u64,
+        provision_targets: Vec<ShardGroupId>,
+    ) -> CommittedBlockHeader {
+        let header = BlockHeader {
+            shard_group_id: shard,
+            height: BlockHeight(height),
+            parent_hash: Hash::from_bytes(b"parent"),
+            parent_qc: QuorumCertificate::genesis(),
+            proposer: ValidatorId(0),
+            timestamp: 1000 + height,
+            round: 0,
+            is_fallback: false,
+            state_root: Hash::from_bytes(format!("root_{shard}_{height}").as_bytes()),
+            state_version: height,
+            transaction_root: Hash::ZERO,
+            provision_targets,
+        };
+        let header_hash = header.hash();
+        let mut qc = QuorumCertificate::genesis();
+        qc.block_hash = header_hash;
+        qc.shard_group_id = shard;
+        CommittedBlockHeader { header, qc }
+    }
+
+    /// Make a minimal Block at the given height for on_block_committed calls.
+    fn make_block(height: u64) -> hyperscale_types::Block {
+        hyperscale_types::Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO, 0)
+            .tap_mut(|b| b.header.height = BlockHeight(height))
+    }
+
+    /// Helper trait to mutate in-place and return self.
+    trait TapMut {
+        fn tap_mut(self, f: impl FnOnce(&mut Self)) -> Self;
+    }
+    impl<T> TapMut for T {
+        fn tap_mut(mut self, f: impl FnOnce(&mut Self)) -> Self {
+            f(&mut self);
+            self
+        }
+    }
+
+    #[test]
+    fn test_expected_provision_tracked_when_header_targets_local_shard() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        // Remote shard 1 block targets shard 0 (our shard)
+        let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(0)]);
+        coordinator.on_remote_block_committed(header, ValidatorId(3));
+
+        // Should have one expected provision
+        assert_eq!(coordinator.expected_provisions.len(), 1);
+    }
+
+    #[test]
+    fn test_expected_provision_not_tracked_when_header_does_not_target_local_shard() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        // Remote shard 1 block targets shard 2 (NOT our shard)
+        let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(2)]);
+        coordinator.on_remote_block_committed(header, ValidatorId(3));
+
+        assert_eq!(coordinator.expected_provisions.len(), 0);
+    }
+
+    #[test]
+    fn test_expected_provision_cleared_on_verification() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        let source_shard = ShardGroupId(1);
+        let header = make_committed_header_with_targets(source_shard, 10, vec![ShardGroupId(0)]);
+        coordinator.on_remote_block_committed(header.clone(), ValidatorId(3));
+        assert_eq!(coordinator.expected_provisions.len(), 1);
+
+        // Provision arrives and is verified
+        let provision = make_provision(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
+        coordinator.on_state_provisions_received(vec![provision.clone()]);
+        let result = make_verified_result(provision, true);
+        coordinator.on_state_provisions_verified(vec![result], Some(header));
+
+        // Expected provision should be cleared
+        assert_eq!(coordinator.expected_provisions.len(), 0);
+    }
+
+    #[test]
+    fn test_timeout_emits_request_missing_provisions() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        // Remote header arrives targeting our shard at local height 0
+        let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(0)]);
+        coordinator.on_remote_block_committed(header, ValidatorId(3));
+
+        // Advance blocks — should not emit before the timeout threshold
+        for h in 1..=9 {
+            let block = make_block(h);
+            let actions = coordinator.on_block_committed(&block);
+            assert!(actions.is_empty(), "Should not emit request at height {h}");
+        }
+
+        // At height 10, age = 10 - 0 = 10 >= PROVISION_FALLBACK_TIMEOUT_BLOCKS → fires
+        let block = make_block(10);
+        let actions = coordinator.on_block_committed(&block);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            Action::RequestMissingProvisions {
+                source_shard,
+                block_height,
+                proposer,
+            } if *source_shard == ShardGroupId(1)
+                && *block_height == BlockHeight(10)
+                && *proposer == ValidatorId(0)
+        ));
+    }
+
+    #[test]
+    fn test_retry_throttled() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(0)]);
+        coordinator.on_remote_block_committed(header, ValidatorId(3));
+
+        // Advance past timeout to trigger first request at height 10
+        // (discovered_at=0, age=10 >= 10 → fires, last_requested_at=10)
+        for h in 1..=10 {
+            coordinator.on_block_committed(&make_block(h));
+        }
+
+        // Heights 11..=19 should be throttled (since_last = 1..9, all < 10)
+        for h in 11..=19 {
+            let actions = coordinator.on_block_committed(&make_block(h));
+            assert!(actions.is_empty(), "Should throttle retry at height {h}");
+        }
+
+        // At height 20, retry should trigger (since_last = 20 - 10 = 10 >= 10)
+        let actions = coordinator.on_block_committed(&make_block(20));
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            &actions[0],
+            Action::RequestMissingProvisions { .. }
+        ));
+    }
+
+    #[test]
+    fn test_no_timeout_when_provision_verified_in_time() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        let source_shard = ShardGroupId(1);
+        let header = make_committed_header_with_targets(source_shard, 10, vec![ShardGroupId(0)]);
+        coordinator.on_remote_block_committed(header.clone(), ValidatorId(3));
+
+        // Advance a few blocks
+        for h in 1..=5 {
+            coordinator.on_block_committed(&make_block(h));
+        }
+
+        // Provision arrives and is verified before timeout
+        let provision = make_provision(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
+        coordinator.on_state_provisions_received(vec![provision.clone()]);
+        let result = make_verified_result(provision, true);
+        coordinator.on_state_provisions_verified(vec![result], Some(header));
+
+        // Continue past timeout threshold
+        for h in 6..=15 {
+            let actions = coordinator.on_block_committed(&make_block(h));
+            assert!(
+                actions.is_empty(),
+                "Should not request at height {h} (provision already verified)"
+            );
+        }
     }
 }

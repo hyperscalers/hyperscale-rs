@@ -9,9 +9,7 @@ use crate::request_manager::{RequestManager, RequestPriority};
 use hyperscale_network::{
     encode_to_wire, frame_request, InboundRequestHandler, Network, RequestError, Topic,
 };
-use hyperscale_types::{
-    NetworkMessage, Request, ShardGroupId, ShardMessage, Topology, ValidatorId,
-};
+use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use libp2p::PeerId;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, warn};
@@ -37,37 +35,20 @@ pub struct ProdNetwork {
     /// Inbound router handle — set once via `register_inbound_handler`.
     /// Kept alive to prevent the background task from being aborted.
     inbound_router: OnceLock<InboundRouterHandle>,
-    /// Cached committee peer IDs (excluding self), built once at construction.
-    committee_peers: Vec<PeerId>,
 }
 
 impl ProdNetwork {
     pub fn new(
         adapter: Arc<Libp2pAdapter>,
         request_manager: Arc<RequestManager>,
-        topology: Arc<dyn Topology>,
         tokio_handle: tokio::runtime::Handle,
     ) -> Self {
-        let committee_peers = Self::build_committee_peers(&adapter, &*topology);
         Self {
             adapter,
             request_manager,
             tokio_handle,
             inbound_router: OnceLock::new(),
-            committee_peers,
         }
-    }
-
-    fn build_committee_peers(adapter: &Libp2pAdapter, topology: &dyn Topology) -> Vec<PeerId> {
-        let local_shard = topology.local_shard();
-        let local_validator = topology.local_validator_id();
-
-        topology
-            .committee_for_shard(local_shard)
-            .iter()
-            .filter(|&&v| v != local_validator)
-            .filter_map(|&v| adapter.peer_for_validator(v))
-            .collect()
     }
 
     fn validator_peer_id(&self, validator: ValidatorId) -> Option<PeerId> {
@@ -115,11 +96,18 @@ impl Network for ProdNetwork {
 
     fn request<R: Request + 'static>(
         &self,
+        peers: &[ValidatorId],
         preferred_peer: Option<ValidatorId>,
         request: R,
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,
     ) {
-        if self.committee_peers.is_empty() {
+        // Resolve ValidatorIds → PeerIds via the adapter's global registry
+        let resolved_peers: Vec<PeerId> = peers
+            .iter()
+            .filter_map(|&v| self.adapter.peer_for_validator(v))
+            .collect();
+
+        if resolved_peers.is_empty() {
             on_response(Err(RequestError::PeerUnreachable(
                 preferred_peer.unwrap_or(ValidatorId(0)),
             )));
@@ -147,11 +135,16 @@ impl Network for ProdNetwork {
         let framed = frame_request(R::message_type_id(), &request_bytes);
         let description = format!("{}({}B)", R::message_type_id(), request_bytes.len());
         let rm = self.request_manager.clone();
-        let peers = self.committee_peers.clone();
 
         self.tokio_handle.spawn(async move {
             match rm
-                .request(&peers, preferred_libp2p, description, framed, priority)
+                .request(
+                    &resolved_peers,
+                    preferred_libp2p,
+                    description,
+                    framed,
+                    priority,
+                )
                 .await
             {
                 Ok((_peer, bytes)) => {

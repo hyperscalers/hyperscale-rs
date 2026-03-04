@@ -72,9 +72,12 @@ pub trait Network: Send + Sync {
 
     /// Send a typed request and receive the response via callback.
     ///
-    /// * `preferred_peer` — `Some(proposer)` hints that this peer likely has
-    ///   the data (e.g., the block proposer for fetch requests). `None` means
-    ///   any available peer (e.g., sync).
+    /// * `peers` — the set of validators eligible to serve this request.
+    ///   Typically the local shard committee (excluding self) for intra-shard
+    ///   fetches, or a remote shard's committee for cross-shard requests.
+    /// * `preferred_peer` — optional hint for which peer to try first (e.g.,
+    ///   the block proposer for fetch requests). `None` means any peer from
+    ///   the `peers` list.
     /// * Implementation handles peer selection, retry, and failover internally.
     ///
     /// The callback is called on a network thread when the response arrives,
@@ -82,6 +85,7 @@ pub trait Network: Send + Sync {
     /// the callback typically pushes into the main loop's event channel.
     fn request<R: Request + 'static>(
         &self,
+        peers: &[ValidatorId],
         preferred_peer: Option<ValidatorId>,
         request: R,
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,

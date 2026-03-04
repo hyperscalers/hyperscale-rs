@@ -42,6 +42,8 @@ pub struct OutboxEntry {
 /// The generic `request<R>()` wrapper decodes `R::Response` before calling
 /// the user's typed callback.
 pub struct PendingRequest {
+    /// Validators eligible to serve this request.
+    pub peers: Vec<ValidatorId>,
     /// Optional preferred peer (e.g., block proposer for fetch).
     pub preferred_peer: Option<ValidatorId>,
     /// Message type ID for dispatch (e.g., "block.request").
@@ -141,6 +143,7 @@ impl Network for SimNetworkAdapter {
 
     fn request<R: Request + 'static>(
         &self,
+        peers: &[ValidatorId],
         preferred_peer: Option<ValidatorId>,
         request: R,
         on_response: Box<dyn FnOnce(Result<R::Response, RequestError>) + Send>,
@@ -161,6 +164,7 @@ impl Network for SimNetworkAdapter {
             });
 
         self.pending_requests.lock().unwrap().push(PendingRequest {
+            peers: peers.to_vec(),
             preferred_peer,
             type_id: R::message_type_id(),
             request_bytes,
@@ -283,7 +287,9 @@ mod tests {
         let adapter = SimNetworkAdapter::default();
         let preferred = Some(ValidatorId(7));
 
+        let peers = &[ValidatorId(7)];
         adapter.request(
+            peers,
             preferred,
             GetBlockRequest::new(BlockHeight(42)),
             Box::new(|_| {}),
@@ -291,6 +297,7 @@ mod tests {
 
         let requests = adapter.drain_pending_requests();
         assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].peers, peers);
         assert_eq!(requests[0].preferred_peer, preferred);
         assert_eq!(requests[0].type_id, "block.request");
         assert!(!requests[0].request_bytes.is_empty());
@@ -311,6 +318,7 @@ mod tests {
         let result_clone = result.clone();
 
         adapter.request(
+            &[ValidatorId(1)],
             None,
             GetBlockRequest::new(BlockHeight(1)),
             Box::new(move |r| {
@@ -342,6 +350,7 @@ mod tests {
         let result_clone = result.clone();
 
         adapter.request(
+            &[ValidatorId(1)],
             None,
             GetBlockRequest::new(BlockHeight(1)),
             Box::new(move |r| {

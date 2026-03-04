@@ -1,9 +1,10 @@
-//! Inbound request handler for block sync and data fetch.
+//! Inbound request handler for block sync, data fetch, and provision serving.
 //!
-//! Processes incoming request-response payloads using `ConsensusStore` trait methods.
-//! Transport-specific I/O (libp2p streams, framing, compression) stays in the
-//! transport crate (`network-libp2p`). This module implements
-//! [`InboundRequestHandler`] so it can be plugged into any transport's inbound router.
+//! Processes incoming request-response payloads using `ConsensusStore` and
+//! `SubstateStore` trait methods. Transport-specific I/O (libp2p streams,
+//! framing, compression) stays in the transport crate (`network-libp2p`).
+//! This module implements [`InboundRequestHandler`] so it can be plugged
+//! into any transport's inbound router.
 //!
 //! # Wire Format
 //!
@@ -13,17 +14,20 @@
 //! - `"block.request"` — block sync (SBOR-encoded `GetBlockRequest`)
 //! - `"transaction.request"` — transaction fetch (SBOR-encoded `GetTransactionsRequest`)
 //! - `"certificate.request"` — certificate fetch (SBOR-encoded `GetCertificatesRequest`)
+//! - `"provision.request"` — provision fetch for fallback recovery
 
 use hyperscale_messages::request::{
-    GetBlockRequest, GetCertificatesRequest, GetTransactionsRequest,
+    GetBlockRequest, GetCertificatesRequest, GetProvisionsRequest, GetTransactionsRequest,
 };
 use hyperscale_messages::response::{
-    GetBlockResponse, GetCertificatesResponse, GetTransactionsResponse,
+    GetBlockResponse, GetCertificatesResponse, GetProvisionsResponse, GetTransactionsResponse,
 };
 use hyperscale_metrics as metrics;
 use hyperscale_network::{parse_request_frame, InboundRequestHandler};
-use hyperscale_storage::ConsensusStore;
-use hyperscale_types::{Hash, RoutableTransaction, TransactionCertificate};
+use hyperscale_storage::{ConsensusStore, SubstateStore};
+use hyperscale_types::{
+    Hash, RoutableTransaction, StateProvision, Topology, TransactionCertificate,
+};
 use quick_cache::sync::Cache as QuickCache;
 use std::sync::Arc;
 use thiserror::Error;
@@ -62,29 +66,32 @@ impl Default for InboundHandlerConfig {
 
 /// Inbound request handler, parameterized over storage.
 ///
-/// Handles block sync, transaction fetch, and certificate fetch requests.
-/// Transport-specific I/O (stream framing, compression, metrics) is handled
-/// by the transport layer's inbound router.
-pub struct InboundHandler<S: ConsensusStore> {
+/// Handles block sync, transaction fetch, certificate fetch, and provision
+/// serving requests. Transport-specific I/O (stream framing, compression,
+/// metrics) is handled by the transport layer's inbound router.
+pub struct InboundHandler<S: ConsensusStore + SubstateStore> {
     config: InboundHandlerConfig,
     storage: Arc<S>,
+    topology: Arc<dyn Topology>,
     /// Cache for recently received transactions (not yet committed to storage).
     recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
     /// Cache for recently built certificates (not yet persisted to storage).
     recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
 }
 
-impl<S: ConsensusStore> InboundHandler<S> {
+impl<S: ConsensusStore + SubstateStore> InboundHandler<S> {
     /// Create a new inbound handler.
     pub fn new(
         config: InboundHandlerConfig,
         storage: Arc<S>,
+        topology: Arc<dyn Topology>,
         recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
         recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
     ) -> Self {
         Self {
             config,
             storage,
+            topology,
             recently_received_txs,
             recently_built_certs,
         }
@@ -102,6 +109,7 @@ impl<S: ConsensusStore> InboundHandler<S> {
             "block.request" => self.handle_block_request(sbor_payload),
             "transaction.request" => self.handle_transaction_request(sbor_payload),
             "certificate.request" => self.handle_certificate_request(sbor_payload),
+            "provision.request" => self.handle_provision_request(sbor_payload),
             _ => Err(InboundError::UnknownRequestType(type_id.to_string())),
         }
     }
@@ -221,9 +229,110 @@ impl<S: ConsensusStore> InboundHandler<S> {
         let response = GetCertificatesResponse::new(found_certificates);
         sbor::basic_encode(&response).map_err(|e| InboundError::EncodeError(format!("{e:?}")))
     }
+
+    /// Handle a provision request from a target shard needing our state.
+    ///
+    /// Looks up the block at the requested height, identifies transactions
+    /// that involve the requesting shard, collects the local state entries
+    /// and merkle proofs, and returns them as `StateProvision`s.
+    fn handle_provision_request(&self, sbor_payload: &[u8]) -> Result<Vec<u8>, InboundError> {
+        let req: GetProvisionsRequest = sbor::basic_decode(sbor_payload)
+            .map_err(|e| InboundError::DecodeError(format!("{e:?}")))?;
+
+        trace!(
+            block_height = req.block_height.0,
+            target_shard = req.target_shard.0,
+            "Handling provision request"
+        );
+
+        let local_shard = self.topology.local_shard();
+
+        // Look up the block at the requested height
+        let (block, _qc) = match self.storage.get_block(req.block_height) {
+            Some(pair) => pair,
+            None => {
+                debug!(
+                    block_height = req.block_height.0,
+                    "Provision request: block not found"
+                );
+                let response = GetProvisionsResponse { provisions: vec![] };
+                return sbor::basic_encode(&response)
+                    .map_err(|e| InboundError::EncodeError(format!("{e:?}")));
+            }
+        };
+
+        let mut provisions = Vec::new();
+
+        // Use the current state version for proof generation.
+        // list_substates_for_node (called by fetch_state_entries) returns entries
+        // at the current version, so proofs must be generated at the same version.
+        let current_state_version = self.storage.state_version();
+
+        // Iterate all transactions in the block
+        let all_txs = block
+            .retry_transactions
+            .iter()
+            .chain(block.priority_transactions.iter())
+            .chain(block.transactions.iter());
+
+        for tx in all_txs {
+            // Check if this transaction involves the requesting target shard
+            let shards = self.topology.all_shards_for_transaction(tx);
+            if !shards.contains(&req.target_shard) {
+                continue;
+            }
+
+            // Collect nodes owned by our local shard
+            let mut owned_nodes: Vec<_> = tx
+                .declared_reads
+                .iter()
+                .chain(tx.declared_writes.iter())
+                .filter(|&node_id| self.topology.shard_for_node_id(node_id) == local_shard)
+                .copied()
+                .collect();
+            owned_nodes.sort();
+            owned_nodes.dedup();
+
+            if owned_nodes.is_empty() {
+                continue;
+            }
+
+            // Fetch state entries and generate merkle proofs at current version
+            let entries = hyperscale_engine::fetch_state_entries(&*self.storage, &owned_nodes);
+            let storage_keys: Vec<Vec<u8>> =
+                entries.iter().map(|e| e.storage_key.clone()).collect();
+            let merkle_proofs = self
+                .storage
+                .generate_merkle_proofs(&storage_keys, current_state_version);
+
+            let entries = Arc::new(entries);
+            let merkle_proofs = Arc::new(merkle_proofs);
+
+            provisions.push(StateProvision {
+                transaction_hash: tx.hash(),
+                target_shard: req.target_shard,
+                source_shard: local_shard,
+                block_height: req.block_height,
+                block_timestamp: block.header.timestamp,
+                state_version: current_state_version,
+                entries,
+                merkle_proofs,
+            });
+        }
+
+        debug!(
+            block_height = req.block_height.0,
+            target_shard = req.target_shard.0,
+            provision_count = provisions.len(),
+            "Responding to provision request"
+        );
+
+        let response = GetProvisionsResponse { provisions };
+        sbor::basic_encode(&response).map_err(|e| InboundError::EncodeError(format!("{e:?}")))
+    }
 }
 
-impl<S: ConsensusStore + 'static> InboundRequestHandler for InboundHandler<S> {
+impl<S: ConsensusStore + SubstateStore + 'static> InboundRequestHandler for InboundHandler<S> {
     fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
         match self.process_request(payload) {
             Ok(data) => data,

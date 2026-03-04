@@ -1097,6 +1097,26 @@ impl BftState {
             "Requesting block build for proposal"
         );
 
+        // Compute provision_targets: which remote shards need provisions from
+        // this block's cross-shard transactions. This is QC-attested (part of the
+        // block hash), so target shards can detect missing provisions.
+        let local_shard = self.local_shard();
+        let mut provision_target_set = std::collections::BTreeSet::new();
+        for tx in retry_transactions
+            .iter()
+            .chain(priority_transactions.iter())
+            .chain(other_transactions.iter())
+        {
+            if !self.topology.is_single_shard_transaction(tx) {
+                for shard in self.topology.all_shards_for_transaction(tx) {
+                    if shard != local_shard {
+                        provision_target_set.insert(shard);
+                    }
+                }
+            }
+        }
+        let provision_targets: Vec<ShardGroupId> = provision_target_set.into_iter().collect();
+
         // Always use BuildProposal - the runner handles JMT readiness and timeout.
         // This ensures transactions are always included regardless of certificate state.
         // Include SetTimer to reschedule the proposal timer.
@@ -1123,6 +1143,7 @@ impl BftState {
                 commitment_proofs,
                 deferred: deferred_filtered,
                 aborted: aborted_with_height,
+                provision_targets,
             },
         ]
     }
@@ -1181,6 +1202,7 @@ impl BftState {
             state_root,
             state_version,
             transaction_root: Hash::ZERO, // Fallback blocks have no transactions
+            provision_targets: vec![],    // Empty - fallback blocks have no transactions
         };
 
         let block = Block {
@@ -1297,6 +1319,7 @@ impl BftState {
             state_root,
             state_version,
             transaction_root: Hash::ZERO, // Sync blocks have no transactions
+            provision_targets: vec![],    // Empty - sync blocks have no transactions
         };
 
         let block = Block {
@@ -1964,6 +1987,17 @@ impl BftState {
                     return vec![];
                 }
 
+                // Validate provision_targets: recompute from transactions and compare
+                if let Err(e) = self.validate_provision_targets(&block) {
+                    warn!(
+                        validator = ?self.validator_id(),
+                        block_hash = ?block_hash,
+                        error = %e,
+                        "Block has invalid provision_targets - not voting"
+                    );
+                    return vec![];
+                }
+
                 // Initiate all async verifications in parallel.
                 // CommitmentProof, StateRoot, and TransactionRoot verifications run concurrently.
                 let mut verification_actions = Vec::new();
@@ -2428,6 +2462,35 @@ impl BftState {
                     tx_hash
                 ));
             }
+        }
+
+        Ok(())
+    }
+
+    /// Validate that a block's `provision_targets` matches the recomputed value.
+    ///
+    /// Recomputes provision targets from the block's transactions using the
+    /// topology, then compares with the header's claimed value. This prevents
+    /// a byzantine proposer from lying about which shards need provisions.
+    fn validate_provision_targets(&self, block: &Block) -> Result<(), String> {
+        let local_shard = self.local_shard();
+        let mut expected = std::collections::BTreeSet::new();
+        for tx in block.all_transactions() {
+            if !self.topology.is_single_shard_transaction(tx) {
+                for shard in self.topology.all_shards_for_transaction(tx) {
+                    if shard != local_shard {
+                        expected.insert(shard);
+                    }
+                }
+            }
+        }
+        let expected: Vec<ShardGroupId> = expected.into_iter().collect();
+
+        if block.header.provision_targets != expected {
+            return Err(format!(
+                "provision_targets mismatch: header={:?}, computed={:?}",
+                block.header.provision_targets, expected
+            ));
         }
 
         Ok(())
@@ -5280,6 +5343,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         }
     }
 
@@ -5301,6 +5365,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
 
         // Should pass - genesis blocks skip timestamp validation
@@ -5396,6 +5461,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
 
         // Should pass - fallback blocks skip timestamp validation
@@ -5417,6 +5483,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
         assert!(
             state.validate_timestamp(&normal_header).is_err(),
@@ -5494,6 +5561,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
 
         // Process the block header
@@ -5576,6 +5644,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
 
         let block_hash = header.hash();
@@ -5662,6 +5731,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
 
         let block_hash = header.hash();
@@ -5735,6 +5805,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
 
         // Process header
@@ -6265,6 +6336,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
         let block_a_hash = block_a.hash();
 
@@ -6280,6 +6352,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
         let block_b_hash = block_b.hash();
 
@@ -6324,6 +6397,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
         let block_hash = block.hash();
 
@@ -6362,6 +6436,7 @@ mod tests {
                 state_root: Hash::ZERO,
                 state_version: 0,
                 transaction_root: Hash::ZERO,
+                provision_targets: vec![],
             };
             state.try_vote_on_block(block.hash(), height, 0);
         }
@@ -6659,6 +6734,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
         let original_block_hash = original_header.hash();
 
@@ -6735,6 +6811,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
 
         // Even though the receiving validator might be at view=31,
@@ -6770,6 +6847,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
 
         let result = state.validate_header(&header);
@@ -7103,6 +7181,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
         let original_block_hash = original_header.hash();
 
@@ -7352,6 +7431,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
         let block_hash_r1 = header_round1.hash();
 
@@ -7367,6 +7447,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
         let block_hash_r2 = header_round2.hash();
 
@@ -7382,6 +7463,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
         let block_hash_r3 = header_round3.hash();
 
@@ -7398,6 +7480,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
         let block_hash_h6 = header_height6.hash();
 
@@ -7674,6 +7757,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
 
         // Process first block header
@@ -7707,6 +7791,7 @@ mod tests {
             state_root: Hash::ZERO,
             state_version: 0,
             transaction_root: Hash::ZERO,
+            provision_targets: vec![],
         };
 
         // Process second block header
@@ -8410,6 +8495,7 @@ mod tests {
                 state_root: Hash::ZERO,
                 state_version: 0,
                 transaction_root: Hash::ZERO,
+                provision_targets: vec![],
             },
             retry_transactions: vec![],
             priority_transactions: vec![],
@@ -8956,6 +9042,7 @@ mod tests {
                 state_root: Hash::ZERO,
                 state_version: 0,
                 transaction_root: Hash::ZERO,
+                provision_targets: vec![],
             },
             retry_transactions: vec![],
             priority_transactions: vec![],

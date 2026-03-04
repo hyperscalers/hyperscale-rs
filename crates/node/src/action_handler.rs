@@ -224,6 +224,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             commitment_proofs,
             deferred,
             aborted,
+            provision_targets,
         } => {
             let result = hyperscale_bft::handlers::build_proposal(
                 ctx.storage,
@@ -244,6 +245,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 deferred,
                 aborted,
                 shard_group_id,
+                provision_targets,
             );
             let prepared = result.prepared_commit.map(|p| (result.block_hash, p));
             Some(DelegatedResult {

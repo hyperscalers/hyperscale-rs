@@ -366,6 +366,8 @@ pub enum Action {
         commitment_proofs: HashMap<Hash, CommitmentProof>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
+        /// Shard groups that need provisions from this block's transactions.
+        provision_targets: Vec<ShardGroupId>,
     },
 
     /// Execute a batch of single-shard transactions.
@@ -669,6 +671,24 @@ pub enum Action {
         /// Hash of the block whose fetches should be cancelled.
         block_hash: Hash,
     },
+
+    /// Request missing provisions from a source shard via cross-shard request.
+    ///
+    /// Emitted by `ProvisionCoordinator` when a remote block's `provision_targets`
+    /// includes our shard but no provisions have arrived within the timeout window.
+    /// This is the fallback recovery mechanism for byzantine proposers that
+    /// silently drop provisions.
+    ///
+    /// The runner sends a `GetProvisionsRequest` to the source shard, and the
+    /// response is fed back as `StateProvisionsReceived` for normal verification.
+    RequestMissingProvisions {
+        /// The shard that should have sent provisions.
+        source_shard: ShardGroupId,
+        /// The block height whose provisions are missing.
+        block_height: BlockHeight,
+        /// The block proposer from the source shard (preferred peer for the request).
+        proposer: ValidatorId,
+    },
 }
 
 impl Action {
@@ -686,6 +706,7 @@ impl Action {
                 | Action::PersistBlock { .. }
                 | Action::PersistAndBroadcastVote { .. }
                 | Action::PersistTransactionCertificate { .. }
+                | Action::RequestMissingProvisions { .. }
         )
     }
 
@@ -792,6 +813,7 @@ impl Action {
             Action::FetchTransactions { .. } => "FetchTransactions",
             Action::FetchCertificates { .. } => "FetchCertificates",
             Action::CancelFetch { .. } => "CancelFetch",
+            Action::RequestMissingProvisions { .. } => "RequestMissingProvisions",
         }
     }
 }

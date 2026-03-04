@@ -70,6 +70,7 @@ async fn test_storage_operations() {
         state_root: Hash::ZERO,
         state_version: 0,
         transaction_root: Hash::ZERO,
+        provision_targets: vec![],
     };
 
     let block = Block {

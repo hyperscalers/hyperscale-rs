@@ -1,0 +1,42 @@
+//! Provision fetch response for fallback recovery.
+
+use hyperscale_types::{MessagePriority, NetworkMessage, StateProvision};
+use sbor::prelude::BasicSbor;
+
+/// Response to a provision fetch request containing the state provisions.
+///
+/// The source shard builds `StateProvision`s for the requested block and
+/// target shard, identical to what the proposer would have broadcast.
+/// The target shard feeds these into the normal verification pipeline
+/// (QC + merkle proof checks).
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct GetProvisionsResponse {
+    /// The provisions for the requested block and target shard.
+    /// Empty if the source shard doesn't have the block or no matching
+    /// transactions target the requesting shard.
+    pub provisions: Vec<StateProvision>,
+}
+
+impl NetworkMessage for GetProvisionsResponse {
+    fn message_type_id() -> &'static str {
+        "provision.response"
+    }
+
+    fn priority() -> MessagePriority {
+        MessagePriority::Coordination
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sbor_roundtrip_empty() {
+        let response = GetProvisionsResponse { provisions: vec![] };
+
+        let encoded = sbor::basic_encode(&response).unwrap();
+        let decoded: GetProvisionsResponse = sbor::basic_decode(&encoded).unwrap();
+        assert_eq!(response, decoded);
+    }
+}

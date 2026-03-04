@@ -35,7 +35,7 @@ mod result;
 mod validation;
 
 pub use execution::ProvisionedSnapshot;
-pub use executor::RadixExecutor;
+pub use executor::{fetch_state_entries, RadixExecutor};
 pub use genesis::GenesisConfig;
 pub use validation::TransactionValidation;
 

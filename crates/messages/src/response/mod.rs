@@ -4,8 +4,10 @@
 
 mod block;
 mod certificate;
+mod provision;
 mod transaction;
 
 pub use block::GetBlockResponse;
 pub use certificate::GetCertificatesResponse;
+pub use provision::GetProvisionsResponse;
 pub use transaction::GetTransactionsResponse;

@@ -320,6 +320,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
     local_shard: ShardGroupId,
+    provision_targets: Vec<ShardGroupId>,
 ) -> ProposalResult<S::PreparedCommit> {
     // Check if JMT is at parent_state_root (no waiting - instant check)
     let current_root = storage.state_root_hash();
@@ -366,6 +367,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         state_root,
         state_version,
         transaction_root,
+        provision_targets,
     };
 
     let block = Block {

@@ -47,6 +47,43 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{instrument, Level};
 
+/// Fetch state entries for the given nodes from storage.
+///
+/// Returns `StateEntry` with pre-computed storage keys. This is efficient
+/// for cross-shard provisioning because:
+/// 1. Storage keys are computed once at the source shard
+/// 2. Receiving shard can use them directly for database lookups
+/// 3. No SpreadPrefixKeyMapper calls needed at execution time
+pub fn fetch_state_entries<S: SubstateStore>(storage: &S, nodes: &[NodeId]) -> Vec<StateEntry> {
+    use hyperscale_storage::RADIX_PREFIX;
+    use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
+
+    let mut entries = Vec::new();
+
+    for node in nodes {
+        // Compute the db_node_key once per node (expensive hash computation)
+        let radix_node_id = radix_common::types::NodeId(node.0);
+        let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
+
+        let substates: Vec<_> = storage.list_substates_for_node(node).collect();
+
+        for (partition_num, db_sort_key, value) in substates {
+            // Build full storage key
+            let mut storage_key = Vec::with_capacity(
+                RADIX_PREFIX.len() + db_node_key.len() + 1 + db_sort_key.0.len(),
+            );
+            storage_key.extend_from_slice(RADIX_PREFIX);
+            storage_key.extend_from_slice(&db_node_key);
+            storage_key.push(partition_num);
+            storage_key.extend_from_slice(&db_sort_key.0);
+
+            entries.push(StateEntry::new(storage_key, Some(value)));
+        }
+    }
+
+    entries
+}
+
 /// Shared executor caches to avoid rebuilding on clone.
 ///
 /// These are wrapped in Arc so that cloning the executor is cheap.
@@ -338,35 +375,7 @@ impl RadixExecutor {
         storage: &S,
         nodes: &[NodeId],
     ) -> Vec<StateEntry> {
-        use hyperscale_storage::RADIX_PREFIX;
-        use radix_substate_store_interface::db_key_mapper::{
-            DatabaseKeyMapper, SpreadPrefixKeyMapper,
-        };
-
-        let mut entries = Vec::new();
-
-        for node in nodes {
-            // Compute the db_node_key once per node (expensive hash computation)
-            let radix_node_id = radix_common::types::NodeId(node.0);
-            let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
-
-            let substates: Vec<_> = storage.list_substates_for_node(node).collect();
-
-            for (partition_num, db_sort_key, value) in substates {
-                // Build full storage key
-                let mut storage_key = Vec::with_capacity(
-                    RADIX_PREFIX.len() + db_node_key.len() + 1 + db_sort_key.0.len(),
-                );
-                storage_key.extend_from_slice(RADIX_PREFIX);
-                storage_key.extend_from_slice(&db_node_key);
-                storage_key.push(partition_num);
-                storage_key.extend_from_slice(&db_sort_key.0);
-
-                entries.push(StateEntry::new(storage_key, Some(value)));
-            }
-        }
-
-        entries
+        fetch_state_entries(storage, nodes)
     }
 
     /// Compute writes commitment from state writes.

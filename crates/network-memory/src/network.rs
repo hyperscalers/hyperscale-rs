@@ -304,22 +304,20 @@ impl SimulatedNetwork {
 
         for request in requests {
             let PendingRequest {
+                peers,
                 preferred_peer,
                 type_id,
                 request_bytes,
                 on_response,
             } = request;
 
-            // Select target peer.
+            // Select target peer from the caller-provided peer list.
             let peer = match preferred_peer {
                 Some(vid) => vid.0 as NodeIndex,
                 None => {
-                    // Pick a random peer (excluding self) for block sync.
-                    let mut candidates: Vec<NodeIndex> = self
-                        .all_nodes()
-                        .into_iter()
-                        .filter(|&n| n != requester)
-                        .collect();
+                    // Pick a random peer from the provided list.
+                    let mut candidates: Vec<NodeIndex> =
+                        peers.iter().map(|v| v.0 as NodeIndex).collect();
                     candidates.shuffle(rng);
                     match candidates.first() {
                         Some(&p) => p,
@@ -730,6 +728,7 @@ mod tests {
 
     /// Helper: build a PendingRequest with a callback that captures the result.
     fn make_request_with_capture(
+        peers: Vec<ValidatorId>,
         preferred_peer: Option<ValidatorId>,
     ) -> (
         PendingRequest,
@@ -738,6 +737,7 @@ mod tests {
         let result = Arc::new(std::sync::Mutex::new(None));
         let result_clone = result.clone();
         let request = PendingRequest {
+            peers,
             preferred_peer,
             type_id: "test.request",
             request_bytes: vec![1, 2, 3],
@@ -761,7 +761,8 @@ mod tests {
         let adapter1 = network.create_adapter(1);
         hyperscale_network::Network::register_inbound_handler(&adapter1, echo_handler());
 
-        let (request, result) = make_request_with_capture(Some(ValidatorId(1)));
+        let (request, result) =
+            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
 
         let stats = network.fulfill_requests(0, vec![request], &mut rng);
 
@@ -789,7 +790,8 @@ mod tests {
         // Partition node 0 → node 1
         network.partition_unidirectional(0, 1);
 
-        let (request, result) = make_request_with_capture(Some(ValidatorId(1)));
+        let (request, result) =
+            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
         let stats = network.fulfill_requests(0, vec![request], &mut rng);
 
         assert_eq!(stats.messages_dropped_partition, 1);
@@ -815,7 +817,8 @@ mod tests {
         let adapter1 = network.create_adapter(1);
         hyperscale_network::Network::register_inbound_handler(&adapter1, echo_handler());
 
-        let (request, result) = make_request_with_capture(Some(ValidatorId(1)));
+        let (request, result) =
+            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
         let stats = network.fulfill_requests(0, vec![request], &mut rng);
 
         assert_eq!(stats.messages_dropped_loss, 1);
@@ -840,7 +843,8 @@ mod tests {
         // Don't register any handler
         let _adapter1 = network.create_adapter(1);
 
-        let (request, result) = make_request_with_capture(Some(ValidatorId(1)));
+        let (request, result) =
+            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
         network.fulfill_requests(0, vec![request], &mut rng);
 
         let captured = result.lock().unwrap().take().unwrap();
@@ -869,7 +873,8 @@ mod tests {
         let adapter1 = network.create_adapter(1);
         hyperscale_network::Network::register_inbound_handler(&adapter1, Arc::new(EmptyHandler));
 
-        let (request, result) = make_request_with_capture(Some(ValidatorId(1)));
+        let (request, result) =
+            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
         network.fulfill_requests(0, vec![request], &mut rng);
 
         let captured = result.lock().unwrap().take().unwrap();
@@ -893,8 +898,9 @@ mod tests {
             hyperscale_network::Network::register_inbound_handler(&adapter, echo_handler());
         }
 
-        // No preferred peer — should pick a random non-self peer
-        let (request, result) = make_request_with_capture(None);
+        // No preferred peer — should pick a random peer from the provided list
+        let peers = vec![ValidatorId(1), ValidatorId(2), ValidatorId(3)];
+        let (request, result) = make_request_with_capture(peers, None);
         let stats = network.fulfill_requests(0, vec![request], &mut rng);
 
         assert_eq!(stats.messages_sent, 2);
@@ -914,8 +920,8 @@ mod tests {
         let adapter0 = network.create_adapter(0);
         hyperscale_network::Network::register_inbound_handler(&adapter0, echo_handler());
 
-        // No preferred peer, and the only node is the requester itself
-        let (request, result) = make_request_with_capture(None);
+        // No preferred peer, and empty peer list
+        let (request, result) = make_request_with_capture(vec![], None);
         network.fulfill_requests(0, vec![request], &mut rng);
 
         let captured = result.lock().unwrap().take().unwrap();
@@ -1149,7 +1155,8 @@ mod tests {
         hyperscale_network::Network::register_inbound_handler(&adapter1, echo_handler());
 
         // fulfill_requests should be able to find the handler
-        let (request, result) = make_request_with_capture(Some(ValidatorId(1)));
+        let (request, result) =
+            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
         let stats = network.fulfill_requests(0, vec![request], &mut rng);
 
         assert_eq!(stats.messages_sent, 2);
