@@ -497,12 +497,6 @@ impl BftState {
         self.topology.public_key(validator_id)
     }
 
-    /// Check if we have quorum.
-    #[allow(dead_code)]
-    fn has_quorum(&self, voting_power: u64) -> bool {
-        self.topology.local_has_quorum(voting_power)
-    }
-
     /// Get proposer for height and round.
     fn proposer_for(&self, height: u64, round: u64) -> ValidatorId {
         self.topology.proposer_for(height, round)

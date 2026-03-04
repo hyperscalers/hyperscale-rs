@@ -327,12 +327,6 @@ impl ExecutionState {
         self.topology.local_committee()
     }
 
-    /// Get the total voting power.
-    #[allow(dead_code)]
-    fn total_voting_power(&self) -> u64 {
-        self.topology.local_voting_power()
-    }
-
     /// Get voting power for a validator.
     fn voting_power(&self, validator_id: ValidatorId) -> u64 {
         self.topology.voting_power(validator_id).unwrap_or(0)
@@ -341,12 +335,6 @@ impl ExecutionState {
     /// Get public key for a validator.
     fn public_key(&self, validator_id: ValidatorId) -> Option<Bls12381G1PublicKey> {
         self.topology.public_key(validator_id)
-    }
-
-    /// Check if we have quorum.
-    #[allow(dead_code)]
-    fn has_quorum(&self, voting_power: u64) -> bool {
-        self.topology.local_has_quorum(voting_power)
     }
 
     /// Get quorum threshold.
