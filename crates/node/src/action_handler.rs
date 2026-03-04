@@ -8,7 +8,7 @@
 //! Batched work (execution votes, execution certs, cross-shard execution) and block
 //! commits are handled inline by the node loop's flush closures.
 
-use hyperscale_core::{Action, NodeInput, ProtocolEvent};
+use hyperscale_core::{Action, NodeInput, ProtocolEvent, ProvisionVerificationResult};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_storage::{CommitStore, SubstateStore};
@@ -62,7 +62,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 
         // General crypto
         Action::AggregateExecutionCertificate { .. } => Some(DispatchPool::Crypto),
-        Action::VerifyStateProvision { .. } => Some(DispatchPool::Crypto),
+        Action::VerifyStateProvisions { .. } => Some(DispatchPool::Crypto),
 
         // Execution
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
@@ -286,43 +286,64 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             })
         }
 
-        // --- State Provision Verification ---
-        Action::VerifyStateProvision {
-            tx_hash,
-            source_shard,
-            committed_header,
-            provision,
+        // --- State Provision Batch Verification ---
+        Action::VerifyStateProvisions {
+            provisions,
+            committed_headers,
             committee_public_keys,
-            total_voting_power,
+            committee_voting_power,
             quorum_threshold,
         } => {
-            // Verify QC signature
-            let qc_valid = hyperscale_bft::handlers::verify_qc_signature(
-                &committed_header.qc,
-                &committee_public_keys,
-            );
-
-            // Verify voting power meets quorum and block hash
-            let mut valid = qc_valid
-                && total_voting_power >= quorum_threshold
-                && committed_header.qc.block_hash == committed_header.header.hash();
-
-            // Verify merkle inclusion proofs against the committed state root
-            if valid {
-                valid = hyperscale_storage::proofs::verify_all_merkle_proofs(
-                    &provision.entries,
-                    &provision.merkle_proofs,
-                    committed_header.header.state_root,
+            // Try each candidate header until one passes QC verification.
+            let verified_header = committed_headers.into_iter().find(|candidate| {
+                // Verify QC signature (BLS pairing — expensive)
+                let qc_valid = hyperscale_bft::handlers::verify_qc_signature(
+                    &candidate.qc,
+                    &committee_public_keys,
                 );
-            }
+                if !qc_valid {
+                    return false;
+                }
+
+                // Compute total voting power from this QC's signers
+                let total_voting_power: u64 = candidate
+                    .qc
+                    .signers
+                    .set_indices()
+                    .filter_map(|idx| committee_voting_power.get(idx).copied())
+                    .sum();
+
+                total_voting_power >= quorum_threshold
+                    && candidate.qc.block_hash == candidate.header.hash()
+            });
+
+            // Check merkle proofs per provision against the verified header's state root.
+            let results: Vec<ProvisionVerificationResult> = provisions
+                .into_iter()
+                .map(|provision| {
+                    let valid = verified_header.as_ref().is_some_and(|header| {
+                        hyperscale_storage::proofs::verify_all_merkle_proofs(
+                            &provision.entries,
+                            &provision.merkle_proofs,
+                            header.header.state_root,
+                        )
+                    });
+                    ProvisionVerificationResult {
+                        tx_hash: provision.transaction_hash,
+                        source_shard: provision.source_shard,
+                        valid,
+                        provision,
+                    }
+                })
+                .collect();
 
             Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(ProtocolEvent::StateProvisionVerified {
-                    tx_hash,
-                    source_shard,
-                    valid,
-                    provision,
-                })],
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::StateProvisionsVerified {
+                        results,
+                        committed_header: verified_header,
+                    },
+                )],
                 prepared_commit: None,
             })
         }

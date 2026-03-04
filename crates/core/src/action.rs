@@ -174,27 +174,26 @@ pub enum Action {
         total_voting_power: u64,
     },
 
-    /// Verify a state provision's QC and merkle inclusion proofs.
+    /// Verify a batch of state provisions' QC and merkle inclusion proofs.
     ///
-    /// Verifies that the committed block header's QC is valid (BLS signature
-    /// from 2f+1 validators) and that each merkle inclusion proof verifies
-    /// against the QC-committed state root.
+    /// The QC signature is verified once across candidate headers. Merkle
+    /// inclusion proofs are checked per provision against the verified
+    /// header's state root.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::StateProvisionVerified` when complete.
-    VerifyStateProvision {
-        /// Transaction hash for correlation.
-        tx_hash: Hash,
-        /// Source shard the provision is from.
-        source_shard: ShardGroupId,
-        /// The committed block header (header + certifying QC).
-        committed_header: CommittedBlockHeader,
-        /// The state provision to verify.
-        provision: StateProvision,
+    /// Returns `ProtocolEvent::StateProvisionsVerified` when complete.
+    VerifyStateProvisions {
+        /// The state provisions to verify (all from the same block).
+        provisions: Vec<StateProvision>,
+        /// Candidate committed block headers to try.
+        /// In normal operation there is one; with byzantine validators
+        /// there may be multiple (one per sender for the same (shard, height)).
+        committed_headers: Vec<CommittedBlockHeader>,
         /// Public keys for the source shard's committee (from topology).
         committee_public_keys: Vec<Bls12381G1PublicKey>,
-        /// Total voting power of QC signers.
-        total_voting_power: u64,
+        /// Voting power for each committee member (parallel to `committee_public_keys`).
+        /// Used to compute total voting power per-candidate from QC signer indices.
+        committee_voting_power: Vec<u64>,
         /// Quorum threshold for the source shard.
         quorum_threshold: u64,
     },
@@ -695,7 +694,7 @@ impl Action {
         matches!(
             self,
             Action::VerifyAndBuildQuorumCertificate { .. }
-                | Action::VerifyStateProvision { .. }
+                | Action::VerifyStateProvisions { .. }
                 | Action::AggregateExecutionCertificate { .. }
                 | Action::VerifyAndAggregateExecutionVotes { .. }
                 | Action::VerifyExecutionCertificateSignature { .. }
@@ -743,7 +742,7 @@ impl Action {
 
             // Delegated Work - Crypto Verification
             Action::VerifyAndBuildQuorumCertificate { .. } => "VerifyAndBuildQuorumCertificate",
-            Action::VerifyStateProvision { .. } => "VerifyStateProvision",
+            Action::VerifyStateProvisions { .. } => "VerifyStateProvisions",
             Action::AggregateExecutionCertificate { .. } => "AggregateExecutionCertificate",
             Action::VerifyAndAggregateExecutionVotes { .. } => "VerifyAndAggregateExecutionVotes",
             Action::VerifyExecutionCertificateSignature { .. } => {

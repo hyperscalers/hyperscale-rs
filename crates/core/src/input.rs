@@ -146,7 +146,7 @@ impl NodeInput {
                 | ProtocolEvent::GlobalBlockVoteReceived { .. }
                 | ProtocolEvent::TransactionFetchDelivered { .. }
                 | ProtocolEvent::CertificateFetchDelivered { .. }
-                | ProtocolEvent::StateProvisionReceived { .. } => EventPriority::Network,
+                | ProtocolEvent::StateProvisionsReceived { .. } => EventPriority::Network,
 
                 _ => EventPriority::Internal,
             },

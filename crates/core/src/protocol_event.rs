@@ -13,6 +13,19 @@ use hyperscale_types::{
 };
 use std::sync::Arc;
 
+/// Result of verifying a single provision within a batch.
+#[derive(Debug, Clone)]
+pub struct ProvisionVerificationResult {
+    /// Transaction hash for correlation.
+    pub tx_hash: Hash,
+    /// Source shard the provision is from.
+    pub source_shard: ShardGroupId,
+    /// Whether the merkle inclusion proof verified against the committed state root.
+    pub valid: bool,
+    /// The provision that was verified.
+    pub provision: StateProvision,
+}
+
 /// Events that the state machine processes.
 ///
 /// These are the typed protocol events that [`NodeStateMachine::handle()`]
@@ -148,15 +161,22 @@ pub enum ProtocolEvent {
         provisions: Vec<StateProvision>,
     },
 
-    /// Received a state provision from a source shard (light-client path).
-    StateProvisionReceived { provision: StateProvision },
+    /// Received a batch of state provisions from a source shard (light-client path).
+    ///
+    /// All provisions in a batch share the same `(source_shard, block_height)`
+    /// because they originate from a single `FetchAndBroadcastProvisions` action.
+    StateProvisionsReceived { provisions: Vec<StateProvision> },
 
-    /// State provision QC + proof verification completed.
-    StateProvisionVerified {
-        tx_hash: Hash,
-        source_shard: ShardGroupId,
-        valid: bool,
-        provision: StateProvision,
+    /// Batch state provision QC + merkle proof verification completed.
+    ///
+    /// The QC is verified once across all candidates; merkle proofs are checked
+    /// per provision. The verified header is returned so the state machine can
+    /// promote it without re-lookup.
+    StateProvisionsVerified {
+        results: Vec<ProvisionVerificationResult>,
+        /// The committed header whose QC passed verification.
+        /// `None` if no candidate header passed QC verification.
+        committed_header: Option<CommittedBlockHeader>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -367,8 +387,8 @@ impl ProtocolEvent {
             ProtocolEvent::CrossShardTxAborted { .. } => "CrossShardTxAborted",
             ProtocolEvent::ProvisionAccepted { .. } => "ProvisionAccepted",
             ProtocolEvent::ProvisioningComplete { .. } => "ProvisioningComplete",
-            ProtocolEvent::StateProvisionReceived { .. } => "StateProvisionReceived",
-            ProtocolEvent::StateProvisionVerified { .. } => "StateProvisionVerified",
+            ProtocolEvent::StateProvisionsReceived { .. } => "StateProvisionsReceived",
+            ProtocolEvent::StateProvisionsVerified { .. } => "StateProvisionsVerified",
 
             // Execution
             ProtocolEvent::ExecutionVoteReceived { .. } => "ExecutionVoteReceived",

@@ -160,7 +160,7 @@ pub struct ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════
     // Pending signature verifications
     // ═══════════════════════════════════════════════════════════════════════
-    /// Note: Provision verification (QC + merkle proofs) is delegated via VerifyStateProvision action.
+    /// Note: Provision verification (QC + merkle proofs) is delegated via VerifyStateProvisions action.
     /// Note: Vote signature verification is handled by VoteTracker with deferred batch verification.
 
     /// Certificates awaiting signature verification.
@@ -1638,7 +1638,7 @@ impl ExecutionState {
         self.early_certificates.remove(tx_hash);
 
         // Pending verifications cleanup using reverse index for O(k) instead of O(n)
-        // Note: Provision verification (QC + merkle proofs) is delegated via VerifyStateProvision action
+        // Note: Provision verification (QC + merkle proofs) is delegated via VerifyStateProvisions action
         if let Some(keys) = self.pending_verifications_by_tx.remove(tx_hash) {
             for key in keys {
                 match key {

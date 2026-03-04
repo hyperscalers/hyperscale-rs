@@ -36,6 +36,6 @@ mod traits;
 
 pub use action::{Action, CrossShardExecutionRequest, ProvisionRequest, TransactionStatus};
 pub use input::{EventPriority, NodeInput};
-pub use protocol_event::ProtocolEvent;
+pub use protocol_event::{ProtocolEvent, ProvisionVerificationResult};
 pub use timer::{TimerId, TimerScheduler};
 pub use traits::{NoOpStateRootComputer, StateMachine, StateRootComputer};

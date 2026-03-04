@@ -628,7 +628,7 @@ impl StateMachine for NodeStateMachine {
             // Provision Events (Byzantine-safe)
             //
             // Provisions are routed ONLY to ProvisionCoordinator, which:
-            // 1. Verifies QC + merkle proofs (via VerifyStateProvision action)
+            // 1. Verifies QC + merkle proofs (via VerifyStateProvisions action)
             // 2. Tracks verified provisions per source shard
             // 3. Emits ProvisionAccepted when a provision is verified
             // 4. Emits ProvisioningComplete when ALL required shards are verified
@@ -636,23 +636,23 @@ impl StateMachine for NodeStateMachine {
             // ExecutionState listens to ProvisioningComplete to trigger execution.
             // LivelockState listens to ProvisionAccepted for cycle detection.
             // ═══════════════════════════════════════════════════════════════════════
-            // StateProvisionReceived: provision from source shard proposer
-            ProtocolEvent::StateProvisionReceived { provision } => {
-                self.provisions.on_state_provision_received(provision)
+            // StateProvisionsReceived: batch of provisions from source shard proposer
+            ProtocolEvent::StateProvisionsReceived { provisions } => {
+                self.provisions.on_state_provisions_received(provisions)
             }
 
-            // StateProvisionVerified: QC + merkle proof verification completed
-            ProtocolEvent::StateProvisionVerified {
-                tx_hash,
-                source_shard,
-                valid,
-                provision,
+            // StateProvisionsVerified: batch QC + merkle proof verification completed
+            ProtocolEvent::StateProvisionsVerified {
+                results,
+                committed_header,
             } => {
-                if valid {
-                    self.mempool.on_provision_verified(tx_hash);
+                for result in &results {
+                    if result.valid {
+                        self.mempool.on_provision_verified(result.tx_hash);
+                    }
                 }
                 self.provisions
-                    .on_state_provision_verified(tx_hash, source_shard, valid, provision)
+                    .on_state_provisions_verified(results, committed_header)
             }
 
             // CrossShardTxRegistered: route to coordinator for tracking

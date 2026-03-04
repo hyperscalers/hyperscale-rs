@@ -2,16 +2,16 @@
 //!
 //! This module implements the provision coordination system that tracks all
 //! cross-shard provisions, manages QC + merkle proof verification, and emits
-//! quorum events for downstream consumers.
+//! verification events for downstream consumers.
 //!
 //! ## Provision Flow
 //!
-//! The source shard proposer broadcasts a `StateProvision` containing JMT
+//! The source shard proposer broadcasts a `StateProvision` batch containing JMT
 //! inclusion proofs. The target shard joins with remote block headers, then
-//! dispatches `VerifyStateProvision` to verify the QC signature and
-//! merkle proofs against the committed state root.
+//! dispatches `VerifyStateProvisions` to verify the QC signature once and
+//! merkle proofs per provision against the committed state root.
 
-use hyperscale_core::{Action, ProtocolEvent};
+use hyperscale_core::{Action, ProtocolEvent, ProvisionVerificationResult};
 use hyperscale_types::{
     BlockHeight, CommitmentProof, CommittedBlockHeader, Hash, NodeId, ShardGroupId, StateProvision,
     Topology, ValidatorId,
@@ -43,11 +43,11 @@ pub struct TxRegistration {
 /// Centralized provision coordination.
 ///
 /// Responsibilities:
-/// - Receive provisions from the source shard proposer
+/// - Receive provision batches from the source shard proposer
 /// - Join provisions with remote block headers
-/// - Dispatch QC + merkle proof verification
-/// - Track quorum per (tx, shard)
-/// - Notify consumers when provisions are verified/quorum reached
+/// - Dispatch QC + merkle proof verification (QC once per batch, proofs per provision)
+/// - Track verified provisions per (tx, shard)
+/// - Notify consumers when all required provisions are verified
 ///
 /// Note: Backpressure is handled by the mempool module, not here.
 /// This module provides `has_any_verified_provisions()` which mempool
@@ -302,10 +302,9 @@ impl ProvisionCoordinator {
                 pending_count = provisions.len(),
                 "Found buffered provisions for newly arrived header"
             );
-            for provision in provisions {
-                actions
-                    .extend(self.emit_provision_verification(provision, committed_header.clone()));
-            }
+            actions.extend(
+                self.emit_provision_verification(provisions, vec![committed_header.clone()]),
+            );
         }
 
         actions
@@ -315,22 +314,27 @@ impl ProvisionCoordinator {
     // State Provision Lifecycle
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Handle a state provision received from the source shard proposer.
+    /// Handle a batch of state provisions received from a source shard proposer.
     ///
-    /// Joins the provision with the corresponding remote block header:
-    /// - If header found in unverified buffer: emit verification action
-    /// - If header not found: buffer provision until header arrives
-    pub fn on_state_provision_received(&mut self, provision: StateProvision) -> Vec<Action> {
-        let tx_hash = provision.transaction_hash;
-        let source_shard = provision.source_shard;
-        let block_height = provision.block_height;
+    /// All provisions in a batch share the same `(source_shard, block_height)`.
+    /// Joins with the corresponding remote block header:
+    /// - If a verified header exists: use it directly (single candidate)
+    /// - If unverified headers exist: send all candidates for verification
+    /// - If no header found: buffer provisions until header arrives
+    pub fn on_state_provisions_received(&mut self, provisions: Vec<StateProvision>) -> Vec<Action> {
+        if provisions.is_empty() {
+            return vec![];
+        }
+
+        // All provisions in a batch share the same source shard and block height.
+        let source_shard = provisions[0].source_shard;
+        let block_height = provisions[0].block_height;
 
         debug!(
-            tx_hash = %tx_hash,
             source_shard = source_shard.0,
             block_height = block_height.0,
-            entries = provision.entries.len(),
-            "State provision received"
+            count = provisions.len(),
+            "State provisions batch received"
         );
 
         // Ignore provisions from our own shard
@@ -338,79 +342,88 @@ impl ProvisionCoordinator {
             return vec![];
         }
 
-        // Auto-register if not already registered (for remote TXs / cycle detection)
-        self.registered_txs.entry(tx_hash).or_insert_with(|| {
-            let mut required_shards = BTreeSet::new();
-            required_shards.insert(source_shard);
+        // Filter: auto-register unknown txs, skip already-verified provisions
+        let mut to_verify = Vec::with_capacity(provisions.len());
+        for provision in provisions {
+            let tx_hash = provision.transaction_hash;
 
-            TxRegistration {
-                required_shards,
-                registered_at: BlockHeight(0),
+            // Auto-register if not already registered (for remote TXs / cycle detection)
+            self.registered_txs.entry(tx_hash).or_insert_with(|| {
+                let mut required_shards = BTreeSet::new();
+                required_shards.insert(source_shard);
+                TxRegistration {
+                    required_shards,
+                    registered_at: BlockHeight(0),
+                }
+            });
+
+            // Skip if already verified for this (tx, shard)
+            if self
+                .verified_provisions
+                .get(&tx_hash)
+                .and_then(|by_shard| by_shard.get(&source_shard))
+                .is_some()
+            {
+                trace!(
+                    tx_hash = %tx_hash,
+                    source_shard = source_shard.0,
+                    "Ignoring provision (already verified for this shard)"
+                );
+                continue;
             }
-        });
 
-        // Already have a verified provision for this (tx, shard)?
-        if self
-            .verified_provisions
-            .get(&tx_hash)
-            .and_then(|by_shard| by_shard.get(&source_shard))
-            .is_some()
-        {
-            trace!(
-                tx_hash = %tx_hash,
-                source_shard = source_shard.0,
-                "Ignoring provision (already verified for this shard)"
-            );
+            to_verify.push(provision);
+        }
+
+        if to_verify.is_empty() {
             return vec![];
         }
 
-        // Look for a matching remote header — check unverified first, then verified.
-        // A prior provision for the same (shard, height) may have already promoted the
-        // header to verified_remote_headers, so we must check both buffers.
-        let header = self
-            .unverified_remote_headers
-            .get(&(source_shard, block_height))
-            .and_then(|by_sender| by_sender.values().next())
-            .cloned()
-            .or_else(|| {
-                self.verified_remote_headers
-                    .get(&(source_shard, block_height))
-                    .cloned()
-            });
+        // Look for matching remote headers — check VERIFIED FIRST (skip QC
+        // re-verification), then collect ALL unverified candidates.
+        let key = (source_shard, block_height);
 
-        if let Some(committed_header) = header {
-            // Header found — emit async QC + merkle proof verification
-            self.emit_provision_verification(provision, committed_header)
-        } else {
-            // No header yet — buffer the provision
-            debug!(
-                tx_hash = %tx_hash,
-                source_shard = source_shard.0,
-                block_height = block_height.0,
-                "Buffering provision (waiting for remote header)"
-            );
-            self.pending_provisions
-                .entry((source_shard, block_height))
-                .or_default()
-                .push(provision);
-            vec![]
+        if let Some(verified_header) = self.verified_remote_headers.get(&key).cloned() {
+            // Header already promoted by prior verification — single candidate
+            return self.emit_provision_verification(to_verify, vec![verified_header]);
         }
+
+        if let Some(by_sender) = self.unverified_remote_headers.get(&key) {
+            // Collect ALL unverified candidates (one per validator sender)
+            let candidates: Vec<CommittedBlockHeader> = by_sender.values().cloned().collect();
+            return self.emit_provision_verification(to_verify, candidates);
+        }
+
+        // No header yet — buffer all provisions
+        debug!(
+            source_shard = source_shard.0,
+            block_height = block_height.0,
+            count = to_verify.len(),
+            "Buffering provisions (waiting for remote header)"
+        );
+        self.pending_provisions
+            .entry(key)
+            .or_default()
+            .extend(to_verify);
+        vec![]
     }
 
-    /// Emit a VerifyStateProvision action for async verification.
+    /// Emit a `VerifyStateProvisions` action for async batch verification.
+    ///
+    /// The QC is verified once across candidates; merkle proofs are checked
+    /// per provision against the verified header's state root.
     fn emit_provision_verification(
         &self,
-        provision: StateProvision,
-        committed_header: CommittedBlockHeader,
+        provisions: Vec<StateProvision>,
+        committed_headers: Vec<CommittedBlockHeader>,
     ) -> Vec<Action> {
-        let source_shard = provision.source_shard;
-        let tx_hash = provision.transaction_hash;
+        // All provisions in a batch share the same source shard.
+        let source_shard = provisions[0].source_shard;
 
         // Resolve ALL committee public keys in order for QC verification.
         // verify_qc_signature filters internally by the signer bitfield,
         // so it needs the full committee array (matching BFT's collect_qc_signer_keys).
         let committee = self.topology.committee_for_shard(source_shard);
-        let mut total_voting_power = 0u64;
         let committee_public_keys: Vec<_> = committee
             .iter()
             .map(|&validator_id| {
@@ -420,150 +433,136 @@ impl ProvisionCoordinator {
             })
             .collect();
 
-        // Compute voting power from signers only
-        for idx in committed_header.qc.signers.set_indices() {
-            if let Some(&validator_id) = committee.get(idx) {
-                total_voting_power += self.topology.voting_power(validator_id).unwrap_or(0);
-            }
-        }
+        // Per-validator voting power (parallel to committee_public_keys).
+        // The action handler computes total_voting_power per-candidate from QC signer indices.
+        let committee_voting_power: Vec<u64> = committee
+            .iter()
+            .map(|&validator_id| self.topology.voting_power(validator_id).unwrap_or(0))
+            .collect();
 
         let quorum_threshold = self.topology.quorum_threshold_for_shard(source_shard);
 
-        vec![Action::VerifyStateProvision {
-            tx_hash,
-            source_shard,
-            committed_header,
-            provision,
+        vec![Action::VerifyStateProvisions {
+            provisions,
+            committed_headers,
             committee_public_keys,
-            total_voting_power,
+            committee_voting_power,
             quorum_threshold,
         }]
     }
 
-    /// Handle state provision verification result.
+    /// Handle batch state provision verification results.
     ///
-    /// On success: build CommitmentProof, track quorum, emit events.
-    pub fn on_state_provision_verified(
+    /// For each valid provision: build CommitmentProof, store provision, emit events.
+    /// Uses the verified header returned by the action handler directly (no re-lookup).
+    pub fn on_state_provisions_verified(
         &mut self,
-        tx_hash: Hash,
-        source_shard: ShardGroupId,
-        valid: bool,
-        provision: StateProvision,
+        results: Vec<ProvisionVerificationResult>,
+        committed_header: Option<CommittedBlockHeader>,
     ) -> Vec<Action> {
-        if !valid {
-            warn!(
-                tx_hash = %tx_hash,
-                source_shard = source_shard.0,
-                "State provision verification failed"
-            );
-            return vec![];
-        }
-
-        debug!(
-            tx_hash = %tx_hash,
-            source_shard = source_shard.0,
-            entries = provision.entries.len(),
-            "State provision verified successfully"
-        );
-
-        // Find the remote header — check verified first (may have been promoted
-        // by a previous provision from the same block), then unverified.
-        let block_height = provision.block_height;
-        let header = if let Some(h) = self
-            .verified_remote_headers
-            .get(&(source_shard, block_height))
-            .cloned()
-        {
-            // Already promoted by a previous provision verification
-            Some(h)
-        } else if let Some(by_sender) = self
-            .unverified_remote_headers
-            .remove(&(source_shard, block_height))
-        {
-            // Take first header and promote to verified
-            let h = by_sender.into_values().next().unwrap();
-            self.verified_remote_headers
-                .insert((source_shard, block_height), h.clone());
-
-            // Update tip tracking
-            let tip = self
-                .remote_header_tips
-                .entry(source_shard)
-                .or_insert(BlockHeight(0));
-            if block_height > *tip {
-                *tip = block_height;
-            }
-
-            Some(h)
-        } else {
-            None
-        };
-
-        let Some(header) = header else {
-            warn!(
-                tx_hash = %tx_hash,
-                source_shard = source_shard.0,
-                "State provision verified but no matching header found"
-            );
-            return vec![];
-        };
-
-        // Build CommitmentProof from provision + header
-        let proof = CommitmentProof::new(
-            tx_hash,
-            source_shard,
-            self.local_shard,
-            provision.block_height,
-            provision.block_timestamp,
-            header.state_root(),
-            header.qc.clone(),
-            (*provision.entries).clone(),
-            (*provision.merkle_proofs).clone(),
-        );
-
-        // Store provision and proof together
-        self.verified_provisions
-            .entry(tx_hash)
-            .or_default()
-            .insert(source_shard, (provision.clone(), proof.clone()));
-
-        // Update reverse index for cycle detection
-        self.txs_by_source_shard
-            .entry(source_shard)
-            .or_default()
-            .insert(tx_hash);
-
         let mut actions = vec![];
 
-        // Emit provision verified for this shard (used by livelock for cycle detection)
-        actions.push(Action::Continuation(ProtocolEvent::ProvisionAccepted {
-            tx_hash,
-            source_shard,
-            commitment_proof: proof,
-        }));
+        // Promote the verified header if we have one
+        if let Some(ref header) = committed_header {
+            let shard = header.header.shard_group_id;
+            let height = header.header.height;
+            let key = (shard, height);
 
-        // Check if ALL required shards have verified provisions
-        if self.all_shards_verified(tx_hash) {
-            let all_provisions: Vec<StateProvision> = self
-                .verified_provisions
-                .get(&tx_hash)
-                .map(|by_shard| {
-                    by_shard
-                        .values()
-                        .map(|(provision, _)| provision.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
+            if let std::collections::hash_map::Entry::Vacant(e) =
+                self.verified_remote_headers.entry(key)
+            {
+                e.insert(header.clone());
+                // Remove unverified entries for this (shard, height)
+                self.unverified_remote_headers.remove(&key);
+            }
+        }
+
+        for result in results {
+            let tx_hash = result.tx_hash;
+            let source_shard = result.source_shard;
+
+            if !result.valid {
+                warn!(
+                    tx_hash = %tx_hash,
+                    source_shard = source_shard.0,
+                    "State provision verification failed"
+                );
+                continue;
+            }
+
+            let Some(ref header) = committed_header else {
+                warn!(
+                    tx_hash = %tx_hash,
+                    source_shard = source_shard.0,
+                    "State provision marked valid but no committed header"
+                );
+                continue;
+            };
 
             debug!(
                 tx_hash = %tx_hash,
-                "All shards verified - ready for execution"
+                source_shard = source_shard.0,
+                entries = result.provision.entries.len(),
+                "State provision verified successfully"
             );
 
-            actions.push(Action::Continuation(ProtocolEvent::ProvisioningComplete {
+            let provision = result.provision;
+
+            // Build CommitmentProof from provision + verified header
+            let proof = CommitmentProof::new(
                 tx_hash,
-                provisions: all_provisions,
+                source_shard,
+                self.local_shard,
+                provision.block_height,
+                provision.block_timestamp,
+                header.state_root(),
+                header.qc.clone(),
+                (*provision.entries).clone(),
+                (*provision.merkle_proofs).clone(),
+            );
+
+            // Store provision and proof together
+            self.verified_provisions
+                .entry(tx_hash)
+                .or_default()
+                .insert(source_shard, (provision.clone(), proof.clone()));
+
+            // Update reverse index for cycle detection
+            self.txs_by_source_shard
+                .entry(source_shard)
+                .or_default()
+                .insert(tx_hash);
+
+            // Emit provision accepted (used by livelock for cycle detection)
+            actions.push(Action::Continuation(ProtocolEvent::ProvisionAccepted {
+                tx_hash,
+                source_shard,
+                commitment_proof: proof,
             }));
+
+            // Check if ALL required shards have verified provisions
+            if self.all_shards_verified(tx_hash) {
+                let all_provisions: Vec<StateProvision> = self
+                    .verified_provisions
+                    .get(&tx_hash)
+                    .map(|by_shard| {
+                        by_shard
+                            .values()
+                            .map(|(provision, _)| provision.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                debug!(
+                    tx_hash = %tx_hash,
+                    "All shards verified - ready for execution"
+                );
+
+                actions.push(Action::Continuation(ProtocolEvent::ProvisioningComplete {
+                    tx_hash,
+                    provisions: all_provisions,
+                }));
+            }
         }
 
         actions
@@ -963,6 +962,16 @@ mod tests {
         }
     }
 
+    /// Helper: simulate successful verification for a single provision.
+    fn make_verified_result(provision: StateProvision, valid: bool) -> ProvisionVerificationResult {
+        ProvisionVerificationResult {
+            tx_hash: provision.transaction_hash,
+            source_shard: provision.source_shard,
+            valid,
+            provision,
+        }
+    }
+
     #[test]
     fn test_provision_received_with_header_emits_verification() {
         let topology = make_test_topology(ShardGroupId(0));
@@ -975,14 +984,14 @@ mod tests {
         let header = make_committed_header(source_shard, 10);
         coordinator.on_remote_block_committed(header, ValidatorId(3));
 
-        // Then: provision arrives — should emit VerifyStateProvision
+        // Then: provision arrives — should emit VerifyStateProvisions
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        let actions = coordinator.on_state_provision_received(provision);
+        let actions = coordinator.on_state_provisions_received(vec![provision]);
 
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyStateProvision { tx_hash: h, .. } if *h == tx_hash
+            Action::VerifyStateProvisions { provisions, .. } if provisions[0].transaction_hash == tx_hash
         ));
 
         // Should auto-register the tx
@@ -999,7 +1008,7 @@ mod tests {
 
         // Provision arrives before header — should buffer
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        let actions = coordinator.on_state_provision_received(provision);
+        let actions = coordinator.on_state_provisions_received(vec![provision]);
 
         assert!(actions.is_empty());
         // Should still auto-register
@@ -1016,7 +1025,7 @@ mod tests {
 
         // Provision arrives first — buffered
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator.on_state_provision_received(provision);
+        coordinator.on_state_provisions_received(vec![provision]);
 
         // Then header arrives — should trigger verification of buffered provision
         let header = make_committed_header(source_shard, 10);
@@ -1025,7 +1034,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::VerifyStateProvision { tx_hash: h, .. } if *h == tx_hash
+            Action::VerifyStateProvisions { provisions, .. } if provisions[0].transaction_hash == tx_hash
         ));
     }
 
@@ -1040,7 +1049,7 @@ mod tests {
             ShardGroupId(1),
             10,
         );
-        let actions = coordinator.on_state_provision_received(provision);
+        let actions = coordinator.on_state_provisions_received(vec![provision]);
 
         assert!(actions.is_empty());
         // Should NOT auto-register
@@ -1057,15 +1066,16 @@ mod tests {
 
         // Setup: header + provision + verification
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed(header, ValidatorId(3));
+        coordinator.on_remote_block_committed(header.clone(), ValidatorId(3));
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator.on_state_provision_received(provision.clone());
+        coordinator.on_state_provisions_received(vec![provision.clone()]);
 
         // Simulate successful verification
-        coordinator.on_state_provision_verified(tx_hash, source_shard, true, provision.clone());
+        let result = make_verified_result(provision.clone(), true);
+        coordinator.on_state_provisions_verified(vec![result], Some(header));
 
         // Second provision for same (tx, shard) should be ignored
-        let actions = coordinator.on_state_provision_received(provision);
+        let actions = coordinator.on_state_provisions_received(vec![provision]);
         assert!(actions.is_empty());
     }
 
@@ -1079,13 +1089,13 @@ mod tests {
 
         // Setup
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed(header, ValidatorId(3));
+        coordinator.on_remote_block_committed(header.clone(), ValidatorId(3));
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator.on_state_provision_received(provision.clone());
+        coordinator.on_state_provisions_received(vec![provision.clone()]);
 
         // Verify
-        let actions =
-            coordinator.on_state_provision_verified(tx_hash, source_shard, true, provision);
+        let result = make_verified_result(provision, true);
+        let actions = coordinator.on_state_provisions_verified(vec![result], Some(header));
 
         // Should emit ProvisionAccepted
         assert!(actions.iter().any(|a| matches!(
@@ -1115,11 +1125,11 @@ mod tests {
         let header = make_committed_header(source_shard, 10);
         coordinator.on_remote_block_committed(header, ValidatorId(3));
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator.on_state_provision_received(provision.clone());
+        coordinator.on_state_provisions_received(vec![provision.clone()]);
 
-        // Verification fails
-        let actions =
-            coordinator.on_state_provision_verified(tx_hash, source_shard, false, provision);
+        // Verification fails — no committed_header returned
+        let result = make_verified_result(provision, false);
+        let actions = coordinator.on_state_provisions_verified(vec![result], None);
 
         assert!(actions.is_empty());
         assert!(!coordinator.has_any_verified_provisions(&tx_hash));
@@ -1140,10 +1150,11 @@ mod tests {
 
         // Verify first shard
         let header1 = make_committed_header(shard1, 10);
-        coordinator.on_remote_block_committed(header1, ValidatorId(3));
+        coordinator.on_remote_block_committed(header1.clone(), ValidatorId(3));
         let prov1 = make_provision(tx_hash, shard1, ShardGroupId(0), 10);
-        coordinator.on_state_provision_received(prov1.clone());
-        let actions = coordinator.on_state_provision_verified(tx_hash, shard1, true, prov1);
+        coordinator.on_state_provisions_received(vec![prov1.clone()]);
+        let result1 = make_verified_result(prov1, true);
+        let actions = coordinator.on_state_provisions_verified(vec![result1], Some(header1));
 
         // Should NOT emit ProvisioningComplete yet (shard2 still pending)
         assert!(!actions.iter().any(|a| matches!(
@@ -1153,10 +1164,11 @@ mod tests {
 
         // Verify second shard
         let header2 = make_committed_header(shard2, 10);
-        coordinator.on_remote_block_committed(header2, ValidatorId(4));
+        coordinator.on_remote_block_committed(header2.clone(), ValidatorId(4));
         let prov2 = make_provision(tx_hash, shard2, ShardGroupId(0), 10);
-        coordinator.on_state_provision_received(prov2.clone());
-        let actions = coordinator.on_state_provision_verified(tx_hash, shard2, true, prov2);
+        coordinator.on_state_provisions_received(vec![prov2.clone()]);
+        let result2 = make_verified_result(prov2, true);
+        let actions = coordinator.on_state_provisions_verified(vec![result2], Some(header2));
 
         // NOW should emit ProvisioningComplete
         assert!(actions.iter().any(|a| matches!(
@@ -1189,9 +1201,10 @@ mod tests {
 
         // Setup + verify
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed(header, ValidatorId(3));
-        coordinator.on_state_provision_received(provision.clone());
-        coordinator.on_state_provision_verified(tx_hash, source_shard, true, provision);
+        coordinator.on_remote_block_committed(header.clone(), ValidatorId(3));
+        coordinator.on_state_provisions_received(vec![provision.clone()]);
+        let result = make_verified_result(provision, true);
+        coordinator.on_state_provisions_verified(vec![result], Some(header));
 
         // Check node extraction
         let nodes = coordinator.provision_nodes(tx_hash, source_shard);
@@ -1212,10 +1225,11 @@ mod tests {
 
         // Setup + verify
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed(header, ValidatorId(3));
+        coordinator.on_remote_block_committed(header.clone(), ValidatorId(3));
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator.on_state_provision_received(provision.clone());
-        coordinator.on_state_provision_verified(tx_hash, source_shard, true, provision);
+        coordinator.on_state_provisions_received(vec![provision.clone()]);
+        let result = make_verified_result(provision, true);
+        coordinator.on_state_provisions_verified(vec![result], Some(header));
 
         // After verification
         let txs = coordinator.txs_with_provisions_from(source_shard).unwrap();
@@ -1232,11 +1246,155 @@ mod tests {
 
         // Buffer a provision (no header yet)
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator.on_state_provision_received(provision);
+        coordinator.on_state_provisions_received(vec![provision]);
 
         // Abort the tx — should clean up pending provisions too
         coordinator.on_tx_aborted(&tx_hash);
         assert!(!coordinator.is_registered(&tx_hash));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Batch Verification Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_provision_batch_emits_single_verification() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        let source_shard = ShardGroupId(1);
+        let header = make_committed_header(source_shard, 10);
+        coordinator.on_remote_block_committed(header, ValidatorId(3));
+
+        // Send batch of 3 provisions from the same block
+        let provisions: Vec<_> = (0..3)
+            .map(|i| {
+                make_provision(
+                    Hash::from_bytes(format!("tx{i}").as_bytes()),
+                    source_shard,
+                    ShardGroupId(0),
+                    10,
+                )
+            })
+            .collect();
+
+        let actions = coordinator.on_state_provisions_received(provisions);
+
+        // Should emit exactly ONE VerifyStateProvisions action with all 3 provisions
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::VerifyStateProvisions { provisions, .. } => {
+                assert_eq!(provisions.len(), 3);
+            }
+            other => panic!("Expected VerifyStateProvisions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_provision_sends_all_unverified_candidates() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        let source_shard = ShardGroupId(1);
+
+        // Two different validators send headers for the same (shard, height)
+        let header = make_committed_header(source_shard, 10);
+        coordinator.on_remote_block_committed(header, ValidatorId(3));
+        coordinator
+            .on_remote_block_committed(make_committed_header(source_shard, 10), ValidatorId(4));
+        assert_eq!(coordinator.unverified_remote_header_count(), 2);
+
+        // Provision arrives — should send BOTH candidates
+        let provision = make_provision(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
+        let actions = coordinator.on_state_provisions_received(vec![provision]);
+
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::VerifyStateProvisions {
+                committed_headers, ..
+            } => {
+                assert_eq!(committed_headers.len(), 2);
+            }
+            other => panic!("Expected VerifyStateProvisions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_provision_uses_verified_header_when_available() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        let source_shard = ShardGroupId(1);
+        let header = make_committed_header(source_shard, 10);
+        coordinator.on_remote_block_committed(header.clone(), ValidatorId(3));
+
+        // First provision verifies (promotes header to verified)
+        let prov1 = make_provision(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
+        coordinator.on_state_provisions_received(vec![prov1.clone()]);
+        let result = make_verified_result(prov1, true);
+        coordinator.on_state_provisions_verified(vec![result], Some(header.clone()));
+
+        // Second provision for different tx at same (shard, height)
+        let prov2 = make_provision(Hash::from_bytes(b"tx2"), source_shard, ShardGroupId(0), 10);
+        let actions = coordinator.on_state_provisions_received(vec![prov2]);
+
+        // Should send only the verified header (single candidate)
+        assert_eq!(actions.len(), 1);
+        match &actions[0] {
+            Action::VerifyStateProvisions {
+                committed_headers, ..
+            } => {
+                assert_eq!(committed_headers.len(), 1);
+            }
+            other => panic!("Expected VerifyStateProvisions, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_batch_partial_merkle_failure() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        let source_shard = ShardGroupId(1);
+        let header = make_committed_header(source_shard, 10);
+        coordinator.on_remote_block_committed(header.clone(), ValidatorId(3));
+
+        let prov_ok = make_provision(
+            Hash::from_bytes(b"tx_ok"),
+            source_shard,
+            ShardGroupId(0),
+            10,
+        );
+        let prov_bad = make_provision(
+            Hash::from_bytes(b"tx_bad"),
+            source_shard,
+            ShardGroupId(0),
+            10,
+        );
+
+        coordinator.on_state_provisions_received(vec![prov_ok.clone(), prov_bad.clone()]);
+
+        // QC passes but one provision fails merkle proof
+        let results = vec![
+            make_verified_result(prov_ok.clone(), true),
+            make_verified_result(prov_bad, false),
+        ];
+        let actions = coordinator.on_state_provisions_verified(results, Some(header));
+
+        // Only the valid provision should emit ProvisionAccepted
+        let accepted_count = actions
+            .iter()
+            .filter(|a| {
+                matches!(
+                    a,
+                    Action::Continuation(ProtocolEvent::ProvisionAccepted { .. })
+                )
+            })
+            .count();
+        assert_eq!(accepted_count, 1);
+
+        assert!(coordinator.has_any_verified_provisions(&Hash::from_bytes(b"tx_ok")));
+        assert!(!coordinator.has_any_verified_provisions(&Hash::from_bytes(b"tx_bad")));
     }
 
     // ═══════════════════════════════════════════════════════════════════════

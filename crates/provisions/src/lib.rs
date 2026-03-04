@@ -5,10 +5,10 @@
 //!
 //! ## Provision Flow
 //!
-//! 1. Source shard proposer broadcasts `StateProvision` with JMT inclusion proofs
-//! 2. Target shard receives provision, joins with remote block header
-//! 3. `VerifyStateProvision` validates the QC signature and merkle proofs
-//! 4. Verified provisions are stored and trigger quorum/completion events
+//! 1. Source shard proposer broadcasts `StateProvision` batch with JMT inclusion proofs
+//! 2. Target shard receives batch, joins with remote block headers
+//! 3. `VerifyStateProvisions` validates the QC signature once and merkle proofs per provision
+//! 4. Verified provisions are stored and trigger completion events
 //!
 //! # Components
 //!

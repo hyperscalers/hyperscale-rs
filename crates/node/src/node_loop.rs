@@ -781,7 +781,7 @@ where
             | Action::VerifyTransactionRoot { .. }
             | Action::BuildProposal { .. }
             | Action::AggregateExecutionCertificate { .. }
-            | Action::VerifyStateProvision { .. }
+            | Action::VerifyStateProvisions { .. }
             | Action::ExecuteTransactions { .. }
             | Action::SpeculativeExecute { .. }
             | Action::FetchAndBroadcastProvisions { .. } => {
@@ -1608,8 +1608,9 @@ where
                     warn!("Failed to decode StateProvisionBatch");
                     return;
                 };
-                for provision in batch.into_provisions() {
-                    let pe = ProtocolEvent::StateProvisionReceived { provision };
+                let provisions = batch.into_provisions();
+                if !provisions.is_empty() {
+                    let pe = ProtocolEvent::StateProvisionsReceived { provisions };
                     let actions = self.state.handle(pe);
                     self.actions_generated += actions.len();
                     for action in actions {
