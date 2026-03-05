@@ -1,9 +1,9 @@
 //! Consolidated configuration for NodeLoop.
 
-use crate::fetch_protocol::FetchConfig;
 use crate::inbound_handler::InboundHandlerConfig;
-use crate::provision_fetch_protocol::ProvisionFetchConfig;
-use crate::sync_protocol::SyncConfig;
+use crate::protocol::fetch::FetchConfig;
+use crate::protocol::provision_fetch::ProvisionFetchConfig;
+use crate::protocol::sync::SyncConfig;
 use std::time::Duration;
 
 /// Configuration for [`NodeLoop`](crate::node_loop::NodeLoop).

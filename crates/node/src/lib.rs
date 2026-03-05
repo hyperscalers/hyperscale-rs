@@ -7,15 +7,13 @@
 mod action_handler;
 mod batch_accumulator;
 mod config;
-mod fetch_protocol;
 mod inbound_handler;
 pub mod node_loop;
-mod provision_fetch_protocol;
-mod sync_protocol;
+mod protocol;
 
 mod state;
 
 pub use config::NodeConfig;
 pub use node_loop::{NodeStatusSnapshot, TimerOp};
+pub use protocol::sync::SyncStateKind;
 pub use state::NodeStateMachine;
-pub use sync_protocol::SyncStateKind;

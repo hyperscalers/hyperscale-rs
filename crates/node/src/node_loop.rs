@@ -21,11 +21,11 @@
 use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::batch_accumulator::{BatchAccumulator, ShardedBatchAccumulator};
 use crate::config::NodeConfig;
-use crate::fetch_protocol::{FetchInput, FetchKind, FetchOutput, FetchProtocol};
-use crate::provision_fetch_protocol::{
+use crate::protocol::fetch::{FetchInput, FetchKind, FetchOutput, FetchProtocol};
+use crate::protocol::provision_fetch::{
     ProvisionFetchInput, ProvisionFetchOutput, ProvisionFetchProtocol,
 };
-use crate::sync_protocol::{SyncInput, SyncOutput, SyncProtocol, SyncStatus};
+use crate::protocol::sync::{SyncInput, SyncOutput, SyncProtocol, SyncStatus};
 use crate::NodeStateMachine;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, NodeInput, ProtocolEvent, StateMachine, TimerId,
