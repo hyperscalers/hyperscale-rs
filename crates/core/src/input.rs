@@ -2,8 +2,8 @@
 
 use crate::ProtocolEvent;
 use hyperscale_types::{
-    Block, CommittedBlockHeader, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    StateProvision, TransactionCertificate, ValidatorId,
+    Block, BlockHeight, CommittedBlockHeader, Hash, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, StateProvision, TransactionCertificate, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -119,6 +119,19 @@ pub enum NodeInput {
     ProvisionsReady {
         batches: Vec<(ShardGroupId, Vec<StateProvision>)>,
     },
+
+    /// Provisions successfully received from a provision fetch request.
+    ProvisionFetchReceived {
+        source_shard: ShardGroupId,
+        block_height: BlockHeight,
+        provisions: Vec<StateProvision>,
+    },
+
+    /// A provision fetch request failed (network error or peer returned None).
+    ProvisionFetchFailed {
+        source_shard: ShardGroupId,
+        block_height: BlockHeight,
+    },
 }
 
 impl NodeInput {
@@ -164,6 +177,8 @@ impl NodeInput {
             NodeInput::CommittedHeaderValidated { .. } => EventPriority::Internal,
             NodeInput::GossipReceived { .. } => EventPriority::Network,
             NodeInput::ProvisionsReady { .. } => EventPriority::Internal,
+            NodeInput::ProvisionFetchReceived { .. } => EventPriority::Internal,
+            NodeInput::ProvisionFetchFailed { .. } => EventPriority::Internal,
         }
     }
 
@@ -202,6 +217,8 @@ impl NodeInput {
             NodeInput::CommittedHeaderValidated { .. } => "CommittedHeaderValidated",
             NodeInput::GossipReceived { .. } => "GossipReceived",
             NodeInput::ProvisionsReady { .. } => "ProvisionsReady",
+            NodeInput::ProvisionFetchReceived { .. } => "ProvisionFetchReceived",
+            NodeInput::ProvisionFetchFailed { .. } => "ProvisionFetchFailed",
         }
     }
 }

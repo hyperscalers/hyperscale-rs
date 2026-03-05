@@ -22,6 +22,9 @@ use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::batch_accumulator::{BatchAccumulator, ShardedBatchAccumulator};
 use crate::config::NodeConfig;
 use crate::fetch_protocol::{FetchInput, FetchKind, FetchOutput, FetchProtocol};
+use crate::provision_fetch_protocol::{
+    ProvisionFetchInput, ProvisionFetchOutput, ProvisionFetchProtocol,
+};
 use crate::sync_protocol::{SyncInput, SyncOutput, SyncProtocol, SyncStatus};
 use crate::NodeStateMachine;
 use hyperscale_core::{
@@ -190,6 +193,9 @@ where
     // Fetch protocol (transaction/certificate fetching with chunking and retry)
     fetch_protocol: FetchProtocol,
 
+    // Provision fetch protocol (cross-shard provision fetching with peer rotation)
+    provision_fetch_protocol: ProvisionFetchProtocol,
+
     // Transaction validation
     tx_validator: Arc<TransactionValidation>,
     pending_validation: HashSet<Hash>,
@@ -240,6 +246,7 @@ where
         let b = &config.batch;
         let sync_protocol = SyncProtocol::new(config.sync.clone());
         let fetch_protocol = FetchProtocol::new(config.fetch.clone());
+        let provision_fetch_protocol = ProvisionFetchProtocol::new(config.provision_fetch.clone());
         Self {
             state,
             storage: Arc::new(storage),
@@ -260,6 +267,7 @@ where
             locally_submitted: HashSet::new(),
             sync_protocol,
             fetch_protocol,
+            provision_fetch_protocol,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             cross_shard_batch: BatchAccumulator::new(b.cross_shard_max, b.cross_shard_window),
             execution_vote_batch: BatchAccumulator::new(
@@ -567,6 +575,47 @@ where
             NodeInput::FetchTick => {
                 let outputs = self.fetch_protocol.handle(FetchInput::Tick);
                 self.process_fetch_outputs(outputs);
+                // Also tick the provision fetch protocol.
+                let prov_outputs = self
+                    .provision_fetch_protocol
+                    .handle(ProvisionFetchInput::Tick);
+                self.process_provision_fetch_outputs(prov_outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            // ── Provision fetch protocol ──────────────────────────────
+            NodeInput::ProvisionFetchReceived {
+                source_shard,
+                block_height,
+                provisions,
+            } => {
+                let outputs = self
+                    .provision_fetch_protocol
+                    .handle(ProvisionFetchInput::Received {
+                        source_shard,
+                        block_height,
+                        provisions,
+                    });
+                self.process_provision_fetch_outputs(outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            NodeInput::ProvisionFetchFailed {
+                source_shard,
+                block_height,
+            } => {
+                let outputs = self
+                    .provision_fetch_protocol
+                    .handle(ProvisionFetchInput::Failed {
+                        source_shard,
+                        block_height,
+                    });
+                self.process_provision_fetch_outputs(outputs);
+                // Tick to retry with next peer immediately.
+                let tick_outputs = self
+                    .provision_fetch_protocol
+                    .handle(ProvisionFetchInput::Tick);
+                self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
 
@@ -1065,14 +1114,8 @@ where
                 block_height,
                 proposer,
             } => {
-                use hyperscale_messages::request::GetProvisionsRequest;
                 let peers: Vec<ValidatorId> =
                     self.topology.committee_for_shard(source_shard).into_owned();
-                let request = GetProvisionsRequest {
-                    block_height,
-                    target_shard: self.local_shard,
-                };
-                let sender = self.event_sender.clone();
                 debug!(
                     source_shard = source_shard.0,
                     block_height = block_height.0,
@@ -1080,40 +1123,23 @@ where
                     peer_count = peers.len(),
                     "Requesting missing provisions from source shard"
                 );
-                self.network.request(
-                    &peers,
-                    Some(proposer),
-                    request,
-                    Box::new(move |result| match result {
-                        Ok(response) => match response.provisions {
-                            Some(provisions) if !provisions.is_empty() => {
-                                let _ = sender.send(NodeInput::Protocol(
-                                    ProtocolEvent::StateProvisionsReceived { provisions },
-                                ));
-                            }
-                            Some(_) => {
-                                // Empty provisions — no matching transactions for
-                                // our shard at this block height. Not an error.
-                            }
-                            None => {
-                                debug!(
-                                    source_shard = source_shard.0,
-                                    block_height = block_height.0,
-                                    "Peer cannot serve provisions (version unavailable), \
-                                     will retry with another peer"
-                                );
-                            }
-                        },
-                        Err(e) => {
-                            warn!(
-                                source_shard = source_shard.0,
-                                block_height = block_height.0,
-                                error = %e,
-                                "Failed to fetch missing provisions"
-                            );
-                        }
-                    }),
-                );
+                // Feed into provision fetch protocol for peer-rotating retry.
+                let outputs = self
+                    .provision_fetch_protocol
+                    .handle(ProvisionFetchInput::Request {
+                        source_shard,
+                        block_height,
+                        target_shard: self.local_shard,
+                        peers,
+                        preferred_peer: proposer,
+                    });
+                self.process_provision_fetch_outputs(outputs);
+                // Immediately tick to spawn the first fetch.
+                let tick_outputs = self
+                    .provision_fetch_protocol
+                    .handle(ProvisionFetchInput::Tick);
+                self.process_provision_fetch_outputs(tick_outputs);
+                self.update_fetch_tick_timer();
             }
         }
     }
@@ -1348,6 +1374,81 @@ where
         }
     }
 
+    /// Process ProvisionFetchProtocol outputs.
+    ///
+    /// `Fetch` uses the Network trait to send a single-peer request.
+    /// `Deliver` feeds provisions into the state machine via `StateProvisionsReceived`.
+    fn process_provision_fetch_outputs(&mut self, outputs: Vec<ProvisionFetchOutput>) {
+        for output in outputs {
+            match output {
+                ProvisionFetchOutput::Fetch {
+                    source_shard,
+                    block_height,
+                    target_shard,
+                    peer,
+                } => {
+                    use hyperscale_messages::request::GetProvisionsRequest;
+                    let request = GetProvisionsRequest {
+                        block_height,
+                        target_shard,
+                    };
+                    let sender = self.event_sender.clone();
+                    self.network.request(
+                        &[peer],
+                        None,
+                        request,
+                        Box::new(move |result| match result {
+                            Ok(response) => match response.provisions {
+                                Some(provisions) if !provisions.is_empty() => {
+                                    let _ = sender.send(NodeInput::ProvisionFetchReceived {
+                                        source_shard,
+                                        block_height,
+                                        provisions,
+                                    });
+                                }
+                                Some(_) => {
+                                    // Empty provisions — no matching transactions for
+                                    // our shard at this block height. Treat as success
+                                    // (removes the pending entry).
+                                    let _ = sender.send(NodeInput::ProvisionFetchReceived {
+                                        source_shard,
+                                        block_height,
+                                        provisions: vec![],
+                                    });
+                                }
+                                None => {
+                                    // Peer cannot serve (state version GC'd) → fail
+                                    // so the protocol tries the next peer.
+                                    let _ = sender.send(NodeInput::ProvisionFetchFailed {
+                                        source_shard,
+                                        block_height,
+                                    });
+                                }
+                            },
+                            Err(_) => {
+                                let _ = sender.send(NodeInput::ProvisionFetchFailed {
+                                    source_shard,
+                                    block_height,
+                                });
+                            }
+                        }),
+                    );
+                }
+                ProvisionFetchOutput::Deliver { provisions } => {
+                    if !provisions.is_empty() {
+                        let actions = self
+                            .state
+                            .handle(ProtocolEvent::StateProvisionsReceived { provisions });
+                        self.actions_generated += actions.len();
+                        for action in actions {
+                            self.process_action(action);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Interval for the periodic fetch tick timer.
     const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -1358,7 +1459,9 @@ where
     /// When all fetches are complete, the timer is cancelled.
     fn update_fetch_tick_timer(&mut self) {
         let status = self.fetch_protocol.status();
-        if status.pending_tx_blocks > 0 || status.pending_cert_blocks > 0 {
+        let has_fetch_work = status.pending_tx_blocks > 0 || status.pending_cert_blocks > 0;
+        let has_provision_work = self.provision_fetch_protocol.has_pending();
+        if has_fetch_work || has_provision_work {
             self.pending_timer_ops.push(TimerOp::Set {
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,

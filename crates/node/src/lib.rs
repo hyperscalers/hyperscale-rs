@@ -10,6 +10,7 @@ mod config;
 mod fetch_protocol;
 mod inbound_handler;
 pub mod node_loop;
+mod provision_fetch_protocol;
 mod sync_protocol;
 
 mod state;

@@ -2,6 +2,7 @@
 
 use crate::fetch_protocol::FetchConfig;
 use crate::inbound_handler::InboundHandlerConfig;
+use crate::provision_fetch_protocol::ProvisionFetchConfig;
 use crate::sync_protocol::SyncConfig;
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ use std::time::Duration;
 pub struct NodeConfig {
     pub sync: SyncConfig,
     pub fetch: FetchConfig,
+    pub provision_fetch: ProvisionFetchConfig,
     pub inbound: InboundHandlerConfig,
     pub batch: BatchConfig,
 }
