@@ -15,8 +15,8 @@
 //!                                               │
 //!                                               ▼
 //!                                      ┌─────────────────┐
-//!                                      │ LZ4 decompress   │
-//!                                      │ → NodeInput chan  │
+//!                                      │ LZ4 decompress  │
+//!                                      │ → NodeInput chan│
 //!                                      └─────────────────┘
 //! ```
 //!

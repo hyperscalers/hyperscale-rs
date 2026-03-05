@@ -5,11 +5,9 @@
 
 use super::behaviour::BehaviourEvent;
 use crate::codec_pool::CodecPoolHandle;
-use dashmap::DashMap;
 use hyperscale_metrics as metrics;
-use hyperscale_types::{ShardGroupId, ValidatorId};
-use libp2p::{gossipsub, swarm::SwarmEvent, PeerId as Libp2pPeerId};
-use std::sync::Arc;
+use hyperscale_types::ShardGroupId;
+use libp2p::{gossipsub, swarm::SwarmEvent};
 use tracing::{debug, warn};
 
 /// Handle a single swarm event — gossipsub messages only.
@@ -17,7 +15,6 @@ use tracing::{debug, warn};
 /// Connection lifecycle, identify, and kademlia events are handled in `event_loop.rs`.
 pub(super) async fn handle_gossipsub_event(
     event: SwarmEvent<BehaviourEvent>,
-    peer_validators: &Arc<DashMap<Libp2pPeerId, ValidatorId>>,
     local_shard: ShardGroupId,
     codec_pool: &CodecPoolHandle,
 ) {
@@ -49,20 +46,6 @@ pub(super) async fn handle_gossipsub_event(
             // Record inbound bandwidth
             metrics::record_libp2p_bandwidth(data_len as u64, 0);
 
-            // Validate that the message comes from a known validator
-            // This is defense-in-depth - messages are also verified by signature.
-            // The peer_validators map is populated at startup using
-            // compute_peer_id_for_validator() for all validators in the local committee.
-            if !peer_validators.contains_key(&propagation_source) {
-                debug!(
-                    peer = %propagation_source,
-                    topic = %topic_str,
-                    "Ignoring message from unknown peer (not in validator set)"
-                );
-                metrics::record_invalid_message();
-                return;
-            }
-            //
             // Cross-shard messages (allowed from any shard):
             // - state.provision: Sent cross-shard to request state for transactions
             // - execution.certificate.batch: Needed for cross-shard transaction execution

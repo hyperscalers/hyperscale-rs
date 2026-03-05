@@ -76,7 +76,7 @@ mod runner;
 mod status;
 mod telemetry;
 pub use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
-pub use hyperscale_network_libp2p::{Libp2pConfig, Libp2pKeypair};
+pub use hyperscale_network_libp2p::Libp2pConfig;
 pub use hyperscale_storage_rocksdb::{
     CompressionType, RocksDbConfig, RocksDbStorage, StorageError,
 };

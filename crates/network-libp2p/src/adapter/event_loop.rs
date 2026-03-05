@@ -33,6 +33,19 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// Interval for periodic Kademlia refresh to discover new peers.
 const KADEMLIA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Parse the hyperscale agent version format: `"hyperscale/<validator_id>/<version>"`.
+///
+/// Returns `(ValidatorId, version_str)` if the format is valid.
+fn parse_agent_version(agent_version: &str) -> Option<(ValidatorId, &str)> {
+    let parts: Vec<&str> = agent_version.splitn(3, '/').collect();
+    if parts.len() == 3 && parts[0] == "hyperscale" {
+        let vid = parts[1].parse::<u64>().ok()?;
+        Some((ValidatorId(vid), parts[2]))
+    } else {
+        None
+    }
+}
+
 /// Background event loop that processes swarm events and routes messages.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
@@ -42,12 +55,12 @@ pub(super) async fn run(
     mut finalization_rx: mpsc::UnboundedReceiver<SwarmCommand>,
     mut propagation_rx: mpsc::UnboundedReceiver<SwarmCommand>,
     mut background_rx: mpsc::UnboundedReceiver<SwarmCommand>,
-    peer_validators: Arc<DashMap<Libp2pPeerId, ValidatorId>>,
     mut shutdown_rx: mpsc::Receiver<()>,
     cached_peer_count: Arc<AtomicUsize>,
     local_shard: ShardGroupId,
     version_interop_mode: VersionInteroperabilityMode,
     codec_pool: CodecPoolHandle,
+    validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
 ) {
     // Track whether we've bootstrapped Kademlia (do it once after first connection)
     let mut kademlia_bootstrapped = false;
@@ -88,26 +101,26 @@ pub(super) async fn run(
                 for peer in reconnects_due {
                     pending_reconnects.remove(&peer);
 
-                    // Only reconnect if this is a known validator and we're not already connected
-                    if peer_validators.contains_key(&peer) && !swarm.is_connected(&peer) {
+                    // Reconnect if we have a known address and are not already connected
+                    if !swarm.is_connected(&peer) {
                         if let Some(addr) = validator_addresses.get(&peer) {
                             info!(
                                 peer = %peer,
                                 addr = %addr,
-                                "Attempting to reconnect to validator"
+                                "Attempting to reconnect to peer"
                             );
                             if let Err(e) = swarm.dial(addr.clone()) {
                                 warn!(
                                     peer = %peer,
                                     error = ?e,
-                                    "Failed to dial validator for reconnection"
+                                    "Failed to dial peer for reconnection"
                                 );
                                 // Schedule another reconnect attempt
                                 pending_reconnects.insert(peer, now + RECONNECT_DELAY * 2);
                             }
                         } else {
                             // No known address, try to find via Kademlia
-                            debug!(peer = %peer, "No known address for validator, relying on Kademlia discovery");
+                            debug!(peer = %peer, "No known address for peer, relying on Kademlia discovery");
                         }
                     }
                 }
@@ -121,14 +134,14 @@ pub(super) async fn run(
                     debug!("Triggered Kademlia refresh for peer discovery");
                 }
 
-                // Check connection health - ensure we're connected to validators
+                // Check connection health
                 let connected_count = swarm.connected_peers().count();
-                let validator_count = peer_validators.len();
-                if connected_count < validator_count / 2 {
+                let known_peers = validator_addresses.len();
+                if known_peers > 0 && connected_count < known_peers / 2 {
                     warn!(
                         connected = connected_count,
-                        total_validators = validator_count,
-                        "Low peer connectivity - connected to less than half of validators"
+                        known_peers = known_peers,
+                        "Low peer connectivity - connected to less than half of known peers"
                     );
                     // Trigger Kademlia bootstrap to find more peers
                     if kademlia_bootstrapped {
@@ -198,26 +211,43 @@ pub(super) async fn run(
                     SwarmEvent::ConnectionEstablished { .. } | SwarmEvent::ConnectionClosed { .. }
                 );
 
-                // Handle Identify events — version check + logging
+                // Handle Identify events — validator discovery + version check
                 if let SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) = &event {
-                    info!(
-                        peer = %peer_id,
-                        agent_version = %info.agent_version,
-                        protocol_version = %info.protocol_version,
-                        protocols = ?info.protocols,
-                        "Identified peer"
-                    );
                     let local_version = option_env!("HYPERSCALE_VERSION").unwrap_or("localdev");
-                    if !version_interop_mode.check(local_version, &info.agent_version) {
+
+                    if let Some((remote_validator_id, remote_version)) = parse_agent_version(&info.agent_version) {
+                        info!(
+                            peer = %peer_id,
+                            validator_id = remote_validator_id.0,
+                            version = %remote_version,
+                            protocol_version = %info.protocol_version,
+                            "Identified peer — registered for request-response"
+                        );
+
+                        // Register ValidatorId → PeerId for request-response routing.
+                        validator_peers.insert(remote_validator_id, *peer_id);
+
+                        // Version compatibility check
+                        if !version_interop_mode.check(local_version, remote_version) {
+                            warn!(
+                                peer = %peer_id,
+                                local_version = %local_version,
+                                remote_version = %remote_version,
+                                mode = ?version_interop_mode,
+                                "Peer version incompatible, disconnecting"
+                            );
+                            if swarm.disconnect_peer_id(*peer_id).is_err() {
+                                debug!(peer = %peer_id, "Failed to disconnect incompatible peer");
+                            }
+                        }
+                    } else {
                         warn!(
                             peer = %peer_id,
-                            local_version = %local_version,
-                            remote_version = %info.agent_version,
-                            mode = ?version_interop_mode,
-                            "Peer version incompatible, disconnecting"
+                            agent_version = %info.agent_version,
+                            "Peer has unrecognised agent version format, disconnecting"
                         );
                         if swarm.disconnect_peer_id(*peer_id).is_err() {
-                            debug!(peer = %peer_id, "Failed to disconnect incompatible peer");
+                            debug!(peer = %peer_id, "Failed to disconnect non-hyperscale peer");
                         }
                     }
                 }
@@ -240,12 +270,10 @@ pub(super) async fn run(
                         "Added peer to Kademlia routing table"
                     );
 
-                    // Track validator addresses for reconnection
-                    if peer_validators.contains_key(peer_id) {
-                        validator_addresses.insert(*peer_id, addr);
-                        // Clear any pending reconnect since we're now connected
-                        pending_reconnects.remove(peer_id);
-                    }
+                    // Track peer addresses for reconnection
+                    validator_addresses.insert(*peer_id, addr);
+                    // Clear any pending reconnect since we're now connected
+                    pending_reconnects.remove(peer_id);
 
                     // Bootstrap Kademlia after first connection to start peer discovery
                     if !kademlia_bootstrapped {
@@ -272,14 +300,13 @@ pub(super) async fn run(
                         "Connection closed"
                     );
 
-                    // Only schedule reconnect if this was the last connection to this peer
-                    // and the peer is a known validator
-                    if *num_established == 0 && peer_validators.contains_key(peer_id) {
+                    // Schedule reconnect if this was the last connection to a known peer
+                    if *num_established == 0 && validator_addresses.contains_key(peer_id) {
                         let reconnect_time = std::time::Instant::now() + RECONNECT_DELAY;
                         info!(
                             peer = %peer_id,
                             reconnect_in_secs = RECONNECT_DELAY.as_secs(),
-                            "Validator disconnected, scheduling reconnection"
+                            "Peer disconnected, scheduling reconnection"
                         );
                         pending_reconnects.insert(*peer_id, reconnect_time);
                     }
@@ -320,7 +347,6 @@ pub(super) async fn run(
                 // Delegate gossipsub messages to the event handler
                 super::gossipsub::handle_gossipsub_event(
                     event,
-                    &peer_validators,
                     local_shard,
                     &codec_pool,
                 ).await;
@@ -422,4 +448,55 @@ fn drain_all_higher_priority_commands(
     drain_channel(swarm, critical_rx);
     drain_channel(swarm, coordination_rx);
     drain_channel(swarm, finalization_rx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_agent_version_valid() {
+        let (vid, version) = parse_agent_version("hyperscale/5/1.0.0").unwrap();
+        assert_eq!(vid, ValidatorId(5));
+        assert_eq!(version, "1.0.0");
+    }
+
+    #[test]
+    fn test_parse_agent_version_localdev() {
+        let (vid, version) = parse_agent_version("hyperscale/42/localdev").unwrap();
+        assert_eq!(vid, ValidatorId(42));
+        assert_eq!(version, "localdev");
+    }
+
+    #[test]
+    fn test_parse_agent_version_version_with_slashes() {
+        // splitn(3, '/') ensures version part can contain slashes
+        let (vid, version) = parse_agent_version("hyperscale/0/1.0.0/extra").unwrap();
+        assert_eq!(vid, ValidatorId(0));
+        assert_eq!(version, "1.0.0/extra");
+    }
+
+    #[test]
+    fn test_parse_agent_version_wrong_prefix() {
+        assert!(parse_agent_version("other/5/1.0.0").is_none());
+    }
+
+    #[test]
+    fn test_parse_agent_version_invalid_validator_id() {
+        assert!(parse_agent_version("hyperscale/abc/1.0.0").is_none());
+    }
+
+    #[test]
+    fn test_parse_agent_version_too_few_parts() {
+        assert!(parse_agent_version("hyperscale/5").is_none());
+        assert!(parse_agent_version("hyperscale").is_none());
+        assert!(parse_agent_version("").is_none());
+    }
+
+    #[test]
+    fn test_parse_agent_version_legacy_format() {
+        // Old format without validator ID should fail gracefully
+        assert!(parse_agent_version("localdev").is_none());
+        assert!(parse_agent_version("1.0.0").is_none());
+    }
 }

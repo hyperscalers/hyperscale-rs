@@ -28,8 +28,6 @@ serde = { version = "1.0", features = ["derive"] }
 # CLI (for config enums)
 clap = { version = "4", features = ["derive"] }
 
-crossbeam.workspace = true
-hex = "0.4"
 
 # Async runtime
 thiserror.workspace = true
@@ -40,9 +38,8 @@ rayon.workspace = true
 # Lock-free concurrent data structures
 dashmap = "6.1.0"
 
-# Cryptographic primitives for deterministic PeerId derivation
-sha2 = "0.10"
-ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+crossbeam.workspace = true
+hex = "0.4"
 rand = "0.8"
 
 [dev-dependencies]

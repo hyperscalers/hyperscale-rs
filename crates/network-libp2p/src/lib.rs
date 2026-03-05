@@ -13,16 +13,10 @@ mod config;
 mod framing;
 mod inbound_router;
 mod network;
-mod peer_health;
 mod request_manager;
 
-pub use adapter::{
-    compute_peer_id_for_validator, derive_libp2p_keypair, Libp2pAdapter, NetworkError,
-};
+pub use adapter::{generate_random_keypair, Libp2pAdapter, NetworkError};
 pub use codec_pool::CodecPoolHandle;
 pub use config::{Libp2pConfig, VersionInteroperabilityMode};
 pub use network::ProdNetwork;
 pub use request_manager::{RequestManager, RequestManagerConfig};
-
-// Re-export libp2p types used by the production runner
-pub use libp2p::identity::Keypair as Libp2pKeypair;

@@ -15,7 +15,7 @@ use libp2p_stream as stream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info, trace};
+use tracing::{info, trace};
 
 /// libp2p-based network adapter for production use.
 ///
@@ -36,11 +36,8 @@ pub struct Libp2pAdapter {
     priority_channels: PriorityCommandChannels,
 
     /// Known validators (ValidatorId -> PeerId).
-    /// Built from Topology at startup.
+    /// Used by request-response to resolve peer addresses.
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
-
-    /// Reverse mapping (PeerId -> ValidatorId) for inbound message validation.
-    peer_validators: Arc<DashMap<Libp2pPeerId, ValidatorId>>,
 
     /// Shutdown signal sender.
     shutdown_tx: Option<mpsc::Sender<()>>,
@@ -63,7 +60,7 @@ impl Libp2pAdapter {
     /// # Arguments
     ///
     /// * `config` - Network configuration
-    /// * `keypair` - Ed25519 keypair for libp2p identity (derived from validator key)
+    /// * `keypair` - Ed25519 keypair for libp2p transport encryption
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
     /// * `codec_pool` - Handle for async message encoding/decoding
@@ -90,7 +87,7 @@ impl Libp2pAdapter {
         // Configure gossipsub
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(config.gossipsub_heartbeat)
-            .validation_mode(gossipsub::ValidationMode::Strict)
+            .validation_mode(gossipsub::ValidationMode::None)
             .message_id_fn(|msg| {
                 // Use message data + topic as ID for deduplication.
                 // Including the topic allows the same message (e.g., cross-shard transaction)
@@ -106,11 +103,9 @@ impl Libp2pAdapter {
             .build()
             .map_err(|e| NetworkError::NetworkError(e.to_string()))?;
 
-        let gossipsub = gossipsub::Behaviour::new(
-            gossipsub::MessageAuthenticity::Signed(keypair.clone()),
-            gossipsub_config,
-        )
-        .map_err(|e| NetworkError::NetworkError(e.to_string()))?;
+        let gossipsub =
+            gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, gossipsub_config)
+                .map_err(|e| NetworkError::NetworkError(e.to_string()))?;
 
         // Set up Kademlia DHT for peer discovery
         let store = kad::store::MemoryStore::new(local_peer_id);
@@ -133,14 +128,13 @@ impl Libp2pAdapter {
                 .with_max_established_per_peer(Some(2)),
         );
 
-        // Configure Identify protocol
+        // Configure Identify protocol.
+        // Agent version format: "hyperscale/<validator_id>/<version>"
+        // This lets peers discover our ValidatorId for request-response routing.
+        let version = option_env!("HYPERSCALE_VERSION").unwrap_or("localdev");
         let identify_config =
             identify::Config::new("/hyperscale/1.0.0".to_string(), keypair.public())
-                .with_agent_version(
-                    option_env!("HYPERSCALE_VERSION")
-                        .unwrap_or("localdev")
-                        .to_string(),
-                );
+                .with_agent_version(format!("hyperscale/{}/{}", validator_id.0, version));
         let identify = identify::Behaviour::new(identify_config);
 
         // Create behaviour
@@ -193,7 +187,6 @@ impl Libp2pAdapter {
         }
 
         let validator_peers = Arc::new(DashMap::new());
-        let peer_validators = Arc::new(DashMap::new());
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         // Priority-based command channels - commands are routed by message priority.
@@ -210,7 +203,6 @@ impl Libp2pAdapter {
             local_validator_id: validator_id,
             priority_channels,
             validator_peers: validator_peers.clone(),
-            peer_validators: peer_validators.clone(),
             shutdown_tx: Some(shutdown_tx),
             cached_peer_count: cached_peer_count.clone(),
             codec_pool: codec_pool.clone(),
@@ -219,6 +211,7 @@ impl Libp2pAdapter {
 
         // Spawn with panic catching - network loop panics are critical but shouldn't
         // crash the entire node. The process supervisor (systemd/k8s) should restart.
+        let event_loop_validator_peers = validator_peers.clone();
         tokio::spawn(async move {
             let result = std::panic::AssertUnwindSafe(super::event_loop::run(
                 swarm,
@@ -227,12 +220,12 @@ impl Libp2pAdapter {
                 finalization_rx,
                 propagation_rx,
                 background_rx,
-                peer_validators,
                 shutdown_rx,
                 cached_peer_count,
                 shard,
                 config.version_interop_mode,
                 codec_pool,
+                event_loop_validator_peers,
             ))
             .catch_unwind()
             .await;
@@ -264,20 +257,6 @@ impl Libp2pAdapter {
         });
 
         Ok(adapter)
-    }
-
-    /// Register a validator's peer ID mapping.
-    ///
-    /// Called during initialization to build the validator allowlist.
-    pub async fn register_validator(&self, validator_id: ValidatorId, peer_id: Libp2pPeerId) {
-        self.validator_peers.insert(validator_id, peer_id);
-        self.peer_validators.insert(peer_id, validator_id);
-
-        debug!(
-            validator_id = validator_id.0,
-            peer_id = %peer_id,
-            "Registered validator peer"
-        );
     }
 
     /// Subscribe to all message types for a shard.

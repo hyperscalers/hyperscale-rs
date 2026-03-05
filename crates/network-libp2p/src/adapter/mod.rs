@@ -18,4 +18,4 @@ mod swarm_builder;
 pub use self::core::Libp2pAdapter;
 pub use behaviour::STREAM_PROTOCOL;
 pub use error::NetworkError;
-pub use identity::{compute_peer_id_for_validator, derive_libp2p_keypair};
+pub use identity::generate_random_keypair;

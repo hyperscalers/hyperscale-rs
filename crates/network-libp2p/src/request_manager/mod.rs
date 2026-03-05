@@ -32,14 +32,15 @@
 //! ```
 
 mod concurrency;
+mod peer_health;
 mod retry;
 mod stream;
 mod timeout;
 
 use crate::adapter::{Libp2pAdapter, NetworkError};
-use crate::peer_health::{PeerHealthConfig, PeerHealthTracker};
 use bytes::Bytes;
 use libp2p::PeerId;
+use peer_health::{PeerHealthConfig, PeerHealthTracker};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -269,7 +270,7 @@ pub struct RequestManagerStats {
     /// Global success rate across all peers.
     pub global_success_rate: f64,
     /// Detailed peer health statistics.
-    pub health_stats: crate::peer_health::PeerHealthStats,
+    pub health_stats: peer_health::PeerHealthStats,
 }
 
 #[cfg(test)]

@@ -264,7 +264,6 @@ async fn test_production_runner_with_network() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     use hyperscale_network_libp2p::Libp2pConfig;
-    use libp2p::identity;
 
     let fixtures = TestFixtures::new(42, 1);
 
@@ -274,7 +273,6 @@ async fn test_production_runner_with_network() {
     let storage = RocksDbStorage::open(&db_path).unwrap();
     let storage = Arc::new(storage);
 
-    let ed25519_keypair = identity::Keypair::generate_ed25519();
     let network_config = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -288,7 +286,7 @@ async fn test_production_runner_with_network() {
             .signing_key(fixtures.signing_key(0))
             .bft_config(BftConfig::default())
             .storage(storage)
-            .network(network_config, ed25519_keypair)
+            .network(network_config)
             .build(),
     )
     .await;
@@ -330,7 +328,6 @@ async fn test_graceful_shutdown() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
     use hyperscale_network_libp2p::Libp2pConfig;
-    use libp2p::identity;
 
     let fixtures = TestFixtures::new(42, 1);
 
@@ -340,7 +337,6 @@ async fn test_graceful_shutdown() {
     let storage = RocksDbStorage::open(&db_path).unwrap();
     let storage = Arc::new(storage);
 
-    let ed25519_keypair = identity::Keypair::generate_ed25519();
     let network_config = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -352,7 +348,7 @@ async fn test_graceful_shutdown() {
         .signing_key(fixtures.signing_key(0))
         .bft_config(BftConfig::default())
         .storage(storage)
-        .network(network_config, ed25519_keypair)
+        .network(network_config)
         .build()
         .await
         .unwrap();

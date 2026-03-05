@@ -51,7 +51,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics as metrics;
 use hyperscale_network_libp2p::ProdNetwork;
 use hyperscale_network_libp2p::{
-    compute_peer_id_for_validator, Libp2pAdapter, Libp2pConfig, Libp2pKeypair, NetworkError,
+    generate_random_keypair, Libp2pAdapter, Libp2pConfig, NetworkError,
 };
 use hyperscale_storage::{
     CommittableSubstateDatabase, ConsensusStore, DatabaseUpdates, DbPartitionKey, DbSortKey,
@@ -177,7 +177,6 @@ pub struct ProductionRunnerBuilder {
     dispatch: Option<Arc<PooledDispatch>>,
     storage: Option<Arc<RocksDbStorage>>,
     network_config: Option<Libp2pConfig>,
-    ed25519_keypair: Option<Libp2pKeypair>,
     channel_capacity: usize,
     rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
     mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
@@ -211,7 +210,6 @@ impl ProductionRunnerBuilder {
             dispatch: None,
             storage: None,
             network_config: None,
-            ed25519_keypair: None,
             channel_capacity: 10_000,
             rpc_status: None,
             mempool_snapshot: None,
@@ -260,10 +258,9 @@ impl ProductionRunnerBuilder {
         self
     }
 
-    /// Set the network configuration and Ed25519 keypair for libp2p.
-    pub fn network(mut self, config: Libp2pConfig, keypair: Libp2pKeypair) -> Self {
+    /// Set the network configuration for libp2p.
+    pub fn network(mut self, config: Libp2pConfig) -> Self {
         self.network_config = Some(config);
-        self.ed25519_keypair = Some(keypair);
         self
     }
 
@@ -348,9 +345,8 @@ impl ProductionRunnerBuilder {
         let network_config = self
             .network_config
             .ok_or_else(|| RunnerError::SendError("network is required".into()))?;
-        let ed25519_keypair = self
-            .ed25519_keypair
-            .ok_or_else(|| RunnerError::SendError("network keypair is required".into()))?;
+
+        let ed25519_keypair = generate_random_keypair();
 
         let validator_id = topology.local_validator_id();
         let local_shard = topology.local_shard();
@@ -430,16 +426,6 @@ impl ProductionRunnerBuilder {
 
         // Subscribe to local shard topics.
         adapter.subscribe_shard(local_shard).await?;
-
-        // Register ALL validators from the global set for peer validation.
-        // Cross-shard transactions are gossiped between shards, so we need
-        // all validators, not just local committee.
-        for validator in &topology.global_validator_set().validators {
-            let peer_id = compute_peer_id_for_validator(&validator.public_key);
-            adapter
-                .register_validator(validator.validator_id, peer_id)
-                .await;
-        }
 
         // ── Create RequestManager ────────────────────────────────────────
         let request_manager = Arc::new(hyperscale_network_libp2p::RequestManager::new(

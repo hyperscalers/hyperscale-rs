@@ -48,7 +48,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use hyperscale_bft::BftConfig;
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_network_libp2p::{derive_libp2p_keypair, VersionInteroperabilityMode};
+use hyperscale_network_libp2p::VersionInteroperabilityMode;
 use hyperscale_production::rpc::{RpcServer, RpcServerConfig};
 use hyperscale_production::Libp2pConfig;
 use hyperscale_production::{
@@ -1171,14 +1171,6 @@ async fn main() -> Result<()> {
         "Loaded signing keypair"
     );
 
-    // Derive libp2p identity deterministically from signing key
-    // This ensures PeerIds are predictable and can be computed from public keys
-    let p2p_identity = derive_libp2p_keypair(&signing_keypair.public_key());
-    info!(
-        peer_id = %p2p_identity.public().to_peer_id(),
-        "Derived p2p identity from signing key"
-    );
-
     // Build topology
     let topology = build_topology(&config, &signing_keypair)?;
     info!(
@@ -1233,7 +1225,7 @@ async fn main() -> Result<()> {
         .bft_config(bft_config)
         .dispatch(dispatch)
         .storage(storage)
-        .network(network_config, p2p_identity)
+        .network(network_config)
         .rpc_status(rpc_node_status.clone())
         .mempool_snapshot(rpc_mempool_snapshot.clone())
         .sync_status(rpc_sync_status.clone())
