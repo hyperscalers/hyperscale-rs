@@ -1,12 +1,17 @@
 //! Node state machine.
 
 use hyperscale_bft::{BftConfig, BftState, RecoveredState};
-use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
+use hyperscale_core::{Action, ProtocolEvent, ProvisionVerificationResult, StateMachine, TimerId};
 use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
 use hyperscale_provisions::ProvisionCoordinator;
-use hyperscale_types::{Block, BlockHeight, Bls12381G1PrivateKey, Hash, ShardGroupId, Topology};
+use hyperscale_types::{
+    Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommitmentProof,
+    CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction,
+    ShardGroupId, Topology, TransactionAbort, TransactionCertificate, TransactionDefer,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
@@ -14,6 +19,20 @@ use tracing::instrument;
 /// Index type for simulation-only node routing.
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
+
+// ─── Constants ──────────────────────────────────────────────────────────
+
+/// How many blocks a cross-shard transaction can wait before being aborted.
+const EXECUTION_TIMEOUT_BLOCKS: u64 = 30;
+
+/// Maximum number of times a timed-out transaction can be retried.
+const MAX_RETRIES: u32 = 3;
+
+/// How many blocks to retain tombstones in the mempool (gossip deduplication).
+const TOMBSTONE_RETENTION_BLOCKS: u64 = 1000;
+
+/// Maximum age for speculative execution results before cleanup.
+const SPECULATIVE_MAX_AGE: Duration = Duration::from_secs(30);
 
 /// Combined node state machine.
 ///
@@ -67,6 +86,18 @@ impl std::fmt::Debug for NodeStateMachine {
             .field("now", &self.now)
             .finish()
     }
+}
+
+/// Inputs gathered for building a block proposal.
+///
+/// Used by both `ProposalTimer` and `QuorumCertificateFormed` handlers
+/// to avoid duplicating the ready-transaction gathering logic.
+struct ProposalInputs {
+    ready_txs: ReadyTransactions,
+    commitment_proofs: HashMap<Hash, CommitmentProof>,
+    deferred: Vec<TransactionDefer>,
+    aborted: Vec<TransactionAbort>,
+    certificates: Vec<Arc<TransactionCertificate>>,
 }
 
 impl NodeStateMachine {
@@ -146,6 +177,8 @@ impl NodeStateMachine {
         }
     }
 
+    // ─── Accessors ──────────────────────────────────────────────────────
+
     /// Get this node's index.
     pub fn node_index(&self) -> NodeIndex {
         self.node_index
@@ -205,6 +238,63 @@ impl NodeStateMachine {
         // implicitly via the proposal timer (HotStuff-2 style)
     }
 
+    // ─── Shared Helpers ─────────────────────────────────────────────────
+
+    /// Build commitment proofs for priority transactions.
+    ///
+    /// Returns a HashMap mapping transaction hash to CommitmentProof for all
+    /// priority transactions (cross-shard with verified provisions). This is included
+    /// in the block to make it self-contained for validation.
+    ///
+    /// Only priority transactions need proofs - they are already classified by the
+    /// mempool as having verified provisions.
+    fn build_commitment_proofs(
+        &self,
+        ready_txs: &ReadyTransactions,
+    ) -> HashMap<Hash, CommitmentProof> {
+        let mut proofs = HashMap::new();
+
+        // Only priority transactions have verified provisions
+        for tx in &ready_txs.priority {
+            let tx_hash = tx.hash();
+            if let Some(proof) = self.provisions.build_commitment_proof(&tx_hash) {
+                proofs.insert(tx_hash, proof);
+            }
+        }
+
+        proofs
+    }
+
+    /// Gather all inputs needed for a block proposal.
+    ///
+    /// Used by both `on_proposal_timer` and `on_qc_formed` to avoid duplicating
+    /// the ready-transaction + deferred + aborted + certificates gathering logic.
+    fn gather_proposal_inputs(&self, pending_txs: usize, pending_certs: usize) -> ProposalInputs {
+        let max_txs = self.bft.config().max_transactions_per_block;
+        let ready_txs = self
+            .mempool
+            .ready_transactions(max_txs, pending_txs, pending_certs);
+        let commitment_proofs = self.build_commitment_proofs(&ready_txs);
+        let deferred = self.livelock.get_pending_deferrals().to_vec();
+        let current_height = BlockHeight(self.bft.committed_height() + 1);
+        let aborted = self.mempool.get_timed_out_transactions(
+            current_height,
+            EXECUTION_TIMEOUT_BLOCKS,
+            MAX_RETRIES,
+        );
+        let certificates = self.execution.get_finalized_certificates();
+
+        ProposalInputs {
+            ready_txs,
+            commitment_proofs,
+            deferred,
+            aborted,
+            certificates,
+        }
+    }
+
+    // ─── Event Handlers ─────────────────────────────────────────────────
+
     /// Handle cleanup timer.
     #[instrument(skip(self))]
     fn on_cleanup_timer(&mut self) -> Vec<Action> {
@@ -228,43 +318,414 @@ impl NodeStateMachine {
         actions.extend(self.bft.check_sync_health());
 
         // Clean up old tombstones in mempool to prevent unbounded memory growth.
-        // Retain tombstones for 1000 blocks (plenty of time for gossip propagation).
-        const TOMBSTONE_RETENTION_BLOCKS: u64 = 1000;
         let current_height = BlockHeight(self.bft.committed_height());
         self.mempool
             .cleanup_old_tombstones(current_height, TOMBSTONE_RETENTION_BLOCKS);
 
-        // Clean up stale speculative execution results (30 second timeout)
-        const SPECULATIVE_MAX_AGE: Duration = Duration::from_secs(30);
+        // Clean up stale speculative execution results
         self.execution
             .cleanup_stale_speculative(SPECULATIVE_MAX_AGE);
 
         actions
     }
 
-    /// Build commitment proofs for priority transactions.
-    ///
-    /// Returns a HashMap mapping transaction hash to CommitmentProof for all
-    /// priority transactions (cross-shard with verified provisions). This is included
-    /// in the block to make it self-contained for validation.
-    ///
-    /// Only priority transactions need proofs - they are already classified by the
-    /// mempool as having verified provisions.
-    fn build_commitment_proofs(
-        &self,
-        ready_txs: &hyperscale_types::ReadyTransactions,
-    ) -> std::collections::HashMap<hyperscale_types::Hash, hyperscale_types::CommitmentProof> {
-        let mut proofs = std::collections::HashMap::new();
+    /// Handle proposal timer — propose a block or advance the round on timeout.
+    fn on_proposal_timer(&mut self) -> Vec<Action> {
+        // Check if we should advance the round due to timeout.
+        // Delegated to BftState which owns timeout tracking.
+        if let Some(actions) = self.bft.check_round_timeout() {
+            let current_height = BlockHeight(self.bft.committed_height() + 1);
 
-        // Only priority transactions have verified provisions
-        for tx in &ready_txs.priority {
-            let tx_hash = tx.hash();
-            if let Some(proof) = self.provisions.build_commitment_proof(&tx_hash) {
-                proofs.insert(tx_hash, proof);
+            // Notify execution of view change to pause speculation temporarily
+            self.execution.on_view_change(current_height.0);
+
+            return actions;
+        }
+
+        // Normal proposal timer - try to propose if we're the proposer
+        //
+        // Account for pipelining: multiple blocks can be proposed before any commit.
+        // We must count txs/certs in ALL pending blocks to avoid exceeding in-flight limits.
+        let (pending_txs, pending_certs) = self.bft.pending_block_tx_cert_counts();
+
+        // Get certificates we're about to propose - these also reduce in-flight
+        let certificates = self.execution.get_finalized_certificates();
+        let new_certs = certificates.len();
+
+        let max_txs = self.bft.config().max_transactions_per_block;
+        let ready_txs = self.mempool.ready_transactions(
+            max_txs,
+            pending_txs,               // txs in uncommitted pipeline blocks
+            pending_certs + new_certs, // certs in pipeline + certs we're proposing
+        );
+        let commitment_proofs = self.build_commitment_proofs(&ready_txs);
+        let deferred = self.livelock.get_pending_deferrals().to_vec();
+        let current_height = BlockHeight(self.bft.committed_height() + 1);
+        let aborted = self.mempool.get_timed_out_transactions(
+            current_height,
+            EXECUTION_TIMEOUT_BLOCKS,
+            MAX_RETRIES,
+        );
+
+        // BftState handles state_root computation internally after filtering certificates
+        self.bft.on_proposal_timer(
+            &ready_txs,
+            deferred,
+            aborted,
+            certificates,
+            commitment_proofs,
+        )
+    }
+
+    /// Handle a received block header — validate in-flight limits and trigger speculative execution.
+    fn on_block_header_received(
+        &mut self,
+        header: BlockHeader,
+        manifest: BlockManifest,
+    ) -> Vec<Action> {
+        // Total transaction count across all sections
+        let total_tx_count = manifest.transaction_count();
+
+        // Validate in-flight limits only for the next block after committed height.
+        // For blocks further ahead, skip validation - validators at different heights
+        // have different in_flight() counts, causing split votes and view changes.
+        let committed_height = self.bft.committed_height();
+        let is_next_block = header.height.0 == committed_height + 1;
+
+        if is_next_block {
+            let current_in_flight = self.mempool.in_flight();
+            let certs_in_block = manifest.cert_hashes.len();
+            let config = self.mempool.config();
+            let soft_limit = config.max_in_flight;
+            let hard_limit = config.max_in_flight_hard_limit;
+
+            // Retry and priority transactions bypass soft limit
+            // Only "other" transactions (tx_hashes) are subject to soft limit
+            let without_proofs = manifest.tx_hashes.len();
+
+            let new_in_flight = current_in_flight
+                .saturating_add(total_tx_count)
+                .saturating_sub(certs_in_block);
+
+            // Reject if exceeding hard limit AND making things worse.
+            // Allow blocks that don't increase in-flight (prevents deadlock).
+            let would_exceed = new_in_flight > hard_limit;
+            let would_increase = new_in_flight > current_in_flight;
+
+            if would_exceed && would_increase {
+                tracing::warn!(
+                    current_in_flight,
+                    certs_in_block,
+                    proposed_tx_count = total_tx_count,
+                    new_in_flight,
+                    hard_limit,
+                    block_hash = ?header.hash(),
+                    height = header.height.0,
+                    "Rejecting block that would exceed in-flight hard limit"
+                );
+                return vec![];
+            }
+
+            // Soft limit: only allow TXs with proofs when at limit
+            // Note: retry_hashes and priority_hashes bypass this check
+            if current_in_flight >= soft_limit && without_proofs > 0 {
+                tracing::warn!(
+                    current_in_flight,
+                    soft_limit,
+                    txs_without_proofs = without_proofs,
+                    block_hash = ?header.hash(),
+                    height = header.height.0,
+                    "Rejecting block with non-priority transactions while at soft limit"
+                );
+                return vec![];
             }
         }
 
-        proofs
+        let mempool_txs = self.mempool.transactions_by_hash();
+        let local_certs = self.execution.finalized_certificates_by_hash();
+
+        // Trigger speculative execution for single-shard transactions
+        // This hides execution latency behind consensus latency
+        let block_hash = header.hash();
+        let height = header.height.0;
+        let all_tx_hashes: Vec<_> = manifest.all_tx_hashes().collect();
+        let transactions: Vec<_> = all_tx_hashes
+            .iter()
+            .filter_map(|h| mempool_txs.get(*h).cloned())
+            .collect();
+        let spec_actions =
+            self.execution
+                .trigger_speculative_execution(block_hash, height, transactions);
+
+        let mut actions = self
+            .bft
+            .on_block_header(header, manifest, &mempool_txs, &local_certs);
+        actions.extend(spec_actions);
+        actions
+    }
+
+    /// Handle QC formed — may trigger immediate next proposal.
+    fn on_qc_formed(&mut self, block_hash: Hash, qc: QuorumCertificate) -> Vec<Action> {
+        // Count transactions and certificates in the block that will be committed.
+        // This is critical for respecting in-flight limits: the BlockCommitted
+        // event won't be processed until after we select transactions, so we
+        // need to preemptively account for:
+        // - Transactions that will INCREASE in-flight (new commits)
+        // - Certificates that will DECREASE in-flight (completed transactions)
+        let (pending_tx_count, pending_cert_count) = self.bft.pending_commit_counts(&qc);
+
+        let inputs = self.gather_proposal_inputs(pending_tx_count, pending_cert_count);
+
+        // BftState handles state_root computation internally after filtering certificates
+        self.bft.on_qc_formed(
+            block_hash,
+            qc,
+            &inputs.ready_txs,
+            inputs.deferred,
+            inputs.aborted,
+            inputs.certificates,
+            inputs.commitment_proofs,
+        )
+    }
+
+    /// Handle JMT state commit completion — update tracked state and notify BFT.
+    fn on_state_commit_complete(
+        &mut self,
+        height: u64,
+        state_version: u64,
+        state_root: Hash,
+    ) -> Vec<Action> {
+        let (prev_height, prev_version, _) = self.last_committed_state;
+
+        // Update if this is a newer height OR if it's genesis bootstrap (height=0
+        // with a higher version than we started with). The genesis case handles
+        // when Radix Engine bootstrap populates the JMT at height 0 after state
+        // machine initialization.
+        let is_newer_height = height > prev_height;
+        let is_genesis_bootstrap = height == 0 && state_version > prev_version;
+
+        if is_newer_height || is_genesis_bootstrap {
+            self.last_committed_state = (height, state_version, state_root);
+
+            tracing::debug!(
+                height,
+                state_version,
+                state_root = ?state_root,
+                is_genesis_bootstrap,
+                "JMT state commit complete"
+            );
+        }
+
+        // Notify BFT so it can update its committed state tracking.
+        // BFT uses this as the source of truth for state_version in block headers,
+        // preventing speculative version propagation that causes deadlocks.
+        self.bft.on_state_commit_complete(state_version, state_root)
+    }
+
+    /// Handle block committed — notify all subsystems in the correct order.
+    ///
+    /// Order invariants:
+    /// 1. Register cross-shard TXs with livelock BEFORE processing deferrals
+    /// 2. Cleanup deferred/aborted/retried execution state BEFORE passing new TXs
+    /// 3. Process CrossShardTxRegistered continuations BEFORE other exec actions
+    fn on_block_committed(&mut self, block_hash: Hash, height: u64, block: Block) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let block_height = BlockHeight(height);
+
+        // Register newly committed cross-shard TXs with livelock for cycle detection.
+        // Must happen BEFORE livelock.on_block_committed() processes deferrals.
+        for tx in block.all_transactions() {
+            if self.livelock.is_cross_shard(tx) {
+                self.livelock.on_cross_shard_committed(tx, block_height);
+            }
+        }
+
+        // Livelock: process deferrals/aborts/certs, add tombstones, cleanup tracking
+        self.livelock.on_block_committed(&block);
+
+        // Cleanup execution state for deferred transactions.
+        // This must happen BEFORE passing new transactions to execution,
+        // so that retries can be processed fresh.
+        for deferral in &block.deferred {
+            self.execution.cleanup_transaction(&deferral.tx_hash);
+        }
+
+        // Cleanup execution state for aborted transactions
+        for abort in &block.aborted {
+            self.execution.cleanup_transaction(&abort.tx_hash);
+        }
+
+        // Cleanup execution state for original transactions superseded by retries.
+        // When a retry T' is committed, the original T's execution state must be
+        // cleaned up so T' can execute fresh. The mempool marks T as Retried and
+        // releases its locks; here we clean up execution tracking.
+        for retry_tx in &block.retry_transactions {
+            let original_hash = retry_tx.original_hash();
+            // Only cleanup if the original is different from the retry
+            // (original_hash returns self.hash() for non-retries, but retry_transactions
+            // should only contain actual retries)
+            if original_hash != retry_tx.hash() {
+                self.execution.cleanup_transaction(&original_hash);
+            }
+        }
+
+        // Remove committed certificates from execution state.
+        // They've been included in this block, so don't need to be proposed again.
+        // Also invalidate any speculative results that conflict with these writes.
+        for cert in &block.certificates {
+            self.execution
+                .remove_finalized_certificate(&cert.transaction_hash);
+            // Invalidate speculative results that read from nodes being written
+            self.execution.invalidate_speculative_on_commit(cert);
+        }
+
+        // Pass all transactions from block to execution (no need for mempool lookup).
+        // NOTE: execution.on_block_committed emits CrossShardTxRegistered events, which
+        // will be processed by the coordinator via Continuation actions.
+        let all_txs: Vec<_> = block.all_transactions().cloned().collect();
+        let exec_actions = self.execution.on_block_committed(
+            block_hash,
+            height,
+            block.header.timestamp,
+            block.header.proposer,
+            block.header.state_version,
+            all_txs,
+        );
+
+        // Process CrossShardTxRegistered events immediately so coordinator has
+        // registrations before any subsequent provisions arrive.
+        // This ensures ProvisionAccepted can be emitted for livelock.
+        for action in &exec_actions {
+            if let Action::Continuation(ProtocolEvent::CrossShardTxRegistered {
+                tx_hash,
+                required_shards,
+                committed_height,
+            }) = action
+            {
+                let registration = hyperscale_provisions::TxRegistration {
+                    required_shards: required_shards.clone(),
+                    registered_at: *committed_height,
+                };
+                actions.extend(self.provisions.on_tx_registered(*tx_hash, registration));
+            }
+        }
+        actions.extend(exec_actions);
+
+        // Also let mempool handle it (marks transactions as committed, processes deferrals/aborts)
+        actions.extend(self.mempool.on_block_committed_full(&block));
+
+        // Let provisions coordinator handle cleanup (certificates, aborts, deferrals)
+        actions.extend(self.provisions.on_block_committed(&block));
+
+        actions
+    }
+
+    /// Handle state provisions verified — notify mempool and coordinator.
+    fn on_state_provisions_verified(
+        &mut self,
+        results: Vec<ProvisionVerificationResult>,
+        committed_header: Option<CommittedBlockHeader>,
+    ) -> Vec<Action> {
+        for result in &results {
+            if result.valid {
+                self.mempool.on_provision_verified(result.tx_hash);
+            }
+        }
+        self.provisions
+            .on_state_provisions_verified(results, committed_header)
+    }
+
+    /// Handle transaction executed — notify mempool and check pending blocks.
+    fn on_transaction_executed(&mut self, tx_hash: Hash, accepted: bool) -> Vec<Action> {
+        // Notify mempool
+        let mut actions = self.mempool.on_transaction_executed(tx_hash, accepted);
+
+        // Check if any pending blocks are now complete with this certificate
+        let local_certs = self.execution.finalized_certificates_by_hash();
+        actions.extend(
+            self.bft
+                .check_pending_blocks_for_certificate(tx_hash, &local_certs),
+        );
+
+        actions
+    }
+
+    /// Handle transaction gossip received — add to mempool and check pending blocks.
+    fn on_transaction_gossip_received(
+        &mut self,
+        tx: Arc<RoutableTransaction>,
+        submitted_locally: bool,
+    ) -> Vec<Action> {
+        // Only add to our mempool if this transaction involves our shard.
+        // Cross-shard transactions that don't touch our shard should be ignored.
+        if !self.topology.involves_local_shard(&tx) {
+            return vec![];
+        }
+
+        let tx_hash = tx.hash();
+        let mut actions = self
+            .mempool
+            .on_transaction_gossip_arc(tx, submitted_locally);
+
+        // Check if any pending blocks are now complete
+        let mempool_map = self.mempool.as_hash_map();
+        actions.extend(
+            self.bft
+                .check_pending_blocks_for_transaction(tx_hash, &mempool_map),
+        );
+
+        actions
+    }
+
+    /// Handle sync complete — resume cleanup timer.
+    fn on_sync_complete(&mut self) -> Vec<Action> {
+        let mut actions = self.bft.on_sync_complete();
+        // Reschedule the cleanup timer. During sync, the cleanup timer
+        // fires StartSync actions which don't reschedule the timer.
+        // Now that sync is complete, we need to restart the cleanup timer
+        // to resume periodic fetch checks and sync health monitoring.
+        actions.push(Action::SetTimer {
+            id: TimerId::Cleanup,
+            duration: self.bft.config().cleanup_interval,
+        });
+        actions
+    }
+
+    /// Handle fetched certificates delivered — verify each against topology.
+    fn on_certificate_fetch_delivered(
+        &mut self,
+        block_hash: Hash,
+        certificates: Vec<TransactionCertificate>,
+    ) -> Vec<Action> {
+        // Verify each fetched certificate's embedded ExecutionCertificates against
+        // our current topology. This ensures we don't accept forged certificates
+        // from Byzantine peers.
+        let mut actions = Vec::new();
+        for cert in certificates {
+            actions.extend(self.execution.verify_fetched_certificate(block_hash, cert));
+        }
+        actions
+    }
+
+    /// Handle a gossiped certificate that has been fully verified.
+    fn on_gossiped_certificate_verified(
+        &mut self,
+        certificate: Arc<TransactionCertificate>,
+    ) -> Vec<Action> {
+        let tx_hash = certificate.transaction_hash;
+        let accepted = certificate.is_accepted();
+
+        // Cancel any ongoing local certificate building
+        self.execution.cancel_certificate_building(&tx_hash);
+
+        // Add to finalized certificates if not already present
+        self.execution.add_verified_certificate(certificate);
+
+        // Notify mempool that transaction is finalized
+        vec![Action::Continuation(ProtocolEvent::TransactionExecuted {
+            tx_hash,
+            accepted,
+        })]
     }
 }
 
@@ -276,191 +737,24 @@ impl StateMachine for NodeStateMachine {
         height = self.bft.committed_height(),
     ))]
     fn handle(&mut self, event: ProtocolEvent) -> Vec<Action> {
-        // Route event to appropriate sub-state machine
         match event {
-            // Timer events
+            // ── Timers ───────────────────────────────────────────────────
             ProtocolEvent::CleanupTimer => self.on_cleanup_timer(),
+            ProtocolEvent::ProposalTimer => self.on_proposal_timer(),
 
-            // ProposalTimer handles both proposal AND implicit round advancement
-            ProtocolEvent::ProposalTimer => {
-                // Check if we should advance the round due to timeout.
-                // Delegated to BftState which owns timeout tracking.
-                if let Some(actions) = self.bft.check_round_timeout() {
-                    let current_height =
-                        hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
-
-                    // Notify execution of view change to pause speculation temporarily
-                    self.execution.on_view_change(current_height.0);
-
-                    return actions;
-                }
-
-                // Normal proposal timer - try to propose if we're the proposer
-                //
-                // Account for pipelining: multiple blocks can be proposed before any commit.
-                // We must count txs/certs in ALL pending blocks to avoid exceeding in-flight limits.
-                let (pending_txs, pending_certs) = self.bft.pending_block_tx_cert_counts();
-
-                // Get certificates we're about to propose - these also reduce in-flight
-                let certificates = self.execution.get_finalized_certificates();
-                let new_certs = certificates.len();
-
-                let max_txs = self.bft.config().max_transactions_per_block;
-                let ready_txs = self.mempool.ready_transactions(
-                    max_txs,
-                    pending_txs,               // txs in uncommitted pipeline blocks
-                    pending_certs + new_certs, // certs in pipeline + certs we're proposing
-                );
-                let commitment_proofs = self.build_commitment_proofs(&ready_txs);
-                // Get pending deferrals from livelock state
-                let deferred = self.livelock.get_pending_deferrals().to_vec();
-                // Get timed-out transactions from mempool
-                // Config: 30 blocks timeout, max 3 retries (per design Decision #27)
-                let current_height = hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
-                let aborted = self.mempool.get_timed_out_transactions(
-                    current_height,
-                    30, // execution_timeout_blocks
-                    3,  // max_retries
-                );
-
-                // BftState handles state_root computation internally after filtering certificates
-                self.bft.on_proposal_timer(
-                    &ready_txs,
-                    deferred,
-                    aborted,
-                    certificates,
-                    commitment_proofs,
-                )
-            }
-
-            // BlockHeaderReceived needs mempool for transaction lookup and certificates
+            // ── BFT Consensus ────────────────────────────────────────────
             ProtocolEvent::BlockHeaderReceived { header, manifest } => {
-                // Total transaction count across all sections
-                let total_tx_count = manifest.transaction_count();
-
-                // Validate in-flight limits only for the next block after committed height.
-                // For blocks further ahead, skip validation - validators at different heights
-                // have different in_flight() counts, causing split votes and view changes.
-                let committed_height = self.bft.committed_height();
-                let is_next_block = header.height.0 == committed_height + 1;
-
-                if is_next_block {
-                    let current_in_flight = self.mempool.in_flight();
-                    let certs_in_block = manifest.cert_hashes.len();
-                    let config = self.mempool.config();
-                    let soft_limit = config.max_in_flight;
-                    let hard_limit = config.max_in_flight_hard_limit;
-
-                    // Retry and priority transactions bypass soft limit
-                    // Only "other" transactions (tx_hashes) are subject to soft limit
-                    let without_proofs = manifest.tx_hashes.len();
-
-                    let new_in_flight = current_in_flight
-                        .saturating_add(total_tx_count)
-                        .saturating_sub(certs_in_block);
-
-                    // Reject if exceeding hard limit AND making things worse.
-                    // Allow blocks that don't increase in-flight (prevents deadlock).
-                    let would_exceed = new_in_flight > hard_limit;
-                    let would_increase = new_in_flight > current_in_flight;
-
-                    if would_exceed && would_increase {
-                        tracing::warn!(
-                            current_in_flight,
-                            certs_in_block,
-                            proposed_tx_count = total_tx_count,
-                            new_in_flight,
-                            hard_limit,
-                            block_hash = ?header.hash(),
-                            height = header.height.0,
-                            "Rejecting block that would exceed in-flight hard limit"
-                        );
-                        return vec![];
-                    }
-
-                    // Soft limit: only allow TXs with proofs when at limit
-                    // Note: retry_hashes and priority_hashes bypass this check
-                    if current_in_flight >= soft_limit && without_proofs > 0 {
-                        tracing::warn!(
-                            current_in_flight,
-                            soft_limit,
-                            txs_without_proofs = without_proofs,
-                            block_hash = ?header.hash(),
-                            height = header.height.0,
-                            "Rejecting block with non-priority transactions while at soft limit"
-                        );
-                        return vec![];
-                    }
-                }
-
-                let mempool_txs = self.mempool.transactions_by_hash();
-                let local_certs = self.execution.finalized_certificates_by_hash();
-
-                // Trigger speculative execution for single-shard transactions
-                // This hides execution latency behind consensus latency
-                let block_hash = header.hash();
-                let height = header.height.0;
-                let all_tx_hashes: Vec<_> = manifest.all_tx_hashes().collect();
-                let transactions: Vec<_> = all_tx_hashes
-                    .iter()
-                    .filter_map(|h| mempool_txs.get(*h).cloned())
-                    .collect();
-                let spec_actions =
-                    self.execution
-                        .trigger_speculative_execution(block_hash, height, transactions);
-
-                let mut actions =
-                    self.bft
-                        .on_block_header(header, manifest, &mempool_txs, &local_certs);
-                actions.extend(spec_actions);
-                actions
+                self.on_block_header_received(header, manifest)
             }
-
-            // QuorumCertificateFormed may trigger immediate proposal, so pass mempool
             ProtocolEvent::QuorumCertificateFormed { block_hash, qc } => {
-                // Count transactions and certificates in the block that will be committed.
-                // This is critical for respecting in-flight limits: the BlockCommitted
-                // event won't be processed until after we select transactions, so we
-                // need to preemptively account for:
-                // - Transactions that will INCREASE in-flight (new commits)
-                // - Certificates that will DECREASE in-flight (completed transactions)
-                let (pending_tx_count, pending_cert_count) = self.bft.pending_commit_counts(&qc);
-
-                let max_txs = self.bft.config().max_transactions_per_block;
-                let ready_txs =
-                    self.mempool
-                        .ready_transactions(max_txs, pending_tx_count, pending_cert_count);
-                let commitment_proofs = self.build_commitment_proofs(&ready_txs);
-                let deferred = self.livelock.get_pending_deferrals().to_vec();
-                let current_height = hyperscale_types::BlockHeight(self.bft.committed_height() + 1);
-                let aborted = self.mempool.get_timed_out_transactions(
-                    current_height,
-                    30, // execution_timeout_blocks
-                    3,  // max_retries
-                );
-                let certificates = self.execution.get_finalized_certificates();
-
-                // BftState handles state_root computation internally after filtering certificates
-                self.bft.on_qc_formed(
-                    block_hash,
-                    qc,
-                    &ready_txs,
-                    deferred,
-                    aborted,
-                    certificates,
-                    commitment_proofs,
-                )
+                self.on_qc_formed(block_hash, qc)
             }
-
-            // Remote committed block header — store for light-client provision verification.
             ProtocolEvent::RemoteBlockCommitted {
                 committed_header,
                 sender,
             } => self
                 .provisions
                 .on_remote_block_committed(committed_header, sender),
-
-            // Self-contained BFT events - direct delegation
             ProtocolEvent::BlockVoteReceived { vote } => self.bft.on_block_vote(vote),
             ProtocolEvent::BlockReadyToCommit { block_hash, qc } => {
                 self.bft.on_block_ready_to_commit(block_hash, qc)
@@ -486,7 +780,6 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::TransactionRootVerified { block_hash, valid } => {
                 self.bft.on_transaction_root_verified(block_hash, valid)
             }
-
             ProtocolEvent::ProposalBuilt {
                 height,
                 round,
@@ -494,168 +787,28 @@ impl StateMachine for NodeStateMachine {
                 block_hash,
             } => self.bft.on_proposal_built(height, round, block, block_hash),
 
-            // JMT state commit completed - update tracked state and notify BFT
+            // ── State Commit ─────────────────────────────────────────────
             ProtocolEvent::StateCommitComplete {
                 height,
                 state_version,
                 state_root,
-            } => {
-                let (prev_height, prev_version, _) = self.last_committed_state;
+            } => self.on_state_commit_complete(height, state_version, state_root),
 
-                // Update if this is a newer height OR if it's genesis bootstrap (height=0
-                // with a higher version than we started with). The genesis case handles
-                // when Radix Engine bootstrap populates the JMT at height 0 after state
-                // machine initialization.
-                let is_newer_height = height > prev_height;
-                let is_genesis_bootstrap = height == 0 && state_version > prev_version;
-
-                if is_newer_height || is_genesis_bootstrap {
-                    self.last_committed_state = (height, state_version, state_root);
-
-                    tracing::debug!(
-                        height,
-                        state_version,
-                        state_root = ?state_root,
-                        is_genesis_bootstrap,
-                        "JMT state commit complete"
-                    );
-                }
-
-                // Notify BFT so it can update its committed state tracking.
-                // BFT uses this as the source of truth for state_version in block headers,
-                // preventing speculative version propagation that causes deadlocks.
-                self.bft.on_state_commit_complete(state_version, state_root)
-            }
-
-            // Block committed needs special handling - notify multiple subsystems
+            // ── Block Committed ──────────────────────────────────────────
             ProtocolEvent::BlockCommitted {
                 block_hash,
                 height,
                 block,
-            } => {
-                let mut actions = Vec::new();
-                let block_height = hyperscale_types::BlockHeight(height);
+            } => self.on_block_committed(block_hash, height, block),
 
-                // Register newly committed cross-shard TXs with livelock for cycle detection.
-                // Must happen BEFORE livelock.on_block_committed() processes deferrals.
-                for tx in block.all_transactions() {
-                    if self.livelock.is_cross_shard(tx) {
-                        self.livelock.on_cross_shard_committed(tx, block_height);
-                    }
-                }
-
-                // Livelock: process deferrals/aborts/certs, add tombstones, cleanup tracking
-                self.livelock.on_block_committed(&block);
-
-                // Cleanup execution state for deferred transactions
-                // This must happen BEFORE passing new transactions to execution,
-                // so that retries can be processed fresh
-                for deferral in &block.deferred {
-                    self.execution.cleanup_transaction(&deferral.tx_hash);
-                }
-
-                // Cleanup execution state for aborted transactions
-                for abort in &block.aborted {
-                    self.execution.cleanup_transaction(&abort.tx_hash);
-                }
-
-                // Cleanup execution state for original transactions superseded by retries.
-                // When a retry T' is committed, the original T's execution state must be
-                // cleaned up so T' can execute fresh. The mempool marks T as Retried and
-                // releases its locks; here we clean up execution tracking.
-                for retry_tx in &block.retry_transactions {
-                    let original_hash = retry_tx.original_hash();
-                    // Only cleanup if the original is different from the retry
-                    // (original_hash returns self.hash() for non-retries, but retry_transactions
-                    // should only contain actual retries)
-                    if original_hash != retry_tx.hash() {
-                        self.execution.cleanup_transaction(&original_hash);
-                    }
-                }
-
-                // Remove committed certificates from execution state
-                // They've been included in this block, so don't need to be proposed again
-                // Also invalidate any speculative results that conflict with these writes
-                for cert in &block.certificates {
-                    self.execution
-                        .remove_finalized_certificate(&cert.transaction_hash);
-                    // Invalidate speculative results that read from nodes being written
-                    self.execution.invalidate_speculative_on_commit(cert);
-                }
-
-                // Pass all transactions from block to execution (no need for mempool lookup)
-                // NOTE: execution.on_block_committed emits CrossShardTxRegistered events, which
-                // will be processed by the coordinator via Continuation actions.
-                let all_txs: Vec<_> = block.all_transactions().cloned().collect();
-                let exec_actions = self.execution.on_block_committed(
-                    block_hash,
-                    height,
-                    block.header.timestamp,
-                    block.header.proposer,
-                    block.header.state_version,
-                    all_txs,
-                );
-
-                // Process CrossShardTxRegistered events immediately so coordinator has
-                // registrations before any subsequent provisions arrive.
-                // This ensures ProvisionAccepted can be emitted for livelock.
-                for action in &exec_actions {
-                    if let Action::Continuation(ProtocolEvent::CrossShardTxRegistered {
-                        tx_hash,
-                        required_shards,
-                        committed_height,
-                    }) = action
-                    {
-                        let registration = hyperscale_provisions::TxRegistration {
-                            required_shards: required_shards.clone(),
-                            registered_at: *committed_height,
-                        };
-                        actions.extend(self.provisions.on_tx_registered(*tx_hash, registration));
-                    }
-                }
-                actions.extend(exec_actions);
-
-                // Also let mempool handle it (marks transactions as committed, processes deferrals/aborts)
-                actions.extend(self.mempool.on_block_committed_full(&block));
-
-                // Let provisions coordinator handle cleanup (certificates, aborts, deferrals)
-                actions.extend(self.provisions.on_block_committed(&block));
-
-                actions
-            }
-
-            // ═══════════════════════════════════════════════════════════════════════
-            // Provision Events (Byzantine-safe)
-            //
-            // Provisions are routed ONLY to ProvisionCoordinator, which:
-            // 1. Verifies QC + merkle proofs (via VerifyStateProvisions action)
-            // 2. Tracks verified provisions per source shard
-            // 3. Emits ProvisionAccepted when a provision is verified
-            // 4. Emits ProvisioningComplete when ALL required shards are verified
-            //
-            // ExecutionState listens to ProvisioningComplete to trigger execution.
-            // LivelockState listens to ProvisionAccepted for cycle detection.
-            // ═══════════════════════════════════════════════════════════════════════
-            // StateProvisionsReceived: batch of provisions from source shard proposer
+            // ── Provisions ───────────────────────────────────────────────
             ProtocolEvent::StateProvisionsReceived { provisions } => {
                 self.provisions.on_state_provisions_received(provisions)
             }
-
-            // StateProvisionsVerified: batch QC + merkle proof verification completed
             ProtocolEvent::StateProvisionsVerified {
                 results,
                 committed_header,
-            } => {
-                for result in &results {
-                    if result.valid {
-                        self.mempool.on_provision_verified(result.tx_hash);
-                    }
-                }
-                self.provisions
-                    .on_state_provisions_verified(results, committed_header)
-            }
-
-            // CrossShardTxRegistered: route to coordinator for tracking
+            } => self.on_state_provisions_verified(results, committed_header),
             ProtocolEvent::CrossShardTxRegistered {
                 tx_hash,
                 required_shards,
@@ -667,43 +820,27 @@ impl StateMachine for NodeStateMachine {
                 };
                 self.provisions.on_tx_registered(tx_hash, registration)
             }
-
-            // CrossShardTxCompleted: route to coordinator for cleanup
             ProtocolEvent::CrossShardTxCompleted { tx_hash } => {
                 self.provisions.on_tx_completed(&tx_hash)
             }
-
-            // CrossShardTxAborted: route to coordinator for cleanup
             ProtocolEvent::CrossShardTxAborted { tx_hash } => {
                 self.provisions.on_tx_aborted(&tx_hash)
             }
-
-            // ProvisionAccepted: Byzantine-safe cycle detection (per-shard)
-            //
-            // This is the ONLY entry point for livelock cycle detection.
-            // Only verified provisions trigger this event. This prevents
-            // Byzantine validators from triggering false deferrals
-            // by sending forged provisions.
             ProtocolEvent::ProvisionAccepted {
                 tx_hash,
                 source_shard,
                 commitment_proof,
             } => {
-                // Cycle detection in livelock (may queue a deferral)
                 self.livelock
                     .on_provision_accepted(tx_hash, source_shard, &commitment_proof);
-
-                // No actions needed - execution waits for ProvisioningComplete
                 vec![]
             }
-
-            // ProvisioningComplete: All shards have quorum, trigger execution
             ProtocolEvent::ProvisioningComplete {
                 tx_hash,
                 provisions,
             } => self.execution.on_provisioning_complete(tx_hash, provisions),
 
-            // Execution events - direct delegation
+            // ── Execution ────────────────────────────────────────────────
             ProtocolEvent::ExecutionVoteReceived { vote } => self.execution.on_vote(vote),
             ProtocolEvent::ExecutionCertificateReceived { cert } => {
                 self.execution.on_certificate(cert)
@@ -730,271 +867,67 @@ impl StateMachine for NodeStateMachine {
                 .execution
                 .on_speculative_execution_complete(block_hash, tx_hashes),
 
-            // TransactionExecuted is emitted by execution, handled by mempool AND BFT
-            // BFT might have pending blocks waiting for this certificate
+            // ── Transactions ─────────────────────────────────────────────
             ProtocolEvent::TransactionExecuted { tx_hash, accepted } => {
-                // Notify mempool
-                let mut actions = self.mempool.on_transaction_executed(tx_hash, accepted);
-
-                // Check if any pending blocks are now complete with this certificate
-                let local_certs = self.execution.finalized_certificates_by_hash();
-                actions.extend(
-                    self.bft
-                        .check_pending_blocks_for_certificate(tx_hash, &local_certs),
-                );
-
-                actions
+                self.on_transaction_executed(tx_hash, accepted)
             }
-
-            // TransactionGossipReceived: add to mempool AND notify BFT
-            // The BFT might have pending blocks waiting for this transaction
             ProtocolEvent::TransactionGossipReceived {
                 tx,
                 submitted_locally,
-            } => {
-                // Only add to our mempool if this transaction involves our shard.
-                // Cross-shard transactions that don't touch our shard should be ignored.
-                if !self.topology.involves_local_shard(&tx) {
-                    return vec![];
-                }
-
-                let tx_hash = tx.hash();
-                let mut actions = self
-                    .mempool
-                    .on_transaction_gossip_arc(tx, submitted_locally);
-
-                // Check if any pending blocks are now complete
-                let mempool_map = self.mempool.as_hash_map();
-                actions.extend(
-                    self.bft
-                        .check_pending_blocks_for_transaction(tx_hash, &mempool_map),
-                );
-
-                actions
-            }
-
-            // Storage callback events - route to appropriate handler
-            ProtocolEvent::BlockFetched { .. } => {
-                // This is for local storage fetch, not sync
-                // For now, this is a no-op
-                vec![]
-            }
-
-            // Sync protocol events - routed to BFT.
-            // Action::StartSync is emitted by BFT and handled by the runner,
-            // which sends SyncBlockReadyToApply and SyncComplete back.
-            ProtocolEvent::SyncBlockReadyToApply { block, qc } => {
-                self.bft.on_sync_block_ready_to_apply(block, qc)
-            }
-            ProtocolEvent::SyncComplete { .. } => {
-                let mut actions = self.bft.on_sync_complete();
-                // Reschedule the cleanup timer. During sync, the cleanup timer
-                // fires StartSync actions which don't reschedule the timer.
-                // Now that sync is complete, we need to restart the cleanup timer
-                // to resume periodic fetch checks and sync health monitoring.
-                actions.push(Action::SetTimer {
-                    id: TimerId::Cleanup,
-                    duration: self.bft.config().cleanup_interval,
-                });
-                actions
-            }
-            ProtocolEvent::ChainMetadataFetched { height, hash, qc } => {
-                self.bft.on_chain_metadata_fetched(height, hash, qc)
-            }
-
-            // Transaction status changes from execution state machine
+            } => self.on_transaction_gossip_received(tx, submitted_locally),
             ProtocolEvent::TransactionStatusChanged { tx_hash, status } => {
                 self.mempool.update_status(&tx_hash, status)
             }
 
-            // ═══════════════════════════════════════════════════════════════════════
-            // Global Consensus / Epoch Events
-            // TODO: Route to GlobalConsensusState when implemented
-            // ═══════════════════════════════════════════════════════════════════════
-            ProtocolEvent::GlobalConsensusTimer => {
-                // Will be handled by GlobalConsensusState
-                tracing::trace!("GlobalConsensusTimer - not yet implemented");
-                vec![]
-            }
-
-            ProtocolEvent::GlobalBlockReceived { epoch, height, .. } => {
-                tracing::debug!(?epoch, ?height, "GlobalBlockReceived - not yet implemented");
-                vec![]
-            }
-
-            ProtocolEvent::GlobalBlockVoteReceived {
-                block_hash, shard, ..
-            } => {
-                tracing::debug!(
-                    ?block_hash,
-                    ?shard,
-                    "GlobalBlockVoteReceived - not yet implemented"
-                );
-                vec![]
-            }
-
-            ProtocolEvent::GlobalQcFormed { block_hash, epoch } => {
-                tracing::info!(?block_hash, ?epoch, "GlobalQcFormed - not yet implemented");
-                vec![]
-            }
-
-            ProtocolEvent::EpochEndApproaching {
-                current_epoch,
-                end_height,
-            } => {
-                tracing::info!(
-                    ?current_epoch,
-                    ?end_height,
-                    "EpochEndApproaching - not yet implemented"
-                );
-                // TODO: Stop accepting new transactions, drain in-flight
-                vec![]
-            }
-
-            ProtocolEvent::EpochTransitionReady {
-                from_epoch,
-                to_epoch,
-                ..
-            } => {
-                tracing::info!(
-                    ?from_epoch,
-                    ?to_epoch,
-                    "EpochTransitionReady - not yet implemented"
-                );
-                // TODO: Update DynamicTopology, notify subsystems
-                vec![]
-            }
-
-            ProtocolEvent::EpochTransitionComplete {
-                new_epoch,
-                new_shard,
-                is_waiting,
-            } => {
-                tracing::info!(
-                    ?new_epoch,
-                    ?new_shard,
-                    is_waiting,
-                    "EpochTransitionComplete - not yet implemented"
-                );
-                vec![]
-            }
-
-            ProtocolEvent::ValidatorSyncComplete { epoch, shard } => {
-                tracing::info!(
-                    ?epoch,
-                    ?shard,
-                    "ValidatorSyncComplete - not yet implemented"
-                );
-                // TODO: Transition from Waiting to Active state
-                vec![]
-            }
-
-            ProtocolEvent::ShardSplitInitiated {
-                source_shard,
-                new_shard,
-                split_point,
-            } => {
-                tracing::info!(
-                    ?source_shard,
-                    ?new_shard,
-                    split_point,
-                    "ShardSplitInitiated - not yet implemented"
-                );
-                // TODO: Mark shard as splitting in topology
-                vec![]
-            }
-
-            ProtocolEvent::ShardSplitComplete {
-                source_shard,
-                new_shard,
-            } => {
-                tracing::info!(
-                    ?source_shard,
-                    ?new_shard,
-                    "ShardSplitComplete - not yet implemented"
-                );
-                vec![]
-            }
-
-            ProtocolEvent::ShardMergeInitiated {
-                shard_a,
-                shard_b,
-                merged_shard,
-            } => {
-                tracing::info!(
-                    ?shard_a,
-                    ?shard_b,
-                    ?merged_shard,
-                    "ShardMergeInitiated - not yet implemented"
-                );
-                vec![]
-            }
-
-            ProtocolEvent::ShardMergeComplete { merged_shard } => {
-                tracing::info!(?merged_shard, "ShardMergeComplete - not yet implemented");
-                vec![]
-            }
-
-            // ═══════════════════════════════════════════════════════════════════════
-            // Transaction Fetch Protocol
-            // BFT emits Action::FetchTransactions; runner handles retries and delivers results.
-            // ═══════════════════════════════════════════════════════════════════════
+            // ── Fetch Protocol ───────────────────────────────────────────
             ProtocolEvent::TransactionFetchDelivered {
                 block_hash,
                 transactions,
             } => self
                 .bft
                 .on_transaction_fetch_received(block_hash, transactions),
-
-            // ═══════════════════════════════════════════════════════════════════════
-            // Certificate Fetch Protocol
-            // BFT emits Action::FetchCertificates; runner handles retries and delivers results.
-            // ═══════════════════════════════════════════════════════════════════════
             ProtocolEvent::CertificateFetchDelivered {
                 block_hash,
                 certificates,
-            } => {
-                // Verify each fetched certificate's embedded ExecutionCertificates against
-                // our current topology. This ensures we don't accept forged certificates
-                // from Byzantine peers.
-                let mut actions = Vec::new();
-                for cert in certificates {
-                    actions.extend(self.execution.verify_fetched_certificate(block_hash, cert));
-                }
-                actions
-            }
-
+            } => self.on_certificate_fetch_delivered(block_hash, certificates),
             ProtocolEvent::FetchedCertificateVerified {
                 block_hash,
                 certificate,
             } => {
-                // Cancel local certificate building - we're using the fetched one
                 self.execution
                     .cancel_certificate_building(&certificate.transaction_hash);
-
-                // Certificate has been verified - add to pending block
                 self.bft
                     .on_certificate_fetch_received(block_hash, vec![Arc::new(certificate)])
             }
-
-            // GossipedCertificateVerified - a gossiped certificate has been verified and persisted.
-            // Cancel local certificate building and add to finalized certificates.
             ProtocolEvent::GossipedCertificateVerified { certificate } => {
-                let tx_hash = certificate.transaction_hash;
-                let accepted = certificate.is_accepted();
-
-                // Cancel any ongoing local certificate building
-                self.execution.cancel_certificate_building(&tx_hash);
-
-                // Add to finalized certificates if not already present
-                self.execution.add_verified_certificate(certificate);
-
-                // Notify mempool that transaction is finalized
-                vec![Action::Continuation(ProtocolEvent::TransactionExecuted {
-                    tx_hash,
-                    accepted,
-                })]
+                self.on_gossiped_certificate_verified(certificate)
             }
+
+            // ── Storage / Sync ───────────────────────────────────────────
+            ProtocolEvent::BlockFetched { .. } => vec![],
+            ProtocolEvent::SyncBlockReadyToApply { block, qc } => {
+                self.bft.on_sync_block_ready_to_apply(block, qc)
+            }
+            ProtocolEvent::SyncComplete { .. } => self.on_sync_complete(),
+            ProtocolEvent::ChainMetadataFetched { height, hash, qc } => {
+                self.bft.on_chain_metadata_fetched(height, hash, qc)
+            }
+
+            // ── Global Consensus / Epoch (not yet implemented) ───────────
+            // When implemented, route to GlobalConsensusState.
+            // The #[instrument] span already logs the specific event name.
+            ProtocolEvent::GlobalConsensusTimer
+            | ProtocolEvent::GlobalBlockReceived { .. }
+            | ProtocolEvent::GlobalBlockVoteReceived { .. }
+            | ProtocolEvent::GlobalQcFormed { .. }
+            | ProtocolEvent::EpochEndApproaching { .. }
+            | ProtocolEvent::EpochTransitionReady { .. }
+            | ProtocolEvent::EpochTransitionComplete { .. }
+            | ProtocolEvent::ValidatorSyncComplete { .. }
+            | ProtocolEvent::ShardSplitInitiated { .. }
+            | ProtocolEvent::ShardSplitComplete { .. }
+            | ProtocolEvent::ShardMergeInitiated { .. }
+            | ProtocolEvent::ShardMergeComplete { .. } => vec![],
         }
     }
 

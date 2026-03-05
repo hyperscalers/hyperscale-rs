@@ -215,6 +215,9 @@ where
     // with external consumers (e.g. RPC handlers in production).
     tx_status_cache: Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>>,
 
+    // Cached local shard peers (committee excluding self) — avoids per-call allocation.
+    cached_local_peers: Vec<ValidatorId>,
+
     // Accumulated outputs from this step (for caller to drain)
     emitted_statuses: Vec<(Hash, hyperscale_types::TransactionStatus)>,
     actions_generated: usize,
@@ -243,6 +246,12 @@ where
     ) -> Self {
         let local_shard = topology.local_shard();
         let validator_id = topology.local_validator_id();
+        let cached_local_peers: Vec<ValidatorId> = topology
+            .committee_for_shard(local_shard)
+            .iter()
+            .filter(|&&v| v != validator_id)
+            .copied()
+            .collect();
         let b = &config.batch;
         let sync_protocol = SyncProtocol::new(config.sync.clone());
         let fetch_protocol = FetchProtocol::new(config.fetch.clone());
@@ -291,6 +300,7 @@ where
                 b.committed_header_window,
             ),
             config,
+            cached_local_peers,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             emitted_statuses: Vec::new(),
             actions_generated: 0,
@@ -450,15 +460,11 @@ where
                 self.pending_validation.remove(&tx_hash);
                 let is_local = submitted_locally || self.locally_submitted.remove(&tx_hash);
                 self.tx_cache.insert(tx_hash, Arc::clone(&tx));
-                let pe = ProtocolEvent::TransactionGossipReceived {
+                self.actions_generated = 0;
+                self.feed_event(ProtocolEvent::TransactionGossipReceived {
                     tx,
                     submitted_locally: is_local,
-                };
-                let actions = self.state.handle(pe);
-                self.actions_generated = actions.len();
-                for action in actions {
-                    self.process_action(action);
-                }
+                });
             }
 
             // Intercept gossip-received transactions for validation.
@@ -624,15 +630,10 @@ where
                 committed_header,
                 sender,
             } => {
-                let pe = ProtocolEvent::RemoteBlockCommitted {
+                self.feed_event(ProtocolEvent::RemoteBlockCommitted {
                     committed_header,
                     sender,
-                };
-                let actions = self.state.handle(pe);
-                self.actions_generated = actions.len();
-                for action in actions {
-                    self.process_action(action);
-                }
+                });
             }
 
             // ── Gossip received (raw bytes) ─────────────────────────────
@@ -667,11 +668,7 @@ where
                     }
                 }
 
-                let actions = self.state.handle(pe);
-                self.actions_generated = actions.len();
-                for action in actions {
-                    self.process_action(action);
-                }
+                self.feed_event(pe);
             }
         }
 
@@ -686,6 +683,18 @@ where
             emitted_statuses: std::mem::take(&mut self.emitted_statuses),
             actions_generated: self.actions_generated,
             timer_ops: std::mem::take(&mut self.pending_timer_ops),
+        }
+    }
+
+    /// Feed a protocol event to the state machine and process all resulting actions.
+    ///
+    /// This is the common pattern used throughout NodeLoop: route an event through
+    /// the state machine, then dispatch each resulting action.
+    fn feed_event(&mut self, event: ProtocolEvent) {
+        let actions = self.state.handle(event);
+        self.actions_generated += actions.len();
+        for action in actions {
+            self.process_action(action);
         }
     }
 
@@ -839,8 +848,71 @@ where
             }
 
             // ═══════════════════════════════════════════════════════════
-            // Storage writes
+            // Storage
             // ═══════════════════════════════════════════════════════════
+            Action::PersistBlock { .. }
+            | Action::PersistTransactionCertificate { .. }
+            | Action::PersistAndBroadcastVote { .. }
+            | Action::FetchBlock { .. }
+            | Action::FetchChainMetadata => {
+                self.process_storage_action(action);
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            // Block commit + notifications
+            // ═══════════════════════════════════════════════════════════
+            Action::EmitCommittedBlock { block, qc } => {
+                self.process_block_commit(block, qc);
+            }
+            Action::EmitTransactionStatus {
+                tx_hash,
+                status,
+                added_at,
+                cross_shard,
+                submitted_locally,
+            } => {
+                debug!(?tx_hash, ?status, "Transaction status");
+                if status.is_final() && submitted_locally {
+                    let now = self.state.now();
+                    let latency_secs = now.saturating_sub(added_at).as_secs_f64();
+                    metrics::record_transaction_finalized(latency_secs, cross_shard);
+                }
+                self.tx_status_cache.insert(tx_hash, status.clone());
+                self.emitted_statuses.push((tx_hash, status));
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            // Sync / Fetch / Provision recovery
+            // ═══════════════════════════════════════════════════════════
+            Action::StartSync { .. }
+            | Action::FetchTransactions { .. }
+            | Action::FetchCertificates { .. }
+            | Action::CancelFetch { .. }
+            | Action::RequestMissingProvisions { .. } => {
+                self.process_sync_fetch_action(action);
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            // Global consensus / epoch (not yet implemented)
+            // ═══════════════════════════════════════════════════════════
+            Action::ProposeGlobalBlock { .. }
+            | Action::BroadcastGlobalBlockVote { .. }
+            | Action::TransitionEpoch { .. }
+            | Action::MarkValidatorReady { .. }
+            | Action::InitiateShardSplit { .. }
+            | Action::CompleteShardSplit { .. }
+            | Action::InitiateShardMerge { .. }
+            | Action::CompleteShardMerge { .. }
+            | Action::PersistEpochConfig { .. }
+            | Action::FetchEpochConfig { .. } => {}
+        }
+    }
+
+    // ─── Action Handler Groups ──────────────────────────────────────────
+
+    /// Process storage read/write actions.
+    fn process_storage_action(&mut self, action: Action) {
+        match action {
             Action::PersistBlock { block, qc } => {
                 let height = block.header.height;
                 ConsensusStore::put_block(&*self.storage, height, &block, &qc);
@@ -872,13 +944,8 @@ where
                     block_hash = ?block_hash,
                     "Persisted own vote"
                 );
-                // Now broadcast.
                 self.network.broadcast_to_shard(shard, &vote);
             }
-
-            // ═══════════════════════════════════════════════════════════
-            // Storage reads (dispatched to execution pool)
-            // ═══════════════════════════════════════════════════════════
             Action::FetchBlock { height } => {
                 let block = self.storage.get_block(height);
                 let _ = self
@@ -896,96 +963,74 @@ where
                     ProtocolEvent::ChainMetadataFetched { height, hash, qc },
                 ));
             }
+            _ => unreachable!(),
+        }
+    }
 
-            // ═══════════════════════════════════════════════════════════
-            // Block commit
-            // ═══════════════════════════════════════════════════════════
-            Action::EmitCommittedBlock { block, qc } => {
-                let block_hash = block.hash();
-                let height = block.header.height;
-                debug!(height = height.0, ?block_hash, "Block committed");
+    /// Process a committed block — apply state, emit metrics, feed sync protocol.
+    fn process_block_commit(
+        &mut self,
+        block: hyperscale_types::Block,
+        qc: hyperscale_types::QuorumCertificate,
+    ) {
+        let block_hash = block.hash();
+        let height = block.header.height;
+        debug!(height = height.0, ?block_hash, "Block committed");
 
-                // Block commit latency: time from proposal timestamp to now.
-                let now_ms = self.state.now().as_millis() as u64;
-                let commit_latency_secs =
-                    (now_ms.saturating_sub(block.header.timestamp)) as f64 / 1000.0;
-                metrics::record_block_committed(height.0, commit_latency_secs);
-                metrics::set_block_height(height.0);
-                metrics::set_txs_with_commitment_proof(block.commitment_proofs.len());
+        // Block commit latency: time from proposal timestamp to now.
+        let now_ms = self.state.now().as_millis() as u64;
+        let commit_latency_secs = (now_ms.saturating_sub(block.header.timestamp)) as f64 / 1000.0;
+        metrics::record_block_committed(height.0, commit_latency_secs);
+        metrics::set_block_height(height.0);
+        metrics::set_txs_with_commitment_proof(block.commitment_proofs.len());
 
-                // Livelock metrics for deferrals in this block.
-                for _deferral in &block.deferred {
-                    metrics::record_livelock_deferral();
-                    metrics::record_livelock_cycle_detected();
-                }
-                metrics::set_livelock_deferred_count(
-                    self.state.livelock().stats().pending_deferrals,
-                );
+        // Livelock metrics for deferrals in this block.
+        for _deferral in &block.deferred {
+            metrics::record_livelock_deferral();
+            metrics::record_livelock_cycle_detected();
+        }
+        metrics::set_livelock_deferred_count(self.state.livelock().stats().pending_deferrals);
 
-                let prepared = self.prepared_commits.lock().unwrap().remove(&block_hash);
+        let prepared = self.prepared_commits.lock().unwrap().remove(&block_hash);
 
-                // Commit state writes (fast path uses prepared handle, slow
-                // path recomputes from certificates).
-                if !block.certificates.is_empty() {
-                    let result = if let Some(prepared) = prepared {
-                        self.storage.commit_prepared_block(prepared)
-                    } else {
-                        self.storage
-                            .commit_block(&block.certificates, self.local_shard)
-                    };
+        // Commit state writes (fast path uses prepared handle, slow
+        // path recomputes from certificates).
+        if !block.certificates.is_empty() {
+            let result = if let Some(prepared) = prepared {
+                self.storage.commit_prepared_block(prepared)
+            } else {
+                self.storage
+                    .commit_block(&block.certificates, self.local_shard)
+            };
 
-                    // Persist committed metadata AFTER state is applied.
-                    ConsensusStore::set_committed_state(&*self.storage, height, block_hash, &qc);
-                    ConsensusStore::prune_own_votes(&*self.storage, height.0);
+            // Persist committed metadata AFTER state is applied.
+            ConsensusStore::set_committed_state(&*self.storage, height, block_hash, &qc);
+            ConsensusStore::prune_own_votes(&*self.storage, height.0);
 
-                    let _ = self.event_sender.send(NodeInput::Protocol(
-                        ProtocolEvent::StateCommitComplete {
-                            height: height.0,
-                            state_version: result.state_version,
-                            state_root: result.state_root,
-                        },
-                    ));
-                } else {
-                    // Empty block — no state changes, but still update
-                    // committed metadata.
-                    ConsensusStore::set_committed_state(&*self.storage, height, block_hash, &qc);
-                    ConsensusStore::prune_own_votes(&*self.storage, height.0);
-                }
+            let _ =
+                self.event_sender
+                    .send(NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
+                        height: height.0,
+                        state_version: result.state_version,
+                        state_root: result.state_root,
+                    }));
+        } else {
+            // Empty block — no state changes, but still update
+            // committed metadata.
+            ConsensusStore::set_committed_state(&*self.storage, height, block_hash, &qc);
+            ConsensusStore::prune_own_votes(&*self.storage, height.0);
+        }
 
-                // Feed committed height to sync protocol.
-                let outputs = self
-                    .sync_protocol
-                    .handle(SyncInput::BlockCommitted { height: height.0 });
-                self.process_sync_outputs(outputs);
-            }
+        // Feed committed height to sync protocol.
+        let outputs = self
+            .sync_protocol
+            .handle(SyncInput::BlockCommitted { height: height.0 });
+        self.process_sync_outputs(outputs);
+    }
 
-            // ═══════════════════════════════════════════════════════════
-            // Notifications
-            // ═══════════════════════════════════════════════════════════
-            Action::EmitTransactionStatus {
-                tx_hash,
-                status,
-                added_at,
-                cross_shard,
-                submitted_locally,
-            } => {
-                debug!(?tx_hash, ?status, "Transaction status");
-                // Only record latency metrics for locally-submitted transactions to
-                // avoid polluting latency histograms with transactions received via
-                // gossip/sync which would have artificially high latencies on lagging
-                // nodes.
-                if status.is_final() && submitted_locally {
-                    let now = self.state.now();
-                    let latency_secs = now.saturating_sub(added_at).as_secs_f64();
-                    metrics::record_transaction_finalized(latency_secs, cross_shard);
-                }
-                self.tx_status_cache.insert(tx_hash, status.clone());
-                self.emitted_statuses.push((tx_hash, status));
-            }
-
-            // ═══════════════════════════════════════════════════════════
-            // Sync/Fetch (protocol state machine + runner I/O)
-            // ═══════════════════════════════════════════════════════════
+    /// Process sync, fetch, and provision recovery actions.
+    fn process_sync_fetch_action(&mut self, action: Action) {
+        match action {
             Action::StartSync {
                 target_height,
                 target_hash,
@@ -1001,13 +1046,11 @@ where
                 proposer,
                 tx_hashes,
             } => {
-                // Feed to FetchProtocol for chunking and concurrency management.
                 self.fetch_protocol.handle(FetchInput::RequestTransactions {
                     block_hash,
                     proposer,
                     tx_hashes,
                 });
-                // Immediately tick to spawn pending fetch operations.
                 let outputs = self.fetch_protocol.handle(FetchInput::Tick);
                 self.process_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
@@ -1017,13 +1060,11 @@ where
                 proposer,
                 cert_hashes,
             } => {
-                // Feed to FetchProtocol for chunking and concurrency management.
                 self.fetch_protocol.handle(FetchInput::RequestCertificates {
                     block_hash,
                     proposer,
                     cert_hashes,
                 });
-                // Immediately tick to spawn pending fetch operations.
                 let outputs = self.fetch_protocol.handle(FetchInput::Tick);
                 self.process_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
@@ -1032,83 +1073,6 @@ where
                 self.fetch_protocol
                     .handle(FetchInput::CancelFetch { block_hash });
             }
-
-            // ═══════════════════════════════════════════════════════════
-            // Global consensus (not yet implemented)
-            // ═══════════════════════════════════════════════════════════
-            Action::ProposeGlobalBlock { epoch, height, .. } => {
-                trace!(?epoch, ?height, "ProposeGlobalBlock - not yet implemented");
-            }
-            Action::BroadcastGlobalBlockVote {
-                block_hash, shard, ..
-            } => {
-                trace!(
-                    ?block_hash,
-                    ?shard,
-                    "BroadcastGlobalBlockVote - not yet implemented"
-                );
-            }
-            Action::TransitionEpoch {
-                from_epoch,
-                to_epoch,
-                ..
-            } => {
-                debug!(
-                    ?from_epoch,
-                    ?to_epoch,
-                    "TransitionEpoch - not yet implemented"
-                );
-            }
-            Action::MarkValidatorReady { epoch, shard } => {
-                debug!(?epoch, ?shard, "MarkValidatorReady - not yet implemented");
-            }
-            Action::InitiateShardSplit {
-                source_shard,
-                new_shard,
-                split_point,
-            } => {
-                trace!(
-                    ?source_shard,
-                    ?new_shard,
-                    split_point,
-                    "InitiateShardSplit - not yet implemented"
-                );
-            }
-            Action::CompleteShardSplit {
-                source_shard,
-                new_shard,
-            } => {
-                trace!(
-                    ?source_shard,
-                    ?new_shard,
-                    "CompleteShardSplit - not yet implemented"
-                );
-            }
-            Action::InitiateShardMerge {
-                shard_a,
-                shard_b,
-                merged_shard,
-            } => {
-                trace!(
-                    ?shard_a,
-                    ?shard_b,
-                    ?merged_shard,
-                    "InitiateShardMerge - not yet implemented"
-                );
-            }
-            Action::CompleteShardMerge { merged_shard } => {
-                trace!(?merged_shard, "CompleteShardMerge - not yet implemented");
-            }
-            Action::PersistEpochConfig { .. } => {
-                debug!("PersistEpochConfig - not yet implemented");
-            }
-            Action::FetchEpochConfig { epoch } => {
-                debug!(?epoch, "FetchEpochConfig - not yet implemented");
-            }
-
-            // ═══════════════════════════════════════════════════════════
-            // Provision fallback recovery
-            // ═══════════════════════════════════════════════════════════
             Action::RequestMissingProvisions {
                 source_shard,
                 block_height,
@@ -1123,7 +1087,6 @@ where
                     peer_count = peers.len(),
                     "Requesting missing provisions from source shard"
                 );
-                // Feed into provision fetch protocol for peer-rotating retry.
                 let outputs = self
                     .provision_fetch_protocol
                     .handle(ProvisionFetchInput::Request {
@@ -1134,13 +1097,13 @@ where
                         preferred_peer: proposer,
                     });
                 self.process_provision_fetch_outputs(outputs);
-                // Immediately tick to spawn the first fetch.
                 let tick_outputs = self
                     .provision_fetch_protocol
                     .handle(ProvisionFetchInput::Tick);
                 self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
+            _ => unreachable!(),
         }
     }
 
@@ -1207,13 +1170,8 @@ where
 
     /// Local shard committee excluding self, for use as the `peers` argument
     /// to `network.request()`.
-    fn local_peers(&self) -> Vec<ValidatorId> {
-        self.topology
-            .committee_for_shard(self.local_shard)
-            .iter()
-            .filter(|&&v| v != self.validator_id)
-            .copied()
-            .collect()
+    fn local_peers(&self) -> &[ValidatorId] {
+        &self.cached_local_peers
     }
 
     /// Process SyncProtocol outputs internally.
@@ -1228,7 +1186,7 @@ where
                     let es = self.event_sender.clone();
                     let peers = self.local_peers();
                     self.network.request(
-                        &peers,
+                        peers,
                         None,
                         GetBlockRequest {
                             height: hyperscale_types::BlockHeight(height),
@@ -1253,21 +1211,13 @@ where
                 SyncOutput::DeliverBlock { block, qc } => {
                     metrics::record_sync_block_received_by_bft();
                     metrics::record_sync_block_submitted_for_verification();
-                    let actions = self.state.handle(ProtocolEvent::SyncBlockReadyToApply {
+                    self.feed_event(ProtocolEvent::SyncBlockReadyToApply {
                         block: *block,
                         qc: *qc,
                     });
-                    self.actions_generated += actions.len();
-                    for action in actions {
-                        self.process_action(action);
-                    }
                 }
                 SyncOutput::SyncComplete { height } => {
-                    let actions = self.state.handle(ProtocolEvent::SyncComplete { height });
-                    self.actions_generated += actions.len();
-                    for action in actions {
-                        self.process_action(action);
-                    }
+                    self.feed_event(ProtocolEvent::SyncComplete { height });
                 }
             }
         }
@@ -1291,7 +1241,7 @@ where
                     let hs = tx_hashes.clone();
                     let peers = self.local_peers();
                     self.network.request(
-                        &peers,
+                        peers,
                         Some(proposer),
                         GetTransactionsRequest::new(block_hash, tx_hashes),
                         Box::new(move |result| match result {
@@ -1321,7 +1271,7 @@ where
                     let hs = cert_hashes.clone();
                     let peers = self.local_peers();
                     self.network.request(
-                        &peers,
+                        peers,
                         Some(proposer),
                         GetCertificatesRequest::new(block_hash, cert_hashes),
                         Box::new(move |result| match result {
@@ -1344,14 +1294,10 @@ where
                     block_hash,
                     transactions,
                 } => {
-                    let actions = self.state.handle(ProtocolEvent::TransactionFetchDelivered {
+                    self.feed_event(ProtocolEvent::TransactionFetchDelivered {
                         block_hash,
                         transactions,
                     });
-                    self.actions_generated += actions.len();
-                    for action in actions {
-                        self.process_action(action);
-                    }
                 }
                 FetchOutput::DeliverCertificates {
                     block_hash,
@@ -1361,14 +1307,10 @@ where
                     for cert in &certificates {
                         self.storage.store_certificate(cert);
                     }
-                    let actions = self.state.handle(ProtocolEvent::CertificateFetchDelivered {
+                    self.feed_event(ProtocolEvent::CertificateFetchDelivered {
                         block_hash,
                         certificates,
                     });
-                    self.actions_generated += actions.len();
-                    for action in actions {
-                        self.process_action(action);
-                    }
                 }
             }
         }
@@ -1436,13 +1378,7 @@ where
                 }
                 ProvisionFetchOutput::Deliver { provisions } => {
                     if !provisions.is_empty() {
-                        let actions = self
-                            .state
-                            .handle(ProtocolEvent::StateProvisionsReceived { provisions });
-                        self.actions_generated += actions.len();
-                        for action in actions {
-                            self.process_action(action);
-                        }
+                        self.feed_event(ProtocolEvent::StateProvisionsReceived { provisions });
                     }
                 }
             }
@@ -1748,13 +1684,7 @@ where
         self.storage.store_certificate(&certificate);
 
         // Feed GossipedCertificateVerified directly to state machine.
-        let actions = self
-            .state
-            .handle(ProtocolEvent::GossipedCertificateVerified { certificate });
-        self.actions_generated += actions.len();
-        for action in actions {
-            self.process_action(action);
-        }
+        self.feed_event(ProtocolEvent::GossipedCertificateVerified { certificate });
     }
 
     // ─── Gossip Decode & Dispatch ──────────────────────────────────────
@@ -1772,24 +1702,14 @@ where
                     return;
                 };
                 let (header, manifest) = gossip.into_parts();
-                let pe = ProtocolEvent::BlockHeaderReceived { header, manifest };
-                let actions = self.state.handle(pe);
-                self.actions_generated += actions.len();
-                for action in actions {
-                    self.process_action(action);
-                }
+                self.feed_event(ProtocolEvent::BlockHeaderReceived { header, manifest });
             }
             "block.vote" => {
                 let Ok(gossip) = sbor::basic_decode::<BlockVoteGossip>(payload) else {
                     warn!("Failed to decode BlockVoteGossip");
                     return;
                 };
-                let pe = ProtocolEvent::BlockVoteReceived { vote: gossip.vote };
-                let actions = self.state.handle(pe);
-                self.actions_generated += actions.len();
-                for action in actions {
-                    self.process_action(action);
-                }
+                self.feed_event(ProtocolEvent::BlockVoteReceived { vote: gossip.vote });
             }
             "state.provision.batch" => {
                 let Ok(batch) =
@@ -1800,12 +1720,7 @@ where
                 };
                 let provisions = batch.into_provisions();
                 if !provisions.is_empty() {
-                    let pe = ProtocolEvent::StateProvisionsReceived { provisions };
-                    let actions = self.state.handle(pe);
-                    self.actions_generated += actions.len();
-                    for action in actions {
-                        self.process_action(action);
-                    }
+                    self.feed_event(ProtocolEvent::StateProvisionsReceived { provisions });
                 }
             }
             "execution.vote.batch" => {
@@ -1814,12 +1729,7 @@ where
                     return;
                 };
                 for vote in batch.into_votes() {
-                    let pe = ProtocolEvent::ExecutionVoteReceived { vote };
-                    let actions = self.state.handle(pe);
-                    self.actions_generated += actions.len();
-                    for action in actions {
-                        self.process_action(action);
-                    }
+                    self.feed_event(ProtocolEvent::ExecutionVoteReceived { vote });
                 }
             }
             "execution.certificate.batch" => {
@@ -1828,12 +1738,7 @@ where
                     return;
                 };
                 for cert in batch.into_certificates() {
-                    let pe = ProtocolEvent::ExecutionCertificateReceived { cert };
-                    let actions = self.state.handle(pe);
-                    self.actions_generated += actions.len();
-                    for action in actions {
-                        self.process_action(action);
-                    }
+                    self.feed_event(ProtocolEvent::ExecutionCertificateReceived { cert });
                 }
             }
             "transaction.gossip" => {
