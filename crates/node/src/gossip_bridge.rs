@@ -1,27 +1,34 @@
-//! Bridges network gossip to the IoLoop event channel.
+//! Per-type gossip bridge to the IoLoop event channel.
 //!
-//! Both production and simulation register an instance of [`ChannelGossipHandler`].
-//! The handler wraps a crossbeam sender and converts gossip into
-//! `NodeInput::GossipReceived` events for the IoLoop.
+//! Each message type gets its own [`TypedGossipBridge`] that captures the
+//! `message_type` string and forwards raw payloads as
+//! `NodeInput::GossipReceived` events for the IoLoop's existing dispatch.
+//!
+//! Registered via `Network::register_gossip_handler` (once per type)
+//! during IoLoop initialization.
 
 use hyperscale_core::NodeInput;
 use hyperscale_network::GossipHandler;
 
-/// Gossip handler that forwards messages to the IoLoop event channel.
-pub struct ChannelGossipHandler {
+/// Gossip handler for a single message type that forwards to the IoLoop event channel.
+///
+/// Each instance captures its message type, so the IoLoop can dispatch
+/// the payload to the correct handler.
+pub struct TypedGossipBridge {
+    message_type: &'static str,
     tx: crossbeam::channel::Sender<NodeInput>,
 }
 
-impl ChannelGossipHandler {
-    pub fn new(tx: crossbeam::channel::Sender<NodeInput>) -> Self {
-        Self { tx }
+impl TypedGossipBridge {
+    pub fn new(message_type: &'static str, tx: crossbeam::channel::Sender<NodeInput>) -> Self {
+        Self { message_type, tx }
     }
 }
 
-impl GossipHandler for ChannelGossipHandler {
-    fn on_gossip(&self, message_type: &'static str, payload: Vec<u8>) {
+impl GossipHandler for TypedGossipBridge {
+    fn on_message(&self, payload: Vec<u8>) {
         let _ = self.tx.send(NodeInput::GossipReceived {
-            message_type,
+            message_type: self.message_type,
             payload,
         });
     }

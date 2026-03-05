@@ -404,22 +404,23 @@ impl ProductionRunnerBuilder {
             network_definition.clone(),
         ));
 
+        // ── Create shared handler registry ────────────────────────────────
+        let registry = Arc::new(hyperscale_network::HandlerRegistry::new());
+
         // ── Create Libp2p network adapter ────────────────────────────────
         //
-        // The gossip handler is registered later by IoLoop::with_storage_and_executor(),
-        // which creates a ChannelGossipHandler wired to the consensus channel.
-        // The adapter's gossip_codec OnceLock is filled at that point.
+        // Gossip and request handlers are registered per message type by the
+        // IoLoop during initialization. Topic subscriptions happen automatically
+        // when handlers are registered.
         let adapter = Libp2pAdapter::new(
             network_config,
             ed25519_keypair,
             validator_id,
             local_shard,
             dispatch.clone(),
+            registry.clone(),
         )
         .await?;
-
-        // Subscribe to local shard topics.
-        adapter.subscribe_shard(local_shard).await?;
 
         // ── Create RequestManager ────────────────────────────────────────
         let request_manager = Arc::new(hyperscale_network_libp2p::RequestManager::new(
@@ -436,6 +437,8 @@ impl ProductionRunnerBuilder {
             adapter.clone(),
             request_manager.clone(),
             tokio::runtime::Handle::current(),
+            registry,
+            local_shard,
         );
 
         // ── Create RadixExecutor ─────────────────────────────────────────

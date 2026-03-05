@@ -2,6 +2,10 @@
 //!
 //! Defines the `Network` interface implemented by both production (`network-libp2p`)
 //! and simulation (`network-memory`) backends.
+//!
+//! Handlers are registered per message type via `register_gossip_handler` and
+//! `register_request_handler`. The network layer dispatches incoming messages
+//! to the appropriate handler by `message_type_id` lookup.
 
 use std::sync::Arc;
 
@@ -20,36 +24,58 @@ pub enum RequestError {
     Shutdown,
 }
 
-/// Trait for handling inbound request-response payloads.
+/// Whether a gossip message type is shard-scoped or global.
 ///
-/// Implementations decode request bytes, process them (e.g., look up blocks,
-/// transactions, certificates from storage), and return SBOR-encoded response bytes.
+/// Determines topic subscription in production:
+/// - `Shard` → `hyperscale/{type_id}/shard-{local}/1.0.0`
+/// - `Global` → `hyperscale/{type_id}/1.0.0`
 ///
-/// The transport layer (`InboundRouter`) handles stream I/O, framing, and
-/// compression. This trait contains only the application-level logic.
-pub trait InboundRequestHandler: Send + Sync + 'static {
-    /// Process a request payload and return response bytes.
-    ///
-    /// Both input and output are uncompressed SBOR-encoded bytes.
-    /// The transport layer handles compression/decompression.
-    fn handle_request(&self, payload: &[u8]) -> Vec<u8>;
+/// Ignored in simulation (delivery is controlled by the harness).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopicScope {
+    /// Shard-local topic. Only peers subscribed to the local shard receive it.
+    Shard,
+    /// Global topic. All connected peers receive it.
+    Global,
 }
 
-impl<T: InboundRequestHandler + ?Sized> InboundRequestHandler for std::sync::Arc<T> {
-    fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
-        (**self).handle_request(payload)
+/// Handler for a single gossip message type.
+///
+/// Called on the codec pool thread (production) or inline (simulation)
+/// after LZ4 decompression. The payload is decompressed SBOR bytes.
+///
+/// Implementations typically SBOR-decode the payload into a typed message,
+/// optionally validate (e.g., BLS signature check), and send a typed
+/// event to the IoLoop via a captured channel sender.
+pub trait GossipHandler: Send + Sync + 'static {
+    fn on_message(&self, payload: Vec<u8>);
+}
+
+/// Blanket impl: any `Fn(Vec<u8>)` can serve as a gossip handler.
+impl<F: Fn(Vec<u8>) + Send + Sync + 'static> GossipHandler for F {
+    fn on_message(&self, payload: Vec<u8>) {
+        (self)(payload)
     }
 }
 
-/// Handler for incoming gossip messages.
+/// Handler for a single request message type.
 ///
-/// Receives decompressed SBOR payloads after the network layer has handled
-/// transport concerns (decompression, topic parsing, shard validation).
-pub trait GossipHandler: Send + Sync + 'static {
-    fn on_gossip(&self, message_type: &'static str, payload: Vec<u8>);
+/// Called on the inbound router thread (production) or inline (simulation).
+/// Receives SBOR-encoded request bytes (no framing — the transport layer
+/// strips the type_id prefix before dispatch). Returns SBOR-encoded
+/// response bytes.
+pub trait RequestHandler: Send + Sync + 'static {
+    fn handle_request(&self, payload: &[u8]) -> Vec<u8>;
 }
 
-/// Network interface for sending typed messages and handling inbound requests.
+/// Blanket impl: any `Fn(&[u8]) -> Vec<u8>` can serve as a request handler.
+impl<F: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static> RequestHandler for F {
+    fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
+        (self)(payload)
+    }
+}
+
+/// Network interface for sending typed messages and handling inbound traffic.
 ///
 /// Generic methods make this NOT object-safe — use `N: Network` bounds.
 /// This is consistent with how storage and dispatch are already used:
@@ -65,24 +91,35 @@ pub trait Network: Send + Sync {
     /// Broadcast a message to all connected peers globally.
     fn broadcast_global<M: NetworkMessage>(&self, message: &M);
 
-    // ── Request handling ──
+    // ── Handler registration ──
 
-    /// Register a request handler.
+    /// Register a handler for a specific gossip message type.
     ///
-    /// The handler processes incoming request-response payloads (block sync,
-    /// transaction/certificate fetches). Called once during node initialization.
+    /// Each message type gets its own handler. The network layer dispatches
+    /// incoming gossip to the handler registered for that type's `message_type_id`.
     ///
-    /// The network layer owns the handler's lifecycle — production spawns an
-    /// `InboundRouter` task, simulation stores it for centralized fulfillment.
-    fn register_request_handler(&self, handler: Arc<dyn InboundRequestHandler>);
+    /// In production, this also auto-subscribes to the corresponding gossipsub
+    /// topic (shard-scoped or global, per `scope`).
+    ///
+    /// Called during node initialization — once per message type.
+    fn register_gossip_handler(
+        &self,
+        message_type_id: &'static str,
+        scope: TopicScope,
+        handler: Arc<dyn GossipHandler>,
+    );
 
-    // ── Gossip handler ──
-
-    /// Register a handler for incoming gossip messages.
+    /// Register a handler for a specific request message type.
     ///
-    /// The handler receives decompressed SBOR payloads. Called once during
-    /// node initialization, alongside `register_request_handler`.
-    fn register_gossip_handler(&self, handler: Arc<dyn GossipHandler>);
+    /// Each request type gets its own handler. The network layer parses the
+    /// type_id frame from incoming requests and dispatches to the matching handler.
+    ///
+    /// Called during node initialization — once per request type.
+    fn register_request_handler(
+        &self,
+        message_type_id: &'static str,
+        handler: Arc<dyn RequestHandler>,
+    );
 
     // ── Request-response ──
 
@@ -113,17 +150,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_request_handler_arc_delegation() {
-        struct Echo;
-        impl InboundRequestHandler for Echo {
-            fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
-                payload.to_vec()
-            }
-        }
+    fn test_closure_gossip_handler() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = counter.clone();
+        let handler: Arc<dyn GossipHandler> = Arc::new(move |_payload: Vec<u8>| {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        handler.on_message(vec![1, 2, 3]);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
 
-        let handler: Arc<Echo> = Arc::new(Echo);
-        let input = b"hello";
-        let output = handler.handle_request(input);
-        assert_eq!(output, input);
+    #[test]
+    fn test_closure_request_handler() {
+        let handler: Arc<dyn RequestHandler> =
+            Arc::new(|payload: &[u8]| -> Vec<u8> { payload.to_vec() });
+        let result = handler.handle_request(b"hello");
+        assert_eq!(result, b"hello");
     }
 }

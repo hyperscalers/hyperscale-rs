@@ -3,14 +3,13 @@
 //! Processes incoming request-response payloads using `ConsensusStore` and
 //! `SubstateStore` trait methods. Transport-specific I/O (libp2p streams,
 //! framing, compression) stays in the transport crate (`network-libp2p`).
-//! This module implements [`InboundRequestHandler`] so it can be plugged
-//! into any transport's inbound router.
 //!
-//! # Wire Format
+//! Each request type is registered as a separate per-type handler via the
+//! `Network::register_request_handler` API. The InboundRouter (production)
+//! or SimulatedNetwork (simulation) parses the type_id frame and dispatches
+//! the raw SBOR payload to the matching handler.
 //!
-//! Requests arrive as: `[type_id_len: u16 LE][type_id: UTF-8][SBOR payload]`
-//!
-//! The `type_id` string dispatches to the appropriate handler:
+//! Request types:
 //! - `"block.request"` — block sync (SBOR-encoded `GetBlockRequest`)
 //! - `"transaction.request"` — transaction fetch (SBOR-encoded `GetTransactionsRequest`)
 //! - `"certificate.request"` — certificate fetch (SBOR-encoded `GetCertificatesRequest`)
@@ -23,7 +22,6 @@ use hyperscale_messages::response::{
     GetBlockResponse, GetCertificatesResponse, GetProvisionsResponse, GetTransactionsResponse,
 };
 use hyperscale_metrics as metrics;
-use hyperscale_network::{parse_request_frame, InboundRequestHandler};
 use hyperscale_storage::{ConsensusStore, SubstateStore};
 use hyperscale_types::{
     Hash, RoutableTransaction, StateProvision, Topology, TransactionCertificate,
@@ -36,18 +34,15 @@ use tracing::{debug, trace};
 /// Errors from request processing.
 #[derive(Debug, Error)]
 pub enum InboundError {
-    #[error("Request frame error: {0}")]
-    FrameError(String),
-
-    #[error("Unknown request type: {0}")]
-    UnknownRequestType(String),
-
     #[error("SBOR decode error: {0}")]
     DecodeError(String),
 
     #[error("SBOR encode error: {0}")]
     EncodeError(String),
 }
+
+/// Function pointer type for `RequestHandler` methods used by `register_one_request`.
+pub type HandlerFn<S> = fn(&RequestHandler<S>, &[u8]) -> Result<Vec<u8>, InboundError>;
 
 /// Configuration for the request handler.
 #[derive(Debug, Clone)]
@@ -97,25 +92,8 @@ impl<S: ConsensusStore + SubstateStore> RequestHandler<S> {
         }
     }
 
-    /// Process a framed request payload and return SBOR-encoded response bytes.
-    ///
-    /// Parses the type_id framing, dispatches to the appropriate handler based
-    /// on the type_id string.
-    pub fn process_request(&self, payload: &[u8]) -> Result<Vec<u8>, InboundError> {
-        let (type_id, sbor_payload) =
-            parse_request_frame(payload).map_err(|e| InboundError::FrameError(e.to_string()))?;
-
-        match type_id {
-            "block.request" => self.handle_block_request(sbor_payload),
-            "transaction.request" => self.handle_transaction_request(sbor_payload),
-            "certificate.request" => self.handle_certificate_request(sbor_payload),
-            "provision.request" => self.handle_provision_request(sbor_payload),
-            _ => Err(InboundError::UnknownRequestType(type_id.to_string())),
-        }
-    }
-
     /// Handle a block sync request.
-    fn handle_block_request(&self, sbor_payload: &[u8]) -> Result<Vec<u8>, InboundError> {
+    pub fn handle_block_request(&self, sbor_payload: &[u8]) -> Result<Vec<u8>, InboundError> {
         let req: GetBlockRequest = sbor::basic_decode(sbor_payload)
             .map_err(|e| InboundError::DecodeError(format!("{e:?}")))?;
 
@@ -130,7 +108,7 @@ impl<S: ConsensusStore + SubstateStore> RequestHandler<S> {
     }
 
     /// Handle a transaction fetch request.
-    fn handle_transaction_request(&self, sbor_payload: &[u8]) -> Result<Vec<u8>, InboundError> {
+    pub fn handle_transaction_request(&self, sbor_payload: &[u8]) -> Result<Vec<u8>, InboundError> {
         let tx_request: GetTransactionsRequest = sbor::basic_decode(sbor_payload)
             .map_err(|e| InboundError::DecodeError(format!("{e:?}")))?;
 
@@ -183,7 +161,7 @@ impl<S: ConsensusStore + SubstateStore> RequestHandler<S> {
     }
 
     /// Handle a certificate fetch request.
-    fn handle_certificate_request(&self, sbor_payload: &[u8]) -> Result<Vec<u8>, InboundError> {
+    pub fn handle_certificate_request(&self, sbor_payload: &[u8]) -> Result<Vec<u8>, InboundError> {
         let cert_request: GetCertificatesRequest = sbor::basic_decode(sbor_payload)
             .map_err(|e| InboundError::DecodeError(format!("{e:?}")))?;
 
@@ -235,7 +213,7 @@ impl<S: ConsensusStore + SubstateStore> RequestHandler<S> {
     /// Looks up the block at the requested height, identifies transactions
     /// that involve the requesting shard, collects the local state entries
     /// and merkle proofs, and returns them as `StateProvision`s.
-    fn handle_provision_request(&self, sbor_payload: &[u8]) -> Result<Vec<u8>, InboundError> {
+    pub fn handle_provision_request(&self, sbor_payload: &[u8]) -> Result<Vec<u8>, InboundError> {
         let req: GetProvisionsRequest = sbor::basic_decode(sbor_payload)
             .map_err(|e| InboundError::DecodeError(format!("{e:?}")))?;
 
@@ -349,17 +327,5 @@ impl<S: ConsensusStore + SubstateStore> RequestHandler<S> {
             provisions: Some(provisions),
         };
         sbor::basic_encode(&response).map_err(|e| InboundError::EncodeError(format!("{e:?}")))
-    }
-}
-
-impl<S: ConsensusStore + SubstateStore + 'static> InboundRequestHandler for RequestHandler<S> {
-    fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
-        match self.process_request(payload) {
-            Ok(data) => data,
-            Err(e) => {
-                debug!(error = %e, "Request processing failed");
-                vec![]
-            }
-        }
     }
 }

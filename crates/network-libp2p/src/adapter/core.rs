@@ -9,12 +9,12 @@ use dashmap::DashMap;
 use futures::FutureExt;
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
-use hyperscale_network::{GossipHandler, Topic};
+use hyperscale_network::HandlerRegistry;
 use hyperscale_types::{MessagePriority, ShardGroupId, ValidatorId};
 use libp2p::{gossipsub, identify, identity, kad, Multiaddr, PeerId as Libp2pPeerId, Stream};
 use libp2p_stream as stream;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, trace};
 
@@ -47,13 +47,6 @@ pub struct Libp2pAdapter {
     /// This avoids blocking the consensus loop to query peer count.
     cached_peer_count: Arc<AtomicUsize>,
 
-    /// Shared dispatch for codec pool thread scheduling.
-    dispatch: Arc<PooledDispatch>,
-
-    /// Gossip codec handle, set lazily via `register_gossip_handler`.
-    /// The event loop checks this OnceLock on each gossipsub message.
-    gossip_codec: Arc<OnceLock<CodecPoolHandle>>,
-
     /// Stream control handle for opening outbound streams.
     /// Cloneable and thread-safe.
     stream_control: stream::Control,
@@ -69,6 +62,7 @@ impl Libp2pAdapter {
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
     /// * `dispatch` - Pooled dispatch for codec thread pool scheduling
+    /// * `registry` - Shared handler registry for per-type message dispatch
     ///
     /// # Returns
     ///
@@ -79,6 +73,7 @@ impl Libp2pAdapter {
         validator_id: ValidatorId,
         shard: ShardGroupId,
         dispatch: Arc<PooledDispatch>,
+        registry: Arc<HandlerRegistry>,
     ) -> Result<Arc<Self>, NetworkError> {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
 
@@ -202,7 +197,9 @@ impl Libp2pAdapter {
         ) = PriorityCommandChannels::new();
 
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
-        let gossip_codec: Arc<OnceLock<CodecPoolHandle>> = Arc::new(OnceLock::new());
+
+        // Create codec pool eagerly (the registry will be populated before messages arrive).
+        let codec_pool = CodecPoolHandle::new(dispatch.clone());
 
         let adapter = Arc::new(Self {
             local_peer_id,
@@ -211,8 +208,6 @@ impl Libp2pAdapter {
             validator_peers: validator_peers.clone(),
             shutdown_tx: Some(shutdown_tx),
             cached_peer_count: cached_peer_count.clone(),
-            dispatch,
-            gossip_codec: gossip_codec.clone(),
             stream_control,
         });
 
@@ -231,7 +226,8 @@ impl Libp2pAdapter {
                 cached_peer_count,
                 shard,
                 config.version_interop_mode,
-                gossip_codec,
+                codec_pool,
+                registry,
                 event_loop_validator_peers,
             ))
             .catch_unwind()
@@ -266,40 +262,14 @@ impl Libp2pAdapter {
         Ok(adapter)
     }
 
-    /// Set the gossip handler, creating a CodecPoolHandle that the event loop uses.
+    /// Subscribe to a gossipsub topic.
     ///
-    /// Called from `ProdNetwork::register_gossip_handler()`.
-    pub fn set_gossip_handler(&self, handler: Arc<dyn GossipHandler>) {
-        let codec = CodecPoolHandle::new(self.dispatch.clone(), handler);
-        let _ = self.gossip_codec.set(codec);
-    }
-
-    /// Subscribe to all message types for a shard.
-    ///
-    /// Called once at startup to subscribe to the local shard's topics.
-    pub async fn subscribe_shard(&self, shard: ShardGroupId) -> Result<(), NetworkError> {
-        let topics = [
-            Topic::block_header(shard),
-            Topic::block_vote(shard),
-            Topic::transaction_gossip(shard),
-            Topic::transaction_certificate(shard),
-            Topic::state_provision_batch(shard),
-            Topic::execution_vote_batch(shard),
-            Topic::execution_certificate_batch(shard),
-            Topic::block_committed(),
-        ];
-
-        for topic in &topics {
-            self.priority_channels
-                .send(SwarmCommand::Subscribe {
-                    topic: topic.to_string(),
-                })
-                .map_err(|_| NetworkError::NetworkShutdown)?;
-
-            info!(topic = %topic, "Subscribed to topic");
-        }
-
-        Ok(())
+    /// Called by `ProdNetwork::register_gossip_handler` to auto-subscribe
+    /// when a handler is registered.
+    pub fn subscribe_topic(&self, topic: String) -> Result<(), NetworkError> {
+        self.priority_channels
+            .send(SwarmCommand::Subscribe { topic })
+            .map_err(|_| NetworkError::NetworkShutdown)
     }
 
     /// Publish pre-encoded data to a topic with a given priority.

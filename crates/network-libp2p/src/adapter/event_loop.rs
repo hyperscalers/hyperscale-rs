@@ -13,13 +13,14 @@ use crate::codec_pool::CodecPoolHandle;
 use crate::config::VersionInteroperabilityMode;
 use dashmap::DashMap;
 use futures::StreamExt;
+use hyperscale_network::HandlerRegistry;
 use hyperscale_types::{ShardGroupId, ValidatorId};
 use libp2p::{
     gossipsub, identify, kad, swarm::SwarmEvent, Multiaddr, PeerId as Libp2pPeerId, Swarm,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
@@ -59,7 +60,8 @@ pub(super) async fn run(
     cached_peer_count: Arc<AtomicUsize>,
     local_shard: ShardGroupId,
     version_interop_mode: VersionInteroperabilityMode,
-    gossip_codec: Arc<OnceLock<CodecPoolHandle>>,
+    codec_pool: CodecPoolHandle,
+    registry: Arc<HandlerRegistry>,
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
 ) {
     // Track whether we've bootstrapped Kademlia (do it once after first connection)
@@ -348,7 +350,8 @@ pub(super) async fn run(
                 super::gossipsub::handle_gossipsub_event(
                     event,
                     local_shard,
-                    &gossip_codec,
+                    &codec_pool,
+                    &registry,
                 ).await;
 
                 // Update cached peer count after connection changes

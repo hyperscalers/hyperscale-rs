@@ -122,7 +122,14 @@ async fn test_network_adapter_starts() {
     let dispatch = test_dispatch();
     let result = timeout(
         CONNECTION_TIMEOUT,
-        Libp2pAdapter::new(config, keypair, validator_id, shard, dispatch),
+        Libp2pAdapter::new(
+            config,
+            keypair,
+            validator_id,
+            shard,
+            dispatch,
+            Arc::new(hyperscale_network::HandlerRegistry::new()),
+        ),
     )
     .await;
 
@@ -163,6 +170,7 @@ async fn test_two_node_connection() {
         ValidatorId(0),
         ShardGroupId(0),
         dispatch1,
+        Arc::new(hyperscale_network::HandlerRegistry::new()),
     )
     .await
     .unwrap();
@@ -189,6 +197,7 @@ async fn test_two_node_connection() {
         ValidatorId(1),
         ShardGroupId(0),
         dispatch2,
+        Arc::new(hyperscale_network::HandlerRegistry::new()),
     )
     .await
     .unwrap();
@@ -237,13 +246,20 @@ async fn test_topic_subscription() {
     };
     let dispatch = test_dispatch();
 
-    let adapter = Libp2pAdapter::new(config, keypair, ValidatorId(0), ShardGroupId(0), dispatch)
-        .await
-        .unwrap();
+    let adapter = Libp2pAdapter::new(
+        config,
+        keypair,
+        ValidatorId(0),
+        ShardGroupId(0),
+        dispatch,
+        Arc::new(hyperscale_network::HandlerRegistry::new()),
+    )
+    .await
+    .unwrap();
 
-    // Subscribe to shard topics
-    let result = adapter.subscribe_shard(ShardGroupId(0)).await;
-    assert!(result.is_ok(), "Should subscribe to shard topics");
+    // Subscribe to a topic via subscribe_topic (individual subscription)
+    let result = adapter.subscribe_topic("hyperscale/block.header/shard-0/1.0.0".to_string());
+    assert!(result.is_ok(), "Should subscribe to topic");
 
     info!("Topic subscription successful");
 }

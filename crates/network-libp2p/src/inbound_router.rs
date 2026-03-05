@@ -1,15 +1,13 @@
-//! Routes inbound network requests to appropriate handlers.
+//! Routes inbound network requests to per-type handlers.
 //!
-//! This component accepts incoming streams from peers and routes them to the
-//! appropriate handler based on request type. It unifies the handling of:
-//! - Block sync requests
-//! - Transaction fetch requests
-//! - Certificate fetch requests
+//! This component accepts incoming streams from peers and dispatches them to
+//! the appropriate handler based on the request type_id frame. The handler
+//! registry is populated during node initialization.
 
 use crate::adapter::{Libp2pAdapter, STREAM_PROTOCOL};
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
 use futures::StreamExt;
-use hyperscale_network::InboundRequestHandler;
+use hyperscale_network::{parse_request_frame, HandlerRegistry};
 use libp2p::{PeerId, Stream};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,27 +25,26 @@ pub(crate) struct InboundRouterHandle {
     join_handle: tokio::task::JoinHandle<()>,
 }
 
-/// Routes inbound requests to an application-level handler.
+/// Routes inbound requests to per-type handlers via the handler registry.
 ///
 /// The router accepts incoming streams and for each:
 /// 1. Reads the length-prefixed compressed request
-/// 2. Decompresses and delegates to `H` for processing
-/// 3. Compresses and writes the length-prefixed response
-/// 4. Closes the stream
-///
-/// Generic over `H: InboundRequestHandler` — the concrete handler is supplied
-/// by the production runner when constructing the router.
-struct InboundRouter<H: InboundRequestHandler> {
-    handler: H,
+/// 2. Decompresses it
+/// 3. Parses the type_id frame to identify the request type
+/// 4. Looks up the handler in the registry and dispatches the SBOR payload
+/// 5. Compresses and writes the length-prefixed response
+/// 6. Closes the stream
+struct InboundRouter {
+    registry: Arc<HandlerRegistry>,
 }
 
-impl<H: InboundRequestHandler> InboundRouter<H> {
+impl InboundRouter {
     /// Spawn the inbound router as a background task.
     ///
     /// The router will accept incoming streams until the stream control is dropped.
-    fn spawn(adapter: Arc<Libp2pAdapter>, handler: H) -> InboundRouterHandle {
+    fn spawn(adapter: Arc<Libp2pAdapter>, registry: Arc<HandlerRegistry>) -> InboundRouterHandle {
         let join_handle = tokio::spawn(async move {
-            let router = Arc::new(InboundRouter { handler });
+            let router = Arc::new(InboundRouter { registry });
             let mut control = adapter.stream_control();
 
             // Register to accept incoming streams for our protocol
@@ -81,7 +78,8 @@ impl<H: InboundRequestHandler> InboundRouter<H> {
 
     /// Handle a single incoming stream.
     async fn handle_stream(&self, _peer: PeerId, mut stream: Stream) -> Result<(), StreamError> {
-        // Read length-prefixed compressed request with timeout
+        // Read length-prefixed compressed request with timeout.
+        // The framing module decompresses the data.
         let request_data = tokio::time::timeout(
             STREAM_IO_TIMEOUT,
             framing::read_frame(&mut stream, MAX_FRAME_SIZE),
@@ -90,8 +88,22 @@ impl<H: InboundRequestHandler> InboundRouter<H> {
         .map_err(|_| StreamError::Timeout)?
         .map_err(StreamError::Frame)?;
 
-        // Delegate to handler for request processing
-        let response_sbor = self.handler.handle_request(&request_data);
+        // Parse the type_id frame to identify the request type.
+        let (type_id, sbor_payload) = parse_request_frame(&request_data).map_err(|e| {
+            StreamError::Frame(FrameError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                e.to_string(),
+            )))
+        })?;
+
+        // Look up the per-type request handler.
+        let handler = self
+            .registry
+            .get_request(type_id)
+            .ok_or(StreamError::UnknownRequestType)?;
+
+        // Delegate to the handler (receives raw SBOR payload, no framing).
+        let response_sbor = handler.handle_request(sbor_payload);
 
         // Write length-prefixed compressed response with timeout
         tokio::time::timeout(
@@ -106,14 +118,14 @@ impl<H: InboundRequestHandler> InboundRouter<H> {
     }
 }
 
-/// Spawn an inbound router with the given handler.
+/// Spawn an inbound router with the given handler registry.
 ///
-/// Used internally by `ProdNetwork::register_request_handler`.
-pub(crate) fn spawn_inbound_router<H: InboundRequestHandler>(
+/// Used internally by `ProdNetwork`.
+pub(crate) fn spawn_inbound_router(
     adapter: Arc<Libp2pAdapter>,
-    handler: H,
+    registry: Arc<HandlerRegistry>,
 ) -> InboundRouterHandle {
-    InboundRouter::spawn(adapter, handler)
+    InboundRouter::spawn(adapter, registry)
 }
 
 /// Errors that can occur during stream handling.
@@ -122,6 +134,7 @@ enum StreamError {
     Timeout,
     Io(std::io::Error),
     Frame(FrameError),
+    UnknownRequestType,
 }
 
 impl std::fmt::Display for StreamError {
@@ -130,6 +143,7 @@ impl std::fmt::Display for StreamError {
             StreamError::Timeout => write!(f, "stream timeout"),
             StreamError::Io(e) => write!(f, "stream I/O error: {}", e),
             StreamError::Frame(e) => write!(f, "stream frame error: {}", e),
+            StreamError::UnknownRequestType => write!(f, "unknown request type"),
         }
     }
 }

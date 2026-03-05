@@ -1,17 +1,15 @@
 //! Simulated network with deterministic latency, packet loss, and partitions.
 
-use crate::sim_network::{
-    BroadcastTarget, GossipHandlerSlot, HandlerSlot, OutboxEntry, PendingRequest, SimNetworkAdapter,
-};
+use crate::sim_network::{BroadcastTarget, OutboxEntry, PendingRequest, SimNetworkAdapter};
 use crate::NodeIndex;
-use hyperscale_network::{frame_request, InboundRequestHandler, RequestError};
+use hyperscale_network::{HandlerRegistry, RequestError};
 use hyperscale_types::{ShardGroupId, ValidatorId};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, trace};
 
@@ -93,23 +91,18 @@ impl Ord for ScheduledGossip {
 /// - Configurable latency with jitter
 /// - Packet loss (probabilistic message drops)
 /// - Network partitions (blocking communication between node pairs)
-/// - Request fulfillment via registered [`InboundRequestHandler`]s (one per node)
-/// - Internalized gossip latency queue with registered [`GossipHandler`]s
+/// - Request fulfillment via per-type handlers in per-node [`HandlerRegistry`]s
+/// - Internalized gossip latency queue with per-type gossip handlers
 pub struct SimulatedNetwork {
     config: NetworkConfig,
     /// Partitioned node pairs. If (a, b) is in this set, messages from a to b are dropped.
     /// Partitions are directional - add both (a, b) and (b, a) for bidirectional partition.
     partitions: HashSet<(NodeIndex, NodeIndex)>,
-    /// Per-node handler slots, shared with each node's [`SimNetworkAdapter`].
+    /// Per-node handler registries, shared with each node's [`SimNetworkAdapter`].
     ///
-    /// Populated when [`Network::register_request_handler`] is called on the
-    /// adapter; read during [`fulfill_requests`](Self::fulfill_requests).
-    handler_slots: Vec<HandlerSlot>,
-    /// Per-node gossip handler slots, shared with each node's [`SimNetworkAdapter`].
-    ///
-    /// Populated when [`Network::register_gossip_handler`] is called on the
-    /// adapter; read during [`flush_gossip`](Self::flush_gossip).
-    gossip_handler_slots: Vec<GossipHandlerSlot>,
+    /// Populated when `register_gossip_handler` / `register_request_handler`
+    /// are called on the adapter; read during `fulfill_requests` / `flush_gossip`.
+    registries: Vec<Arc<HandlerRegistry>>,
     /// Internal latency queue for pending gossip deliveries.
     pending_gossip: BinaryHeap<Reverse<ScheduledGossip>>,
     /// Monotonic sequence counter for deterministic ordering of same-time deliveries.
@@ -121,39 +114,35 @@ impl std::fmt::Debug for SimulatedNetwork {
         f.debug_struct("SimulatedNetwork")
             .field("config", &self.config)
             .field("partitions", &self.partitions)
-            .field("handler_slots", &self.handler_slots.len())
+            .field("registries", &self.registries.len())
             .field("pending_gossip", &self.pending_gossip.len())
             .finish()
     }
 }
 
 impl SimulatedNetwork {
-    /// Create a new simulated network with pre-allocated handler slots.
+    /// Create a new simulated network with per-node handler registries.
     pub fn new(config: NetworkConfig) -> Self {
         let num_nodes = (config.num_shards * config.validators_per_shard) as usize;
-        let handler_slots = (0..num_nodes).map(|_| Arc::new(OnceLock::new())).collect();
-        let gossip_handler_slots = (0..num_nodes).map(|_| Arc::new(OnceLock::new())).collect();
+        let registries = (0..num_nodes)
+            .map(|_| Arc::new(HandlerRegistry::new()))
+            .collect();
         Self {
             config,
             partitions: HashSet::new(),
-            handler_slots,
-            gossip_handler_slots,
+            registries,
             pending_gossip: BinaryHeap::new(),
             gossip_sequence: 0,
         }
     }
 
-    /// Create a [`SimNetworkAdapter`] for a node, sharing its handler slots.
+    /// Create a [`SimNetworkAdapter`] for a node, sharing its handler registry.
     ///
-    /// The returned adapter's [`Network::register_request_handler`] and
-    /// [`Network::register_gossip_handler`] calls will populate the shared
-    /// slots, making them visible to [`fulfill_requests`](Self::fulfill_requests)
-    /// and [`flush_gossip`](Self::flush_gossip).
+    /// The returned adapter's `register_gossip_handler` / `register_request_handler`
+    /// calls populate the shared registry, making them visible to
+    /// [`fulfill_requests`](Self::fulfill_requests) and [`flush_gossip`](Self::flush_gossip).
     pub fn create_adapter(&self, node: NodeIndex) -> SimNetworkAdapter {
-        SimNetworkAdapter::new(
-            Arc::clone(&self.handler_slots[node as usize]),
-            Arc::clone(&self.gossip_handler_slots[node as usize]),
-        )
+        SimNetworkAdapter::new(Arc::clone(&self.registries[node as usize]))
     }
 
     // ─── Partition Management ───
@@ -317,17 +306,14 @@ impl SimulatedNetwork {
 
     /// Fulfill pending requests by routing them through peer request handlers.
     ///
-    /// Handlers are obtained from the shared [`HandlerSlot`]s populated by each
-    /// node's [`Network::register_request_handler`] call.
+    /// Handlers are obtained from per-node [`HandlerRegistry`]s populated by
+    /// each node's `register_request_handler` calls.
     ///
     /// For each request:
     /// 1. Select a peer (preferred_peer if set, otherwise random non-self peer)
     /// 2. Check partition and packet loss (request + response directions)
-    /// 3. Frame the request bytes with type_id and call the peer's handler
+    /// 3. Look up the per-type handler and pass the raw SBOR payload
     /// 4. Invoke the callback with the response bytes
-    ///
-    /// This ensures simulation exercises the same encode/decode/dispatch path
-    /// as production (via `RequestHandler`).
     pub fn fulfill_requests(
         &self,
         requester: NodeIndex,
@@ -391,19 +377,22 @@ impl SimulatedNetwork {
 
             stats.messages_sent += 2; // request + response
 
-            // Frame the request and dispatch through the peer's handler.
-            let handler = match self.handler_slots.get(peer as usize).and_then(|s| s.get()) {
+            // Look up the per-type request handler from the peer's registry.
+            let handler = match self
+                .registries
+                .get(peer as usize)
+                .and_then(|r| r.get_request(type_id))
+            {
                 Some(h) => h,
                 None => {
                     on_response(Err(RequestError::PeerError(format!(
-                        "no handler for node {peer}"
+                        "no handler for {type_id} on node {peer}"
                     ))));
                     continue;
                 }
             };
 
-            let framed = frame_request(type_id, &request_bytes);
-            let response_bytes = handler.handle_request(&framed);
+            let response_bytes = handler.handle_request(&request_bytes);
 
             if response_bytes.is_empty() {
                 on_response(Err(RequestError::PeerError(
@@ -500,17 +489,17 @@ impl SimulatedNetwork {
             }
             let Reverse(scheduled) = self.pending_gossip.pop().unwrap();
             if let Some(handler) = self
-                .gossip_handler_slots
+                .registries
                 .get(scheduled.target_node as usize)
-                .and_then(|s| s.get())
+                .and_then(|r| r.get_gossip(scheduled.message_type))
             {
-                handler.on_gossip(scheduled.message_type, scheduled.payload);
+                handler.on_message(scheduled.payload);
                 delivered += 1;
             } else {
                 debug!(
                     target_node = scheduled.target_node,
                     message_type = scheduled.message_type,
-                    "Gossip handler not registered for target node, dropping message"
+                    "No gossip handler for message type on target node, dropping"
                 );
             }
         }
@@ -779,14 +768,19 @@ mod tests {
     // ─── fulfill_requests() Tests ───
 
     /// Helper: create a simple echo handler that returns the payload as-is.
-    fn echo_handler() -> Arc<dyn InboundRequestHandler> {
+    fn echo_handler() -> Arc<dyn hyperscale_network::RequestHandler> {
         struct Echo;
-        impl InboundRequestHandler for Echo {
+        impl hyperscale_network::RequestHandler for Echo {
             fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
                 payload.to_vec()
             }
         }
         Arc::new(Echo)
+    }
+
+    /// Helper: register an echo handler on a node's adapter for a given type_id.
+    fn register_echo(adapter: &SimNetworkAdapter, type_id: &'static str) {
+        hyperscale_network::Network::register_request_handler(adapter, type_id, echo_handler());
     }
 
     /// Helper: build a PendingRequest with a callback that captures the result.
@@ -822,7 +816,7 @@ mod tests {
 
         // Register echo handler on node 1
         let adapter1 = network.create_adapter(1);
-        hyperscale_network::Network::register_request_handler(&adapter1, echo_handler());
+        register_echo(&adapter1, "test.request");
 
         let (request, result) =
             make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
@@ -848,7 +842,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter1 = network.create_adapter(1);
-        hyperscale_network::Network::register_request_handler(&adapter1, echo_handler());
+        register_echo(&adapter1, "test.request");
 
         // Partition node 0 → node 1
         network.partition_unidirectional(0, 1);
@@ -878,7 +872,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter1 = network.create_adapter(1);
-        hyperscale_network::Network::register_request_handler(&adapter1, echo_handler());
+        register_echo(&adapter1, "test.request");
 
         let (request, result) =
             make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
@@ -928,13 +922,17 @@ mod tests {
 
         // Register handler that returns empty
         struct EmptyHandler;
-        impl InboundRequestHandler for EmptyHandler {
+        impl hyperscale_network::RequestHandler for EmptyHandler {
             fn handle_request(&self, _: &[u8]) -> Vec<u8> {
                 vec![]
             }
         }
         let adapter1 = network.create_adapter(1);
-        hyperscale_network::Network::register_request_handler(&adapter1, Arc::new(EmptyHandler));
+        hyperscale_network::Network::register_request_handler(
+            &adapter1,
+            "test.request",
+            Arc::new(EmptyHandler),
+        );
 
         let (request, result) =
             make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
@@ -958,7 +956,7 @@ mod tests {
         // Register handlers on all nodes
         for i in 0..4 {
             let adapter = network.create_adapter(i);
-            hyperscale_network::Network::register_request_handler(&adapter, echo_handler());
+            register_echo(&adapter, "test.request");
         }
 
         // No preferred peer — should pick a random peer from the provided list
@@ -981,7 +979,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter0 = network.create_adapter(0);
-        hyperscale_network::Network::register_request_handler(&adapter0, echo_handler());
+        register_echo(&adapter0, "test.request");
 
         // No preferred peer, and empty peer list
         let (request, result) = make_request_with_capture(vec![], None);
@@ -1006,9 +1004,12 @@ mod tests {
         }
     }
 
-    /// Test gossip handler that records received messages.
+    /// Test gossip handler that records received payloads.
+    ///
+    /// Each handler is registered for a single message type, so the type is
+    /// implicit — we only need to record the payloads.
     struct RecordingHandler {
-        received: std::sync::Mutex<Vec<(&'static str, Vec<u8>)>>,
+        received: std::sync::Mutex<Vec<Vec<u8>>>,
     }
 
     impl RecordingHandler {
@@ -1022,20 +1023,23 @@ mod tests {
             self.received.lock().unwrap().len()
         }
 
-        fn messages(&self) -> Vec<(&'static str, Vec<u8>)> {
+        fn payloads(&self) -> Vec<Vec<u8>> {
             self.received.lock().unwrap().clone()
         }
     }
 
     impl hyperscale_network::GossipHandler for RecordingHandler {
-        fn on_gossip(&self, message_type: &'static str, payload: Vec<u8>) {
-            self.received.lock().unwrap().push((message_type, payload));
+        fn on_message(&self, payload: Vec<u8>) {
+            self.received.lock().unwrap().push(payload);
         }
     }
 
+    /// The message type used in gossip tests.
+    const TEST_GOSSIP_TYPE: &str = "test.gossip";
+
     /// Register recording handlers on all nodes and return them.
     ///
-    /// Each adapter is ephemeral — the handler survives in the shared `OnceLock` slot.
+    /// Each adapter is ephemeral — the handler survives in the shared registry.
     fn register_gossip_handlers(network: &SimulatedNetwork) -> Vec<Arc<RecordingHandler>> {
         let total = network.total_nodes();
         (0..total as NodeIndex)
@@ -1044,6 +1048,8 @@ mod tests {
                 let adapter = network.create_adapter(i);
                 hyperscale_network::Network::register_gossip_handler(
                     &adapter,
+                    TEST_GOSSIP_TYPE,
+                    hyperscale_network::TopicScope::Global,
                     handler.clone() as Arc<dyn hyperscale_network::GossipHandler>,
                 );
                 handler
@@ -1220,10 +1226,9 @@ mod tests {
         network.flush_gossip(FAR_FUTURE);
 
         // Node 1 should have received the decompressed payload
-        let messages = handlers[1].messages();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].0, "test.gossip");
-        assert_eq!(messages[0].1, original_payload);
+        let payloads = handlers[1].payloads();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0], original_payload);
     }
 
     #[test]
@@ -1319,7 +1324,7 @@ mod tests {
 
         // Create adapter for node 1 and register handler through it
         let adapter1 = network.create_adapter(1);
-        hyperscale_network::Network::register_request_handler(&adapter1, echo_handler());
+        register_echo(&adapter1, "test.request");
 
         // fulfill_requests should be able to find the handler
         let (request, result) =
@@ -1342,8 +1347,22 @@ mod tests {
             packet_loss_rate: 0.0,
             ..Default::default()
         });
-        let handlers = register_gossip_handlers(&network);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Register per-type handlers for "block.vote" on each node.
+        let handlers: Vec<Arc<RecordingHandler>> = (0..network.total_nodes() as NodeIndex)
+            .map(|i| {
+                let handler = RecordingHandler::new();
+                let adapter = network.create_adapter(i);
+                hyperscale_network::Network::register_gossip_handler(
+                    &adapter,
+                    "block.vote",
+                    hyperscale_network::TopicScope::Shard,
+                    handler.clone() as Arc<dyn hyperscale_network::GossipHandler>,
+                );
+                handler
+            })
+            .collect();
 
         let adapter0 = network.create_adapter(0);
 
@@ -1374,9 +1393,8 @@ mod tests {
         network.flush_gossip(FAR_FUTURE);
 
         // Node 1 should have received the vote gossip
-        let messages = handlers[1].messages();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].0, "block.vote");
-        assert!(!messages[0].1.is_empty());
+        let payloads = handlers[1].payloads();
+        assert_eq!(payloads.len(), 1);
+        assert!(!payloads[0].is_empty());
     }
 }

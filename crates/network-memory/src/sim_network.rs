@@ -8,13 +8,14 @@
 //!
 //! Messages are wire-encoded (SBOR + LZ4) in the outbox, matching the production
 //! encoding path. [`SimulatedNetwork::flush_gossip`](crate::SimulatedNetwork::flush_gossip)
-//! delivers due messages via each target's registered `GossipHandler`.
+//! delivers due messages via each target's registered per-type gossip handler.
 
 use hyperscale_network::{
-    encode_to_wire, GossipHandler, InboundRequestHandler, Network, RequestError,
+    encode_to_wire, GossipHandler, HandlerRegistry, Network, RequestError, RequestHandler,
+    TopicScope,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 /// Target for an outbound message.
 #[derive(Debug, Clone)]
@@ -38,37 +39,22 @@ pub struct OutboxEntry {
 
 /// A buffered request from IoLoop, awaiting harness fulfillment.
 ///
-/// The simulation harness drains these after each step, dispatches on
-/// `type_id` to decode the request, looks up data from peer nodes,
-/// SBOR-encodes the response, and calls `on_response` with raw bytes.
-/// The generic `request<R>()` wrapper decodes `R::Response` before calling
-/// the user's typed callback.
+/// The simulation harness drains these after each step, looks up the
+/// per-type request handler on the target peer, passes the SBOR-encoded
+/// request bytes directly (no framing needed), and calls `on_response`
+/// with the raw SBOR response bytes.
 pub struct PendingRequest {
     /// Validators eligible to serve this request.
     pub peers: Vec<ValidatorId>,
     /// Optional preferred peer (e.g., block proposer for fetch).
     pub preferred_peer: Option<ValidatorId>,
-    /// Message type ID for dispatch (e.g., "block.request").
+    /// Message type ID for handler lookup (e.g., "block.request").
     pub type_id: &'static str,
     /// SBOR-encoded request bytes.
     pub request_bytes: Vec<u8>,
     /// Callback that receives SBOR-encoded response bytes (or error).
     pub on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) + Send>,
 }
-
-/// Shared slot for an inbound request handler.
-///
-/// Created by [`SimulatedNetwork::create_adapter`] and shared between the
-/// per-node [`SimNetworkAdapter`] and the central [`SimulatedNetwork`].
-/// [`Network::register_request_handler`] sets the slot; request fulfillment reads it.
-pub type HandlerSlot = Arc<OnceLock<Arc<dyn InboundRequestHandler>>>;
-
-/// Shared slot for a gossip handler.
-///
-/// Created by [`SimulatedNetwork::create_adapter`] and shared between the
-/// per-node [`SimNetworkAdapter`] and the central [`SimulatedNetwork`].
-/// [`Network::register_gossip_handler`] sets the slot; gossip flushing reads it.
-pub type GossipHandlerSlot = Arc<OnceLock<Arc<dyn GossipHandler>>>;
 
 /// Network implementation for simulation.
 ///
@@ -86,25 +72,21 @@ pub type GossipHandlerSlot = Arc<OnceLock<Arc<dyn GossipHandler>>>;
 pub struct SimNetworkAdapter {
     outbox: Mutex<Vec<OutboxEntry>>,
     pending_requests: Mutex<Vec<PendingRequest>>,
-    /// Shared handler slot — written by [`Network::register_request_handler`],
-    /// read by [`SimulatedNetwork::fulfill_requests`].
-    handler_slot: HandlerSlot,
-    /// Shared gossip handler slot — written by [`Network::register_gossip_handler`],
-    /// read by [`SimulatedNetwork::flush_gossip`].
-    gossip_handler_slot: GossipHandlerSlot,
+    /// Shared handler registry — written by `register_*_handler`,
+    /// read by `SimulatedNetwork::fulfill_requests` and `flush_gossip`.
+    registry: Arc<HandlerRegistry>,
 }
 
 impl SimNetworkAdapter {
-    /// Create a new adapter with pre-allocated handler slots.
+    /// Create a new adapter with a shared handler registry.
     ///
     /// Use [`SimulatedNetwork::create_adapter`] to create adapters with
-    /// shared handler slots for request fulfillment and gossip delivery.
-    pub fn new(handler_slot: HandlerSlot, gossip_handler_slot: GossipHandlerSlot) -> Self {
+    /// shared registries for request fulfillment and gossip delivery.
+    pub fn new(registry: Arc<HandlerRegistry>) -> Self {
         Self {
             outbox: Mutex::new(Vec::new()),
             pending_requests: Mutex::new(Vec::new()),
-            handler_slot,
-            gossip_handler_slot,
+            registry,
         }
     }
 
@@ -127,7 +109,7 @@ impl SimNetworkAdapter {
 
 impl Default for SimNetworkAdapter {
     fn default() -> Self {
-        Self::new(Arc::new(OnceLock::new()), Arc::new(OnceLock::new()))
+        Self::new(Arc::new(HandlerRegistry::new()))
     }
 }
 
@@ -150,12 +132,22 @@ impl Network for SimNetworkAdapter {
         });
     }
 
-    fn register_request_handler(&self, handler: Arc<dyn InboundRequestHandler>) {
-        let _ = self.handler_slot.set(handler);
+    fn register_gossip_handler(
+        &self,
+        message_type_id: &'static str,
+        _scope: TopicScope,
+        handler: Arc<dyn GossipHandler>,
+    ) {
+        // Scope is irrelevant in simulation (delivery controlled by harness).
+        self.registry.register_gossip(message_type_id, handler);
     }
 
-    fn register_gossip_handler(&self, handler: Arc<dyn GossipHandler>) {
-        let _ = self.gossip_handler_slot.set(handler);
+    fn register_request_handler(
+        &self,
+        message_type_id: &'static str,
+        handler: Arc<dyn RequestHandler>,
+    ) {
+        self.registry.register_request(message_type_id, handler);
     }
 
     fn request<R: Request + 'static>(
@@ -255,47 +247,47 @@ mod tests {
     }
 
     #[test]
-    fn test_register_request_handler_sets_slot() {
-        let handler_slot: HandlerSlot = Arc::new(OnceLock::new());
-        let gossip_slot: GossipHandlerSlot = Arc::new(OnceLock::new());
-        let adapter = SimNetworkAdapter::new(handler_slot.clone(), gossip_slot);
+    fn test_register_request_handler() {
+        let registry = Arc::new(HandlerRegistry::new());
+        let adapter = SimNetworkAdapter::new(registry.clone());
 
         struct EchoHandler;
-        impl InboundRequestHandler for EchoHandler {
+        impl hyperscale_network::RequestHandler for EchoHandler {
             fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
                 payload.to_vec()
             }
         }
 
-        assert!(handler_slot.get().is_none());
-        adapter.register_request_handler(Arc::new(EchoHandler));
-        assert!(handler_slot.get().is_some());
+        assert!(registry.get_request("test.request").is_none());
+        adapter.register_request_handler("test.request", Arc::new(EchoHandler));
+        assert!(registry.get_request("test.request").is_some());
     }
 
     #[test]
-    fn test_register_request_handler_idempotent() {
+    fn test_register_request_handler_overwrites() {
         let adapter = SimNetworkAdapter::default();
 
         struct Handler1;
-        impl InboundRequestHandler for Handler1 {
+        impl hyperscale_network::RequestHandler for Handler1 {
             fn handle_request(&self, _: &[u8]) -> Vec<u8> {
                 vec![1]
             }
         }
 
         struct Handler2;
-        impl InboundRequestHandler for Handler2 {
+        impl hyperscale_network::RequestHandler for Handler2 {
             fn handle_request(&self, _: &[u8]) -> Vec<u8> {
                 vec![2]
             }
         }
 
-        adapter.register_request_handler(Arc::new(Handler1));
-        adapter.register_request_handler(Arc::new(Handler2)); // should be ignored
+        adapter.register_request_handler("test", Arc::new(Handler1));
+        adapter.register_request_handler("test", Arc::new(Handler2));
 
-        // First handler should have won
-        let result = adapter.handler_slot.get().unwrap().handle_request(&[]);
-        assert_eq!(result, vec![1]);
+        // Second handler should have won (overwrites)
+        let handler = adapter.registry.get_request("test").unwrap();
+        let result = handler.handle_request(&[]);
+        assert_eq!(result, vec![2]);
     }
 
     #[test]

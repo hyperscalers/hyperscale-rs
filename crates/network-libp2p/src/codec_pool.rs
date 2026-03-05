@@ -15,18 +15,19 @@
 //!                                               ▼
 //!                                      ┌─────────────────┐
 //!                                      │ LZ4 decompress  │
-//!                                      │ → GossipHandler │
+//!                                      │ → handler lookup │
+//!                                      │ → on_message()  │
 //!                                      └─────────────────┘
 //! ```
 //!
-//! The event loop remains non-blocking - after basic validation (peer, shard),
-//! decode work is spawned to the shared codec pool which decompresses and
-//! forwards the raw payload via the registered [`GossipHandler`].
+//! The event loop remains non-blocking — after basic validation (peer, shard)
+//! and handler lookup, the codec pool decompresses and invokes the per-type
+//! gossip handler directly.
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
-use hyperscale_network::{GossipHandler, Topic};
+use hyperscale_network::GossipHandler;
 use libp2p::PeerId as Libp2pPeerId;
 use std::sync::Arc;
 use tracing::warn;
@@ -38,47 +39,43 @@ use tracing::warn;
 /// thread pool in production, inline in simulation).
 pub(crate) struct CodecPoolHandle<D: Dispatch = PooledDispatch> {
     dispatch: Arc<D>,
-    handler: Arc<dyn GossipHandler>,
 }
 
 impl<D: Dispatch> Clone for CodecPoolHandle<D> {
     fn clone(&self) -> Self {
         Self {
             dispatch: self.dispatch.clone(),
-            handler: self.handler.clone(),
         }
     }
 }
 
 impl<D: Dispatch> CodecPoolHandle<D> {
-    /// Create a new handle wrapping the dispatch implementation and gossip handler.
-    pub(crate) fn new(dispatch: Arc<D>, handler: Arc<dyn GossipHandler>) -> Self {
-        Self { dispatch, handler }
+    /// Create a new handle wrapping the dispatch implementation.
+    pub(crate) fn new(dispatch: Arc<D>) -> Self {
+        Self { dispatch }
     }
 
-    /// Decode a message asynchronously and forward to the registered gossip handler.
+    /// Decompress a message asynchronously and forward to the given handler.
     ///
-    /// This method returns immediately - the actual decompress work happens on the
-    /// dispatch's codec pool. The decompressed payload is forwarded via the
-    /// `GossipHandler`, which handles delivery to the IoLoop.
+    /// This method returns immediately — the actual decompress work happens on the
+    /// dispatch's codec pool. The decompressed payload is forwarded directly to the
+    /// per-type gossip handler.
     ///
     /// # Arguments
     ///
-    /// * `topic` - The parsed gossipsub topic (determines message type)
+    /// * `handler` - The gossip handler for this message type (already looked up)
     /// * `data` - Raw LZ4-compressed message bytes from the network
     /// * `propagation_source` - Peer that sent the message (for logging)
     pub(crate) fn decode_async(
         &self,
-        topic: Topic,
+        handler: Arc<dyn GossipHandler>,
         data: Vec<u8>,
         propagation_source: Libp2pPeerId,
     ) {
-        let message_type = topic.message_type();
-        let handler = self.handler.clone();
         self.dispatch
             .spawn_codec(move || match hyperscale_network::wire::decompress(&data) {
                 Ok(payload) => {
-                    handler.on_gossip(message_type, payload);
+                    handler.on_message(payload);
                     metrics::record_network_message_received();
                 }
                 Err(e) => {
@@ -96,28 +93,35 @@ impl<D: Dispatch> CodecPoolHandle<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_core::NodeInput;
     use hyperscale_dispatch_pooled::ThreadPoolConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Test GossipHandler that forwards to a crossbeam channel.
-    struct ChannelHandler {
-        tx: crossbeam::channel::Sender<NodeInput>,
+    struct CountingHandler {
+        counter: Arc<AtomicUsize>,
+        tx: crossbeam::channel::Sender<Vec<u8>>,
     }
 
-    impl GossipHandler for ChannelHandler {
-        fn on_gossip(&self, message_type: &'static str, payload: Vec<u8>) {
-            let _ = self.tx.send(NodeInput::GossipReceived {
-                message_type,
-                payload,
-            });
+    impl GossipHandler for CountingHandler {
+        fn on_message(&self, payload: Vec<u8>) {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            let _ = self.tx.send(payload);
         }
     }
 
-    fn make_handle() -> (CodecPoolHandle, crossbeam::channel::Receiver<NodeInput>) {
+    fn make_handle() -> (
+        CodecPoolHandle,
+        Arc<dyn GossipHandler>,
+        Arc<AtomicUsize>,
+        crossbeam::channel::Receiver<Vec<u8>>,
+    ) {
         let dispatch = Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap());
+        let counter = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = crossbeam::channel::unbounded();
-        let handler: Arc<dyn GossipHandler> = Arc::new(ChannelHandler { tx });
-        (CodecPoolHandle::new(dispatch, handler), rx)
+        let handler: Arc<dyn GossipHandler> = Arc::new(CountingHandler {
+            counter: counter.clone(),
+            tx,
+        });
+        (CodecPoolHandle::new(dispatch), handler, counter, rx)
     }
 
     #[test]
@@ -143,69 +147,49 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_async_sends_gossip_received() {
-        let (handle, event_rx) = make_handle();
+    fn test_decode_async_calls_handler() {
+        let (pool, handler, counter, rx) = make_handle();
 
         let original = b"hello world";
         let compressed = hyperscale_network::wire::compress(original);
-        let topic = Topic::global("test.message");
         let peer = Libp2pPeerId::random();
 
-        handle.decode_async(topic, compressed, peer);
+        pool.decode_async(handler, compressed, peer);
 
-        let event = event_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        match event {
-            NodeInput::GossipReceived {
-                message_type,
-                payload,
-            } => {
-                assert_eq!(message_type, "test.message");
-                assert_eq!(payload, original);
-            }
-            other => panic!("Expected GossipReceived, got {:?}", other),
-        }
+        let payload = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(payload, original);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn test_decode_async_invalid_data_no_event() {
-        let (handle, event_rx) = make_handle();
-
-        let topic = Topic::global("test.message");
+    fn test_decode_async_invalid_data_no_handler_call() {
+        let (pool, handler, counter, rx) = make_handle();
         let peer = Libp2pPeerId::random();
 
         // Send garbage data that can't be decompressed
-        handle.decode_async(topic, vec![0xFF, 0xFE, 0xFD], peer);
+        pool.decode_async(handler, vec![0xFF, 0xFE, 0xFD], peer);
 
-        // Should not receive any event (decompress fails)
-        let result = event_rx.recv_timeout(std::time::Duration::from_millis(500));
-        assert!(result.is_err(), "Should not receive event for invalid data");
+        // Handler should not be called (decompress fails)
+        let result = rx.recv_timeout(std::time::Duration::from_millis(500));
+        assert!(
+            result.is_err(),
+            "Handler should not be called for invalid data"
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn test_clone_shares_handler() {
-        let (handle, event_rx) = make_handle();
-        let handle2 = handle.clone();
+    fn test_clone_shares_dispatch() {
+        let (pool, handler, counter, rx) = make_handle();
+        let pool2 = pool.clone();
 
         let compressed = hyperscale_network::wire::compress(b"from clone");
-        let topic = Topic::global("test.clone");
         let peer = Libp2pPeerId::random();
 
-        handle2.decode_async(topic, compressed, peer);
+        pool2.decode_async(handler, compressed, peer);
 
-        let event = event_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        match event {
-            NodeInput::GossipReceived {
-                message_type,
-                payload,
-            } => {
-                assert_eq!(message_type, "test.clone");
-                assert_eq!(payload, b"from clone");
-            }
-            other => panic!("Expected GossipReceived, got {:?}", other),
-        }
+        let payload = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(payload, b"from clone");
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 }

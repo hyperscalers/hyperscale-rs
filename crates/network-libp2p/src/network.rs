@@ -7,13 +7,13 @@ use crate::adapter::Libp2pAdapter;
 use crate::inbound_router::{spawn_inbound_router, InboundRouterHandle};
 use crate::request_manager::{RequestManager, RequestPriority};
 use hyperscale_network::{
-    encode_to_wire, frame_request, GossipHandler, InboundRequestHandler, Network, RequestError,
-    Topic,
+    encode_to_wire, frame_request, GossipHandler, HandlerRegistry, Network, RequestError,
+    RequestHandler, Topic, TopicScope,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use libp2p::PeerId;
-use std::sync::{Arc, OnceLock};
-use tracing::{debug, warn};
+use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 // ═══════════════════════════════════════════════════════════════════════
 // ProdNetwork
@@ -33,9 +33,13 @@ pub struct ProdNetwork {
     adapter: Arc<Libp2pAdapter>,
     request_manager: Arc<RequestManager>,
     tokio_handle: tokio::runtime::Handle,
-    /// Inbound router handle — set once via `register_request_handler`.
+    /// Shared handler registry for per-type gossip and request dispatch.
+    registry: Arc<HandlerRegistry>,
+    /// Local shard for deriving topic subscriptions.
+    local_shard: ShardGroupId,
+    /// Inbound router handle — spawned eagerly at construction.
     /// Kept alive to prevent the background task from being aborted.
-    inbound_router: OnceLock<InboundRouterHandle>,
+    _inbound_router: InboundRouterHandle,
 }
 
 impl ProdNetwork {
@@ -43,12 +47,21 @@ impl ProdNetwork {
         adapter: Arc<Libp2pAdapter>,
         request_manager: Arc<RequestManager>,
         tokio_handle: tokio::runtime::Handle,
+        registry: Arc<HandlerRegistry>,
+        local_shard: ShardGroupId,
     ) -> Self {
+        // Eagerly spawn the inbound router. It will dispatch incoming
+        // requests to handlers as they are registered in the registry.
+        let _guard = tokio_handle.enter();
+        let inbound_router = spawn_inbound_router(adapter.clone(), registry.clone());
+
         Self {
             adapter,
             request_manager,
             tokio_handle,
-            inbound_router: OnceLock::new(),
+            registry,
+            local_shard,
+            _inbound_router: inbound_router,
         }
     }
 
@@ -86,17 +99,38 @@ impl Network for ProdNetwork {
         }
     }
 
-    fn register_request_handler(&self, handler: Arc<dyn InboundRequestHandler>) {
-        // Enter the tokio runtime context so spawn_inbound_router can use
-        // tokio::spawn (this may be called from the main thread before the
-        // IoLoop is moved to its pinned thread).
-        let _guard = self.tokio_handle.enter();
-        let handle = spawn_inbound_router(self.adapter.clone(), handler);
-        let _ = self.inbound_router.set(handle);
+    fn register_gossip_handler(
+        &self,
+        message_type_id: &'static str,
+        scope: TopicScope,
+        handler: Arc<dyn GossipHandler>,
+    ) {
+        // Store in registry for dispatch by the codec pool.
+        self.registry.register_gossip(message_type_id, handler);
+
+        // Auto-subscribe to the corresponding gossipsub topic.
+        let topic = match scope {
+            TopicScope::Shard => Topic::shard(message_type_id, self.local_shard),
+            TopicScope::Global => Topic::global(message_type_id),
+        };
+        if let Err(e) = self.adapter.subscribe_topic(topic.to_string()) {
+            warn!(
+                message_type = message_type_id,
+                error = ?e,
+                "Failed to subscribe to topic"
+            );
+        } else {
+            info!(topic = %topic, "Subscribed to topic");
+        }
     }
 
-    fn register_gossip_handler(&self, handler: Arc<dyn GossipHandler>) {
-        self.adapter.set_gossip_handler(handler);
+    fn register_request_handler(
+        &self,
+        message_type_id: &'static str,
+        handler: Arc<dyn RequestHandler>,
+    ) {
+        // Store in registry for dispatch by the inbound router.
+        self.registry.register_request(message_type_id, handler);
     }
 
     fn request<R: Request + 'static>(
@@ -136,7 +170,7 @@ impl Network for ProdNetwork {
             }
         };
 
-        // Frame with type_id for dispatch by the receiver's RequestHandler
+        // Frame with type_id for dispatch by the receiver's InboundRouter
         let framed = frame_request(R::message_type_id(), &request_bytes);
         let description = format!("{}({}B)", R::message_type_id(), request_bytes.len());
         let rm = self.request_manager.clone();

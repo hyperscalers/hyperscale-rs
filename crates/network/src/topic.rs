@@ -40,12 +40,10 @@ impl Default for ProtocolVersion {
     }
 }
 
-/// Structured representation of a gossipsub topic.
+/// Structured representation of a gossipsub topic for the **send path**.
 ///
-/// Topics are used for:
-/// - Subscribing to message types
-/// - Routing broadcast messages
-/// - Filtering incoming messages
+/// Created via [`Topic::shard`] or [`Topic::global`] using `&'static str`
+/// message type identifiers from `NetworkMessage::message_type_id()`.
 ///
 /// # Topic Format
 ///
@@ -132,131 +130,90 @@ impl Topic {
             ),
         }
     }
-
-    /// Map a dynamic message type string to its interned `&'static str`.
-    ///
-    /// Returns `None` for unrecognized message types.
-    fn intern_message_type(s: &str) -> Option<&'static str> {
-        match s {
-            "block.header" => Some("block.header"),
-            "block.vote" => Some("block.vote"),
-            "transaction.gossip" => Some("transaction.gossip"),
-            "transaction.certificate" => Some("transaction.certificate"),
-            "state.provision.batch" => Some("state.provision.batch"),
-            "execution.vote.batch" => Some("execution.vote.batch"),
-            "execution.certificate.batch" => Some("execution.certificate.batch"),
-            "block.committed" => Some("block.committed"),
-            _ => None,
-        }
-    }
-
-    /// Parse a topic string back to a Topic.
-    ///
-    /// Returns `None` if the format is invalid or the message type is unknown.
-    pub fn parse(topic_str: &str) -> Option<Self> {
-        let parts: Vec<&str> = topic_str.split('/').collect();
-
-        // Must start with "hyperscale"
-        if parts.is_empty() || parts[0] != "hyperscale" {
-            return None;
-        }
-
-        match parts.len() {
-            // Global format: hyperscale/{message_type}/{version}
-            3 => {
-                let message_type = Self::intern_message_type(parts[1])?;
-                let version = Self::parse_version(parts[2])?;
-                Some(Self {
-                    message_type,
-                    shard: None,
-                    version,
-                })
-            }
-            // Shard format: hyperscale/{message_type}/shard-{id}/{version}
-            4 => {
-                let message_type = Self::intern_message_type(parts[1])?;
-                let shard_str = parts[2];
-
-                // Check for shard prefix
-                let shard = if let Some(id_str) = shard_str.strip_prefix("shard-") {
-                    let shard_id: u64 = id_str.parse().ok()?;
-                    Some(ShardGroupId(shard_id))
-                } else {
-                    return None;
-                };
-
-                let version = Self::parse_version(parts[3])?;
-                Some(Self {
-                    message_type,
-                    shard,
-                    version,
-                })
-            }
-            _ => None,
-        }
-    }
-
-    /// Parse version string (e.g., "1.0.0")
-    fn parse_version(version_str: &str) -> Option<ProtocolVersion> {
-        let parts: Vec<&str> = version_str.split('.').collect();
-        if parts.len() != 3 {
-            return None;
-        }
-        Some(ProtocolVersion {
-            major: parts[0].parse().ok()?,
-            minor: parts[1].parse().ok()?,
-        })
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Predefined topics for message types
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// Topic for block header gossip.
-    pub fn block_header(shard: ShardGroupId) -> Self {
-        Self::shard("block.header", shard)
-    }
-
-    /// Topic for block vote gossip.
-    pub fn block_vote(shard: ShardGroupId) -> Self {
-        Self::shard("block.vote", shard)
-    }
-
-    /// Topic for transaction gossip.
-    pub fn transaction_gossip(shard: ShardGroupId) -> Self {
-        Self::shard("transaction.gossip", shard)
-    }
-
-    /// Topic for transaction certificate gossip (finalized certificates).
-    pub fn transaction_certificate(shard: ShardGroupId) -> Self {
-        Self::shard("transaction.certificate", shard)
-    }
-
-    /// Topic for state provision batch gossip.
-    pub fn state_provision_batch(shard: ShardGroupId) -> Self {
-        Self::shard("state.provision.batch", shard)
-    }
-
-    /// Topic for execution vote batch gossip.
-    pub fn execution_vote_batch(shard: ShardGroupId) -> Self {
-        Self::shard("execution.vote.batch", shard)
-    }
-
-    /// Topic for execution certificate batch gossip.
-    pub fn execution_certificate_batch(shard: ShardGroupId) -> Self {
-        Self::shard("execution.certificate.batch", shard)
-    }
-
-    /// Topic for committed block header gossip (global, cross-shard).
-    pub fn block_committed() -> Self {
-        Self::global("block.committed")
-    }
 }
 
 impl std::fmt::Display for Topic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.to_topic_string())
     }
+}
+
+/// Result of parsing an incoming gossipsub topic string.
+///
+/// Used on the **receive path** where message types are dynamic strings
+/// from the network, not compile-time `&'static str` identifiers.
+#[derive(Debug, Clone)]
+pub struct ParsedTopic<'a> {
+    /// Message type identifier extracted from the topic string.
+    pub message_type: &'a str,
+    /// Optional shard targeting.
+    pub shard_id: Option<ShardGroupId>,
+}
+
+/// Parse a gossipsub topic string into its components.
+///
+/// Extracts the message type and optional shard ID from topics matching:
+/// - `hyperscale/{message_type}/{version}` (global)
+/// - `hyperscale/{message_type}/shard-{id}/{version}` (shard-scoped)
+///
+/// Returns `None` if the topic format is invalid. Does **not** validate
+/// the message type against a known set — handler lookup serves as
+/// the validation step.
+pub fn parse_topic(topic_str: &str) -> Option<ParsedTopic<'_>> {
+    let parts: Vec<&str> = topic_str.split('/').collect();
+
+    // Must start with "hyperscale"
+    if parts.is_empty() || parts[0] != "hyperscale" {
+        return None;
+    }
+
+    match parts.len() {
+        // Global format: hyperscale/{message_type}/{version}
+        3 => {
+            let message_type = parts[1];
+            if message_type.is_empty() {
+                return None;
+            }
+            if !validate_version(parts[2]) {
+                return None;
+            }
+            Some(ParsedTopic {
+                message_type,
+                shard_id: None,
+            })
+        }
+        // Shard format: hyperscale/{message_type}/shard-{id}/{version}
+        4 => {
+            let message_type = parts[1];
+            if message_type.is_empty() {
+                return None;
+            }
+            let shard_str = parts[2];
+            let shard_id = if let Some(id_str) = shard_str.strip_prefix("shard-") {
+                let shard_id: u64 = id_str.parse().ok()?;
+                Some(ShardGroupId(shard_id))
+            } else {
+                return None;
+            };
+
+            if !validate_version(parts[3]) {
+                return None;
+            }
+            Some(ParsedTopic {
+                message_type,
+                shard_id,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Validate that a version segment has the expected `major.minor.patch` shape.
+///
+/// We only need structural validation on the receive path (the actual version
+/// is unused after parsing), so we just check for three dot-separated parts.
+fn validate_version(version_str: &str) -> bool {
+    version_str.split('.').count() == 3
 }
 
 #[cfg(test)]
@@ -288,58 +245,47 @@ mod tests {
 
     #[test]
     fn test_parse_global_topic() {
-        let topic = Topic::parse("hyperscale/block.header/1.0.0").unwrap();
-        assert_eq!(topic.message_type(), "block.header");
-        assert!(topic.is_global());
-        assert_eq!(topic.version(), ProtocolVersion::CURRENT);
+        let parsed = parse_topic("hyperscale/block.header/1.0.0").unwrap();
+        assert_eq!(parsed.message_type, "block.header");
+        assert!(parsed.shard_id.is_none());
     }
 
     #[test]
     fn test_parse_shard_topic() {
-        let topic = Topic::parse("hyperscale/transaction.gossip/shard-3/1.0.0").unwrap();
-        assert_eq!(topic.message_type(), "transaction.gossip");
-        assert_eq!(topic.shard_id(), Some(ShardGroupId(3)));
-        assert_eq!(topic.version(), ProtocolVersion::CURRENT);
+        let parsed = parse_topic("hyperscale/transaction.gossip/shard-3/1.0.0").unwrap();
+        assert_eq!(parsed.message_type, "transaction.gossip");
+        assert_eq!(parsed.shard_id, Some(ShardGroupId(3)));
+    }
+
+    #[test]
+    fn test_parse_unknown_type_accepted() {
+        // Any well-formed topic is accepted — validation is by handler lookup
+        let parsed = parse_topic("hyperscale/unknown.type/1.0.0").unwrap();
+        assert_eq!(parsed.message_type, "unknown.type");
     }
 
     #[test]
     fn test_parse_invalid_topics() {
-        assert!(Topic::parse("invalid/topic").is_none());
-        assert!(Topic::parse("hyperscale/").is_none());
-        assert!(Topic::parse("hyperscale/msg").is_none());
-        assert!(Topic::parse("hyperscale/msg/not-shard/1.0.0").is_none());
-        assert!(Topic::parse("other/block.header/1.0.0").is_none());
-        assert!(Topic::parse("hyperscale/unknown.type/1.0.0").is_none());
+        assert!(parse_topic("invalid/topic").is_none());
+        assert!(parse_topic("hyperscale/").is_none());
+        assert!(parse_topic("hyperscale/msg").is_none());
+        assert!(parse_topic("hyperscale/msg/not-shard/1.0.0").is_none());
+        assert!(parse_topic("other/block.header/1.0.0").is_none());
+        assert!(parse_topic("hyperscale//1.0.0").is_none());
     }
 
     #[test]
     fn test_roundtrip() {
         let original = Topic::global("block.header");
         let string = original.to_string();
-        let parsed = Topic::parse(&string).unwrap();
-        assert_eq!(original, parsed);
+        let parsed = parse_topic(&string).unwrap();
+        assert_eq!(parsed.message_type, original.message_type());
+        assert_eq!(parsed.shard_id, original.shard_id());
 
         let original = Topic::shard("transaction.gossip", ShardGroupId(42));
         let string = original.to_string();
-        let parsed = Topic::parse(&string).unwrap();
-        assert_eq!(original, parsed);
-    }
-
-    #[test]
-    fn test_predefined_topics() {
-        let shard = ShardGroupId(0);
-
-        assert_eq!(
-            Topic::block_header(shard).to_string(),
-            "hyperscale/block.header/shard-0/1.0.0"
-        );
-        assert_eq!(
-            Topic::block_vote(shard).to_string(),
-            "hyperscale/block.vote/shard-0/1.0.0"
-        );
-        assert_eq!(
-            Topic::transaction_gossip(shard).to_string(),
-            "hyperscale/transaction.gossip/shard-0/1.0.0"
-        );
+        let parsed = parse_topic(&string).unwrap();
+        assert_eq!(parsed.message_type, original.message_type());
+        assert_eq!(parsed.shard_id, original.shard_id());
     }
 }

@@ -54,7 +54,7 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, WireError> {
 /// Wire format: `[type_id_len: u16 LE][type_id: UTF-8][SBOR payload]`
 ///
 /// Used by the `Network::request<R>()` sender to tag opaque request bytes
-/// with a type identifier. The receiver (`InboundRequestHandler`) calls
+/// with a type identifier. The receiver (`InboundRouter`) calls
 /// [`parse_request_frame`] to extract the type_id and dispatch accordingly.
 pub fn frame_request(type_id: &str, payload: &[u8]) -> Vec<u8> {
     let type_id_bytes = type_id.as_bytes();

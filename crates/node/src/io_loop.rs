@@ -412,25 +412,88 @@ where
         &self.tx_status_cache
     }
 
-    /// Create and register the request handler with the network.
+    /// Register per-type request handlers with the network.
+    ///
+    /// Each request type gets its own handler closure that delegates to the
+    /// shared `RequestHandler<S>` instance.
     fn register_request_handler(&self) {
-        let handler: Arc<dyn hyperscale_network::InboundRequestHandler> =
-            Arc::new(crate::request_handler::RequestHandler::new(
-                self.config.inbound.clone(),
-                Arc::clone(&self.storage),
-                Arc::clone(&self.topology),
-                Arc::clone(&self.tx_cache),
-                Arc::clone(&self.cert_cache),
-            ));
-        self.network.register_request_handler(handler);
+        let rh = Arc::new(crate::request_handler::RequestHandler::new(
+            self.config.inbound.clone(),
+            Arc::clone(&self.storage),
+            Arc::clone(&self.topology),
+            Arc::clone(&self.tx_cache),
+            Arc::clone(&self.cert_cache),
+        ));
+
+        self.register_one_request(
+            "block.request",
+            &rh,
+            crate::request_handler::RequestHandler::handle_block_request,
+        );
+        self.register_one_request(
+            "transaction.request",
+            &rh,
+            crate::request_handler::RequestHandler::handle_transaction_request,
+        );
+        self.register_one_request(
+            "certificate.request",
+            &rh,
+            crate::request_handler::RequestHandler::handle_certificate_request,
+        );
+        self.register_one_request(
+            "provision.request",
+            &rh,
+            crate::request_handler::RequestHandler::handle_provision_request,
+        );
     }
 
-    /// Create and register the gossip handler with the network.
+    /// Register a single request type handler that delegates to a method on `RequestHandler<S>`.
+    fn register_one_request(
+        &self,
+        type_id: &'static str,
+        rh: &Arc<crate::request_handler::RequestHandler<S>>,
+        method: crate::request_handler::HandlerFn<S>,
+    ) {
+        let rh = rh.clone();
+        let handler: Arc<dyn hyperscale_network::RequestHandler> =
+            Arc::new(move |payload: &[u8]| -> Vec<u8> {
+                match method(&rh, payload) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::debug!(error = %e, type_id = type_id, "Request processing failed");
+                        vec![]
+                    }
+                }
+            });
+        self.network.register_request_handler(type_id, handler);
+    }
+
+    /// Register per-type gossip handlers with the network.
+    ///
+    /// Each gossip message type gets a [`TypedGossipBridge`] that forwards
+    /// the payload to the IoLoop event channel as `NodeInput::GossipReceived`.
     fn register_gossip_handler(&self) {
-        let handler = Arc::new(crate::gossip_bridge::ChannelGossipHandler::new(
-            self.event_sender.clone(),
-        ));
-        self.network.register_gossip_handler(handler);
+        use hyperscale_network::TopicScope;
+
+        let gossip_types: &[(&str, TopicScope)] = &[
+            ("block.header", TopicScope::Shard),
+            ("block.vote", TopicScope::Shard),
+            ("transaction.gossip", TopicScope::Shard),
+            ("transaction.certificate", TopicScope::Shard),
+            ("state.provision.batch", TopicScope::Shard),
+            ("execution.vote.batch", TopicScope::Shard),
+            ("execution.certificate.batch", TopicScope::Shard),
+            ("block.committed", TopicScope::Global),
+        ];
+
+        for &(type_id, scope) in gossip_types {
+            let handler = Arc::new(crate::gossip_bridge::TypedGossipBridge::new(
+                type_id,
+                self.event_sender.clone(),
+            ));
+            self.network
+                .register_gossip_handler(type_id, scope, handler);
+        }
     }
 
     // ─── Event Processing ───────────────────────────────────────────────
