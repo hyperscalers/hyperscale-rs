@@ -585,7 +585,7 @@ impl SimulationRunner {
         }
 
         // Fulfill pending network requests (block, tx, cert fetches) through
-        // peer InboundHandlers. Must happen BEFORE draining buffered events so
+        // peer RequestHandlers. Must happen BEFORE draining buffered events so
         // that callback-generated events are included in the drain below.
         let pending_requests = self.io_loops[i].network().drain_pending_requests();
         if !pending_requests.is_empty() {

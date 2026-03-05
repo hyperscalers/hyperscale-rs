@@ -60,7 +60,7 @@ pub struct PendingRequest {
 ///
 /// Created by [`SimulatedNetwork::create_adapter`] and shared between the
 /// per-node [`SimNetworkAdapter`] and the central [`SimulatedNetwork`].
-/// [`Network::register_inbound_handler`] sets the slot; request fulfillment reads it.
+/// [`Network::register_request_handler`] sets the slot; request fulfillment reads it.
 pub type HandlerSlot = Arc<OnceLock<Arc<dyn InboundRequestHandler>>>;
 
 /// Shared slot for a gossip handler.
@@ -86,7 +86,7 @@ pub type GossipHandlerSlot = Arc<OnceLock<Arc<dyn GossipHandler>>>;
 pub struct SimNetworkAdapter {
     outbox: Mutex<Vec<OutboxEntry>>,
     pending_requests: Mutex<Vec<PendingRequest>>,
-    /// Shared handler slot — written by [`Network::register_inbound_handler`],
+    /// Shared handler slot — written by [`Network::register_request_handler`],
     /// read by [`SimulatedNetwork::fulfill_requests`].
     handler_slot: HandlerSlot,
     /// Shared gossip handler slot — written by [`Network::register_gossip_handler`],
@@ -150,7 +150,7 @@ impl Network for SimNetworkAdapter {
         });
     }
 
-    fn register_inbound_handler(&self, handler: Arc<dyn InboundRequestHandler>) {
+    fn register_request_handler(&self, handler: Arc<dyn InboundRequestHandler>) {
         let _ = self.handler_slot.set(handler);
     }
 
@@ -255,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn test_register_inbound_handler_sets_slot() {
+    fn test_register_request_handler_sets_slot() {
         let handler_slot: HandlerSlot = Arc::new(OnceLock::new());
         let gossip_slot: GossipHandlerSlot = Arc::new(OnceLock::new());
         let adapter = SimNetworkAdapter::new(handler_slot.clone(), gossip_slot);
@@ -268,12 +268,12 @@ mod tests {
         }
 
         assert!(handler_slot.get().is_none());
-        adapter.register_inbound_handler(Arc::new(EchoHandler));
+        adapter.register_request_handler(Arc::new(EchoHandler));
         assert!(handler_slot.get().is_some());
     }
 
     #[test]
-    fn test_register_inbound_handler_idempotent() {
+    fn test_register_request_handler_idempotent() {
         let adapter = SimNetworkAdapter::default();
 
         struct Handler1;
@@ -290,8 +290,8 @@ mod tests {
             }
         }
 
-        adapter.register_inbound_handler(Arc::new(Handler1));
-        adapter.register_inbound_handler(Arc::new(Handler2)); // should be ignored
+        adapter.register_request_handler(Arc::new(Handler1));
+        adapter.register_request_handler(Arc::new(Handler2)); // should be ignored
 
         // First handler should have won
         let result = adapter.handler_slot.get().unwrap().handle_request(&[]);

@@ -1,4 +1,4 @@
-//! Inbound request handler for block sync, data fetch, and provision serving.
+//! Request handler for block sync, data fetch, and provision serving.
 //!
 //! Processes incoming request-response payloads using `ConsensusStore` and
 //! `SubstateStore` trait methods. Transport-specific I/O (libp2p streams,
@@ -33,7 +33,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, trace};
 
-/// Errors from inbound request processing.
+/// Errors from request processing.
 #[derive(Debug, Error)]
 pub enum InboundError {
     #[error("Request frame error: {0}")]
@@ -49,14 +49,14 @@ pub enum InboundError {
     EncodeError(String),
 }
 
-/// Configuration for the inbound handler.
+/// Configuration for the request handler.
 #[derive(Debug, Clone)]
-pub struct InboundHandlerConfig {
+pub struct RequestHandlerConfig {
     /// Maximum number of items to return in a single fetch response.
     pub max_items_per_response: usize,
 }
 
-impl Default for InboundHandlerConfig {
+impl Default for RequestHandlerConfig {
     fn default() -> Self {
         Self {
             max_items_per_response: 500,
@@ -64,13 +64,13 @@ impl Default for InboundHandlerConfig {
     }
 }
 
-/// Inbound request handler, parameterized over storage.
+/// Request handler, parameterized over storage.
 ///
 /// Handles block sync, transaction fetch, certificate fetch, and provision
 /// serving requests. Transport-specific I/O (stream framing, compression,
 /// metrics) is handled by the transport layer's inbound router.
-pub struct InboundHandler<S: ConsensusStore + SubstateStore> {
-    config: InboundHandlerConfig,
+pub struct RequestHandler<S: ConsensusStore + SubstateStore> {
+    config: RequestHandlerConfig,
     storage: Arc<S>,
     topology: Arc<dyn Topology>,
     /// Cache for recently received transactions (not yet committed to storage).
@@ -79,10 +79,10 @@ pub struct InboundHandler<S: ConsensusStore + SubstateStore> {
     recently_built_certs: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
 }
 
-impl<S: ConsensusStore + SubstateStore> InboundHandler<S> {
-    /// Create a new inbound handler.
+impl<S: ConsensusStore + SubstateStore> RequestHandler<S> {
+    /// Create a new request handler.
     pub fn new(
-        config: InboundHandlerConfig,
+        config: RequestHandlerConfig,
         storage: Arc<S>,
         topology: Arc<dyn Topology>,
         recently_received_txs: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
@@ -352,12 +352,12 @@ impl<S: ConsensusStore + SubstateStore> InboundHandler<S> {
     }
 }
 
-impl<S: ConsensusStore + SubstateStore + 'static> InboundRequestHandler for InboundHandler<S> {
+impl<S: ConsensusStore + SubstateStore + 'static> InboundRequestHandler for RequestHandler<S> {
     fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
         match self.process_request(payload) {
             Ok(data) => data,
             Err(e) => {
-                debug!(error = %e, "Inbound request processing failed");
+                debug!(error = %e, "Request processing failed");
                 vec![]
             }
         }

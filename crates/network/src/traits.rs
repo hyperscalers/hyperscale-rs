@@ -65,23 +65,23 @@ pub trait Network: Send + Sync {
     /// Broadcast a message to all connected peers globally.
     fn broadcast_global<M: NetworkMessage>(&self, message: &M);
 
-    // ── Inbound request handling ──
+    // ── Request handling ──
 
-    /// Register an inbound request handler.
+    /// Register a request handler.
     ///
     /// The handler processes incoming request-response payloads (block sync,
     /// transaction/certificate fetches). Called once during node initialization.
     ///
     /// The network layer owns the handler's lifecycle — production spawns an
     /// `InboundRouter` task, simulation stores it for centralized fulfillment.
-    fn register_inbound_handler(&self, handler: Arc<dyn InboundRequestHandler>);
+    fn register_request_handler(&self, handler: Arc<dyn InboundRequestHandler>);
 
     // ── Gossip handler ──
 
     /// Register a handler for incoming gossip messages.
     ///
     /// The handler receives decompressed SBOR payloads. Called once during
-    /// node initialization, alongside `register_inbound_handler`.
+    /// node initialization, alongside `register_request_handler`.
     fn register_gossip_handler(&self, handler: Arc<dyn GossipHandler>);
 
     // ── Request-response ──
@@ -113,7 +113,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_inbound_handler_arc_delegation() {
+    fn test_request_handler_arc_delegation() {
         struct Echo;
         impl InboundRequestHandler for Echo {
             fn handle_request(&self, payload: &[u8]) -> Vec<u8> {

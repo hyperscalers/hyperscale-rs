@@ -8,9 +8,9 @@ mod action_handler;
 mod batch_accumulator;
 mod config;
 mod gossip_bridge;
-mod inbound_handler;
 pub mod io_loop;
 mod protocol;
+mod request_handler;
 
 mod state;
 

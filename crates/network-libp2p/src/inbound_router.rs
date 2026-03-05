@@ -108,7 +108,7 @@ impl<H: InboundRequestHandler> InboundRouter<H> {
 
 /// Spawn an inbound router with the given handler.
 ///
-/// Used internally by `ProdNetwork::register_inbound_handler`.
+/// Used internally by `ProdNetwork::register_request_handler`.
 pub(crate) fn spawn_inbound_router<H: InboundRequestHandler>(
     adapter: Arc<Libp2pAdapter>,
     handler: H,

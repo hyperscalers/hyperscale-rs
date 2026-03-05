@@ -33,7 +33,7 @@ pub struct ProdNetwork {
     adapter: Arc<Libp2pAdapter>,
     request_manager: Arc<RequestManager>,
     tokio_handle: tokio::runtime::Handle,
-    /// Inbound router handle — set once via `register_inbound_handler`.
+    /// Inbound router handle — set once via `register_request_handler`.
     /// Kept alive to prevent the background task from being aborted.
     inbound_router: OnceLock<InboundRouterHandle>,
 }
@@ -86,7 +86,7 @@ impl Network for ProdNetwork {
         }
     }
 
-    fn register_inbound_handler(&self, handler: Arc<dyn InboundRequestHandler>) {
+    fn register_request_handler(&self, handler: Arc<dyn InboundRequestHandler>) {
         // Enter the tokio runtime context so spawn_inbound_router can use
         // tokio::spawn (this may be called from the main thread before the
         // IoLoop is moved to its pinned thread).
@@ -136,7 +136,7 @@ impl Network for ProdNetwork {
             }
         };
 
-        // Frame with type_id for dispatch by the receiver's InboundHandler
+        // Frame with type_id for dispatch by the receiver's RequestHandler
         let framed = frame_request(R::message_type_id(), &request_bytes);
         let description = format!("{}({}B)", R::message_type_id(), request_bytes.len());
         let rm = self.request_manager.clone();

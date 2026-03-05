@@ -102,7 +102,7 @@ pub struct SimulatedNetwork {
     partitions: HashSet<(NodeIndex, NodeIndex)>,
     /// Per-node handler slots, shared with each node's [`SimNetworkAdapter`].
     ///
-    /// Populated when [`Network::register_inbound_handler`] is called on the
+    /// Populated when [`Network::register_request_handler`] is called on the
     /// adapter; read during [`fulfill_requests`](Self::fulfill_requests).
     handler_slots: Vec<HandlerSlot>,
     /// Per-node gossip handler slots, shared with each node's [`SimNetworkAdapter`].
@@ -145,7 +145,7 @@ impl SimulatedNetwork {
 
     /// Create a [`SimNetworkAdapter`] for a node, sharing its handler slots.
     ///
-    /// The returned adapter's [`Network::register_inbound_handler`] and
+    /// The returned adapter's [`Network::register_request_handler`] and
     /// [`Network::register_gossip_handler`] calls will populate the shared
     /// slots, making them visible to [`fulfill_requests`](Self::fulfill_requests)
     /// and [`flush_gossip`](Self::flush_gossip).
@@ -315,10 +315,10 @@ impl SimulatedNetwork {
 
     // ─── Request Fulfillment ───
 
-    /// Fulfill pending requests by routing them through peer InboundRequestHandlers.
+    /// Fulfill pending requests by routing them through peer request handlers.
     ///
     /// Handlers are obtained from the shared [`HandlerSlot`]s populated by each
-    /// node's [`Network::register_inbound_handler`] call.
+    /// node's [`Network::register_request_handler`] call.
     ///
     /// For each request:
     /// 1. Select a peer (preferred_peer if set, otherwise random non-self peer)
@@ -327,7 +327,7 @@ impl SimulatedNetwork {
     /// 4. Invoke the callback with the response bytes
     ///
     /// This ensures simulation exercises the same encode/decode/dispatch path
-    /// as production (via `InboundHandler`).
+    /// as production (via `RequestHandler`).
     pub fn fulfill_requests(
         &self,
         requester: NodeIndex,
@@ -822,7 +822,7 @@ mod tests {
 
         // Register echo handler on node 1
         let adapter1 = network.create_adapter(1);
-        hyperscale_network::Network::register_inbound_handler(&adapter1, echo_handler());
+        hyperscale_network::Network::register_request_handler(&adapter1, echo_handler());
 
         let (request, result) =
             make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
@@ -848,7 +848,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter1 = network.create_adapter(1);
-        hyperscale_network::Network::register_inbound_handler(&adapter1, echo_handler());
+        hyperscale_network::Network::register_request_handler(&adapter1, echo_handler());
 
         // Partition node 0 → node 1
         network.partition_unidirectional(0, 1);
@@ -878,7 +878,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter1 = network.create_adapter(1);
-        hyperscale_network::Network::register_inbound_handler(&adapter1, echo_handler());
+        hyperscale_network::Network::register_request_handler(&adapter1, echo_handler());
 
         let (request, result) =
             make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
@@ -934,7 +934,7 @@ mod tests {
             }
         }
         let adapter1 = network.create_adapter(1);
-        hyperscale_network::Network::register_inbound_handler(&adapter1, Arc::new(EmptyHandler));
+        hyperscale_network::Network::register_request_handler(&adapter1, Arc::new(EmptyHandler));
 
         let (request, result) =
             make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
@@ -958,7 +958,7 @@ mod tests {
         // Register handlers on all nodes
         for i in 0..4 {
             let adapter = network.create_adapter(i);
-            hyperscale_network::Network::register_inbound_handler(&adapter, echo_handler());
+            hyperscale_network::Network::register_request_handler(&adapter, echo_handler());
         }
 
         // No preferred peer — should pick a random peer from the provided list
@@ -981,7 +981,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter0 = network.create_adapter(0);
-        hyperscale_network::Network::register_inbound_handler(&adapter0, echo_handler());
+        hyperscale_network::Network::register_request_handler(&adapter0, echo_handler());
 
         // No preferred peer, and empty peer list
         let (request, result) = make_request_with_capture(vec![], None);
@@ -1319,7 +1319,7 @@ mod tests {
 
         // Create adapter for node 1 and register handler through it
         let adapter1 = network.create_adapter(1);
-        hyperscale_network::Network::register_inbound_handler(&adapter1, echo_handler());
+        hyperscale_network::Network::register_request_handler(&adapter1, echo_handler());
 
         // fulfill_requests should be able to find the handler
         let (request, result) =

@@ -168,7 +168,7 @@ where
     dispatch: D,
     event_sender: crossbeam::channel::Sender<NodeInput>,
 
-    // Configuration (retained for creating InboundHandler)
+    // Configuration (retained for creating RequestHandler)
     config: NodeConfig,
 
     // Identity
@@ -180,7 +180,7 @@ where
     // Prepared commit cache (shared with dispatch closures)
     prepared_commits: Arc<Mutex<HashMap<Hash, S::PreparedCommit>>>,
 
-    // In-memory caches (shared with InboundRouter in production)
+    // In-memory caches (shared with inbound router in production)
     cert_cache: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
     tx_cache: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
 
@@ -360,7 +360,7 @@ where
         let result = f(storage, &self.executor);
 
         // Now sole ownership is released — register handlers.
-        self.register_inbound_handler();
+        self.register_request_handler();
         self.register_gossip_handler();
 
         result
@@ -412,17 +412,17 @@ where
         &self.tx_status_cache
     }
 
-    /// Create and register the inbound request handler with the network.
-    fn register_inbound_handler(&self) {
+    /// Create and register the request handler with the network.
+    fn register_request_handler(&self) {
         let handler: Arc<dyn hyperscale_network::InboundRequestHandler> =
-            Arc::new(crate::inbound_handler::InboundHandler::new(
+            Arc::new(crate::request_handler::RequestHandler::new(
                 self.config.inbound.clone(),
                 Arc::clone(&self.storage),
                 Arc::clone(&self.topology),
                 Arc::clone(&self.tx_cache),
                 Arc::clone(&self.cert_cache),
             ));
-        self.network.register_inbound_handler(handler);
+        self.network.register_request_handler(handler);
     }
 
     /// Create and register the gossip handler with the network.
