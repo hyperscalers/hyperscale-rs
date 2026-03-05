@@ -3,8 +3,8 @@
 use super::behaviour::{Behaviour, STREAM_PROTOCOL};
 use super::command::{PriorityCommandChannels, SwarmCommand};
 use super::error::NetworkError;
-use crate::codec_pool::CodecPoolHandle;
 use crate::config::Libp2pConfig;
+use crate::decompress_pool::DecompressPoolHandle;
 use dashmap::DashMap;
 use futures::FutureExt;
 use hyperscale_dispatch_pooled::PooledDispatch;
@@ -61,7 +61,7 @@ impl Libp2pAdapter {
     /// * `keypair` - Ed25519 keypair for libp2p transport encryption
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
-    /// * `dispatch` - Pooled dispatch for codec thread pool scheduling
+    /// * `dispatch` - Pooled dispatch for decompression thread pool scheduling
     /// * `registry` - Shared handler registry for per-type message dispatch
     ///
     /// # Returns
@@ -198,8 +198,8 @@ impl Libp2pAdapter {
 
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
-        // Create codec pool eagerly (the registry will be populated before messages arrive).
-        let codec_pool = CodecPoolHandle::new(dispatch.clone());
+        // Create decompress pool eagerly (the registry will be populated before messages arrive).
+        let decompress_pool = DecompressPoolHandle::new(dispatch.clone());
 
         let adapter = Arc::new(Self {
             local_peer_id,
@@ -226,7 +226,7 @@ impl Libp2pAdapter {
                 cached_peer_count,
                 shard,
                 config.version_interop_mode,
-                codec_pool,
+                decompress_pool,
                 registry,
                 event_loop_validator_peers,
             ))
@@ -279,7 +279,7 @@ impl Libp2pAdapter {
     /// processed before Background messages (sync).
     ///
     /// Callers are responsible for SBOR-encoding and compressing the message
-    /// before calling this method (use `hyperscale_network::encode_to_wire`).
+    /// before calling this method (use `sbor::basic_encode` + `compression::compress`).
     pub fn publish(
         &self,
         topic: &hyperscale_network::Topic,

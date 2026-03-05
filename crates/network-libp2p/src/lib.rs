@@ -5,15 +5,15 @@
 //! - **Gossipsub** for efficient broadcast messaging (shard-scoped topics)
 //! - **Streams** for request-response (sync/fetch)
 //! - **QUIC** transport for reliable, encrypted connections
-//! - **Codec pool** for async SBOR encoding/decoding
+//! - **Decompress pool** for async LZ4 decompression off the event loop
 
 mod adapter;
-mod codec_pool;
 mod config;
-mod framing;
+mod decompress_pool;
 mod inbound_router;
 mod network;
 mod request_manager;
+mod stream_framing;
 
 pub use adapter::{generate_random_keypair, Libp2pAdapter, NetworkError};
 pub use config::{Libp2pConfig, VersionInteroperabilityMode};

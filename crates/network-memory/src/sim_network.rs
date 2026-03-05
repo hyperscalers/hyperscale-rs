@@ -11,8 +11,7 @@
 //! delivers due messages via each target's registered per-type gossip handler.
 
 use hyperscale_network::{
-    encode_to_wire, GossipHandler, HandlerRegistry, Network, RequestError, RequestHandler,
-    TopicScope,
+    compression, GossipHandler, HandlerRegistry, Network, RequestError, RequestHandler, TopicScope,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use sbor::{basic_decode, basic_encode};
@@ -116,7 +115,9 @@ impl Default for SimNetworkAdapter {
 
 impl Network for SimNetworkAdapter {
     fn broadcast_to_shard<M: ShardMessage>(&self, shard: ShardGroupId, message: &M) {
-        let data = encode_to_wire(message).expect("SimNetworkAdapter: failed to encode message");
+        let data = compression::compress(
+            &basic_encode(message).expect("SimNetworkAdapter: failed to encode message"),
+        );
         self.outbox.lock().unwrap().push(OutboxEntry {
             target: BroadcastTarget::Shard(shard),
             message_type: M::message_type_id(),
@@ -125,7 +126,9 @@ impl Network for SimNetworkAdapter {
     }
 
     fn broadcast_global<M: NetworkMessage>(&self, message: &M) {
-        let data = encode_to_wire(message).expect("SimNetworkAdapter: failed to encode message");
+        let data = compression::compress(
+            &basic_encode(message).expect("SimNetworkAdapter: failed to encode message"),
+        );
         self.outbox.lock().unwrap().push(OutboxEntry {
             target: BroadcastTarget::Global,
             message_type: M::message_type_id(),

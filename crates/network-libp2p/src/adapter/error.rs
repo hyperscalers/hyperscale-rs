@@ -1,7 +1,5 @@
 //! Network error types.
 
-use hyperscale_network::CodecError;
-
 /// Network errors.
 #[derive(Debug, thiserror::Error)]
 pub enum NetworkError {
@@ -16,9 +14,6 @@ pub enum NetworkError {
 
     #[error("Request timeout")]
     Timeout,
-
-    #[error("Codec error: {0}")]
-    CodecError(#[from] CodecError),
 
     #[error("Invalid peer ID")]
     InvalidPeerId,

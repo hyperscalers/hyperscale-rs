@@ -10,7 +10,7 @@
 //! ```
 
 use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use hyperscale_network::wire;
+use hyperscale_network::compression;
 use std::io;
 
 /// Maximum frame size (compressed), shared across inbound and outbound paths.
@@ -21,7 +21,7 @@ pub(crate) const MAX_FRAME_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 pub(crate) enum FrameError {
     Io(io::Error),
     TooLarge(usize),
-    Decompress(hyperscale_network::wire::WireError),
+    Decompress(hyperscale_network::CompressionError),
 }
 
 impl std::fmt::Display for FrameError {
@@ -45,7 +45,7 @@ pub(crate) async fn write_frame<S: AsyncWrite + Unpin>(
     stream: &mut S,
     data: &[u8],
 ) -> Result<(), io::Error> {
-    let compressed = wire::compress(data);
+    let compressed = compression::compress(data);
     let len = compressed.len() as u32;
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(&compressed).await?;
@@ -67,7 +67,7 @@ pub(crate) async fn read_frame<S: AsyncReadExt + Unpin>(
     let mut data = vec![0u8; len];
     stream.read_exact(&mut data).await?;
 
-    wire::decompress(&data).map_err(FrameError::Decompress)
+    compression::decompress(&data).map_err(FrameError::Decompress)
 }
 
 /// Read the 4-byte length prefix and validate against `max_size`.
@@ -97,7 +97,7 @@ mod tests {
     /// `write_frame` calls close() so we can't use the same stream for both.
     async fn write_to_buf(data: &[u8]) -> Vec<u8> {
         let mut buf = Vec::new();
-        let compressed = wire::compress(data);
+        let compressed = compression::compress(data);
         let len = compressed.len() as u32;
         // Manually write instead of write_frame (which calls close)
         futures::AsyncWriteExt::write_all(&mut buf, &len.to_be_bytes())

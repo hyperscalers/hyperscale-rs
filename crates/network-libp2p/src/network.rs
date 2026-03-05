@@ -7,7 +7,7 @@ use crate::adapter::Libp2pAdapter;
 use crate::inbound_router::{spawn_inbound_router, InboundRouterHandle};
 use crate::request_manager::{RequestManager, RequestPriority};
 use hyperscale_network::{
-    encode_to_wire, frame_request, GossipHandler, HandlerRegistry, Network, RequestError,
+    compression, frame_request, GossipHandler, HandlerRegistry, Network, RequestError,
     RequestHandler, Topic, TopicScope,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
@@ -21,7 +21,7 @@ use tracing::{debug, info, warn};
 
 /// Production network adapter implementing the Network trait.
 ///
-/// Wraps `Arc<Libp2pAdapter>` and encodes messages to wire format before
+/// Wraps `Arc<Libp2pAdapter>` and SBOR-encodes + LZ4-compresses messages before
 /// publishing via the adapter's priority channels. The `publish()` call
 /// is sync-safe (non-blocking channel send), so this works from the
 /// pinned state machine thread without a tokio runtime context.
@@ -73,29 +73,17 @@ impl ProdNetwork {
 impl Network for ProdNetwork {
     fn broadcast_to_shard<M: ShardMessage>(&self, shard: ShardGroupId, message: &M) {
         let topic = Topic::shard(M::message_type_id(), shard);
-        match encode_to_wire(message) {
-            Ok(data) => {
-                if let Err(e) = self.adapter.publish(&topic, data, M::priority()) {
-                    debug!(error = ?e, "ProdNetwork: broadcast_to_shard failed");
-                }
-            }
-            Err(e) => {
-                debug!(error = ?e, "ProdNetwork: failed to encode message");
-            }
+        let data = compression::compress(&sbor::basic_encode(message).expect("SBOR encode failed"));
+        if let Err(e) = self.adapter.publish(&topic, data, M::priority()) {
+            debug!(error = ?e, "ProdNetwork: broadcast_to_shard failed");
         }
     }
 
     fn broadcast_global<M: NetworkMessage>(&self, message: &M) {
         let topic = Topic::global(M::message_type_id());
-        match encode_to_wire(message) {
-            Ok(data) => {
-                if let Err(e) = self.adapter.publish(&topic, data, M::priority()) {
-                    debug!(error = ?e, "ProdNetwork: broadcast_global failed");
-                }
-            }
-            Err(e) => {
-                debug!(error = ?e, "ProdNetwork: failed to encode message");
-            }
+        let data = compression::compress(&sbor::basic_encode(message).expect("SBOR encode failed"));
+        if let Err(e) = self.adapter.publish(&topic, data, M::priority()) {
+            debug!(error = ?e, "ProdNetwork: broadcast_global failed");
         }
     }
 
@@ -118,7 +106,7 @@ impl Network for ProdNetwork {
             },
         );
 
-        // Store in registry for dispatch by the codec pool.
+        // Store in registry for dispatch by the decompress pool.
         self.registry.register_gossip(M::message_type_id(), raw);
 
         // Auto-subscribe to the corresponding gossipsub topic.

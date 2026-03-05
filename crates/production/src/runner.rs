@@ -390,7 +390,7 @@ impl ProductionRunnerBuilder {
         // ── Create ProdNetwork ───────────────────────────────────────────
         //
         // Wraps the Libp2p adapter for use by IoLoop's action handler.
-        // encode_to_wire + adapter.publish() is sync-safe (non-blocking send).
+        // SBOR encode + compress + adapter.publish() is sync-safe (non-blocking send).
         // Note: We create the adapter below, then wrap it.
         // ProdNetwork is created after the adapter.
 

@@ -4,7 +4,7 @@
 //! in `event_loop.rs`. This module only processes gossipsub application messages.
 
 use super::behaviour::BehaviourEvent;
-use crate::codec_pool::CodecPoolHandle;
+use crate::decompress_pool::DecompressPoolHandle;
 use hyperscale_metrics as metrics;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_types::ShardGroupId;
@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 pub(super) async fn handle_gossipsub_event(
     event: SwarmEvent<BehaviourEvent>,
     local_shard: ShardGroupId,
-    codec_pool: &CodecPoolHandle,
+    decompress_pool: &DecompressPoolHandle,
     registry: &Arc<HandlerRegistry>,
 ) {
     match event {
@@ -81,8 +81,8 @@ pub(super) async fn handle_gossipsub_event(
                 }
             };
 
-            // Dispatch decompression + handler invocation to the codec pool.
-            codec_pool.decode_async(handler, message.data, propagation_source);
+            // Dispatch decompression + handler invocation to the decompress pool.
+            decompress_pool.decompress_async(handler, message.data, propagation_source);
         }
 
         // Handle subscription events

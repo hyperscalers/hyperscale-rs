@@ -6,10 +6,10 @@
 
 use super::{RequestManager, RequestPriority};
 use crate::adapter::{Libp2pAdapter, NetworkError};
-use crate::framing::{self, MAX_FRAME_SIZE};
+use crate::stream_framing::{self, MAX_FRAME_SIZE};
 use bytes::Bytes;
 use futures::AsyncReadExt;
-use hyperscale_network::wire;
+use hyperscale_network::compression;
 use libp2p::PeerId;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -183,8 +183,11 @@ impl RequestManager {
             .map_err(|e| NetworkError::StreamOpenFailed(format!("{:?}", e)))?;
 
         // Write length-prefixed compressed request with timeout
-        let write_result =
-            tokio::time::timeout(timeout, framing::write_frame(&mut stream, request_data)).await;
+        let write_result = tokio::time::timeout(
+            timeout,
+            stream_framing::write_frame(&mut stream, request_data),
+        )
+        .await;
 
         match write_result {
             Ok(Ok(())) => {}
@@ -195,7 +198,7 @@ impl RequestManager {
         // Read response length with timeout
         let response_len = match tokio::time::timeout(
             timeout,
-            framing::read_frame_len(&mut stream, MAX_FRAME_SIZE),
+            stream_framing::read_frame_len(&mut stream, MAX_FRAME_SIZE),
         )
         .await
         {
@@ -254,7 +257,7 @@ impl RequestManager {
         }
 
         // Decompress response
-        wire::decompress(&compressed_response)
+        compression::decompress(&compressed_response)
             .map_err(|e| NetworkError::StreamIo(format!("decompression failed: {}", e)))
     }
 }

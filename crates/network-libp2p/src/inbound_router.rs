@@ -5,7 +5,7 @@
 //! registry is populated during node initialization.
 
 use crate::adapter::{Libp2pAdapter, STREAM_PROTOCOL};
-use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
+use crate::stream_framing::{self, FrameError, MAX_FRAME_SIZE};
 use futures::StreamExt;
 use hyperscale_network::{parse_request_frame, HandlerRegistry};
 use libp2p::{PeerId, Stream};
@@ -79,10 +79,10 @@ impl InboundRouter {
     /// Handle a single incoming stream.
     async fn handle_stream(&self, _peer: PeerId, mut stream: Stream) -> Result<(), StreamError> {
         // Read length-prefixed compressed request with timeout.
-        // The framing module decompresses the data.
+        // The stream_framing module decompresses the data.
         let request_data = tokio::time::timeout(
             STREAM_IO_TIMEOUT,
-            framing::read_frame(&mut stream, MAX_FRAME_SIZE),
+            stream_framing::read_frame(&mut stream, MAX_FRAME_SIZE),
         )
         .await
         .map_err(|_| StreamError::Timeout)?
@@ -108,7 +108,7 @@ impl InboundRouter {
         // Write length-prefixed compressed response with timeout
         tokio::time::timeout(
             STREAM_IO_TIMEOUT,
-            framing::write_frame(&mut stream, &response_sbor),
+            stream_framing::write_frame(&mut stream, &response_sbor),
         )
         .await
         .map_err(|_| StreamError::Timeout)?

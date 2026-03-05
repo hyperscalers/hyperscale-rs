@@ -1,27 +1,26 @@
-//! Async message decoding using the shared thread pool.
+//! Async LZ4 decompression using the shared thread pool.
 //!
-//! This module provides a handle for LZ4 decompression, offloading it from the
-//! network event loop to the shared codec thread pool managed by `ThreadPoolManager`.
+//! This module provides a handle for offloading LZ4 decompression from the
+//! network event loop to a shared thread pool managed by `ThreadPoolManager`.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Network Event Loop                    Codec Pool (via ThreadPoolManager)
+//! Network Event Loop                    Decompress Pool (via ThreadPoolManager)
 //! ┌─────────────────┐                  ┌──────────────────┐
-//! │ Gossipsub msg   │──decode_async───►│ spawn_codec()    │
+//! │ Gossipsub msg   │──decompress────► │ decompress()     │
 //! │ (raw bytes)     │   (non-blocking) │ (shared pool)    │
 //! └─────────────────┘                  └────────┬─────────┘
 //!                                               │
 //!                                               ▼
 //!                                      ┌──────────────────┐
 //!                                      │ LZ4 decompress   │
-//!                                      │ → handler lookup │
-//!                                      │ → on_message()   │
+//!                                      │ → handler()      │
 //!                                      └──────────────────┘
 //! ```
 //!
 //! The event loop remains non-blocking — after basic validation (peer, shard)
-//! and handler lookup, the codec pool decompresses and invokes the per-type
+//! and handler lookup, the pool decompresses and invokes the per-type
 //! gossip handler directly.
 
 use hyperscale_dispatch::Dispatch;
@@ -32,16 +31,16 @@ use libp2p::PeerId as Libp2pPeerId;
 use std::sync::Arc;
 use tracing::warn;
 
-/// Handle for async message decoding using a dispatch implementation.
+/// Handle for async decompression using a dispatch implementation.
 ///
 /// Generic over `D: Dispatch`, defaulting to [`PooledDispatch`] for production.
-/// The dispatch implementation determines how codec work is scheduled (rayon
+/// The dispatch implementation determines how work is scheduled (rayon
 /// thread pool in production, inline in simulation).
-pub(crate) struct CodecPoolHandle<D: Dispatch = PooledDispatch> {
+pub(crate) struct DecompressPoolHandle<D: Dispatch = PooledDispatch> {
     dispatch: Arc<D>,
 }
 
-impl<D: Dispatch> Clone for CodecPoolHandle<D> {
+impl<D: Dispatch> Clone for DecompressPoolHandle<D> {
     fn clone(&self) -> Self {
         Self {
             dispatch: self.dispatch.clone(),
@@ -49,7 +48,7 @@ impl<D: Dispatch> Clone for CodecPoolHandle<D> {
     }
 }
 
-impl<D: Dispatch> CodecPoolHandle<D> {
+impl<D: Dispatch> DecompressPoolHandle<D> {
     /// Create a new handle wrapping the dispatch implementation.
     pub(crate) fn new(dispatch: Arc<D>) -> Self {
         Self { dispatch }
@@ -58,7 +57,7 @@ impl<D: Dispatch> CodecPoolHandle<D> {
     /// Decompress a message asynchronously and forward to the given handler.
     ///
     /// This method returns immediately — the actual decompress work happens on the
-    /// dispatch's codec pool. The decompressed payload is forwarded directly to the
+    /// dispatch's thread pool. The decompressed payload is forwarded directly to the
     /// per-type gossip handler.
     ///
     /// # Arguments
@@ -66,14 +65,14 @@ impl<D: Dispatch> CodecPoolHandle<D> {
     /// * `handler` - The gossip handler for this message type (already looked up)
     /// * `data` - Raw LZ4-compressed message bytes from the network
     /// * `propagation_source` - Peer that sent the message (for logging)
-    pub(crate) fn decode_async(
+    pub(crate) fn decompress_async(
         &self,
         handler: Arc<RawGossipHandler>,
         data: Vec<u8>,
         propagation_source: Libp2pPeerId,
     ) {
-        self.dispatch
-            .spawn_codec(move || match hyperscale_network::wire::decompress(&data) {
+        self.dispatch.spawn_codec(move || {
+            match hyperscale_network::compression::decompress(&data) {
                 Ok(payload) => {
                     handler(payload);
                     metrics::record_network_message_received();
@@ -82,11 +81,12 @@ impl<D: Dispatch> CodecPoolHandle<D> {
                     warn!(
                         error = %e,
                         peer = %propagation_source,
-                        "Failed to decompress message in codec pool"
+                        "Failed to decompress gossip message"
                     );
                     metrics::record_invalid_message();
                 }
-            });
+            }
+        });
     }
 }
 
@@ -97,7 +97,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn make_handle() -> (
-        CodecPoolHandle,
+        DecompressPoolHandle,
         Arc<RawGossipHandler>,
         Arc<AtomicUsize>,
         crossbeam::channel::Receiver<Vec<u8>>,
@@ -110,40 +110,28 @@ mod tests {
             counter_clone.fetch_add(1, Ordering::SeqCst);
             let _ = tx.send(payload);
         });
-        (CodecPoolHandle::new(dispatch), handler, counter, rx)
+        (DecompressPoolHandle::new(dispatch), handler, counter, rx)
     }
 
     #[test]
-    fn test_encode_to_wire() {
-        use hyperscale_messages::gossip::BlockVoteGossip;
-        use hyperscale_types::{
-            zero_bls_signature, BlockHeight, BlockVote, Hash, ShardGroupId, ValidatorId,
-        };
+    fn test_compress_roundtrip() {
+        use hyperscale_network::compression;
 
-        let vote = BlockVote {
-            block_hash: Hash::from_bytes(&[1u8; 32]),
-            shard_group_id: ShardGroupId(0),
-            height: BlockHeight(1),
-            voter: ValidatorId(0),
-            round: 0,
-            signature: zero_bls_signature(),
-            timestamp: 0,
-        };
-        let gossip = BlockVoteGossip { vote };
-
-        let encoded = hyperscale_network::encode_to_wire(&gossip).unwrap();
-        assert!(!encoded.is_empty());
+        let original = b"hello world";
+        let compressed = compression::compress(original);
+        let decompressed = compression::decompress(&compressed).unwrap();
+        assert_eq!(decompressed, original);
     }
 
     #[test]
-    fn test_decode_async_calls_handler() {
+    fn test_decompress_async_calls_handler() {
         let (pool, handler, counter, rx) = make_handle();
 
         let original = b"hello world";
-        let compressed = hyperscale_network::wire::compress(original);
+        let compressed = hyperscale_network::compression::compress(original);
         let peer = Libp2pPeerId::random();
 
-        pool.decode_async(handler, compressed, peer);
+        pool.decompress_async(handler, compressed, peer);
 
         let payload = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert_eq!(payload, original);
@@ -151,12 +139,12 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_async_invalid_data_no_handler_call() {
+    fn test_decompress_async_invalid_data_no_handler_call() {
         let (pool, handler, counter, rx) = make_handle();
         let peer = Libp2pPeerId::random();
 
         // Send garbage data that can't be decompressed
-        pool.decode_async(handler, vec![0xFF, 0xFE, 0xFD], peer);
+        pool.decompress_async(handler, vec![0xFF, 0xFE, 0xFD], peer);
 
         // Handler should not be called (decompress fails)
         let result = rx.recv_timeout(std::time::Duration::from_millis(500));
@@ -172,10 +160,10 @@ mod tests {
         let (pool, handler, counter, rx) = make_handle();
         let pool2 = pool.clone();
 
-        let compressed = hyperscale_network::wire::compress(b"from clone");
+        let compressed = hyperscale_network::compression::compress(b"from clone");
         let peer = Libp2pPeerId::random();
 
-        pool2.decode_async(handler, compressed, peer);
+        pool2.decompress_async(handler, compressed, peer);
 
         let payload = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
         assert_eq!(payload, b"from clone");
