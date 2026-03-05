@@ -13,6 +13,7 @@
 //! | `BLOCK_VOTE` | BFT block votes |
 //! | `EXEC_VOTE` | Execution votes |
 //! | `COMMITTED_BLOCK_HEADER` | Committed block header gossip |
+//! | `BLOCK_HEADER` | Block header proposal gossip |
 //!
 //! # Usage
 //!
@@ -81,6 +82,35 @@ pub fn committed_block_header_message(
     message
 }
 
+/// Domain tag for block header proposal gossip.
+///
+/// Format: `BLOCK_HEADER` || shard_group_id || height || round || block_hash
+///
+/// Signed by the proposer when broadcasting block header proposals.
+/// Verified by receivers before admitting the proposal into BFT.
+/// Distinct from `DOMAIN_BLOCK_VOTE` to prevent cross-protocol replay.
+pub const DOMAIN_BLOCK_HEADER: &[u8] = b"BLOCK_HEADER";
+
+/// Build the signing message for a block header proposal gossip.
+///
+/// This is used for:
+/// - Proposer signature on BlockHeaderGossip (authenticated proposals)
+/// - Verification before admitting proposals to the BFT state machine
+pub fn block_header_message(
+    shard_group: ShardGroupId,
+    height: u64,
+    round: u64,
+    block_hash: &Hash,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(80);
+    message.extend_from_slice(DOMAIN_BLOCK_HEADER);
+    message.extend_from_slice(&shard_group.0.to_le_bytes());
+    message.extend_from_slice(&height.to_le_bytes());
+    message.extend_from_slice(&round.to_le_bytes());
+    message.extend_from_slice(block_hash.as_bytes());
+    message
+}
+
 /// Build the signing message for an execution vote.
 ///
 /// This is used for:
@@ -142,6 +172,30 @@ mod tests {
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_COMMITTED_BLOCK_HEADER));
+    }
+
+    #[test]
+    fn test_block_header_message_deterministic() {
+        let shard = ShardGroupId(1);
+        let block = Hash::from_bytes(b"test_block");
+
+        let msg1 = block_header_message(shard, 10, 0, &block);
+        let msg2 = block_header_message(shard, 10, 0, &block);
+
+        assert_eq!(msg1, msg2);
+        assert!(msg1.starts_with(DOMAIN_BLOCK_HEADER));
+    }
+
+    #[test]
+    fn test_block_header_differs_from_block_vote() {
+        let shard = ShardGroupId(1);
+        let block = Hash::from_bytes(b"test_block");
+
+        let header_msg = block_header_message(shard, 10, 0, &block);
+        let vote_msg = block_vote_message(shard, 10, 0, &block);
+
+        // Must differ due to different domain tags (prevents cross-protocol replay)
+        assert_ne!(header_msg, vote_msg);
     }
 
     #[test]

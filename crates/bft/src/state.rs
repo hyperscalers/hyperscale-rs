@@ -29,10 +29,10 @@ pub struct BftStats {
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
 use hyperscale_types::{
-    committed_block_header_message, Block, BlockHeader, BlockHeight, BlockManifest, BlockVote,
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, CommitmentProof, Hash, QuorumCertificate,
-    ReadyTransactions, RoutableTransaction, ShardGroupId, Topology, TransactionAbort,
-    TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
+    block_header_message, committed_block_header_message, Block, BlockHeader, BlockHeight,
+    BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommitmentProof, Hash,
+    QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, Topology,
+    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
 };
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -701,6 +701,25 @@ impl BftState {
         self.last_leader_activity = self.now;
     }
 
+    /// Sign a block header for gossip broadcast.
+    ///
+    /// Produces a BLS signature over the domain-separated block header message,
+    /// enabling receivers to verify the proposal came from the claimed proposer
+    /// without relying on transport-level identity.
+    fn sign_block_header(
+        &self,
+        header: &BlockHeader,
+        block_hash: Hash,
+    ) -> hyperscale_types::Bls12381G2Signature {
+        let msg = block_header_message(
+            header.shard_group_id,
+            header.height.0,
+            header.round,
+            &block_hash,
+        );
+        self.signing_key.sign_v1(&msg)
+    }
+
     /// Record leader activity from receiving a block header.
     ///
     /// Rate-limited to once per (height, round) to prevent a Byzantine leader
@@ -1236,7 +1255,9 @@ impl BftState {
         }
 
         // Create gossip message (fallback blocks have no transactions, deferrals, or aborts)
-        let gossip = hyperscale_messages::BlockHeaderGossip::new(header, BlockManifest::default());
+        let sig = self.sign_block_header(&header, block_hash);
+        let gossip =
+            hyperscale_messages::BlockHeaderGossip::new(header, BlockManifest::default(), sig);
 
         // Track proposal time for rate limiting
         self.last_proposal_time = self.now;
@@ -1353,7 +1374,9 @@ impl BftState {
         }
 
         // Create gossip message (sync blocks have no transactions, deferrals, or aborts)
-        let gossip = hyperscale_messages::BlockHeaderGossip::new(header, BlockManifest::default());
+        let sig = self.sign_block_header(&header, block_hash);
+        let gossip =
+            hyperscale_messages::BlockHeaderGossip::new(header, BlockManifest::default(), sig);
 
         // Track proposal time for rate limiting
         self.last_proposal_time = self.now;
@@ -1442,7 +1465,8 @@ impl BftState {
         );
 
         // Create and broadcast the gossip message - include commitment proofs for ordering validation
-        let gossip = hyperscale_messages::BlockHeaderGossip::new(header, manifest);
+        let sig = self.sign_block_header(&header, block_hash);
+        let gossip = hyperscale_messages::BlockHeaderGossip::new(header, manifest, sig);
 
         actions.push(Action::BroadcastBlockHeader {
             shard: self.local_shard(),
@@ -3288,9 +3312,11 @@ impl BftState {
             return vec![];
         }
 
+        let sig = self.sign_block_header(&block.header, block_hash);
         let gossip = hyperscale_messages::BlockHeaderGossip::new(
             block.header.clone(),
             pending_block.manifest().clone(),
+            sig,
         );
 
         self.pending_blocks.insert(block_hash, pending_block);

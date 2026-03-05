@@ -4392,6 +4392,24 @@
           "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"committed_header\"}[1m])) by (le))",
           "legendFormat": "committed_header p99",
           "refId": "T"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"block_header\"}[1m])) by (le))",
+          "legendFormat": "block_header p50",
+          "refId": "U"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"block_header\"}[1m])) by (le))",
+          "legendFormat": "block_header p99",
+          "refId": "V"
         }
       ],
       "title": "Verification Latency by Type",

@@ -1,6 +1,9 @@
 //! BlockHeader gossip message.
 
-use hyperscale_types::{BlockHeader, BlockManifest, MessagePriority, NetworkMessage, ShardMessage};
+use hyperscale_types::{
+    block_header_message, BlockHeader, BlockManifest, Bls12381G2Signature, MessagePriority,
+    NetworkMessage, ShardMessage,
+};
 use sbor::prelude::BasicSbor;
 
 /// Gossips a block proposal (header + manifest, not full block).
@@ -10,6 +13,10 @@ use sbor::prelude::BasicSbor;
 /// 1. **retry_hashes**: Retry transactions (highest priority, critical for liveness)
 /// 2. **priority_hashes**: Cross-shard transactions with commitment proofs
 /// 3. **tx_hashes**: All other transactions
+///
+/// The `proposer_signature` is a BLS signature by the proposer over a domain-separated
+/// message, ensuring that block proposals cannot be forged by non-proposers. This
+/// enables gossipsub to operate in anonymous mode without transport-level signing.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockHeaderGossip {
     /// The block header being gossiped.
@@ -17,17 +24,39 @@ pub struct BlockHeaderGossip {
 
     /// Block contents manifest (transaction hashes, certificates, deferrals, etc.)
     pub manifest: BlockManifest,
+
+    /// BLS signature by the proposer over the domain-separated block header message.
+    /// Verifies that the claimed proposer actually created this proposal.
+    pub proposer_signature: Bls12381G2Signature,
 }
 
 impl BlockHeaderGossip {
     /// Create a block header gossip message.
-    pub fn new(header: BlockHeader, manifest: BlockManifest) -> Self {
-        Self { header, manifest }
+    pub fn new(
+        header: BlockHeader,
+        manifest: BlockManifest,
+        proposer_signature: Bls12381G2Signature,
+    ) -> Self {
+        Self {
+            header,
+            manifest,
+            proposer_signature,
+        }
     }
 
-    /// Consume and return header + manifest.
-    pub fn into_parts(self) -> (BlockHeader, BlockManifest) {
-        (self.header, self.manifest)
+    /// Build the domain-separated signing message for this block header.
+    pub fn signing_message(&self) -> Vec<u8> {
+        block_header_message(
+            self.header.shard_group_id,
+            self.header.height.0,
+            self.header.round,
+            &self.header.hash(),
+        )
+    }
+
+    /// Consume and return header, manifest, and proposer signature.
+    pub fn into_parts(self) -> (BlockHeader, BlockManifest, Bls12381G2Signature) {
+        (self.header, self.manifest, self.proposer_signature)
     }
 }
 
@@ -67,6 +96,10 @@ mod tests {
         }
     }
 
+    fn zero_sig() -> Bls12381G2Signature {
+        Bls12381G2Signature([0u8; Bls12381G2Signature::LENGTH])
+    }
+
     #[test]
     fn test_block_header_gossip_creation() {
         let header = make_header(1);
@@ -77,7 +110,7 @@ mod tests {
             ..Default::default()
         };
 
-        let gossip = BlockHeaderGossip::new(header.clone(), manifest.clone());
+        let gossip = BlockHeaderGossip::new(header.clone(), manifest.clone(), zero_sig());
         assert_eq!(gossip.header, header);
         assert_eq!(gossip.manifest, manifest);
         assert_eq!(gossip.manifest.transaction_count(), 4);
@@ -91,8 +124,8 @@ mod tests {
             ..Default::default()
         };
 
-        let gossip = BlockHeaderGossip::new(header.clone(), manifest.clone());
-        let (h, m) = gossip.into_parts();
+        let gossip = BlockHeaderGossip::new(header.clone(), manifest.clone(), zero_sig());
+        let (h, m, _sig) = gossip.into_parts();
         assert_eq!(h, header);
         assert_eq!(m, manifest);
     }
@@ -111,6 +144,7 @@ mod tests {
                 tx_hashes: vec![other],
                 ..Default::default()
             },
+            zero_sig(),
         );
 
         let all: Vec<Hash> = gossip.manifest.all_tx_hashes().copied().collect();

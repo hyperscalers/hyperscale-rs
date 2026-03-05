@@ -1701,7 +1701,36 @@ where
                     warn!("Failed to decode BlockHeaderGossip");
                     return;
                 };
-                let (header, manifest) = gossip.into_parts();
+
+                // Verify proposer BLS signature before admitting to state machine.
+                // This ensures proposals cannot be forged, independent of transport identity.
+                let proposer = gossip.header.proposer;
+                let Some(public_key) = self.topology.public_key(proposer) else {
+                    warn!(proposer = proposer.0, "Unknown proposer for block header");
+                    return;
+                };
+                let msg = gossip.signing_message();
+                let start = std::time::Instant::now();
+                let valid = hyperscale_types::verify_bls12381_v1(
+                    &msg,
+                    &public_key,
+                    &gossip.proposer_signature,
+                );
+                metrics::record_signature_verification_latency(
+                    "block_header",
+                    start.elapsed().as_secs_f64(),
+                );
+                if !valid {
+                    warn!(
+                        proposer = proposer.0,
+                        height = gossip.header.height.0,
+                        round = gossip.header.round,
+                        "Block header proposer signature invalid — dropping"
+                    );
+                    return;
+                }
+
+                let (header, manifest, _sig) = gossip.into_parts();
                 self.feed_event(ProtocolEvent::BlockHeaderReceived { header, manifest });
             }
             "block.vote" => {
