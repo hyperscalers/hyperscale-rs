@@ -4284,9 +4284,117 @@
           "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"bls_execution_cert\"}[1m])) by (le))",
           "legendFormat": "execution_cert p99",
           "refId": "H"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"commitment_proof\"}[1m])) by (le))",
+          "legendFormat": "commitment_proof p50",
+          "refId": "I"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"commitment_proof\"}[1m])) by (le))",
+          "legendFormat": "commitment_proof p99",
+          "refId": "J"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"provision_qc\"}[1m])) by (le))",
+          "legendFormat": "provision_qc p50",
+          "refId": "K"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"provision_qc\"}[1m])) by (le))",
+          "legendFormat": "provision_qc p99",
+          "refId": "L"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"inclusion_proof\"}[1m])) by (le))",
+          "legendFormat": "inclusion_proof p50",
+          "refId": "M"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"inclusion_proof\"}[1m])) by (le))",
+          "legendFormat": "inclusion_proof p99",
+          "refId": "N"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"state_root\"}[1m])) by (le))",
+          "legendFormat": "state_root p50",
+          "refId": "O"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"state_root\"}[1m])) by (le))",
+          "legendFormat": "state_root p99",
+          "refId": "P"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"transaction_root\"}[1m])) by (le))",
+          "legendFormat": "transaction_root p50",
+          "refId": "Q"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"transaction_root\"}[1m])) by (le))",
+          "legendFormat": "transaction_root p99",
+          "refId": "R"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"committed_header\"}[1m])) by (le))",
+          "legendFormat": "committed_header p50",
+          "refId": "S"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"committed_header\"}[1m])) by (le))",
+          "legendFormat": "committed_header p99",
+          "refId": "T"
         }
       ],
-      "title": "Signature Verification Latency by Type",
+      "title": "Verification Latency by Type",
       "type": "timeseries"
     },
     {

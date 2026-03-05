@@ -11,6 +11,7 @@
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, ProvisionVerificationResult};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
+use hyperscale_metrics as metrics;
 use hyperscale_storage::{CommitStore, SubstateStore};
 use hyperscale_types::{
     Bls12381G1PrivateKey, ExecutionVote, Hash, ShardGroupId, Topology, ValidatorId,
@@ -98,6 +99,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             verified_votes,
             total_voting_power,
         } => {
+            let start = std::time::Instant::now();
             let result = hyperscale_bft::handlers::verify_and_build_qc(
                 block_hash,
                 shard_group_id,
@@ -108,6 +110,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 verified_votes,
                 total_voting_power,
             );
+            metrics::record_signature_verification_latency("vote", start.elapsed().as_secs_f64());
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
                     ProtocolEvent::QuorumCertificateResult {
@@ -125,7 +128,9 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             public_keys,
             block_hash,
         } => {
+            let start = std::time::Instant::now();
             let valid = hyperscale_bft::handlers::verify_qc_signature(&qc, &public_keys);
+            metrics::record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(ProtocolEvent::QcSignatureVerified {
                     block_hash,
@@ -143,11 +148,16 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             voting_power,
             quorum_threshold,
         } => {
+            let start = std::time::Instant::now();
             let valid = hyperscale_bft::handlers::verify_commitment_proof(
                 &commitment_proof,
                 &public_keys,
                 voting_power,
                 quorum_threshold,
+            );
+            metrics::record_signature_verification_latency(
+                "commitment_proof",
+                start.elapsed().as_secs_f64(),
             );
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
@@ -168,11 +178,16 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             priority_transactions,
             transactions,
         } => {
+            let start = std::time::Instant::now();
             let valid = hyperscale_bft::handlers::verify_transaction_root(
                 expected_root,
                 &retry_transactions,
                 &priority_transactions,
                 &transactions,
+            );
+            metrics::record_signature_verification_latency(
+                "transaction_root",
+                start.elapsed().as_secs_f64(),
             );
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
@@ -189,12 +204,17 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             expected_root,
             certificates,
         } => {
+            let start = std::time::Instant::now();
             let result = hyperscale_bft::handlers::verify_state_root(
                 ctx.storage,
                 parent_state_root,
                 expected_root,
                 &certificates,
                 ctx.local_shard,
+            );
+            metrics::record_signature_verification_latency(
+                "state_root",
+                start.elapsed().as_secs_f64(),
             );
             let prepared = result.prepared_commit.map(|p| (block_hash, p));
             Some(DelegatedResult {
@@ -297,6 +317,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             quorum_threshold,
         } => {
             // Try each candidate header until one passes QC verification.
+            let qc_start = std::time::Instant::now();
             let verified_header = committed_headers.into_iter().find(|candidate| {
                 // Verify QC signature (BLS pairing — expensive)
                 let qc_valid = hyperscale_bft::handlers::verify_qc_signature(
@@ -318,8 +339,13 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 total_voting_power >= quorum_threshold
                     && candidate.qc.block_hash == candidate.header.hash()
             });
+            metrics::record_signature_verification_latency(
+                "provision_qc",
+                qc_start.elapsed().as_secs_f64(),
+            );
 
             // Check merkle proofs per provision against the verified header's state root.
+            let merkle_start = std::time::Instant::now();
             let results: Vec<ProvisionVerificationResult> = provisions
                 .into_iter()
                 .map(|provision| {
@@ -338,6 +364,10 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                     }
                 })
                 .collect();
+            metrics::record_signature_verification_latency(
+                "inclusion_proof",
+                merkle_start.elapsed().as_secs_f64(),
+            );
 
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(

@@ -1565,6 +1565,7 @@ where
 
         let event_tx = self.event_sender.clone();
         self.dispatch.spawn_crypto(move || {
+            let start = std::time::Instant::now();
             for (tx_hash, verified_votes) in
                 hyperscale_execution::handlers::batch_verify_and_aggregate_execution_votes(items)
             {
@@ -1575,6 +1576,10 @@ where
                     },
                 ));
             }
+            metrics::record_signature_verification_latency(
+                "bls_execution_vote",
+                start.elapsed().as_secs_f64(),
+            );
         });
     }
 
@@ -1590,6 +1595,7 @@ where
 
         let event_tx = self.event_sender.clone();
         self.dispatch.spawn_crypto(move || {
+            let start = std::time::Instant::now();
             let results =
                 hyperscale_execution::handlers::batch_verify_execution_certificate_signatures(
                     &items,
@@ -1599,6 +1605,10 @@ where
                     ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid },
                 ));
             }
+            metrics::record_signature_verification_latency(
+                "bls_execution_cert",
+                start.elapsed().as_secs_f64(),
+            );
         });
     }
 
@@ -1997,6 +2007,7 @@ where
         let event_tx = self.event_sender.clone();
         self.dispatch.spawn_crypto(move || {
             for (committed_header, sender, public_key, sender_signature) in items {
+                let start = std::time::Instant::now();
                 let msg = hyperscale_types::committed_block_header_message(
                     committed_header.header.shard_group_id,
                     committed_header.header.height.0,
@@ -2004,6 +2015,10 @@ where
                 );
                 let valid =
                     hyperscale_types::verify_bls12381_v1(&msg, &public_key, &sender_signature);
+                metrics::record_signature_verification_latency(
+                    "committed_header",
+                    start.elapsed().as_secs_f64(),
+                );
                 if valid {
                     let _ = event_tx.send(NodeInput::CommittedHeaderValidated {
                         committed_header,
