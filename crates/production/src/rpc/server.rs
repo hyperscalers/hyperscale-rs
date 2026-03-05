@@ -61,7 +61,7 @@ pub struct RpcServerHandle {
     sync_status: Arc<ArcSwap<SyncStatus>>,
     /// Node status provider for updates.
     node_status: Arc<RwLock<NodeStatusState>>,
-    /// Transaction status cache (shared from NodeLoop's QuickCache).
+    /// Transaction status cache (shared from IoLoop's QuickCache).
     tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
     /// Mempool snapshot for updates.
     mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
@@ -116,8 +116,8 @@ impl RpcServer {
     /// # Arguments
     ///
     /// * `config` - Server configuration
-    /// * `tx_submission_tx` - Crossbeam channel to submit transactions directly to NodeLoop
-    /// * `tx_status_cache` - Transaction status cache shared from NodeLoop
+    /// * `tx_submission_tx` - Crossbeam channel to submit transactions directly to IoLoop
+    /// * `tx_status_cache` - Transaction status cache shared from IoLoop
     pub fn new(
         config: RpcServerConfig,
         tx_submission_tx: TxSubmissionSender,

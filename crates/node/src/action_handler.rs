@@ -6,7 +6,7 @@
 //! on the appropriate thread pool.
 //!
 //! Batched work (execution votes, execution certs, cross-shard execution) and block
-//! commits are handled inline by the node loop's flush closures.
+//! commits are handled inline by the I/O loop's flush closures.
 
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, ProvisionVerificationResult};
 use hyperscale_dispatch::Dispatch;

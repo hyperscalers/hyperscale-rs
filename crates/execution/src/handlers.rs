@@ -9,7 +9,7 @@
 //!
 //! The `batch_verify_*` functions use [`batch_verify_bls_different_messages`] to
 //! verify accumulated signatures across multiple transactions in ~2 pairing
-//! operations. These are called from the node loop's time-windowed batch flush.
+//! operations. These are called from the I/O loop's time-windowed batch flush.
 
 use hyperscale_engine::RadixExecutor;
 use hyperscale_storage::SubstateStore;

@@ -1,20 +1,20 @@
-//! Unified node loop for action processing.
+//! Unified I/O loop for action processing.
 //!
-//! `NodeLoop` handles ALL actions from `NodeStateMachine`, dispatching them via
+//! `IoLoop` handles ALL actions from `NodeStateMachine`, dispatching them via
 //! generic trait methods (Network, Dispatch, Storage) and concrete types for
 //! timer ops and event delivery. Both production and simulation runners construct
-//! a `NodeLoop` with their concrete trait implementations.
+//! an `IoLoop` with their concrete trait implementations.
 //!
 //! # Driving modes
 //!
-//! - **Production**: `NodeLoop::run()` blocks on a crossbeam channel, processing
+//! - **Production**: `IoLoop::run()` blocks on a crossbeam channel, processing
 //!   events as they arrive from tokio bridge tasks.
-//! - **Simulation**: The harness calls `NodeLoop::step()` per event, then drains
+//! - **Simulation**: The harness calls `IoLoop::step()` per event, then drains
 //!   buffered outputs (timer ops, events, sync I/O).
 //!
 //! # Batching
 //!
-//! NodeLoop batches execution-layer broadcasts and crypto verification for
+//! IoLoop batches execution-layer broadcasts and crypto verification for
 //! efficiency. Batch deadlines are tracked as logical time (`Duration`) so both
 //! production (wall clock) and simulation (logical clock) use the same paths.
 
@@ -92,7 +92,7 @@ type CommittedHeaderVerificationItem = (
 // TimerOp — buffered timer operations for the runner
 // ═══════════════════════════════════════════════════════════════════════
 
-/// A timer operation buffered by NodeLoop for the runner to process.
+/// A timer operation buffered by IoLoop for the runner to process.
 #[derive(Debug, Clone)]
 pub enum TimerOp {
     /// Set a timer to fire after `duration`.
@@ -105,9 +105,9 @@ pub enum TimerOp {
 // StepOutput — returned to the caller after processing an event
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Output from processing a single event via `NodeLoop::step()`.
+/// Output from processing a single event via `IoLoop::step()`.
 ///
-/// NodeLoop now handles all sync/fetch I/O internally via the Network trait.
+/// IoLoop now handles all sync/fetch I/O internally via the Network trait.
 /// The runner processes emitted transaction statuses and timer operations.
 pub struct StepOutput {
     /// Transaction status notifications emitted during this step.
@@ -124,7 +124,7 @@ pub struct StepOutput {
 
 /// Snapshot of node state for external status APIs.
 ///
-/// Produced by [`NodeLoop::status_snapshot()`] on the periodic metrics tick.
+/// Produced by [`IoLoop::status_snapshot()`] on the periodic metrics tick.
 /// The production runner maps this into its RPC shared state types.
 #[derive(Debug, Clone)]
 pub struct NodeStatusSnapshot {
@@ -146,16 +146,16 @@ pub struct NodeStatusSnapshot {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// NodeLoop
+// IoLoop
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Unified node loop that processes all actions from the state machine.
+/// Unified I/O loop that processes all actions from the state machine.
 ///
 /// Generic over:
 /// - `S`: Storage (CommitStore + SubstateStore + ConsensusStore)
 /// - `N`: Network (message sending)
 /// - `D`: Dispatch (thread pool work scheduling)
-pub struct NodeLoop<S, N, D>
+pub struct IoLoop<S, N, D>
 where
     S: CommitStore + SubstateStore + ConsensusStore,
     D: Dispatch,
@@ -224,13 +224,13 @@ where
     pending_timer_ops: Vec<TimerOp>,
 }
 
-impl<S, N, D> NodeLoop<S, N, D>
+impl<S, N, D> IoLoop<S, N, D>
 where
     S: CommitStore + SubstateStore + ConsensusStore + Send + Sync + 'static,
     N: Network,
     D: Dispatch + 'static,
 {
-    /// Create a new NodeLoop.
+    /// Create a new IoLoop.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: NodeStateMachine,
@@ -323,7 +323,7 @@ where
     /// Process actions from genesis initialization.
     ///
     /// `NodeStateMachine::initialize_genesis()` returns actions (timer sets)
-    /// that must be processed through the NodeLoop's action handler.
+    /// that must be processed through the IoLoop's action handler.
     pub fn handle_actions(&mut self, actions: Vec<Action>) {
         for action in actions {
             self.process_action(action);
@@ -688,7 +688,7 @@ where
 
     /// Feed a protocol event to the state machine and process all resulting actions.
     ///
-    /// This is the common pattern used throughout NodeLoop: route an event through
+    /// This is the common pattern used throughout IoLoop: route an event through
     /// the state machine, then dispatch each resulting action.
     fn feed_event(&mut self, event: ProtocolEvent) {
         let actions = self.state.handle(event);
@@ -1421,7 +1421,7 @@ where
     /// Flush the validation batch, dispatching to the tx_validation pool.
     ///
     /// Valid transactions are sent back as `TransactionGossipReceived` events
-    /// through the event channel. NodeLoop recognises them via `pending_validation`
+    /// through the event channel. IoLoop recognises them via `pending_validation`
     /// and passes them through to the state machine.
     fn flush_validation_batch(&mut self) {
         let batch = self.validation_batch.take();
@@ -1442,7 +1442,7 @@ where
                 if valid {
                     let _ = event_tx.send(NodeInput::TransactionValidated {
                         tx,
-                        submitted_locally: false, // NodeLoop sets from locally_submitted
+                        submitted_locally: false, // IoLoop sets from locally_submitted
                     });
                 }
             }

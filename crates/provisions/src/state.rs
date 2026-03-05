@@ -106,7 +106,7 @@ pub struct ProvisionCoordinator {
     ///
     /// Outer key: `(shard, height)` for O(1) lookup when a provision arrives.
     /// Inner key: `sender` — one slot per validator. The sender's BLS signature
-    /// was verified by NodeLoop but the QC has NOT been verified yet (deferred
+    /// was verified by IoLoop but the QC has NOT been verified yet (deferred
     /// until a provision needs this header).
     ///
     /// Pruned when a header from the same shard arrives with a height
@@ -292,7 +292,7 @@ impl ProvisionCoordinator {
 
     /// Handle a committed block header received from a remote shard.
     ///
-    /// The sender's BLS signature was already verified by NodeLoop.
+    /// The sender's BLS signature was already verified by IoLoop.
     /// Headers are stored in an unverified buffer keyed by `(shard, height, sender)`.
     /// QC verification is deferred until a provision arrives that needs this header.
     ///

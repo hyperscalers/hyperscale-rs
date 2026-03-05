@@ -1226,7 +1226,7 @@ async fn main() -> Result<()> {
 
     // Create production runner first (before RPC server)
     // The runner creates the crossbeam event channel that the RPC server needs
-    // for submitting transactions directly to NodeLoop.
+    // for submitting transactions directly to IoLoop.
     let mut runner_builder = ProductionRunner::builder()
         .topology(topology)
         .signing_key(signing_keypair)

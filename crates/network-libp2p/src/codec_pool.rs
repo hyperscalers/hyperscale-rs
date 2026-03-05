@@ -22,7 +22,7 @@
 //!
 //! The event loop remains non-blocking - after basic validation (peer, shard),
 //! decode work is spawned to the shared codec pool which decompresses and
-//! forwards the raw payload to the NodeLoop via the event channel.
+//! forwards the raw payload to the IoLoop via the event channel.
 
 use hyperscale_core::NodeInput;
 use hyperscale_dispatch::Dispatch;
@@ -58,11 +58,11 @@ impl<D: Dispatch> CodecPoolHandle<D> {
         Self { dispatch, event_tx }
     }
 
-    /// Decode a message asynchronously and forward to the NodeLoop event channel.
+    /// Decode a message asynchronously and forward to the IoLoop event channel.
     ///
     /// This method returns immediately - the actual decompress work happens on the
     /// dispatch's codec pool. The decompressed payload is sent as a
-    /// `NodeInput::GossipReceived` to the NodeLoop, which handles SBOR decoding
+    /// `NodeInput::GossipReceived` to the IoLoop, which handles SBOR decoding
     /// and type dispatch internally.
     ///
     /// # Arguments

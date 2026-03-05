@@ -1,4 +1,4 @@
-//! Consolidated configuration for NodeLoop.
+//! Consolidated configuration for IoLoop.
 
 use crate::inbound_handler::InboundHandlerConfig;
 use crate::protocol::fetch::FetchConfig;
@@ -6,7 +6,7 @@ use crate::protocol::provision_fetch::ProvisionFetchConfig;
 use crate::protocol::sync::SyncConfig;
 use std::time::Duration;
 
-/// Configuration for [`NodeLoop`](crate::node_loop::NodeLoop).
+/// Configuration for [`IoLoop`](crate::io_loop::IoLoop).
 ///
 /// Bundles all sub-component configs so runners can pass a single value.
 #[derive(Debug, Default, Clone)]
@@ -18,7 +18,7 @@ pub struct NodeConfig {
     pub batch: BatchConfig,
 }
 
-/// Batching thresholds for the node loop.
+/// Batching thresholds for the I/O loop.
 ///
 /// Each batch has a maximum item count and a time window. The batch flushes
 /// when either limit is reached. Defaults match the previous hard-coded

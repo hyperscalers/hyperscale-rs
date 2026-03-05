@@ -1,7 +1,7 @@
 //! Protocol events for the deterministic state machine.
 //!
 //! [`ProtocolEvent`] contains only the events that [`NodeStateMachine`] actually
-//! processes. I/O callbacks (sync, fetch, validation) are handled by [`NodeLoop`]
+//! processes. I/O callbacks (sync, fetch, validation) are handled by [`IoLoop`]
 //! and never reach the state machine. This provides type-level enforcement of the
 //! boundary between protocol logic and I/O orchestration.
 
@@ -31,7 +31,7 @@ pub struct ProvisionVerificationResult {
 /// These are the typed protocol events that [`NodeStateMachine::handle()`]
 /// receives. No I/O callbacks, no intercepted events, no dead arms.
 ///
-/// [`NodeLoop`] translates [`NodeInput`] into `ProtocolEvent` before passing
+/// [`IoLoop`] translates [`NodeInput`] into `ProtocolEvent` before passing
 /// to the state machine.
 #[derive(Debug, Clone)]
 pub enum ProtocolEvent {
@@ -62,7 +62,7 @@ pub enum ProtocolEvent {
     /// Used for the light-client provisions pattern: remote shards broadcast
     /// committed headers so we can verify state roots via merkle inclusion proofs.
     ///
-    /// The `sender` field is the authenticated sender identity — NodeLoop
+    /// The `sender` field is the authenticated sender identity — IoLoop
     /// verified the sender's BLS signature before admitting this event.
     RemoteBlockCommitted {
         committed_header: CommittedBlockHeader,
@@ -231,7 +231,7 @@ pub enum ProtocolEvent {
     },
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Fetch Delivery (from NodeLoop after fetch protocol processing)
+    // Fetch Delivery (from IoLoop after fetch protocol processing)
     // ═══════════════════════════════════════════════════════════════════════
     /// Fetched transactions delivered to state machine.
     TransactionFetchDelivered {
@@ -252,7 +252,7 @@ pub enum ProtocolEvent {
     },
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Gossiped Certificate (verified by NodeLoop)
+    // Gossiped Certificate (verified by IoLoop)
     // ═══════════════════════════════════════════════════════════════════════
     /// A gossiped TransactionCertificate has been fully verified.
     GossipedCertificateVerified {
@@ -276,7 +276,7 @@ pub enum ProtocolEvent {
     },
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Sync Delivery (from NodeLoop after sync protocol processing)
+    // Sync Delivery (from IoLoop after sync protocol processing)
     // ═══════════════════════════════════════════════════════════════════════
     /// A synced block is ready to be applied to local state.
     SyncBlockReadyToApply { block: Block, qc: QuorumCertificate },

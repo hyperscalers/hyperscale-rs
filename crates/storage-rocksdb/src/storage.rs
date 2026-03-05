@@ -2345,7 +2345,7 @@ impl hyperscale_storage::ConsensusStore for RocksDbStorage {
 // ═══════════════════════════════════════════════════════════════════════
 // SharedStorage newtype — Arc-wrapped RocksDbStorage with full trait impls
 //
-// Production uses `CachingStorage<SharedStorage>` on the pinned NodeLoop
+// Production uses `CachingStorage<SharedStorage>` on the pinned IoLoop
 // thread while sharing the same underlying RocksDbStorage with async tasks
 // (InboundRouter, FetchManager) via cheap Arc clones.
 //
@@ -2357,7 +2357,7 @@ impl hyperscale_storage::ConsensusStore for RocksDbStorage {
 /// Shared RocksDB storage handle with full storage trait implementations.
 ///
 /// A cheap-to-clone wrapper around `Arc<RocksDbStorage>` that implements all
-/// storage traits needed by `NodeLoop`. Use this as the storage type parameter
+/// storage traits needed by `IoLoop`. Use this as the storage type parameter
 /// for `CachingStorage` in production.
 ///
 /// # Why a newtype?

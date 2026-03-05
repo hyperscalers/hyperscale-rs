@@ -224,8 +224,8 @@ pub async fn submit_transaction_handler(
     let hash = hex::encode(transaction.hash().as_bytes());
     let tx_arc = Arc::new(transaction);
 
-    // Submit directly to NodeLoop via crossbeam channel.
-    // NodeLoop will:
+    // Submit directly to IoLoop via crossbeam channel.
+    // IoLoop will:
     // 1. Gossip to all relevant shards
     // 2. Queue for batch validation (via Dispatch)
     // 3. Dispatch to mempool after validation

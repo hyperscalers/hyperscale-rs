@@ -6,17 +6,17 @@
 //!
 //! ```text
 //!  ┌──────────────────────────────────────────────────────────────────────┐
-//!  │  Core 0 (pinned std::thread)                                        │
+//!  │  Core 0 (pinned std::thread)                                         │
 //!  │  ┌────────────────────────────────────────────────────────────────┐  │
-//!  │  │  NodeLoop<SharedStorage, ProdNetwork, PooledDispatch>         │  │
-//!  │  │    - State machine event processing                           │  │
-//!  │  │    - Storage I/O (RocksDB)                                    │  │
-//!  │  │    - Action handling (timers, broadcasts, crypto dispatch)    │  │
+//!  │  │  IoLoop<SharedStorage, ProdNetwork, PooledDispatch>            │  │
+//!  │  │    - State machine event processing                            │  │
+//!  │  │    - Storage I/O (RocksDB)                                     │  │
+//!  │  │    - Action handling (timers, broadcasts, crypto dispatch)     │  │
 //!  │  │    - Transaction validation batching via Dispatch              │  │
-//!  │  │    - RPC SubmitTransaction handling (gossip + validate)       │  │
-//!  │  │    - Batched message sending, batched crypto verification     │  │
+//!  │  │    - RPC SubmitTransaction handling (gossip + validate)        │  │
+//!  │  │    - Batched message sending, batched crypto verification      │  │
 //!  │  └────────────────────────────────────────────────────────────────┘  │
-//!  │       ↑ crossbeam channels (all events) ↑                           │
+//!  │       ↑ crossbeam channels (all events) ↑                            │
 //!  └──────────────────────────────────────────────────────────────────────┘
 //!
 //!  ┌──────────────────────────────────────────────────────────────────────┐
@@ -34,13 +34,13 @@
 //! ## Channel topology
 //!
 //! ```text
-//! Libp2p adapter ──crossbeam──→ pinned thread (NodeLoop)
+//! Libp2p adapter ──crossbeam──→ pinned thread (IoLoop)
 //! RPC server     ──crossbeam──→ pinned thread (Event::SubmitTransaction)
 //! Dispatch       ──crossbeam──→ pinned thread (crypto/validation callbacks)
 //! ProdTimerManager ──crossbeam──→ pinned thread (timer events)
 //! ```
 
-use crate::event_loop::{spawn_pinned_loop, PinnedLoopConfig, ProdNodeLoop};
+use crate::event_loop::{spawn_pinned_loop, PinnedLoopConfig, ProdIoLoop};
 use crate::rpc::{MempoolSnapshot, NodeStatusState};
 use arc_swap::ArcSwap;
 use hyperscale_bft::BftConfig;
@@ -61,7 +61,7 @@ use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use quick_cache::sync::Cache as QuickCache;
 
 use hyperscale_core::NodeInput;
-use hyperscale_node::node_loop::{NodeLoop, TimerOp};
+use hyperscale_node::io_loop::{IoLoop, TimerOp};
 use hyperscale_node::{NodeConfig, NodeStateMachine};
 use hyperscale_types::{Block, Bls12381G1PrivateKey, Hash, ShardGroupId, Topology, ValidatorId};
 use std::sync::Arc;
@@ -314,8 +314,8 @@ impl ProductionRunnerBuilder {
 
     /// Build the production runner.
     ///
-    /// Creates all channels, the NodeLoop, networking adapters, and supporting
-    /// infrastructure. The NodeLoop is held in an `Option` so it can be moved
+    /// Creates all channels, the IoLoop, networking adapters, and supporting
+    /// infrastructure. The IoLoop is held in an `Option` so it can be moved
     /// to the pinned thread when `run()` is called.
     ///
     /// # Errors
@@ -358,12 +358,12 @@ impl ProductionRunnerBuilder {
         // Clone signing key bytes BEFORE passing to state machine (which consumes it).
         // Bls12381G1PrivateKey doesn't impl Clone, so we round-trip through bytes.
         let key_bytes = signing_key.to_bytes();
-        let node_loop_signing_key =
+        let io_loop_signing_key =
             Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
 
         // ── Crossbeam channels (→ pinned thread) ───────────────────────
         //
-        // These are the inputs to the pinned NodeLoop thread. Crossbeam unbounded
+        // These are the inputs to the pinned IoLoop thread. Crossbeam unbounded
         // channels are chosen because they are lock-free and sync-safe.
         let (xb_timer_tx, xb_timer_rx) = crossbeam::channel::unbounded();
         let (xb_callback_tx, xb_callback_rx) = crossbeam::channel::unbounded();
@@ -393,7 +393,7 @@ impl ProductionRunnerBuilder {
 
         // ── Create ProdNetwork ───────────────────────────────────────────
         //
-        // Wraps the Libp2p adapter for use by NodeLoop's action handler.
+        // Wraps the Libp2p adapter for use by IoLoop's action handler.
         // encode_to_wire + adapter.publish() is sync-safe (non-blocking send).
         // Note: We create the adapter below, then wrap it.
         // ProdNetwork is created after the adapter.
@@ -411,7 +411,7 @@ impl ProductionRunnerBuilder {
         // ── Create codec pool handle ─────────────────────────────────────
         //
         // The codec pool decompresses gossip wire bytes and forwards them as
-        // NodeInput::GossipReceived to the consensus channel. NodeLoop handles
+        // NodeInput::GossipReceived to the consensus channel. IoLoop handles
         // SBOR decoding and type dispatch internally.
         let codec_pool_handle = hyperscale_network_libp2p::CodecPoolHandle::new(
             dispatch.clone(),
@@ -461,33 +461,33 @@ impl ProductionRunnerBuilder {
         // ── Create RadixExecutor ─────────────────────────────────────────
         let executor = RadixExecutor::new(network_definition);
 
-        // ── Create NodeLoop ──────────────────────────────────────────────
+        // ── Create IoLoop ──────────────────────────────────────────────
         //
-        // The NodeLoop owns the state machine, storage, executor, network,
+        // The IoLoop owns the state machine, storage, executor, network,
         // dispatch, and event sender. It processes ALL actions from the
         // state machine on the pinned thread. Timer ops are returned in
         // StepOutput and managed by ProdTimerManager on the pinned thread.
 
-        let node_loop = NodeLoop::new(
+        let io_loop = IoLoop::new(
             state,
             shared_storage,
             executor,
             prod_network,
             (*dispatch).clone(),
             xb_callback_tx.clone(),
-            node_loop_signing_key,
+            io_loop_signing_key,
             topology.clone(),
             NodeConfig::default(),
             tx_validator.clone(),
         );
 
-        // ── Get cache/status handles from NodeLoop ────────────────────────
-        let tx_status_cache = Arc::clone(node_loop.tx_status_cache());
+        // ── Get cache/status handles from IoLoop ────────────────────────
+        let tx_status_cache = Arc::clone(io_loop.tx_status_cache());
 
         // ── Build ProductionRunner ───────────────────────────────────────
 
         Ok(ProductionRunner {
-            node_loop: Some(node_loop),
+            io_loop: Some(io_loop),
             xb_timer_tx,
             xb_consensus_tx,
             xb_callback_tx: xb_callback_tx.clone(),
@@ -516,17 +516,17 @@ impl ProductionRunnerBuilder {
 // ProductionRunner
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Production runner with NodeLoop on a pinned thread.
+/// Production runner with IoLoop on a pinned thread.
 ///
-/// The state machine (NodeLoop) runs on a dedicated thread pinned to core 0.
+/// The state machine (IoLoop) runs on a dedicated thread pinned to core 0.
 /// All state machine processing, storage I/O, action handling, and gossip cert
 /// verification happen on that thread. The tokio runtime handles async I/O
 /// routing, RPC transaction handling, sync/fetch management, and metrics.
 pub struct ProductionRunner {
-    // ── NodeLoop (moved to pinned thread on run()) ───────────────────────
-    /// The NodeLoop, wrapped in Option because it's moved to the pinned thread.
+    // ── IoLoop (moved to pinned thread on run()) ───────────────────────
+    /// The IoLoop, wrapped in Option because it's moved to the pinned thread.
     /// `None` after `run()` extracts it.
-    node_loop: Option<ProdNodeLoop>,
+    io_loop: Option<ProdIoLoop>,
 
     // ── Crossbeam senders (async → pinned thread) ────────────────────────
     /// Timer events to pinned thread (for external timer injection if needed).
@@ -573,7 +573,7 @@ pub struct ProductionRunner {
     genesis_config: Option<hyperscale_engine::GenesisConfig>,
 
     // ── Caches ───────────────────────────────────────────────────────────
-    /// Transaction status cache, shared from NodeLoop.
+    /// Transaction status cache, shared from IoLoop.
     /// Provided to the RPC server for lock-free status queries.
     tx_status_cache: Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>>,
 
@@ -605,9 +605,9 @@ impl ProductionRunner {
         self.local_shard
     }
 
-    /// Get the transaction status cache shared from NodeLoop.
+    /// Get the transaction status cache shared from IoLoop.
     ///
-    /// This `Arc<QuickCache>` is the same instance used by NodeLoop on the
+    /// This `Arc<QuickCache>` is the same instance used by IoLoop on the
     /// pinned thread. It can be passed directly to the RPC server for
     /// lock-free status queries.
     pub fn tx_status_cache(&self) -> Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>> {
@@ -616,7 +616,7 @@ impl ProductionRunner {
 
     /// Get a crossbeam sender for submitting consensus events.
     ///
-    /// Events sent through this sender are forwarded to the pinned NodeLoop
+    /// Events sent through this sender are forwarded to the pinned IoLoop
     /// thread via the crossbeam consensus channel.
     pub fn event_sender(&self) -> crossbeam::channel::Sender<NodeInput> {
         self.xb_consensus_tx.clone()
@@ -624,9 +624,9 @@ impl ProductionRunner {
 
     /// Get a sender for RPC transaction submissions.
     ///
-    /// Returns a crossbeam channel sender that feeds directly into the NodeLoop.
+    /// Returns a crossbeam channel sender that feeds directly into the IoLoop.
     /// RPC handlers wrap transactions in `Event::SubmitTransaction` before sending.
-    /// NodeLoop handles gossip, validation, and mempool dispatch.
+    /// IoLoop handles gossip, validation, and mempool dispatch.
     pub fn tx_submission_sender(&self) -> crossbeam::channel::Sender<NodeInput> {
         self.xb_consensus_tx.clone()
     }
@@ -650,16 +650,16 @@ impl ProductionRunner {
     /// Checks if we have any committed blocks. If not, creates a genesis block
     /// and initializes the state machine (which sets up the initial proposal timer).
     ///
-    /// This MUST be called before the NodeLoop is moved to the pinned thread,
-    /// since it needs mutable access to the NodeLoop.
+    /// This MUST be called before the IoLoop is moved to the pinned thread,
+    /// since it needs mutable access to the IoLoop.
     fn maybe_initialize_genesis(&mut self) -> Vec<TimerOp> {
-        let node_loop = self
-            .node_loop
+        let io_loop = self
+            .io_loop
             .as_mut()
-            .expect("node_loop must exist for genesis");
+            .expect("io_loop must exist for genesis");
 
         // Check if we already have committed blocks
-        let height = node_loop.storage().committed_height();
+        let height = io_loop.storage().committed_height();
         let has_blocks = height.0 > 0;
 
         if has_blocks {
@@ -676,7 +676,7 @@ impl ProductionRunner {
         // Uses GenesisMutWrapper to bridge RocksDbStorage's &self commit()
         // with the Radix Engine's &mut self CommittableSubstateDatabase trait.
         let genesis_config = self.genesis_config.take();
-        let result = node_loop.with_storage_and_executor(|storage, executor| {
+        let result = io_loop.with_storage_and_executor(|storage, executor| {
             // SharedStorage derefs to &RocksDbStorage.
             let mut wrapper = GenesisMutWrapper(storage);
             if let Some(config) = genesis_config {
@@ -696,8 +696,8 @@ impl ProductionRunner {
 
         // Get the JMT state AFTER genesis bootstrap.
         use hyperscale_storage::SubstateStore;
-        let genesis_jmt_version = node_loop.storage().state_version();
-        let genesis_jmt_root = node_loop.storage().state_root_hash();
+        let genesis_jmt_version = io_loop.storage().state_version();
+        let genesis_jmt_root = io_loop.storage().state_root_hash();
 
         info!(
             genesis_jmt_version,
@@ -728,22 +728,22 @@ impl ProductionRunner {
         );
 
         // Initialize state machine with genesis (this sets up proposal timer).
-        let actions = node_loop.state_mut().initialize_genesis(genesis_block);
+        let actions = io_loop.state_mut().initialize_genesis(genesis_block);
         info!(num_actions = actions.len(), "Genesis returned actions");
 
-        // Process actions through NodeLoop (timers, etc.).
-        node_loop.handle_actions(actions);
-        node_loop.flush_all_batches();
+        // Process actions through IoLoop (timers, etc.).
+        io_loop.handle_actions(actions);
+        io_loop.flush_all_batches();
 
         // Drain timer ops from genesis actions (includes ProposalTimer).
-        let genesis_output = node_loop.drain_pending_output();
+        let genesis_output = io_loop.drain_pending_output();
         let mut timer_ops = genesis_output.timer_ops;
 
         // CRITICAL: Update state machine with the genesis JMT state.
         // The state machine was created BEFORE genesis bootstrap ran, so it has
         // stale/zero state. We need to sync it with the actual JMT state from
         // genesis so future blocks compute state_root from the correct base.
-        let genesis_commit_output = node_loop.step(NodeInput::Protocol(
+        let genesis_commit_output = io_loop.step(NodeInput::Protocol(
             hyperscale_core::ProtocolEvent::StateCommitComplete {
                 height: 0,
                 state_version: genesis_jmt_version,
@@ -762,7 +762,7 @@ impl ProductionRunner {
         timer_ops.extend(genesis_commit_output.timer_ops);
 
         // Flush any batches from the genesis commit step.
-        node_loop.flush_all_batches();
+        io_loop.flush_all_batches();
 
         timer_ops
     }
@@ -773,9 +773,9 @@ impl ProductionRunner {
 
     /// Run the production node.
     ///
-    /// 1. Initializes genesis via NodeLoop (before spawning pinned thread)
-    /// 2. Extracts the NodeLoop and channel receivers for the pinned thread
-    /// 3. Spawns the pinned thread running the NodeLoop event loop
+    /// 1. Initializes genesis via IoLoop (before spawning pinned thread)
+    /// 2. Extracts the IoLoop and channel receivers for the pinned thread
+    /// 3. Spawns the pinned thread running the IoLoop event loop
     /// 4. Runs a minimal loop for metrics collection and shutdown handling
     /// 5. On shutdown, signals the pinned thread and joins it
     pub async fn run(mut self) -> Result<(), RunnerError> {
@@ -786,17 +786,17 @@ impl ProductionRunner {
             execution_threads = config.execution_threads,
             io_threads = config.io_threads,
             pin_cores = config.pin_cores,
-            "Starting production runner (NodeLoop architecture)"
+            "Starting production runner (IoLoop architecture)"
         );
 
         // ── 1. Initialize genesis before spawning pinned thread ──────────
         let initial_timer_ops = self.maybe_initialize_genesis();
 
-        // ── 2. Extract NodeLoop and channel receivers for pinned thread ───
-        let node_loop = self
-            .node_loop
+        // ── 2. Extract IoLoop and channel receivers for pinned thread ───
+        let io_loop = self
+            .io_loop
             .take()
-            .expect("node_loop already taken (run called twice?)");
+            .expect("io_loop already taken (run called twice?)");
 
         let pinned_config = PinnedLoopConfig {
             timer_tx: self.xb_timer_tx.clone(),
@@ -821,7 +821,7 @@ impl ProductionRunner {
         };
 
         // ── 3. Spawn pinned thread ───────────────────────────────────────
-        let loop_handle = spawn_pinned_loop(node_loop, pinned_config);
+        let loop_handle = spawn_pinned_loop(io_loop, pinned_config);
 
         // ── 4. Metrics + shutdown loop ───────────────────────────────────
         let mut metrics_tick = tokio::time::interval(Duration::from_secs(1));

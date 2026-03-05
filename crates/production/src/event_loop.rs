@@ -1,6 +1,6 @@
 //! Pinned thread event loop for the production runner.
 //!
-//! [`NodeLoop`] runs on a dedicated `std::thread` pinned to core 0. It receives
+//! [`IoLoop`] runs on a dedicated `std::thread` pinned to core 0. It receives
 //! events from three crossbeam channels with priority via `try_recv` cascade:
 //!
 //! ```text
@@ -9,7 +9,7 @@
 //!
 //! When nothing is ready, blocks on `crossbeam::select!` with a timeout derived
 //! from the nearest batch deadline. Transaction statuses are written to
-//! NodeLoop's internal `QuickCache`, shared with RPC handlers via `Arc`.
+//! IoLoop's internal `QuickCache`, shared with RPC handlers via `Arc`.
 
 use crate::rpc::state::{MempoolSnapshot, NodeStatusState};
 use crate::status::SyncStatus;
@@ -19,7 +19,7 @@ use hyperscale_core::{NodeInput, TimerId};
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network_libp2p::ProdNetwork;
-use hyperscale_node::node_loop::{NodeLoop, NodeStatusSnapshot, TimerOp};
+use hyperscale_node::io_loop::{IoLoop, NodeStatusSnapshot, TimerOp};
 use hyperscale_storage_rocksdb::SharedStorage;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,13 +28,13 @@ use tokio::sync::RwLock as TokioRwLock;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-/// Concrete NodeLoop type for the production runner.
+/// Concrete IoLoop type for the production runner.
 ///
 /// Storage is `SharedStorage`, a newtype around `Arc<RocksDbStorage>`. This
-/// allows the same underlying storage to be shared between the pinned NodeLoop
+/// allows the same underlying storage to be shared between the pinned IoLoop
 /// thread and async tasks (InboundRouter) via cheap Arc clones.
-/// Certificate and transaction caches live inside NodeLoop itself.
-pub type ProdNodeLoop = NodeLoop<SharedStorage, ProdNetwork, PooledDispatch>;
+/// Certificate and transaction caches live inside IoLoop itself.
+pub type ProdIoLoop = IoLoop<SharedStorage, ProdNetwork, PooledDispatch>;
 
 /// Configuration for the pinned event loop.
 pub struct PinnedLoopConfig {
@@ -175,7 +175,7 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
     }
 }
 
-/// Run the NodeLoop on a pinned thread.
+/// Run the IoLoop on a pinned thread.
 ///
 /// This function blocks the calling thread until shutdown. It should be called
 /// from a dedicated `std::thread::spawn` with core affinity set.
@@ -185,11 +185,11 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
 /// 2. Sets wall-clock time on the state machine
 /// 3. Tries to receive events in priority order (timer > callback > consensus)
 /// 4. Falls back to `crossbeam::select!` with batch deadline timeout
-/// 5. Processes the event via `NodeLoop::step()`
+/// 5. Processes the event via `IoLoop::step()`
 /// 6. Writes emitted statuses to tx_status_cache and records RPC latency
 /// 7. Flushes expired batches
 /// 8. Periodic metrics collection and JMT garbage collection
-pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, mut config: PinnedLoopConfig) {
+pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
     info!("Pinned event loop starting");
 
     let mut timer_mgr = ProdTimerManager::new(config.tokio_handle.clone(), config.timer_tx.clone());
@@ -211,7 +211,7 @@ pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, mut config: PinnedLoopConfig
 
         // ── Set wall-clock time ──
         let now = wall_clock_duration();
-        node_loop.set_time(now);
+        io_loop.set_time(now);
 
         // ── Priority try_recv cascade ──
         let event = 'recv: {
@@ -226,7 +226,7 @@ pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, mut config: PinnedLoopConfig
             }
 
             // Nothing ready — block with timeout from nearest batch deadline
-            let timeout = node_loop
+            let timeout = io_loop
                 .nearest_batch_deadline()
                 .map(|deadline| deadline.saturating_sub(now))
                 .unwrap_or(DEFAULT_TIMEOUT);
@@ -245,7 +245,7 @@ pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, mut config: PinnedLoopConfig
 
         // ── Process event ──
         if let Some(event) = event {
-            let output = node_loop.step(event);
+            let output = io_loop.step(event);
 
             // Process timer operations from this step.
             for op in output.timer_ops {
@@ -254,12 +254,12 @@ pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, mut config: PinnedLoopConfig
         }
 
         // ── Flush expired batches ──
-        node_loop.flush_expired_batches(wall_clock_duration());
+        io_loop.flush_expired_batches(wall_clock_duration());
 
         // ── Periodic metrics + RPC status snapshot ──
         if last_metrics.elapsed() >= METRICS_INTERVAL {
             last_metrics = Instant::now();
-            node_loop.collect_metrics();
+            io_loop.collect_metrics();
             metrics::set_channel_depths(&hyperscale_metrics::ChannelDepths {
                 callback: config.callback_rx.len(),
                 consensus: config.consensus_rx.len(),
@@ -272,13 +272,13 @@ pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, mut config: PinnedLoopConfig
             });
 
             // Push status snapshot to shared RPC state.
-            update_rpc_state(&config, &node_loop.status_snapshot());
+            update_rpc_state(&config, &io_loop.status_snapshot());
         }
 
         // ── Periodic JMT GC ──
         if last_gc.elapsed() >= GC_INTERVAL {
             last_gc = Instant::now();
-            let deleted = node_loop.storage().run_jmt_gc();
+            let deleted = io_loop.storage().run_jmt_gc();
             if deleted > 0 {
                 debug!(deleted, "JMT garbage collection completed");
             }
@@ -288,29 +288,29 @@ pub fn run_pinned_loop(mut node_loop: ProdNodeLoop, mut config: PinnedLoopConfig
     info!("Pinned event loop exiting");
 }
 
-/// Spawn the NodeLoop on a dedicated pinned thread.
+/// Spawn the IoLoop on a dedicated pinned thread.
 ///
 /// Returns a `JoinHandle` for the spawned thread. The caller should hold
 /// on to this and join on shutdown.
 pub fn spawn_pinned_loop(
-    node_loop: ProdNodeLoop,
+    io_loop: ProdIoLoop,
     config: PinnedLoopConfig,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
-        .name("node-loop".to_string())
+        .name("io-loop".to_string())
         .spawn(move || {
             // Try to pin to core 0
             if let Some(core_ids) = core_affinity::get_core_ids() {
                 if let Some(&core_id) = core_ids.first() {
                     if core_affinity::set_for_current(core_id) {
-                        info!(?core_id, "Pinned node-loop thread to core");
+                        info!(?core_id, "Pinned io-loop thread to core");
                     } else {
-                        warn!("Failed to pin node-loop thread to core 0");
+                        warn!("Failed to pin io-loop thread to core 0");
                     }
                 }
             }
 
-            run_pinned_loop(node_loop, config);
+            run_pinned_loop(io_loop, config);
         })
-        .expect("failed to spawn node-loop thread")
+        .expect("failed to spawn io-loop thread")
 }

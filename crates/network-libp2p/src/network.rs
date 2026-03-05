@@ -1,7 +1,7 @@
 //! Production network adapter implementing the Network trait.
 //!
 //! [`ProdNetwork`] wraps [`Libp2pAdapter`] and [`RequestManager`] to provide
-//! the [`Network`] interface used by `NodeLoop` in the production runner.
+//! the [`Network`] interface used by `IoLoop` in the production runner.
 
 use crate::adapter::Libp2pAdapter;
 use crate::inbound_router::{spawn_inbound_router, InboundRouterHandle};
@@ -88,7 +88,7 @@ impl Network for ProdNetwork {
     fn register_inbound_handler(&self, handler: Arc<dyn InboundRequestHandler>) {
         // Enter the tokio runtime context so spawn_inbound_router can use
         // tokio::spawn (this may be called from the main thread before the
-        // NodeLoop is moved to its pinned thread).
+        // IoLoop is moved to its pinned thread).
         let _guard = self.tokio_handle.enter();
         let handle = spawn_inbound_router(self.adapter.clone(), handler);
         let _ = self.inbound_router.set(handle);

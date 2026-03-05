@@ -40,7 +40,7 @@ pub const DOMAIN_EXEC_VOTE: &[u8] = b"EXEC_VOTE";
 /// Format: `COMMITTED_BLOCK_HEADER` || shard_group_id || height || block_hash
 ///
 /// Signed by the sender (proposer) when broadcasting committed block headers
-/// globally. Verified by NodeLoop before admitting to the state machine.
+/// globally. Verified by IoLoop before admitting to the state machine.
 pub const DOMAIN_COMMITTED_BLOCK_HEADER: &[u8] = b"COMMITTED_BLOCK_HEADER";
 
 /// Build the signing message for a block vote.

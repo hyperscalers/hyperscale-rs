@@ -33,16 +33,16 @@ pub enum EventPriority {
 
 /// All possible inputs a node can receive.
 ///
-/// `NodeInput` is the top-level input type for [`NodeLoop`]. It contains:
-/// - `Protocol(ProtocolEvent)`: pass-through events that NodeLoop extracts and
+/// `NodeInput` is the top-level input type for [`IoLoop`]. It contains:
+/// - `Protocol(ProtocolEvent)`: pass-through events that IoLoop extracts and
 ///   passes to the state machine's `handle()` method directly.
-/// - NodeInput-specific variants: events that NodeLoop handles internally
+/// - NodeInput-specific variants: events that IoLoop handles internally
 ///   (sync, fetch, validation pipeline) before potentially converting them
 ///   into `ProtocolEvent`s.
 #[allow(clippy::large_enum_variant)] // TODO: Box ProtocolEvent
 #[derive(Debug, Clone)]
 pub enum NodeInput {
-    /// Pass-through to state machine. NodeLoop extracts the ProtocolEvent and
+    /// Pass-through to state machine. IoLoop extracts the ProtocolEvent and
     /// passes it to state.handle() directly.
     Protocol(ProtocolEvent),
 
@@ -96,7 +96,7 @@ pub enum NodeInput {
     },
 
     /// A committed block header from a remote shard whose sender signature
-    /// has been verified by the NodeLoop gossip gate.
+    /// has been verified by the IoLoop gossip gate.
     CommittedHeaderValidated {
         committed_header: CommittedBlockHeader,
         sender: ValidatorId,
@@ -104,7 +104,7 @@ pub enum NodeInput {
 
     /// Raw gossip payload received from the network layer.
     ///
-    /// Network handles decompression; NodeLoop SBOR-decodes based on
+    /// Network handles decompression; IoLoop SBOR-decodes based on
     /// message_type and converts to typed ProtocolEvents.
     GossipReceived {
         message_type: &'static str,
@@ -115,7 +115,7 @@ pub enum NodeInput {
     /// Provisions built by the execution pool, ready for network broadcast.
     ///
     /// Returned from delegated `FetchAndBroadcastProvisions` action.
-    /// The node loop broadcasts one `StateProvisionBatch` per target shard.
+    /// The I/O loop broadcasts one `StateProvisionBatch` per target shard.
     ProvisionsReady {
         batches: Vec<(ShardGroupId, Vec<StateProvision>)>,
     },

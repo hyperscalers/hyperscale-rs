@@ -1,7 +1,7 @@
 //! Network trait implementation for deterministic simulation.
 //!
 //! [`SimNetworkAdapter`] buffers outgoing messages in an outbox. After each
-//! `NodeLoop::step()`, the simulation harness drains the outbox and routes
+//! `IoLoop::step()`, the simulation harness drains the outbox and routes
 //! entries through [`SimulatedNetwork::deliver_gossip`](crate::SimulatedNetwork::deliver_gossip),
 //! which applies partition/latency/loss, LZ4-decompresses the payload once,
 //! and returns a [`GossipDelivery`](crate::GossipDelivery) per target peer.
@@ -34,7 +34,7 @@ pub struct OutboxEntry {
     pub data: Vec<u8>,
 }
 
-/// A buffered request from NodeLoop, awaiting harness fulfillment.
+/// A buffered request from IoLoop, awaiting harness fulfillment.
 ///
 /// The simulation harness drains these after each step, dispatches on
 /// `type_id` to decode the request, looks up data from peer nodes,
@@ -64,13 +64,13 @@ pub type HandlerSlot = Arc<OnceLock<Arc<dyn InboundRequestHandler>>>;
 /// Network implementation for simulation.
 ///
 /// Buffers outgoing messages in an outbox rather than delivering them immediately.
-/// The simulation harness drains the outbox after each `NodeLoop::step()` and
+/// The simulation harness drains the outbox after each `IoLoop::step()` and
 /// controls delivery timing, partitions, and packet loss.
 ///
 /// # Usage
 ///
 /// Each simulated node owns a `SimNetworkAdapter`. The harness:
-/// 1. Calls `NodeLoop::step(event)` which may produce network sends
+/// 1. Calls `IoLoop::step(event)` which may produce network sends
 /// 2. Drains the adapter's outbox via [`drain_outbox()`](Self::drain_outbox)
 /// 3. Routes entries through `SimulatedNetwork::deliver_gossip()`
 /// 4. Events are scheduled with the sampled latency offset
@@ -98,14 +98,14 @@ impl SimNetworkAdapter {
     /// Drain all buffered outgoing messages.
     ///
     /// Returns the entries accumulated since the last drain. The harness calls
-    /// this after each `NodeLoop::step()` to process outbound messages.
+    /// this after each `IoLoop::step()` to process outbound messages.
     pub fn drain_outbox(&self) -> Vec<OutboxEntry> {
         std::mem::take(&mut self.outbox.lock().unwrap())
     }
 
     /// Drain all buffered requests.
     ///
-    /// The harness calls this after each `NodeLoop::step()` to fulfill
+    /// The harness calls this after each `IoLoop::step()` to fulfill
     /// requests by looking up data from peer nodes and calling the callbacks.
     pub fn drain_pending_requests(&self) -> Vec<PendingRequest> {
         std::mem::take(&mut self.pending_requests.lock().unwrap())

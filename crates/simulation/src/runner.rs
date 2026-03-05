@@ -1,6 +1,6 @@
 //! Deterministic simulation runner.
 //!
-//! Uses [`NodeLoop`] to process all actions per-node, with the simulation harness
+//! Uses [`IoLoop`] to process all actions per-node, with the simulation harness
 //! controlling event scheduling, network delivery, and time.
 
 use crate::event_queue::EventKey;
@@ -14,7 +14,7 @@ use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
     NetworkConfig, NetworkTrafficAnalyzer, SimNetworkAdapter, SimulatedNetwork,
 };
-use hyperscale_node::node_loop::{NodeLoop, StepOutput};
+use hyperscale_node::io_loop::{IoLoop, StepOutput};
 use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp};
 use hyperscale_storage::ConsensusStore;
 use hyperscale_storage_memory::SimStorage;
@@ -30,22 +30,22 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
-/// Type alias for the simulation's concrete NodeLoop.
-type SimNodeLoop = NodeLoop<SimStorage, SimNetworkAdapter, SyncDispatch>;
+/// Type alias for the simulation's concrete IoLoop.
+type SimIoLoop = IoLoop<SimStorage, SimNetworkAdapter, SyncDispatch>;
 
 /// Deterministic simulation runner.
 ///
-/// Processes events in deterministic order using [`NodeLoop`] for action handling.
+/// Processes events in deterministic order using [`IoLoop`] for action handling.
 /// Given the same seed, produces identical results every run.
 ///
-/// Each node has its own independent storage and executor inside its `NodeLoop`.
+/// Each node has its own independent storage and executor inside its `IoLoop`.
 /// The harness controls the event queue, network delivery (latency, partitions,
 /// packet loss), and time advancement.
 pub struct SimulationRunner {
-    /// Per-node NodeLoop instances. Index corresponds to NodeIndex.
-    node_loops: Vec<SimNodeLoop>,
+    /// Per-node IoLoop instances. Index corresponds to NodeIndex.
+    io_loops: Vec<SimIoLoop>,
 
-    /// Per-node event receivers (from crossbeam channels passed to NodeLoop).
+    /// Per-node event receivers (from crossbeam channels passed to IoLoop).
     event_rxs: Vec<crossbeam::channel::Receiver<NodeInput>>,
 
     /// Global event queue, ordered deterministically.
@@ -162,9 +162,9 @@ impl SimulationRunner {
             shard_committees.insert(shard, committee);
         }
 
-        // Create NodeLoop for each validator
+        // Create IoLoop for each validator
         let num_nodes = total_validators as usize;
-        let mut node_loops = Vec::with_capacity(num_nodes);
+        let mut io_loops = Vec::with_capacity(num_nodes);
         let mut event_rxs = Vec::with_capacity(num_nodes);
 
         for shard_id in 0..network_config.num_shards {
@@ -206,7 +206,7 @@ impl SimulationRunner {
                     network_def.clone(),
                 ));
 
-                let node_loop = NodeLoop::new(
+                let io_loop = IoLoop::new(
                     state,
                     SimStorage::new(),
                     RadixExecutor::new(network_def),
@@ -219,13 +219,13 @@ impl SimulationRunner {
                     tx_validator,
                 );
 
-                node_loops.push(node_loop);
+                io_loops.push(io_loop);
                 event_rxs.push(event_rx);
             }
         }
 
         info!(
-            num_nodes = node_loops.len(),
+            num_nodes = io_loops.len(),
             num_shards = network_config.num_shards,
             validators_per_shard = network_config.validators_per_shard,
             seed,
@@ -233,7 +233,7 @@ impl SimulationRunner {
         );
 
         Self {
-            node_loops,
+            io_loops,
             event_rxs,
             event_queue: BTreeMap::new(),
             sequence: 0,
@@ -279,12 +279,12 @@ impl SimulationRunner {
 
     /// Get a reference to a node's storage.
     pub fn node_storage(&self, node: NodeIndex) -> Option<&SimStorage> {
-        self.node_loops.get(node as usize).map(|nl| nl.storage())
+        self.io_loops.get(node as usize).map(|nl| nl.storage())
     }
 
     /// Get the last emitted transaction status for a node.
     pub fn tx_status(&self, node: NodeIndex, tx_hash: &TxHash) -> Option<TransactionStatus> {
-        self.node_loops
+        self.io_loops
             .get(node as usize)
             .and_then(|nl| nl.tx_status(tx_hash))
     }
@@ -301,7 +301,7 @@ impl SimulationRunner {
 
     /// Get a reference to a node's state machine by index.
     pub fn node(&self, index: NodeIndex) -> Option<&NodeStateMachine> {
-        self.node_loops.get(index as usize).map(|nl| nl.state())
+        self.io_loops.get(index as usize).map(|nl| nl.state())
     }
 
     /// Get a reference to the network.
@@ -316,7 +316,7 @@ impl SimulationRunner {
 
     /// Get the number of committed blocks stored for a specific node.
     pub fn committed_block_count(&self, node: NodeIndex) -> usize {
-        self.node_loops
+        self.io_loops
             .get(node as usize)
             .map(|nl| {
                 let s = nl.storage();
@@ -336,7 +336,7 @@ impl SimulationRunner {
 
     /// Check if a specific block is stored for a node.
     pub fn has_committed_block(&self, node: NodeIndex, height: u64) -> bool {
-        self.node_loops
+        self.io_loops
             .get(node as usize)
             .map(|nl| {
                 nl.storage()
@@ -359,9 +359,9 @@ impl SimulationRunner {
     /// Initialize all nodes with genesis blocks and start consensus.
     pub fn initialize_genesis(&mut self) {
         // Run Radix Engine genesis on each node's storage.
-        for node_idx in 0..self.node_loops.len() {
+        for node_idx in 0..self.io_loops.len() {
             if !self.genesis_executed[node_idx] {
-                let result = self.node_loops[node_idx]
+                let result = self.io_loops[node_idx]
                     .with_storage_and_executor(|storage, executor| executor.run_genesis(storage));
                 if let Err(e) = result {
                     warn!(node = node_idx, "Radix Engine genesis failed: {:?}", e);
@@ -370,7 +370,7 @@ impl SimulationRunner {
             }
         }
         info!(
-            num_nodes = self.node_loops.len(),
+            num_nodes = self.io_loops.len(),
             "Radix Engine genesis complete on all nodes"
         );
 
@@ -388,11 +388,11 @@ impl SimulationRunner {
         use hyperscale_engine::GenesisConfig;
 
         // Run Radix Engine genesis on each node's storage with balances.
-        for node_idx in 0..self.node_loops.len() {
+        for node_idx in 0..self.io_loops.len() {
             if !self.genesis_executed[node_idx] {
                 let balances = balances.clone();
                 let result =
-                    self.node_loops[node_idx].with_storage_and_executor(|storage, executor| {
+                    self.io_loops[node_idx].with_storage_and_executor(|storage, executor| {
                         let config = GenesisConfig {
                             xrd_balances: balances,
                             ..GenesisConfig::test_default()
@@ -406,7 +406,7 @@ impl SimulationRunner {
             }
         }
         info!(
-            num_nodes = self.node_loops.len(),
+            num_nodes = self.io_loops.len(),
             num_funded_accounts = balances.len(),
             "Radix Engine genesis complete with funded accounts"
         );
@@ -428,7 +428,7 @@ impl SimulationRunner {
 
         for shard_id in 0..num_shards {
             let shard_start = shard_id * validators_per_shard;
-            let first_node_storage = self.node_loops[shard_start as usize].storage();
+            let first_node_storage = self.io_loops[shard_start as usize].storage();
             let genesis_jmt_version = first_node_storage.state_version();
             let genesis_jmt_root = first_node_storage.state_root_hash();
 
@@ -450,14 +450,14 @@ impl SimulationRunner {
             let shard_end = shard_start + validators_per_shard;
             for node_index in shard_start..shard_end {
                 let i = node_index as usize;
-                let actions = self.node_loops[i]
+                let actions = self.io_loops[i]
                     .state_mut()
                     .initialize_genesis(genesis_block.clone());
-                self.node_loops[i].handle_actions(actions);
-                self.node_loops[i].flush_all_batches();
+                self.io_loops[i].handle_actions(actions);
+                self.io_loops[i].flush_all_batches();
 
                 // Drain outputs from genesis initialization (timer sets, etc.)
-                let output = self.node_loops[i].drain_pending_output();
+                let output = self.io_loops[i].drain_pending_output();
                 self.drain_node_io(node_index);
                 self.process_step_output(node_index, output);
 
@@ -513,9 +513,9 @@ impl SimulationRunner {
             self.stats.events_processed += 1;
             self.stats.events_by_priority[event.priority() as usize] += 1;
 
-            self.node_loops[node_index as usize].set_time(self.now);
-            let output = self.node_loops[node_index as usize].step(event);
-            self.node_loops[node_index as usize].flush_all_batches();
+            self.io_loops[node_index as usize].set_time(self.now);
+            let output = self.io_loops[node_index as usize].step(event);
+            self.io_loops[node_index as usize].flush_all_batches();
 
             self.drain_node_io(node_index);
             self.process_step_output(node_index, output);
@@ -539,12 +539,12 @@ impl SimulationRunner {
 
     /// Drain network outbox, timer ops, pending requests, and buffered events from a node.
     ///
-    /// Converts NodeLoop-internal outputs into harness-level operations:
+    /// Converts IoLoop-internal outputs into harness-level operations:
     /// outbox entries → network delivery, timer ops → event queue,
     /// pending requests → fulfill from peer data, buffered events → event queue.
     fn drain_node_io(&mut self, node: NodeIndex) {
         let i = node as usize;
-        let outbox = self.node_loops[i].network().drain_outbox();
+        let outbox = self.io_loops[i].network().drain_outbox();
 
         for entry in outbox {
             self.deliver_outbox_entry(node, entry);
@@ -553,7 +553,7 @@ impl SimulationRunner {
         // Fulfill pending network requests (block, tx, cert fetches) through
         // peer InboundHandlers. Must happen BEFORE draining buffered events so
         // that callback-generated events are included in the drain below.
-        let pending_requests = self.node_loops[i].network().drain_pending_requests();
+        let pending_requests = self.io_loops[i].network().drain_pending_requests();
         if !pending_requests.is_empty() {
             let stats = self
                 .network
