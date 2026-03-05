@@ -2,8 +2,9 @@
 
 use crate::ProtocolEvent;
 use hyperscale_types::{
-    Block, BlockHeight, CommittedBlockHeader, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, StateProvision, TransactionCertificate, ValidatorId,
+    Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, Hash,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, StateProvision, TransactionCertificate,
+    ValidatorId,
 };
 use std::sync::Arc;
 
@@ -102,14 +103,14 @@ pub enum NodeInput {
         sender: ValidatorId,
     },
 
-    /// Raw gossip payload received from the network layer.
-    ///
-    /// Network handles decompression; IoLoop SBOR-decodes based on
-    /// message_type and converts to typed ProtocolEvents.
-    GossipReceived {
-        message_type: &'static str,
-        /// Decompressed SBOR payload bytes.
-        payload: Vec<u8>,
+    /// A committed block header gossip that has passed pre-filtering
+    /// (sender committee check + public key resolution) but still needs
+    /// batched BLS signature verification.
+    CommittedBlockGossipReceived {
+        committed_header: CommittedBlockHeader,
+        sender: ValidatorId,
+        public_key: Bls12381G1PublicKey,
+        sender_signature: Bls12381G2Signature,
     },
 
     /// Provisions built by the execution pool, ready for network broadcast.
@@ -175,7 +176,7 @@ impl NodeInput {
             NodeInput::CertificateReceived { .. } => EventPriority::Network,
             NodeInput::TransactionValidated { .. } => EventPriority::Internal,
             NodeInput::CommittedHeaderValidated { .. } => EventPriority::Internal,
-            NodeInput::GossipReceived { .. } => EventPriority::Network,
+            NodeInput::CommittedBlockGossipReceived { .. } => EventPriority::Network,
             NodeInput::ProvisionsReady { .. } => EventPriority::Internal,
             NodeInput::ProvisionFetchReceived { .. } => EventPriority::Internal,
             NodeInput::ProvisionFetchFailed { .. } => EventPriority::Internal,
@@ -215,7 +216,7 @@ impl NodeInput {
             NodeInput::CertificateReceived { .. } => "CertificateReceived",
             NodeInput::TransactionValidated { .. } => "TransactionValidated",
             NodeInput::CommittedHeaderValidated { .. } => "CommittedHeaderValidated",
-            NodeInput::GossipReceived { .. } => "GossipReceived",
+            NodeInput::CommittedBlockGossipReceived { .. } => "CommittedBlockGossipReceived",
             NodeInput::ProvisionsReady { .. } => "ProvisionsReady",
             NodeInput::ProvisionFetchReceived { .. } => "ProvisionFetchReceived",
             NodeInput::ProvisionFetchFailed { .. } => "ProvisionFetchFailed",

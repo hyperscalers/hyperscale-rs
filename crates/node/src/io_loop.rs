@@ -417,6 +417,10 @@ where
     /// Each request type gets its own handler closure that delegates to the
     /// shared `RequestHandler<S>` instance.
     fn register_request_handler(&self) {
+        use hyperscale_messages::request::{
+            GetBlockRequest, GetCertificatesRequest, GetProvisionsRequest, GetTransactionsRequest,
+        };
+
         let rh = Arc::new(crate::request_handler::RequestHandler::new(
             self.config.inbound.clone(),
             Arc::clone(&self.storage),
@@ -425,75 +429,211 @@ where
             Arc::clone(&self.cert_cache),
         ));
 
-        self.register_one_request(
-            "block.request",
-            &rh,
-            crate::request_handler::RequestHandler::handle_block_request,
-        );
-        self.register_one_request(
-            "transaction.request",
-            &rh,
-            crate::request_handler::RequestHandler::handle_transaction_request,
-        );
-        self.register_one_request(
-            "certificate.request",
-            &rh,
-            crate::request_handler::RequestHandler::handle_certificate_request,
-        );
-        self.register_one_request(
-            "provision.request",
-            &rh,
-            crate::request_handler::RequestHandler::handle_provision_request,
-        );
-    }
-
-    /// Register a single request type handler that delegates to a method on `RequestHandler<S>`.
-    fn register_one_request(
-        &self,
-        type_id: &'static str,
-        rh: &Arc<crate::request_handler::RequestHandler<S>>,
-        method: crate::request_handler::HandlerFn<S>,
-    ) {
-        let rh = rh.clone();
-        let handler: Arc<dyn hyperscale_network::RequestHandler> =
-            Arc::new(move |payload: &[u8]| -> Vec<u8> {
-                match method(&rh, payload) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        tracing::debug!(error = %e, type_id = type_id, "Request processing failed");
-                        vec![]
-                    }
-                }
+        let rh2 = rh.clone();
+        self.network
+            .register_request_handler::<GetBlockRequest>(move |req: GetBlockRequest| {
+                rh2.handle_block_request(req)
             });
-        self.network.register_request_handler(type_id, handler);
+
+        let rh2 = rh.clone();
+        self.network
+            .register_request_handler::<GetTransactionsRequest>(
+                move |req: GetTransactionsRequest| rh2.handle_transaction_request(req),
+            );
+
+        let rh2 = rh.clone();
+        self.network
+            .register_request_handler::<GetCertificatesRequest>(
+                move |req: GetCertificatesRequest| rh2.handle_certificate_request(req),
+            );
+
+        let rh2 = rh.clone();
+        self.network
+            .register_request_handler::<GetProvisionsRequest>(move |req: GetProvisionsRequest| {
+                rh2.handle_provision_request(req)
+            });
     }
 
     /// Register per-type gossip handlers with the network.
     ///
-    /// Each gossip message type gets a [`TypedGossipBridge`] that forwards
-    /// the payload to the IoLoop event channel as `NodeInput::GossipReceived`.
+    /// All gossip types use typed `register_gossip_handler<M>` which
+    /// SBOR-decodes in the network layer before calling the handler closure.
+    /// Handler closures either convert directly to ProtocolEvents or forward
+    /// as typed NodeInput variants for IoLoop processing.
     fn register_gossip_handler(&self) {
         use hyperscale_network::TopicScope;
 
-        let gossip_types: &[(&str, TopicScope)] = &[
-            ("block.header", TopicScope::Shard),
-            ("block.vote", TopicScope::Shard),
-            ("transaction.gossip", TopicScope::Shard),
-            ("transaction.certificate", TopicScope::Shard),
-            ("state.provision.batch", TopicScope::Shard),
-            ("execution.vote.batch", TopicScope::Shard),
-            ("execution.certificate.batch", TopicScope::Shard),
-            ("block.committed", TopicScope::Global),
-        ];
+        // ── block.vote → ProtocolEvent::BlockVoteReceived ────────────
 
-        for &(type_id, scope) in gossip_types {
-            let handler = Arc::new(crate::gossip_bridge::TypedGossipBridge::new(
-                type_id,
-                self.event_sender.clone(),
-            ));
-            self.network
-                .register_gossip_handler(type_id, scope, handler);
-        }
+        let tx = self.event_sender.clone();
+        self.network.register_gossip_handler::<BlockVoteGossip>(
+            TopicScope::Shard,
+            move |gossip: BlockVoteGossip| {
+                let _ = tx.send(NodeInput::Protocol(ProtocolEvent::BlockVoteReceived {
+                    vote: gossip.vote,
+                }));
+            },
+        );
+
+        // ── state.provision.batch → ProtocolEvent::StateProvisionsReceived ─
+
+        let tx = self.event_sender.clone();
+        self.network
+            .register_gossip_handler::<hyperscale_messages::StateProvisionBatch>(
+                TopicScope::Shard,
+                move |batch: hyperscale_messages::StateProvisionBatch| {
+                    let provisions = batch.into_provisions();
+                    if !provisions.is_empty() {
+                        let _ = tx.send(NodeInput::Protocol(
+                            ProtocolEvent::StateProvisionsReceived { provisions },
+                        ));
+                    }
+                },
+            );
+
+        // ── execution.vote.batch → ProtocolEvent::ExecutionVoteReceived ─
+
+        let tx = self.event_sender.clone();
+        self.network.register_gossip_handler::<ExecutionVoteBatch>(
+            TopicScope::Shard,
+            move |batch: ExecutionVoteBatch| {
+                for vote in batch.into_votes() {
+                    let _ = tx.send(NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived {
+                        vote,
+                    }));
+                }
+            },
+        );
+
+        // ── execution.certificate.batch → ProtocolEvent::ExecutionCertificateReceived ─
+
+        let tx = self.event_sender.clone();
+        self.network
+            .register_gossip_handler::<ExecutionCertificateBatch>(
+                TopicScope::Shard,
+                move |batch: ExecutionCertificateBatch| {
+                    for cert in batch.into_certificates() {
+                        let _ = tx.send(NodeInput::Protocol(
+                            ProtocolEvent::ExecutionCertificateReceived { cert },
+                        ));
+                    }
+                },
+            );
+
+        // ── block.header → verify proposer sig, then ProtocolEvent::BlockHeaderReceived ─
+
+        let tx = self.event_sender.clone();
+        let topology = Arc::clone(&self.topology);
+        self.network.register_gossip_handler::<BlockHeaderGossip>(
+            TopicScope::Shard,
+            move |gossip: BlockHeaderGossip| {
+                let proposer = gossip.header.proposer;
+                let Some(public_key) = topology.public_key(proposer) else {
+                    warn!(proposer = proposer.0, "Unknown proposer for block header");
+                    return;
+                };
+                let msg = gossip.signing_message();
+                let start = std::time::Instant::now();
+                let valid = hyperscale_types::verify_bls12381_v1(
+                    &msg,
+                    &public_key,
+                    &gossip.proposer_signature,
+                );
+                metrics::record_signature_verification_latency(
+                    "block_header",
+                    start.elapsed().as_secs_f64(),
+                );
+                if !valid {
+                    warn!(
+                        proposer = proposer.0,
+                        height = gossip.header.height.0,
+                        round = gossip.header.round,
+                        "Block header proposer signature invalid — dropping"
+                    );
+                    return;
+                }
+                let (header, manifest, _sig) = gossip.into_parts();
+                let _ = tx.send(NodeInput::Protocol(ProtocolEvent::BlockHeaderReceived {
+                    header,
+                    manifest,
+                }));
+            },
+        );
+
+        // ── transaction.gossip → ProtocolEvent::TransactionGossipReceived ─
+        // The existing step() intercept handles dedup + validation queueing.
+
+        let tx = self.event_sender.clone();
+        self.network.register_gossip_handler::<TransactionGossip>(
+            TopicScope::Shard,
+            move |gossip: TransactionGossip| {
+                let _ = tx.send(NodeInput::Protocol(
+                    ProtocolEvent::TransactionGossipReceived {
+                        tx: gossip.transaction,
+                        submitted_locally: false,
+                    },
+                ));
+            },
+        );
+
+        // ── transaction.certificate → NodeInput::TransactionCertificateReceived ─
+
+        let tx = self.event_sender.clone();
+        self.network
+            .register_gossip_handler::<TransactionCertificateGossip>(
+                TopicScope::Shard,
+                move |gossip: TransactionCertificateGossip| {
+                    let _ = tx.send(NodeInput::TransactionCertificateReceived {
+                        certificate: gossip.into_certificate(),
+                    });
+                },
+            );
+
+        // ── block.committed → pre-filter, then NodeInput::CommittedBlockGossipReceived ─
+
+        let tx = self.event_sender.clone();
+        let topology = Arc::clone(&self.topology);
+        let local_shard = self.local_shard;
+        self.network
+            .register_gossip_handler::<hyperscale_messages::CommittedBlockHeaderGossip>(
+                TopicScope::Global,
+                move |gossip: hyperscale_messages::CommittedBlockHeaderGossip| {
+                    let sender = gossip.sender;
+                    let header_shard = gossip.committed_header.header.shard_group_id;
+
+                    // Ignore headers from our own shard.
+                    if header_shard == local_shard {
+                        return;
+                    }
+
+                    // Verify sender is in the source shard's committee.
+                    let committee = topology.committee_for_shard(header_shard);
+                    if !committee.contains(&sender) {
+                        warn!(
+                            sender = sender.0,
+                            header_shard = header_shard.0,
+                            "Committed header sender not in source shard committee"
+                        );
+                        return;
+                    }
+
+                    // Resolve sender's public key.
+                    let Some(public_key) = topology.public_key(sender) else {
+                        warn!(
+                            sender = sender.0,
+                            "Could not resolve public key for committed header sender"
+                        );
+                        return;
+                    };
+
+                    let _ = tx.send(NodeInput::CommittedBlockGossipReceived {
+                        committed_header: gossip.committed_header,
+                        sender,
+                        public_key,
+                        sender_signature: gossip.sender_signature,
+                    });
+                },
+            );
     }
 
     // ─── Event Processing ───────────────────────────────────────────────
@@ -708,15 +848,21 @@ where
                 });
             }
 
-            // ── Gossip received (raw bytes) ─────────────────────────────
+            // ── Committed block gossip (pre-filtered) ─────────────────
             //
-            // Network layer decompressed the wire bytes; we SBOR-decode
-            // based on message_type and convert to typed protocol events.
-            NodeInput::GossipReceived {
-                message_type,
-                payload,
+            // Handler closure already verified sender's committee membership
+            // and resolved the public key. Queue for batched BLS verification.
+            NodeInput::CommittedBlockGossipReceived {
+                committed_header,
+                sender,
+                public_key,
+                sender_signature,
             } => {
-                self.handle_gossip_received(message_type, &payload);
+                let item: CommittedHeaderVerificationItem =
+                    (committed_header, sender, public_key, sender_signature);
+                if self.committed_header_batch.push(item, self.state.now()) {
+                    self.flush_committed_header_verifications();
+                }
             }
 
             // ── Provisions ready (from execution pool) ─────────────────
@@ -1757,166 +1903,6 @@ where
 
         // Feed GossipedCertificateVerified directly to state machine.
         self.feed_event(ProtocolEvent::GossipedCertificateVerified { certificate });
-    }
-
-    // ─── Gossip Decode & Dispatch ──────────────────────────────────────
-
-    /// Decode a raw gossip payload and process the resulting protocol events.
-    ///
-    /// The network layer has already decompressed the LZ4 wire bytes; we
-    /// SBOR-decode based on `message_type` and feed typed events to the
-    /// state machine.
-    fn handle_gossip_received(&mut self, message_type: &str, payload: &[u8]) {
-        match message_type {
-            "block.header" => {
-                let Ok(gossip) = sbor::basic_decode::<BlockHeaderGossip>(payload) else {
-                    warn!("Failed to decode BlockHeaderGossip");
-                    return;
-                };
-
-                // Verify proposer BLS signature before admitting to state machine.
-                // This ensures proposals cannot be forged, independent of transport identity.
-                let proposer = gossip.header.proposer;
-                let Some(public_key) = self.topology.public_key(proposer) else {
-                    warn!(proposer = proposer.0, "Unknown proposer for block header");
-                    return;
-                };
-                let msg = gossip.signing_message();
-                let start = std::time::Instant::now();
-                let valid = hyperscale_types::verify_bls12381_v1(
-                    &msg,
-                    &public_key,
-                    &gossip.proposer_signature,
-                );
-                metrics::record_signature_verification_latency(
-                    "block_header",
-                    start.elapsed().as_secs_f64(),
-                );
-                if !valid {
-                    warn!(
-                        proposer = proposer.0,
-                        height = gossip.header.height.0,
-                        round = gossip.header.round,
-                        "Block header proposer signature invalid — dropping"
-                    );
-                    return;
-                }
-
-                let (header, manifest, _sig) = gossip.into_parts();
-                self.feed_event(ProtocolEvent::BlockHeaderReceived { header, manifest });
-            }
-            "block.vote" => {
-                let Ok(gossip) = sbor::basic_decode::<BlockVoteGossip>(payload) else {
-                    warn!("Failed to decode BlockVoteGossip");
-                    return;
-                };
-                self.feed_event(ProtocolEvent::BlockVoteReceived { vote: gossip.vote });
-            }
-            "state.provision.batch" => {
-                let Ok(batch) =
-                    sbor::basic_decode::<hyperscale_messages::StateProvisionBatch>(payload)
-                else {
-                    warn!("Failed to decode StateProvisionBatch");
-                    return;
-                };
-                let provisions = batch.into_provisions();
-                if !provisions.is_empty() {
-                    self.feed_event(ProtocolEvent::StateProvisionsReceived { provisions });
-                }
-            }
-            "execution.vote.batch" => {
-                let Ok(batch) = sbor::basic_decode::<ExecutionVoteBatch>(payload) else {
-                    warn!("Failed to decode ExecutionVoteBatch");
-                    return;
-                };
-                for vote in batch.into_votes() {
-                    self.feed_event(ProtocolEvent::ExecutionVoteReceived { vote });
-                }
-            }
-            "execution.certificate.batch" => {
-                let Ok(batch) = sbor::basic_decode::<ExecutionCertificateBatch>(payload) else {
-                    warn!("Failed to decode ExecutionCertificateBatch");
-                    return;
-                };
-                for cert in batch.into_certificates() {
-                    self.feed_event(ProtocolEvent::ExecutionCertificateReceived { cert });
-                }
-            }
-            "transaction.gossip" => {
-                let Ok(gossip) = sbor::basic_decode::<TransactionGossip>(payload) else {
-                    warn!("Failed to decode TransactionGossip");
-                    return;
-                };
-                let tx = gossip.transaction;
-                let tx_hash = tx.hash();
-                // Same logic as the TransactionGossipReceived arm in step():
-                // route through validation pipeline.
-                if self.tx_cache.get(&tx_hash).is_none()
-                    && !self.state.mempool().is_tombstoned(&tx_hash)
-                {
-                    self.pending_validation.insert(tx_hash);
-                    self.queue_validation(tx);
-                }
-            }
-            "transaction.certificate" => {
-                let Ok(gossip) = sbor::basic_decode::<TransactionCertificateGossip>(payload) else {
-                    warn!("Failed to decode TransactionCertificateGossip");
-                    return;
-                };
-                self.handle_gossiped_certificate(gossip.into_certificate());
-            }
-            "block.committed" => {
-                let Ok(gossip) =
-                    sbor::basic_decode::<hyperscale_messages::CommittedBlockHeaderGossip>(payload)
-                else {
-                    warn!("Failed to decode CommittedBlockHeaderGossip");
-                    return;
-                };
-
-                // Gossip gate: synchronous pre-checks before crypto verification.
-                let sender = gossip.sender;
-                let header_shard = gossip.committed_header.header.shard_group_id;
-
-                // Ignore headers from our own shard (we already have these locally).
-                if header_shard == self.local_shard {
-                    return;
-                }
-
-                // Verify sender is in the source shard's committee.
-                let committee = self.topology.committee_for_shard(header_shard);
-                if !committee.contains(&sender) {
-                    warn!(
-                        sender = sender.0,
-                        header_shard = header_shard.0,
-                        "Committed header sender not in source shard committee"
-                    );
-                    return;
-                }
-
-                // Resolve sender's public key for signature verification.
-                let Some(public_key) = self.topology.public_key(sender) else {
-                    warn!(
-                        sender = sender.0,
-                        "Could not resolve public key for committed header sender"
-                    );
-                    return;
-                };
-
-                // Queue for batched sender-signature verification.
-                let item: CommittedHeaderVerificationItem = (
-                    gossip.committed_header,
-                    sender,
-                    public_key,
-                    gossip.sender_signature,
-                );
-                if self.committed_header_batch.push(item, self.state.now()) {
-                    self.flush_committed_header_verifications();
-                }
-            }
-            _ => {
-                warn!(message_type, "Unknown gossip message type");
-            }
-        }
     }
 
     // ─── Batch Accumulation ─────────────────────────────────────────────

@@ -3,11 +3,9 @@
 //! Defines the `Network` interface implemented by both production (`network-libp2p`)
 //! and simulation (`network-memory`) backends.
 //!
-//! Handlers are registered per message type via `register_gossip_handler` and
-//! `register_request_handler`. The network layer dispatches incoming messages
-//! to the appropriate handler by `message_type_id` lookup.
-
-use std::sync::Arc;
+//! Handler registration is fully typed: `register_gossip_handler<M>` accepts a
+//! `GossipHandler<M>` and `register_request_handler<R>` accepts a `RequestHandler<R>`.
+//! Each implementation crate is responsible for SBOR decode/encode at the boundary.
 
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 
@@ -39,39 +37,35 @@ pub enum TopicScope {
     Global,
 }
 
-/// Handler for a single gossip message type.
+/// Typed handler for a single gossip message type.
 ///
-/// Called on the codec pool thread (production) or inline (simulation)
-/// after LZ4 decompression. The payload is decompressed SBOR bytes.
-///
-/// Implementations typically SBOR-decode the payload into a typed message,
-/// optionally validate (e.g., BLS signature check), and send a typed
-/// event to the IoLoop via a captured channel sender.
-pub trait GossipHandler: Send + Sync + 'static {
-    fn on_message(&self, payload: Vec<u8>);
+/// Called after the network layer SBOR-decodes the raw payload into `M`.
+/// Implementations typically convert the message into a `ProtocolEvent` and
+/// send it to the IoLoop via a captured channel sender.
+pub trait GossipHandler<M: NetworkMessage>: Send + Sync + 'static {
+    fn on_message(&self, message: M);
 }
 
-/// Blanket impl: any `Fn(Vec<u8>)` can serve as a gossip handler.
-impl<F: Fn(Vec<u8>) + Send + Sync + 'static> GossipHandler for F {
-    fn on_message(&self, payload: Vec<u8>) {
-        (self)(payload)
+/// Blanket impl: any `Fn(M)` can serve as a typed gossip handler.
+impl<M: NetworkMessage, F: Fn(M) + Send + Sync + 'static> GossipHandler<M> for F {
+    fn on_message(&self, message: M) {
+        (self)(message)
     }
 }
 
-/// Handler for a single request message type.
+/// Typed handler for a single request message type.
 ///
-/// Called on the inbound router thread (production) or inline (simulation).
-/// Receives SBOR-encoded request bytes (no framing — the transport layer
-/// strips the type_id prefix before dispatch). Returns SBOR-encoded
-/// response bytes.
-pub trait RequestHandler: Send + Sync + 'static {
-    fn handle_request(&self, payload: &[u8]) -> Vec<u8>;
+/// Called after the network layer SBOR-decodes the raw request into `R`.
+/// The returned `R::Response` is SBOR-encoded by the network layer before
+/// sending back to the requester.
+pub trait RequestHandler<R: Request>: Send + Sync + 'static {
+    fn handle_request(&self, request: R) -> R::Response;
 }
 
-/// Blanket impl: any `Fn(&[u8]) -> Vec<u8>` can serve as a request handler.
-impl<F: Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static> RequestHandler for F {
-    fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
-        (self)(payload)
+/// Blanket impl: any `Fn(R) -> R::Response` can serve as a typed request handler.
+impl<R: Request, F: Fn(R) -> R::Response + Send + Sync + 'static> RequestHandler<R> for F {
+    fn handle_request(&self, request: R) -> R::Response {
+        (self)(request)
     }
 }
 
@@ -93,33 +87,29 @@ pub trait Network: Send + Sync {
 
     // ── Handler registration ──
 
-    /// Register a handler for a specific gossip message type.
+    /// Register a typed gossip handler for a message type.
     ///
-    /// Each message type gets its own handler. The network layer dispatches
-    /// incoming gossip to the handler registered for that type's `message_type_id`.
+    /// The implementation SBOR-decodes the raw network payload into `M` before
+    /// calling the handler. Decode errors are logged and the message is dropped.
     ///
     /// In production, this also auto-subscribes to the corresponding gossipsub
     /// topic (shard-scoped or global, per `scope`).
     ///
     /// Called during node initialization — once per message type.
-    fn register_gossip_handler(
+    fn register_gossip_handler<M: NetworkMessage>(
         &self,
-        message_type_id: &'static str,
         scope: TopicScope,
-        handler: Arc<dyn GossipHandler>,
+        handler: impl GossipHandler<M>,
     );
 
-    /// Register a handler for a specific request message type.
+    /// Register a typed request handler for a message type.
     ///
-    /// Each request type gets its own handler. The network layer parses the
-    /// type_id frame from incoming requests and dispatches to the matching handler.
+    /// The implementation SBOR-decodes the raw request into `R` and SBOR-encodes
+    /// the `R::Response` before sending it back. Decode/encode errors are logged
+    /// and an empty response is returned.
     ///
     /// Called during node initialization — once per request type.
-    fn register_request_handler(
-        &self,
-        message_type_id: &'static str,
-        handler: Arc<dyn RequestHandler>,
-    );
+    fn register_request_handler<R: Request>(&self, handler: impl RequestHandler<R>);
 
     // ── Request-response ──
 
@@ -149,23 +139,28 @@ pub trait Network: Send + Sync {
 mod tests {
     use super::*;
 
+    // Verify that closures satisfy GossipHandler<M> via blanket impl.
     #[test]
     fn test_closure_gossip_handler() {
+        use hyperscale_types::NetworkMessage;
+        use sbor::{Decode, Encode};
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        #[derive(Debug, Encode, Decode)]
+        struct TestMsg(u32);
+        impl NetworkMessage for TestMsg {
+            fn message_type_id() -> &'static str {
+                "test.msg"
+            }
+        }
+
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
-        let handler: Arc<dyn GossipHandler> = Arc::new(move |_payload: Vec<u8>| {
+        let handler = move |_msg: TestMsg| {
             counter_clone.fetch_add(1, Ordering::SeqCst);
-        });
-        handler.on_message(vec![1, 2, 3]);
+        };
+        handler.on_message(TestMsg(42));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_closure_request_handler() {
-        let handler: Arc<dyn RequestHandler> =
-            Arc::new(|payload: &[u8]| -> Vec<u8> { payload.to_vec() });
-        let result = handler.handle_request(b"hello");
-        assert_eq!(result, b"hello");
     }
 }

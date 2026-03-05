@@ -7,17 +7,17 @@
 //!
 //! ```text
 //! Network Event Loop                    Codec Pool (via ThreadPoolManager)
-//! ┌─────────────────┐                  ┌─────────────────┐
-//! │ Gossipsub msg   │──decode_async───►│ spawn_codec()   │
-//! │ (raw bytes)     │   (non-blocking) │ (shared pool)   │
-//! └─────────────────┘                  └────────┬────────┘
+//! ┌─────────────────┐                  ┌──────────────────┐
+//! │ Gossipsub msg   │──decode_async───►│ spawn_codec()    │
+//! │ (raw bytes)     │   (non-blocking) │ (shared pool)    │
+//! └─────────────────┘                  └────────┬─────────┘
 //!                                               │
 //!                                               ▼
-//!                                      ┌─────────────────┐
-//!                                      │ LZ4 decompress  │
+//!                                      ┌──────────────────┐
+//!                                      │ LZ4 decompress   │
 //!                                      │ → handler lookup │
-//!                                      │ → on_message()  │
-//!                                      └─────────────────┘
+//!                                      │ → on_message()   │
+//!                                      └──────────────────┘
 //! ```
 //!
 //! The event loop remains non-blocking — after basic validation (peer, shard)
@@ -27,7 +27,7 @@
 use hyperscale_dispatch::Dispatch;
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
-use hyperscale_network::GossipHandler;
+use hyperscale_network::RawGossipHandler;
 use libp2p::PeerId as Libp2pPeerId;
 use std::sync::Arc;
 use tracing::warn;
@@ -68,14 +68,14 @@ impl<D: Dispatch> CodecPoolHandle<D> {
     /// * `propagation_source` - Peer that sent the message (for logging)
     pub(crate) fn decode_async(
         &self,
-        handler: Arc<dyn GossipHandler>,
+        handler: Arc<RawGossipHandler>,
         data: Vec<u8>,
         propagation_source: Libp2pPeerId,
     ) {
         self.dispatch
             .spawn_codec(move || match hyperscale_network::wire::decompress(&data) {
                 Ok(payload) => {
-                    handler.on_message(payload);
+                    handler(payload);
                     metrics::record_network_message_received();
                 }
                 Err(e) => {
@@ -96,30 +96,19 @@ mod tests {
     use hyperscale_dispatch_pooled::ThreadPoolConfig;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct CountingHandler {
-        counter: Arc<AtomicUsize>,
-        tx: crossbeam::channel::Sender<Vec<u8>>,
-    }
-
-    impl GossipHandler for CountingHandler {
-        fn on_message(&self, payload: Vec<u8>) {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-            let _ = self.tx.send(payload);
-        }
-    }
-
     fn make_handle() -> (
         CodecPoolHandle,
-        Arc<dyn GossipHandler>,
+        Arc<RawGossipHandler>,
         Arc<AtomicUsize>,
         crossbeam::channel::Receiver<Vec<u8>>,
     ) {
         let dispatch = Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap());
         let counter = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = crossbeam::channel::unbounded();
-        let handler: Arc<dyn GossipHandler> = Arc::new(CountingHandler {
-            counter: counter.clone(),
-            tx,
+        let counter_clone = counter.clone();
+        let handler: Arc<RawGossipHandler> = Arc::new(move |payload: Vec<u8>| {
+            counter_clone.fetch_add(1, Ordering::SeqCst);
+            let _ = tx.send(payload);
         });
         (CodecPoolHandle::new(dispatch), handler, counter, rx)
     }

@@ -20,7 +20,7 @@ pub mod wire;
 
 // Re-export key types
 pub use codec::{encode_to_wire, CodecError};
-pub use registry::HandlerRegistry;
+pub use registry::{HandlerRegistry, RawGossipHandler, RawRequestHandler};
 pub use topic::{parse_topic, ParsedTopic, Topic};
 pub use traits::{GossipHandler, Network, RequestError, RequestHandler, TopicScope};
 pub use wire::{frame_request, parse_request_frame};

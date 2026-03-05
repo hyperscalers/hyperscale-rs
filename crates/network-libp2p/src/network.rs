@@ -99,23 +99,36 @@ impl Network for ProdNetwork {
         }
     }
 
-    fn register_gossip_handler(
+    fn register_gossip_handler<M: NetworkMessage>(
         &self,
-        message_type_id: &'static str,
         scope: TopicScope,
-        handler: Arc<dyn GossipHandler>,
+        handler: impl GossipHandler<M>,
     ) {
+        // Wrap the typed handler in a raw closure that SBOR-decodes the payload.
+        let raw = Arc::new(
+            move |payload: Vec<u8>| match sbor::basic_decode::<M>(&payload) {
+                Ok(msg) => handler.on_message(msg),
+                Err(e) => {
+                    tracing::warn!(
+                        message_type = M::message_type_id(),
+                        error = ?e,
+                        "Failed to SBOR-decode gossip message — dropping"
+                    );
+                }
+            },
+        );
+
         // Store in registry for dispatch by the codec pool.
-        self.registry.register_gossip(message_type_id, handler);
+        self.registry.register_gossip(M::message_type_id(), raw);
 
         // Auto-subscribe to the corresponding gossipsub topic.
         let topic = match scope {
-            TopicScope::Shard => Topic::shard(message_type_id, self.local_shard),
-            TopicScope::Global => Topic::global(message_type_id),
+            TopicScope::Shard => Topic::shard(M::message_type_id(), self.local_shard),
+            TopicScope::Global => Topic::global(M::message_type_id()),
         };
         if let Err(e) = self.adapter.subscribe_topic(topic.to_string()) {
             warn!(
-                message_type = message_type_id,
+                message_type = M::message_type_id(),
                 error = ?e,
                 "Failed to subscribe to topic"
             );
@@ -124,13 +137,37 @@ impl Network for ProdNetwork {
         }
     }
 
-    fn register_request_handler(
-        &self,
-        message_type_id: &'static str,
-        handler: Arc<dyn RequestHandler>,
-    ) {
+    fn register_request_handler<R: Request>(&self, handler: impl RequestHandler<R>) {
+        // Wrap the typed handler in a raw closure that SBOR-decodes the request
+        // and SBOR-encodes the response.
+        let raw = Arc::new(move |payload: &[u8]| -> Vec<u8> {
+            let req = match sbor::basic_decode::<R>(payload) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        message_type = R::message_type_id(),
+                        error = ?e,
+                        "Failed to SBOR-decode request — returning empty response"
+                    );
+                    return vec![];
+                }
+            };
+            let response = handler.handle_request(req);
+            match sbor::basic_encode(&response) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(
+                        message_type = R::message_type_id(),
+                        error = ?e,
+                        "Failed to SBOR-encode response — returning empty response"
+                    );
+                    vec![]
+                }
+            }
+        });
+
         // Store in registry for dispatch by the inbound router.
-        self.registry.register_request(message_type_id, handler);
+        self.registry.register_request(R::message_type_id(), raw);
     }
 
     fn request<R: Request + 'static>(

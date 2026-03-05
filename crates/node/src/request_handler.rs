@@ -1,19 +1,15 @@
 //! Request handler for block sync, data fetch, and provision serving.
 //!
-//! Processes incoming request-response payloads using `ConsensusStore` and
-//! `SubstateStore` trait methods. Transport-specific I/O (libp2p streams,
-//! framing, compression) stays in the transport crate (`network-libp2p`).
-//!
-//! Each request type is registered as a separate per-type handler via the
-//! `Network::register_request_handler` API. The InboundRouter (production)
-//! or SimulatedNetwork (simulation) parses the type_id frame and dispatches
-//! the raw SBOR payload to the matching handler.
+//! Processes incoming requests using `ConsensusStore` and `SubstateStore`
+//! trait methods. SBOR decode/encode is handled by the network layer via
+//! `Network::register_typed_request_handler` — these methods receive typed
+//! requests and return typed responses.
 //!
 //! Request types:
-//! - `"block.request"` — block sync (SBOR-encoded `GetBlockRequest`)
-//! - `"transaction.request"` — transaction fetch (SBOR-encoded `GetTransactionsRequest`)
-//! - `"certificate.request"` — certificate fetch (SBOR-encoded `GetCertificatesRequest`)
-//! - `"provision.request"` — provision fetch for fallback recovery
+//! - `GetBlockRequest` / `GetBlockResponse` — block sync
+//! - `GetTransactionsRequest` / `GetTransactionsResponse` — transaction fetch
+//! - `GetCertificatesRequest` / `GetCertificatesResponse` — certificate fetch
+//! - `GetProvisionsRequest` / `GetProvisionsResponse` — provision fetch for fallback recovery
 
 use hyperscale_messages::request::{
     GetBlockRequest, GetCertificatesRequest, GetProvisionsRequest, GetTransactionsRequest,
@@ -28,21 +24,7 @@ use hyperscale_types::{
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::sync::Arc;
-use thiserror::Error;
 use tracing::{debug, trace};
-
-/// Errors from request processing.
-#[derive(Debug, Error)]
-pub enum InboundError {
-    #[error("SBOR decode error: {0}")]
-    DecodeError(String),
-
-    #[error("SBOR encode error: {0}")]
-    EncodeError(String),
-}
-
-/// Function pointer type for `RequestHandler` methods used by `register_one_request`.
-pub type HandlerFn<S> = fn(&RequestHandler<S>, &[u8]) -> Result<Vec<u8>, InboundError>;
 
 /// Configuration for the request handler.
 #[derive(Debug, Clone)]
@@ -93,25 +75,20 @@ impl<S: ConsensusStore + SubstateStore> RequestHandler<S> {
     }
 
     /// Handle a block sync request.
-    pub fn handle_block_request(&self, sbor_payload: &[u8]) -> Result<Vec<u8>, InboundError> {
-        let req: GetBlockRequest = sbor::basic_decode(sbor_payload)
-            .map_err(|e| InboundError::DecodeError(format!("{e:?}")))?;
-
+    pub fn handle_block_request(&self, req: GetBlockRequest) -> GetBlockResponse {
         trace!(height = req.height.0, "Handling block sync request");
 
-        let response = match self.storage.get_block_for_sync(req.height) {
+        match self.storage.get_block_for_sync(req.height) {
             Some((block, qc)) => GetBlockResponse::found(block, qc),
             None => GetBlockResponse::not_found(),
-        };
-
-        sbor::basic_encode(&response).map_err(|e| InboundError::EncodeError(format!("{e:?}")))
+        }
     }
 
     /// Handle a transaction fetch request.
-    pub fn handle_transaction_request(&self, sbor_payload: &[u8]) -> Result<Vec<u8>, InboundError> {
-        let tx_request: GetTransactionsRequest = sbor::basic_decode(sbor_payload)
-            .map_err(|e| InboundError::DecodeError(format!("{e:?}")))?;
-
+    pub fn handle_transaction_request(
+        &self,
+        tx_request: GetTransactionsRequest,
+    ) -> GetTransactionsResponse {
         let requested_count = tx_request.tx_hashes.len();
         trace!(
             block_hash = ?tx_request.block_hash,
@@ -156,15 +133,14 @@ impl<S: ConsensusStore + SubstateStore> RequestHandler<S> {
         );
         metrics::record_fetch_response_sent("transaction", found_count);
 
-        let response = GetTransactionsResponse::new(found_transactions);
-        sbor::basic_encode(&response).map_err(|e| InboundError::EncodeError(format!("{e:?}")))
+        GetTransactionsResponse::new(found_transactions)
     }
 
     /// Handle a certificate fetch request.
-    pub fn handle_certificate_request(&self, sbor_payload: &[u8]) -> Result<Vec<u8>, InboundError> {
-        let cert_request: GetCertificatesRequest = sbor::basic_decode(sbor_payload)
-            .map_err(|e| InboundError::DecodeError(format!("{e:?}")))?;
-
+    pub fn handle_certificate_request(
+        &self,
+        cert_request: GetCertificatesRequest,
+    ) -> GetCertificatesResponse {
         let requested_count = cert_request.cert_hashes.len();
         trace!(
             block_hash = ?cert_request.block_hash,
@@ -204,8 +180,7 @@ impl<S: ConsensusStore + SubstateStore> RequestHandler<S> {
         );
         metrics::record_fetch_response_sent("certificate", found_count);
 
-        let response = GetCertificatesResponse::new(found_certificates);
-        sbor::basic_encode(&response).map_err(|e| InboundError::EncodeError(format!("{e:?}")))
+        GetCertificatesResponse::new(found_certificates)
     }
 
     /// Handle a provision request from a target shard needing our state.
@@ -213,10 +188,7 @@ impl<S: ConsensusStore + SubstateStore> RequestHandler<S> {
     /// Looks up the block at the requested height, identifies transactions
     /// that involve the requesting shard, collects the local state entries
     /// and merkle proofs, and returns them as `StateProvision`s.
-    pub fn handle_provision_request(&self, sbor_payload: &[u8]) -> Result<Vec<u8>, InboundError> {
-        let req: GetProvisionsRequest = sbor::basic_decode(sbor_payload)
-            .map_err(|e| InboundError::DecodeError(format!("{e:?}")))?;
-
+    pub fn handle_provision_request(&self, req: GetProvisionsRequest) -> GetProvisionsResponse {
         trace!(
             block_height = req.block_height.0,
             target_shard = req.target_shard.0,
@@ -233,9 +205,7 @@ impl<S: ConsensusStore + SubstateStore> RequestHandler<S> {
                     block_height = req.block_height.0,
                     "Provision request: block not found"
                 );
-                let response = GetProvisionsResponse { provisions: None };
-                return sbor::basic_encode(&response)
-                    .map_err(|e| InboundError::EncodeError(format!("{e:?}")));
+                return GetProvisionsResponse { provisions: None };
             }
         };
 
@@ -290,9 +260,7 @@ impl<S: ConsensusStore + SubstateStore> RequestHandler<S> {
                         state_version = block_state_version,
                         "Provision request: historical state version unavailable"
                     );
-                    let response = GetProvisionsResponse { provisions: None };
-                    return sbor::basic_encode(&response)
-                        .map_err(|e| InboundError::EncodeError(format!("{e:?}")));
+                    return GetProvisionsResponse { provisions: None };
                 }
             };
             let storage_keys: Vec<Vec<u8>> =
@@ -323,9 +291,8 @@ impl<S: ConsensusStore + SubstateStore> RequestHandler<S> {
             "Responding to provision request"
         );
 
-        let response = GetProvisionsResponse {
+        GetProvisionsResponse {
             provisions: Some(provisions),
-        };
-        sbor::basic_encode(&response).map_err(|e| InboundError::EncodeError(format!("{e:?}")))
+        }
     }
 }

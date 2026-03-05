@@ -15,6 +15,7 @@ use hyperscale_network::{
     TopicScope,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
+use sbor::{basic_decode, basic_encode};
 use std::sync::{Arc, Mutex};
 
 /// Target for an outbound message.
@@ -74,7 +75,7 @@ pub struct SimNetworkAdapter {
     pending_requests: Mutex<Vec<PendingRequest>>,
     /// Shared handler registry — written by `register_*_handler`,
     /// read by `SimulatedNetwork::fulfill_requests` and `flush_gossip`.
-    registry: Arc<HandlerRegistry>,
+    pub(crate) registry: Arc<HandlerRegistry>,
 }
 
 impl SimNetworkAdapter {
@@ -132,22 +133,55 @@ impl Network for SimNetworkAdapter {
         });
     }
 
-    fn register_gossip_handler(
+    fn register_gossip_handler<M: NetworkMessage>(
         &self,
-        message_type_id: &'static str,
         _scope: TopicScope,
-        handler: Arc<dyn GossipHandler>,
+        handler: impl GossipHandler<M>,
     ) {
+        // Wrap the typed handler in a raw closure that SBOR-decodes the payload.
+        let raw = Arc::new(move |payload: Vec<u8>| match basic_decode::<M>(&payload) {
+            Ok(msg) => handler.on_message(msg),
+            Err(e) => {
+                tracing::warn!(
+                    message_type = M::message_type_id(),
+                    error = ?e,
+                    "Failed to SBOR-decode gossip message — dropping"
+                );
+            }
+        });
         // Scope is irrelevant in simulation (delivery controlled by harness).
-        self.registry.register_gossip(message_type_id, handler);
+        self.registry.register_gossip(M::message_type_id(), raw);
     }
 
-    fn register_request_handler(
-        &self,
-        message_type_id: &'static str,
-        handler: Arc<dyn RequestHandler>,
-    ) {
-        self.registry.register_request(message_type_id, handler);
+    fn register_request_handler<R: Request>(&self, handler: impl RequestHandler<R>) {
+        // Wrap the typed handler in a raw closure that SBOR-decodes the request
+        // and SBOR-encodes the response.
+        let raw = Arc::new(move |payload: &[u8]| -> Vec<u8> {
+            let req = match basic_decode::<R>(payload) {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        message_type = R::message_type_id(),
+                        error = ?e,
+                        "Failed to SBOR-decode request — returning empty response"
+                    );
+                    return vec![];
+                }
+            };
+            let response = handler.handle_request(req);
+            match basic_encode(&response) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(
+                        message_type = R::message_type_id(),
+                        error = ?e,
+                        "Failed to SBOR-encode response — returning empty response"
+                    );
+                    vec![]
+                }
+            }
+        });
+        self.registry.register_request(R::message_type_id(), raw);
     }
 
     fn request<R: Request + 'static>(
@@ -248,46 +282,35 @@ mod tests {
 
     #[test]
     fn test_register_request_handler() {
+        use hyperscale_messages::request::GetBlockRequest;
+
         let registry = Arc::new(HandlerRegistry::new());
         let adapter = SimNetworkAdapter::new(registry.clone());
 
-        struct EchoHandler;
-        impl hyperscale_network::RequestHandler for EchoHandler {
-            fn handle_request(&self, payload: &[u8]) -> Vec<u8> {
-                payload.to_vec()
-            }
-        }
-
-        assert!(registry.get_request("test.request").is_none());
-        adapter.register_request_handler("test.request", Arc::new(EchoHandler));
-        assert!(registry.get_request("test.request").is_some());
+        assert!(registry.get_request("block.request").is_none());
+        adapter.register_request_handler::<GetBlockRequest>(|_req| {
+            hyperscale_messages::response::GetBlockResponse::not_found()
+        });
+        assert!(registry.get_request("block.request").is_some());
     }
 
     #[test]
     fn test_register_request_handler_overwrites() {
+        use hyperscale_messages::request::GetBlockRequest;
+        use hyperscale_messages::response::GetBlockResponse;
+
         let adapter = SimNetworkAdapter::default();
 
-        struct Handler1;
-        impl hyperscale_network::RequestHandler for Handler1 {
-            fn handle_request(&self, _: &[u8]) -> Vec<u8> {
-                vec![1]
-            }
-        }
-
-        struct Handler2;
-        impl hyperscale_network::RequestHandler for Handler2 {
-            fn handle_request(&self, _: &[u8]) -> Vec<u8> {
-                vec![2]
-            }
-        }
-
-        adapter.register_request_handler("test", Arc::new(Handler1));
-        adapter.register_request_handler("test", Arc::new(Handler2));
+        adapter.register_request_handler::<GetBlockRequest>(|_req| GetBlockResponse::not_found());
+        adapter.register_request_handler::<GetBlockRequest>(|_req| GetBlockResponse::not_found());
 
         // Second handler should have won (overwrites)
-        let handler = adapter.registry.get_request("test").unwrap();
-        let result = handler.handle_request(&[]);
-        assert_eq!(result, vec![2]);
+        let handler = adapter.registry.get_request("block.request").unwrap();
+        // Encode a real request, call the raw handler, verify it works
+        let req = GetBlockRequest::new(BlockHeight(1));
+        let req_bytes = sbor::basic_encode(&req).unwrap();
+        let response_bytes = handler(&req_bytes);
+        assert!(!response_bytes.is_empty());
     }
 
     #[test]

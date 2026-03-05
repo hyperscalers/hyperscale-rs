@@ -103,7 +103,7 @@ impl InboundRouter {
             .ok_or(StreamError::UnknownRequestType)?;
 
         // Delegate to the handler (receives raw SBOR payload, no framing).
-        let response_sbor = handler.handle_request(sbor_payload);
+        let response_sbor = handler(sbor_payload);
 
         // Write length-prefixed compressed response with timeout
         tokio::time::timeout(
