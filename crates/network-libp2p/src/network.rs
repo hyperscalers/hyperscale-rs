@@ -7,7 +7,8 @@ use crate::adapter::Libp2pAdapter;
 use crate::inbound_router::{spawn_inbound_router, InboundRouterHandle};
 use crate::request_manager::{RequestManager, RequestPriority};
 use hyperscale_network::{
-    encode_to_wire, frame_request, InboundRequestHandler, Network, RequestError, Topic,
+    encode_to_wire, frame_request, GossipHandler, InboundRequestHandler, Network, RequestError,
+    Topic,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use libp2p::PeerId;
@@ -92,6 +93,10 @@ impl Network for ProdNetwork {
         let _guard = self.tokio_handle.enter();
         let handle = spawn_inbound_router(self.adapter.clone(), handler);
         let _ = self.inbound_router.set(handle);
+    }
+
+    fn register_gossip_handler(&self, handler: Arc<dyn GossipHandler>) {
+        self.adapter.set_gossip_handler(handler);
     }
 
     fn request<R: Request + 'static>(

@@ -2,15 +2,17 @@
 //!
 //! [`SimNetworkAdapter`] buffers outgoing messages in an outbox. After each
 //! `IoLoop::step()`, the simulation harness drains the outbox and routes
-//! entries through [`SimulatedNetwork::deliver_gossip`](crate::SimulatedNetwork::deliver_gossip),
+//! entries through [`SimulatedNetwork::accept_gossip`](crate::SimulatedNetwork::accept_gossip),
 //! which applies partition/latency/loss, LZ4-decompresses the payload once,
-//! and returns a [`GossipDelivery`](crate::GossipDelivery) per target peer.
+//! and queues deliveries in an internal latency heap.
 //!
 //! Messages are wire-encoded (SBOR + LZ4) in the outbox, matching the production
-//! encoding path. The harness schedules the resulting `NodeInput::GossipReceived`
-//! events directly with the sampled latency.
+//! encoding path. [`SimulatedNetwork::flush_gossip`](crate::SimulatedNetwork::flush_gossip)
+//! delivers due messages via each target's registered `GossipHandler`.
 
-use hyperscale_network::{encode_to_wire, InboundRequestHandler, Network, RequestError};
+use hyperscale_network::{
+    encode_to_wire, GossipHandler, InboundRequestHandler, Network, RequestError,
+};
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -61,6 +63,13 @@ pub struct PendingRequest {
 /// [`Network::register_inbound_handler`] sets the slot; request fulfillment reads it.
 pub type HandlerSlot = Arc<OnceLock<Arc<dyn InboundRequestHandler>>>;
 
+/// Shared slot for a gossip handler.
+///
+/// Created by [`SimulatedNetwork::create_adapter`] and shared between the
+/// per-node [`SimNetworkAdapter`] and the central [`SimulatedNetwork`].
+/// [`Network::register_gossip_handler`] sets the slot; gossip flushing reads it.
+pub type GossipHandlerSlot = Arc<OnceLock<Arc<dyn GossipHandler>>>;
+
 /// Network implementation for simulation.
 ///
 /// Buffers outgoing messages in an outbox rather than delivering them immediately.
@@ -72,26 +81,30 @@ pub type HandlerSlot = Arc<OnceLock<Arc<dyn InboundRequestHandler>>>;
 /// Each simulated node owns a `SimNetworkAdapter`. The harness:
 /// 1. Calls `IoLoop::step(event)` which may produce network sends
 /// 2. Drains the adapter's outbox via [`drain_outbox()`](Self::drain_outbox)
-/// 3. Routes entries through `SimulatedNetwork::deliver_gossip()`
-/// 4. Events are scheduled with the sampled latency offset
+/// 3. Routes entries through `SimulatedNetwork::accept_gossip()`
+/// 4. `SimulatedNetwork::flush_gossip()` delivers due messages via handlers
 pub struct SimNetworkAdapter {
     outbox: Mutex<Vec<OutboxEntry>>,
     pending_requests: Mutex<Vec<PendingRequest>>,
     /// Shared handler slot — written by [`Network::register_inbound_handler`],
     /// read by [`SimulatedNetwork::fulfill_requests`].
     handler_slot: HandlerSlot,
+    /// Shared gossip handler slot — written by [`Network::register_gossip_handler`],
+    /// read by [`SimulatedNetwork::flush_gossip`].
+    gossip_handler_slot: GossipHandlerSlot,
 }
 
 impl SimNetworkAdapter {
-    /// Create a new adapter with a pre-allocated handler slot.
+    /// Create a new adapter with pre-allocated handler slots.
     ///
     /// Use [`SimulatedNetwork::create_adapter`] to create adapters with
-    /// shared handler slots for request fulfillment.
-    pub fn new(handler_slot: HandlerSlot) -> Self {
+    /// shared handler slots for request fulfillment and gossip delivery.
+    pub fn new(handler_slot: HandlerSlot, gossip_handler_slot: GossipHandlerSlot) -> Self {
         Self {
             outbox: Mutex::new(Vec::new()),
             pending_requests: Mutex::new(Vec::new()),
             handler_slot,
+            gossip_handler_slot,
         }
     }
 
@@ -114,7 +127,7 @@ impl SimNetworkAdapter {
 
 impl Default for SimNetworkAdapter {
     fn default() -> Self {
-        Self::new(Arc::new(OnceLock::new()))
+        Self::new(Arc::new(OnceLock::new()), Arc::new(OnceLock::new()))
     }
 }
 
@@ -139,6 +152,10 @@ impl Network for SimNetworkAdapter {
 
     fn register_inbound_handler(&self, handler: Arc<dyn InboundRequestHandler>) {
         let _ = self.handler_slot.set(handler);
+    }
+
+    fn register_gossip_handler(&self, handler: Arc<dyn GossipHandler>) {
+        let _ = self.gossip_handler_slot.set(handler);
     }
 
     fn request<R: Request + 'static>(
@@ -240,7 +257,8 @@ mod tests {
     #[test]
     fn test_register_inbound_handler_sets_slot() {
         let handler_slot: HandlerSlot = Arc::new(OnceLock::new());
-        let adapter = SimNetworkAdapter::new(handler_slot.clone());
+        let gossip_slot: GossipHandlerSlot = Arc::new(OnceLock::new());
+        let adapter = SimNetworkAdapter::new(handler_slot.clone(), gossip_slot);
 
         struct EchoHandler;
         impl InboundRequestHandler for EchoHandler {

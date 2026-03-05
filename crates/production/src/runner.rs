@@ -404,23 +404,17 @@ impl ProductionRunnerBuilder {
             network_definition.clone(),
         ));
 
-        // ── Create codec pool handle ─────────────────────────────────────
-        //
-        // The codec pool decompresses gossip wire bytes and forwards them as
-        // NodeInput::GossipReceived to the consensus channel. IoLoop handles
-        // SBOR decoding and type dispatch internally.
-        let codec_pool_handle = hyperscale_network_libp2p::CodecPoolHandle::new(
-            dispatch.clone(),
-            xb_consensus_tx.clone(),
-        );
-
         // ── Create Libp2p network adapter ────────────────────────────────
+        //
+        // The gossip handler is registered later by IoLoop::with_storage_and_executor(),
+        // which creates a ChannelGossipHandler wired to the consensus channel.
+        // The adapter's gossip_codec OnceLock is filled at that point.
         let adapter = Libp2pAdapter::new(
             network_config,
             ed25519_keypair,
             validator_id,
             local_shard,
-            codec_pool_handle,
+            dispatch.clone(),
         )
         .await?;
 

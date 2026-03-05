@@ -491,8 +491,18 @@ impl SimulationRunner {
             "Running simulation step"
         );
 
-        while let Some((&key, _)) = self.event_queue.first_key_value() {
-            if key.time > end_time {
+        loop {
+            // Determine next time: min(event_queue, pending_gossip)
+            let next_event = self.event_queue.first_key_value().map(|(k, _)| k.time);
+            let next_gossip = self.network.next_gossip_delivery_time();
+
+            let next_time = match (next_event, next_gossip) {
+                (Some(e), Some(g)) => e.min(g),
+                (Some(t), None) | (None, Some(t)) => t,
+                (None, None) => break,
+            };
+
+            if next_time > end_time {
                 debug!(
                     remaining_events = self.event_queue.len(),
                     "Time limit reached"
@@ -500,25 +510,44 @@ impl SimulationRunner {
                 break;
             }
 
-            let (key, event) = self.event_queue.pop_first().unwrap();
-            self.now = key.time;
-            let node_index = key.node_index;
+            self.now = next_time;
 
-            trace!(
-                time = ?self.now,
-                node = node_index,
-                "Processing event"
-            );
+            // Flush gossip that's due — handlers push to event channels.
+            let delivered = self.network.flush_gossip(self.now);
+            if delivered > 0 {
+                // Drain events that gossip handlers pushed into channels.
+                for node_idx in 0..self.io_loops.len() as u32 {
+                    while let Ok(event) = self.event_rxs[node_idx as usize].try_recv() {
+                        self.schedule_event(node_idx, self.now, event);
+                    }
+                }
+            }
 
-            self.stats.events_processed += 1;
-            self.stats.events_by_priority[event.priority() as usize] += 1;
+            // Process all events at current time.
+            while let Some((&key, _)) = self.event_queue.first_key_value() {
+                if key.time > self.now {
+                    break;
+                }
 
-            self.io_loops[node_index as usize].set_time(self.now);
-            let output = self.io_loops[node_index as usize].step(event);
-            self.io_loops[node_index as usize].flush_all_batches();
+                let (key, event) = self.event_queue.pop_first().unwrap();
+                let node_index = key.node_index;
 
-            self.drain_node_io(node_index);
-            self.process_step_output(node_index, output);
+                trace!(
+                    time = ?self.now,
+                    node = node_index,
+                    "Processing event"
+                );
+
+                self.stats.events_processed += 1;
+                self.stats.events_by_priority[event.priority() as usize] += 1;
+
+                self.io_loops[node_index as usize].set_time(self.now);
+                let output = self.io_loops[node_index as usize].step(event);
+                self.io_loops[node_index as usize].flush_all_batches();
+
+                self.drain_node_io(node_index);
+                self.process_step_output(node_index, output);
+            }
         }
 
         if self.now < end_time {
@@ -547,7 +576,12 @@ impl SimulationRunner {
         let outbox = self.io_loops[i].network().drain_outbox();
 
         for entry in outbox {
-            self.deliver_outbox_entry(node, entry);
+            let stats = self
+                .network
+                .accept_gossip(node, self.now, entry, &mut self.rng);
+            self.stats.messages_sent += stats.messages_sent;
+            self.stats.messages_dropped_partition += stats.messages_dropped_partition;
+            self.stats.messages_dropped_loss += stats.messages_dropped_loss;
         }
 
         // Fulfill pending network requests (block, tx, cert fetches) through
@@ -574,31 +608,6 @@ impl SimulationRunner {
         self.stats.actions_generated += output.actions_generated as u64;
         for op in output.timer_ops {
             self.process_timer_op(node, op);
-        }
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Network Delivery
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// Fan out an outbox entry via [`SimulatedNetwork::deliver_gossip`].
-    ///
-    /// Each delivery contains a `NodeInput::GossipReceived` event that is
-    /// scheduled directly — no channel draining needed.
-    fn deliver_outbox_entry(
-        &mut self,
-        from: NodeIndex,
-        entry: hyperscale_network_memory::OutboxEntry,
-    ) {
-        let (deliveries, stats) = self.network.deliver_gossip(from, entry, &mut self.rng);
-
-        self.stats.messages_sent += stats.messages_sent;
-        self.stats.messages_dropped_partition += stats.messages_dropped_partition;
-        self.stats.messages_dropped_loss += stats.messages_dropped_loss;
-
-        for delivery in deliveries {
-            let deliver_at = self.now + delivery.latency;
-            self.schedule_event(delivery.to, deliver_at, delivery.event);
         }
     }
 

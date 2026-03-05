@@ -19,7 +19,7 @@ use libp2p::{
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
@@ -59,7 +59,7 @@ pub(super) async fn run(
     cached_peer_count: Arc<AtomicUsize>,
     local_shard: ShardGroupId,
     version_interop_mode: VersionInteroperabilityMode,
-    codec_pool: CodecPoolHandle,
+    gossip_codec: Arc<OnceLock<CodecPoolHandle>>,
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
 ) {
     // Track whether we've bootstrapped Kademlia (do it once after first connection)
@@ -348,7 +348,7 @@ pub(super) async fn run(
                 super::gossipsub::handle_gossipsub_event(
                     event,
                     local_shard,
-                    &codec_pool,
+                    &gossip_codec,
                 ).await;
 
                 // Update cached peer count after connection changes

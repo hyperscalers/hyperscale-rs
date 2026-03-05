@@ -28,12 +28,6 @@ fn test_dispatch() -> Arc<PooledDispatch> {
     Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap())
 }
 
-/// Create a test codec pool handle for network adapter tests.
-fn test_codec_pool_handle() -> hyperscale_network_libp2p::CodecPoolHandle {
-    let (event_tx, _event_rx) = crossbeam::channel::unbounded();
-    hyperscale_network_libp2p::CodecPoolHandle::new(test_dispatch(), event_tx)
-}
-
 /// Test timeout values (from design spec).
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 #[allow(dead_code)]
@@ -125,10 +119,10 @@ async fn test_network_adapter_starts() {
         ..Default::default()
     };
 
-    let codec_pool = test_codec_pool_handle();
+    let dispatch = test_dispatch();
     let result = timeout(
         CONNECTION_TIMEOUT,
-        Libp2pAdapter::new(config, keypair, validator_id, shard, codec_pool),
+        Libp2pAdapter::new(config, keypair, validator_id, shard, dispatch),
     )
     .await;
 
@@ -161,14 +155,14 @@ async fn test_two_node_connection() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let codec_pool1 = test_codec_pool_handle();
+    let dispatch1 = test_dispatch();
 
     let adapter1 = Libp2pAdapter::new(
         config1,
         keypair1,
         ValidatorId(0),
         ShardGroupId(0),
-        codec_pool1,
+        dispatch1,
     )
     .await
     .unwrap();
@@ -187,14 +181,14 @@ async fn test_two_node_connection() {
         bootstrap_peers: vec![node1_addr.clone()],
         ..Default::default()
     };
-    let codec_pool2 = test_codec_pool_handle();
+    let dispatch2 = test_dispatch();
 
     let adapter2 = Libp2pAdapter::new(
         config2,
         keypair2,
         ValidatorId(1),
         ShardGroupId(0),
-        codec_pool2,
+        dispatch2,
     )
     .await
     .unwrap();
@@ -241,9 +235,9 @@ async fn test_topic_subscription() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let codec_pool = test_codec_pool_handle();
+    let dispatch = test_dispatch();
 
-    let adapter = Libp2pAdapter::new(config, keypair, ValidatorId(0), ShardGroupId(0), codec_pool)
+    let adapter = Libp2pAdapter::new(config, keypair, ValidatorId(0), ShardGroupId(0), dispatch)
         .await
         .unwrap();
 

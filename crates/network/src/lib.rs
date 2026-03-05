@@ -19,5 +19,5 @@ pub mod wire;
 // Re-export key types
 pub use codec::{encode_to_wire, CodecError};
 pub use topic::Topic;
-pub use traits::{InboundRequestHandler, Network, RequestError};
+pub use traits::{GossipHandler, InboundRequestHandler, Network, RequestError};
 pub use wire::{frame_request, parse_request_frame};

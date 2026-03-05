@@ -8,6 +8,7 @@ use crate::codec_pool::CodecPoolHandle;
 use hyperscale_metrics as metrics;
 use hyperscale_types::ShardGroupId;
 use libp2p::{gossipsub, swarm::SwarmEvent};
+use std::sync::OnceLock;
 use tracing::{debug, warn};
 
 /// Handle a single swarm event — gossipsub messages only.
@@ -16,7 +17,7 @@ use tracing::{debug, warn};
 pub(super) async fn handle_gossipsub_event(
     event: SwarmEvent<BehaviourEvent>,
     local_shard: ShardGroupId,
-    codec_pool: &CodecPoolHandle,
+    gossip_codec: &OnceLock<CodecPoolHandle>,
 ) {
     match event {
         // Handle gossipsub messages
@@ -72,10 +73,14 @@ pub(super) async fn handle_gossipsub_event(
             }
 
             // Dispatch decoding to the codec pool (non-blocking).
-            // The codec pool handles SBOR decoding on a separate thread pool,
-            // then sends decoded events directly to the consensus channel.
+            // The codec pool handles LZ4 decompression on a separate thread pool,
+            // then forwards decompressed payloads via the registered GossipHandler.
             // This prevents large messages (state batches) from blocking the event loop.
-            codec_pool.decode_async(parsed_topic, message.data, propagation_source);
+            if let Some(codec) = gossip_codec.get() {
+                codec.decode_async(parsed_topic, message.data, propagation_source);
+            } else {
+                warn!("Gossip handler not yet registered, dropping message");
+            }
         }
 
         // Handle subscription events

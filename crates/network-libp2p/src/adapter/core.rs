@@ -7,13 +7,14 @@ use crate::codec_pool::CodecPoolHandle;
 use crate::config::Libp2pConfig;
 use dashmap::DashMap;
 use futures::FutureExt;
+use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
-use hyperscale_network::Topic;
+use hyperscale_network::{GossipHandler, Topic};
 use hyperscale_types::{MessagePriority, ShardGroupId, ValidatorId};
 use libp2p::{gossipsub, identify, identity, kad, Multiaddr, PeerId as Libp2pPeerId, Stream};
 use libp2p_stream as stream;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 use tracing::{info, trace};
 
@@ -46,8 +47,12 @@ pub struct Libp2pAdapter {
     /// This avoids blocking the consensus loop to query peer count.
     cached_peer_count: Arc<AtomicUsize>,
 
-    #[allow(dead_code)]
-    codec_pool: CodecPoolHandle,
+    /// Shared dispatch for codec pool thread scheduling.
+    dispatch: Arc<PooledDispatch>,
+
+    /// Gossip codec handle, set lazily via `register_gossip_handler`.
+    /// The event loop checks this OnceLock on each gossipsub message.
+    gossip_codec: Arc<OnceLock<CodecPoolHandle>>,
 
     /// Stream control handle for opening outbound streams.
     /// Cloneable and thread-safe.
@@ -63,7 +68,7 @@ impl Libp2pAdapter {
     /// * `keypair` - Ed25519 keypair for libp2p transport encryption
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
-    /// * `codec_pool` - Handle for async message encoding/decoding
+    /// * `dispatch` - Pooled dispatch for codec thread pool scheduling
     ///
     /// # Returns
     ///
@@ -73,7 +78,7 @@ impl Libp2pAdapter {
         keypair: identity::Keypair,
         validator_id: ValidatorId,
         shard: ShardGroupId,
-        codec_pool: CodecPoolHandle,
+        dispatch: Arc<PooledDispatch>,
     ) -> Result<Arc<Self>, NetworkError> {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
 
@@ -197,6 +202,7 @@ impl Libp2pAdapter {
         ) = PriorityCommandChannels::new();
 
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
+        let gossip_codec: Arc<OnceLock<CodecPoolHandle>> = Arc::new(OnceLock::new());
 
         let adapter = Arc::new(Self {
             local_peer_id,
@@ -205,7 +211,8 @@ impl Libp2pAdapter {
             validator_peers: validator_peers.clone(),
             shutdown_tx: Some(shutdown_tx),
             cached_peer_count: cached_peer_count.clone(),
-            codec_pool: codec_pool.clone(),
+            dispatch,
+            gossip_codec: gossip_codec.clone(),
             stream_control,
         });
 
@@ -224,7 +231,7 @@ impl Libp2pAdapter {
                 cached_peer_count,
                 shard,
                 config.version_interop_mode,
-                codec_pool,
+                gossip_codec,
                 event_loop_validator_peers,
             ))
             .catch_unwind()
@@ -257,6 +264,14 @@ impl Libp2pAdapter {
         });
 
         Ok(adapter)
+    }
+
+    /// Set the gossip handler, creating a CodecPoolHandle that the event loop uses.
+    ///
+    /// Called from `ProdNetwork::register_gossip_handler()`.
+    pub fn set_gossip_handler(&self, handler: Arc<dyn GossipHandler>) {
+        let codec = CodecPoolHandle::new(self.dispatch.clone(), handler);
+        let _ = self.gossip_codec.set(codec);
     }
 
     /// Subscribe to all message types for a shard.

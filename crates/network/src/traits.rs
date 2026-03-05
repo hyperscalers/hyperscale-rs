@@ -41,6 +41,14 @@ impl<T: InboundRequestHandler + ?Sized> InboundRequestHandler for std::sync::Arc
     }
 }
 
+/// Handler for incoming gossip messages.
+///
+/// Receives decompressed SBOR payloads after the network layer has handled
+/// transport concerns (decompression, topic parsing, shard validation).
+pub trait GossipHandler: Send + Sync + 'static {
+    fn on_gossip(&self, message_type: &'static str, payload: Vec<u8>);
+}
+
 /// Network interface for sending typed messages and handling inbound requests.
 ///
 /// Generic methods make this NOT object-safe — use `N: Network` bounds.
@@ -67,6 +75,14 @@ pub trait Network: Send + Sync {
     /// The network layer owns the handler's lifecycle — production spawns an
     /// `InboundRouter` task, simulation stores it for centralized fulfillment.
     fn register_inbound_handler(&self, handler: Arc<dyn InboundRequestHandler>);
+
+    // ── Gossip handler ──
+
+    /// Register a handler for incoming gossip messages.
+    ///
+    /// The handler receives decompressed SBOR payloads. Called once during
+    /// node initialization, alongside `register_inbound_handler`.
+    fn register_gossip_handler(&self, handler: Arc<dyn GossipHandler>);
 
     // ── Request-response ──
 

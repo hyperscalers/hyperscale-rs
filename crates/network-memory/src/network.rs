@@ -1,19 +1,19 @@
 //! Simulated network with deterministic latency, packet loss, and partitions.
 
 use crate::sim_network::{
-    BroadcastTarget, HandlerSlot, OutboxEntry, PendingRequest, SimNetworkAdapter,
+    BroadcastTarget, GossipHandlerSlot, HandlerSlot, OutboxEntry, PendingRequest, SimNetworkAdapter,
 };
 use crate::NodeIndex;
-use hyperscale_core::NodeInput;
 use hyperscale_network::{frame_request, InboundRequestHandler, RequestError};
 use hyperscale_types::{ShardGroupId, ValidatorId};
 use rand::seq::SliceRandom;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
-use std::collections::HashSet;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tracing::trace;
+use tracing::{debug, trace};
 
 /// Configuration for simulated network.
 #[derive(Debug, Clone)]
@@ -50,7 +50,7 @@ impl Default for NetworkConfig {
 }
 
 /// Stats returned by [`SimulatedNetwork::fulfill_requests`] and
-/// [`SimulatedNetwork::deliver_gossip`].
+/// [`SimulatedNetwork::accept_gossip`].
 #[derive(Debug, Default)]
 pub struct FulfillmentStats {
     pub messages_sent: u64,
@@ -58,18 +58,33 @@ pub struct FulfillmentStats {
     pub messages_dropped_loss: u64,
 }
 
-/// A single gossip delivery to a target node.
-///
-/// Returned by [`SimulatedNetwork::deliver_gossip`]. The caller schedules the
-/// contained event directly — no channel draining required.
-#[derive(Debug)]
-pub struct GossipDelivery {
-    /// Target node.
-    pub to: NodeIndex,
-    /// Sampled one-way latency.
-    pub latency: Duration,
-    /// The event to deliver.
-    pub event: NodeInput,
+/// A gossip delivery scheduled for future delivery via the internal latency queue.
+struct ScheduledGossip {
+    delivery_time: Duration,
+    sequence: u64,
+    target_node: NodeIndex,
+    message_type: &'static str,
+    payload: Vec<u8>,
+}
+
+// Only (delivery_time, sequence) matters for ordering/identity — `sequence` is a
+// unique monotonic counter, so two entries with the same sequence are the same entry.
+impl PartialEq for ScheduledGossip {
+    fn eq(&self, other: &Self) -> bool {
+        (self.delivery_time, self.sequence) == (other.delivery_time, other.sequence)
+    }
+}
+impl Eq for ScheduledGossip {}
+
+impl PartialOrd for ScheduledGossip {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ScheduledGossip {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.delivery_time, self.sequence).cmp(&(other.delivery_time, other.sequence))
+    }
 }
 
 /// Simulated network for deterministic message delivery.
@@ -79,6 +94,7 @@ pub struct GossipDelivery {
 /// - Packet loss (probabilistic message drops)
 /// - Network partitions (blocking communication between node pairs)
 /// - Request fulfillment via registered [`InboundRequestHandler`]s (one per node)
+/// - Internalized gossip latency queue with registered [`GossipHandler`]s
 pub struct SimulatedNetwork {
     config: NetworkConfig,
     /// Partitioned node pairs. If (a, b) is in this set, messages from a to b are dropped.
@@ -89,6 +105,15 @@ pub struct SimulatedNetwork {
     /// Populated when [`Network::register_inbound_handler`] is called on the
     /// adapter; read during [`fulfill_requests`](Self::fulfill_requests).
     handler_slots: Vec<HandlerSlot>,
+    /// Per-node gossip handler slots, shared with each node's [`SimNetworkAdapter`].
+    ///
+    /// Populated when [`Network::register_gossip_handler`] is called on the
+    /// adapter; read during [`flush_gossip`](Self::flush_gossip).
+    gossip_handler_slots: Vec<GossipHandlerSlot>,
+    /// Internal latency queue for pending gossip deliveries.
+    pending_gossip: BinaryHeap<Reverse<ScheduledGossip>>,
+    /// Monotonic sequence counter for deterministic ordering of same-time deliveries.
+    gossip_sequence: u64,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -97,6 +122,7 @@ impl std::fmt::Debug for SimulatedNetwork {
             .field("config", &self.config)
             .field("partitions", &self.partitions)
             .field("handler_slots", &self.handler_slots.len())
+            .field("pending_gossip", &self.pending_gossip.len())
             .finish()
     }
 }
@@ -106,20 +132,28 @@ impl SimulatedNetwork {
     pub fn new(config: NetworkConfig) -> Self {
         let num_nodes = (config.num_shards * config.validators_per_shard) as usize;
         let handler_slots = (0..num_nodes).map(|_| Arc::new(OnceLock::new())).collect();
+        let gossip_handler_slots = (0..num_nodes).map(|_| Arc::new(OnceLock::new())).collect();
         Self {
             config,
             partitions: HashSet::new(),
             handler_slots,
+            gossip_handler_slots,
+            pending_gossip: BinaryHeap::new(),
+            gossip_sequence: 0,
         }
     }
 
-    /// Create a [`SimNetworkAdapter`] for a node, sharing its handler slot.
+    /// Create a [`SimNetworkAdapter`] for a node, sharing its handler slots.
     ///
-    /// The returned adapter's [`Network::register_inbound_handler`] call
-    /// will populate the shared slot, making the handler visible to
-    /// [`fulfill_requests`](Self::fulfill_requests).
+    /// The returned adapter's [`Network::register_inbound_handler`] and
+    /// [`Network::register_gossip_handler`] calls will populate the shared
+    /// slots, making them visible to [`fulfill_requests`](Self::fulfill_requests)
+    /// and [`flush_gossip`](Self::flush_gossip).
     pub fn create_adapter(&self, node: NodeIndex) -> SimNetworkAdapter {
-        SimNetworkAdapter::new(Arc::clone(&self.handler_slots[node as usize]))
+        SimNetworkAdapter::new(
+            Arc::clone(&self.handler_slots[node as usize]),
+            Arc::clone(&self.gossip_handler_slots[node as usize]),
+        )
     }
 
     // ─── Partition Management ───
@@ -383,27 +417,24 @@ impl SimulatedNetwork {
         stats
     }
 
-    // ─── Gossip Delivery ───
+    // ─── Internalized Gossip Queue ───
 
-    /// Fan out a gossip outbox entry, LZ4-decompressing once and producing a
-    /// [`GossipDelivery`] per target peer.
+    /// Buffer an outbox entry for delivery with simulated latency.
     ///
-    /// For each target peer (excluding the sender):
-    /// 1. Check partition and packet loss
-    /// 2. Sample one-way latency
-    /// 3. Create a `NodeInput::GossipReceived` event with the decompressed payload
+    /// The message is decompressed once, then per-peer deliveries are pushed into
+    /// the internal `pending_gossip` heap with sampled latency offsets.
     ///
-    /// The caller schedules each delivery directly — no channel draining needed.
-    pub fn deliver_gossip(
-        &self,
+    /// The harness calls [`flush_gossip()`](Self::flush_gossip) to deliver
+    /// due messages via each target's registered `GossipHandler`.
+    pub fn accept_gossip(
+        &mut self,
         from: NodeIndex,
+        now: Duration,
         entry: OutboxEntry,
         rng: &mut ChaCha8Rng,
-    ) -> (Vec<GossipDelivery>, FulfillmentStats) {
+    ) -> FulfillmentStats {
         let mut stats = FulfillmentStats::default();
-        let mut deliveries = Vec::new();
 
-        // Determine target peers from broadcast target.
         let peers = match &entry.target {
             BroadcastTarget::Shard(shard) => self.peers_in_shard(*shard),
             BroadcastTarget::Global => {
@@ -412,7 +443,6 @@ impl SimulatedNetwork {
             }
         };
 
-        // LZ4-decompress once; each target gets a clone of the decompressed payload.
         let payload = match hyperscale_network::wire::decompress(&entry.data) {
             Ok(p) => p,
             Err(e) => {
@@ -420,9 +450,9 @@ impl SimulatedNetwork {
                     from,
                     message_type = entry.message_type,
                     ?e,
-                    "Gossip decompress error"
+                    "Gossip decompress error in accept_gossip"
                 );
-                return (deliveries, stats);
+                return stats;
             }
         };
 
@@ -443,20 +473,53 @@ impl SimulatedNetwork {
                 }
                 Some(latency) => {
                     stats.messages_sent += 1;
-
-                    deliveries.push(GossipDelivery {
-                        to,
-                        latency,
-                        event: NodeInput::GossipReceived {
-                            message_type,
-                            payload: payload.clone(),
-                        },
-                    });
+                    self.gossip_sequence += 1;
+                    self.pending_gossip.push(Reverse(ScheduledGossip {
+                        delivery_time: now + latency,
+                        sequence: self.gossip_sequence,
+                        target_node: to,
+                        message_type,
+                        payload: payload.clone(),
+                    }));
                 }
             }
         }
 
-        (deliveries, stats)
+        stats
+    }
+
+    /// Deliver all pending gossip with `delivery_time <= now`.
+    ///
+    /// Calls each target node's registered `GossipHandler`. Returns the
+    /// number of messages delivered.
+    pub fn flush_gossip(&mut self, now: Duration) -> usize {
+        let mut delivered = 0;
+        while let Some(Reverse(scheduled)) = self.pending_gossip.peek() {
+            if scheduled.delivery_time > now {
+                break;
+            }
+            let Reverse(scheduled) = self.pending_gossip.pop().unwrap();
+            if let Some(handler) = self
+                .gossip_handler_slots
+                .get(scheduled.target_node as usize)
+                .and_then(|s| s.get())
+            {
+                handler.on_gossip(scheduled.message_type, scheduled.payload);
+                delivered += 1;
+            } else {
+                debug!(
+                    target_node = scheduled.target_node,
+                    message_type = scheduled.message_type,
+                    "Gossip handler not registered for target node, dropping message"
+                );
+            }
+        }
+        delivered
+    }
+
+    /// Earliest pending gossip delivery time (for event loop scheduling).
+    pub fn next_gossip_delivery_time(&self) -> Option<Duration> {
+        self.pending_gossip.peek().map(|Reverse(s)| s.delivery_time)
     }
 }
 
@@ -931,7 +994,7 @@ mod tests {
         ));
     }
 
-    // ─── deliver_gossip() Tests ───
+    // ─── accept_gossip / flush_gossip Tests ───
 
     /// Helper: create a wire-encoded (LZ4-compressed) outbox entry.
     fn make_gossip_entry(target: BroadcastTarget) -> OutboxEntry {
@@ -943,165 +1006,234 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_deliver_gossip_shard_scoped() {
-        let network = SimulatedNetwork::new(NetworkConfig {
-            validators_per_shard: 2,
-            num_shards: 2,
-            packet_loss_rate: 0.0,
-            ..Default::default()
-        });
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
-
-        // Node 0 is in shard 0, along with node 1. Nodes 2,3 are in shard 1.
-        let entry = make_gossip_entry(BroadcastTarget::Shard(ShardGroupId(0)));
-        let (deliveries, stats) = network.deliver_gossip(0, entry, &mut rng);
-
-        // Should deliver only to node 1 (same shard, excluding sender)
-        assert_eq!(deliveries.len(), 1);
-        assert_eq!(deliveries[0].to, 1);
-        assert_eq!(stats.messages_sent, 1);
+    /// Test gossip handler that records received messages.
+    struct RecordingHandler {
+        received: std::sync::Mutex<Vec<(&'static str, Vec<u8>)>>,
     }
 
-    #[test]
-    fn test_deliver_gossip_global() {
-        let network = SimulatedNetwork::new(NetworkConfig {
-            validators_per_shard: 2,
-            num_shards: 2,
-            packet_loss_rate: 0.0,
-            ..Default::default()
-        });
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+    impl RecordingHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                received: std::sync::Mutex::new(Vec::new()),
+            })
+        }
 
-        let entry = make_gossip_entry(BroadcastTarget::Global);
-        let (deliveries, stats) = network.deliver_gossip(0, entry, &mut rng);
+        fn count(&self) -> usize {
+            self.received.lock().unwrap().len()
+        }
 
-        // Should deliver to nodes 1, 2, 3 (everyone except sender node 0)
-        assert_eq!(deliveries.len(), 3);
-        let targets: Vec<NodeIndex> = deliveries.iter().map(|d| d.to).collect();
-        assert!(targets.contains(&1));
-        assert!(targets.contains(&2));
-        assert!(targets.contains(&3));
-        assert_eq!(stats.messages_sent, 3);
+        fn messages(&self) -> Vec<(&'static str, Vec<u8>)> {
+            self.received.lock().unwrap().clone()
+        }
     }
 
-    #[test]
-    fn test_deliver_gossip_excludes_sender() {
-        let network = SimulatedNetwork::new(NetworkConfig {
-            validators_per_shard: 4,
-            num_shards: 1,
-            packet_loss_rate: 0.0,
-            ..Default::default()
-        });
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
-
-        let entry = make_gossip_entry(BroadcastTarget::Global);
-        let (deliveries, _) = network.deliver_gossip(0, entry, &mut rng);
-
-        // Sender should never appear in deliveries
-        assert!(deliveries.iter().all(|d| d.to != 0));
+    impl hyperscale_network::GossipHandler for RecordingHandler {
+        fn on_gossip(&self, message_type: &'static str, payload: Vec<u8>) {
+            self.received.lock().unwrap().push((message_type, payload));
+        }
     }
 
+    /// Register recording handlers on all nodes and return them.
+    ///
+    /// Each adapter is ephemeral — the handler survives in the shared `OnceLock` slot.
+    fn register_gossip_handlers(network: &SimulatedNetwork) -> Vec<Arc<RecordingHandler>> {
+        let total = network.total_nodes();
+        (0..total as NodeIndex)
+            .map(|i| {
+                let handler = RecordingHandler::new();
+                let adapter = network.create_adapter(i);
+                hyperscale_network::Network::register_gossip_handler(
+                    &adapter,
+                    handler.clone() as Arc<dyn hyperscale_network::GossipHandler>,
+                );
+                handler
+            })
+            .collect()
+    }
+
+    /// Far-future time that ensures all pending gossip is delivered.
+    const FAR_FUTURE: Duration = Duration::from_secs(60);
+
     #[test]
-    fn test_deliver_gossip_partition_blocks() {
+    fn test_accept_gossip_shard_scoped() {
         let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 2,
             num_shards: 2,
             packet_loss_rate: 0.0,
             ..Default::default()
         });
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // Node 0 is in shard 0, along with node 1. Nodes 2,3 are in shard 1.
+        let entry = make_gossip_entry(BroadcastTarget::Shard(ShardGroupId(0)));
+        let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
+        network.flush_gossip(FAR_FUTURE);
+
+        // Should deliver only to node 1 (same shard, excluding sender)
+        assert_eq!(stats.messages_sent, 1);
+        assert_eq!(handlers[0].count(), 0); // sender
+        assert_eq!(handlers[1].count(), 1);
+        assert_eq!(handlers[2].count(), 0); // different shard
+        assert_eq!(handlers[3].count(), 0); // different shard
+    }
+
+    #[test]
+    fn test_accept_gossip_global() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 2,
+            num_shards: 2,
+            packet_loss_rate: 0.0,
+            ..Default::default()
+        });
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let entry = make_gossip_entry(BroadcastTarget::Global);
+        let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
+        network.flush_gossip(FAR_FUTURE);
+
+        // Should deliver to nodes 1, 2, 3 (everyone except sender node 0)
+        assert_eq!(stats.messages_sent, 3);
+        assert_eq!(handlers[0].count(), 0);
+        assert_eq!(handlers[1].count(), 1);
+        assert_eq!(handlers[2].count(), 1);
+        assert_eq!(handlers[3].count(), 1);
+    }
+
+    #[test]
+    fn test_accept_gossip_excludes_sender() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 4,
+            num_shards: 1,
+            packet_loss_rate: 0.0,
+            ..Default::default()
+        });
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let entry = make_gossip_entry(BroadcastTarget::Global);
+        network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
+        network.flush_gossip(FAR_FUTURE);
+
+        // Sender (node 0) should never receive its own gossip
+        assert_eq!(handlers[0].count(), 0);
+        for h in &handlers[1..] {
+            assert_eq!(h.count(), 1);
+        }
+    }
+
+    #[test]
+    fn test_accept_gossip_partition_blocks() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 2,
+            num_shards: 2,
+            packet_loss_rate: 0.0,
+            ..Default::default()
+        });
+        let handlers = register_gossip_handlers(&network);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Partition node 0 → node 1
         network.partition_unidirectional(0, 1);
 
         let entry = make_gossip_entry(BroadcastTarget::Global);
-        let (deliveries, stats) = network.deliver_gossip(0, entry, &mut rng);
+        let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
+        network.flush_gossip(FAR_FUTURE);
 
         // Node 1 should be blocked, nodes 2,3 should receive
-        assert_eq!(deliveries.len(), 2);
-        assert!(deliveries.iter().all(|d| d.to != 1));
+        assert_eq!(handlers[1].count(), 0);
+        assert_eq!(handlers[2].count(), 1);
+        assert_eq!(handlers[3].count(), 1);
         assert_eq!(stats.messages_dropped_partition, 1);
         assert_eq!(stats.messages_sent, 2);
     }
 
     #[test]
-    fn test_deliver_gossip_100_percent_loss() {
-        let network = SimulatedNetwork::new(NetworkConfig {
+    fn test_accept_gossip_100_percent_loss() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 4,
             num_shards: 1,
             packet_loss_rate: 1.0,
             ..Default::default()
         });
+        let handlers = register_gossip_handlers(&network);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let entry = make_gossip_entry(BroadcastTarget::Global);
-        let (deliveries, stats) = network.deliver_gossip(0, entry, &mut rng);
+        let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
+        let delivered = network.flush_gossip(FAR_FUTURE);
 
-        assert!(deliveries.is_empty());
+        assert_eq!(delivered, 0);
+        for h in &handlers {
+            assert_eq!(h.count(), 0);
+        }
         assert_eq!(stats.messages_dropped_loss, 3);
         assert_eq!(stats.messages_sent, 0);
     }
 
     #[test]
-    fn test_deliver_gossip_latency_varies() {
-        let network = SimulatedNetwork::new(NetworkConfig {
+    fn test_accept_gossip_latency_varies() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 4,
             num_shards: 1,
             jitter_fraction: 0.5, // High jitter
             packet_loss_rate: 0.0,
             ..Default::default()
         });
+        let handlers = register_gossip_handlers(&network);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let entry = make_gossip_entry(BroadcastTarget::Global);
-        let (deliveries, _) = network.deliver_gossip(0, entry, &mut rng);
+        let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
+        assert_eq!(stats.messages_sent, 3);
 
-        assert_eq!(deliveries.len(), 3);
-        // With high jitter, latencies should differ
-        let latencies: Vec<Duration> = deliveries.iter().map(|d| d.latency).collect();
-        // At least not all identical (possible but astronomically unlikely with jitter 0.5)
-        assert!(
-            latencies[0] != latencies[1] || latencies[1] != latencies[2],
-            "Expected varying latencies, got {:?}",
-            latencies
-        );
+        // With high jitter, not all messages should arrive at the same time.
+        // Flush at the earliest delivery time — should deliver at least one
+        // but not necessarily all.
+        let first_time = network.next_gossip_delivery_time().unwrap();
+        let delivered_at_first = network.flush_gossip(first_time);
+        assert!(delivered_at_first >= 1);
+
+        // Flush the rest
+        network.flush_gossip(FAR_FUTURE);
+
+        // All 3 peers should have received
+        let total: usize = handlers.iter().map(|h| h.count()).sum();
+        assert_eq!(total, 3);
     }
 
     #[test]
-    fn test_deliver_gossip_payload_decompressed() {
-        let network = SimulatedNetwork::new(NetworkConfig {
+    fn test_accept_gossip_payload_decompressed() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 2,
             num_shards: 1,
             packet_loss_rate: 0.0,
             ..Default::default()
         });
+        let handlers = register_gossip_handlers(&network);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let original_payload = b"test gossip payload";
         let entry = make_gossip_entry(BroadcastTarget::Global);
-        let (deliveries, _) = network.deliver_gossip(0, entry, &mut rng);
+        network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
+        network.flush_gossip(FAR_FUTURE);
 
-        assert_eq!(deliveries.len(), 1);
-        match &deliveries[0].event {
-            NodeInput::GossipReceived {
-                payload,
-                message_type,
-            } => {
-                assert_eq!(payload.as_slice(), original_payload);
-                assert_eq!(*message_type, "test.gossip");
-            }
-            other => panic!("Expected GossipReceived, got {:?}", other),
-        }
+        // Node 1 should have received the decompressed payload
+        let messages = handlers[1].messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, "test.gossip");
+        assert_eq!(messages[0].1, original_payload);
     }
 
     #[test]
-    fn test_deliver_gossip_invalid_compressed_data() {
-        let network = SimulatedNetwork::new(NetworkConfig {
+    fn test_accept_gossip_invalid_compressed_data() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 2,
             num_shards: 1,
             ..Default::default()
         });
+        let handlers = register_gossip_handlers(&network);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Pass garbage data that can't be decompressed
@@ -1111,32 +1243,67 @@ mod tests {
             data: vec![0xFF, 0xFE, 0xFD],
         };
 
-        let (deliveries, stats) = network.deliver_gossip(0, entry, &mut rng);
-        assert!(deliveries.is_empty());
+        let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
+        let delivered = network.flush_gossip(FAR_FUTURE);
+
+        assert_eq!(delivered, 0);
         assert_eq!(stats.messages_sent, 0);
+        for h in &handlers {
+            assert_eq!(h.count(), 0);
+        }
     }
 
     #[test]
-    fn test_deliver_gossip_stats_accurate() {
+    fn test_accept_gossip_stats_accurate() {
         let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 2,
             num_shards: 2, // nodes 0,1 in shard 0; nodes 2,3 in shard 1
             packet_loss_rate: 0.0,
             ..Default::default()
         });
+        let handlers = register_gossip_handlers(&network);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Partition node 0 → node 2
         network.partition_unidirectional(0, 2);
 
         let entry = make_gossip_entry(BroadcastTarget::Global);
-        let (deliveries, stats) = network.deliver_gossip(0, entry, &mut rng);
+        let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
+        network.flush_gossip(FAR_FUTURE);
 
         // 3 targets (1, 2, 3), 1 partitioned (node 2), 2 delivered
-        assert_eq!(deliveries.len(), 2);
         assert_eq!(stats.messages_sent, 2);
         assert_eq!(stats.messages_dropped_partition, 1);
         assert_eq!(stats.messages_dropped_loss, 0);
+        assert_eq!(handlers[1].count(), 1);
+        assert_eq!(handlers[2].count(), 0); // partitioned
+        assert_eq!(handlers[3].count(), 1);
+    }
+
+    #[test]
+    fn test_next_gossip_delivery_time() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 2,
+            num_shards: 1,
+            packet_loss_rate: 0.0,
+            ..Default::default()
+        });
+        let _handlers = register_gossip_handlers(&network);
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        // No pending gossip
+        assert!(network.next_gossip_delivery_time().is_none());
+
+        let entry = make_gossip_entry(BroadcastTarget::Global);
+        network.accept_gossip(0, Duration::from_millis(100), entry, &mut rng);
+
+        // Should have a delivery time > 100ms (100ms + latency)
+        let next = network.next_gossip_delivery_time().unwrap();
+        assert!(next > Duration::from_millis(100));
+
+        // Flush clears queue
+        network.flush_gossip(FAR_FUTURE);
+        assert!(network.next_gossip_delivery_time().is_none());
     }
 
     // ─── create_adapter and Integration ───
@@ -1169,12 +1336,13 @@ mod tests {
         use hyperscale_messages::BlockVoteGossip;
         use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash, ShardGroupId};
 
-        let network = SimulatedNetwork::new(NetworkConfig {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 2,
             num_shards: 1,
             packet_loss_rate: 0.0,
             ..Default::default()
         });
+        let handlers = register_gossip_handlers(&network);
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         let adapter0 = network.create_adapter(0);
@@ -1191,26 +1359,24 @@ mod tests {
         });
         hyperscale_network::Network::broadcast_to_shard(&adapter0, ShardGroupId(0), &gossip);
 
-        // Drain and deliver
+        // Drain and deliver via accept_gossip + flush_gossip
         let entries = adapter0.drain_outbox();
         assert_eq!(entries.len(), 1);
 
-        let (deliveries, stats) =
-            network.deliver_gossip(0, entries.into_iter().next().unwrap(), &mut rng);
+        let stats = network.accept_gossip(
+            0,
+            Duration::ZERO,
+            entries.into_iter().next().unwrap(),
+            &mut rng,
+        );
         assert_eq!(stats.messages_sent, 1);
-        assert_eq!(deliveries.len(), 1);
-        assert_eq!(deliveries[0].to, 1);
 
-        // Verify the event contains valid decompressed payload
-        match &deliveries[0].event {
-            NodeInput::GossipReceived {
-                payload,
-                message_type,
-            } => {
-                assert_eq!(*message_type, "block.vote");
-                assert!(!payload.is_empty());
-            }
-            other => panic!("Expected GossipReceived, got {:?}", other),
-        }
+        network.flush_gossip(FAR_FUTURE);
+
+        // Node 1 should have received the vote gossip
+        let messages = handlers[1].messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].0, "block.vote");
+        assert!(!messages[0].1.is_empty());
     }
 }

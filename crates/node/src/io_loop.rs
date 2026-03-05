@@ -359,8 +359,9 @@ where
         );
         let result = f(storage, &self.executor);
 
-        // Now sole ownership is released — register the inbound handler.
+        // Now sole ownership is released — register handlers.
         self.register_inbound_handler();
+        self.register_gossip_handler();
 
         result
     }
@@ -422,6 +423,14 @@ where
                 Arc::clone(&self.cert_cache),
             ));
         self.network.register_inbound_handler(handler);
+    }
+
+    /// Create and register the gossip handler with the network.
+    fn register_gossip_handler(&self) {
+        let handler = Arc::new(crate::gossip_bridge::ChannelGossipHandler::new(
+            self.event_sender.clone(),
+        ));
+        self.network.register_gossip_handler(handler);
     }
 
     // ─── Event Processing ───────────────────────────────────────────────
