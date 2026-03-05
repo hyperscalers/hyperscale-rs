@@ -90,6 +90,16 @@ pub fn decompose_storage_key(storage_key: &[u8]) -> Option<(&[u8], u8, &[u8])> {
     Some((entity_key, partition_num, sort_key))
 }
 
+/// Get the JMT entity key (db_node_key) for a NodeId.
+///
+/// This is the key used in the JMT entity tier — the hash-spread 50-byte
+/// representation of the NodeId. Unlike `node_prefix`, this does NOT
+/// include the `RADIX_PREFIX`.
+pub fn node_entity_key(node_id: &NodeId) -> Vec<u8> {
+    let radix_node_id = radix_common::types::NodeId(node_id.0);
+    SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id)
+}
+
 /// Build the storage key prefix for a given NodeId.
 pub fn node_prefix(node_id: &NodeId) -> Vec<u8> {
     let radix_node_id = radix_common::types::NodeId(node_id.0);

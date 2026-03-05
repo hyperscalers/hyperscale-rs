@@ -13,29 +13,99 @@
 //! simulation has identical JMT behavior to production.
 
 use hyperscale_storage::{
-    jmt::{put_at_next_version, StoredTreeNodeKey, TypedInMemoryTreeStore, WriteableTreeStore},
+    jmt::{
+        put_at_next_version, AssociatedSubstateValue, EntityTier, ReadableTreeStore, StaleTreePart,
+        StoredTreeNodeKey, TreeNode, TypedInMemoryTreeStore, WriteableTreeStore,
+    },
     keys, CommitResult, CommitStore, CommittableSubstateDatabase, ConsensusStore, DatabaseUpdate,
-    DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot, OverlayTreeStore,
-    PartitionDatabaseUpdates, PartitionEntry, StateRootHash, SubstateDatabase, SubstateStore,
+    DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot,
+    LeafSubstateKeyAssociation, OverlayTreeStore, PartitionDatabaseUpdates, PartitionEntry,
+    StateRootHash, SubstateDatabase, SubstateDbLookup, SubstateLookup, SubstateStore,
 };
 use hyperscale_types::{
     Block, BlockHeight, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
     SubstateWrite, TransactionCertificate,
 };
 use im::OrdMap;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 
 // ═══════════════════════════════════════════════════════════════════════
-// Overlay tree store for speculative JMT computation
-// Uses the unified OverlayTreeStore from hyperscale_storage.
+// JMT helpers
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Thin wrapper that writes JMT nodes directly to the underlying
+/// `TypedInMemoryTreeStore` while capturing leaf-substate associations.
+///
+/// Unlike [`OverlayTreeStore`], this does **not** buffer nodes in a separate
+/// HashMap — nodes go straight into the real store. Only used by
+/// [`SimStorage::commit_shared`] where we want immediate, permanent writes
+/// and don't need the overlay→snapshot→apply roundtrip.
+struct DirectWriteCapture<'a> {
+    store: &'a TypedInMemoryTreeStore,
+    lookup: &'a dyn SubstateLookup,
+    associations: RefCell<Vec<LeafSubstateKeyAssociation>>,
+}
+
+impl DirectWriteCapture<'_> {
+    fn into_associations(self) -> Vec<LeafSubstateKeyAssociation> {
+        self.associations.into_inner()
+    }
+}
+
+impl ReadableTreeStore for DirectWriteCapture<'_> {
+    fn get_node(&self, key: &StoredTreeNodeKey) -> Option<TreeNode> {
+        self.store.get_node(key)
+    }
+}
+
+impl WriteableTreeStore for DirectWriteCapture<'_> {
+    fn insert_node(&self, key: StoredTreeNodeKey, node: TreeNode) {
+        self.store.insert_node(key, node);
+    }
+
+    fn associate_substate(
+        &self,
+        state_tree_leaf_key: &StoredTreeNodeKey,
+        partition_key: &DbPartitionKey,
+        sort_key: &DbSortKey,
+        substate_value: AssociatedSubstateValue,
+    ) {
+        let value = match substate_value {
+            AssociatedSubstateValue::Upserted(v) => v.to_vec(),
+            AssociatedSubstateValue::Unchanged => {
+                match self.lookup.lookup_substate(partition_key, sort_key) {
+                    Some(v) => v,
+                    None => return,
+                }
+            }
+        };
+        self.associations
+            .borrow_mut()
+            .push(LeafSubstateKeyAssociation {
+                tree_node_key: state_tree_leaf_key.clone(),
+                substate_value: value,
+            });
+    }
+
+    fn record_stale_tree_part(&self, part: StaleTreePart) {
+        self.store.record_stale_tree_part(part);
+    }
+}
+
 /// Inner state protected by a single lock to prevent TOCTOU races.
+///
+/// The `associations` map lives here (rather than as a separate lock on
+/// `SimStorage`) so that readers like `list_substates_for_node_at_version`
+/// can access both the tree store and the association table under a single
+/// Mutex acquisition, eliminating lock-ordering concerns.
 pub(crate) struct JmtInner {
     pub tree_store: TypedInMemoryTreeStore,
     pub current_version: u64,
     pub current_root_hash: StateRootHash,
+    /// Leaf-key → substate-value associations for historical queries.
+    pub associations: HashMap<StoredTreeNodeKey, Vec<u8>>,
 }
 
 /// JMT state bundled for thread-safe access.
@@ -50,9 +120,14 @@ impl SharedJmtState {
     fn new() -> Self {
         Self {
             inner: Mutex::new(JmtInner {
-                tree_store: TypedInMemoryTreeStore::new().with_pruning_enabled(),
+                // Pruning disabled: historical substate reads traverse the JMT at
+                // past versions and need old nodes to still exist. In production,
+                // RocksDB GC respects `state_version_history_length` (default 60k).
+                // In simulation, tests are short-lived so retaining all nodes is fine.
+                tree_store: TypedInMemoryTreeStore::new(),
                 current_version: 0,
                 current_root_hash: StateRootHash([0u8; 32]),
+                associations: HashMap::new(),
             }),
         }
     }
@@ -139,7 +214,7 @@ impl SharedJmtState {
         (result_hash, snapshot)
     }
 
-    /// Apply a JMT snapshot directly, inserting precomputed nodes.
+    /// Apply a JMT snapshot directly, inserting precomputed nodes and associations.
     fn apply_snapshot(&self, snapshot: JmtSnapshot) {
         let mut inner = self.inner.lock().unwrap();
 
@@ -173,23 +248,14 @@ impl SharedJmtState {
             inner.tree_store.record_stale_tree_part(stale_part);
         }
 
+        // Store leaf-substate associations for historical queries
+        for a in snapshot.leaf_substate_associations {
+            inner.associations.insert(a.tree_node_key, a.substate_value);
+        }
+
         // Advance version and update root
         inner.current_version += snapshot.num_versions;
         inner.current_root_hash = snapshot.result_root;
-    }
-
-    fn commit(&self, updates: &DatabaseUpdates) {
-        let mut inner = self.inner.lock().unwrap();
-
-        let parent_version = if inner.current_version == 0 {
-            None
-        } else {
-            Some(inner.current_version)
-        };
-
-        let new_root = put_at_next_version(&inner.tree_store, parent_version, updates);
-        inner.current_version += 1;
-        inner.current_root_hash = new_root;
     }
 }
 
@@ -239,13 +305,8 @@ pub struct SimStorage {
     // ═══════════════════════════════════════════════════════════════════════
     // JMT state tracking
     // ═══════════════════════════════════════════════════════════════════════
-    /// JMT state (tree store, version, root hash).
+    /// JMT state (tree store, version, root hash, leaf associations).
     jmt: Arc<SharedJmtState>,
-
-    /// Historical substate value associations.
-    /// Maps JMT leaf node keys to substate values for historical queries.
-    /// Simulation always collects these for testing/debugging.
-    associated_state_tree_values: Arc<RwLock<HashMap<StoredTreeNodeKey, Vec<u8>>>>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Consensus storage (interior mutability via RwLock)
@@ -277,7 +338,6 @@ impl SimStorage {
         Self {
             data: Arc::new(RwLock::new(OrdMap::new())),
             jmt: Arc::new(SharedJmtState::new()),
-            associated_state_tree_values: Arc::new(RwLock::new(HashMap::new())),
             blocks: RwLock::new(BTreeMap::new()),
             committed_state: RwLock::new(CommittedConsensusState {
                 height: BlockHeight(0),
@@ -300,7 +360,6 @@ impl SimStorage {
         self.data.write().unwrap().clear();
         // Replace the shared JMT state with a fresh one
         self.jmt = Arc::new(SharedJmtState::new());
-        self.associated_state_tree_values.write().unwrap().clear();
         self.blocks.write().unwrap().clear();
         {
             let mut state = self.committed_state.write().unwrap();
@@ -362,15 +421,50 @@ impl SimStorage {
     ///
     /// Mirrors `CommittableSubstateDatabase::commit` but takes `&self`.
     /// The Radix trait impl delegates to this method.
+    ///
+    /// Uses [`DirectWriteCapture`] to write JMT nodes directly to the tree
+    /// store while capturing leaf-substate associations for historical reads.
     pub fn commit_shared(&self, updates: &DatabaseUpdates) {
-        // 1. Update substate data
+        // 1. Update substate data (immediately visible for lookups below).
+        //    LOCK ORDERING: data.write() MUST be released before jmt.inner.lock()
+        //    is acquired, because put_at_next_version may call SubstateDbLookup
+        //    which takes data.read() under the jmt lock.
         {
             let mut data = self.data.write().unwrap();
             apply_updates_to_ordmap(&mut data, updates);
         }
 
-        // 2. Update JMT and compute new root hash (via shared state)
-        self.jmt.commit(updates);
+        // 2. Update JMT directly, capturing leaf-substate associations.
+        //    DirectWriteCapture writes nodes straight to the tree store (no
+        //    overlay buffer) and intercepts associate_substate calls. For
+        //    unchanged substates whose leaves are recreated during tree
+        //    rebalancing, SubstateDbLookup reads from the already-updated
+        //    OrdMap to get the actual value bytes.
+        let mut inner = self.jmt.inner.lock().unwrap();
+        let parent_version = if inner.current_version == 0 {
+            None
+        } else {
+            Some(inner.current_version)
+        };
+
+        let (new_root, associations) = {
+            let lookup = SubstateDbLookup(self as &dyn SubstateDatabase);
+            let capture = DirectWriteCapture {
+                store: &inner.tree_store,
+                lookup: &lookup,
+                associations: RefCell::new(Vec::new()),
+            };
+            let new_root = put_at_next_version(&capture, parent_version, updates);
+            (new_root, capture.into_associations())
+        };
+
+        inner.current_version += 1;
+        inner.current_root_hash = new_root;
+
+        // 3. Store captured associations for historical queries (same lock)
+        for a in associations {
+            inner.associations.insert(a.tree_node_key, a.substate_value);
+        }
     }
 }
 
@@ -467,6 +561,35 @@ impl SubstateStore for SimStorage {
         self.jmt.current_jmt_root()
     }
 
+    fn list_substates_for_node_at_version(
+        &self,
+        node_id: &NodeId,
+        state_version: u64,
+    ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
+        let entity_key = keys::node_entity_key(node_id);
+
+        let inner = self.jmt.inner.lock().unwrap();
+
+        // Version not yet committed — caller asked for a future version.
+        if state_version > inner.current_version {
+            return None;
+        }
+
+        let entity_tier = EntityTier::new(&inner.tree_store, Some(state_version));
+        let partition_tier = entity_tier.get_entity_partition_tier(entity_key);
+        let mut results = Vec::new();
+
+        for substate_tier in partition_tier.into_iter_partition_substate_tiers_from(None) {
+            let partition_num = substate_tier.partition_key().partition_num;
+            for summary in substate_tier.into_iter_substate_summaries_from(None) {
+                if let Some(value) = inner.associations.get(&summary.state_tree_leaf_key) {
+                    results.push((partition_num, summary.sort_key, value.clone()));
+                }
+            }
+        }
+        Some(results)
+    }
+
     fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
@@ -488,15 +611,6 @@ impl SimStorage {
     /// from verification. Also stores leaf-to-substate associations for
     /// historical queries.
     pub fn apply_jmt_snapshot(&self, snapshot: JmtSnapshot) {
-        // Store associations for historical queries
-        {
-            let mut assoc = self.associated_state_tree_values.write().unwrap();
-            for a in &snapshot.leaf_substate_associations {
-                assoc.insert(a.tree_node_key.clone(), a.substate_value.clone());
-            }
-        }
-
-        // Apply JMT nodes
         self.jmt.apply_snapshot(snapshot);
     }
 }
@@ -1478,5 +1592,61 @@ mod tests {
         let other_node = NodeId([99; 30]);
         let other_substates: Vec<_> = storage.list_substates_for_node(&other_node).collect();
         assert!(other_substates.is_empty());
+    }
+
+    #[test]
+    fn test_list_substates_for_node_at_version_returns_historical_data() {
+        let storage = SimStorage::new();
+        let node_id = NodeId([1; 30]);
+        let shard = ShardGroupId(0);
+
+        // Version 1: commit value [100] for node 1
+        let write1 = make_substate_write(1, 0, vec![10], vec![100]);
+        let cert1 = make_test_certificate(1, shard, vec![write1]);
+        storage.commit_certificate(
+            &cert1,
+            &cert1.shard_proofs.get(&shard).unwrap().state_writes,
+        );
+        assert_eq!(storage.state_version(), 1);
+        let root_v1 = storage.state_root_hash();
+
+        // Version 2: overwrite with value [200]
+        let write2 = make_substate_write(1, 0, vec![10], vec![200]);
+        let cert2 = make_test_certificate(2, shard, vec![write2]);
+        storage.commit_certificate(
+            &cert2,
+            &cert2.shard_proofs.get(&shard).unwrap().state_writes,
+        );
+        assert_eq!(storage.state_version(), 2);
+        let root_v2 = storage.state_root_hash();
+        assert_ne!(root_v1, root_v2, "roots must differ after overwrite");
+
+        // Read at version 1: should get the original value [100]
+        let v1_substates = storage
+            .list_substates_for_node_at_version(&node_id, 1)
+            .expect("version 1 should be available");
+        assert_eq!(v1_substates.len(), 1, "should find 1 substate at v1");
+        assert_eq!(v1_substates[0].2, vec![100u8], "v1 value should be [100]");
+
+        // Read at version 2: should get the overwritten value [200]
+        let v2_substates = storage
+            .list_substates_for_node_at_version(&node_id, 2)
+            .expect("version 2 should be available");
+        assert_eq!(v2_substates.len(), 1, "should find 1 substate at v2");
+        assert_eq!(v2_substates[0].2, vec![200u8], "v2 value should be [200]");
+
+        // Read for a nonexistent node: should be Some(empty)
+        let other = storage
+            .list_substates_for_node_at_version(&NodeId([99; 30]), 1)
+            .expect("version 1 should be available even for unknown node");
+        assert!(other.is_empty());
+
+        // Read at a future version: should be None
+        assert!(
+            storage
+                .list_substates_for_node_at_version(&node_id, 99)
+                .is_none(),
+            "future version should return None"
+        );
     }
 }

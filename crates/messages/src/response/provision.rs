@@ -12,9 +12,13 @@ use sbor::prelude::BasicSbor;
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetProvisionsResponse {
     /// The provisions for the requested block and target shard.
-    /// Empty if the source shard doesn't have the block or no matching
-    /// transactions target the requesting shard.
-    pub provisions: Vec<StateProvision>,
+    ///
+    /// - `Some(provisions)` — successfully built provisions (may be empty if no
+    ///   matching transactions target the requesting shard).
+    /// - `None` — the source shard cannot serve this request (block not found,
+    ///   or the historical state version has been garbage-collected). The
+    ///   requester should try a different peer.
+    pub provisions: Option<Vec<StateProvision>>,
 }
 
 impl NetworkMessage for GetProvisionsResponse {
@@ -33,7 +37,18 @@ mod tests {
 
     #[test]
     fn test_sbor_roundtrip_empty() {
-        let response = GetProvisionsResponse { provisions: vec![] };
+        let response = GetProvisionsResponse {
+            provisions: Some(vec![]),
+        };
+
+        let encoded = sbor::basic_encode(&response).unwrap();
+        let decoded: GetProvisionsResponse = sbor::basic_decode(&encoded).unwrap();
+        assert_eq!(response, decoded);
+    }
+
+    #[test]
+    fn test_sbor_roundtrip_unavailable() {
+        let response = GetProvisionsResponse { provisions: None };
 
         let encoded = sbor::basic_encode(&response).unwrap();
         let decoded: GetProvisionsResponse = sbor::basic_decode(&encoded).unwrap();

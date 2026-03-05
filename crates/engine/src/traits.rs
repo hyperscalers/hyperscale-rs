@@ -63,11 +63,12 @@ pub trait ExecutionBackend: Clone + Send + Sync + 'static {
         provisions: &[StateProvision],
     ) -> ExecutionOutput;
 
-    /// Fetch state entries for the given nodes.
+    /// Fetch state entries for the given nodes at a specific JMT version.
     ///
     /// Used by provisioning to collect state for remote shards.
-    /// Returns `StateEntry` with pre-computed storage keys for efficient cross-shard execution.
-    fn fetch_state_entries(&self, nodes: &[NodeId]) -> Vec<StateEntry>;
+    /// Returns `None` if the version is unavailable (GC'd or not yet committed).
+    /// Returns `Some(entries)` with pre-computed storage keys on success.
+    fn fetch_state_entries(&self, nodes: &[NodeId], state_version: u64) -> Option<Vec<StateEntry>>;
 
     /// Compute writes commitment from state writes.
     ///

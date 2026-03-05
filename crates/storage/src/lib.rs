@@ -73,9 +73,11 @@ pub mod jmt {
         IteratedLeafKey, LeafKey, SparseMerkleLeafNode, SparseMerkleProof,
     };
 
-    // Re-export tier types for proof generation
+    // Re-export tier types for proof generation and historical reads
     pub use radix_substate_store_impls::state_tree::entity_tier::EntityTier;
     pub use radix_substate_store_impls::state_tree::partition_tier::PartitionTier;
-    pub use radix_substate_store_impls::state_tree::substate_tier::SubstateTier;
+    pub use radix_substate_store_impls::state_tree::substate_tier::{
+        SubstateSummary, SubstateTier,
+    };
     pub use radix_substate_store_impls::state_tree::tier_framework::ReadableTier;
 }

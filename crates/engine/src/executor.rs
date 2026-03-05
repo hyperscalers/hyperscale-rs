@@ -47,14 +47,20 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{instrument, Level};
 
-/// Fetch state entries for the given nodes from storage.
+/// Fetch state entries for the given nodes from storage at a specific JMT version.
 ///
-/// Returns `StateEntry` with pre-computed storage keys. This is efficient
-/// for cross-shard provisioning because:
-/// 1. Storage keys are computed once at the source shard
-/// 2. Receiving shard can use them directly for database lookups
-/// 3. No SpreadPrefixKeyMapper calls needed at execution time
-pub fn fetch_state_entries<S: SubstateStore>(storage: &S, nodes: &[NodeId]) -> Vec<StateEntry> {
+/// Reads substates at the given `state_version` using historical JMT traversal
+/// and the leaf association table. Both data and proofs must come from the same
+/// version to pass verification against the block header's `state_root`.
+///
+/// Returns `None` if the requested version is unavailable (GC'd or not yet
+/// committed). Returns `Some(entries)` on success with pre-computed storage
+/// keys for efficient cross-shard provisioning.
+pub fn fetch_state_entries<S: SubstateStore>(
+    storage: &S,
+    nodes: &[NodeId],
+    state_version: u64,
+) -> Option<Vec<StateEntry>> {
     use hyperscale_storage::RADIX_PREFIX;
     use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 
@@ -65,7 +71,7 @@ pub fn fetch_state_entries<S: SubstateStore>(storage: &S, nodes: &[NodeId]) -> V
         let radix_node_id = radix_common::types::NodeId(node.0);
         let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
 
-        let substates: Vec<_> = storage.list_substates_for_node(node).collect();
+        let substates = storage.list_substates_for_node_at_version(node, state_version)?;
 
         for (partition_num, db_sort_key, value) in substates {
             // Build full storage key
@@ -81,7 +87,7 @@ pub fn fetch_state_entries<S: SubstateStore>(storage: &S, nodes: &[NodeId]) -> V
         }
     }
 
-    entries
+    Some(entries)
 }
 
 /// Shared executor caches to avoid rebuilding on clone.
@@ -363,19 +369,18 @@ impl RadixExecutor {
         }
     }
 
-    /// Fetch state entries for the given nodes from storage.
+    /// Fetch state entries for the given nodes from storage at a specific JMT version.
     ///
-    /// Returns `StateEntry` with pre-computed storage keys. This is efficient
-    /// for cross-shard provisioning because:
-    /// 1. Storage keys are computed once at the source shard
-    /// 2. Receiving shard can use them directly for database lookups
-    /// 3. No SpreadPrefixKeyMapper calls needed at execution time
+    /// Reads substates at the given `state_version` using historical JMT traversal.
+    /// Both data and proofs must come from the same version.
+    /// Returns `None` if the version is unavailable (GC'd or not yet committed).
     pub fn fetch_state_entries<S: SubstateStore>(
         &self,
         storage: &S,
         nodes: &[NodeId],
-    ) -> Vec<StateEntry> {
-        fetch_state_entries(storage, nodes)
+        state_version: u64,
+    ) -> Option<Vec<StateEntry>> {
+        fetch_state_entries(storage, nodes, state_version)
     }
 
     /// Compute writes commitment from state writes.

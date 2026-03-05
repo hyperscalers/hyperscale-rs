@@ -427,8 +427,13 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             let mut batches: HashMap<ShardGroupId, Vec<StateProvision>> = HashMap::new();
 
             for req in requests {
-                // Fetch state entries from storage
-                let entries = ctx.executor.fetch_state_entries(ctx.storage, &req.nodes);
+                // Fetch state entries from storage at the block's state version.
+                // This is the proactive path — the proposer just committed this
+                // block, so the state version must still be available.
+                let entries = ctx
+                    .executor
+                    .fetch_state_entries(ctx.storage, &req.nodes, state_version)
+                    .expect("proactive provision path: state version must be available");
                 let storage_keys: Vec<Vec<u8>> =
                     entries.iter().map(|e| e.storage_key.clone()).collect();
                 let merkle_proofs = ctx

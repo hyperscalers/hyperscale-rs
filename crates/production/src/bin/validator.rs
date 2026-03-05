@@ -407,18 +407,6 @@ pub struct StorageConfig {
     #[serde(default = "default_keep_log_file_num")]
     pub keep_log_file_num: usize,
 
-    /// Enable historical substate values storage.
-    ///
-    /// When enabled, the storage persists associations between JMT leaf nodes
-    /// and their substate values. This enables historical state queries - looking
-    /// up substate values at any past state version (within the retention window).
-    ///
-    /// This adds storage overhead proportional to the number of substates modified.
-    /// Defaults to `false` for minimal overhead; enable for Mesh API compatibility
-    /// or when historical state queries are needed.
-    #[serde(default)]
-    pub enable_historical_substate_values: bool,
-
     /// Number of state versions to retain before garbage collection.
     ///
     /// Stale JMT nodes and their associations are kept for this many versions
@@ -442,7 +430,6 @@ impl Default for StorageConfig {
             bloom_filter_bits: default_bloom_filter_bits(),
             bytes_per_sync_mb: default_bytes_per_sync_mb(),
             keep_log_file_num: default_keep_log_file_num(),
-            enable_historical_substate_values: false,
             state_version_history_length: default_state_version_history_length(),
         }
     }
@@ -945,7 +932,6 @@ fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
         bloom_filter_bits: config.bloom_filter_bits,
         bytes_per_sync: config.bytes_per_sync_mb * 1024 * 1024,
         keep_log_file_num: config.keep_log_file_num,
-        enable_historical_substate_values: config.enable_historical_substate_values,
         state_version_history_length: config.state_version_history_length,
         ..RocksDbConfig::default()
     }

@@ -120,13 +120,6 @@ bytes_per_sync_mb = 1
 # Number of old log files to keep
 keep_log_file_num = 10
 
-# Enable historical substate values storage.
-# When enabled, the storage will persist associations between JMT leaf nodes
-# and their substate values. This enables historical state queries - looking
-# up substate values at any past state version (within the retention window).
-# Adds storage overhead; enable for Mesh API or historical state queries.
-enable_historical_substate_values = false
-
 # Number of state versions to retain before garbage collection.
 # Stale JMT nodes and their associations are kept for this many versions
 # before being eligible for deletion. This enables historical queries within

@@ -61,6 +61,23 @@ pub trait SubstateStore: SubstateDatabase + CommittableSubstateDatabase + Send +
     /// Returns a zero hash if no commits have occurred.
     fn state_root_hash(&self) -> Hash;
 
+    /// List all substates for a node at a specific historical JMT version.
+    ///
+    /// Traverses the 3-tier JMT at `state_version` and looks up raw substate
+    /// values from the leaf association table.
+    ///
+    /// Returns `Some(entries)` on success (may be empty if the node has no
+    /// substates at that version), or `None` if the version is unavailable
+    /// (e.g. garbage-collected or not yet committed).
+    ///
+    /// Used by cross-shard provision paths to serve historical state that
+    /// can be verified against the original block's `state_root`.
+    fn list_substates_for_node_at_version(
+        &self,
+        node_id: &NodeId,
+        state_version: u64,
+    ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>>;
+
     /// Generate 3-tier JMT inclusion proofs for the given storage keys.
     fn generate_merkle_proofs(
         &self,

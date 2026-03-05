@@ -255,7 +255,7 @@ impl<S: ConsensusStore + SubstateStore> InboundHandler<S> {
                     block_height = req.block_height.0,
                     "Provision request: block not found"
                 );
-                let response = GetProvisionsResponse { provisions: vec![] };
+                let response = GetProvisionsResponse { provisions: None };
                 return sbor::basic_encode(&response)
                     .map_err(|e| InboundError::EncodeError(format!("{e:?}")));
             }
@@ -263,10 +263,10 @@ impl<S: ConsensusStore + SubstateStore> InboundHandler<S> {
 
         let mut provisions = Vec::new();
 
-        // Use the current state version for proof generation.
-        // list_substates_for_node (called by fetch_state_entries) returns entries
-        // at the current version, so proofs must be generated at the same version.
-        let current_state_version = self.storage.state_version();
+        // Use the block header's state_version (QC-attested, matches state_root).
+        // Both data and proofs must come from this version so the target shard
+        // can verify against header.state_root.
+        let block_state_version = block.header.state_version;
 
         // Iterate all transactions in the block
         let all_txs = block
@@ -297,13 +297,31 @@ impl<S: ConsensusStore + SubstateStore> InboundHandler<S> {
                 continue;
             }
 
-            // Fetch state entries and generate merkle proofs at current version
-            let entries = hyperscale_engine::fetch_state_entries(&*self.storage, &owned_nodes);
+            // Fetch state entries and generate merkle proofs at the block's version.
+            // If the version is no longer available (GC'd), respond with None so
+            // the requester can try a different peer.
+            let entries = match hyperscale_engine::fetch_state_entries(
+                &*self.storage,
+                &owned_nodes,
+                block_state_version,
+            ) {
+                Some(entries) => entries,
+                None => {
+                    debug!(
+                        block_height = req.block_height.0,
+                        state_version = block_state_version,
+                        "Provision request: historical state version unavailable"
+                    );
+                    let response = GetProvisionsResponse { provisions: None };
+                    return sbor::basic_encode(&response)
+                        .map_err(|e| InboundError::EncodeError(format!("{e:?}")));
+                }
+            };
             let storage_keys: Vec<Vec<u8>> =
                 entries.iter().map(|e| e.storage_key.clone()).collect();
             let merkle_proofs = self
                 .storage
-                .generate_merkle_proofs(&storage_keys, current_state_version);
+                .generate_merkle_proofs(&storage_keys, block_state_version);
 
             let entries = Arc::new(entries);
             let merkle_proofs = Arc::new(merkle_proofs);
@@ -314,7 +332,7 @@ impl<S: ConsensusStore + SubstateStore> InboundHandler<S> {
                 source_shard: local_shard,
                 block_height: req.block_height,
                 block_timestamp: block.header.timestamp,
-                state_version: current_state_version,
+                state_version: block_state_version,
                 entries,
                 merkle_proofs,
             });
@@ -327,7 +345,9 @@ impl<S: ConsensusStore + SubstateStore> InboundHandler<S> {
             "Responding to provision request"
         );
 
-        let response = GetProvisionsResponse { provisions };
+        let response = GetProvisionsResponse {
+            provisions: Some(provisions),
+        };
         sbor::basic_encode(&response).map_err(|e| InboundError::EncodeError(format!("{e:?}")))
     }
 }

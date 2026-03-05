@@ -1085,15 +1085,25 @@ where
                     Some(proposer),
                     request,
                     Box::new(move |result| match result {
-                        Ok(response) => {
-                            if !response.provisions.is_empty() {
+                        Ok(response) => match response.provisions {
+                            Some(provisions) if !provisions.is_empty() => {
                                 let _ = sender.send(NodeInput::Protocol(
-                                    ProtocolEvent::StateProvisionsReceived {
-                                        provisions: response.provisions,
-                                    },
+                                    ProtocolEvent::StateProvisionsReceived { provisions },
                                 ));
                             }
-                        }
+                            Some(_) => {
+                                // Empty provisions — no matching transactions for
+                                // our shard at this block height. Not an error.
+                            }
+                            None => {
+                                debug!(
+                                    source_shard = source_shard.0,
+                                    block_height = block_height.0,
+                                    "Peer cannot serve provisions (version unavailable), \
+                                     will retry with another peer"
+                                );
+                            }
+                        },
                         Err(e) => {
                             warn!(
                                 source_shard = source_shard.0,

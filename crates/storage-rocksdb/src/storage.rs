@@ -14,8 +14,8 @@
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{
     jmt::{
-        encode_key as encode_jmt_key, put_at_next_version, ReadableTreeStore, StaleTreePart,
-        StoredTreeNodeKey, TreeNode, VersionedTreeNode,
+        encode_key as encode_jmt_key, put_at_next_version, EntityTier, ReadableTreeStore,
+        StaleTreePart, StoredTreeNodeKey, TreeNode, VersionedTreeNode,
     },
     keys, CommittableSubstateDatabase, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
     DbSubstateValue, JmtSnapshot, OverlayTreeStore, PartitionDatabaseUpdates, PartitionEntry,
@@ -54,9 +54,6 @@ pub struct RocksDbStorage {
     /// Serializes JMT-mutating commits to prevent interleaved read-modify-write
     /// sequences (e.g., `read_jmt_metadata` + `WriteBatch` write).
     commit_lock: Mutex<()>,
-
-    /// Whether to persist historical substate values for historical queries.
-    enable_historical_substate_values: bool,
 
     /// Number of state versions to retain before garbage collection.
     state_version_history_length: u64,
@@ -128,14 +125,8 @@ impl RocksDbStorage {
         Ok(Self {
             db: Arc::new(db),
             commit_lock: Mutex::new(()),
-            enable_historical_substate_values: config.enable_historical_substate_values,
             state_version_history_length: config.state_version_history_length,
         })
-    }
-
-    /// Check if historical substate values are enabled.
-    pub fn is_historical_substate_values_enabled(&self) -> bool {
-        self.enable_historical_substate_values
     }
 
     /// Get the configured state version history length.
@@ -210,16 +201,14 @@ impl RocksDbStorage {
             batch.put_cf(stale_cf, version_key, encoded_parts);
         }
 
-        // Historical associations
-        if self.enable_historical_substate_values {
-            let assoc_cf = self
-                .db
-                .cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)
-                .expect("associated_state_tree_values column family must exist");
-            for assoc in &snapshot.leaf_substate_associations {
-                let encoded_key = encode_jmt_key(&assoc.tree_node_key);
-                batch.put_cf(assoc_cf, encoded_key, &assoc.substate_value);
-            }
+        // Historical associations (always enabled — required for cross-shard provisions)
+        let assoc_cf = self
+            .db
+            .cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)
+            .expect("associated_state_tree_values column family must exist");
+        for assoc in &snapshot.leaf_substate_associations {
+            let encoded_key = encode_jmt_key(&assoc.tree_node_key);
+            batch.put_cf(assoc_cf, encoded_key, &assoc.substate_value);
         }
 
         // JMT metadata
@@ -562,11 +551,7 @@ impl RocksDbStorage {
         let snapshot_store = SnapshotTreeStore::new(&self.db);
         let (base_version, base_root) = snapshot_store.read_jmt_metadata();
 
-        let overlay = if self.enable_historical_substate_values {
-            OverlayTreeStore::new(&snapshot_store).with_substate_lookup(&snapshot_store)
-        } else {
-            OverlayTreeStore::new(&snapshot_store)
-        };
+        let overlay = OverlayTreeStore::new(&snapshot_store).with_substate_lookup(&snapshot_store);
         let parent_version = if base_version == 0 {
             None
         } else {
@@ -649,6 +634,65 @@ impl SubstateStore for RocksDbStorage {
         hyperscale_types::Hash::from_hash_bytes(&root_hash.0)
     }
 
+    fn list_substates_for_node_at_version(
+        &self,
+        node_id: &NodeId,
+        state_version: u64,
+    ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
+        // Version beyond what we've committed — can't serve.
+        if state_version > self.state_version() {
+            return None;
+        }
+
+        let entity_key = keys::node_entity_key(node_id);
+
+        let assoc_cf = self.db.cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)?;
+
+        // Pass 1: traverse the 3-tier JMT to collect substate metadata
+        let entity_tier = EntityTier::new(self, Some(state_version));
+        let partition_tier = entity_tier.get_entity_partition_tier(entity_key);
+        let mut entries: Vec<(u8, DbSortKey, Vec<u8>)> = Vec::new();
+
+        for substate_tier in partition_tier.into_iter_partition_substate_tiers_from(None) {
+            let partition_num = substate_tier.partition_key().partition_num;
+            for summary in substate_tier.into_iter_substate_summaries_from(None) {
+                entries.push((
+                    partition_num,
+                    summary.sort_key,
+                    encode_jmt_key(&summary.state_tree_leaf_key),
+                ));
+            }
+        }
+
+        if entries.is_empty() {
+            return Some(vec![]);
+        }
+
+        // Pass 2: batch-read all association values in a single multi_get_cf
+        let values = self.db.multi_get_cf(
+            entries
+                .iter()
+                .map(|(_, _, encoded_key)| (assoc_cf, encoded_key.as_slice())),
+        );
+
+        let mut results = Vec::with_capacity(entries.len());
+        for ((partition_num, sort_key, _), result) in entries.into_iter().zip(values) {
+            let value = result.expect("RocksDB read failure on associated_state_tree_values CF");
+            match value {
+                Some(v) => results.push((partition_num, sort_key, v)),
+                None => {
+                    // Association was garbage-collected — version no longer servable.
+                    tracing::warn!(
+                        state_version,
+                        "Historical substate association missing — version likely GC'd"
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(results)
+    }
+
     fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
@@ -719,12 +763,7 @@ impl RocksDbStorage {
             );
         }
 
-        // Create overlay, optionally enabling historical value collection
-        let overlay = if self.enable_historical_substate_values {
-            OverlayTreeStore::new(&snapshot_store).with_substate_lookup(&snapshot_store)
-        } else {
-            OverlayTreeStore::new(&snapshot_store)
-        };
+        let overlay = OverlayTreeStore::new(&snapshot_store).with_substate_lookup(&snapshot_store);
 
         let mut current_version = base_version;
         let mut root = base_root;
@@ -1624,11 +1663,7 @@ impl RocksDbStorage {
         let snapshot_store = SnapshotTreeStore::new(&self.db);
         let (base_version, base_root) = snapshot_store.read_jmt_metadata();
 
-        let overlay = if self.enable_historical_substate_values {
-            OverlayTreeStore::new(&snapshot_store).with_substate_lookup(&snapshot_store)
-        } else {
-            OverlayTreeStore::new(&snapshot_store)
-        };
+        let overlay = OverlayTreeStore::new(&snapshot_store).with_substate_lookup(&snapshot_store);
         let parent_version = if base_version == 0 {
             None
         } else {
@@ -1893,11 +1928,7 @@ impl RocksDbStorage {
             None => return 0,
         };
 
-        let assoc_cf = if self.enable_historical_substate_values {
-            self.db.cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)
-        } else {
-            None
-        };
+        let assoc_cf = self.db.cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF);
 
         // Iterate through stale parts older than the cutoff
         let mut iter = self.db.raw_iterator_cf(stale_cf);
@@ -2088,17 +2119,6 @@ pub struct RocksDbConfig {
     pub keep_log_file_num: usize,
     /// Column families to create
     pub column_families: Vec<String>,
-    /// Enable historical substate values storage.
-    ///
-    /// When enabled, the storage will persist associations between JMT leaf nodes
-    /// and their substate values. This enables historical state queries - looking
-    /// up substate values at any past state version (within the retention window).
-    ///
-    /// This adds storage overhead proportional to the number of substates modified.
-    /// Defaults to `false` for minimal overhead; enable for Mesh API compatibility
-    /// or when historical state queries are needed.
-    pub enable_historical_substate_values: bool,
-
     /// Number of state versions to retain before garbage collection.
     ///
     /// Stale JMT nodes and their associations are kept for this many versions
@@ -2132,8 +2152,7 @@ impl Default for RocksDbConfig {
                 "associated_state_tree_values".to_string(), // Historical substate values (leaf key -> value)
                 "stale_state_hash_tree_parts".to_string(),  // Deferred GC queue for stale JMT nodes
             ],
-            enable_historical_substate_values: false, // Disabled by default, like Babylon
-            state_version_history_length: 60_000,     // Match Babylon's default
+            state_version_history_length: 60_000, // Match Babylon's default
         }
     }
 }
@@ -2418,6 +2437,15 @@ impl SubstateStore for SharedStorage {
 
     fn state_root_hash(&self) -> hyperscale_types::Hash {
         self.0.state_root_hash()
+    }
+
+    fn list_substates_for_node_at_version(
+        &self,
+        node_id: &NodeId,
+        state_version: u64,
+    ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
+        self.0
+            .list_substates_for_node_at_version(node_id, state_version)
     }
 
     fn generate_merkle_proofs(
