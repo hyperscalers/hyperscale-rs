@@ -13,13 +13,13 @@
 //! All registrations happen at init (before any messages arrive), so
 //! the read-heavy RwLock pattern is ideal.
 
-use crate::traits::{GossipHandler, RequestHandler};
+use crate::traits::{GossipHandler, GossipVerdict, RequestHandler};
 use hyperscale_types::{NetworkMessage, Request};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-/// Type-erased gossip handler: receives decompressed SBOR bytes.
-pub type RawGossipHandler = dyn Fn(Vec<u8>) + Send + Sync;
+/// Type-erased gossip handler: receives decompressed SBOR bytes, returns verdict.
+pub type RawGossipHandler = dyn Fn(Vec<u8>) -> GossipVerdict + Send + Sync;
 
 /// Type-erased request handler: receives SBOR request bytes, returns SBOR response bytes.
 pub type RawRequestHandler = dyn Fn(&[u8]) -> Vec<u8> + Send + Sync;
@@ -56,8 +56,9 @@ impl HandlerRegistry {
                     tracing::warn!(
                         message_type = M::message_type_id(),
                         error = ?e,
-                        "Failed to SBOR-decode gossip message — dropping"
+                        "Failed to SBOR-decode gossip message — rejecting"
                     );
+                    GossipVerdict::Reject
                 }
             },
         );
@@ -163,14 +164,21 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
 
-        registry.register_gossip(move |_msg: TestMsg| {
+        registry.register_gossip(move |_msg: TestMsg| -> GossipVerdict {
             counter_clone.fetch_add(1, Ordering::SeqCst);
+            GossipVerdict::Accept
         });
 
         let handler = registry.get_gossip("test.gossip").unwrap();
         let encoded = sbor::basic_encode(&TestMsg(42)).unwrap();
-        handler(encoded);
+        let verdict = handler(encoded);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(verdict, GossipVerdict::Accept);
+
+        // SBOR decode failure should return Reject.
+        let verdict = handler(vec![0xFF, 0xFE]);
+        assert_eq!(verdict, GossipVerdict::Reject);
+        assert_eq!(counter.load(Ordering::SeqCst), 1); // handler not called
 
         assert!(registry.get_gossip("unknown.type").is_none());
     }
@@ -231,12 +239,14 @@ mod tests {
         let counter2 = Arc::new(AtomicUsize::new(0));
 
         let c1 = counter1.clone();
-        registry.register_gossip(move |_: TestMsg| {
+        registry.register_gossip(move |_: TestMsg| -> GossipVerdict {
             c1.fetch_add(1, Ordering::SeqCst);
+            GossipVerdict::Accept
         });
         let c2 = counter2.clone();
-        registry.register_gossip(move |_: TestMsg| {
+        registry.register_gossip(move |_: TestMsg| -> GossipVerdict {
             c2.fetch_add(1, Ordering::SeqCst);
+            GossipVerdict::Accept
         });
 
         let handler = registry.get_gossip("test").unwrap();

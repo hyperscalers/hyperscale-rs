@@ -20,4 +20,4 @@ mod traits;
 pub use compression::CompressionError;
 pub use registry::{HandlerRegistry, RawGossipHandler, RawRequestHandler};
 pub use topic::{parse_topic, ParsedTopic, Topic};
-pub use traits::{GossipHandler, Network, RequestError, RequestHandler, TopicScope};
+pub use traits::{GossipHandler, GossipVerdict, Network, RequestError, RequestHandler, TopicScope};

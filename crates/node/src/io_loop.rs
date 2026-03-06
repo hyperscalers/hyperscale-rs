@@ -463,17 +463,18 @@ where
     /// Handler closures either convert directly to ProtocolEvents or forward
     /// as typed NodeInput variants for IoLoop processing.
     fn register_gossip_handler(&self) {
-        use hyperscale_network::TopicScope;
+        use hyperscale_network::{GossipVerdict, TopicScope};
 
         // ── block.vote → ProtocolEvent::BlockVoteReceived ────────────
 
         let tx = self.event_sender.clone();
         self.network.register_gossip_handler::<BlockVoteGossip>(
             TopicScope::Shard,
-            move |gossip: BlockVoteGossip| {
+            move |gossip: BlockVoteGossip| -> GossipVerdict {
                 let _ = tx.send(NodeInput::Protocol(ProtocolEvent::BlockVoteReceived {
                     vote: gossip.vote,
                 }));
+                GossipVerdict::Accept
             },
         );
 
@@ -484,9 +485,9 @@ where
         self.network
             .register_gossip_handler::<hyperscale_messages::StateProvisionBatch>(
                 TopicScope::Shard,
-                move |batch: hyperscale_messages::StateProvisionBatch| {
+                move |batch: hyperscale_messages::StateProvisionBatch| -> GossipVerdict {
                     if batch.provisions.is_empty() {
-                        return;
+                        return GossipVerdict::Reject;
                     }
 
                     let sender = batch.sender;
@@ -500,7 +501,7 @@ where
                             source_shard = source_shard.0,
                             "State provision sender not in source shard committee"
                         );
-                        return;
+                        return GossipVerdict::Reject;
                     }
 
                     // Resolve sender's public key.
@@ -509,7 +510,7 @@ where
                             sender = sender.0,
                             "Could not resolve public key for state provision sender"
                         );
-                        return;
+                        return GossipVerdict::Reject;
                     };
 
                     let msg = batch.signing_message();
@@ -527,15 +528,16 @@ where
                         warn!(
                             sender = sender.0,
                             source_shard = source_shard.0,
-                            "State provision sender signature invalid — dropping"
+                            "State provision sender signature invalid — rejecting"
                         );
-                        return;
+                        return GossipVerdict::Reject;
                     }
 
                     let provisions = batch.into_provisions();
                     let _ = tx.send(NodeInput::Protocol(
                         ProtocolEvent::StateProvisionsReceived { provisions },
                     ));
+                    GossipVerdict::Accept
                 },
             );
 
@@ -546,9 +548,9 @@ where
         let local_shard = self.local_shard;
         self.network.register_gossip_handler::<ExecutionVoteBatch>(
             TopicScope::Shard,
-            move |batch: ExecutionVoteBatch| {
+            move |batch: ExecutionVoteBatch| -> GossipVerdict {
                 if batch.votes.is_empty() {
-                    return;
+                    return GossipVerdict::Reject;
                 }
 
                 let sender = batch.sender;
@@ -558,7 +560,7 @@ where
                         sender = sender.0,
                         "Execution vote batch sender not in local shard committee"
                     );
-                    return;
+                    return GossipVerdict::Reject;
                 }
 
                 let Some(public_key) = topology.public_key(sender) else {
@@ -566,7 +568,7 @@ where
                         sender = sender.0,
                         "Could not resolve public key for execution vote batch sender"
                     );
-                    return;
+                    return GossipVerdict::Reject;
                 };
 
                 let msg = batch.signing_message(local_shard);
@@ -583,9 +585,9 @@ where
                 if !valid {
                     warn!(
                         sender = sender.0,
-                        "Execution vote batch sender signature invalid — dropping"
+                        "Execution vote batch sender signature invalid — rejecting"
                     );
-                    return;
+                    return GossipVerdict::Reject;
                 }
 
                 for vote in batch.into_votes() {
@@ -593,6 +595,7 @@ where
                         vote,
                     }));
                 }
+                GossipVerdict::Accept
             },
         );
 
@@ -604,9 +607,9 @@ where
         self.network
             .register_gossip_handler::<ExecutionCertificateBatch>(
                 TopicScope::Shard,
-                move |batch: ExecutionCertificateBatch| {
+                move |batch: ExecutionCertificateBatch| -> GossipVerdict {
                     if batch.certificates.is_empty() {
-                        return;
+                        return GossipVerdict::Reject;
                     }
 
                     let sender = batch.sender;
@@ -620,9 +623,9 @@ where
                     {
                         warn!(
                             sender = sender.0,
-                            "Execution certificate batch contains mixed shard_group_ids — dropping"
+                            "Execution certificate batch contains mixed shard_group_ids — rejecting"
                         );
-                        return;
+                        return GossipVerdict::Reject;
                     }
                     let committee = topology.committee_for_shard(source_shard);
                     if !committee.contains(&sender) {
@@ -631,7 +634,7 @@ where
                             source_shard = source_shard.0,
                             "Execution certificate batch sender not in source shard committee"
                         );
-                        return;
+                        return GossipVerdict::Reject;
                     }
 
                     let Some(public_key) = topology.public_key(sender) else {
@@ -639,7 +642,7 @@ where
                             sender = sender.0,
                             "Could not resolve public key for execution certificate batch sender"
                         );
-                        return;
+                        return GossipVerdict::Reject;
                     };
 
                     let msg = batch.signing_message(local_shard);
@@ -656,9 +659,9 @@ where
                     if !valid {
                         warn!(
                             sender = sender.0,
-                            "Execution certificate batch sender signature invalid — dropping"
+                            "Execution certificate batch sender signature invalid — rejecting"
                         );
-                        return;
+                        return GossipVerdict::Reject;
                     }
 
                     for cert in batch.into_certificates() {
@@ -666,6 +669,7 @@ where
                             ProtocolEvent::ExecutionCertificateReceived { cert },
                         ));
                     }
+                    GossipVerdict::Accept
                 },
             );
 
@@ -675,11 +679,11 @@ where
         let topology = Arc::clone(&self.topology);
         self.network.register_gossip_handler::<BlockHeaderGossip>(
             TopicScope::Shard,
-            move |gossip: BlockHeaderGossip| {
+            move |gossip: BlockHeaderGossip| -> GossipVerdict {
                 let proposer = gossip.header.proposer;
                 let Some(public_key) = topology.public_key(proposer) else {
                     warn!(proposer = proposer.0, "Unknown proposer for block header");
-                    return;
+                    return GossipVerdict::Reject;
                 };
                 let msg = gossip.signing_message();
                 let start = std::time::Instant::now();
@@ -697,15 +701,16 @@ where
                         proposer = proposer.0,
                         height = gossip.header.height.0,
                         round = gossip.header.round,
-                        "Block header proposer signature invalid — dropping"
+                        "Block header proposer signature invalid — rejecting"
                     );
-                    return;
+                    return GossipVerdict::Reject;
                 }
                 let (header, manifest, _sig) = gossip.into_parts();
                 let _ = tx.send(NodeInput::Protocol(ProtocolEvent::BlockHeaderReceived {
                     header,
                     manifest,
                 }));
+                GossipVerdict::Accept
             },
         );
 
@@ -715,13 +720,14 @@ where
         let tx = self.event_sender.clone();
         self.network.register_gossip_handler::<TransactionGossip>(
             TopicScope::Shard,
-            move |gossip: TransactionGossip| {
+            move |gossip: TransactionGossip| -> GossipVerdict {
                 let _ = tx.send(NodeInput::Protocol(
                     ProtocolEvent::TransactionGossipReceived {
                         tx: gossip.transaction,
                         submitted_locally: false,
                     },
                 ));
+                GossipVerdict::Accept
             },
         );
 
@@ -733,7 +739,7 @@ where
         self.network
             .register_gossip_handler::<TransactionCertificateGossip>(
                 TopicScope::Shard,
-                move |gossip: TransactionCertificateGossip| {
+                move |gossip: TransactionCertificateGossip| -> GossipVerdict {
                     let sender = gossip.sender;
                     let committee = topology.committee_for_shard(local_shard);
                     if !committee.contains(&sender) {
@@ -741,7 +747,7 @@ where
                             sender = sender.0,
                             "Transaction certificate gossip sender not in local shard committee"
                         );
-                        return;
+                        return GossipVerdict::Reject;
                     }
 
                     let Some(public_key) = topology.public_key(sender) else {
@@ -749,7 +755,7 @@ where
                             sender = sender.0,
                             "Could not resolve public key for transaction certificate gossip sender"
                         );
-                        return;
+                        return GossipVerdict::Reject;
                     };
 
                     let msg = gossip.signing_message(local_shard);
@@ -766,14 +772,15 @@ where
                     if !valid {
                         warn!(
                             sender = sender.0,
-                            "Transaction certificate gossip sender signature invalid — dropping"
+                            "Transaction certificate gossip sender signature invalid — rejecting"
                         );
-                        return;
+                        return GossipVerdict::Reject;
                     }
 
                     let _ = tx.send(NodeInput::TransactionCertificateReceived {
                         certificate: gossip.into_certificate(),
                     });
+                    GossipVerdict::Accept
                 },
             );
 
@@ -785,13 +792,13 @@ where
         self.network
             .register_gossip_handler::<hyperscale_messages::CommittedBlockHeaderGossip>(
                 TopicScope::Global,
-                move |gossip: hyperscale_messages::CommittedBlockHeaderGossip| {
+                move |gossip: hyperscale_messages::CommittedBlockHeaderGossip| -> GossipVerdict {
                     let sender = gossip.sender;
                     let header_shard = gossip.committed_header.header.shard_group_id;
 
-                    // Ignore headers from our own shard.
+                    // Own-shard headers are valid but not needed — accept to forward.
                     if header_shard == local_shard {
-                        return;
+                        return GossipVerdict::Accept;
                     }
 
                     // Verify sender is in the source shard's committee.
@@ -802,7 +809,7 @@ where
                             header_shard = header_shard.0,
                             "Committed header sender not in source shard committee"
                         );
-                        return;
+                        return GossipVerdict::Reject;
                     }
 
                     // Resolve sender's public key.
@@ -811,7 +818,7 @@ where
                             sender = sender.0,
                             "Could not resolve public key for committed header sender"
                         );
-                        return;
+                        return GossipVerdict::Reject;
                     };
 
                     let _ = tx.send(NodeInput::CommittedBlockGossipReceived {
@@ -820,6 +827,7 @@ where
                         public_key,
                         sender_signature: gossip.sender_signature,
                     });
+                    GossipVerdict::Accept
                 },
             );
     }

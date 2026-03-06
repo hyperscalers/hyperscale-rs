@@ -482,7 +482,7 @@ impl SimulatedNetwork {
                 .get(scheduled.target_node as usize)
                 .and_then(|r| r.get_gossip(scheduled.message_type))
             {
-                handler(scheduled.payload);
+                let _ = handler(scheduled.payload);
                 delivered += 1;
             } else {
                 debug!(
@@ -1000,6 +1000,7 @@ mod tests {
     /// the SimulatedNetwork infrastructure, not the typed handler API.
     fn register_gossip_handlers(network: &SimulatedNetwork) -> Vec<Arc<RecordingHandler>> {
         use hyperscale_network::registry::RawGossipHandler;
+        use hyperscale_network::GossipVerdict;
         let total = network.total_nodes();
         (0..total as NodeIndex)
             .map(|i| {
@@ -1008,6 +1009,7 @@ mod tests {
                 let handler_clone = handler.clone();
                 let raw: Arc<RawGossipHandler> = Arc::new(move |payload: Vec<u8>| {
                     handler_clone.received.lock().unwrap().push(payload);
+                    GossipVerdict::Accept
                 });
                 adapter.registry.register_raw_gossip(TEST_GOSSIP_TYPE, raw);
                 handler
@@ -1310,6 +1312,7 @@ mod tests {
         // Register per-type handlers for "block.vote" on each node.
         // Register directly on registry since we want raw recording handlers.
         use hyperscale_network::registry::RawGossipHandler;
+        use hyperscale_network::GossipVerdict;
         let handlers: Vec<Arc<RecordingHandler>> = (0..network.total_nodes() as NodeIndex)
             .map(|i| {
                 let handler = RecordingHandler::new();
@@ -1317,6 +1320,7 @@ mod tests {
                 let handler_clone = handler.clone();
                 let raw: Arc<RawGossipHandler> = Arc::new(move |payload: Vec<u8>| {
                     handler_clone.received.lock().unwrap().push(payload);
+                    GossipVerdict::Accept
                 });
                 adapter.registry.register_raw_gossip("block.vote", raw);
                 handler

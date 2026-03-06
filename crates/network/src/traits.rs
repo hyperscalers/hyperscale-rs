@@ -37,18 +37,34 @@ pub enum TopicScope {
     Global,
 }
 
+/// Result of gossip message validation by the application handler.
+///
+/// Returned by [`GossipHandler::on_message`] to tell the network layer whether
+/// the message should be accepted (forwarded to peers) or rejected (dropped
+/// with a peer-scoring penalty).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GossipVerdict {
+    /// Message is valid — accept and forward to peers.
+    Accept,
+    /// Message is invalid — reject and penalize sender.
+    Reject,
+}
+
 /// Typed handler for a single gossip message type.
 ///
 /// Called after the network layer SBOR-decodes the raw payload into `M`.
 /// Implementations typically convert the message into a `ProtocolEvent` and
 /// send it to the IoLoop via a captured channel sender.
+///
+/// Returns [`GossipVerdict`] to indicate whether the message should be
+/// accepted (forwarded) or rejected (dropped with peer penalty).
 pub trait GossipHandler<M: NetworkMessage>: Send + Sync + 'static {
-    fn on_message(&self, message: M);
+    fn on_message(&self, message: M) -> GossipVerdict;
 }
 
-/// Blanket impl: any `Fn(M)` can serve as a typed gossip handler.
-impl<M: NetworkMessage, F: Fn(M) + Send + Sync + 'static> GossipHandler<M> for F {
-    fn on_message(&self, message: M) {
+/// Blanket impl: any `Fn(M) -> GossipVerdict` can serve as a typed gossip handler.
+impl<M: NetworkMessage, F: Fn(M) -> GossipVerdict + Send + Sync + 'static> GossipHandler<M> for F {
+    fn on_message(&self, message: M) -> GossipVerdict {
         (self)(message)
     }
 }
@@ -157,10 +173,12 @@ mod tests {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let counter_clone = counter.clone();
-        let handler = move |_msg: TestMsg| {
+        let handler = move |_msg: TestMsg| -> GossipVerdict {
             counter_clone.fetch_add(1, Ordering::SeqCst);
+            GossipVerdict::Accept
         };
-        handler.on_message(TestMsg(42));
+        let verdict = handler.on_message(TestMsg(42));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(verdict, GossipVerdict::Accept);
     }
 }

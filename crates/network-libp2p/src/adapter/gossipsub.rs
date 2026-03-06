@@ -117,12 +117,21 @@ pub(super) async fn handle_gossipsub_event(
             tokio::spawn(async move {
                 match hyperscale_network::compression::decompress(&message.data) {
                     Ok(payload) => {
-                        handler(payload);
-                        metrics::record_network_message_received();
+                        let verdict = handler(payload);
+                        let acceptance = match verdict {
+                            hyperscale_network::GossipVerdict::Accept => {
+                                metrics::record_network_message_received();
+                                gossipsub::MessageAcceptance::Accept
+                            }
+                            hyperscale_network::GossipVerdict::Reject => {
+                                metrics::record_invalid_message();
+                                gossipsub::MessageAcceptance::Reject
+                            }
+                        };
                         let _ = vtx.send(ValidationReport {
                             message_id,
                             propagation_source,
-                            acceptance: gossipsub::MessageAcceptance::Accept,
+                            acceptance,
                         });
                     }
                     Err(e) => {
