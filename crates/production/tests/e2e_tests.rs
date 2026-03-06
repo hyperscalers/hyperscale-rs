@@ -14,7 +14,9 @@ use hyperscale_bft::BftConfig;
 use hyperscale_production::{ProductionRunner, RocksDbStorage};
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, ValidatorId,
+    generate_bls_keypair, validator_bind_message, Block, BlockHeader, BlockHeight, Hash,
+    QuorumCertificate, ShardGroupId, StaticTopology, Topology, ValidatorId, ValidatorInfo,
+    ValidatorSet,
 };
 use serial_test::serial;
 use std::sync::Arc;
@@ -95,6 +97,27 @@ async fn test_storage_operations() {
 // Network Tests (localhost QUIC)
 // ============================================================================
 
+/// Create a dummy bind signature + topology for tests that create adapters directly.
+fn test_bind_args(
+    keypair: &libp2p::identity::Keypair,
+    validator_id: ValidatorId,
+) -> (hyperscale_types::Bls12381G2Signature, Arc<dyn Topology>) {
+    let bls_key = generate_bls_keypair();
+    let pubkey = bls_key.public_key();
+    let peer_id = libp2p::PeerId::from(keypair.public());
+    let sig = bls_key.sign_v1(&validator_bind_message(&peer_id.to_bytes()));
+    let topo = Arc::new(StaticTopology::new(
+        validator_id,
+        1,
+        ValidatorSet::new(vec![ValidatorInfo {
+            validator_id,
+            public_key: pubkey,
+            voting_power: 1,
+        }]),
+    )) as Arc<dyn Topology>;
+    (sig, topo)
+}
+
 #[tokio::test]
 #[serial]
 async fn test_network_adapter_starts() {
@@ -114,6 +137,7 @@ async fn test_network_adapter_starts() {
         ..Default::default()
     };
 
+    let (bind_sig, topo) = test_bind_args(&keypair, validator_id);
     let result = timeout(
         CONNECTION_TIMEOUT,
         Libp2pAdapter::new(
@@ -122,6 +146,8 @@ async fn test_network_adapter_starts() {
             validator_id,
             shard,
             Arc::new(hyperscale_network::HandlerRegistry::new()),
+            bind_sig,
+            topo,
         ),
     )
     .await;
@@ -150,6 +176,7 @@ async fn test_two_node_connection() {
 
     // Node 1
     let keypair1 = identity::Keypair::generate_ed25519();
+    let (bind_sig1, topo1) = test_bind_args(&keypair1, ValidatorId(0));
     let config1 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -161,6 +188,8 @@ async fn test_two_node_connection() {
         ValidatorId(0),
         ShardGroupId(0),
         Arc::new(hyperscale_network::HandlerRegistry::new()),
+        bind_sig1,
+        topo1,
     )
     .await
     .unwrap();
@@ -174,6 +203,7 @@ async fn test_two_node_connection() {
 
     // Node 2 - bootstrap to node 1
     let keypair2 = identity::Keypair::generate_ed25519();
+    let (bind_sig2, topo2) = test_bind_args(&keypair2, ValidatorId(1));
     let config2 = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![node1_addr.clone()],
@@ -185,6 +215,8 @@ async fn test_two_node_connection() {
         ValidatorId(1),
         ShardGroupId(0),
         Arc::new(hyperscale_network::HandlerRegistry::new()),
+        bind_sig2,
+        topo2,
     )
     .await
     .unwrap();
@@ -226,6 +258,7 @@ async fn test_topic_subscription() {
     use libp2p::identity;
 
     let keypair = identity::Keypair::generate_ed25519();
+    let (bind_sig, topo) = test_bind_args(&keypair, ValidatorId(0));
     let config = Libp2pConfig {
         listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
         bootstrap_peers: vec![],
@@ -237,6 +270,8 @@ async fn test_topic_subscription() {
         ValidatorId(0),
         ShardGroupId(0),
         Arc::new(hyperscale_network::HandlerRegistry::new()),
+        bind_sig,
+        topo,
     )
     .await
     .unwrap();
@@ -246,6 +281,265 @@ async fn test_topic_subscription() {
     assert!(result.is_ok(), "Should subscribe to topic");
 
     info!("Topic subscription successful");
+}
+
+// ============================================================================
+// Validator-Bind Protocol Tests
+// ============================================================================
+
+#[tokio::test]
+#[serial]
+async fn test_validator_bind_success() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
+
+    // Shared topology — both validators known to both nodes.
+    let fixtures = TestFixtures::new(42, 2);
+
+    // Node 0
+    let keypair0 = fixtures.ed25519_keypair(0);
+    let bind_sig0 = fixtures.bind_signature(0, &keypair0);
+    let config0 = Libp2pConfig {
+        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
+        bootstrap_peers: vec![],
+        ..Default::default()
+    };
+    let adapter0 = Libp2pAdapter::new(
+        config0,
+        keypair0,
+        ValidatorId(0),
+        ShardGroupId(0),
+        Arc::new(hyperscale_network::HandlerRegistry::new()),
+        bind_sig0,
+        fixtures.topology(0),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let addrs0 = adapter0.listen_addresses().await;
+    assert!(!addrs0.is_empty(), "Node 0 should have listen addresses");
+    let node0_addr = addrs0[0].clone();
+
+    // Node 1 — bootstrap to node 0
+    let keypair1 = fixtures.ed25519_keypair(1);
+    let bind_sig1 = fixtures.bind_signature(1, &keypair1);
+    let config1 = Libp2pConfig {
+        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
+        bootstrap_peers: vec![node0_addr],
+        ..Default::default()
+    };
+    let adapter1 = Libp2pAdapter::new(
+        config1,
+        keypair1,
+        ValidatorId(1),
+        ShardGroupId(0),
+        Arc::new(hyperscale_network::HandlerRegistry::new()),
+        bind_sig1,
+        fixtures.topology(1),
+    )
+    .await
+    .unwrap();
+
+    // Wait for validator-bind to complete on both sides.
+    let bound = timeout(CONNECTION_TIMEOUT, async {
+        loop {
+            if let (Some(p1), Some(p0)) = (
+                adapter0.peer_for_validator(ValidatorId(1)),
+                adapter1.peer_for_validator(ValidatorId(0)),
+            ) {
+                return (p1, p0);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+
+    assert!(
+        bound.is_ok(),
+        "Validator-bind should complete within timeout"
+    );
+    let (resolved_peer1, resolved_peer0) = bound.unwrap();
+
+    // Resolved PeerIds must match the actual adapter PeerIds.
+    assert_eq!(resolved_peer1, adapter1.local_peer_id());
+    assert_eq!(resolved_peer0, adapter0.local_peer_id());
+
+    info!("Validator-bind success test completed");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_validator_bind_rejects_wrong_key() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
+
+    let fixtures = TestFixtures::new(42, 2);
+
+    // Node 0 — legitimate
+    let keypair0 = fixtures.ed25519_keypair(0);
+    let bind_sig0 = fixtures.bind_signature(0, &keypair0);
+    let config0 = Libp2pConfig {
+        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
+        bootstrap_peers: vec![],
+        ..Default::default()
+    };
+    let adapter0 = Libp2pAdapter::new(
+        config0,
+        keypair0,
+        ValidatorId(0),
+        ShardGroupId(0),
+        Arc::new(hyperscale_network::HandlerRegistry::new()),
+        bind_sig0,
+        fixtures.topology(0),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let addrs0 = adapter0.listen_addresses().await;
+    assert!(!addrs0.is_empty(), "Node 0 should have listen addresses");
+    let node0_addr = addrs0[0].clone();
+
+    // Node 1 — impersonator: signs with a BLS key that doesn't match the topology.
+    let keypair1 = fixtures.ed25519_keypair(1);
+    let wrong_bls_key = generate_bls_keypair();
+    let peer1_id = libp2p::PeerId::from(keypair1.public());
+    let wrong_sig = wrong_bls_key.sign_v1(&validator_bind_message(&peer1_id.to_bytes()));
+    let config1 = Libp2pConfig {
+        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
+        bootstrap_peers: vec![node0_addr],
+        ..Default::default()
+    };
+    let adapter1 = Libp2pAdapter::new(
+        config1,
+        keypair1,
+        ValidatorId(1),
+        ShardGroupId(0),
+        Arc::new(hyperscale_network::HandlerRegistry::new()),
+        wrong_sig,
+        fixtures.topology(1),
+    )
+    .await
+    .unwrap();
+
+    // Wait for transport connection to establish.
+    let connected = timeout(CONNECTION_TIMEOUT, async {
+        loop {
+            if !adapter0.connected_peers().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(connected.is_ok(), "Transport connection should establish");
+
+    // Give the bind protocol time to attempt and fail.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Node 0 must NOT trust the impersonator.
+    assert!(
+        adapter0.peer_for_validator(ValidatorId(1)).is_none(),
+        "Node 0 should NOT resolve validator 1 (wrong BLS key)"
+    );
+
+    // Suppress unused-variable warning — we need adapter1 alive for the connection.
+    drop(adapter1);
+
+    info!("Validator-bind rejection test completed");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_validator_bind_evicted_on_disconnect() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
+
+    let fixtures = TestFixtures::new(42, 2);
+
+    // Node 0
+    let keypair0 = fixtures.ed25519_keypair(0);
+    let bind_sig0 = fixtures.bind_signature(0, &keypair0);
+    let config0 = Libp2pConfig {
+        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
+        bootstrap_peers: vec![],
+        ..Default::default()
+    };
+    let adapter0 = Libp2pAdapter::new(
+        config0,
+        keypair0,
+        ValidatorId(0),
+        ShardGroupId(0),
+        Arc::new(hyperscale_network::HandlerRegistry::new()),
+        bind_sig0,
+        fixtures.topology(0),
+    )
+    .await
+    .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let addrs0 = adapter0.listen_addresses().await;
+    assert!(!addrs0.is_empty(), "Node 0 should have listen addresses");
+    let node0_addr = addrs0[0].clone();
+
+    // Node 1
+    let keypair1 = fixtures.ed25519_keypair(1);
+    let bind_sig1 = fixtures.bind_signature(1, &keypair1);
+    let config1 = Libp2pConfig {
+        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
+        bootstrap_peers: vec![node0_addr],
+        ..Default::default()
+    };
+    let adapter1 = Libp2pAdapter::new(
+        config1,
+        keypair1,
+        ValidatorId(1),
+        ShardGroupId(0),
+        Arc::new(hyperscale_network::HandlerRegistry::new()),
+        bind_sig1,
+        fixtures.topology(1),
+    )
+    .await
+    .unwrap();
+
+    // Wait for bind to complete.
+    let bound = timeout(CONNECTION_TIMEOUT, async {
+        loop {
+            if adapter0.peer_for_validator(ValidatorId(1)).is_some() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        bound.is_ok(),
+        "Validator-bind should complete within timeout"
+    );
+
+    // Drop node 1 — triggers shutdown and connection close.
+    drop(adapter1);
+
+    // Node 0 should evict the mapping once the disconnect is detected.
+    let evicted = timeout(CONNECTION_TIMEOUT, async {
+        loop {
+            if adapter0.peer_for_validator(ValidatorId(1)).is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        evicted.is_ok(),
+        "Validator mapping should be evicted after disconnect"
+    );
+
+    info!("Validator-bind eviction test completed");
 }
 
 // ============================================================================

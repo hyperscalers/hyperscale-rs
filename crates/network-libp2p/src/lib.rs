@@ -12,6 +12,7 @@ mod inbound_router;
 mod network;
 mod request_manager;
 mod stream_framing;
+mod validator_bind;
 
 pub use adapter::{generate_random_keypair, Libp2pAdapter, NetworkError};
 pub use config::{Libp2pConfig, VersionInteroperabilityMode};

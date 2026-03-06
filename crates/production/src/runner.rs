@@ -357,6 +357,15 @@ impl ProductionRunnerBuilder {
         let io_loop_signing_key =
             Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
 
+        // Pre-compute the BLS signature binding our ValidatorId to our libp2p PeerId.
+        // This is used by the validator-bind protocol to cryptographically prove identity.
+        let local_peer_id = libp2p::PeerId::from(ed25519_keypair.public());
+        let bind_signing_key =
+            Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
+        let local_bind_signature = bind_signing_key.sign_v1(
+            &hyperscale_types::validator_bind_message(&local_peer_id.to_bytes()),
+        );
+
         // ── Crossbeam channels (→ pinned thread) ───────────────────────
         //
         // These are the inputs to the pinned IoLoop thread. Crossbeam unbounded
@@ -418,6 +427,8 @@ impl ProductionRunnerBuilder {
             validator_id,
             local_shard,
             registry.clone(),
+            local_bind_signature,
+            topology.clone(),
         )
         .await?;
 

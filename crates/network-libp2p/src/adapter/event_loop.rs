@@ -34,17 +34,13 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// Interval for periodic Kademlia refresh to discover new peers.
 const KADEMLIA_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Parse the hyperscale agent version format: `"hyperscale/<validator_id>/<version>"`.
+/// Parse the hyperscale agent version format: `"hyperscale/<version>"`.
 ///
-/// Returns `(ValidatorId, version_str)` if the format is valid.
-fn parse_agent_version(agent_version: &str) -> Option<(ValidatorId, &str)> {
-    let parts: Vec<&str> = agent_version.splitn(3, '/').collect();
-    if parts.len() == 3 && parts[0] == "hyperscale" {
-        let vid = parts[1].parse::<u64>().ok()?;
-        Some((ValidatorId(vid), parts[2]))
-    } else {
-        None
-    }
+/// Returns the version string if the format is valid.
+fn parse_hyperscale_version(agent_version: &str) -> Option<&str> {
+    agent_version
+        .strip_prefix("hyperscale/")
+        .filter(|v| !v.is_empty())
 }
 
 /// Background event loop that processes swarm events and routes messages.
@@ -64,6 +60,7 @@ pub(super) async fn run(
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
     validation_tx: mpsc::UnboundedSender<ValidationReport>,
     mut validation_rx: mpsc::UnboundedReceiver<ValidationReport>,
+    bind_trigger_tx: mpsc::UnboundedSender<Libp2pPeerId>,
 ) {
     // Track whether we've bootstrapped Kademlia (do it once after first connection)
     let mut kademlia_bootstrapped = false;
@@ -224,21 +221,17 @@ pub(super) async fn run(
                     SwarmEvent::ConnectionEstablished { .. } | SwarmEvent::ConnectionClosed { .. }
                 );
 
-                // Handle Identify events — validator discovery + version check
+                // Handle Identify events — version check + trigger validator-bind
                 if let SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) = &event {
                     let local_version = option_env!("HYPERSCALE_VERSION").unwrap_or("localdev");
 
-                    if let Some((remote_validator_id, remote_version)) = parse_agent_version(&info.agent_version) {
+                    if let Some(remote_version) = parse_hyperscale_version(&info.agent_version) {
                         info!(
                             peer = %peer_id,
-                            validator_id = remote_validator_id.0,
                             version = %remote_version,
                             protocol_version = %info.protocol_version,
-                            "Identified peer — registered for request-response"
+                            "Identified hyperscale peer"
                         );
-
-                        // Register ValidatorId → PeerId for request-response routing.
-                        validator_peers.insert(remote_validator_id, *peer_id);
 
                         // Version compatibility check
                         if !version_interop_mode.check(local_version, remote_version) {
@@ -252,6 +245,12 @@ pub(super) async fn run(
                             if swarm.disconnect_peer_id(*peer_id).is_err() {
                                 debug!(peer = %peer_id, "Failed to disconnect incompatible peer");
                             }
+                        } else {
+                            // Version OK — trigger the validator-bind protocol.
+                            // The bind service will open a stream, exchange BLS-signed
+                            // PeerId proofs, and register the ValidatorId → PeerId
+                            // mapping on success.
+                            let _ = bind_trigger_tx.send(*peer_id);
                         }
                     } else {
                         warn!(
@@ -313,15 +312,22 @@ pub(super) async fn run(
                         "Connection closed"
                     );
 
-                    // Schedule reconnect if this was the last connection to a known peer
-                    if *num_established == 0 && validator_addresses.contains_key(peer_id) {
-                        let reconnect_time = std::time::Instant::now() + RECONNECT_DELAY;
-                        info!(
-                            peer = %peer_id,
-                            reconnect_in_secs = RECONNECT_DELAY.as_secs(),
-                            "Peer disconnected, scheduling reconnection"
-                        );
-                        pending_reconnects.insert(*peer_id, reconnect_time);
+                    // If this was the last connection to a peer, evict stale
+                    // validator_peers entries and schedule reconnection.
+                    if *num_established == 0 {
+                        // Evict ValidatorId → PeerId mapping for this peer.
+                        // DashMap doesn't have reverse lookup, so scan entries.
+                        validator_peers.retain(|_vid, pid| *pid != *peer_id);
+
+                        if validator_addresses.contains_key(peer_id) {
+                            let reconnect_time = std::time::Instant::now() + RECONNECT_DELAY;
+                            info!(
+                                peer = %peer_id,
+                                reconnect_in_secs = RECONNECT_DELAY.as_secs(),
+                                "Peer disconnected, scheduling reconnection"
+                            );
+                            pending_reconnects.insert(*peer_id, reconnect_time);
+                        }
                     }
                 }
 
@@ -469,48 +475,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_agent_version_valid() {
-        let (vid, version) = parse_agent_version("hyperscale/5/1.0.0").unwrap();
-        assert_eq!(vid, ValidatorId(5));
-        assert_eq!(version, "1.0.0");
+    fn test_parse_hyperscale_version_valid() {
+        assert_eq!(parse_hyperscale_version("hyperscale/1.0.0"), Some("1.0.0"));
     }
 
     #[test]
-    fn test_parse_agent_version_localdev() {
-        let (vid, version) = parse_agent_version("hyperscale/42/localdev").unwrap();
-        assert_eq!(vid, ValidatorId(42));
-        assert_eq!(version, "localdev");
+    fn test_parse_hyperscale_version_localdev() {
+        assert_eq!(
+            parse_hyperscale_version("hyperscale/localdev"),
+            Some("localdev")
+        );
     }
 
     #[test]
-    fn test_parse_agent_version_version_with_slashes() {
-        // splitn(3, '/') ensures version part can contain slashes
-        let (vid, version) = parse_agent_version("hyperscale/0/1.0.0/extra").unwrap();
-        assert_eq!(vid, ValidatorId(0));
-        assert_eq!(version, "1.0.0/extra");
+    fn test_parse_hyperscale_version_with_slashes() {
+        // Version part can contain slashes
+        assert_eq!(
+            parse_hyperscale_version("hyperscale/1.0.0/extra"),
+            Some("1.0.0/extra")
+        );
     }
 
     #[test]
-    fn test_parse_agent_version_wrong_prefix() {
-        assert!(parse_agent_version("other/5/1.0.0").is_none());
+    fn test_parse_hyperscale_version_wrong_prefix() {
+        assert!(parse_hyperscale_version("other/1.0.0").is_none());
+        assert!(parse_hyperscale_version("lighthouse/v5.1.0").is_none());
     }
 
     #[test]
-    fn test_parse_agent_version_invalid_validator_id() {
-        assert!(parse_agent_version("hyperscale/abc/1.0.0").is_none());
+    fn test_parse_hyperscale_version_empty_or_missing() {
+        assert!(parse_hyperscale_version("hyperscale/").is_none());
+        assert!(parse_hyperscale_version("hyperscale").is_none());
+        assert!(parse_hyperscale_version("").is_none());
     }
 
     #[test]
-    fn test_parse_agent_version_too_few_parts() {
-        assert!(parse_agent_version("hyperscale/5").is_none());
-        assert!(parse_agent_version("hyperscale").is_none());
-        assert!(parse_agent_version("").is_none());
-    }
-
-    #[test]
-    fn test_parse_agent_version_legacy_format() {
-        // Old format without validator ID should fail gracefully
-        assert!(parse_agent_version("localdev").is_none());
-        assert!(parse_agent_version("1.0.0").is_none());
+    fn test_parse_hyperscale_version_legacy_format() {
+        // Old format with embedded ValidatorId now returns vid as part of version
+        // (harmless — version check will handle compatibility)
+        assert_eq!(
+            parse_hyperscale_version("hyperscale/42/1.0.0"),
+            Some("42/1.0.0")
+        );
     }
 }

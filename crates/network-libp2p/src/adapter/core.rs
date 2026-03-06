@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use futures::FutureExt;
 use hyperscale_metrics as metrics;
 use hyperscale_network::HandlerRegistry;
-use hyperscale_types::{MessagePriority, ShardGroupId, ValidatorId};
+use hyperscale_types::{Bls12381G2Signature, MessagePriority, ShardGroupId, Topology, ValidatorId};
 use libp2p::{gossipsub, identify, identity, kad, Multiaddr, PeerId as Libp2pPeerId, Stream};
 use libp2p_stream as stream;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -60,6 +60,8 @@ impl Libp2pAdapter {
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
     /// * `registry` - Shared handler registry for per-type message dispatch
+    /// * `local_bind_signature` - Pre-computed BLS signature over our PeerId (for validator-bind)
+    /// * `topology` - Validator set for BLS public key lookups during bind verification
     ///
     /// # Returns
     ///
@@ -70,6 +72,8 @@ impl Libp2pAdapter {
         validator_id: ValidatorId,
         shard: ShardGroupId,
         registry: Arc<HandlerRegistry>,
+        local_bind_signature: Bls12381G2Signature,
+        topology: Arc<dyn Topology>,
     ) -> Result<Arc<Self>, NetworkError> {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
 
@@ -126,12 +130,13 @@ impl Libp2pAdapter {
         );
 
         // Configure Identify protocol.
-        // Agent version format: "hyperscale/<validator_id>/<version>"
-        // This lets peers discover our ValidatorId for request-response routing.
+        // Agent version format: "hyperscale/<version>"
+        // Used for version compatibility checks; ValidatorId binding is
+        // handled separately by the validator-bind protocol.
         let version = option_env!("HYPERSCALE_VERSION").unwrap_or("localdev");
         let identify_config =
             identify::Config::new("/hyperscale/1.0.0".to_string(), keypair.public())
-                .with_agent_version(format!("hyperscale/{}/{}", validator_id.0, version));
+                .with_agent_version(format!("hyperscale/{}", version));
         let identify = identify::Behaviour::new(identify_config);
 
         // Create behaviour
@@ -201,6 +206,16 @@ impl Libp2pAdapter {
 
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
+        // Spawn the validator-bind service. This handles cryptographic
+        // ValidatorId ↔ PeerId binding via BLS signatures.
+        let bind_handle = crate::validator_bind::spawn_validator_bind_service(
+            stream_control.clone(),
+            validator_peers.clone(),
+            validator_id,
+            local_bind_signature,
+            topology,
+        );
+
         let adapter = Arc::new(Self {
             local_peer_id,
             local_validator_id: validator_id,
@@ -214,7 +229,11 @@ impl Libp2pAdapter {
         // Spawn with panic catching - network loop panics are critical but shouldn't
         // crash the entire node. The process supervisor (systemd/k8s) should restart.
         let event_loop_validator_peers = validator_peers.clone();
+        let bind_trigger_tx = bind_handle.bind_tx.clone();
         tokio::spawn(async move {
+            // Keep bind_handle alive for the lifetime of the event loop.
+            let _bind_handle = bind_handle;
+
             let result = std::panic::AssertUnwindSafe(super::event_loop::run(
                 swarm,
                 critical_rx,
@@ -230,6 +249,7 @@ impl Libp2pAdapter {
                 event_loop_validator_peers,
                 validation_tx,
                 validation_rx,
+                bind_trigger_tx,
             ))
             .catch_unwind()
             .await;

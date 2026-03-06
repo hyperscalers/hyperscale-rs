@@ -14,6 +14,7 @@
 //! | `EXEC_VOTE` | Execution votes |
 //! | `COMMITTED_BLOCK_HEADER` | Committed block header gossip |
 //! | `BLOCK_HEADER` | Block header proposal gossip |
+//! | `VALIDATOR_BIND` | Validator-bind PeerId authentication |
 //!
 //! # Usage
 //!
@@ -231,6 +232,27 @@ pub fn tx_cert_gossip_message(shard_group: ShardGroupId, tx_hash: &Hash) -> Vec<
     message
 }
 
+/// Domain tag for validator-bind protocol.
+///
+/// Format: `VALIDATOR_BIND` || peer_id_bytes
+///
+/// Signed by a validator's BLS key to cryptographically bind their
+/// consensus identity (ValidatorId) to their ephemeral libp2p PeerId.
+/// Verified by peers using the BLS public key from the topology.
+pub const DOMAIN_VALIDATOR_BIND: &[u8] = b"VALIDATOR_BIND";
+
+/// Build the signing message for the validator-bind protocol.
+///
+/// The message binds a validator's BLS identity to their ephemeral libp2p PeerId.
+/// The Noise handshake proves PeerId ownership; this signature proves the BLS key
+/// holder authorised that PeerId.
+pub fn validator_bind_message(peer_id_bytes: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(DOMAIN_VALIDATOR_BIND.len() + peer_id_bytes.len());
+    message.extend_from_slice(DOMAIN_VALIDATOR_BIND);
+    message.extend_from_slice(peer_id_bytes);
+    message
+}
+
 /// Build the signing message for an execution vote.
 ///
 /// This is used for:
@@ -403,6 +425,27 @@ mod tests {
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_TX_CERT_GOSSIP));
+    }
+
+    #[test]
+    fn test_validator_bind_message_deterministic() {
+        let peer_id = b"12D3KooWDummyPeerId000000000000000";
+
+        let msg1 = validator_bind_message(peer_id);
+        let msg2 = validator_bind_message(peer_id);
+
+        assert_eq!(msg1, msg2);
+        assert!(msg1.starts_with(DOMAIN_VALIDATOR_BIND));
+    }
+
+    #[test]
+    fn test_validator_bind_differs_from_other_domains() {
+        let bytes = b"some_bytes_here_for_testing_1234";
+
+        let bind_msg = validator_bind_message(bytes);
+        let block_msg = block_vote_message(ShardGroupId(0), 0, 0, &Hash::from_bytes(bytes));
+
+        assert_ne!(bind_msg, block_msg);
     }
 
     #[test]

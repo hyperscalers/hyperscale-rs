@@ -139,7 +139,6 @@ impl TestFixtures {
     }
 
     /// Get the Ed25519 keypair for a validator.
-    #[allow(dead_code)]
     pub fn ed25519_keypair(&self, index: u32) -> identity::Keypair {
         self.ed25519_keys[index as usize].clone()
     }
@@ -154,6 +153,20 @@ impl TestFixtures {
         let start = shard.0 as u32 * self.validators_per_shard;
         let end = start + self.validators_per_shard;
         (start..end).collect()
+    }
+
+    /// Compute the BLS bind signature for a validator's PeerId.
+    ///
+    /// Used by the validator-bind protocol to prove identity.
+    pub fn bind_signature(
+        &self,
+        index: u32,
+        keypair: &identity::Keypair,
+    ) -> hyperscale_types::Bls12381G2Signature {
+        let peer_id = libp2p::PeerId::from(keypair.public());
+        let msg = hyperscale_types::validator_bind_message(&peer_id.to_bytes());
+        let signing_key = self.signing_key(index);
+        signing_key.sign_v1(&msg)
     }
 
     /// Create a listen address using port 0 (OS-assigned).
