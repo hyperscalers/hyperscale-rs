@@ -96,21 +96,45 @@ impl ShardMessage for StateProvisionBatch {}
 /// Batched votes on transaction execution results within a shard.
 ///
 /// 2f+1 matching votes create an ExecutionCertificate with aggregated BLS signature.
+/// The sender signature authenticates the batch at the gossipsub layer, allowing
+/// receivers to reject forged vote batches before doing expensive per-vote
+/// BLS signature verification.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ExecutionVoteBatch {
-    /// The execution votes being gossiped
+    /// The execution votes being gossiped.
     pub votes: Vec<ExecutionVote>,
+    /// The validator who sent this batch.
+    pub sender: ValidatorId,
+    /// BLS signature over the domain-separated signing message, by the sender.
+    pub sender_signature: Bls12381G2Signature,
 }
 
 impl ExecutionVoteBatch {
-    /// Create a new execution vote batch.
-    pub fn new(votes: Vec<ExecutionVote>) -> Self {
-        Self { votes }
+    /// Create a new signed execution vote batch.
+    pub fn new(
+        votes: Vec<ExecutionVote>,
+        sender: ValidatorId,
+        sender_signature: Bls12381G2Signature,
+    ) -> Self {
+        Self {
+            votes,
+            sender,
+            sender_signature,
+        }
+    }
+
+    /// Build the canonical signing message for this batch.
+    pub fn signing_message(&self, shard: hyperscale_types::ShardGroupId) -> Vec<u8> {
+        hyperscale_types::exec_vote_batch_message(shard, &self.votes)
     }
 
     /// Create a batch from a single vote.
-    pub fn single(vote: ExecutionVote) -> Self {
-        Self::new(vec![vote])
+    pub fn single(
+        vote: ExecutionVote,
+        sender: ValidatorId,
+        sender_signature: Bls12381G2Signature,
+    ) -> Self {
+        Self::new(vec![vote], sender, sender_signature)
     }
 
     /// Get the votes.
@@ -149,32 +173,60 @@ impl ShardMessage for ExecutionVoteBatch {}
 /// Batched certificates proving execution quorum.
 ///
 /// Contains full state data. Once all shards' certificates collected, transaction is finalized.
+/// The sender signature authenticates the batch at the gossipsub layer, allowing
+/// receivers to reject forged certificate batches before doing expensive
+/// aggregated BLS signature verification.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ExecutionCertificateBatch {
-    /// The execution certificates being gossiped
+    /// The execution certificates being gossiped.
     pub certificates: Vec<ExecutionCertificate>,
+    /// The validator who sent this batch.
+    pub sender: ValidatorId,
+    /// BLS signature over the domain-separated signing message, by the sender.
+    pub sender_signature: Bls12381G2Signature,
     /// Trace context for distributed tracing (empty when feature disabled).
     pub trace_context: TraceContext,
 }
 
 impl ExecutionCertificateBatch {
-    /// Create a new execution certificate batch.
-    pub fn new(certificates: Vec<ExecutionCertificate>) -> Self {
+    /// Create a new signed execution certificate batch.
+    pub fn new(
+        certificates: Vec<ExecutionCertificate>,
+        sender: ValidatorId,
+        sender_signature: Bls12381G2Signature,
+    ) -> Self {
         Self {
             certificates,
+            sender,
+            sender_signature,
             trace_context: TraceContext::default(),
         }
     }
 
-    /// Create a batch from a single certificate.
-    pub fn single(certificate: ExecutionCertificate) -> Self {
-        Self::new(vec![certificate])
+    /// Build the canonical signing message for this batch.
+    pub fn signing_message(&self, shard: hyperscale_types::ShardGroupId) -> Vec<u8> {
+        hyperscale_types::exec_cert_batch_message(shard, &self.certificates)
     }
 
-    /// Create a new execution certificate batch with trace context from current span.
-    pub fn with_trace_context(certificates: Vec<ExecutionCertificate>) -> Self {
+    /// Create a batch from a single certificate.
+    pub fn single(
+        certificate: ExecutionCertificate,
+        sender: ValidatorId,
+        sender_signature: Bls12381G2Signature,
+    ) -> Self {
+        Self::new(vec![certificate], sender, sender_signature)
+    }
+
+    /// Create a new signed execution certificate batch with trace context from current span.
+    pub fn with_trace_context(
+        certificates: Vec<ExecutionCertificate>,
+        sender: ValidatorId,
+        sender_signature: Bls12381G2Signature,
+    ) -> Self {
         Self {
             certificates,
+            sender,
+            sender_signature,
             trace_context: TraceContext::from_current(),
         }
     }
@@ -227,16 +279,36 @@ impl ShardMessage for ExecutionCertificateBatch {}
 /// Unlike batched messages, this uses individual gossip to enable better deduplication
 /// by gossipsub - the message hash is based on the certificate content, so identical
 /// certificates are naturally deduplicated across the network.
+///
+/// The sender signature authenticates the message at the gossipsub layer, allowing
+/// receivers to reject forged certificate gossip before processing.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct TransactionCertificateGossip {
-    /// The finalized transaction certificate being gossiped
+    /// The finalized transaction certificate being gossiped.
     pub certificate: TransactionCertificate,
+    /// The validator who sent this gossip.
+    pub sender: ValidatorId,
+    /// BLS signature over the domain-separated signing message, by the sender.
+    pub sender_signature: Bls12381G2Signature,
 }
 
 impl TransactionCertificateGossip {
-    /// Create a new transaction certificate gossip message.
-    pub fn new(certificate: TransactionCertificate) -> Self {
-        Self { certificate }
+    /// Create a new signed transaction certificate gossip message.
+    pub fn new(
+        certificate: TransactionCertificate,
+        sender: ValidatorId,
+        sender_signature: Bls12381G2Signature,
+    ) -> Self {
+        Self {
+            certificate,
+            sender,
+            sender_signature,
+        }
+    }
+
+    /// Build the canonical signing message for this gossip.
+    pub fn signing_message(&self, shard: hyperscale_types::ShardGroupId) -> Vec<u8> {
+        hyperscale_types::tx_cert_gossip_message(shard, &self.certificate.transaction_hash)
     }
 
     /// Get the certificate.
@@ -279,7 +351,7 @@ mod tests {
             signature: zero_bls_signature(),
         };
 
-        let batch = ExecutionVoteBatch::single(vote.clone());
+        let batch = ExecutionVoteBatch::single(vote.clone(), ValidatorId(0), zero_bls_signature());
         assert_eq!(batch.len(), 1);
         assert!(!batch.is_empty());
         assert_eq!(batch.votes()[0], vote);
@@ -307,7 +379,8 @@ mod tests {
             signers,
         };
 
-        let batch = ExecutionCertificateBatch::single(cert.clone());
+        let batch =
+            ExecutionCertificateBatch::single(cert.clone(), ValidatorId(0), zero_bls_signature());
         assert_eq!(batch.len(), 1);
         assert!(!batch.is_empty());
         assert_eq!(batch.certificates()[0], cert);
@@ -331,11 +404,11 @@ mod tests {
 
     #[test]
     fn test_empty_batches() {
-        let votes = ExecutionVoteBatch::new(vec![]);
+        let votes = ExecutionVoteBatch::new(vec![], ValidatorId(0), zero_bls_signature());
         assert!(votes.is_empty());
         assert_eq!(votes.len(), 0);
 
-        let certs = ExecutionCertificateBatch::new(vec![]);
+        let certs = ExecutionCertificateBatch::new(vec![], ValidatorId(0), zero_bls_signature());
         assert!(certs.is_empty());
         assert_eq!(certs.len(), 0);
     }
@@ -359,11 +432,16 @@ mod tests {
         };
 
         // new() should have empty trace context
-        let batch = ExecutionCertificateBatch::single(cert.clone());
+        let batch =
+            ExecutionCertificateBatch::single(cert.clone(), ValidatorId(0), zero_bls_signature());
         assert!(!batch.trace_context().has_trace());
 
         // with_trace_context() without active span should also be empty
-        let batch_with_ctx = ExecutionCertificateBatch::with_trace_context(vec![cert]);
+        let batch_with_ctx = ExecutionCertificateBatch::with_trace_context(
+            vec![cert],
+            ValidatorId(0),
+            zero_bls_signature(),
+        );
         assert!(!batch_with_ctx.trace_context().has_trace() || TraceContext::is_enabled());
     }
 }

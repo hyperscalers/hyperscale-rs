@@ -148,6 +148,89 @@ pub fn state_provision_batch_message(
     message
 }
 
+/// Domain tag for execution vote batch gossip.
+///
+/// Format: `EXEC_VOTE_BATCH` || shard_group_id || H(tx_hashes)
+///
+/// Signed by the sender when broadcasting execution vote batches.
+/// Verified by receivers to reject unauthenticated vote spam before
+/// doing expensive per-vote BLS signature verification.
+pub const DOMAIN_EXEC_VOTE_BATCH: &[u8] = b"EXEC_VOTE_BATCH";
+
+/// Build the signing message for an execution vote batch gossip.
+///
+/// The message covers the shard and a digest of the transaction hashes in
+/// the batch. Cheap to reconstruct at verification while binding the
+/// signature to the specific batch contents.
+pub fn exec_vote_batch_message(
+    shard_group: ShardGroupId,
+    votes: &[crate::ExecutionVote],
+) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new();
+    for v in votes {
+        hasher.update(v.transaction_hash.as_bytes());
+    }
+    let tx_digest = hasher.finalize();
+
+    let mut message = Vec::with_capacity(64);
+    message.extend_from_slice(DOMAIN_EXEC_VOTE_BATCH);
+    message.extend_from_slice(&shard_group.0.to_le_bytes());
+    message.extend_from_slice(tx_digest.as_bytes());
+    message
+}
+
+/// Domain tag for execution certificate batch gossip.
+///
+/// Format: `EXEC_CERT_BATCH` || shard_group_id || H(tx_hashes)
+///
+/// Signed by the sender when broadcasting execution certificate batches.
+/// Verified by receivers to reject unauthenticated certificate spam before
+/// doing expensive aggregated BLS signature verification.
+pub const DOMAIN_EXEC_CERT_BATCH: &[u8] = b"EXEC_CERT_BATCH";
+
+/// Build the signing message for an execution certificate batch gossip.
+///
+/// The message covers the shard and a digest of the transaction hashes in
+/// the batch. Cheap to reconstruct at verification while binding the
+/// signature to the specific batch contents.
+pub fn exec_cert_batch_message(
+    shard_group: ShardGroupId,
+    certificates: &[crate::ExecutionCertificate],
+) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new();
+    for c in certificates {
+        hasher.update(c.transaction_hash.as_bytes());
+    }
+    let tx_digest = hasher.finalize();
+
+    let mut message = Vec::with_capacity(64);
+    message.extend_from_slice(DOMAIN_EXEC_CERT_BATCH);
+    message.extend_from_slice(&shard_group.0.to_le_bytes());
+    message.extend_from_slice(tx_digest.as_bytes());
+    message
+}
+
+/// Domain tag for transaction certificate gossip.
+///
+/// Format: `TX_CERT_GOSSIP` || shard_group_id || tx_hash
+///
+/// Signed by the sender when gossiping finalized transaction certificates.
+/// Verified by receivers to reject unauthenticated certificate spam.
+pub const DOMAIN_TX_CERT_GOSSIP: &[u8] = b"TX_CERT_GOSSIP";
+
+/// Build the signing message for a transaction certificate gossip.
+///
+/// The message covers the shard and the transaction hash. Cheap to
+/// reconstruct at verification while binding the signature to the
+/// specific certificate.
+pub fn tx_cert_gossip_message(shard_group: ShardGroupId, tx_hash: &Hash) -> Vec<u8> {
+    let mut message = Vec::with_capacity(64);
+    message.extend_from_slice(DOMAIN_TX_CERT_GOSSIP);
+    message.extend_from_slice(&shard_group.0.to_le_bytes());
+    message.extend_from_slice(tx_hash.as_bytes());
+    message
+}
+
 /// Build the signing message for an execution vote.
 ///
 /// This is used for:
@@ -266,6 +349,60 @@ mod tests {
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_STATE_PROVISION_BATCH));
+    }
+
+    #[test]
+    fn test_exec_vote_batch_message_deterministic() {
+        use crate::ExecutionVote;
+
+        let votes = vec![ExecutionVote {
+            transaction_hash: Hash::from_bytes(b"tx1"),
+            shard_group_id: ShardGroupId(1),
+            writes_commitment: Hash::from_bytes(b"commit"),
+            success: true,
+            state_writes: vec![],
+            validator: crate::ValidatorId(0),
+            signature: crate::zero_bls_signature(),
+        }];
+
+        let msg1 = exec_vote_batch_message(ShardGroupId(1), &votes);
+        let msg2 = exec_vote_batch_message(ShardGroupId(1), &votes);
+
+        assert_eq!(msg1, msg2);
+        assert!(msg1.starts_with(DOMAIN_EXEC_VOTE_BATCH));
+    }
+
+    #[test]
+    fn test_exec_cert_batch_message_deterministic() {
+        use crate::{ExecutionCertificate, SignerBitfield};
+
+        let certs = vec![ExecutionCertificate {
+            transaction_hash: Hash::from_bytes(b"tx1"),
+            shard_group_id: ShardGroupId(1),
+            read_nodes: vec![],
+            state_writes: vec![],
+            writes_commitment: Hash::from_bytes(b"commit"),
+            success: true,
+            aggregated_signature: crate::zero_bls_signature(),
+            signers: SignerBitfield::new(4),
+        }];
+
+        let msg1 = exec_cert_batch_message(ShardGroupId(1), &certs);
+        let msg2 = exec_cert_batch_message(ShardGroupId(1), &certs);
+
+        assert_eq!(msg1, msg2);
+        assert!(msg1.starts_with(DOMAIN_EXEC_CERT_BATCH));
+    }
+
+    #[test]
+    fn test_tx_cert_gossip_message_deterministic() {
+        let tx_hash = Hash::from_bytes(b"tx1");
+
+        let msg1 = tx_cert_gossip_message(ShardGroupId(1), &tx_hash);
+        let msg2 = tx_cert_gossip_message(ShardGroupId(1), &tx_hash);
+
+        assert_eq!(msg1, msg2);
+        assert!(msg1.starts_with(DOMAIN_TX_CERT_GOSSIP));
     }
 
     #[test]

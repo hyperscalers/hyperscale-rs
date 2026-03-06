@@ -62,9 +62,11 @@ pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, Valida
 pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
 pub use proofs::{CommitmentProof, MerkleInclusionProof, SubstateInclusionProof};
 pub use signing::{
-    block_header_message, block_vote_message, committed_block_header_message, exec_vote_message,
-    state_provision_batch_message, DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE,
-    DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_VOTE, DOMAIN_STATE_PROVISION_BATCH,
+    block_header_message, block_vote_message, committed_block_header_message,
+    exec_cert_batch_message, exec_vote_batch_message, exec_vote_message,
+    state_provision_batch_message, tx_cert_gossip_message, DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE,
+    DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH, DOMAIN_EXEC_VOTE,
+    DOMAIN_EXEC_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_TX_CERT_GOSSIP,
 };
 
 pub use block::{
