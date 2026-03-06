@@ -9,6 +9,7 @@
 
 use super::behaviour::{Behaviour, BehaviourEvent};
 use super::command::{SwarmCommand, MAX_COMMANDS_PER_DRAIN};
+use super::gossipsub::ValidationReport;
 use crate::config::VersionInteroperabilityMode;
 use dashmap::DashMap;
 use futures::StreamExt;
@@ -61,6 +62,8 @@ pub(super) async fn run(
     version_interop_mode: VersionInteroperabilityMode,
     registry: Arc<HandlerRegistry>,
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
+    validation_tx: mpsc::UnboundedSender<ValidationReport>,
+    mut validation_rx: mpsc::UnboundedReceiver<ValidationReport>,
 ) {
     // Track whether we've bootstrapped Kademlia (do it once after first connection)
     let mut kademlia_bootstrapped = false;
@@ -201,6 +204,16 @@ pub(super) async fn run(
                 drain_channel(&mut swarm, &mut propagation_rx);
                 handle_command(&mut swarm, cmd);
                 drain_channel(&mut swarm, &mut background_rx);
+            }
+
+            // Drain gossipsub validation results and report to swarm.
+            // This controls message forwarding (Accept) and peer scoring (Reject).
+            Some(report) = validation_rx.recv() => {
+                swarm.behaviour_mut().gossipsub.report_message_validation_result(
+                    &report.message_id,
+                    &report.propagation_source,
+                    report.acceptance,
+                );
             }
 
             // Handle swarm events
@@ -349,6 +362,7 @@ pub(super) async fn run(
                     event,
                     local_shard,
                     &registry,
+                    &validation_tx,
                 ).await;
 
                 // Update cached peer count after connection changes

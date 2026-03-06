@@ -84,6 +84,7 @@ impl Libp2pAdapter {
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .heartbeat_interval(config.gossipsub_heartbeat)
             .validation_mode(gossipsub::ValidationMode::None)
+            .validate_messages()
             .message_id_fn(|msg| {
                 // Use message data + topic as ID for deduplication.
                 // Including the topic allows the same message (e.g., cross-shard transaction)
@@ -185,6 +186,12 @@ impl Libp2pAdapter {
         let validator_peers = Arc::new(DashMap::new());
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
+        // Channel for gossipsub validation results.
+        // The gossipsub handler sends Accept/Reject reports; the event loop
+        // drains them and calls report_message_validation_result on the swarm.
+        let (validation_tx, validation_rx) =
+            mpsc::unbounded_channel::<super::gossipsub::ValidationReport>();
+
         // Priority-based command channels - commands are routed by message priority.
         // Critical messages (BFT consensus) are processed before Background (sync).
         let (
@@ -221,6 +228,8 @@ impl Libp2pAdapter {
                 config.version_interop_mode,
                 registry,
                 event_loop_validator_peers,
+                validation_tx,
+                validation_rx,
             ))
             .catch_unwind()
             .await;

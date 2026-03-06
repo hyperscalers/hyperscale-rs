@@ -7,24 +7,39 @@ use super::behaviour::BehaviourEvent;
 use hyperscale_metrics as metrics;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_types::ShardGroupId;
-use libp2p::{gossipsub, swarm::SwarmEvent};
+use libp2p::{gossipsub, swarm::SwarmEvent, PeerId as Libp2pPeerId};
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
+
+/// Validation result sent from the gossipsub handler back to the event loop.
+///
+/// The event loop drains these and calls `report_message_validation_result`
+/// on the gossipsub behaviour, which controls message forwarding and peer scoring.
+pub(super) struct ValidationReport {
+    pub message_id: gossipsub::MessageId,
+    pub propagation_source: Libp2pPeerId,
+    pub acceptance: gossipsub::MessageAcceptance,
+}
 
 /// Handle a single swarm event — gossipsub messages only.
 ///
 /// Connection lifecycle, identify, and kademlia events are handled in `event_loop.rs`.
+///
+/// Sends a [`ValidationReport`] for each gossipsub message so the event loop can call
+/// `report_message_validation_result`, controlling forwarding and peer scoring.
 pub(super) async fn handle_gossipsub_event(
     event: SwarmEvent<BehaviourEvent>,
     local_shard: ShardGroupId,
     registry: &Arc<HandlerRegistry>,
+    validation_tx: &mpsc::UnboundedSender<ValidationReport>,
 ) {
     match event {
         // Handle gossipsub messages
         SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
             propagation_source,
+            message_id,
             message,
-            ..
         })) => {
             // Parse topic immediately to determine message type and shard
             let topic_str = message.topic.as_str();
@@ -37,6 +52,11 @@ pub(super) async fn handle_gossipsub_event(
                         "Received message with invalid topic format"
                     );
                     metrics::record_invalid_message();
+                    let _ = validation_tx.send(ValidationReport {
+                        message_id,
+                        propagation_source,
+                        acceptance: gossipsub::MessageAcceptance::Reject,
+                    });
                     return;
                 }
             };
@@ -62,6 +82,11 @@ pub(super) async fn handle_gossipsub_event(
                             "Dropping shard-local message from wrong shard (cross-shard contamination attempt)"
                         );
                         metrics::record_invalid_message();
+                        let _ = validation_tx.send(ValidationReport {
+                            message_id,
+                            propagation_source,
+                            acceptance: gossipsub::MessageAcceptance::Reject,
+                        });
                         return;
                     }
                 }
@@ -75,6 +100,12 @@ pub(super) async fn handle_gossipsub_event(
                         msg_type = msg_type,
                         "No gossip handler registered for message type, dropping"
                     );
+                    // No handler is not the sender's fault — ignore rather than reject.
+                    let _ = validation_tx.send(ValidationReport {
+                        message_id,
+                        propagation_source,
+                        acceptance: gossipsub::MessageAcceptance::Ignore,
+                    });
                     return;
                 }
             };
@@ -82,11 +113,17 @@ pub(super) async fn handle_gossipsub_event(
             // Spawn decompress + handler off the event loop.
             // LZ4 decompression is fast (~4GB/s) but the handler includes
             // SBOR decode which we don't want to stall the swarm poll on.
+            let vtx = validation_tx.clone();
             tokio::spawn(async move {
                 match hyperscale_network::compression::decompress(&message.data) {
                     Ok(payload) => {
                         handler(payload);
                         metrics::record_network_message_received();
+                        let _ = vtx.send(ValidationReport {
+                            message_id,
+                            propagation_source,
+                            acceptance: gossipsub::MessageAcceptance::Accept,
+                        });
                     }
                     Err(e) => {
                         warn!(
@@ -95,6 +132,11 @@ pub(super) async fn handle_gossipsub_event(
                             "Failed to decompress gossip message"
                         );
                         metrics::record_invalid_message();
+                        let _ = vtx.send(ValidationReport {
+                            message_id,
+                            propagation_source,
+                            acceptance: gossipsub::MessageAcceptance::Reject,
+                        });
                     }
                 }
             });
