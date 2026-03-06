@@ -21,7 +21,7 @@
 //! `signing_message()` method pattern. The signing message is constructed
 //! by prepending the domain tag to the serialized content.
 
-use crate::{Hash, ShardGroupId};
+use crate::{BlockHeight, Hash, ShardGroupId, StateProvision};
 
 /// Domain tag for BFT block votes.
 ///
@@ -111,6 +111,43 @@ pub fn block_header_message(
     message
 }
 
+/// Domain tag for state provision batch gossip.
+///
+/// Format: `STATE_PROVISION_BATCH` || source_shard || target_shard || block_height || H(tx_hashes)
+///
+/// Signed by the sender when broadcasting cross-shard state provisions.
+/// Verified by receivers to reject unauthenticated provision spam before
+/// doing expensive merkle proof verification.
+pub const DOMAIN_STATE_PROVISION_BATCH: &[u8] = b"STATE_PROVISION_BATCH";
+
+/// Build the signing message for a state provision batch gossip.
+///
+/// The message covers source shard, target shard, block height, and a
+/// digest of the transaction hashes in the batch. This is cheap to
+/// reconstruct at verification (no re-serialization needed) while binding
+/// the signature to the specific batch contents.
+pub fn state_provision_batch_message(
+    source_shard: ShardGroupId,
+    target_shard: ShardGroupId,
+    block_height: BlockHeight,
+    provisions: &[StateProvision],
+) -> Vec<u8> {
+    // Hash the concatenated transaction hashes to produce a batch digest.
+    let mut hasher = blake3::Hasher::new();
+    for p in provisions {
+        hasher.update(p.transaction_hash.as_bytes());
+    }
+    let tx_digest = hasher.finalize();
+
+    let mut message = Vec::with_capacity(96);
+    message.extend_from_slice(DOMAIN_STATE_PROVISION_BATCH);
+    message.extend_from_slice(&source_shard.0.to_le_bytes());
+    message.extend_from_slice(&target_shard.0.to_le_bytes());
+    message.extend_from_slice(&block_height.0.to_le_bytes());
+    message.extend_from_slice(tx_digest.as_bytes());
+    message
+}
+
 /// Build the signing message for an execution vote.
 ///
 /// This is used for:
@@ -196,6 +233,39 @@ mod tests {
 
         // Must differ due to different domain tags (prevents cross-protocol replay)
         assert_ne!(header_msg, vote_msg);
+    }
+
+    #[test]
+    fn test_state_provision_batch_message_deterministic() {
+        use crate::StateProvision;
+        use std::sync::Arc;
+
+        let provisions = vec![StateProvision {
+            transaction_hash: Hash::from_bytes(b"tx1"),
+            target_shard: ShardGroupId(2),
+            source_shard: ShardGroupId(1),
+            block_height: BlockHeight(10),
+            block_timestamp: 0,
+            state_version: 0,
+            entries: Arc::new(vec![]),
+            merkle_proofs: Arc::new(vec![]),
+        }];
+
+        let msg1 = state_provision_batch_message(
+            ShardGroupId(1),
+            ShardGroupId(2),
+            BlockHeight(10),
+            &provisions,
+        );
+        let msg2 = state_provision_batch_message(
+            ShardGroupId(1),
+            ShardGroupId(2),
+            BlockHeight(10),
+            &provisions,
+        );
+
+        assert_eq!(msg1, msg2);
+        assert!(msg1.starts_with(DOMAIN_STATE_PROVISION_BATCH));
     }
 
     #[test]

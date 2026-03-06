@@ -477,19 +477,65 @@ where
             },
         );
 
-        // ── state.provision.batch → ProtocolEvent::StateProvisionsReceived ─
+        // ── state.provision.batch → verify sender sig, then ProtocolEvent::StateProvisionsReceived ─
 
         let tx = self.event_sender.clone();
+        let topology = Arc::clone(&self.topology);
         self.network
             .register_gossip_handler::<hyperscale_messages::StateProvisionBatch>(
                 TopicScope::Shard,
                 move |batch: hyperscale_messages::StateProvisionBatch| {
-                    let provisions = batch.into_provisions();
-                    if !provisions.is_empty() {
-                        let _ = tx.send(NodeInput::Protocol(
-                            ProtocolEvent::StateProvisionsReceived { provisions },
-                        ));
+                    if batch.provisions.is_empty() {
+                        return;
                     }
+
+                    let sender = batch.sender;
+                    let source_shard = batch.provisions[0].source_shard;
+
+                    // Verify sender is in the source shard's committee.
+                    let committee = topology.committee_for_shard(source_shard);
+                    if !committee.contains(&sender) {
+                        warn!(
+                            sender = sender.0,
+                            source_shard = source_shard.0,
+                            "State provision sender not in source shard committee"
+                        );
+                        return;
+                    }
+
+                    // Resolve sender's public key.
+                    let Some(public_key) = topology.public_key(sender) else {
+                        warn!(
+                            sender = sender.0,
+                            "Could not resolve public key for state provision sender"
+                        );
+                        return;
+                    };
+
+                    let msg = batch.signing_message();
+                    let start = std::time::Instant::now();
+                    let valid = hyperscale_types::verify_bls12381_v1(
+                        &msg,
+                        &public_key,
+                        &batch.sender_signature,
+                    );
+                    metrics::record_signature_verification_latency(
+                        "state_provision_batch",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        warn!(
+                            sender = sender.0,
+                            source_shard = source_shard.0,
+                            "State provision sender signature invalid — dropping"
+                        );
+                        return;
+                    }
+
+                    let provisions = batch.into_provisions();
+                    let _ = tx.send(NodeInput::Protocol(
+                        ProtocolEvent::StateProvisionsReceived { provisions },
+                    ));
                 },
             );
 
@@ -873,7 +919,18 @@ where
             // grouped by target shard. Broadcast one batch per shard.
             NodeInput::ProvisionsReady { batches } => {
                 for (shard, provisions) in batches {
-                    let batch = hyperscale_messages::StateProvisionBatch::new(provisions);
+                    let msg = hyperscale_types::state_provision_batch_message(
+                        self.local_shard,
+                        shard,
+                        provisions[0].block_height,
+                        &provisions,
+                    );
+                    let sig = self.signing_key.sign_v1(&msg);
+                    let batch = hyperscale_messages::StateProvisionBatch::new(
+                        provisions,
+                        self.validator_id,
+                        sig,
+                    );
                     self.network.broadcast_to_shard(shard, &batch);
                 }
             }

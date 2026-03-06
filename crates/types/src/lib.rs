@@ -63,7 +63,8 @@ pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
 pub use proofs::{CommitmentProof, MerkleInclusionProof, SubstateInclusionProof};
 pub use signing::{
     block_header_message, block_vote_message, committed_block_header_message, exec_vote_message,
-    DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_VOTE,
+    state_provision_batch_message, DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE,
+    DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_VOTE, DOMAIN_STATE_PROVISION_BATCH,
 };
 
 pub use block::{
