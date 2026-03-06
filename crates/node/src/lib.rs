@@ -9,8 +9,6 @@ mod batch_accumulator;
 mod config;
 pub mod io_loop;
 mod protocol;
-mod request_handler;
-
 mod state;
 
 pub use config::NodeConfig;

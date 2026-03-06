@@ -417,7 +417,6 @@ impl ProductionRunnerBuilder {
             ed25519_keypair,
             validator_id,
             local_shard,
-            dispatch.clone(),
             registry.clone(),
         )
         .await?;

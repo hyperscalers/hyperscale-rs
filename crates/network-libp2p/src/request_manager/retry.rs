@@ -17,6 +17,7 @@ impl RequestManager {
         peers: &[PeerId],
         preferred_peer: Option<PeerId>,
         request_desc: &str,
+        type_id: &'static str,
         data: &[u8],
         priority: RequestPriority,
     ) -> Result<(PeerId, Bytes), RequestError> {
@@ -50,7 +51,7 @@ impl RequestManager {
 
             // Use speculative retry to race against packet loss
             let result = self
-                .send_request_with_speculative_retry(&current_peer, data, priority)
+                .send_request_with_speculative_retry(&current_peer, type_id, data, priority)
                 .await;
 
             debug!(

@@ -4,7 +4,6 @@
 //! in `event_loop.rs`. This module only processes gossipsub application messages.
 
 use super::behaviour::BehaviourEvent;
-use crate::decompress_pool::DecompressPoolHandle;
 use hyperscale_metrics as metrics;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_types::ShardGroupId;
@@ -18,7 +17,6 @@ use tracing::{debug, warn};
 pub(super) async fn handle_gossipsub_event(
     event: SwarmEvent<BehaviourEvent>,
     local_shard: ShardGroupId,
-    decompress_pool: &DecompressPoolHandle,
     registry: &Arc<HandlerRegistry>,
 ) {
     match event {
@@ -81,8 +79,25 @@ pub(super) async fn handle_gossipsub_event(
                 }
             };
 
-            // Dispatch decompression + handler invocation to the decompress pool.
-            decompress_pool.decompress_async(handler, message.data, propagation_source);
+            // Spawn decompress + handler off the event loop.
+            // LZ4 decompression is fast (~4GB/s) but the handler includes
+            // SBOR decode which we don't want to stall the swarm poll on.
+            tokio::spawn(async move {
+                match hyperscale_network::compression::decompress(&message.data) {
+                    Ok(payload) => {
+                        handler(payload);
+                        metrics::record_network_message_received();
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            peer = %propagation_source,
+                            "Failed to decompress gossip message"
+                        );
+                        metrics::record_invalid_message();
+                    }
+                }
+            });
         }
 
         // Handle subscription events

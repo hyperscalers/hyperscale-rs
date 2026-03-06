@@ -4,10 +4,8 @@ use super::behaviour::{Behaviour, STREAM_PROTOCOL};
 use super::command::{PriorityCommandChannels, SwarmCommand};
 use super::error::NetworkError;
 use crate::config::Libp2pConfig;
-use crate::decompress_pool::DecompressPoolHandle;
 use dashmap::DashMap;
 use futures::FutureExt;
-use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network::HandlerRegistry;
 use hyperscale_types::{MessagePriority, ShardGroupId, ValidatorId};
@@ -61,7 +59,6 @@ impl Libp2pAdapter {
     /// * `keypair` - Ed25519 keypair for libp2p transport encryption
     /// * `validator_id` - Local validator ID
     /// * `shard` - Local shard assignment
-    /// * `dispatch` - Pooled dispatch for decompression thread pool scheduling
     /// * `registry` - Shared handler registry for per-type message dispatch
     ///
     /// # Returns
@@ -72,7 +69,6 @@ impl Libp2pAdapter {
         keypair: identity::Keypair,
         validator_id: ValidatorId,
         shard: ShardGroupId,
-        dispatch: Arc<PooledDispatch>,
         registry: Arc<HandlerRegistry>,
     ) -> Result<Arc<Self>, NetworkError> {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
@@ -198,9 +194,6 @@ impl Libp2pAdapter {
 
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
-        // Create decompress pool eagerly (the registry will be populated before messages arrive).
-        let decompress_pool = DecompressPoolHandle::new(dispatch.clone());
-
         let adapter = Arc::new(Self {
             local_peer_id,
             local_validator_id: validator_id,
@@ -226,7 +219,6 @@ impl Libp2pAdapter {
                 cached_peer_count,
                 shard,
                 config.version_interop_mode,
-                decompress_pool,
                 registry,
                 event_loop_validator_peers,
             ))

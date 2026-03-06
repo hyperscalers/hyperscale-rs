@@ -14,7 +14,7 @@ use hyperscale_network::{
     compression, GossipHandler, HandlerRegistry, Network, RequestError, RequestHandler, TopicScope,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
-use sbor::{basic_decode, basic_encode};
+use sbor::basic_encode;
 use std::sync::{Arc, Mutex};
 
 /// Target for an outbound message.
@@ -141,50 +141,14 @@ impl Network for SimNetworkAdapter {
         _scope: TopicScope,
         handler: impl GossipHandler<M>,
     ) {
-        // Wrap the typed handler in a raw closure that SBOR-decodes the payload.
-        let raw = Arc::new(move |payload: Vec<u8>| match basic_decode::<M>(&payload) {
-            Ok(msg) => handler.on_message(msg),
-            Err(e) => {
-                tracing::warn!(
-                    message_type = M::message_type_id(),
-                    error = ?e,
-                    "Failed to SBOR-decode gossip message — dropping"
-                );
-            }
-        });
+        // Registry owns SBOR decode — just forward.
         // Scope is irrelevant in simulation (delivery controlled by harness).
-        self.registry.register_gossip(M::message_type_id(), raw);
+        self.registry.register_gossip(handler);
     }
 
     fn register_request_handler<R: Request>(&self, handler: impl RequestHandler<R>) {
-        // Wrap the typed handler in a raw closure that SBOR-decodes the request
-        // and SBOR-encodes the response.
-        let raw = Arc::new(move |payload: &[u8]| -> Vec<u8> {
-            let req = match basic_decode::<R>(payload) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(
-                        message_type = R::message_type_id(),
-                        error = ?e,
-                        "Failed to SBOR-decode request — returning empty response"
-                    );
-                    return vec![];
-                }
-            };
-            let response = handler.handle_request(req);
-            match basic_encode(&response) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    tracing::warn!(
-                        message_type = R::message_type_id(),
-                        error = ?e,
-                        "Failed to SBOR-encode response — returning empty response"
-                    );
-                    vec![]
-                }
-            }
-        });
-        self.registry.register_request(R::message_type_id(), raw);
+        // Registry owns SBOR decode/encode — just forward.
+        self.registry.register_request(handler);
     }
 
     fn request<R: Request + 'static>(
@@ -286,14 +250,13 @@ mod tests {
     #[test]
     fn test_register_request_handler() {
         use hyperscale_messages::request::GetBlockRequest;
+        use hyperscale_messages::response::GetBlockResponse;
 
         let registry = Arc::new(HandlerRegistry::new());
         let adapter = SimNetworkAdapter::new(registry.clone());
 
         assert!(registry.get_request("block.request").is_none());
-        adapter.register_request_handler::<GetBlockRequest>(|_req| {
-            hyperscale_messages::response::GetBlockResponse::not_found()
-        });
+        adapter.register_request_handler::<GetBlockRequest>(|_req| GetBlockResponse::not_found());
         assert!(registry.get_request("block.request").is_some());
     }
 
@@ -307,9 +270,9 @@ mod tests {
         adapter.register_request_handler::<GetBlockRequest>(|_req| GetBlockResponse::not_found());
         adapter.register_request_handler::<GetBlockRequest>(|_req| GetBlockResponse::not_found());
 
-        // Second handler should have won (overwrites)
+        // Second handler should have won (overwrites).
+        // Encode a real request, call the raw handler, verify it works.
         let handler = adapter.registry.get_request("block.request").unwrap();
-        // Encode a real request, call the raw handler, verify it works
         let req = GetBlockRequest::new(BlockHeight(1));
         let req_bytes = sbor::basic_encode(&req).unwrap();
         let response_bytes = handler(&req_bytes);

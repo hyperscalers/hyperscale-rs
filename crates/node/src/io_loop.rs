@@ -168,9 +168,6 @@ where
     dispatch: D,
     event_sender: crossbeam::channel::Sender<NodeInput>,
 
-    // Configuration (retained for creating RequestHandler)
-    config: NodeConfig,
-
     // Identity
     signing_key: Arc<Bls12381G1PrivateKey>,
     topology: Arc<dyn Topology>,
@@ -299,7 +296,6 @@ where
                 b.committed_header_max,
                 b.committed_header_window,
             ),
-            config,
             cached_local_peers,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             emitted_statuses: Vec::new(),
@@ -414,43 +410,49 @@ where
 
     /// Register per-type request handlers with the network.
     ///
-    /// Each request type gets its own handler closure that delegates to the
-    /// shared `RequestHandler<S>` instance.
+    /// Each handler is a closure that captures shared state and delegates to
+    /// the serving function in the corresponding protocol module.
     fn register_request_handler(&self) {
+        use crate::protocol::fetch::{serve_certificate_request, serve_transaction_request};
+        use crate::protocol::provision_fetch::serve_provision_request;
+        use crate::protocol::sync::serve_block_request;
         use hyperscale_messages::request::{
             GetBlockRequest, GetCertificatesRequest, GetProvisionsRequest, GetTransactionsRequest,
         };
 
-        let rh = Arc::new(crate::request_handler::RequestHandler::new(
-            self.config.inbound.clone(),
-            Arc::clone(&self.storage),
-            Arc::clone(&self.topology),
-            Arc::clone(&self.tx_cache),
-            Arc::clone(&self.cert_cache),
-        ));
+        // ── block.request → sync protocol ────────────────────────────
 
-        let rh2 = rh.clone();
+        let storage = Arc::clone(&self.storage);
         self.network
-            .register_request_handler::<GetBlockRequest>(move |req: GetBlockRequest| {
-                rh2.handle_block_request(req)
+            .register_request_handler::<GetBlockRequest>(move |req| {
+                serve_block_request(&*storage, req)
             });
 
-        let rh2 = rh.clone();
-        self.network
-            .register_request_handler::<GetTransactionsRequest>(
-                move |req: GetTransactionsRequest| rh2.handle_transaction_request(req),
-            );
+        // ── transaction.request → fetch protocol ─────────────────────
 
-        let rh2 = rh.clone();
+        let storage = Arc::clone(&self.storage);
+        let tx_cache = Arc::clone(&self.tx_cache);
         self.network
-            .register_request_handler::<GetCertificatesRequest>(
-                move |req: GetCertificatesRequest| rh2.handle_certificate_request(req),
-            );
+            .register_request_handler::<GetTransactionsRequest>(move |req| {
+                serve_transaction_request(&*storage, &tx_cache, req)
+            });
 
-        let rh2 = rh.clone();
+        // ── certificate.request → fetch protocol ─────────────────────
+
+        let storage = Arc::clone(&self.storage);
+        let cert_cache = Arc::clone(&self.cert_cache);
         self.network
-            .register_request_handler::<GetProvisionsRequest>(move |req: GetProvisionsRequest| {
-                rh2.handle_provision_request(req)
+            .register_request_handler::<GetCertificatesRequest>(move |req| {
+                serve_certificate_request(&*storage, &cert_cache, req)
+            });
+
+        // ── provision.request → provision fetch protocol ─────────────
+
+        let storage = Arc::clone(&self.storage);
+        let topology = Arc::clone(&self.topology);
+        self.network
+            .register_request_handler::<GetProvisionsRequest>(move |req| {
+                serve_provision_request(&*storage, &*topology, req)
             });
     }
 

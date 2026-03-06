@@ -3,11 +3,20 @@
 //! Shared by both the inbound router (server) and request manager (client)
 //! to ensure the wire protocol cannot drift between the two sides.
 //!
-//! # Wire format
+//! # Wire formats
 //!
+//! ## Plain frame (responses)
 //! ```text
-//! [4-byte big-endian length][LZ4-compressed payload]
+//! [4-byte BE length][LZ4-compressed payload]
 //! ```
+//!
+//! ## Typed frame (requests)
+//! ```text
+//! [2-byte LE type_id_len][type_id bytes][4-byte BE length][LZ4-compressed SBOR]
+//! ```
+//!
+//! The type_id sits outside the compressed payload so the receiver can route
+//! requests to per-type handlers without decompressing first.
 
 use futures::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use hyperscale_network::compression;
@@ -87,6 +96,64 @@ pub(crate) async fn read_frame_len<S: AsyncReadExt + Unpin>(
     }
 
     Ok(len)
+}
+
+/// Maximum type_id length (sanity bound to prevent allocation bombs).
+const MAX_TYPE_ID_LEN: usize = 256;
+
+/// Write a typed request frame: type_id header followed by compressed SBOR payload.
+///
+/// Flushes and half-closes the write side so the receiver knows the request is complete.
+pub(crate) async fn write_typed_frame<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    type_id: &str,
+    sbor_data: &[u8],
+) -> Result<(), io::Error> {
+    // Type-id header (uncompressed)
+    let type_id_bytes = type_id.as_bytes();
+    let type_id_len = type_id_bytes.len() as u16;
+    stream.write_all(&type_id_len.to_le_bytes()).await?;
+    stream.write_all(type_id_bytes).await?;
+
+    // Compressed SBOR payload (same format as write_frame)
+    let compressed = compression::compress(sbor_data);
+    let len = compressed.len() as u32;
+    stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(&compressed).await?;
+    stream.flush().await?;
+    stream.close().await?;
+    Ok(())
+}
+
+/// Read a typed request frame: type_id header followed by compressed SBOR payload.
+///
+/// Returns `(type_id, decompressed_payload)`.
+pub(crate) async fn read_typed_frame<S: AsyncReadExt + Unpin>(
+    stream: &mut S,
+    max_size: usize,
+) -> Result<(String, Vec<u8>), FrameError> {
+    // Read type-id header
+    let mut type_id_len_bytes = [0u8; 2];
+    stream.read_exact(&mut type_id_len_bytes).await?;
+    let type_id_len = u16::from_le_bytes(type_id_len_bytes) as usize;
+
+    if type_id_len > MAX_TYPE_ID_LEN {
+        return Err(FrameError::TooLarge(type_id_len));
+    }
+
+    let mut type_id_bytes = vec![0u8; type_id_len];
+    stream.read_exact(&mut type_id_bytes).await?;
+    let type_id = String::from_utf8(type_id_bytes).map_err(|e| {
+        FrameError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid type_id UTF-8: {}", e),
+        ))
+    })?;
+
+    // Read compressed payload (reuse existing read_frame logic)
+    let payload = read_frame(stream, max_size).await?;
+
+    Ok((type_id, payload))
 }
 
 #[cfg(test)]
@@ -186,5 +253,55 @@ mod tests {
         let mut cursor = futures::io::Cursor::new(buf);
         let result = read_frame_len(&mut cursor, MAX_FRAME_SIZE).await;
         assert!(matches!(result, Err(FrameError::TooLarge(len)) if len == large_len as usize));
+    }
+
+    /// Build a typed frame buffer (without calling close) for read tests.
+    async fn write_typed_to_buf(type_id: &str, sbor_data: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let type_id_bytes = type_id.as_bytes();
+        let type_id_len = type_id_bytes.len() as u16;
+        futures::AsyncWriteExt::write_all(&mut buf, &type_id_len.to_le_bytes())
+            .await
+            .unwrap();
+        futures::AsyncWriteExt::write_all(&mut buf, type_id_bytes)
+            .await
+            .unwrap();
+        let compressed = compression::compress(sbor_data);
+        let len = compressed.len() as u32;
+        futures::AsyncWriteExt::write_all(&mut buf, &len.to_be_bytes())
+            .await
+            .unwrap();
+        futures::AsyncWriteExt::write_all(&mut buf, &compressed)
+            .await
+            .unwrap();
+        buf
+    }
+
+    #[tokio::test]
+    async fn test_typed_frame_roundtrip() {
+        let type_id = "block.request";
+        let payload = b"some sbor data here";
+        let buf = write_typed_to_buf(type_id, payload).await;
+        let mut cursor = futures::io::Cursor::new(buf);
+        let (parsed_type_id, parsed_payload) =
+            read_typed_frame(&mut cursor, MAX_FRAME_SIZE).await.unwrap();
+        assert_eq!(parsed_type_id, type_id);
+        assert_eq!(parsed_payload, payload);
+    }
+
+    #[tokio::test]
+    async fn test_typed_frame_empty_payload() {
+        let buf = write_typed_to_buf("test", b"").await;
+        let mut cursor = futures::io::Cursor::new(buf);
+        let (type_id, payload) = read_typed_frame(&mut cursor, MAX_FRAME_SIZE).await.unwrap();
+        assert_eq!(type_id, "test");
+        assert!(payload.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_typed_frame_empty_stream() {
+        let mut cursor = futures::io::Cursor::new(Vec::<u8>::new());
+        let result = read_typed_frame(&mut cursor, MAX_FRAME_SIZE).await;
+        assert!(matches!(result, Err(FrameError::Io(_))));
     }
 }

@@ -40,10 +40,6 @@ impl Dispatch for SyncDispatch {
         f();
     }
 
-    fn spawn_codec(&self, f: impl FnOnce() + Send + 'static) {
-        f();
-    }
-
     fn consensus_crypto_queue_depth(&self) -> usize {
         0
     }
@@ -57,10 +53,6 @@ impl Dispatch for SyncDispatch {
     }
 
     fn execution_queue_depth(&self) -> usize {
-        0
-    }
-
-    fn codec_queue_depth(&self) -> usize {
         0
     }
 
@@ -131,11 +123,7 @@ mod tests {
         });
         assert_eq!(counter.load(Ordering::SeqCst), 5);
 
-        let c = counter.clone();
-        dispatch.spawn_codec(move || {
-            c.fetch_add(1, Ordering::SeqCst);
-        });
-        assert_eq!(counter.load(Ordering::SeqCst), 6);
+        assert_eq!(counter.load(Ordering::SeqCst), 5);
     }
 
     #[test]
@@ -145,6 +133,5 @@ mod tests {
         assert_eq!(dispatch.crypto_queue_depth(), 0);
         assert_eq!(dispatch.tx_validation_queue_depth(), 0);
         assert_eq!(dispatch.execution_queue_depth(), 0);
-        assert_eq!(dispatch.codec_queue_depth(), 0);
     }
 }

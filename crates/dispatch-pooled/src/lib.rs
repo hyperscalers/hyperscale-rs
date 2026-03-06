@@ -7,7 +7,6 @@
 //! - **Crypto**: General signature verification (provisions, execution votes)
 //! - **TX Validation**: Transaction signature verification (isolated from crypto)
 //! - **Execution**: Radix Engine transaction execution
-//! - **Codec**: SBOR message encoding/decoding
 //!
 //! # Example
 //!
@@ -76,11 +75,6 @@ pub struct ThreadPoolConfig {
     /// These run the Radix Engine and are CPU/memory intensive.
     pub execution_threads: usize,
 
-    /// Number of threads for codec operations (SBOR encoding/decoding).
-    /// This pool handles message serialization to prevent the network event loop
-    /// from blocking on large messages (state batches, transaction bundles).
-    pub codec_threads: usize,
-
     /// Number of threads for the tokio async runtime (network, storage, timers).
     /// These are mostly I/O-bound. Not used by dispatch itself — provided for
     /// runner configuration.
@@ -126,11 +120,10 @@ impl ThreadPoolConfig {
     /// - State Machine: 1 core (always)
     /// - Consensus Crypto: 2 threads (dedicated for block votes/QC - liveness critical)
     /// - After reserving state machine and consensus crypto, remaining cores are split:
-    ///   - Crypto: 35% (provisions, execution votes, gossiped cert verification - highest load)
     ///   - Execution: 25% (Radix Engine)
     ///   - TX Validation: 15% (transaction signature verification)
     ///   - I/O: 15% (network, storage, timers)
-    ///   - Codec: 10% (SBOR encode/decode)
+    ///   - Crypto: remainder (provisions, execution votes, gossiped cert verification)
     ///
     /// On systems with fewer than 8 cores, all pools get 1 thread each.
     pub fn auto() -> Self {
@@ -152,38 +145,28 @@ impl ThreadPoolConfig {
         // Allocation:
         // - Consensus crypto is fixed at 2 threads (liveness critical for block votes/QC)
         // - All other pools use percentage-based allocation from pool_budget
-        let (consensus_crypto, tx_validation, codec, crypto, execution, io) = if pool_budget <= 6 {
+        let (consensus_crypto, tx_validation, crypto, execution, io) = if pool_budget <= 6 {
             // Minimum viable: 1 each for variable pools, 2 for consensus crypto
-            (2, 1, 1, 1, 1, 1)
+            (2, 1, 1, 1, 1)
         } else {
             // Consensus crypto: fixed 2 threads (enough for ~1000 votes/sec)
             let consensus_crypto = 2;
 
             // Pool budget split by percentage:
-            // - Crypto: 35% (provisions, execution votes, gossiped cert verification - highest load)
             // - Execution: 25% (Radix Engine)
             // - TX Validation: 15% (transaction signature verification, bursty)
             // - I/O: 15% (network, storage, timers)
-            // - Codec: 10% (SBOR encode/decode)
-            let crypto = (pool_budget * 35 / 100).max(1);
+            // - Crypto: remainder (provisions, execution votes, gossiped cert verification)
             let execution = (pool_budget * 25 / 100).max(1);
             let tx_validation = (pool_budget * 15 / 100).max(1);
             let io = (pool_budget * 15 / 100).max(1);
-            // Codec gets the remainder to ensure we use all cores
-            let codec = pool_budget
-                .saturating_sub(crypto)
+            // Crypto gets the remainder to ensure all cores are used
+            let crypto = pool_budget
                 .saturating_sub(execution)
                 .saturating_sub(tx_validation)
                 .saturating_sub(io)
                 .max(1);
-            (
-                consensus_crypto,
-                tx_validation,
-                codec,
-                crypto,
-                execution,
-                io,
-            )
+            (consensus_crypto, tx_validation, crypto, execution, io)
         };
 
         Self {
@@ -191,7 +174,6 @@ impl ThreadPoolConfig {
             crypto_threads: crypto,
             tx_validation_threads: tx_validation,
             execution_threads: execution,
-            codec_threads: codec,
             io_threads: io,
             pin_cores: false,
             consensus_crypto_core_start: None,
@@ -216,7 +198,6 @@ impl ThreadPoolConfig {
             crypto_threads: 1,
             tx_validation_threads: 1,
             execution_threads: 1,
-            codec_threads: 1,
             io_threads: 1,
             pin_cores: false,
             consensus_crypto_core_start: None,
@@ -235,7 +216,6 @@ impl ThreadPoolConfig {
             + self.crypto_threads
             + self.tx_validation_threads
             + self.execution_threads
-            + self.codec_threads
             + self.io_threads
     }
 
@@ -261,11 +241,6 @@ impl ThreadPoolConfig {
                 "execution_threads must be at least 1".to_string(),
             ));
         }
-        if self.codec_threads == 0 {
-            return Err(ThreadPoolError::InvalidConfig(
-                "codec_threads must be at least 1".to_string(),
-            ));
-        }
         if self.io_threads == 0 {
             return Err(ThreadPoolError::InvalidConfig(
                 "io_threads must be at least 1".to_string(),
@@ -283,7 +258,6 @@ impl ThreadPoolConfig {
                 + self.crypto_threads
                 + self.tx_validation_threads
                 + self.execution_threads
-                + self.codec_threads
                 + self.io_threads;
             if total_needed > available {
                 return Err(ThreadPoolError::InvalidConfig(format!(
@@ -333,12 +307,6 @@ impl ThreadPoolConfigBuilder {
     /// Set the number of execution threads.
     pub fn execution_threads(mut self, count: usize) -> Self {
         self.config.execution_threads = count;
-        self
-    }
-
-    /// Set the number of codec threads (SBOR encoding/decoding).
-    pub fn codec_threads(mut self, count: usize) -> Self {
-        self.config.codec_threads = count;
         self
     }
 
@@ -426,7 +394,6 @@ impl Default for ThreadPoolConfigBuilder {
 /// - General crypto pool (provisions, execution votes)
 /// - TX validation pool (transaction signatures) — isolated from crypto
 /// - Execution pool (Radix Engine)
-/// - Codec pool (SBOR encoding/decoding)
 ///
 /// Spawned closures are automatically wrapped in `rayon::ThreadPool::install()`,
 /// ensuring that `par_iter` and other parallel primitives use the correct pool.
@@ -437,12 +404,10 @@ pub struct PooledDispatch {
     crypto_pool: Arc<rayon::ThreadPool>,
     tx_validation_pool: Arc<rayon::ThreadPool>,
     execution_pool: Arc<rayon::ThreadPool>,
-    codec_pool: Arc<rayon::ThreadPool>,
     consensus_crypto_pending: Arc<AtomicUsize>,
     crypto_pending: Arc<AtomicUsize>,
     tx_validation_pending: Arc<AtomicUsize>,
     execution_pending: Arc<AtomicUsize>,
-    codec_pending: Arc<AtomicUsize>,
 }
 
 impl PooledDispatch {
@@ -454,14 +419,12 @@ impl PooledDispatch {
         let crypto_pool = Arc::new(Self::build_crypto_pool(&config)?);
         let tx_validation_pool = Arc::new(Self::build_tx_validation_pool(&config)?);
         let execution_pool = Arc::new(Self::build_execution_pool(&config)?);
-        let codec_pool = Arc::new(Self::build_codec_pool(&config)?);
 
         tracing::info!(
             consensus_crypto_threads = config.consensus_crypto_threads,
             crypto_threads = config.crypto_threads,
             tx_validation_threads = config.tx_validation_threads,
             execution_threads = config.execution_threads,
-            codec_threads = config.codec_threads,
             io_threads = config.io_threads,
             pin_cores = config.pin_cores,
             "Thread pools initialized"
@@ -473,12 +436,10 @@ impl PooledDispatch {
             crypto_pool,
             tx_validation_pool,
             execution_pool,
-            codec_pool,
             consensus_crypto_pending: Arc::new(AtomicUsize::new(0)),
             crypto_pending: Arc::new(AtomicUsize::new(0)),
             tx_validation_pending: Arc::new(AtomicUsize::new(0)),
             execution_pending: Arc::new(AtomicUsize::new(0)),
-            codec_pending: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -579,15 +540,6 @@ impl PooledDispatch {
             .build()
             .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
     }
-
-    fn build_codec_pool(config: &ThreadPoolConfig) -> Result<rayon::ThreadPool, ThreadPoolError> {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(config.codec_threads)
-            .stack_size(config.crypto_stack_size)
-            .thread_name(|i| format!("codec-{}", i))
-            .build()
-            .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
-    }
 }
 
 impl Dispatch for PooledDispatch {
@@ -647,16 +599,6 @@ impl Dispatch for PooledDispatch {
         });
     }
 
-    fn spawn_codec(&self, f: impl FnOnce() + Send + 'static) {
-        self.codec_pending.fetch_add(1, Ordering::Relaxed);
-        let pending = self.codec_pending.clone();
-        let pool = Arc::clone(&self.codec_pool);
-        self.codec_pool.spawn(move || {
-            pool.install(f);
-            pending.fetch_sub(1, Ordering::Relaxed);
-        });
-    }
-
     fn consensus_crypto_queue_depth(&self) -> usize {
         self.consensus_crypto_pending.load(Ordering::Relaxed)
     }
@@ -671,10 +613,6 @@ impl Dispatch for PooledDispatch {
 
     fn execution_queue_depth(&self) -> usize {
         self.execution_pending.load(Ordering::Relaxed)
-    }
-
-    fn codec_queue_depth(&self) -> usize {
-        self.codec_pending.load(Ordering::Relaxed)
     }
 
     fn map_execution<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
@@ -763,7 +701,6 @@ mod tests {
         assert!(config.crypto_threads >= 1);
         assert!(config.tx_validation_threads >= 1);
         assert!(config.execution_threads >= 1);
-        assert!(config.codec_threads >= 1);
         assert!(config.io_threads >= 1);
         config.validate().unwrap();
     }
@@ -777,38 +714,34 @@ mod tests {
         assert_eq!(config.crypto_threads, 1);
         assert_eq!(config.tx_validation_threads, 1);
         assert_eq!(config.execution_threads, 1);
-        assert_eq!(config.codec_threads, 1);
         assert_eq!(config.io_threads, 1);
 
         // 12 cores: pool_budget = 12 - 3 = 9 (percentage mode)
-        // crypto 35% = 3, execution 25% = 2, tx_validation 15% = 1, io 15% = 1, codec = remainder = 2
+        // execution 25% = 2, tx_validation 15% = 1, io 15% = 1, crypto = remainder = 5
         let config = ThreadPoolConfig::for_core_count(12);
         assert_eq!(config.consensus_crypto_threads, 2);
-        assert_eq!(config.crypto_threads, 3);
+        assert_eq!(config.crypto_threads, 5);
         assert_eq!(config.execution_threads, 2);
         assert_eq!(config.tx_validation_threads, 1);
         assert_eq!(config.io_threads, 1);
-        assert_eq!(config.codec_threads, 2);
 
         // 18 cores: pool_budget = 18 - 3 = 15 (percentage mode)
-        // crypto 35% = 5, execution 25% = 3, tx_validation 15% = 2, io 15% = 2, codec = remainder = 3
+        // execution 25% = 3, tx_validation 15% = 2, io 15% = 2, crypto = remainder = 8
         let config = ThreadPoolConfig::for_core_count(18);
         assert_eq!(config.consensus_crypto_threads, 2);
-        assert_eq!(config.crypto_threads, 5);
+        assert_eq!(config.crypto_threads, 8);
         assert_eq!(config.execution_threads, 3);
         assert_eq!(config.tx_validation_threads, 2);
         assert_eq!(config.io_threads, 2);
-        assert_eq!(config.codec_threads, 3);
 
         // 32 cores: pool_budget = 32 - 3 = 29 (percentage mode)
-        // crypto 35% = 10, execution 25% = 7, tx_validation 15% = 4, io 15% = 4, codec = remainder = 4
+        // execution 25% = 7, tx_validation 15% = 4, io 15% = 4, crypto = remainder = 14
         let config = ThreadPoolConfig::for_core_count(32);
         assert_eq!(config.consensus_crypto_threads, 2);
-        assert_eq!(config.crypto_threads, 10);
+        assert_eq!(config.crypto_threads, 14);
         assert_eq!(config.execution_threads, 7);
         assert_eq!(config.tx_validation_threads, 4);
         assert_eq!(config.io_threads, 4);
-        assert_eq!(config.codec_threads, 4);
     }
 
     #[test]
@@ -818,7 +751,6 @@ mod tests {
         assert_eq!(config.crypto_threads, 1);
         assert_eq!(config.tx_validation_threads, 1);
         assert_eq!(config.execution_threads, 1);
-        assert_eq!(config.codec_threads, 1);
         assert_eq!(config.io_threads, 1);
         config.validate().unwrap();
     }
@@ -878,7 +810,6 @@ mod tests {
         assert_eq!(dispatch.config().consensus_crypto_threads, 1);
         assert_eq!(dispatch.config().crypto_threads, 1);
         assert_eq!(dispatch.config().execution_threads, 1);
-        assert_eq!(dispatch.config().codec_threads, 1);
     }
 
     #[test]
@@ -892,7 +823,6 @@ mod tests {
         let crypto_counter = Arc::new(AtomicUsize::new(0));
         let tx_validation_counter = Arc::new(AtomicUsize::new(0));
         let exec_counter = Arc::new(AtomicUsize::new(0));
-        let codec_counter = Arc::new(AtomicUsize::new(0));
 
         let counter = consensus_crypto_counter.clone();
         dispatch.spawn_consensus_crypto(move || {
@@ -914,11 +844,6 @@ mod tests {
             counter.fetch_add(1, Ordering::SeqCst);
         });
 
-        let counter = codec_counter.clone();
-        dispatch.spawn_codec(move || {
-            counter.fetch_add(1, Ordering::SeqCst);
-        });
-
         // Wait for tasks to complete
         std::thread::sleep(std::time::Duration::from_millis(100));
 
@@ -926,7 +851,6 @@ mod tests {
         assert_eq!(crypto_counter.load(Ordering::SeqCst), 1);
         assert_eq!(tx_validation_counter.load(Ordering::SeqCst), 1);
         assert_eq!(exec_counter.load(Ordering::SeqCst), 1);
-        assert_eq!(codec_counter.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -936,10 +860,9 @@ mod tests {
             .crypto_threads(4)
             .tx_validation_threads(3)
             .execution_threads(6)
-            .codec_threads(2)
             .io_threads(2)
             .build_unchecked();
 
-        assert_eq!(config.total_threads(), 19); // 2 + 4 + 3 + 6 + 2 + 2
+        assert_eq!(config.total_threads(), 17); // 2 + 4 + 3 + 6 + 2
     }
 }

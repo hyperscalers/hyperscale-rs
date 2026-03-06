@@ -7,8 +7,8 @@ use crate::adapter::Libp2pAdapter;
 use crate::inbound_router::{spawn_inbound_router, InboundRouterHandle};
 use crate::request_manager::{RequestManager, RequestPriority};
 use hyperscale_network::{
-    compression, frame_request, GossipHandler, HandlerRegistry, Network, RequestError,
-    RequestHandler, Topic, TopicScope,
+    compression, GossipHandler, HandlerRegistry, Network, RequestError, RequestHandler, Topic,
+    TopicScope,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use libp2p::PeerId;
@@ -92,22 +92,8 @@ impl Network for ProdNetwork {
         scope: TopicScope,
         handler: impl GossipHandler<M>,
     ) {
-        // Wrap the typed handler in a raw closure that SBOR-decodes the payload.
-        let raw = Arc::new(
-            move |payload: Vec<u8>| match sbor::basic_decode::<M>(&payload) {
-                Ok(msg) => handler.on_message(msg),
-                Err(e) => {
-                    tracing::warn!(
-                        message_type = M::message_type_id(),
-                        error = ?e,
-                        "Failed to SBOR-decode gossip message — dropping"
-                    );
-                }
-            },
-        );
-
-        // Store in registry for dispatch by the decompress pool.
-        self.registry.register_gossip(M::message_type_id(), raw);
+        // Registry owns SBOR decode — just forward.
+        self.registry.register_gossip(handler);
 
         // Auto-subscribe to the corresponding gossipsub topic.
         let topic = match scope {
@@ -126,36 +112,8 @@ impl Network for ProdNetwork {
     }
 
     fn register_request_handler<R: Request>(&self, handler: impl RequestHandler<R>) {
-        // Wrap the typed handler in a raw closure that SBOR-decodes the request
-        // and SBOR-encodes the response.
-        let raw = Arc::new(move |payload: &[u8]| -> Vec<u8> {
-            let req = match sbor::basic_decode::<R>(payload) {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!(
-                        message_type = R::message_type_id(),
-                        error = ?e,
-                        "Failed to SBOR-decode request — returning empty response"
-                    );
-                    return vec![];
-                }
-            };
-            let response = handler.handle_request(req);
-            match sbor::basic_encode(&response) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    tracing::warn!(
-                        message_type = R::message_type_id(),
-                        error = ?e,
-                        "Failed to SBOR-encode response — returning empty response"
-                    );
-                    vec![]
-                }
-            }
-        });
-
-        // Store in registry for dispatch by the inbound router.
-        self.registry.register_request(R::message_type_id(), raw);
+        // Registry owns SBOR decode/encode — just forward.
+        self.registry.register_request(handler);
     }
 
     fn request<R: Request + 'static>(
@@ -195,9 +153,9 @@ impl Network for ProdNetwork {
             }
         };
 
-        // Frame with type_id for dispatch by the receiver's InboundRouter
-        let framed = frame_request(R::message_type_id(), &request_bytes);
-        let description = format!("{}({}B)", R::message_type_id(), request_bytes.len());
+        // Pass type_id + SBOR bytes separately — the transport writes the typed frame.
+        let type_id = R::message_type_id();
+        let description = format!("{}({}B)", type_id, request_bytes.len());
         let rm = self.request_manager.clone();
 
         self.tokio_handle.spawn(async move {
@@ -206,7 +164,8 @@ impl Network for ProdNetwork {
                     &resolved_peers,
                     preferred_libp2p,
                     description,
-                    framed,
+                    type_id,
+                    request_bytes,
                     priority,
                 )
                 .await

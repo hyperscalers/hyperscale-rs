@@ -1,13 +1,13 @@
 //! Routes inbound network requests to per-type handlers.
 //!
 //! This component accepts incoming streams from peers and dispatches them to
-//! the appropriate handler based on the request type_id frame. The handler
-//! registry is populated during node initialization.
+//! the appropriate handler based on the request type_id in the frame header.
+//! The handler registry is populated during node initialization.
 
 use crate::adapter::{Libp2pAdapter, STREAM_PROTOCOL};
 use crate::stream_framing::{self, FrameError, MAX_FRAME_SIZE};
 use futures::StreamExt;
-use hyperscale_network::{parse_request_frame, HandlerRegistry};
+use hyperscale_network::HandlerRegistry;
 use libp2p::{PeerId, Stream};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,12 +28,10 @@ pub(crate) struct InboundRouterHandle {
 /// Routes inbound requests to per-type handlers via the handler registry.
 ///
 /// The router accepts incoming streams and for each:
-/// 1. Reads the length-prefixed compressed request
-/// 2. Decompresses it
-/// 3. Parses the type_id frame to identify the request type
-/// 4. Looks up the handler in the registry and dispatches the SBOR payload
-/// 5. Compresses and writes the length-prefixed response
-/// 6. Closes the stream
+/// 1. Reads the typed frame header (type_id) + compressed SBOR payload
+/// 2. Looks up the handler in the registry and calls it with the SBOR payload
+/// 3. Compresses and writes the length-prefixed response
+/// 4. Closes the stream
 struct InboundRouter {
     registry: Arc<HandlerRegistry>,
 }
@@ -78,32 +76,24 @@ impl InboundRouter {
 
     /// Handle a single incoming stream.
     async fn handle_stream(&self, _peer: PeerId, mut stream: Stream) -> Result<(), StreamError> {
-        // Read length-prefixed compressed request with timeout.
-        // The stream_framing module decompresses the data.
-        let request_data = tokio::time::timeout(
+        // Read typed frame: type_id header + compressed SBOR payload.
+        // The type_id is outside the compressed payload for routing without decompression.
+        let (type_id, sbor_payload) = tokio::time::timeout(
             STREAM_IO_TIMEOUT,
-            stream_framing::read_frame(&mut stream, MAX_FRAME_SIZE),
+            stream_framing::read_typed_frame(&mut stream, MAX_FRAME_SIZE),
         )
         .await
         .map_err(|_| StreamError::Timeout)?
         .map_err(StreamError::Frame)?;
 
-        // Parse the type_id frame to identify the request type.
-        let (type_id, sbor_payload) = parse_request_frame(&request_data).map_err(|e| {
-            StreamError::Frame(FrameError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                e.to_string(),
-            )))
-        })?;
-
         // Look up the per-type request handler.
         let handler = self
             .registry
-            .get_request(type_id)
+            .get_request(&type_id)
             .ok_or(StreamError::UnknownRequestType)?;
 
-        // Delegate to the handler (receives raw SBOR payload, no framing).
-        let response_sbor = handler(sbor_payload);
+        // Delegate to the handler (receives raw SBOR payload, returns SBOR response).
+        let response_sbor = handler(&sbor_payload);
 
         // Write length-prefixed compressed response with timeout
         tokio::time::timeout(

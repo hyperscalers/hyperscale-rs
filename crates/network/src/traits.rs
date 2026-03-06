@@ -5,7 +5,7 @@
 //!
 //! Handler registration is fully typed: `register_gossip_handler<M>` accepts a
 //! `GossipHandler<M>` and `register_request_handler<R>` accepts a `RequestHandler<R>`.
-//! Each implementation crate is responsible for SBOR decode/encode at the boundary.
+//! The `HandlerRegistry` owns SBOR serialization — `Network` impls just forward.
 
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 
@@ -104,7 +104,7 @@ pub trait Network: Send + Sync {
 
     /// Register a typed request handler for a message type.
     ///
-    /// The implementation SBOR-decodes the raw request into `R` and SBOR-encodes
+    /// The `HandlerRegistry` SBOR-decodes the raw request into `R` and SBOR-encodes
     /// the `R::Response` before sending it back. Decode/encode errors are logged
     /// and an empty response is returned.
     ///

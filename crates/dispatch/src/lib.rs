@@ -18,7 +18,6 @@
 //! - **Crypto**: General signature verification (provisions, execution votes)
 //! - **TX Validation**: Transaction signature verification (isolated from crypto)
 //! - **Execution**: Radix Engine transaction execution
-//! - **Codec**: SBOR message encoding/decoding
 
 /// Trait for dispatching CPU-intensive work to priority-isolated pools.
 ///
@@ -58,9 +57,6 @@ pub trait Dispatch: Send + Sync + Clone {
     /// Spawn an execution task (Radix Engine).
     fn spawn_execution(&self, f: impl FnOnce() + Send + 'static);
 
-    /// Spawn a codec task (SBOR encoding/decoding).
-    fn spawn_codec(&self, f: impl FnOnce() + Send + 'static);
-
     /// Current consensus crypto pool queue depth.
     fn consensus_crypto_queue_depth(&self) -> usize;
 
@@ -72,9 +68,6 @@ pub trait Dispatch: Send + Sync + Clone {
 
     /// Current execution pool queue depth.
     fn execution_queue_depth(&self) -> usize;
-
-    /// Current codec pool queue depth.
-    fn codec_queue_depth(&self) -> usize;
 
     /// Map a function over items on the execution pool, potentially in parallel.
     ///

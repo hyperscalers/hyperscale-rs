@@ -22,9 +22,8 @@
 //! ```ignore
 //! let manager = RequestManager::new(adapter.clone(), RequestManagerConfig::default());
 //!
-//! // Send a request with automatic retry (opaque bytes)
-//! let data = frame_request("block.request", &sbor_bytes);
-//! match manager.request(&peers, None, "block.request".into(), data, RequestPriority::Background).await {
+//! // Send a request with automatic retry
+//! match manager.request(&peers, None, "block.request".into(), "block.request", sbor_bytes, RequestPriority::Background).await {
 //!     Ok((peer, response)) => { /* success */ }
 //!     Err(RequestError::Exhausted { attempts }) => { /* all retries failed */ }
 //!     Err(RequestError::NoPeers) => { /* no peers available */ }
@@ -200,16 +199,13 @@ impl RequestManager {
 
     /// Send a request with automatic retry and peer failover.
     ///
-    /// The request manager is transport-generic: it operates on opaque bytes
-    /// (already framed with type_id + SBOR payload by the caller). All retry,
-    /// timeout, and peer selection logic is handled internally.
-    ///
     /// # Arguments
     ///
     /// * `peers` - Candidate peer list (from topology/committee)
     /// * `preferred_peer` - If provided and in the list, try this peer first
     /// * `request_desc` - Description for logging (e.g., "block.request")
-    /// * `data` - Request payload (opaque bytes, already framed)
+    /// * `type_id` - Message type identifier for the typed frame header
+    /// * `sbor_data` - SBOR-encoded request payload (compressed by transport)
     /// * `priority` - Request priority (affects timeout and retry aggressiveness)
     ///
     /// # Returns
@@ -220,14 +216,22 @@ impl RequestManager {
         peers: &[PeerId],
         preferred_peer: Option<PeerId>,
         request_desc: String,
-        data: Vec<u8>,
+        type_id: &'static str,
+        sbor_data: Vec<u8>,
         priority: RequestPriority,
     ) -> Result<(PeerId, Bytes), RequestError> {
         // Acquire concurrency slot
         self.acquire_slot().await?;
 
         let result = self
-            .request_inner(peers, preferred_peer, &request_desc, &data, priority)
+            .request_inner(
+                peers,
+                preferred_peer,
+                &request_desc,
+                type_id,
+                &sbor_data,
+                priority,
+            )
             .await;
 
         // Release slot

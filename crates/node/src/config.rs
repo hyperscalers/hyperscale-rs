@@ -3,7 +3,6 @@
 use crate::protocol::fetch::FetchConfig;
 use crate::protocol::provision_fetch::ProvisionFetchConfig;
 use crate::protocol::sync::SyncConfig;
-use crate::request_handler::RequestHandlerConfig;
 use std::time::Duration;
 
 /// Configuration for [`IoLoop`](crate::io_loop::IoLoop).
@@ -14,7 +13,6 @@ pub struct NodeConfig {
     pub sync: SyncConfig,
     pub fetch: FetchConfig,
     pub provision_fetch: ProvisionFetchConfig,
-    pub inbound: RequestHandlerConfig,
     pub batch: BatchConfig,
 }
 

@@ -11,8 +11,12 @@
 //! Runner ──► ProvisionFetchProtocol::handle(Input) ──► Vec<Output>
 //! ```
 
-use hyperscale_types::{BlockHeight, ShardGroupId, StateProvision, ValidatorId};
+use hyperscale_messages::request::GetProvisionsRequest;
+use hyperscale_messages::response::GetProvisionsResponse;
+use hyperscale_storage::{ConsensusStore, SubstateStore};
+use hyperscale_types::{BlockHeight, ShardGroupId, StateProvision, Topology, ValidatorId};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tracing::{debug, trace};
 
 /// Configuration for the provision fetch protocol.
@@ -283,6 +287,110 @@ impl ProvisionFetchProtocol {
         }
 
         outputs
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Inbound request serving
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Serve an inbound provision request from a target shard needing our state.
+///
+/// Looks up the block at the requested height, identifies transactions
+/// that involve the requesting shard, collects the local state entries
+/// and merkle proofs, and returns them as `StateProvision`s.
+pub fn serve_provision_request(
+    storage: &(impl ConsensusStore + SubstateStore),
+    topology: &dyn Topology,
+    req: GetProvisionsRequest,
+) -> GetProvisionsResponse {
+    trace!(
+        block_height = req.block_height.0,
+        target_shard = req.target_shard.0,
+        "Handling provision request"
+    );
+
+    let local_shard = topology.local_shard();
+
+    let (block, _qc) = match storage.get_block(req.block_height) {
+        Some(pair) => pair,
+        None => {
+            debug!(
+                block_height = req.block_height.0,
+                "Provision request: block not found"
+            );
+            return GetProvisionsResponse { provisions: None };
+        }
+    };
+
+    let block_state_version = block.header.state_version;
+    let mut provisions = Vec::new();
+
+    let all_txs = block
+        .retry_transactions
+        .iter()
+        .chain(block.priority_transactions.iter())
+        .chain(block.transactions.iter());
+
+    for tx in all_txs {
+        let shards = topology.all_shards_for_transaction(tx);
+        if !shards.contains(&req.target_shard) {
+            continue;
+        }
+
+        let mut owned_nodes: Vec<_> = tx
+            .declared_reads
+            .iter()
+            .chain(tx.declared_writes.iter())
+            .filter(|&node_id| topology.shard_for_node_id(node_id) == local_shard)
+            .copied()
+            .collect();
+        owned_nodes.sort();
+        owned_nodes.dedup();
+
+        if owned_nodes.is_empty() {
+            continue;
+        }
+
+        let entries = match hyperscale_engine::fetch_state_entries(
+            storage,
+            &owned_nodes,
+            block_state_version,
+        ) {
+            Some(entries) => entries,
+            None => {
+                debug!(
+                    block_height = req.block_height.0,
+                    state_version = block_state_version,
+                    "Provision request: historical state version unavailable"
+                );
+                return GetProvisionsResponse { provisions: None };
+            }
+        };
+        let storage_keys: Vec<Vec<u8>> = entries.iter().map(|e| e.storage_key.clone()).collect();
+        let merkle_proofs = storage.generate_merkle_proofs(&storage_keys, block_state_version);
+
+        provisions.push(StateProvision {
+            transaction_hash: tx.hash(),
+            target_shard: req.target_shard,
+            source_shard: local_shard,
+            block_height: req.block_height,
+            block_timestamp: block.header.timestamp,
+            state_version: block_state_version,
+            entries: Arc::new(entries),
+            merkle_proofs: Arc::new(merkle_proofs),
+        });
+    }
+
+    debug!(
+        block_height = req.block_height.0,
+        target_shard = req.target_shard.0,
+        provision_count = provisions.len(),
+        "Responding to provision request"
+    );
+
+    GetProvisionsResponse {
+        provisions: Some(provisions),
     }
 }
 

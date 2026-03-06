@@ -10,7 +10,6 @@
 use super::behaviour::{Behaviour, BehaviourEvent};
 use super::command::{SwarmCommand, MAX_COMMANDS_PER_DRAIN};
 use crate::config::VersionInteroperabilityMode;
-use crate::decompress_pool::DecompressPoolHandle;
 use dashmap::DashMap;
 use futures::StreamExt;
 use hyperscale_network::HandlerRegistry;
@@ -60,7 +59,6 @@ pub(super) async fn run(
     cached_peer_count: Arc<AtomicUsize>,
     local_shard: ShardGroupId,
     version_interop_mode: VersionInteroperabilityMode,
-    decompress_pool: DecompressPoolHandle,
     registry: Arc<HandlerRegistry>,
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
 ) {
@@ -350,7 +348,6 @@ pub(super) async fn run(
                 super::gossipsub::handle_gossipsub_event(
                     event,
                     local_shard,
-                    &decompress_pool,
                     &registry,
                 ).await;
 

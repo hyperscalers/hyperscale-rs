@@ -749,7 +749,7 @@ mod tests {
     fn register_echo(adapter: &SimNetworkAdapter, type_id: &'static str) {
         let handler: Arc<hyperscale_network::RawRequestHandler> =
             Arc::new(|payload: &[u8]| -> Vec<u8> { payload.to_vec() });
-        adapter.registry.register_request(type_id, handler);
+        adapter.registry.register_raw_request(type_id, handler);
     }
 
     /// Helper: build a PendingRequest with a callback that captures the result.
@@ -893,7 +893,9 @@ mod tests {
         let adapter1 = network.create_adapter(1);
         let handler: Arc<hyperscale_network::RawRequestHandler> =
             Arc::new(|_: &[u8]| -> Vec<u8> { vec![] });
-        adapter1.registry.register_request("test.request", handler);
+        adapter1
+            .registry
+            .register_raw_request("test.request", handler);
 
         let (request, result) =
             make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
@@ -997,17 +999,17 @@ mod tests {
     /// Registers directly on the shared registry since these tests exercise
     /// the SimulatedNetwork infrastructure, not the typed handler API.
     fn register_gossip_handlers(network: &SimulatedNetwork) -> Vec<Arc<RecordingHandler>> {
+        use hyperscale_network::registry::RawGossipHandler;
         let total = network.total_nodes();
         (0..total as NodeIndex)
             .map(|i| {
                 let handler = RecordingHandler::new();
                 let adapter = network.create_adapter(i);
                 let handler_clone = handler.clone();
-                let raw: Arc<hyperscale_network::RawGossipHandler> =
-                    Arc::new(move |payload: Vec<u8>| {
-                        handler_clone.received.lock().unwrap().push(payload);
-                    });
-                adapter.registry.register_gossip(TEST_GOSSIP_TYPE, raw);
+                let raw: Arc<RawGossipHandler> = Arc::new(move |payload: Vec<u8>| {
+                    handler_clone.received.lock().unwrap().push(payload);
+                });
+                adapter.registry.register_raw_gossip(TEST_GOSSIP_TYPE, raw);
                 handler
             })
             .collect()
@@ -1307,16 +1309,16 @@ mod tests {
 
         // Register per-type handlers for "block.vote" on each node.
         // Register directly on registry since we want raw recording handlers.
+        use hyperscale_network::registry::RawGossipHandler;
         let handlers: Vec<Arc<RecordingHandler>> = (0..network.total_nodes() as NodeIndex)
             .map(|i| {
                 let handler = RecordingHandler::new();
                 let adapter = network.create_adapter(i);
                 let handler_clone = handler.clone();
-                let raw: Arc<hyperscale_network::RawGossipHandler> =
-                    Arc::new(move |payload: Vec<u8>| {
-                        handler_clone.received.lock().unwrap().push(payload);
-                    });
-                adapter.registry.register_gossip("block.vote", raw);
+                let raw: Arc<RawGossipHandler> = Arc::new(move |payload: Vec<u8>| {
+                    handler_clone.received.lock().unwrap().push(payload);
+                });
+                adapter.registry.register_raw_gossip("block.vote", raw);
                 handler
             })
             .collect();

@@ -11,7 +11,7 @@ mod fixtures;
 
 use fixtures::TestFixtures;
 use hyperscale_bft::BftConfig;
-use hyperscale_production::{PooledDispatch, ProductionRunner, RocksDbStorage, ThreadPoolConfig};
+use hyperscale_production::{ProductionRunner, RocksDbStorage};
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId, ValidatorId,
@@ -22,11 +22,6 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tracing::info;
-
-/// Create a minimal test dispatch.
-fn test_dispatch() -> Arc<PooledDispatch> {
-    Arc::new(PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap())
-}
 
 /// Test timeout values (from design spec).
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -119,7 +114,6 @@ async fn test_network_adapter_starts() {
         ..Default::default()
     };
 
-    let dispatch = test_dispatch();
     let result = timeout(
         CONNECTION_TIMEOUT,
         Libp2pAdapter::new(
@@ -127,7 +121,6 @@ async fn test_network_adapter_starts() {
             keypair,
             validator_id,
             shard,
-            dispatch,
             Arc::new(hyperscale_network::HandlerRegistry::new()),
         ),
     )
@@ -162,14 +155,11 @@ async fn test_two_node_connection() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let dispatch1 = test_dispatch();
-
     let adapter1 = Libp2pAdapter::new(
         config1,
         keypair1,
         ValidatorId(0),
         ShardGroupId(0),
-        dispatch1,
         Arc::new(hyperscale_network::HandlerRegistry::new()),
     )
     .await
@@ -189,14 +179,11 @@ async fn test_two_node_connection() {
         bootstrap_peers: vec![node1_addr.clone()],
         ..Default::default()
     };
-    let dispatch2 = test_dispatch();
-
     let adapter2 = Libp2pAdapter::new(
         config2,
         keypair2,
         ValidatorId(1),
         ShardGroupId(0),
-        dispatch2,
         Arc::new(hyperscale_network::HandlerRegistry::new()),
     )
     .await
@@ -244,14 +231,11 @@ async fn test_topic_subscription() {
         bootstrap_peers: vec![],
         ..Default::default()
     };
-    let dispatch = test_dispatch();
-
     let adapter = Libp2pAdapter::new(
         config,
         keypair,
         ValidatorId(0),
         ShardGroupId(0),
-        dispatch,
         Arc::new(hyperscale_network::HandlerRegistry::new()),
     )
     .await

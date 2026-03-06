@@ -13,7 +13,10 @@
 //! Production: `SyncManager` wraps this, maps outputs to tokio tasks.
 //! Simulation: feeds inputs/outputs synchronously via event queue.
 
+use hyperscale_messages::request::GetBlockRequest;
+use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
+use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{Block, Hash, QuorumCertificate};
 use serde::Serialize;
 use std::cmp::Reverse;
@@ -361,6 +364,22 @@ impl SyncProtocol {
             }
         }
         outputs
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Inbound request serving
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Serve an inbound block sync request.
+pub fn serve_block_request(
+    storage: &impl ConsensusStore,
+    req: GetBlockRequest,
+) -> GetBlockResponse {
+    trace!(height = req.height.0, "Handling block sync request");
+    match storage.get_block_for_sync(req.height) {
+        Some((block, qc)) => GetBlockResponse::found(block, qc),
+        None => GetBlockResponse::not_found(),
     }
 }
 

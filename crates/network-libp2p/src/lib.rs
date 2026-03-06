@@ -5,11 +5,9 @@
 //! - **Gossipsub** for efficient broadcast messaging (shard-scoped topics)
 //! - **Streams** for request-response (sync/fetch)
 //! - **QUIC** transport for reliable, encrypted connections
-//! - **Decompress pool** for async LZ4 decompression off the event loop
 
 mod adapter;
 mod config;
-mod decompress_pool;
 mod inbound_router;
 mod network;
 mod request_manager;

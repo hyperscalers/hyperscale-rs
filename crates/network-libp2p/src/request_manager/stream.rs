@@ -1,8 +1,8 @@
 //! Stream I/O and speculative retry logic.
 //!
 //! Handles the low-level mechanics of sending requests over libp2p streams,
-//! including length-prefixed framing, compression, and speculative retry
-//! (racing duplicate requests based on RTT history).
+//! including typed framing (type_id in header), compression, and speculative
+//! retry (racing duplicate requests based on RTT history).
 
 use super::{RequestManager, RequestPriority};
 use crate::adapter::{Libp2pAdapter, NetworkError};
@@ -18,17 +18,17 @@ use tracing::{debug, trace};
 impl RequestManager {
     /// Send the actual request through the adapter using raw streams.
     ///
-    /// Opens a stream, writes the length-prefixed request, reads the length-prefixed
-    /// response, all wrapped in timeouts. The adapter is a "dumb pipe" - all timeout
-    /// logic is here in RequestManager.
+    /// Opens a stream, writes a typed frame (type_id + compressed SBOR),
+    /// reads the compressed response, all wrapped in timeouts.
     pub(super) async fn send_request(
         &self,
         peer: &PeerId,
+        type_id: &'static str,
         data: &[u8],
         _priority: RequestPriority,
     ) -> Result<Vec<u8>, NetworkError> {
         let timeout = self.compute_stream_timeout(peer);
-        Self::send_request_static(&self.adapter, peer, data, timeout).await
+        Self::send_request_static(&self.adapter, peer, type_id, data, timeout).await
     }
 
     /// Send a request with speculative retry based on RTT.
@@ -42,6 +42,7 @@ impl RequestManager {
     pub(super) async fn send_request_with_speculative_retry(
         &self,
         peer: &PeerId,
+        type_id: &'static str,
         data: &[u8],
         priority: RequestPriority,
     ) -> Result<(Vec<u8>, Duration), NetworkError> {
@@ -54,7 +55,7 @@ impl RequestManager {
         if self.config.speculative_retry_multiplier == 0.0
             || speculative_timeout >= self.config.speculative_retry_max
         {
-            let result = self.send_request(peer, data, priority).await?;
+            let result = self.send_request(peer, type_id, data, priority).await?;
             return Ok((result, start.elapsed()));
         }
 
@@ -77,8 +78,14 @@ impl RequestManager {
 
         // Spawn the first request so it continues running independently
         let mut first_handle = tokio::spawn(async move {
-            Self::send_request_static(&adapter_clone, &peer_clone, &data_first, stream_timeout)
-                .await
+            Self::send_request_static(
+                &adapter_clone,
+                &peer_clone,
+                type_id,
+                &data_first,
+                stream_timeout,
+            )
+            .await
         });
 
         // Wait for either: first request completes, or speculative timeout
@@ -110,8 +117,14 @@ impl RequestManager {
         let peer_clone2 = *peer;
 
         let mut second_handle = tokio::spawn(async move {
-            Self::send_request_static(&adapter_clone2, &peer_clone2, &data_shared, stream_timeout)
-                .await
+            Self::send_request_static(
+                &adapter_clone2,
+                &peer_clone2,
+                type_id,
+                &data_shared,
+                stream_timeout,
+            )
+            .await
         });
 
         // Race both requests - first SUCCESS wins.
@@ -160,20 +173,18 @@ impl RequestManager {
 
     /// Static version of send_request for use in spawned tasks.
     ///
-    /// Uses raw streams with length-prefixed framing:
+    /// Uses typed framing for requests:
     /// 1. Open stream to peer
-    /// 2. Write [4-byte big-endian length][compressed request data]
-    /// 3. Read [4-byte big-endian length][compressed response data]
+    /// 2. Write typed frame: [2B type_id_len][type_id][4B len][LZ4 compressed SBOR]
+    /// 3. Read plain frame response: [4B len][LZ4 compressed SBOR]
     /// 4. Decompress response
-    /// 5. Close stream
     ///
     /// All I/O operations are wrapped with the provided timeout (RTT-based).
-    /// The `request_data` is opaque bytes (already framed by the caller),
-    /// not yet compressed.
     async fn send_request_static(
         adapter: &Arc<Libp2pAdapter>,
         peer: &PeerId,
-        request_data: &[u8],
+        type_id: &str,
+        sbor_data: &[u8],
         timeout: Duration,
     ) -> Result<Vec<u8>, NetworkError> {
         // Open stream with timeout
@@ -182,10 +193,11 @@ impl RequestManager {
             .map_err(|_| NetworkError::Timeout)?
             .map_err(|e| NetworkError::StreamOpenFailed(format!("{:?}", e)))?;
 
-        // Write length-prefixed compressed request with timeout
+        // Write typed frame (type_id header + compressed SBOR) with timeout.
+        // write_typed_frame flushes and half-closes the write side.
         let write_result = tokio::time::timeout(
             timeout,
-            stream_framing::write_frame(&mut stream, request_data),
+            stream_framing::write_typed_frame(&mut stream, type_id, sbor_data),
         )
         .await;
 
