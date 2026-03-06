@@ -85,7 +85,7 @@ pub struct SimNetworkAdapter {
     pending_requests: Mutex<Vec<PendingRequest>>,
     pending_notifications: Mutex<Vec<PendingNotification>>,
     /// Shared handler registry — written by `register_*_handler`,
-    /// read by `SimulatedNetwork::fulfill_requests` and `flush_gossip`.
+    /// read by `SimulatedNetwork::accept_requests`, `flush_notifications`, and `flush_gossip`.
     pub(crate) registry: Arc<HandlerRegistry>,
 }
 
@@ -168,9 +168,9 @@ impl Network for SimNetworkAdapter {
     }
 
     fn notify<M: NetworkMessage>(&self, recipients: &[ValidatorId], message: &M) {
-        // Note: compression happens here at send-time, then fulfill_notifications()
-        // decompresses before calling handlers. In production (ProdNetwork), compression
-        // happens inside the stream framing layer (write_typed_frame) instead.
+        // Note: compression happens here at send-time, then accept_notifications()
+        // decompresses before queueing for delivery. In production (ProdNetwork),
+        // compression happens inside the stream framing layer (write_typed_frame) instead.
         let data = compression::compress(
             &basic_encode(message).expect("SimNetworkAdapter: failed to encode notification"),
         );

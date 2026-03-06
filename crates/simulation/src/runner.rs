@@ -492,12 +492,12 @@ impl SimulationRunner {
         );
 
         loop {
-            // Determine next time: min(event_queue, pending_gossip)
+            // Determine next time: min(event_queue, all pending deliveries)
             let next_event = self.event_queue.first_key_value().map(|(k, _)| k.time);
-            let next_gossip = self.network.next_gossip_delivery_time();
+            let next_delivery = self.network.next_delivery_time();
 
-            let next_time = match (next_event, next_gossip) {
-                (Some(e), Some(g)) => e.min(g),
+            let next_time = match (next_event, next_delivery) {
+                (Some(e), Some(d)) => e.min(d),
                 (Some(t), None) | (None, Some(t)) => t,
                 (None, None) => break,
             };
@@ -512,10 +512,14 @@ impl SimulationRunner {
 
             self.now = next_time;
 
-            // Flush gossip that's due — handlers push to event channels.
-            let delivered = self.network.flush_gossip(self.now);
-            if delivered > 0 {
-                // Drain events that gossip handlers pushed into channels.
+            // Flush all delivery queues that are due — handlers/callbacks push
+            // events into crossbeam channels.
+            let gossip_delivered = self.network.flush_gossip(self.now);
+            let notif_delivered = self.network.flush_notifications(self.now);
+            let response_delivered = self.network.flush_responses(self.now);
+
+            if gossip_delivered + notif_delivered + response_delivered > 0 {
+                // Drain events that handlers pushed into channels.
                 for node_idx in 0..self.io_loops.len() as u32 {
                     while let Ok(event) = self.event_rxs[node_idx as usize].try_recv() {
                         self.schedule_event(node_idx, self.now, event);
@@ -566,11 +570,14 @@ impl SimulationRunner {
     // Output Draining
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Drain network outbox, timer ops, pending requests, and buffered events from a node.
+    /// Drain network outbox, pending requests, pending notifications, and
+    /// buffered events from a node.
     ///
     /// Converts IoLoop-internal outputs into harness-level operations:
-    /// outbox entries → network delivery, timer ops → event queue,
-    /// pending requests → fulfill from peer data, buffered events → event queue.
+    /// - Outbox entries → gossip latency queue
+    /// - Pending requests → handler invoked, response callback deferred
+    /// - Pending notifications → notification latency queue
+    /// - Buffered events (from error callbacks, IoLoop step) → event queue
     fn drain_node_io(&mut self, node: NodeIndex) {
         let i = node as usize;
         let outbox = self.io_loops[i].network().drain_outbox();
@@ -584,31 +591,35 @@ impl SimulationRunner {
             self.stats.messages_dropped_loss += stats.messages_dropped_loss;
         }
 
-        // Fulfill pending network requests (block, tx, cert fetches) through
-        // peer RequestHandlers. Must happen BEFORE draining buffered events so
-        // that callback-generated events are included in the drain below.
+        // Accept pending requests: handler invoked now, response callback
+        // deferred with round-trip latency. Error callbacks fire immediately
+        // and push events into channels, so drain must happen after this.
         let pending_requests = self.io_loops[i].network().drain_pending_requests();
         if !pending_requests.is_empty() {
-            let stats = self
-                .network
-                .fulfill_requests(node, pending_requests, &mut self.rng);
-            self.stats.messages_sent += stats.messages_sent;
-            self.stats.messages_dropped_partition += stats.messages_dropped_partition;
-            self.stats.messages_dropped_loss += stats.messages_dropped_loss;
-        }
-
-        // Fulfill pending notifications (fire-and-forget unicast).
-        let pending_notifications = self.io_loops[i].network().drain_pending_notifications();
-        if !pending_notifications.is_empty() {
             let stats =
                 self.network
-                    .fulfill_notifications(node, pending_notifications, &mut self.rng);
+                    .accept_requests(node, self.now, pending_requests, &mut self.rng);
             self.stats.messages_sent += stats.messages_sent;
             self.stats.messages_dropped_partition += stats.messages_dropped_partition;
             self.stats.messages_dropped_loss += stats.messages_dropped_loss;
         }
 
-        // Drain buffered events (includes events from request callbacks above).
+        // Accept pending notifications: queued for deferred delivery with latency.
+        let pending_notifications = self.io_loops[i].network().drain_pending_notifications();
+        if !pending_notifications.is_empty() {
+            let stats = self.network.accept_notifications(
+                node,
+                self.now,
+                pending_notifications,
+                &mut self.rng,
+            );
+            self.stats.messages_sent += stats.messages_sent;
+            self.stats.messages_dropped_partition += stats.messages_dropped_partition;
+            self.stats.messages_dropped_loss += stats.messages_dropped_loss;
+        }
+
+        // Drain buffered events (from error callbacks in accept_requests,
+        // plus any events the IoLoop step itself pushed).
         while let Ok(event) = self.event_rxs[i].try_recv() {
             self.schedule_event(node, self.now, event);
         }

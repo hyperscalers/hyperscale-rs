@@ -45,7 +45,8 @@ impl Default for NetworkConfig {
     }
 }
 
-/// Stats returned by [`SimulatedNetwork::fulfill_requests`] and
+/// Stats returned by [`SimulatedNetwork::accept_requests`],
+/// [`SimulatedNetwork::accept_notifications`], and
 /// [`SimulatedNetwork::accept_gossip`].
 #[derive(Debug, Default)]
 pub struct FulfillmentStats {
@@ -83,6 +84,64 @@ impl Ord for ScheduledGossip {
     }
 }
 
+/// A notification delivery scheduled for future delivery via the internal latency queue.
+struct ScheduledNotification {
+    delivery_time: Duration,
+    sequence: u64,
+    target_node: NodeIndex,
+    message_type: &'static str,
+    payload: Vec<u8>,
+}
+
+impl PartialEq for ScheduledNotification {
+    fn eq(&self, other: &Self) -> bool {
+        (self.delivery_time, self.sequence) == (other.delivery_time, other.sequence)
+    }
+}
+impl Eq for ScheduledNotification {}
+
+impl PartialOrd for ScheduledNotification {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ScheduledNotification {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.delivery_time, self.sequence).cmp(&(other.delivery_time, other.sequence))
+    }
+}
+
+/// A request-response callback scheduled for future delivery.
+///
+/// The handler was already invoked at accept-time (it's a data lookup);
+/// only the callback delivery is delayed to model round-trip latency.
+struct ScheduledResponse {
+    delivery_time: Duration,
+    sequence: u64,
+    #[allow(dead_code)]
+    requester_node: NodeIndex,
+    on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) + Send>,
+    response: Vec<u8>,
+}
+
+impl PartialEq for ScheduledResponse {
+    fn eq(&self, other: &Self) -> bool {
+        (self.delivery_time, self.sequence) == (other.delivery_time, other.sequence)
+    }
+}
+impl Eq for ScheduledResponse {}
+
+impl PartialOrd for ScheduledResponse {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ScheduledResponse {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.delivery_time, self.sequence).cmp(&(other.delivery_time, other.sequence))
+    }
+}
+
 /// Simulated network for deterministic message delivery.
 ///
 /// Supports:
@@ -90,7 +149,7 @@ impl Ord for ScheduledGossip {
 /// - Packet loss (probabilistic message drops)
 /// - Network partitions (blocking communication between node pairs)
 /// - Request fulfillment via per-type handlers in per-node [`HandlerRegistry`]s
-/// - Internalized gossip latency queue with per-type gossip handlers
+/// - Internalized latency queues for gossip, notifications, and request-responses
 pub struct SimulatedNetwork {
     config: NetworkConfig,
     /// Partitioned node pairs. If (a, b) is in this set, messages from a to b are dropped.
@@ -98,13 +157,22 @@ pub struct SimulatedNetwork {
     partitions: HashSet<(NodeIndex, NodeIndex)>,
     /// Per-node handler registries, shared with each node's [`SimNetworkAdapter`].
     ///
-    /// Populated when `register_gossip_handler` / `register_request_handler`
-    /// are called on the adapter; read during `fulfill_requests` / `flush_gossip`.
+    /// Populated when `register_gossip_handler` / `register_request_handler` /
+    /// `register_notification_handler` are called on the adapter; read during
+    /// `flush_gossip` / `flush_notifications` / `accept_requests`.
     registries: Vec<Arc<HandlerRegistry>>,
     /// Internal latency queue for pending gossip deliveries.
     pending_gossip: BinaryHeap<Reverse<ScheduledGossip>>,
-    /// Monotonic sequence counter for deterministic ordering of same-time deliveries.
+    /// Monotonic sequence counter for deterministic gossip ordering.
     gossip_sequence: u64,
+    /// Internal latency queue for pending notification deliveries.
+    pending_notifications: BinaryHeap<Reverse<ScheduledNotification>>,
+    /// Monotonic sequence counter for deterministic notification ordering.
+    notification_sequence: u64,
+    /// Internal latency queue for pending request-response callback deliveries.
+    pending_responses: BinaryHeap<Reverse<ScheduledResponse>>,
+    /// Monotonic sequence counter for deterministic response ordering.
+    response_sequence: u64,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -114,6 +182,8 @@ impl std::fmt::Debug for SimulatedNetwork {
             .field("partitions", &self.partitions)
             .field("registries", &self.registries.len())
             .field("pending_gossip", &self.pending_gossip.len())
+            .field("pending_notifications", &self.pending_notifications.len())
+            .field("pending_responses", &self.pending_responses.len())
             .finish()
     }
 }
@@ -131,6 +201,10 @@ impl SimulatedNetwork {
             registries,
             pending_gossip: BinaryHeap::new(),
             gossip_sequence: 0,
+            pending_notifications: BinaryHeap::new(),
+            notification_sequence: 0,
+            pending_responses: BinaryHeap::new(),
+            response_sequence: 0,
         }
     }
 
@@ -138,7 +212,8 @@ impl SimulatedNetwork {
     ///
     /// The returned adapter's `register_gossip_handler` / `register_request_handler`
     /// calls populate the shared registry, making them visible to
-    /// [`fulfill_requests`](Self::fulfill_requests) and [`flush_gossip`](Self::flush_gossip).
+    /// [`accept_requests`](Self::accept_requests), [`flush_notifications`](Self::flush_notifications),
+    /// and [`flush_gossip`](Self::flush_gossip).
     pub fn create_adapter(&self, node: NodeIndex) -> SimNetworkAdapter {
         SimNetworkAdapter::new(Arc::clone(&self.registries[node as usize]))
     }
@@ -293,21 +368,22 @@ impl SimulatedNetwork {
         &self.config
     }
 
-    // ─── Request Fulfillment ───
+    // ─── Request Acceptance (Latency-Modeled) ───
 
-    /// Fulfill pending requests by routing them through peer request handlers.
-    ///
-    /// Handlers are obtained from per-node [`HandlerRegistry`]s populated by
-    /// each node's `register_request_handler` calls.
+    /// Accept pending requests: invoke handler immediately, schedule callback
+    /// with round-trip latency.
     ///
     /// For each request:
-    /// 1. Select a peer (preferred_peer if set, otherwise random non-self peer)
+    /// 1. Select a peer (preferred_peer if set, otherwise random from list)
     /// 2. Check partition and packet loss (request + response directions)
-    /// 3. Look up the per-type handler and pass the raw SBOR payload
-    /// 4. Invoke the callback with the response bytes
-    pub fn fulfill_requests(
-        &self,
+    /// 3. On error (partition/loss/no handler/empty): invoke callback immediately
+    /// 4. On success: invoke handler to get response bytes, sample two
+    ///    independent latencies (request + response legs), schedule callback
+    ///    delivery at `now + latency_request + latency_response`
+    pub fn accept_requests(
+        &mut self,
         requester: NodeIndex,
+        now: Duration,
         requests: Vec<PendingRequest>,
         rng: &mut ChaCha8Rng,
     ) -> FulfillmentStats {
@@ -342,7 +418,7 @@ impl SimulatedNetwork {
                 }
             };
 
-            // Partition check.
+            // Partition check — immediate error.
             if self.is_partitioned(requester, peer) {
                 stats.messages_dropped_partition += 1;
                 trace!(requester, peer, "Request dropped: partition");
@@ -350,7 +426,7 @@ impl SimulatedNetwork {
                 continue;
             }
 
-            // Packet loss (request direction).
+            // Packet loss (request direction) — immediate error.
             if self.should_drop_packet(rng) {
                 stats.messages_dropped_loss += 1;
                 trace!(requester, peer, "Request dropped: packet loss");
@@ -358,7 +434,7 @@ impl SimulatedNetwork {
                 continue;
             }
 
-            // Packet loss (response direction).
+            // Packet loss (response direction) — immediate error.
             if self.should_drop_packet(rng) {
                 stats.messages_dropped_loss += 1;
                 trace!(requester, peer, "Response dropped: packet loss");
@@ -383,30 +459,47 @@ impl SimulatedNetwork {
                 }
             };
 
+            // Invoke handler synchronously (data lookup).
             let response_bytes = handler(&request_bytes);
 
             if response_bytes.is_empty() {
                 on_response(Err(RequestError::PeerError(
                     "handler returned empty response".to_string(),
                 )));
-            } else {
-                on_response(Ok(response_bytes));
+                continue;
             }
+
+            // Sample round-trip latency: two independent one-way latencies.
+            let request_latency = self.sample_latency(requester, peer, rng);
+            let response_latency = self.sample_latency(peer, requester, rng);
+            let round_trip = request_latency + response_latency;
+
+            self.response_sequence += 1;
+            self.pending_responses.push(Reverse(ScheduledResponse {
+                delivery_time: now + round_trip,
+                sequence: self.response_sequence,
+                requester_node: requester,
+                on_response,
+                response: response_bytes,
+            }));
         }
 
         stats
     }
 
-    // ─── Notification Fulfillment ───
+    // ─── Notification Acceptance (Latency-Modeled) ───
 
-    /// Fulfill pending notifications by delivering to each recipient's notification handler.
+    /// Buffer notifications for delivery with simulated latency.
     ///
-    /// For each notification, the payload is decompressed once and delivered to
-    /// each recipient (with partition/loss checks). Similar to gossip delivery
-    /// but targeted at explicit recipients rather than broadcast.
-    pub fn fulfill_notifications(
-        &self,
+    /// Decompresses the payload once, then for each recipient: checks
+    /// partition/loss, samples latency, and queues into `pending_notifications`.
+    ///
+    /// The harness calls [`flush_notifications()`](Self::flush_notifications)
+    /// to deliver due messages via each target's registered notification handler.
+    pub fn accept_notifications(
+        &mut self,
         sender: NodeIndex,
+        now: Duration,
         notifications: Vec<PendingNotification>,
         rng: &mut ChaCha8Rng,
     ) -> FulfillmentStats {
@@ -426,7 +519,7 @@ impl SimulatedNetwork {
                         sender,
                         type_id,
                         ?e,
-                        "Notification decompress error in fulfill_notifications"
+                        "Notification decompress error in accept_notifications"
                     );
                     continue;
                 }
@@ -435,35 +528,26 @@ impl SimulatedNetwork {
             for &recipient in &recipients {
                 let to = recipient.0 as NodeIndex;
 
-                // Partition check.
-                if self.is_partitioned(sender, to) {
-                    stats.messages_dropped_partition += 1;
-                    trace!(sender, to, "Notification dropped: partition");
-                    continue;
-                }
-
-                // Packet loss.
-                if self.should_drop_packet(rng) {
-                    stats.messages_dropped_loss += 1;
-                    trace!(sender, to, "Notification dropped: packet loss");
-                    continue;
-                }
-
-                stats.messages_sent += 1;
-
-                // Look up the per-type notification handler from the recipient's registry.
-                if let Some(handler) = self
-                    .registries
-                    .get(to as usize)
-                    .and_then(|r| r.get_notification(type_id))
-                {
-                    handler(payload.clone());
-                } else {
-                    debug!(
-                        target_node = to,
-                        type_id,
-                        "No notification handler for message type on target node, dropping"
-                    );
+                match self.should_deliver(sender, to, rng) {
+                    None => {
+                        if self.is_partitioned(sender, to) {
+                            stats.messages_dropped_partition += 1;
+                        } else {
+                            stats.messages_dropped_loss += 1;
+                        }
+                    }
+                    Some(latency) => {
+                        stats.messages_sent += 1;
+                        self.notification_sequence += 1;
+                        self.pending_notifications
+                            .push(Reverse(ScheduledNotification {
+                                delivery_time: now + latency,
+                                sequence: self.notification_sequence,
+                                target_node: to,
+                                message_type: type_id,
+                                payload: payload.clone(),
+                            }));
+                    }
                 }
             }
         }
@@ -574,6 +658,84 @@ impl SimulatedNetwork {
     /// Earliest pending gossip delivery time (for event loop scheduling).
     pub fn next_gossip_delivery_time(&self) -> Option<Duration> {
         self.pending_gossip.peek().map(|Reverse(s)| s.delivery_time)
+    }
+
+    // ─── Notification Latency Queue ───
+
+    /// Deliver all pending notifications with `delivery_time <= now`.
+    ///
+    /// Calls each target node's registered notification handler. Returns
+    /// the number of notifications delivered.
+    pub fn flush_notifications(&mut self, now: Duration) -> usize {
+        let mut delivered = 0;
+        while let Some(Reverse(scheduled)) = self.pending_notifications.peek() {
+            if scheduled.delivery_time > now {
+                break;
+            }
+            let Reverse(scheduled) = self.pending_notifications.pop().unwrap();
+            if let Some(handler) = self
+                .registries
+                .get(scheduled.target_node as usize)
+                .and_then(|r| r.get_notification(scheduled.message_type))
+            {
+                handler(scheduled.payload);
+                delivered += 1;
+            } else {
+                debug!(
+                    target_node = scheduled.target_node,
+                    message_type = scheduled.message_type,
+                    "No notification handler for message type on target node, dropping"
+                );
+            }
+        }
+        delivered
+    }
+
+    /// Earliest pending notification delivery time.
+    pub fn next_notification_delivery_time(&self) -> Option<Duration> {
+        self.pending_notifications
+            .peek()
+            .map(|Reverse(s)| s.delivery_time)
+    }
+
+    // ─── Response Callback Latency Queue ───
+
+    /// Deliver all pending response callbacks with `delivery_time <= now`.
+    ///
+    /// Invokes each deferred `on_response` callback with the pre-computed
+    /// response bytes. Returns the number of responses delivered.
+    pub fn flush_responses(&mut self, now: Duration) -> usize {
+        let mut delivered = 0;
+        while let Some(Reverse(scheduled)) = self.pending_responses.peek() {
+            if scheduled.delivery_time > now {
+                break;
+            }
+            let Reverse(scheduled) = self.pending_responses.pop().unwrap();
+            (scheduled.on_response)(Ok(scheduled.response));
+            delivered += 1;
+        }
+        delivered
+    }
+
+    /// Earliest pending response delivery time.
+    pub fn next_response_delivery_time(&self) -> Option<Duration> {
+        self.pending_responses
+            .peek()
+            .map(|Reverse(s)| s.delivery_time)
+    }
+
+    // ─── Unified Delivery Time ───
+
+    /// Earliest pending delivery time across gossip, notifications, and responses.
+    pub fn next_delivery_time(&self) -> Option<Duration> {
+        [
+            self.next_gossip_delivery_time(),
+            self.next_notification_delivery_time(),
+            self.next_response_delivery_time(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 }
 
@@ -815,7 +977,7 @@ mod tests {
         assert!(network.should_deliver(0, 1, &mut rng).is_none());
     }
 
-    // ─── fulfill_requests() Tests ───
+    // ─── accept_requests() Tests ───
 
     /// Helper: register an echo handler on a node's adapter for a given type_id.
     ///
@@ -851,8 +1013,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fulfill_requests_happy_path() {
-        let network = SimulatedNetwork::new(NetworkConfig {
+    fn test_accept_requests_happy_path() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 4,
             num_shards: 1,
             ..Default::default()
@@ -866,19 +1028,24 @@ mod tests {
         let (request, result) =
             make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
 
-        let stats = network.fulfill_requests(0, vec![request], &mut rng);
+        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_sent, 2); // request + response
         assert_eq!(stats.messages_dropped_partition, 0);
         assert_eq!(stats.messages_dropped_loss, 0);
 
-        // Callback should have been invoked with Ok
+        // Callback is deferred — not yet invoked
+        assert!(result.lock().unwrap().is_none());
+
+        // Flush to deliver the response
+        network.flush_responses(FAR_FUTURE);
+
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
     }
 
     #[test]
-    fn test_fulfill_requests_partition_drops() {
+    fn test_accept_requests_partition_drops() {
         let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 4,
             num_shards: 1,
@@ -894,11 +1061,12 @@ mod tests {
 
         let (request, result) =
             make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
-        let stats = network.fulfill_requests(0, vec![request], &mut rng);
+        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_dropped_partition, 1);
         assert_eq!(stats.messages_sent, 0);
 
+        // Error callbacks are immediate — no flush needed
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(
             captured,
@@ -907,8 +1075,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fulfill_requests_packet_loss() {
-        let network = SimulatedNetwork::new(NetworkConfig {
+    fn test_accept_requests_packet_loss() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 4,
             num_shards: 1,
             packet_loss_rate: 1.0, // 100% loss
@@ -921,11 +1089,12 @@ mod tests {
 
         let (request, result) =
             make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
-        let stats = network.fulfill_requests(0, vec![request], &mut rng);
+        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_dropped_loss, 1);
         assert_eq!(stats.messages_sent, 0);
 
+        // Error callbacks are immediate
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(
             captured,
@@ -934,8 +1103,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fulfill_requests_no_handler() {
-        let network = SimulatedNetwork::new(NetworkConfig {
+    fn test_accept_requests_no_handler() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 4,
             num_shards: 1,
             ..Default::default()
@@ -947,8 +1116,9 @@ mod tests {
 
         let (request, result) =
             make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
-        network.fulfill_requests(0, vec![request], &mut rng);
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
+        // Error callbacks are immediate
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(
             captured,
@@ -957,8 +1127,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fulfill_requests_empty_response() {
-        let network = SimulatedNetwork::new(NetworkConfig {
+    fn test_accept_requests_empty_response() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 4,
             num_shards: 1,
             ..Default::default()
@@ -975,8 +1145,9 @@ mod tests {
 
         let (request, result) =
             make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
-        network.fulfill_requests(0, vec![request], &mut rng);
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
+        // Error callbacks are immediate
         let captured = result.lock().unwrap().take().unwrap();
         assert!(
             matches!(captured, Err(hyperscale_network::RequestError::PeerError(ref s)) if s.contains("empty"))
@@ -984,8 +1155,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fulfill_requests_random_peer_selection() {
-        let network = SimulatedNetwork::new(NetworkConfig {
+    fn test_accept_requests_random_peer_selection() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 4,
             num_shards: 1,
             ..Default::default()
@@ -1001,16 +1172,19 @@ mod tests {
         // No preferred peer — should pick a random peer from the provided list
         let peers = vec![ValidatorId(1), ValidatorId(2), ValidatorId(3)];
         let (request, result) = make_request_with_capture(peers, None);
-        let stats = network.fulfill_requests(0, vec![request], &mut rng);
+        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_sent, 2);
+
+        // Flush to deliver the deferred response
+        network.flush_responses(FAR_FUTURE);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
     }
 
     #[test]
-    fn test_fulfill_requests_single_node_no_peers() {
-        let network = SimulatedNetwork::new(NetworkConfig {
+    fn test_accept_requests_single_node_no_peers() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 1,
             num_shards: 1,
             ..Default::default()
@@ -1022,13 +1196,47 @@ mod tests {
 
         // No preferred peer, and empty peer list
         let (request, result) = make_request_with_capture(vec![], None);
-        network.fulfill_requests(0, vec![request], &mut rng);
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
+        // Error callbacks are immediate
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(
             captured,
             Err(hyperscale_network::RequestError::PeerUnreachable(_))
         ));
+    }
+
+    #[test]
+    fn test_accept_requests_response_latency() {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
+            validators_per_shard: 4,
+            num_shards: 1,
+            packet_loss_rate: 0.0,
+            ..Default::default()
+        });
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+
+        let adapter1 = network.create_adapter(1);
+        register_echo(&adapter1, "test.request");
+
+        let (request, result) =
+            make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
+
+        network.accept_requests(0, Duration::from_millis(100), vec![request], &mut rng);
+
+        // Response should be scheduled with round-trip latency after 100ms
+        let next = network.next_response_delivery_time().unwrap();
+        assert!(next > Duration::from_millis(100));
+
+        // Flush at 100ms — should not deliver yet
+        let delivered = network.flush_responses(Duration::from_millis(100));
+        assert_eq!(delivered, 0);
+        assert!(result.lock().unwrap().is_none());
+
+        // Flush at far future — should deliver
+        network.flush_responses(FAR_FUTURE);
+        let captured = result.lock().unwrap().take().unwrap();
+        assert!(captured.is_ok());
     }
 
     // ─── accept_gossip / flush_gossip Tests ───
@@ -1351,7 +1559,7 @@ mod tests {
 
     #[test]
     fn test_create_adapter_shares_handler_slot() {
-        let network = SimulatedNetwork::new(NetworkConfig {
+        let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 2,
             num_shards: 1,
             ..Default::default()
@@ -1362,12 +1570,13 @@ mod tests {
         let adapter1 = network.create_adapter(1);
         register_echo(&adapter1, "test.request");
 
-        // fulfill_requests should be able to find the handler
+        // accept_requests should be able to find the handler
         let (request, result) =
             make_request_with_capture(vec![ValidatorId(1)], Some(ValidatorId(1)));
-        let stats = network.fulfill_requests(0, vec![request], &mut rng);
+        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_sent, 2);
+        network.flush_responses(FAR_FUTURE);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
     }
