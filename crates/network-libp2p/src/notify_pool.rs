@@ -39,7 +39,7 @@ const PEER_CHANNEL_CAPACITY: usize = 256;
 /// A message queued for sending on a persistent notification stream.
 ///
 /// Carries pre-compressed data so that compression happens once per message
-/// (in [`ProdNetwork::notify`]) rather than once per peer.
+/// (in [`Libp2pNetwork::notify`]) rather than once per peer.
 struct PendingFrame {
     type_id: &'static str,
     compressed_data: Vec<u8>,
@@ -195,7 +195,7 @@ impl NotifyStreamPool {
             }
         }
 
-        // Channel closed (ProdNetwork dropped or pool shutdown). Graceful close.
+        // Channel closed (Libp2pNetwork dropped or pool shutdown). Graceful close.
         let _ = stream.close().await;
         peers.remove(&peer_id);
     }

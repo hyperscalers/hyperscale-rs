@@ -40,7 +40,7 @@ const MAX_INBOUND_PER_PEER: usize = 16;
 
 /// Handle for the inbound router tasks.
 ///
-/// Kept alive inside `ProdNetwork` to prevent the tokio tasks from being
+/// Kept alive inside `Libp2pNetwork` to prevent the tokio tasks from being
 /// aborted when the `JoinHandle`s are dropped.
 pub(crate) struct InboundRouterHandle {
     #[allow(dead_code)]
@@ -291,7 +291,7 @@ impl InboundRouter {
 
 /// Spawn an inbound router with the given handler registry.
 ///
-/// Used internally by `ProdNetwork`.
+/// Used internally by `Libp2pNetwork`.
 pub(crate) fn spawn_inbound_router(
     adapter: Arc<Libp2pAdapter>,
     registry: Arc<HandlerRegistry>,

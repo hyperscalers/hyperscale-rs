@@ -1,6 +1,6 @@
 //! Production network adapter implementing the Network trait.
 //!
-//! [`ProdNetwork`] wraps [`Libp2pAdapter`] and [`RequestManager`] to provide
+//! [`Libp2pNetwork`] wraps [`Libp2pAdapter`] and [`RequestManager`] to provide
 //! the [`Network`] interface used by `IoLoop` in the production runner.
 
 use crate::adapter::Libp2pAdapter;
@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 // ═══════════════════════════════════════════════════════════════════════
-// ProdNetwork
+// Libp2pNetwork
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Production network adapter implementing the Network trait.
@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 /// Also owns a `RequestManager` for request-response operations.
 /// The generic `request<R>()` method SBOR-encodes the request, dispatches
 /// to the RequestManager, and SBOR-decodes the response.
-pub struct ProdNetwork {
+pub struct Libp2pNetwork {
     adapter: Arc<Libp2pAdapter>,
     request_manager: Arc<RequestManager>,
     tokio_handle: tokio::runtime::Handle,
@@ -48,7 +48,7 @@ pub struct ProdNetwork {
     _inbound_router: InboundRouterHandle,
 }
 
-impl ProdNetwork {
+impl Libp2pNetwork {
     pub fn new(
         adapter: Arc<Libp2pAdapter>,
         request_manager: Arc<RequestManager>,
@@ -80,12 +80,12 @@ impl ProdNetwork {
     }
 }
 
-impl Network for ProdNetwork {
+impl Network for Libp2pNetwork {
     fn broadcast_to_shard<M: ShardMessage>(&self, shard: ShardGroupId, message: &M) {
         let topic = Topic::shard(M::message_type_id(), shard);
         let data = compression::compress(&sbor::basic_encode(message).expect("SBOR encode failed"));
         if let Err(e) = self.adapter.publish(&topic, data, M::priority()) {
-            debug!(error = ?e, "ProdNetwork: broadcast_to_shard failed");
+            debug!(error = ?e, "Libp2pNetwork: broadcast_to_shard failed");
         }
     }
 
@@ -93,7 +93,7 @@ impl Network for ProdNetwork {
         let topic = Topic::global(M::message_type_id());
         let data = compression::compress(&sbor::basic_encode(message).expect("SBOR encode failed"));
         if let Err(e) = self.adapter.publish(&topic, data, M::priority()) {
-            debug!(error = ?e, "ProdNetwork: broadcast_global failed");
+            debug!(error = ?e, "Libp2pNetwork: broadcast_global failed");
         }
     }
 
@@ -195,7 +195,7 @@ impl Network for ProdNetwork {
         let request_bytes = match sbor::basic_encode(&request) {
             Ok(bytes) => bytes,
             Err(e) => {
-                warn!(error = ?e, "ProdNetwork: failed to encode request");
+                warn!(error = ?e, "Libp2pNetwork: failed to encode request");
                 on_response(Err(RequestError::PeerError(format!("encode error: {e:?}"))));
                 return;
             }

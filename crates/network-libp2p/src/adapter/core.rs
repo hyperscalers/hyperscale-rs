@@ -287,7 +287,7 @@ impl Libp2pAdapter {
 
     /// Subscribe to a gossipsub topic.
     ///
-    /// Called by `ProdNetwork::register_gossip_handler` to auto-subscribe
+    /// Called by `Libp2pNetwork::register_gossip_handler` to auto-subscribe
     /// when a handler is registered.
     pub fn subscribe_topic(&self, topic: String) -> Result<(), NetworkError> {
         self.priority_channels

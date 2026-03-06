@@ -8,7 +8,7 @@
 //!  ┌──────────────────────────────────────────────────────────────────────┐
 //!  │  Core 0 (pinned std::thread)                                         │
 //!  │  ┌────────────────────────────────────────────────────────────────┐  │
-//!  │  │  IoLoop<SharedStorage, ProdNetwork, PooledDispatch>            │  │
+//!  │  │  IoLoop<SharedStorage, Libp2pNetwork, PooledDispatch>            │  │
 //!  │  │    - State machine event processing                            │  │
 //!  │  │    - Storage I/O (RocksDB)                                     │  │
 //!  │  │    - Action handling (timers, broadcasts, crypto dispatch)     │  │
@@ -49,7 +49,7 @@ use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_engine::{NetworkDefinition, RadixExecutor};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics as metrics;
-use hyperscale_network_libp2p::ProdNetwork;
+use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_network_libp2p::{
     generate_random_keypair, Libp2pAdapter, Libp2pConfig, NetworkError,
 };
@@ -396,12 +396,12 @@ impl ProductionRunnerBuilder {
         // ── Create SharedStorage ────────────────────────────────────────
         let shared_storage = SharedStorage::new(Arc::clone(&storage));
 
-        // ── Create ProdNetwork ───────────────────────────────────────────
+        // ── Create Libp2pNetwork ───────────────────────────────────────────
         //
         // Wraps the Libp2p adapter for use by IoLoop's action handler.
         // SBOR encode + compress + adapter.publish() is sync-safe (non-blocking send).
         // Note: We create the adapter below, then wrap it.
-        // ProdNetwork is created after the adapter.
+        // Libp2pNetwork is created after the adapter.
 
         // ── Use configured network definition or default ─────────────────
         let network_definition = self
@@ -438,12 +438,12 @@ impl ProductionRunnerBuilder {
             hyperscale_network_libp2p::RequestManagerConfig::default(),
         ));
 
-        // ── Now create ProdNetwork wrapping the adapter ──────────────────
+        // ── Now create Libp2pNetwork wrapping the adapter ──────────────────
         //
-        // ProdNetwork owns the RequestManager for generic request-response.
+        // Libp2pNetwork owns the RequestManager for generic request-response.
         // It SBOR-encodes requests, frames them with type_id, and dispatches
         // through the RequestManager's retry/peer-selection logic.
-        let prod_network = ProdNetwork::new(
+        let libp2p_network = Libp2pNetwork::new(
             adapter.clone(),
             request_manager.clone(),
             tokio::runtime::Handle::current(),
@@ -465,7 +465,7 @@ impl ProductionRunnerBuilder {
             state,
             shared_storage,
             executor,
-            prod_network,
+            libp2p_network,
             (*dispatch).clone(),
             xb_callback_tx.clone(),
             io_loop_signing_key,
@@ -875,7 +875,7 @@ impl ProductionRunner {
             }
         }
 
-        // ── Update sync_peers on the sync status (only runner has ProdNetwork) ──
+        // ── Update sync_peers on the sync status (only runner has Libp2pNetwork) ──
         if let Some(ref sync_status) = self.sync_status {
             let current = sync_status.load();
             if current.sync_peers != peer_count {

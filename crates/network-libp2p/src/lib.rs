@@ -17,5 +17,5 @@ mod validator_bind;
 
 pub use adapter::{generate_random_keypair, Libp2pAdapter, NetworkError};
 pub use config::{Libp2pConfig, VersionInteroperabilityMode};
-pub use network::ProdNetwork;
+pub use network::Libp2pNetwork;
 pub use request_manager::{RequestManager, RequestManagerConfig};

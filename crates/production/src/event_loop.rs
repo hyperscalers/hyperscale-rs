@@ -18,7 +18,7 @@ use crossbeam::channel::Receiver;
 use hyperscale_core::{NodeInput, TimerId};
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
-use hyperscale_network_libp2p::ProdNetwork;
+use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_node::io_loop::{IoLoop, NodeStatusSnapshot, TimerOp};
 use hyperscale_storage_rocksdb::SharedStorage;
 use std::collections::HashMap;
@@ -34,7 +34,7 @@ use tracing::{debug, info, warn};
 /// allows the same underlying storage to be shared between the pinned IoLoop
 /// thread and async tasks (InboundRouter) via cheap Arc clones.
 /// Certificate and transaction caches live inside IoLoop itself.
-pub type ProdIoLoop = IoLoop<SharedStorage, ProdNetwork, PooledDispatch>;
+pub type ProdIoLoop = IoLoop<SharedStorage, Libp2pNetwork, PooledDispatch>;
 
 /// Configuration for the pinned event loop.
 pub struct PinnedLoopConfig {
@@ -155,7 +155,7 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
             current_height: snapshot.sync.current_height,
             target_height: snapshot.sync.target_height,
             blocks_behind: snapshot.sync.blocks_behind,
-            sync_peers: 0, // Set by runner's collect_metrics (has ProdNetwork access)
+            sync_peers: 0, // Set by runner's collect_metrics (has Libp2pNetwork access)
             pending_fetches: snapshot.sync.pending_fetches,
             queued_heights: snapshot.sync.queued_heights,
         }));

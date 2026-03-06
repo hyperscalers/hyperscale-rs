@@ -169,7 +169,7 @@ impl Network for SimNetworkAdapter {
 
     fn notify<M: NetworkMessage>(&self, recipients: &[ValidatorId], message: &M) {
         // Note: compression happens here at send-time, then accept_notifications()
-        // decompresses before queueing for delivery. In production (ProdNetwork),
+        // decompresses before queueing for delivery. In production (Libp2pNetwork),
         // compression happens inside the stream framing layer (write_typed_frame) instead.
         let data = compression::compress(
             &basic_encode(message).expect("SimNetworkAdapter: failed to encode notification"),
