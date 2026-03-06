@@ -129,19 +129,34 @@ pub(crate) async fn write_typed_frame_no_close<S: AsyncWrite + Unpin>(
     type_id: &str,
     sbor_data: &[u8],
 ) -> Result<usize, io::Error> {
+    let compressed = compression::compress(sbor_data);
+    write_precompressed_typed_frame_no_close(stream, type_id, &compressed).await
+}
+
+/// Write a typed frame with an already-compressed payload, WITHOUT closing the stream.
+///
+/// Like [`write_typed_frame_no_close`], but skips compression. The caller is
+/// responsible for LZ4-compressing the SBOR payload before calling this.
+/// This avoids redundant compression when the same payload is sent to many peers.
+///
+/// Returns the number of bytes written on the wire (type header + compressed payload).
+pub(crate) async fn write_precompressed_typed_frame_no_close<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    type_id: &str,
+    compressed_data: &[u8],
+) -> Result<usize, io::Error> {
     // Type-id header (uncompressed)
     let type_id_bytes = type_id.as_bytes();
     let type_id_len = type_id_bytes.len() as u16;
     stream.write_all(&type_id_len.to_le_bytes()).await?;
     stream.write_all(type_id_bytes).await?;
 
-    // Compressed SBOR payload (same format as write_frame)
-    let compressed = compression::compress(sbor_data);
-    let len = compressed.len() as u32;
+    // Pre-compressed payload
+    let len = compressed_data.len() as u32;
     stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&compressed).await?;
+    stream.write_all(compressed_data).await?;
     stream.flush().await?;
-    Ok(2 + type_id_bytes.len() + 4 + compressed.len())
+    Ok(2 + type_id_bytes.len() + 4 + compressed_data.len())
 }
 
 /// Read a typed request frame: type_id header followed by compressed SBOR payload.

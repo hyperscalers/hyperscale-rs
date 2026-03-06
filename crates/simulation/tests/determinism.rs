@@ -951,20 +951,21 @@ fn test_block_commit_verification() {
 
     println!("Committed heights: {:?}", committed_heights);
 
-    // All nodes should have the same committed height
-    let first_height = committed_heights[0];
-    assert!(first_height > 0, "Should have committed at least one block");
+    // With targeted voting, nodes may differ by at most 1 committed height
+    // at any snapshot. The last block's proposer learns about the QC for its
+    // own block via the next block header, so it commits one block later.
+    let max_height = *committed_heights.iter().max().unwrap();
+    let min_height = *committed_heights.iter().min().unwrap();
+    assert!(max_height > 0, "Should have committed at least one block");
+    assert!(
+        max_height - min_height <= 1,
+        "Committed heights should differ by at most 1, got {:?}",
+        committed_heights
+    );
 
-    for (i, &height) in committed_heights.iter().enumerate() {
-        assert_eq!(
-            height, first_height,
-            "Node {} has committed height {} but expected {}",
-            i, height, first_height
-        );
-    }
-
-    // All nodes should have the same latest QC
-    let qc_heights: Vec<Option<u64>> = (0..4u32)
+    // QC heights also differ by at most 1 — the last proposer doesn't
+    // form the QC for its own block until the next header arrives.
+    let qc_heights: Vec<u64> = (0..4u32)
         .map(|i| {
             runner
                 .node(i)
@@ -972,21 +973,29 @@ fn test_block_commit_verification() {
                 .bft()
                 .latest_qc()
                 .map(|qc| qc.height.0)
+                .unwrap_or(0)
         })
         .collect();
 
-    let first_qc_height = qc_heights[0];
-    for (i, &qc_height) in qc_heights.iter().enumerate() {
-        assert_eq!(
-            qc_height, first_qc_height,
-            "Node {} has QC height {:?} but expected {:?}",
-            i, qc_height, first_qc_height
-        );
-    }
+    let max_qc = *qc_heights.iter().max().unwrap();
+    let min_qc = *qc_heights.iter().min().unwrap();
+    assert!(
+        max_qc - min_qc <= 1,
+        "QC heights should differ by at most 1, got {:?}",
+        qc_heights
+    );
 
     println!("All nodes consistent:");
-    println!("  Committed height: {}", first_height);
-    println!("  QC height: {:?}", first_qc_height);
+    println!(
+        "  Committed heights: {:?} (max diff: {})",
+        committed_heights,
+        max_height - min_height
+    );
+    println!(
+        "  QC heights: {:?} (max diff: {})",
+        qc_heights,
+        max_qc - min_qc
+    );
 }
 
 /// Verify block commit determinism across runs.
@@ -1085,27 +1094,30 @@ fn test_sequential_commit() {
         }
     }
 
-    // Verify all nodes have committed sequentially to the same height
+    // With targeted voting, nodes may differ by at most 1 committed height
+    // at any snapshot (the last proposer learns about its QC via the next header).
     let final_heights: Vec<u64> = (0..4u32)
         .map(|i| runner.node(i).unwrap().bft().committed_height())
         .collect();
 
-    let first = final_heights[0];
-    for (i, &h) in final_heights.iter().enumerate() {
-        assert_eq!(
-            h, first,
-            "Node {} has height {} but expected {}",
-            i, h, first
-        );
-    }
+    let max_h = *final_heights.iter().max().unwrap();
+    let min_h = *final_heights.iter().min().unwrap();
+    assert!(
+        max_h - min_h <= 1,
+        "Committed heights should differ by at most 1, got {:?}",
+        final_heights
+    );
 
     // With 300ms proposal interval, expect ~6 blocks in 2 seconds
     assert!(
-        first >= 5,
+        max_h >= 5,
         "Should have committed at least 5 blocks in 2 seconds, got {}",
-        first
+        max_h
     );
-    println!("Sequential commit verified: {} blocks committed", first);
+    println!(
+        "Sequential commit verified: {} blocks committed (heights: {:?})",
+        max_h, final_heights
+    );
 }
 
 /// Test throughput and latency characteristics.
@@ -1444,31 +1456,27 @@ fn test_multi_shard_consensus_progress() {
     println!("Shard 0 committed heights: {:?}", shard0_heights);
     println!("Shard 1 committed heights: {:?}", shard1_heights);
 
-    // All nodes in a shard should have the same committed height (consensus)
-    let shard0_first = shard0_heights[0];
-    for (i, &h) in shard0_heights.iter().enumerate() {
-        assert_eq!(
-            h, shard0_first,
-            "Shard 0 node {} has height {} but expected {}",
-            i, h, shard0_first
-        );
-    }
+    // With targeted voting, nodes may differ by at most 1 committed height
+    // at any snapshot (the last proposer learns about its QC via the next header).
+    let shard0_max = *shard0_heights.iter().max().unwrap();
+    let shard0_min = *shard0_heights.iter().min().unwrap();
+    assert!(
+        shard0_max - shard0_min <= 1,
+        "Shard 0 committed heights should differ by at most 1, got {:?}",
+        shard0_heights
+    );
 
-    let shard1_first = shard1_heights[0];
-    for (i, &h) in shard1_heights.iter().enumerate() {
-        assert_eq!(
-            h,
-            shard1_first,
-            "Shard 1 node {} has height {} but expected {}",
-            i + 4,
-            h,
-            shard1_first
-        );
-    }
+    let shard1_max = *shard1_heights.iter().max().unwrap();
+    let shard1_min = *shard1_heights.iter().min().unwrap();
+    assert!(
+        shard1_max - shard1_min <= 1,
+        "Shard 1 committed heights should differ by at most 1, got {:?}",
+        shard1_heights
+    );
 
     // Both shards should have made progress
-    assert!(shard0_first > 0, "Shard 0 should have committed blocks");
-    assert!(shard1_first > 0, "Shard 1 should have committed blocks");
+    assert!(shard0_min > 0, "Shard 0 should have committed blocks");
+    assert!(shard1_min > 0, "Shard 1 should have committed blocks");
 
     let stats = runner.stats();
     println!("\nSimulation stats:");
@@ -1683,13 +1691,20 @@ fn test_consensus_with_isolated_node() {
     println!("  Node 2: {}", height_node2);
     println!("  Node 3: {}", height_node3);
 
-    // Nodes 1, 2, 3 should all be at the same height (consensus)
-    assert_eq!(height_node1, height_node2);
-    assert_eq!(height_node2, height_node3);
+    // With targeted voting and an isolated node causing asymmetric vote
+    // distribution, non-isolated nodes may differ by at most 1 committed height.
+    let active_heights = [height_node1, height_node2, height_node3];
+    let max_h = *active_heights.iter().max().unwrap();
+    let min_h = *active_heights.iter().min().unwrap();
+    assert!(
+        max_h - min_h <= 1,
+        "Non-isolated nodes should differ by at most 1, got {:?}",
+        active_heights
+    );
 
     // They should have made progress beyond the isolation point
     assert!(
-        height_node1 > height_before,
+        min_h > height_before,
         "Consensus should continue with 3/4 nodes"
     );
 
@@ -2055,13 +2070,19 @@ fn test_sync_triggers_when_behind() {
         "Should have committed at least 5 blocks, got {}",
         max_height
     );
-    assert_eq!(
-        max_height, min_height,
-        "All nodes should be at the same height"
+    // With targeted voting, nodes may differ by at most 1 committed height
+    // at any snapshot (the last proposer learns about its QC via the next header).
+    assert!(
+        max_height - min_height <= 1,
+        "All nodes should be within 1 block of each other, got max={} min={}",
+        max_height,
+        min_height
     );
 
-    // All nodes committed to the same height means they were in sync
-    println!("Test passed: nodes progressed normally without needing sync");
+    println!(
+        "Test passed: nodes progressed normally (heights: {:?})",
+        heights
+    );
 }
 
 /// Test sync detection threshold - sync only triggers when 2+ blocks behind.

@@ -123,6 +123,7 @@ impl Network for ProdNetwork {
 
     fn notify<M: NetworkMessage>(&self, recipients: &[ValidatorId], message: &M) {
         let sbor = sbor::basic_encode(message).expect("SBOR encode failed");
+        let compressed = compression::compress(&sbor);
         let type_id = M::message_type_id();
         for &validator in recipients {
             let Some(peer_id) = self.validator_peer_id(validator) else {
@@ -132,7 +133,7 @@ impl Network for ProdNetwork {
                 );
                 continue;
             };
-            self.notify_pool.send(peer_id, type_id, sbor.clone());
+            self.notify_pool.send(peer_id, type_id, compressed.clone());
         }
     }
 

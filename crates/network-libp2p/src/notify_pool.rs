@@ -37,9 +37,12 @@ const BACKOFF_MULTIPLIER: u32 = 2;
 const PEER_CHANNEL_CAPACITY: usize = 256;
 
 /// A message queued for sending on a persistent notification stream.
+///
+/// Carries pre-compressed data so that compression happens once per message
+/// (in [`ProdNetwork::notify`]) rather than once per peer.
 struct PendingFrame {
     type_id: &'static str,
-    sbor_data: Vec<u8>,
+    compressed_data: Vec<u8>,
 }
 
 /// Exponential backoff state for a peer after stream failure.
@@ -79,13 +82,20 @@ impl NotifyStreamPool {
         }
     }
 
-    /// Send a typed notification frame to a peer.
+    /// Send a pre-compressed notification frame to a peer.
+    ///
+    /// The caller is responsible for SBOR-encoding and LZ4-compressing the
+    /// payload once; this method fans out the already-compressed bytes to
+    /// each peer's stream actor without redundant compression.
     ///
     /// If a persistent stream actor exists and is healthy, the frame is queued
     /// (non-blocking fast path). If no actor exists or the existing one is dead,
     /// a new actor is spawned (subject to backoff).
-    pub fn send(&self, peer_id: PeerId, type_id: &'static str, sbor_data: Vec<u8>) {
-        let frame = PendingFrame { type_id, sbor_data };
+    pub fn send(&self, peer_id: PeerId, type_id: &'static str, compressed_data: Vec<u8>) {
+        let frame = PendingFrame {
+            type_id,
+            compressed_data,
+        };
 
         // Fast path: try to send on existing actor's channel.
         if let Some(actor) = self.peers.get(&peer_id) {
@@ -162,10 +172,10 @@ impl NotifyStreamPool {
 
         // Read frames from channel and write to stream.
         while let Some(frame) = frame_rx.recv().await {
-            match stream_framing::write_typed_frame_no_close(
+            match stream_framing::write_precompressed_typed_frame_no_close(
                 &mut stream,
                 frame.type_id,
-                &frame.sbor_data,
+                &frame.compressed_data,
             )
             .await
             {
