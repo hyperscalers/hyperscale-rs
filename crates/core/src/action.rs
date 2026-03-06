@@ -483,6 +483,9 @@ pub enum Action {
         block_hash: Hash,
         shard: ShardGroupId,
         vote: BlockVoteNotification,
+        /// Targeted vote recipients — the next proposer who needs this vote
+        /// to build the QC for the next block.
+        recipients: Vec<ValidatorId>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

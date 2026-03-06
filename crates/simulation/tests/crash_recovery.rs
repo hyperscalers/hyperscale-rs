@@ -110,7 +110,7 @@ fn test_recovered_votes_prevent_equivocation() {
     // Check that no vote was broadcast
     let voted = actions
         .iter()
-        .any(|a| matches!(a, hyperscale_core::Action::BroadcastBlockVote { .. }));
+        .any(|a| matches!(a, hyperscale_core::Action::PersistAndBroadcastVote { .. }));
 
     // We might get a VerifyQcSignature action first, so let's simulate that verification
     // and then check if vote is created
@@ -125,7 +125,7 @@ fn test_recovered_votes_prevent_equivocation() {
         // Should NOT vote because we already voted at this height for a DIFFERENT block
         let voted_after_verify = vote_actions
             .iter()
-            .any(|a| matches!(a, hyperscale_core::Action::BroadcastBlockVote { .. }));
+            .any(|a| matches!(a, hyperscale_core::Action::PersistAndBroadcastVote { .. }));
 
         assert!(
             !voted_after_verify,

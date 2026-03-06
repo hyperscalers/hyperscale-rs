@@ -1363,6 +1363,7 @@ where
                 block_hash,
                 shard: _,
                 vote,
+                recipients,
             } => {
                 // BFT Safety: persist vote BEFORE broadcasting.
                 self.storage.put_own_vote(height.0, round, block_hash);
@@ -1372,7 +1373,7 @@ where
                     block_hash = ?block_hash,
                     "Persisted own vote"
                 );
-                self.network.notify(&self.cached_local_peers, &vote);
+                self.network.notify(&recipients, &vote);
             }
             Action::FetchBlock { height } => {
                 let block = self.storage.get_block(height);

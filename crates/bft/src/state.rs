@@ -507,6 +507,32 @@ impl BftState {
         self.topology.should_propose(height, round)
     }
 
+    /// Compute vote recipients for a vote at the given height/round.
+    ///
+    /// Returns up to `k` distinct next proposers (for rounds 0, 1, …),
+    /// excluding self (we already process our own vote internally).
+    /// Sending to k=2 provides redundancy: if the primary next proposer
+    /// crashes before broadcasting its block, the secondary already has
+    /// the votes and can form the QC on view change without re-collection.
+    fn vote_recipients(&self, height: u64, round: u64) -> Vec<ValidatorId> {
+        const K: usize = 2;
+        let committee_len = self.committee().len();
+        let self_id = self.validator_id();
+        let mut recipients = Vec::with_capacity(K);
+
+        for offset in 0..committee_len as u64 {
+            let proposer = self.proposer_for(height + 1, round + offset);
+            if proposer != self_id && !recipients.contains(&proposer) {
+                recipients.push(proposer);
+                if recipients.len() >= K {
+                    break;
+                }
+            }
+        }
+
+        recipients
+    }
+
     /// Get committee index for a validator.
     fn committee_index(&self, validator_id: ValidatorId) -> Option<usize> {
         self.topology.local_committee_index(validator_id)
@@ -1594,6 +1620,30 @@ impl BftState {
                 );
                 self.latest_qc = Some(header.parent_qc.clone());
                 self.maybe_unlock_for_qc(&header.parent_qc);
+
+                // Persist the now-certified parent block for sync availability.
+                // With targeted votes, only the next proposer forms the QC via
+                // on_qc_formed (which emits PersistBlock). Other validators
+                // learn about the QC here and must also persist so they can
+                // serve the certified block to syncing peers.
+                let parent_hash = header.parent_qc.block_hash;
+                let parent_block = if let Some(pending) = self.pending_blocks.get(&parent_hash) {
+                    pending.block().map(|b| (*b).clone())
+                } else {
+                    self.certified_blocks.get(&parent_hash).cloned()
+                };
+                if let Some(block) = parent_block {
+                    sync_actions.push(Action::PersistBlock {
+                        block,
+                        qc: header.parent_qc.clone(),
+                    });
+                }
+
+                // Two-chain commit: the parent_qc may allow committing an
+                // ancestor block. This is essential when votes are targeted
+                // to the next proposer only — non-proposers learn about QCs
+                // via block headers rather than forming them locally.
+                sync_actions.extend(self.try_two_chain_commit(&header.parent_qc));
             }
         }
 
@@ -2583,12 +2633,15 @@ impl BftState {
         // for a different block at this height after restart (equivocation).
         // Using the combined action allows the runner to optimize the flow
         // while guaranteeing persist-before-broadcast ordering.
+        let recipients = self.vote_recipients(height, round);
+
         let mut actions = vec![Action::PersistAndBroadcastVote {
             height: BlockHeight(height),
             round,
             block_hash,
             shard: self.local_shard(),
             vote: gossip,
+            recipients,
         }];
 
         // Also process our own vote locally
@@ -3588,38 +3641,7 @@ impl BftState {
             );
         }
 
-        // Two-chain commit rule: when we have QC for block N,
-        // we can commit block N-1 (the parent)
-        if qc.has_committable_block() {
-            if let (Some(committable_height), Some(committable_hash)) =
-                (qc.committable_height(), qc.committable_hash())
-            {
-                // Only commit if we haven't already committed this height
-                if committable_height.0 > self.committed_height {
-                    // The certifying QC for the committable block (block N-1) is the
-                    // parent_qc of the block whose QC just formed (block N).
-                    // Block N's parent_qc = QC_for_N-1, which directly certifies block N-1.
-                    let certifying_qc = if let Some(pending) = self.pending_blocks.get(&block_hash)
-                    {
-                        pending.header().parent_qc.clone()
-                    } else if let Some(block) = self.certified_blocks.get(&block_hash) {
-                        block.header.parent_qc.clone()
-                    } else {
-                        warn!(
-                            validator = ?self.validator_id(),
-                            block_hash = ?block_hash,
-                            committable_hash = ?committable_hash,
-                            "Cannot find block to extract certifying QC for committable block"
-                        );
-                        qc.clone()
-                    };
-                    actions.push(Action::Continuation(ProtocolEvent::BlockReadyToCommit {
-                        block_hash: committable_hash,
-                        qc: certifying_qc,
-                    }));
-                }
-            }
-        }
+        actions.extend(self.try_two_chain_commit(&qc));
 
         // Immediately try to propose the next block if there's content to include.
         // This is how the QC propagates to other validators - the next block
@@ -3675,6 +3697,51 @@ impl BftState {
         }
 
         actions
+    }
+
+    /// Two-chain commit rule: when we have QC for block N, commit block N-1.
+    ///
+    /// Called from both `on_qc_formed` (when we build the QC locally) and
+    /// `on_block_header` (when we learn about a QC via the next block's
+    /// parent_qc). This ensures all validators commit regardless of whether
+    /// they received votes directly.
+    fn try_two_chain_commit(&self, qc: &QuorumCertificate) -> Vec<Action> {
+        if !qc.has_committable_block() {
+            return vec![];
+        }
+
+        let Some(committable_height) = qc.committable_height() else {
+            return vec![];
+        };
+        let Some(committable_hash) = qc.committable_hash() else {
+            return vec![];
+        };
+
+        if committable_height.0 <= self.committed_height {
+            return vec![];
+        }
+
+        // The certifying QC for the committable block (block N-1) is the
+        // parent_qc of the block whose QC this is (block N).
+        let block_hash = qc.block_hash;
+        let certifying_qc = if let Some(pending) = self.pending_blocks.get(&block_hash) {
+            pending.header().parent_qc.clone()
+        } else if let Some(block) = self.certified_blocks.get(&block_hash) {
+            block.header.parent_qc.clone()
+        } else {
+            warn!(
+                validator = ?self.validator_id(),
+                block_hash = ?block_hash,
+                committable_hash = ?committable_hash,
+                "Cannot find block to extract certifying QC for committable block"
+            );
+            qc.clone()
+        };
+
+        vec![Action::Continuation(ProtocolEvent::BlockReadyToCommit {
+            block_hash: committable_hash,
+            qc: certifying_qc,
+        })]
     }
 
     /// Handle block ready to commit.
@@ -5306,7 +5373,11 @@ mod tests {
     };
 
     fn make_test_state() -> BftState {
-        let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
+        make_test_state_with_validators(4)
+    }
+
+    fn make_test_state_with_validators(n: usize) -> BftState {
+        let keys: Vec<Bls12381G1PrivateKey> = (0..n).map(|_| generate_bls_keypair()).collect();
 
         // Create validator set with ValidatorInfo
         let validators: Vec<ValidatorInfo> = keys
@@ -9581,5 +9652,65 @@ mod tests {
             base_timeout + increment * 1000,
             "At round 1000 with no cap: should be 503s (~8.4 minutes)"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Vote recipient targeting tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_vote_recipients_targets_next_proposers() {
+        // 4 validators (V0-V3), self = V0.
+        // Proposer formula: committee[(height + round) % 4].
+        let state = make_test_state();
+
+        // Voting at height 0, round 0. Next proposers for height 1:
+        //   round 0: (1+0)%4 = 1 -> V1 (primary)
+        //   round 1: (1+1)%4 = 2 -> V2 (secondary)
+        assert_eq!(
+            state.vote_recipients(0, 0),
+            vec![ValidatorId(1), ValidatorId(2)]
+        );
+
+        // Voting at height 1, round 0. Next proposers for height 2:
+        //   round 0: (2+0)%4 = 2 -> V2 (primary)
+        //   round 1: (2+1)%4 = 3 -> V3 (secondary)
+        assert_eq!(
+            state.vote_recipients(1, 0),
+            vec![ValidatorId(2), ValidatorId(3)]
+        );
+    }
+
+    #[test]
+    fn test_vote_recipients_excludes_self() {
+        // Self = V0. Voting at height 3, round 0. Next proposers for height 4:
+        //   round 0: (4+0)%4 = 0 -> V0 (self, skipped)
+        //   round 1: (4+1)%4 = 1 -> V1 (primary)
+        //   round 2: (4+2)%4 = 2 -> V2 (secondary)
+        let state = make_test_state();
+        assert_eq!(
+            state.vote_recipients(3, 0),
+            vec![ValidatorId(1), ValidatorId(2)]
+        );
+    }
+
+    #[test]
+    fn test_vote_recipients_respects_current_round() {
+        // Self = V0. Voting at height 0, round 2. Next proposers for height 1:
+        //   round 2: (1+2)%4 = 3 -> V3 (primary)
+        //   round 3: (1+3)%4 = 0 -> V0 (self, skipped)
+        //   round 4: (1+4)%4 = 1 -> V1 (secondary)
+        let state = make_test_state();
+        assert_eq!(
+            state.vote_recipients(0, 2),
+            vec![ValidatorId(3), ValidatorId(1)]
+        );
+    }
+
+    #[test]
+    fn test_vote_recipients_empty_when_solo_validator() {
+        // Solo validator — no one to send to (own vote processed internally).
+        let state = make_test_state_with_validators(1);
+        assert!(state.vote_recipients(0, 0).is_empty());
     }
 }
