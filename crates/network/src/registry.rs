@@ -13,13 +13,16 @@
 //! All registrations happen at init (before any messages arrive), so
 //! the read-heavy RwLock pattern is ideal.
 
-use crate::traits::{GossipHandler, GossipVerdict, RequestHandler};
+use crate::traits::{GossipHandler, GossipVerdict, NotificationHandler, RequestHandler};
 use hyperscale_types::{NetworkMessage, Request};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// Type-erased gossip handler: receives decompressed SBOR bytes, returns verdict.
 pub type RawGossipHandler = dyn Fn(Vec<u8>) -> GossipVerdict + Send + Sync;
+
+/// Type-erased notification handler: receives decompressed SBOR bytes, no return value.
+pub type RawNotificationHandler = dyn Fn(Vec<u8>) + Send + Sync;
 
 /// Type-erased request handler: receives SBOR request bytes, returns SBOR response bytes.
 pub type RawRequestHandler = dyn Fn(&[u8]) -> Vec<u8> + Send + Sync;
@@ -28,9 +31,14 @@ pub type RawRequestHandler = dyn Fn(&[u8]) -> Vec<u8> + Send + Sync;
 ///
 /// Shared between the `Network` impl (which registers handlers) and
 /// the transport layer (which dispatches incoming messages).
+///
+/// Three maps: `gossip`, `request`, and `notification`. A message type
+/// can be registered in multiple maps simultaneously (e.g. during migration
+/// from gossip to notification).
 pub struct HandlerRegistry {
     gossip: RwLock<HashMap<&'static str, Arc<RawGossipHandler>>>,
     request: RwLock<HashMap<&'static str, Arc<RawRequestHandler>>>,
+    notification: RwLock<HashMap<&'static str, Arc<RawNotificationHandler>>>,
 }
 
 impl HandlerRegistry {
@@ -39,6 +47,7 @@ impl HandlerRegistry {
         Self {
             gossip: RwLock::new(HashMap::new()),
             request: RwLock::new(HashMap::new()),
+            notification: RwLock::new(HashMap::new()),
         }
     }
 
@@ -105,6 +114,30 @@ impl HandlerRegistry {
             .insert(R::message_type_id(), raw);
     }
 
+    /// Register a typed notification handler for a message type.
+    ///
+    /// SBOR-decodes the payload before calling the handler. Stored in a separate
+    /// map so a message type can be registered as both gossip and notification.
+    pub fn register_notification<M: NetworkMessage>(&self, handler: impl NotificationHandler<M>) {
+        let raw: Arc<RawNotificationHandler> =
+            Arc::new(
+                move |payload: Vec<u8>| match sbor::basic_decode::<M>(&payload) {
+                    Ok(msg) => handler.on_notification(msg),
+                    Err(e) => {
+                        tracing::warn!(
+                            message_type = M::message_type_id(),
+                            error = ?e,
+                            "Failed to SBOR-decode notification message — dropping"
+                        );
+                    }
+                },
+            );
+        self.notification
+            .write()
+            .unwrap()
+            .insert(M::message_type_id(), raw);
+    }
+
     // ── Raw registration (used by infrastructure tests) ──
 
     /// Register a raw gossip handler by type_id string.
@@ -123,6 +156,18 @@ impl HandlerRegistry {
         self.request.write().unwrap().insert(type_id, handler);
     }
 
+    /// Register a raw notification handler by type_id string.
+    ///
+    /// Prefer [`register_notification`](Self::register_notification) for production code.
+    /// This is useful for infrastructure tests that work with raw bytes.
+    pub fn register_raw_notification(
+        &self,
+        type_id: &'static str,
+        handler: Arc<RawNotificationHandler>,
+    ) {
+        self.notification.write().unwrap().insert(type_id, handler);
+    }
+
     // ── Transport-layer dispatch (used by inbound router / sim harness) ──
 
     /// Look up the gossip handler for a message type.
@@ -133,6 +178,15 @@ impl HandlerRegistry {
     /// Look up the request handler for a message type.
     pub fn get_request(&self, message_type_id: &str) -> Option<Arc<RawRequestHandler>> {
         self.request.read().unwrap().get(message_type_id).cloned()
+    }
+
+    /// Look up the notification handler for a message type.
+    pub fn get_notification(&self, message_type_id: &str) -> Option<Arc<RawNotificationHandler>> {
+        self.notification
+            .read()
+            .unwrap()
+            .get(message_type_id)
+            .cloned()
     }
 }
 

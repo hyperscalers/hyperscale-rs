@@ -109,6 +109,21 @@ pub(crate) async fn write_typed_frame<S: AsyncWrite + Unpin>(
     type_id: &str,
     sbor_data: &[u8],
 ) -> Result<(), io::Error> {
+    write_typed_frame_no_close(stream, type_id, sbor_data).await?;
+    stream.close().await?;
+    Ok(())
+}
+
+/// Write a typed frame WITHOUT closing the stream.
+///
+/// Used by persistent notification streams where multiple frames are sent over
+/// the same stream. Flushes after writing to ensure the frame is delivered
+/// immediately, but does NOT half-close the write side.
+pub(crate) async fn write_typed_frame_no_close<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    type_id: &str,
+    sbor_data: &[u8],
+) -> Result<(), io::Error> {
     // Type-id header (uncompressed)
     let type_id_bytes = type_id.as_bytes();
     let type_id_len = type_id_bytes.len() as u16;
@@ -121,7 +136,6 @@ pub(crate) async fn write_typed_frame<S: AsyncWrite + Unpin>(
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(&compressed).await?;
     stream.flush().await?;
-    stream.close().await?;
     Ok(())
 }
 
@@ -301,6 +315,37 @@ mod tests {
     #[tokio::test]
     async fn test_typed_frame_empty_stream() {
         let mut cursor = futures::io::Cursor::new(Vec::<u8>::new());
+        let result = read_typed_frame(&mut cursor, MAX_FRAME_SIZE).await;
+        assert!(matches!(result, Err(FrameError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn test_multi_frame_roundtrip() {
+        // Simulate persistent stream: write multiple typed frames without
+        // closing, then read them back sequentially.
+        let frames = [
+            ("block.header", b"header payload 1" as &[u8]),
+            ("block.vote", b"vote payload 2"),
+            ("tx.cert", b"certificate payload 3"),
+        ];
+
+        // Write all frames to a single buffer (no close between them).
+        let mut buf = Vec::new();
+        for (type_id, payload) in &frames {
+            write_typed_frame_no_close(&mut buf, type_id, payload)
+                .await
+                .unwrap();
+        }
+
+        // Read them back sequentially from the same cursor.
+        let mut cursor = futures::io::Cursor::new(buf);
+        for (expected_type_id, expected_payload) in &frames {
+            let (type_id, payload) = read_typed_frame(&mut cursor, MAX_FRAME_SIZE).await.unwrap();
+            assert_eq!(type_id, *expected_type_id);
+            assert_eq!(payload, *expected_payload);
+        }
+
+        // Next read should fail with EOF (no more frames).
         let result = read_typed_frame(&mut cursor, MAX_FRAME_SIZE).await;
         assert!(matches!(result, Err(FrameError::Io(_))));
     }

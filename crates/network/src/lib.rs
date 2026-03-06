@@ -18,6 +18,9 @@ mod traits;
 
 // Re-export key types
 pub use compression::CompressionError;
-pub use registry::{HandlerRegistry, RawGossipHandler, RawRequestHandler};
+pub use registry::{HandlerRegistry, RawGossipHandler, RawNotificationHandler, RawRequestHandler};
 pub use topic::{parse_topic, ParsedTopic, Topic};
-pub use traits::{GossipHandler, GossipVerdict, Network, RequestError, RequestHandler, TopicScope};
+pub use traits::{
+    GossipHandler, GossipVerdict, Network, NotificationHandler, RequestError, RequestHandler,
+    TopicScope,
+};

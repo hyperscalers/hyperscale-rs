@@ -16,6 +16,6 @@ mod identity;
 mod swarm_builder;
 
 pub use self::core::Libp2pAdapter;
-pub use behaviour::STREAM_PROTOCOL;
+pub use behaviour::{NOTIFY_PROTOCOL, REQUEST_PROTOCOL};
 pub use error::NetworkError;
 pub use identity::generate_random_keypair;

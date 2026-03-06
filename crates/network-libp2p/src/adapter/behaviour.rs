@@ -3,8 +3,11 @@
 use libp2p::{gossipsub, identify, kad, swarm::NetworkBehaviour, StreamProtocol};
 use libp2p_stream as stream;
 
-/// Protocol identifier for raw stream requests.
-pub const STREAM_PROTOCOL: StreamProtocol = StreamProtocol::new("/hyperscale/req/2.0.0");
+/// Protocol identifier for request/response streams.
+pub const REQUEST_PROTOCOL: StreamProtocol = StreamProtocol::new("/hyperscale/request/1.0.0");
+
+/// Protocol identifier for fire-and-forget notification streams.
+pub const NOTIFY_PROTOCOL: StreamProtocol = StreamProtocol::new("/hyperscale/notify/1.0.0");
 
 /// libp2p network behaviour combining gossipsub, Kademlia, and raw streams.
 #[derive(NetworkBehaviour)]

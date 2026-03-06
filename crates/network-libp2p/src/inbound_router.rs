@@ -7,10 +7,10 @@
 //! Concurrency is bounded by a global semaphore and per-peer counters to
 //! prevent any single peer (or flood of peers) from exhausting handler capacity.
 
-use crate::adapter::{Libp2pAdapter, STREAM_PROTOCOL};
+use crate::adapter::{Libp2pAdapter, NOTIFY_PROTOCOL, REQUEST_PROTOCOL};
 use crate::stream_framing::{self, FrameError, MAX_FRAME_SIZE};
 use dashmap::DashMap;
-use futures::StreamExt;
+use futures::{AsyncWriteExt, StreamExt};
 use hyperscale_network::HandlerRegistry;
 use libp2p::{PeerId, Stream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,19 +22,30 @@ use tracing::debug;
 /// Timeout for reading requests and writing responses on streams.
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Idle timeout for persistent notification streams.
+///
+/// If no frame is received within this period, the stream is closed.
+/// The sender will detect the write error and reconnect when it has
+/// more frames to send. Longer than QUIC idle timeout (30s) so QUIC
+/// keep-alive handles liveness detection; this just prevents resource
+/// leaks if a sender silently disappears.
+const PERSISTENT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Maximum number of inbound streams handled concurrently across all peers.
 const MAX_INBOUND_CONCURRENT: usize = 128;
 
 /// Maximum number of concurrent inbound streams from a single peer.
 const MAX_INBOUND_PER_PEER: usize = 16;
 
-/// Handle for the inbound router task.
+/// Handle for the inbound router tasks.
 ///
-/// Kept alive inside `ProdNetwork` to prevent the tokio task from being
-/// aborted when the `JoinHandle` is dropped.
+/// Kept alive inside `ProdNetwork` to prevent the tokio tasks from being
+/// aborted when the `JoinHandle`s are dropped.
 pub(crate) struct InboundRouterHandle {
     #[allow(dead_code)]
-    join_handle: tokio::task::JoinHandle<()>,
+    request_handle: tokio::task::JoinHandle<()>,
+    #[allow(dead_code)]
+    notify_handle: tokio::task::JoinHandle<()>,
 }
 
 /// Routes inbound requests to per-type handlers via the handler registry.
@@ -54,85 +65,127 @@ struct InboundRouter {
 }
 
 impl InboundRouter {
-    /// Spawn the inbound router as a background task.
+    /// Spawn the inbound router as two background tasks (request + notification).
     ///
     /// The router will accept incoming streams until the stream control is dropped.
     fn spawn(adapter: Arc<Libp2pAdapter>, registry: Arc<HandlerRegistry>) -> InboundRouterHandle {
-        let join_handle = tokio::spawn(async move {
-            let router = Arc::new(InboundRouter {
-                registry,
-                global_semaphore: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENT)),
-                per_peer: Arc::new(DashMap::new()),
-            });
+        let router = Arc::new(InboundRouter {
+            registry,
+            global_semaphore: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENT)),
+            per_peer: Arc::new(DashMap::new()),
+        });
+
+        // ── Request accept loop (REQUEST_PROTOCOL) ──
+        let request_handle = {
+            let router = router.clone();
             let mut control = adapter.stream_control();
-
-            // Register to accept incoming streams for our protocol
-            let mut incoming = match control.accept(STREAM_PROTOCOL) {
-                Ok(incoming) => incoming,
-                Err(e) => {
-                    tracing::error!(error = ?e, "Failed to register stream protocol");
-                    return;
-                }
-            };
-
-            tracing::info!("InboundRouter started, accepting incoming streams");
-
-            // Accept incoming streams with concurrency control
-            while let Some((peer_id, stream)) = incoming.next().await {
-                // Per-peer check (fast path, no async wait).
-                let peer_counter = router
-                    .per_peer
-                    .entry(peer_id)
-                    .or_insert_with(|| AtomicUsize::new(0));
-                let prev = peer_counter.fetch_add(1, Ordering::Relaxed);
-                drop(peer_counter); // release DashMap shard lock
-                if prev >= MAX_INBOUND_PER_PEER {
-                    router.decrement_peer_count(&peer_id);
-                    debug!(
-                        peer = %peer_id,
-                        active = prev,
-                        limit = MAX_INBOUND_PER_PEER,
-                        "Dropping inbound stream: per-peer limit exceeded"
-                    );
-                    drop(stream);
-                    continue;
-                }
-
-                // Global concurrency: try_acquire (non-blocking).
-                // Under overload we drop rather than queue — the remote side retries.
-                let permit = match router.global_semaphore.clone().try_acquire_owned() {
-                    Ok(permit) => permit,
-                    Err(_) => {
-                        router.decrement_peer_count(&peer_id);
-                        debug!(
-                            peer = %peer_id,
-                            limit = MAX_INBOUND_CONCURRENT,
-                            "Dropping inbound stream: global concurrency limit reached"
-                        );
-                        drop(stream);
-                        continue;
+            tokio::spawn(async move {
+                let mut incoming = match control.accept(REQUEST_PROTOCOL) {
+                    Ok(incoming) => incoming,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "Failed to register request protocol");
+                        return;
                     }
                 };
 
-                let router_clone = router.clone();
+                tracing::info!("InboundRouter: request loop started");
 
-                // Spawn a task to handle the stream. The semaphore permit is
-                // moved in and auto-dropped when the task completes.
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    let result = router_clone.handle_stream(peer_id, stream).await;
-                    router_clone.decrement_peer_count(&peer_id);
-
-                    if let Err(e) = result {
-                        debug!(peer = %peer_id, error = ?e, "Stream handling failed");
+                while let Some((peer_id, stream)) = incoming.next().await {
+                    if let Some(permit) = router.try_admit(&peer_id) {
+                        let router_clone = router.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let result = router_clone.handle_request_stream(peer_id, stream).await;
+                            router_clone.decrement_peer_count(&peer_id);
+                            if let Err(e) = result {
+                                debug!(peer = %peer_id, error = ?e, "Request stream handling failed");
+                            }
+                        });
+                    } else {
+                        drop(stream);
                     }
-                });
+                }
+
+                tracing::info!("InboundRouter: request loop shutting down");
+            })
+        };
+
+        // ── Notification accept loop (NOTIFY_PROTOCOL) ──
+        let notify_handle = {
+            let router = router.clone();
+            let mut control = adapter.stream_control();
+            tokio::spawn(async move {
+                let mut incoming = match control.accept(NOTIFY_PROTOCOL) {
+                    Ok(incoming) => incoming,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "Failed to register notify protocol");
+                        return;
+                    }
+                };
+
+                tracing::info!("InboundRouter: notification loop started");
+
+                while let Some((peer_id, stream)) = incoming.next().await {
+                    if let Some(permit) = router.try_admit(&peer_id) {
+                        let router_clone = router.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let result = router_clone
+                                .handle_notification_stream(peer_id, stream)
+                                .await;
+                            router_clone.decrement_peer_count(&peer_id);
+                            if let Err(e) = result {
+                                debug!(peer = %peer_id, error = ?e, "Notification stream handling failed");
+                            }
+                        });
+                    } else {
+                        drop(stream);
+                    }
+                }
+
+                tracing::info!("InboundRouter: notification loop shutting down");
+            })
+        };
+
+        InboundRouterHandle {
+            request_handle,
+            notify_handle,
+        }
+    }
+
+    /// Try to admit an inbound stream, checking per-peer and global limits.
+    ///
+    /// Returns `Some(permit)` if admitted, `None` if rejected.
+    fn try_admit(self: &Arc<Self>, peer_id: &PeerId) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let peer_counter = self
+            .per_peer
+            .entry(*peer_id)
+            .or_insert_with(|| AtomicUsize::new(0));
+        let prev = peer_counter.fetch_add(1, Ordering::Relaxed);
+        drop(peer_counter);
+        if prev >= MAX_INBOUND_PER_PEER {
+            self.decrement_peer_count(peer_id);
+            debug!(
+                peer = %peer_id,
+                active = prev,
+                limit = MAX_INBOUND_PER_PEER,
+                "Dropping inbound stream: per-peer limit exceeded"
+            );
+            return None;
+        }
+
+        match self.global_semaphore.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                self.decrement_peer_count(peer_id);
+                debug!(
+                    peer = %peer_id,
+                    limit = MAX_INBOUND_CONCURRENT,
+                    "Dropping inbound stream: global concurrency limit reached"
+                );
+                None
             }
-
-            tracing::info!("InboundRouter shutting down (incoming streams closed)");
-        });
-
-        InboundRouterHandle { join_handle }
+        }
     }
 
     /// Decrement the per-peer active stream counter.
@@ -142,10 +195,13 @@ impl InboundRouter {
         }
     }
 
-    /// Handle a single incoming stream.
-    async fn handle_stream(&self, _peer: PeerId, mut stream: Stream) -> Result<(), StreamError> {
+    /// Handle a single incoming request stream (read request, call handler, write response).
+    async fn handle_request_stream(
+        &self,
+        _peer: PeerId,
+        mut stream: Stream,
+    ) -> Result<(), StreamError> {
         // Read typed frame: type_id header + compressed SBOR payload.
-        // The type_id is outside the compressed payload for routing without decompression.
         let (type_id, sbor_payload) = tokio::time::timeout(
             STREAM_IO_TIMEOUT,
             stream_framing::read_typed_frame(&mut stream, MAX_FRAME_SIZE),
@@ -158,12 +214,12 @@ impl InboundRouter {
         let handler = self
             .registry
             .get_request(&type_id)
-            .ok_or(StreamError::UnknownRequestType)?;
+            .ok_or(StreamError::UnknownMessageType)?;
 
         // Delegate to the handler (receives raw SBOR payload, returns SBOR response).
         let response_sbor = handler(&sbor_payload);
 
-        // Write length-prefixed compressed response with timeout
+        // Write length-prefixed compressed response with timeout.
         tokio::time::timeout(
             STREAM_IO_TIMEOUT,
             stream_framing::write_frame(&mut stream, &response_sbor),
@@ -173,6 +229,56 @@ impl InboundRouter {
         .map_err(StreamError::Io)?;
 
         Ok(())
+    }
+
+    /// Handle a persistent incoming notification stream.
+    ///
+    /// Reads typed frames in a loop until the stream is closed by the sender,
+    /// an error occurs, or the idle timeout elapses. Each frame is dispatched
+    /// to the registered handler.
+    async fn handle_notification_stream(
+        &self,
+        peer: PeerId,
+        mut stream: Stream,
+    ) -> Result<(), StreamError> {
+        loop {
+            let read_result = tokio::time::timeout(
+                PERSISTENT_STREAM_IDLE_TIMEOUT,
+                stream_framing::read_typed_frame(&mut stream, MAX_FRAME_SIZE),
+            )
+            .await;
+
+            let (type_id, sbor_payload) = match read_result {
+                Ok(Ok(frame)) => frame,
+                Ok(Err(FrameError::Io(ref e))) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    // Clean stream closure by sender.
+                    debug!(peer = %peer, "Notification stream closed by sender");
+                    return Ok(());
+                }
+                Ok(Err(e)) => {
+                    return Err(StreamError::Frame(e));
+                }
+                Err(_) => {
+                    // Idle timeout — close our side. The sender will get a
+                    // write error and reconnect when it has more frames.
+                    debug!(peer = %peer, "Notification stream idle timeout, closing");
+                    let _ = stream.close().await;
+                    return Ok(());
+                }
+            };
+
+            // Look up the per-type notification handler.
+            if let Some(handler) = self.registry.get_notification(&type_id) {
+                handler(sbor_payload);
+            } else {
+                debug!(
+                    peer = %peer,
+                    type_id = %type_id,
+                    "Unknown notification type on persistent stream"
+                );
+                // Don't close — the sender may send other known types.
+            }
+        }
     }
 }
 
@@ -192,7 +298,7 @@ enum StreamError {
     Timeout,
     Io(std::io::Error),
     Frame(FrameError),
-    UnknownRequestType,
+    UnknownMessageType,
 }
 
 impl std::fmt::Display for StreamError {
@@ -201,7 +307,7 @@ impl std::fmt::Display for StreamError {
             StreamError::Timeout => write!(f, "stream timeout"),
             StreamError::Io(e) => write!(f, "stream I/O error: {}", e),
             StreamError::Frame(e) => write!(f, "stream frame error: {}", e),
-            StreamError::UnknownRequestType => write!(f, "unknown request type"),
+            StreamError::UnknownMessageType => write!(f, "unknown message type"),
         }
     }
 }

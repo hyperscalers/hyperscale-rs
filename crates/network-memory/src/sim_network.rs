@@ -11,7 +11,8 @@
 //! delivers due messages via each target's registered per-type gossip handler.
 
 use hyperscale_network::{
-    compression, GossipHandler, HandlerRegistry, Network, RequestError, RequestHandler, TopicScope,
+    compression, GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError,
+    RequestHandler, TopicScope,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use sbor::basic_encode;
@@ -33,6 +34,16 @@ pub struct OutboxEntry {
     pub target: BroadcastTarget,
     /// The message type identifier (e.g., "block.header").
     pub message_type: &'static str,
+    /// Wire-encoded message bytes (SBOR + LZ4).
+    pub data: Vec<u8>,
+}
+
+/// A buffered notification (fire-and-forget unicast) awaiting harness delivery.
+pub struct PendingNotification {
+    /// Validators to deliver to.
+    pub recipients: Vec<ValidatorId>,
+    /// Message type ID for handler lookup.
+    pub type_id: &'static str,
     /// Wire-encoded message bytes (SBOR + LZ4).
     pub data: Vec<u8>,
 }
@@ -72,6 +83,7 @@ pub struct PendingRequest {
 pub struct SimNetworkAdapter {
     outbox: Mutex<Vec<OutboxEntry>>,
     pending_requests: Mutex<Vec<PendingRequest>>,
+    pending_notifications: Mutex<Vec<PendingNotification>>,
     /// Shared handler registry — written by `register_*_handler`,
     /// read by `SimulatedNetwork::fulfill_requests` and `flush_gossip`.
     pub(crate) registry: Arc<HandlerRegistry>,
@@ -86,6 +98,7 @@ impl SimNetworkAdapter {
         Self {
             outbox: Mutex::new(Vec::new()),
             pending_requests: Mutex::new(Vec::new()),
+            pending_notifications: Mutex::new(Vec::new()),
             registry,
         }
     }
@@ -104,6 +117,14 @@ impl SimNetworkAdapter {
     /// requests by looking up data from peer nodes and calling the callbacks.
     pub fn drain_pending_requests(&self) -> Vec<PendingRequest> {
         std::mem::take(&mut self.pending_requests.lock().unwrap())
+    }
+
+    /// Drain all buffered notifications.
+    ///
+    /// The harness calls this after each `IoLoop::step()` to deliver
+    /// notifications to their recipients via per-type notification handlers.
+    pub fn drain_pending_notifications(&self) -> Vec<PendingNotification> {
+        std::mem::take(&mut self.pending_notifications.lock().unwrap())
     }
 }
 
@@ -144,6 +165,30 @@ impl Network for SimNetworkAdapter {
         // Registry owns SBOR decode — just forward.
         // Scope is irrelevant in simulation (delivery controlled by harness).
         self.registry.register_gossip(handler);
+    }
+
+    fn notify<M: NetworkMessage>(&self, recipients: &[ValidatorId], message: &M) {
+        // Note: compression happens here at send-time, then fulfill_notifications()
+        // decompresses before calling handlers. In production (ProdNetwork), compression
+        // happens inside the stream framing layer (write_typed_frame) instead.
+        let data = compression::compress(
+            &basic_encode(message).expect("SimNetworkAdapter: failed to encode notification"),
+        );
+        self.pending_notifications
+            .lock()
+            .unwrap()
+            .push(PendingNotification {
+                recipients: recipients.to_vec(),
+                type_id: M::message_type_id(),
+                data,
+            });
+    }
+
+    fn register_notification_handler<M: NetworkMessage>(
+        &self,
+        handler: impl NotificationHandler<M>,
+    ) {
+        self.registry.register_notification(handler);
     }
 
     fn register_request_handler<R: Request>(&self, handler: impl RequestHandler<R>) {

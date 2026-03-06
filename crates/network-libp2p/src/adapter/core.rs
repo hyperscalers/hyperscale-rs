@@ -1,6 +1,6 @@
 //! Core Libp2pAdapter: construction, public API, and shutdown.
 
-use super::behaviour::{Behaviour, STREAM_PROTOCOL};
+use super::behaviour::{Behaviour, NOTIFY_PROTOCOL, REQUEST_PROTOCOL};
 use super::command::{PriorityCommandChannels, SwarmCommand};
 use super::error::NetworkError;
 use crate::config::Libp2pConfig;
@@ -396,10 +396,22 @@ impl Libp2pAdapter {
     ///
     /// RequestManager should be used for request/response patterns - it wraps
     /// this method with proper timeout, retry, and peer selection logic.
-    pub async fn open_stream(&self, peer: Libp2pPeerId) -> Result<Stream, NetworkError> {
+    pub async fn open_request_stream(&self, peer: Libp2pPeerId) -> Result<Stream, NetworkError> {
         self.stream_control
             .clone()
-            .open_stream(peer, STREAM_PROTOCOL)
+            .open_stream(peer, REQUEST_PROTOCOL)
+            .await
+            .map_err(|e| NetworkError::StreamOpenFailed(format!("{:?}", e)))
+    }
+
+    /// Open a fire-and-forget notification stream to a peer.
+    ///
+    /// Uses `NOTIFY_PROTOCOL` — the receiver reads the typed frame and closes
+    /// the stream (no response is sent back).
+    pub async fn open_notify_stream(&self, peer: Libp2pPeerId) -> Result<Stream, NetworkError> {
+        self.stream_control
+            .clone()
+            .open_stream(peer, NOTIFY_PROTOCOL)
             .await
             .map_err(|e| NetworkError::StreamOpenFailed(format!("{:?}", e)))
     }

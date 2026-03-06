@@ -188,7 +188,7 @@ impl RequestManager {
         timeout: Duration,
     ) -> Result<Vec<u8>, NetworkError> {
         // Open stream with timeout
-        let mut stream = tokio::time::timeout(timeout, adapter.open_stream(*peer))
+        let mut stream = tokio::time::timeout(timeout, adapter.open_request_stream(*peer))
             .await
             .map_err(|_| NetworkError::Timeout)?
             .map_err(|e| NetworkError::StreamOpenFailed(format!("{:?}", e)))?;

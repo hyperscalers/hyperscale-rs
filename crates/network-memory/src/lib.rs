@@ -11,7 +11,7 @@ mod sim_network;
 mod traffic;
 
 pub use network::{FulfillmentStats, NetworkConfig, SimulatedNetwork};
-pub use sim_network::{OutboxEntry, SimNetworkAdapter};
+pub use sim_network::{OutboxEntry, PendingNotification, SimNetworkAdapter};
 pub use traffic::{BandwidthReport, NetworkTrafficAnalyzer};
 
 /// Type alias for deterministic node indexing in simulation.

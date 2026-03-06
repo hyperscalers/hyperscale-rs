@@ -597,6 +597,17 @@ impl SimulationRunner {
             self.stats.messages_dropped_loss += stats.messages_dropped_loss;
         }
 
+        // Fulfill pending notifications (fire-and-forget unicast).
+        let pending_notifications = self.io_loops[i].network().drain_pending_notifications();
+        if !pending_notifications.is_empty() {
+            let stats =
+                self.network
+                    .fulfill_notifications(node, pending_notifications, &mut self.rng);
+            self.stats.messages_sent += stats.messages_sent;
+            self.stats.messages_dropped_partition += stats.messages_dropped_partition;
+            self.stats.messages_dropped_loss += stats.messages_dropped_loss;
+        }
+
         // Drain buffered events (includes events from request callbacks above).
         while let Ok(event) = self.event_rxs[i].try_recv() {
             self.schedule_event(node, self.now, event);

@@ -10,6 +10,7 @@ mod adapter;
 mod config;
 mod inbound_router;
 mod network;
+mod notify_pool;
 mod request_manager;
 mod stream_framing;
 mod validator_bind;

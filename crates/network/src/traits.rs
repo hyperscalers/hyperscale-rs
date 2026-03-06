@@ -69,6 +69,21 @@ impl<M: NetworkMessage, F: Fn(M) -> GossipVerdict + Send + Sync + 'static> Gossi
     }
 }
 
+/// Typed handler for inbound notification messages (fire-and-forget unicast).
+///
+/// Called after the network layer SBOR-decodes the raw payload into `M`.
+/// No return value — notifications are one-way.
+pub trait NotificationHandler<M: NetworkMessage>: Send + Sync + 'static {
+    fn on_notification(&self, message: M);
+}
+
+/// Blanket impl: any `Fn(M)` can serve as a typed notification handler.
+impl<M: NetworkMessage, F: Fn(M) + Send + Sync + 'static> NotificationHandler<M> for F {
+    fn on_notification(&self, message: M) {
+        (self)(message)
+    }
+}
+
 /// Typed handler for a single request message type.
 ///
 /// Called after the network layer SBOR-decodes the raw request into `R`.
@@ -126,6 +141,22 @@ pub trait Network: Send + Sync {
     ///
     /// Called during node initialization — once per request type.
     fn register_request_handler<R: Request>(&self, handler: impl RequestHandler<R>);
+
+    // ── Unicast notifications ──
+
+    /// Send a typed notification directly to specific validators (fire-and-forget).
+    ///
+    /// No response is expected. TCP provides packet-level reliability;
+    /// protocol-level timeouts handle the rest.
+    fn notify<M: NetworkMessage>(&self, recipients: &[ValidatorId], message: &M);
+
+    /// Register a handler for inbound notification messages (fire-and-forget unicast).
+    ///
+    /// Called during node initialization — once per notification type.
+    fn register_notification_handler<M: NetworkMessage>(
+        &self,
+        handler: impl NotificationHandler<M>,
+    );
 
     // ── Request-response ──
 

@@ -5,10 +5,11 @@
 
 use crate::adapter::Libp2pAdapter;
 use crate::inbound_router::{spawn_inbound_router, InboundRouterHandle};
+use crate::notify_pool::NotifyStreamPool;
 use crate::request_manager::{RequestManager, RequestPriority};
 use hyperscale_network::{
-    compression, GossipHandler, HandlerRegistry, Network, RequestError, RequestHandler, Topic,
-    TopicScope,
+    compression, GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError,
+    RequestHandler, Topic, TopicScope,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use libp2p::PeerId;
@@ -40,6 +41,8 @@ pub struct ProdNetwork {
     local_shard: ShardGroupId,
     /// Count of PeerUnreachable errors (cold-start diagnostics).
     peer_unreachable_count: AtomicUsize,
+    /// Persistent per-peer notification stream pool.
+    notify_pool: NotifyStreamPool,
     /// Inbound router handle — spawned eagerly at construction.
     /// Kept alive to prevent the background task from being aborted.
     _inbound_router: InboundRouterHandle,
@@ -58,6 +61,8 @@ impl ProdNetwork {
         let _guard = tokio_handle.enter();
         let inbound_router = spawn_inbound_router(adapter.clone(), registry.clone());
 
+        let notify_pool = NotifyStreamPool::new(adapter.clone(), tokio_handle.clone());
+
         Self {
             adapter,
             request_manager,
@@ -65,6 +70,7 @@ impl ProdNetwork {
             registry,
             local_shard,
             peer_unreachable_count: AtomicUsize::new(0),
+            notify_pool,
             _inbound_router: inbound_router,
         }
     }
@@ -113,6 +119,28 @@ impl Network for ProdNetwork {
         } else {
             info!(topic = %topic, "Subscribed to topic");
         }
+    }
+
+    fn notify<M: NetworkMessage>(&self, recipients: &[ValidatorId], message: &M) {
+        let sbor = sbor::basic_encode(message).expect("SBOR encode failed");
+        let type_id = M::message_type_id();
+        for &validator in recipients {
+            let Some(peer_id) = self.validator_peer_id(validator) else {
+                debug!(
+                    validator = validator.0,
+                    "No peer ID for notify target, skipping"
+                );
+                continue;
+            };
+            self.notify_pool.send(peer_id, type_id, sbor.clone());
+        }
+    }
+
+    fn register_notification_handler<M: NetworkMessage>(
+        &self,
+        handler: impl NotificationHandler<M>,
+    ) {
+        self.registry.register_notification(handler);
     }
 
     fn register_request_handler<R: Request>(&self, handler: impl RequestHandler<R>) {

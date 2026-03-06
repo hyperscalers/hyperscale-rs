@@ -1,6 +1,8 @@
 //! Simulated network with deterministic latency, packet loss, and partitions.
 
-use crate::sim_network::{BroadcastTarget, OutboxEntry, PendingRequest, SimNetworkAdapter};
+use crate::sim_network::{
+    BroadcastTarget, OutboxEntry, PendingNotification, PendingRequest, SimNetworkAdapter,
+};
 use crate::NodeIndex;
 use hyperscale_network::{HandlerRegistry, RequestError};
 use hyperscale_types::{ShardGroupId, ValidatorId};
@@ -389,6 +391,80 @@ impl SimulatedNetwork {
                 )));
             } else {
                 on_response(Ok(response_bytes));
+            }
+        }
+
+        stats
+    }
+
+    // ─── Notification Fulfillment ───
+
+    /// Fulfill pending notifications by delivering to each recipient's notification handler.
+    ///
+    /// For each notification, the payload is decompressed once and delivered to
+    /// each recipient (with partition/loss checks). Similar to gossip delivery
+    /// but targeted at explicit recipients rather than broadcast.
+    pub fn fulfill_notifications(
+        &self,
+        sender: NodeIndex,
+        notifications: Vec<PendingNotification>,
+        rng: &mut ChaCha8Rng,
+    ) -> FulfillmentStats {
+        let mut stats = FulfillmentStats::default();
+
+        for notification in notifications {
+            let PendingNotification {
+                recipients,
+                type_id,
+                data,
+            } = notification;
+
+            let payload = match hyperscale_network::compression::decompress(&data) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        sender,
+                        type_id,
+                        ?e,
+                        "Notification decompress error in fulfill_notifications"
+                    );
+                    continue;
+                }
+            };
+
+            for &recipient in &recipients {
+                let to = recipient.0 as NodeIndex;
+
+                // Partition check.
+                if self.is_partitioned(sender, to) {
+                    stats.messages_dropped_partition += 1;
+                    trace!(sender, to, "Notification dropped: partition");
+                    continue;
+                }
+
+                // Packet loss.
+                if self.should_drop_packet(rng) {
+                    stats.messages_dropped_loss += 1;
+                    trace!(sender, to, "Notification dropped: packet loss");
+                    continue;
+                }
+
+                stats.messages_sent += 1;
+
+                // Look up the per-type notification handler from the recipient's registry.
+                if let Some(handler) = self
+                    .registries
+                    .get(to as usize)
+                    .and_then(|r| r.get_notification(type_id))
+                {
+                    handler(payload.clone());
+                } else {
+                    debug!(
+                        target_node = to,
+                        type_id,
+                        "No notification handler for message type on target node, dropping"
+                    );
+                }
             }
         }
 
