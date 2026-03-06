@@ -33,8 +33,8 @@ use hyperscale_core::{
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{RadixExecutor, TransactionValidation};
 use hyperscale_messages::{
-    BlockHeaderGossip, BlockVoteGossip, ExecutionCertificateBatch, ExecutionVoteBatch,
-    TransactionCertificateGossip, TransactionGossip,
+    BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
+    ExecutionVotesNotification, TransactionCertificateNotification, TransactionGossip,
 };
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
@@ -56,15 +56,15 @@ const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
 const DEFAULT_TX_CACHE_SIZE: usize = 50_000;
 /// Default transaction status cache capacity.
 const DEFAULT_TX_STATUS_CACHE_SIZE: usize = 100_000;
-/// Maximum age for pending gossip certificate verifications before cleanup.
-const PENDING_GOSSIP_CERT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum age for pending certificate verifications before cleanup.
+const PENDING_CERT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Pending verification of a gossiped TransactionCertificate.
+/// Pending verification of a received TransactionCertificate.
 ///
-/// When we receive a TransactionCertificate via gossip, we verify each embedded
+/// When we receive a TransactionCertificate, we verify each embedded
 /// ExecutionCertificate's BLS signature before persisting. This tracks the verification
 /// progress for a single certificate.
-struct PendingGossipVerification {
+struct PendingCertificateVerification {
     /// The certificate being verified.
     certificate: Arc<TransactionCertificate>,
     /// Shards still awaiting verification callback.
@@ -181,8 +181,8 @@ where
     cert_cache: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
     tx_cache: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
 
-    // Gossip certificate verification tracking
-    pending_gossip_verifications: HashMap<Hash, PendingGossipVerification>,
+    // Certificate verification tracking
+    pending_cert_verifications: HashMap<Hash, PendingCertificateVerification>,
 
     // Sync protocol
     sync_protocol: SyncProtocol,
@@ -267,7 +267,7 @@ where
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             cert_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
-            pending_gossip_verifications: HashMap::new(),
+            pending_cert_verifications: HashMap::new(),
             tx_validator,
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
@@ -357,7 +357,8 @@ where
 
         // Now sole ownership is released — register handlers.
         self.register_request_handler();
-        self.register_gossip_handler();
+        self.register_gossip_handlers();
+        self.register_notification_handlers();
 
         result
     }
@@ -456,263 +457,10 @@ where
             });
     }
 
-    /// Register per-type gossip handlers with the network.
-    ///
-    /// All gossip types use typed `register_gossip_handler<M>` which
-    /// SBOR-decodes in the network layer before calling the handler closure.
-    /// Handler closures either convert directly to ProtocolEvents or forward
-    /// as typed NodeInput variants for IoLoop processing.
-    fn register_gossip_handler(&self) {
+    /// Register gossip handlers for broadcast message types (transactions
+    /// and committed block headers).
+    fn register_gossip_handlers(&self) {
         use hyperscale_network::{GossipVerdict, TopicScope};
-
-        // ── block.vote → ProtocolEvent::BlockVoteReceived ────────────
-
-        let tx = self.event_sender.clone();
-        self.network.register_gossip_handler::<BlockVoteGossip>(
-            TopicScope::Shard,
-            move |gossip: BlockVoteGossip| -> GossipVerdict {
-                let _ = tx.send(NodeInput::Protocol(ProtocolEvent::BlockVoteReceived {
-                    vote: gossip.vote,
-                }));
-                GossipVerdict::Accept
-            },
-        );
-
-        // ── state.provision.batch → verify sender sig, then ProtocolEvent::StateProvisionsReceived ─
-
-        let tx = self.event_sender.clone();
-        let topology = Arc::clone(&self.topology);
-        self.network
-            .register_gossip_handler::<hyperscale_messages::StateProvisionBatch>(
-                TopicScope::Shard,
-                move |batch: hyperscale_messages::StateProvisionBatch| -> GossipVerdict {
-                    if batch.provisions.is_empty() {
-                        return GossipVerdict::Reject;
-                    }
-
-                    let sender = batch.sender;
-                    let source_shard = batch.provisions[0].source_shard;
-
-                    // Verify sender is in the source shard's committee.
-                    let committee = topology.committee_for_shard(source_shard);
-                    if !committee.contains(&sender) {
-                        warn!(
-                            sender = sender.0,
-                            source_shard = source_shard.0,
-                            "State provision sender not in source shard committee"
-                        );
-                        return GossipVerdict::Reject;
-                    }
-
-                    // Resolve sender's public key.
-                    let Some(public_key) = topology.public_key(sender) else {
-                        warn!(
-                            sender = sender.0,
-                            "Could not resolve public key for state provision sender"
-                        );
-                        return GossipVerdict::Reject;
-                    };
-
-                    let msg = batch.signing_message();
-                    let start = std::time::Instant::now();
-                    let valid = hyperscale_types::verify_bls12381_v1(
-                        &msg,
-                        &public_key,
-                        &batch.sender_signature,
-                    );
-                    metrics::record_signature_verification_latency(
-                        "state_provision_batch",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        warn!(
-                            sender = sender.0,
-                            source_shard = source_shard.0,
-                            "State provision sender signature invalid — rejecting"
-                        );
-                        return GossipVerdict::Reject;
-                    }
-
-                    let provisions = batch.into_provisions();
-                    let _ = tx.send(NodeInput::Protocol(
-                        ProtocolEvent::StateProvisionsReceived { provisions },
-                    ));
-                    GossipVerdict::Accept
-                },
-            );
-
-        // ── execution.vote.batch → verify sender sig, then ProtocolEvent::ExecutionVoteReceived ─
-
-        let tx = self.event_sender.clone();
-        let topology = Arc::clone(&self.topology);
-        let local_shard = self.local_shard;
-        self.network.register_gossip_handler::<ExecutionVoteBatch>(
-            TopicScope::Shard,
-            move |batch: ExecutionVoteBatch| -> GossipVerdict {
-                if batch.votes.is_empty() {
-                    return GossipVerdict::Reject;
-                }
-
-                let sender = batch.sender;
-                let committee = topology.committee_for_shard(local_shard);
-                if !committee.contains(&sender) {
-                    warn!(
-                        sender = sender.0,
-                        "Execution vote batch sender not in local shard committee"
-                    );
-                    return GossipVerdict::Reject;
-                }
-
-                let Some(public_key) = topology.public_key(sender) else {
-                    warn!(
-                        sender = sender.0,
-                        "Could not resolve public key for execution vote batch sender"
-                    );
-                    return GossipVerdict::Reject;
-                };
-
-                let msg = batch.signing_message(local_shard);
-                let start = std::time::Instant::now();
-                let valid = hyperscale_types::verify_bls12381_v1(
-                    &msg,
-                    &public_key,
-                    &batch.sender_signature,
-                );
-                metrics::record_signature_verification_latency(
-                    "exec_vote_batch",
-                    start.elapsed().as_secs_f64(),
-                );
-                if !valid {
-                    warn!(
-                        sender = sender.0,
-                        "Execution vote batch sender signature invalid — rejecting"
-                    );
-                    return GossipVerdict::Reject;
-                }
-
-                for vote in batch.into_votes() {
-                    let _ = tx.send(NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived {
-                        vote,
-                    }));
-                }
-                GossipVerdict::Accept
-            },
-        );
-
-        // ── execution.certificate.batch → verify sender sig, then ProtocolEvent::ExecutionCertificateReceived ─
-
-        let tx = self.event_sender.clone();
-        let topology = Arc::clone(&self.topology);
-        let local_shard = self.local_shard;
-        self.network
-            .register_gossip_handler::<ExecutionCertificateBatch>(
-                TopicScope::Shard,
-                move |batch: ExecutionCertificateBatch| -> GossipVerdict {
-                    if batch.certificates.is_empty() {
-                        return GossipVerdict::Reject;
-                    }
-
-                    let sender = batch.sender;
-                    // The sender is from the shard that produced the certificates,
-                    // which may differ from the local shard in cross-shard transactions.
-                    let source_shard = batch.certificates[0].shard_group_id;
-                    if batch
-                        .certificates
-                        .iter()
-                        .any(|c| c.shard_group_id != source_shard)
-                    {
-                        warn!(
-                            sender = sender.0,
-                            "Execution certificate batch contains mixed shard_group_ids — rejecting"
-                        );
-                        return GossipVerdict::Reject;
-                    }
-                    let committee = topology.committee_for_shard(source_shard);
-                    if !committee.contains(&sender) {
-                        warn!(
-                            sender = sender.0,
-                            source_shard = source_shard.0,
-                            "Execution certificate batch sender not in source shard committee"
-                        );
-                        return GossipVerdict::Reject;
-                    }
-
-                    let Some(public_key) = topology.public_key(sender) else {
-                        warn!(
-                            sender = sender.0,
-                            "Could not resolve public key for execution certificate batch sender"
-                        );
-                        return GossipVerdict::Reject;
-                    };
-
-                    let msg = batch.signing_message(local_shard);
-                    let start = std::time::Instant::now();
-                    let valid = hyperscale_types::verify_bls12381_v1(
-                        &msg,
-                        &public_key,
-                        &batch.sender_signature,
-                    );
-                    metrics::record_signature_verification_latency(
-                        "exec_cert_batch",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        warn!(
-                            sender = sender.0,
-                            "Execution certificate batch sender signature invalid — rejecting"
-                        );
-                        return GossipVerdict::Reject;
-                    }
-
-                    for cert in batch.into_certificates() {
-                        let _ = tx.send(NodeInput::Protocol(
-                            ProtocolEvent::ExecutionCertificateReceived { cert },
-                        ));
-                    }
-                    GossipVerdict::Accept
-                },
-            );
-
-        // ── block.header → verify proposer sig, then ProtocolEvent::BlockHeaderReceived ─
-
-        let tx = self.event_sender.clone();
-        let topology = Arc::clone(&self.topology);
-        self.network.register_gossip_handler::<BlockHeaderGossip>(
-            TopicScope::Shard,
-            move |gossip: BlockHeaderGossip| -> GossipVerdict {
-                let proposer = gossip.header.proposer;
-                let Some(public_key) = topology.public_key(proposer) else {
-                    warn!(proposer = proposer.0, "Unknown proposer for block header");
-                    return GossipVerdict::Reject;
-                };
-                let msg = gossip.signing_message();
-                let start = std::time::Instant::now();
-                let valid = hyperscale_types::verify_bls12381_v1(
-                    &msg,
-                    &public_key,
-                    &gossip.proposer_signature,
-                );
-                metrics::record_signature_verification_latency(
-                    "block_header",
-                    start.elapsed().as_secs_f64(),
-                );
-                if !valid {
-                    warn!(
-                        proposer = proposer.0,
-                        height = gossip.header.height.0,
-                        round = gossip.header.round,
-                        "Block header proposer signature invalid — rejecting"
-                    );
-                    return GossipVerdict::Reject;
-                }
-                let (header, manifest, _sig) = gossip.into_parts();
-                let _ = tx.send(NodeInput::Protocol(ProtocolEvent::BlockHeaderReceived {
-                    header,
-                    manifest,
-                }));
-                GossipVerdict::Accept
-            },
-        );
 
         // ── transaction.gossip → ProtocolEvent::TransactionGossipReceived ─
         // The existing step() intercept handles dedup + validation queueing.
@@ -730,59 +478,6 @@ where
                 GossipVerdict::Accept
             },
         );
-
-        // ── transaction.certificate → verify sender sig, then NodeInput::TransactionCertificateReceived ─
-
-        let tx = self.event_sender.clone();
-        let topology = Arc::clone(&self.topology);
-        let local_shard = self.local_shard;
-        self.network
-            .register_gossip_handler::<TransactionCertificateGossip>(
-                TopicScope::Shard,
-                move |gossip: TransactionCertificateGossip| -> GossipVerdict {
-                    let sender = gossip.sender;
-                    let committee = topology.committee_for_shard(local_shard);
-                    if !committee.contains(&sender) {
-                        warn!(
-                            sender = sender.0,
-                            "Transaction certificate gossip sender not in local shard committee"
-                        );
-                        return GossipVerdict::Reject;
-                    }
-
-                    let Some(public_key) = topology.public_key(sender) else {
-                        warn!(
-                            sender = sender.0,
-                            "Could not resolve public key for transaction certificate gossip sender"
-                        );
-                        return GossipVerdict::Reject;
-                    };
-
-                    let msg = gossip.signing_message(local_shard);
-                    let start = std::time::Instant::now();
-                    let valid = hyperscale_types::verify_bls12381_v1(
-                        &msg,
-                        &public_key,
-                        &gossip.sender_signature,
-                    );
-                    metrics::record_signature_verification_latency(
-                        "tx_cert_gossip",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        warn!(
-                            sender = sender.0,
-                            "Transaction certificate gossip sender signature invalid — rejecting"
-                        );
-                        return GossipVerdict::Reject;
-                    }
-
-                    let _ = tx.send(NodeInput::TransactionCertificateReceived {
-                        certificate: gossip.into_certificate(),
-                    });
-                    GossipVerdict::Accept
-                },
-            );
 
         // ── block.committed → pre-filter, then NodeInput::CommittedBlockGossipReceived ─
 
@@ -828,6 +523,304 @@ where
                         sender_signature: gossip.sender_signature,
                     });
                     GossipVerdict::Accept
+                },
+            );
+    }
+
+    /// Register notification handlers for protocol messages sent via unicast
+    /// to known committee members.
+    fn register_notification_handlers(&self) {
+        // ── block.vote → ProtocolEvent::BlockVoteReceived ────────────
+
+        let tx = self.event_sender.clone();
+        self.network
+            .register_notification_handler::<BlockVoteNotification>(
+                move |gossip: BlockVoteNotification| {
+                    let _ = tx.send(NodeInput::Protocol(ProtocolEvent::BlockVoteReceived {
+                        vote: gossip.vote,
+                    }));
+                },
+            );
+
+        // ── block.header → verify proposer sig, then ProtocolEvent::BlockHeaderReceived ─
+
+        let tx = self.event_sender.clone();
+        let topology = Arc::clone(&self.topology);
+        self.network
+            .register_notification_handler::<BlockHeaderNotification>(
+                move |gossip: BlockHeaderNotification| {
+                    let proposer = gossip.header.proposer;
+                    let Some(public_key) = topology.public_key(proposer) else {
+                        warn!(proposer = proposer.0, "Unknown proposer for block header");
+                        return;
+                    };
+                    let msg = gossip.signing_message();
+                    let start = std::time::Instant::now();
+                    let valid = hyperscale_types::verify_bls12381_v1(
+                        &msg,
+                        &public_key,
+                        &gossip.proposer_signature,
+                    );
+                    metrics::record_signature_verification_latency(
+                        "block_header",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        warn!(
+                            proposer = proposer.0,
+                            height = gossip.header.height.0,
+                            round = gossip.header.round,
+                            "Block header proposer signature invalid — dropping"
+                        );
+                        return;
+                    }
+                    let (header, manifest, _sig) = gossip.into_parts();
+                    let _ = tx.send(NodeInput::Protocol(ProtocolEvent::BlockHeaderReceived {
+                        header,
+                        manifest,
+                    }));
+                },
+            );
+
+        // ── transaction.certificate → verify sender sig, then NodeInput::TransactionCertificateReceived ─
+
+        let tx = self.event_sender.clone();
+        let topology = Arc::clone(&self.topology);
+        let local_shard = self.local_shard;
+        self.network
+            .register_notification_handler::<TransactionCertificateNotification>(
+                move |gossip: TransactionCertificateNotification| {
+                    let sender = gossip.sender;
+                    let committee = topology.committee_for_shard(local_shard);
+                    if !committee.contains(&sender) {
+                        warn!(
+                            sender = sender.0,
+                            "Transaction certificate sender not in local shard committee"
+                        );
+                        return;
+                    }
+
+                    let Some(public_key) = topology.public_key(sender) else {
+                        warn!(
+                            sender = sender.0,
+                            "Could not resolve public key for transaction certificate sender"
+                        );
+                        return;
+                    };
+
+                    let msg = gossip.signing_message(local_shard);
+                    let start = std::time::Instant::now();
+                    let valid = hyperscale_types::verify_bls12381_v1(
+                        &msg,
+                        &public_key,
+                        &gossip.sender_signature,
+                    );
+                    metrics::record_signature_verification_latency(
+                        "tx_cert_gossip",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        warn!(
+                            sender = sender.0,
+                            "Transaction certificate sender signature invalid — dropping"
+                        );
+                        return;
+                    }
+
+                    let _ = tx.send(NodeInput::TransactionCertificateReceived {
+                        certificate: gossip.into_certificate(),
+                    });
+                },
+            );
+
+        // ── state.provision.batch → verify sender sig, then ProtocolEvent::StateProvisionsReceived ─
+
+        let tx = self.event_sender.clone();
+        let topology = Arc::clone(&self.topology);
+        self.network
+            .register_notification_handler::<hyperscale_messages::StateProvisionsNotification>(
+                move |batch: hyperscale_messages::StateProvisionsNotification| {
+                    if batch.provisions.is_empty() {
+                        return;
+                    }
+
+                    let sender = batch.sender;
+                    let source_shard = batch.provisions[0].source_shard;
+
+                    // Verify sender is in the source shard's committee.
+                    let committee = topology.committee_for_shard(source_shard);
+                    if !committee.contains(&sender) {
+                        warn!(
+                            sender = sender.0,
+                            source_shard = source_shard.0,
+                            "State provision sender not in source shard committee"
+                        );
+                        return;
+                    }
+
+                    // Resolve sender's public key.
+                    let Some(public_key) = topology.public_key(sender) else {
+                        warn!(
+                            sender = sender.0,
+                            "Could not resolve public key for state provision sender"
+                        );
+                        return;
+                    };
+
+                    let msg = batch.signing_message();
+                    let start = std::time::Instant::now();
+                    let valid = hyperscale_types::verify_bls12381_v1(
+                        &msg,
+                        &public_key,
+                        &batch.sender_signature,
+                    );
+                    metrics::record_signature_verification_latency(
+                        "state_provision_batch",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        warn!(
+                            sender = sender.0,
+                            source_shard = source_shard.0,
+                            "State provision sender signature invalid — dropping"
+                        );
+                        return;
+                    }
+
+                    let provisions = batch.into_provisions();
+                    let _ = tx.send(NodeInput::Protocol(
+                        ProtocolEvent::StateProvisionsReceived { provisions },
+                    ));
+                },
+            );
+
+        // ── execution.vote.batch → verify sender sig, then ProtocolEvent::ExecutionVoteReceived ─
+
+        let tx = self.event_sender.clone();
+        let topology = Arc::clone(&self.topology);
+        let local_shard = self.local_shard;
+        self.network
+            .register_notification_handler::<ExecutionVotesNotification>(
+                move |batch: ExecutionVotesNotification| {
+                    if batch.votes.is_empty() {
+                        return;
+                    }
+
+                    let sender = batch.sender;
+                    let committee = topology.committee_for_shard(local_shard);
+                    if !committee.contains(&sender) {
+                        warn!(
+                            sender = sender.0,
+                            "Execution vote batch sender not in local shard committee"
+                        );
+                        return;
+                    }
+
+                    let Some(public_key) = topology.public_key(sender) else {
+                        warn!(
+                            sender = sender.0,
+                            "Could not resolve public key for execution vote batch sender"
+                        );
+                        return;
+                    };
+
+                    let msg = batch.signing_message(local_shard);
+                    let start = std::time::Instant::now();
+                    let valid = hyperscale_types::verify_bls12381_v1(
+                        &msg,
+                        &public_key,
+                        &batch.sender_signature,
+                    );
+                    metrics::record_signature_verification_latency(
+                        "exec_vote_batch",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        warn!(
+                            sender = sender.0,
+                            "Execution vote batch sender signature invalid — dropping"
+                        );
+                        return;
+                    }
+
+                    for vote in batch.into_votes() {
+                        let _ =
+                            tx.send(NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived {
+                                vote,
+                            }));
+                    }
+                },
+            );
+
+        // ── execution.certificate.batch → verify sender sig, then ProtocolEvent::ExecutionCertificateReceived ─
+
+        let tx = self.event_sender.clone();
+        let topology = Arc::clone(&self.topology);
+        let local_shard = self.local_shard;
+        self.network
+            .register_notification_handler::<ExecutionCertificatesNotification>(
+                move |batch: ExecutionCertificatesNotification| {
+                    if batch.certificates.is_empty() {
+                        return;
+                    }
+
+                    let sender = batch.sender;
+                    // The sender is from the shard that produced the certificates,
+                    // which may differ from the local shard in cross-shard transactions.
+                    let source_shard = batch.certificates[0].shard_group_id;
+                    if batch
+                        .certificates
+                        .iter()
+                        .any(|c| c.shard_group_id != source_shard)
+                    {
+                        warn!(
+                            sender = sender.0,
+                            "Execution certificate batch contains mixed shard_group_ids — dropping"
+                        );
+                        return;
+                    }
+                    let committee = topology.committee_for_shard(source_shard);
+                    if !committee.contains(&sender) {
+                        warn!(
+                            sender = sender.0,
+                            source_shard = source_shard.0,
+                            "Execution certificate batch sender not in source shard committee"
+                        );
+                        return;
+                    }
+
+                    let Some(public_key) = topology.public_key(sender) else {
+                        warn!(
+                            sender = sender.0,
+                            "Could not resolve public key for execution certificate batch sender"
+                        );
+                        return;
+                    };
+
+                    let msg = batch.signing_message(local_shard);
+                    let start = std::time::Instant::now();
+                    let valid = hyperscale_types::verify_bls12381_v1(
+                        &msg,
+                        &public_key,
+                        &batch.sender_signature,
+                    );
+                    metrics::record_signature_verification_latency(
+                        "exec_cert_batch",
+                        start.elapsed().as_secs_f64(),
+                    );
+                    if !valid {
+                        warn!(
+                            sender = sender.0,
+                            "Execution certificate batch sender signature invalid — dropping"
+                        );
+                        return;
+                    }
+
+                    for cert in batch.into_certificates() {
+                        let _ = tx.send(NodeInput::Protocol(
+                            ProtocolEvent::ExecutionCertificateReceived { cert },
+                        ));
+                    }
                 },
             );
     }
@@ -908,15 +901,15 @@ where
             }
 
             NodeInput::TransactionCertificateReceived { certificate } => {
-                self.handle_gossiped_certificate(certificate);
+                self.handle_received_certificate(certificate);
             }
 
-            NodeInput::GossipedCertificateSignatureVerified {
+            NodeInput::CertificateSignatureVerified {
                 tx_hash,
                 shard,
                 valid,
             } => {
-                self.handle_gossip_cert_result(tx_hash, shard, valid);
+                self.handle_cert_verification_result(tx_hash, shard, valid);
             }
 
             // ── Sync protocol ──────────────────────────────────────────
@@ -1074,12 +1067,13 @@ where
                         &provisions,
                     );
                     let sig = self.signing_key.sign_v1(&msg);
-                    let batch = hyperscale_messages::StateProvisionBatch::new(
+                    let batch = hyperscale_messages::StateProvisionsNotification::new(
                         provisions,
                         self.validator_id,
                         sig,
                     );
-                    self.network.broadcast_to_shard(shard, &batch);
+                    let recipients = self.peers_for_shard(shard);
+                    self.network.notify(&recipients, &batch);
                 }
             }
 
@@ -1151,17 +1145,17 @@ where
             self.flush_committed_header_verifications();
         }
 
-        // Clean up stale pending gossip cert verifications.
-        let before = self.pending_gossip_verifications.len();
-        self.pending_gossip_verifications.retain(|_, pending| {
-            now.saturating_sub(pending.created_at) < PENDING_GOSSIP_CERT_TIMEOUT
+        // Clean up stale pending certificate verifications.
+        let before = self.pending_cert_verifications.len();
+        self.pending_cert_verifications.retain(|_, pending| {
+            now.saturating_sub(pending.created_at) < PENDING_CERT_VERIFICATION_TIMEOUT
         });
-        let cleaned = before - self.pending_gossip_verifications.len();
+        let cleaned = before - self.pending_cert_verifications.len();
         if cleaned > 0 {
             warn!(
                 cleaned,
-                remaining = self.pending_gossip_verifications.len(),
-                "Cleaned up stale pending gossip cert verifications"
+                remaining = self.pending_cert_verifications.len(),
+                "Cleaned up stale pending certificate verifications"
             );
         }
     }
@@ -1210,17 +1204,17 @@ where
             // ═══════════════════════════════════════════════════════════
             // Network broadcasts — immediate (non-batched)
             // ═══════════════════════════════════════════════════════════
-            Action::BroadcastBlockHeader { shard, header } => {
-                self.network.broadcast_to_shard(shard, &*header);
+            Action::BroadcastBlockHeader { shard: _, header } => {
+                self.network.notify(&self.cached_local_peers, &*header);
             }
-            Action::BroadcastBlockVote { shard, vote } => {
-                self.network.broadcast_to_shard(shard, &vote);
+            Action::BroadcastBlockVote { shard: _, vote } => {
+                self.network.notify(&self.cached_local_peers, &vote);
             }
             Action::BroadcastTransaction { shard, gossip } => {
                 self.network.broadcast_to_shard(shard, &*gossip);
             }
-            Action::BroadcastTransactionCertificate { shard, gossip } => {
-                self.network.broadcast_to_shard(shard, &gossip);
+            Action::BroadcastTransactionCertificate { shard: _, gossip } => {
+                self.network.notify(&self.cached_local_peers, &gossip);
             }
             Action::BroadcastCommittedBlockHeader { gossip } => {
                 self.network.broadcast_global(&gossip);
@@ -1348,23 +1342,26 @@ where
                 self.cert_cache
                     .insert(certificate.transaction_hash, Arc::new(certificate.clone()));
                 self.storage.store_certificate(&certificate);
-                // Gossip cross-shard certificates to local shard peers.
+                // Notify local shard peers about cross-shard certificates.
                 if certificate.shard_proofs.len() > 1 {
                     let msg = hyperscale_types::tx_cert_gossip_message(
                         self.local_shard,
                         &certificate.transaction_hash,
                     );
                     let sig = self.signing_key.sign_v1(&msg);
-                    let gossip =
-                        TransactionCertificateGossip::new(certificate, self.validator_id, sig);
-                    self.network.broadcast_to_shard(self.local_shard, &gossip);
+                    let gossip = TransactionCertificateNotification::new(
+                        certificate,
+                        self.validator_id,
+                        sig,
+                    );
+                    self.network.notify(&self.cached_local_peers, &gossip);
                 }
             }
             Action::PersistAndBroadcastVote {
                 height,
                 round,
                 block_hash,
-                shard,
+                shard: _,
                 vote,
             } => {
                 // BFT Safety: persist vote BEFORE broadcasting.
@@ -1375,7 +1372,7 @@ where
                     block_hash = ?block_hash,
                     "Persisted own vote"
                 );
-                self.network.broadcast_to_shard(shard, &vote);
+                self.network.notify(&self.cached_local_peers, &vote);
             }
             Action::FetchBlock { height } => {
                 let block = self.storage.get_block(height);
@@ -1603,6 +1600,17 @@ where
     /// to `network.request()`.
     fn local_peers(&self) -> &[ValidatorId] {
         &self.cached_local_peers
+    }
+
+    /// Committee for a shard excluding self, for use as notify recipients.
+    fn peers_for_shard(&self, shard: ShardGroupId) -> Vec<ValidatorId> {
+        let vid = self.validator_id;
+        self.topology
+            .committee_for_shard(shard)
+            .iter()
+            .copied()
+            .filter(|&v| v != vid)
+            .collect()
     }
 
     /// Process SyncProtocol outputs internally.
@@ -1979,13 +1987,13 @@ where
         });
     }
 
-    // ─── Gossip Certificate Verification ─────────────────────────────────
+    // ─── Certificate Verification ───────────────────────────────────────
 
-    /// Handle a gossiped TransactionCertificate.
+    /// Handle a received TransactionCertificate.
     ///
     /// Verifies each embedded ExecutionCertificate's BLS signature before persisting
     /// to prevent malicious peers from filling storage with invalid certificates.
-    fn handle_gossiped_certificate(&mut self, certificate: TransactionCertificate) {
+    fn handle_received_certificate(&mut self, certificate: TransactionCertificate) {
         let tx_hash = certificate.transaction_hash;
 
         // Fast path: skip if we built this certificate locally (O(1) cache check).
@@ -1994,7 +2002,7 @@ where
         }
 
         // Skip if already in verification pipeline.
-        if self.pending_gossip_verifications.contains_key(&tx_hash) {
+        if self.pending_cert_verifications.contains_key(&tx_hash) {
             return;
         }
 
@@ -2011,16 +2019,16 @@ where
 
         if pending_shards.is_empty() {
             // Empty certificate (no shard proofs) - persist directly.
-            self.persist_and_notify_gossiped_certificate(certificate);
+            self.persist_and_notify_verified_certificate(certificate);
             return;
         }
 
         let now = self.state.now();
 
         // Track pending verification.
-        self.pending_gossip_verifications.insert(
+        self.pending_cert_verifications.insert(
             tx_hash,
-            PendingGossipVerification {
+            PendingCertificateVerification {
                 certificate: Arc::clone(&certificate),
                 pending_shards,
                 failed: false,
@@ -2040,13 +2048,13 @@ where
                 warn!(
                     tx_hash = ?tx_hash,
                     shard = shard_id.0,
-                    "Could not resolve all public keys for gossiped certificate"
+                    "Could not resolve all public keys for received certificate"
                 );
-                if let Some(pending) = self.pending_gossip_verifications.get_mut(&tx_hash) {
+                if let Some(pending) = self.pending_cert_verifications.get_mut(&tx_hash) {
                     pending.failed = true;
                     pending.pending_shards.remove(shard_id);
                     if pending.pending_shards.is_empty() {
-                        self.pending_gossip_verifications.remove(&tx_hash);
+                        self.pending_cert_verifications.remove(&tx_hash);
                     }
                 }
                 continue;
@@ -2069,7 +2077,7 @@ where
                 if !valid {
                     metrics::record_signature_verification_failure();
                 }
-                let _ = es.send(NodeInput::GossipedCertificateSignatureVerified {
+                let _ = es.send(NodeInput::CertificateSignatureVerified {
                     tx_hash,
                     shard,
                     valid,
@@ -2078,31 +2086,31 @@ where
         }
     }
 
-    /// Handle a gossip cert verification result from the crypto pool.
-    fn handle_gossip_cert_result(&mut self, tx_hash: Hash, shard: ShardGroupId, valid: bool) {
-        if let Some(pending) = self.pending_gossip_verifications.get_mut(&tx_hash) {
+    /// Handle a certificate verification result from the crypto pool.
+    fn handle_cert_verification_result(&mut self, tx_hash: Hash, shard: ShardGroupId, valid: bool) {
+        if let Some(pending) = self.pending_cert_verifications.get_mut(&tx_hash) {
             if !valid {
                 pending.failed = true;
                 warn!(
                     tx_hash = ?tx_hash,
                     shard = shard.0,
-                    "Gossiped certificate signature verification failed"
+                    "Certificate signature verification failed"
                 );
             }
             pending.pending_shards.remove(&shard);
 
             if pending.pending_shards.is_empty() {
-                let pending = self.pending_gossip_verifications.remove(&tx_hash).unwrap();
+                let pending = self.pending_cert_verifications.remove(&tx_hash).unwrap();
 
                 if !pending.failed {
-                    self.persist_and_notify_gossiped_certificate(pending.certificate);
+                    self.persist_and_notify_verified_certificate(pending.certificate);
                 }
             }
         }
     }
 
-    /// Persist a verified gossiped certificate and notify the state machine.
-    fn persist_and_notify_gossiped_certificate(
+    /// Persist a verified certificate and notify the state machine.
+    fn persist_and_notify_verified_certificate(
         &mut self,
         certificate: Arc<TransactionCertificate>,
     ) {
@@ -2114,8 +2122,8 @@ where
         // Persist to storage.
         self.storage.store_certificate(&certificate);
 
-        // Feed GossipedCertificateVerified directly to state machine.
-        self.feed_event(ProtocolEvent::GossipedCertificateVerified { certificate });
+        // Feed TransactionCertificateVerified directly to state machine.
+        self.feed_event(ProtocolEvent::TransactionCertificateVerified { certificate });
     }
 
     // ─── Batch Accumulation ─────────────────────────────────────────────
@@ -2184,8 +2192,8 @@ where
             if !votes.is_empty() {
                 let msg = hyperscale_types::exec_vote_batch_message(shard, &votes);
                 let sig = self.signing_key.sign_v1(&msg);
-                let batch = ExecutionVoteBatch::new(votes, self.validator_id, sig);
-                self.network.broadcast_to_shard(shard, &batch);
+                let batch = ExecutionVotesNotification::new(votes, self.validator_id, sig);
+                self.network.notify(&self.cached_local_peers, &batch);
             }
         }
     }
@@ -2197,8 +2205,9 @@ where
                     certs.into_iter().map(Arc::unwrap_or_clone).collect();
                 let msg = hyperscale_types::exec_cert_batch_message(shard, &owned);
                 let sig = self.signing_key.sign_v1(&msg);
-                let batch = ExecutionCertificateBatch::new(owned, self.validator_id, sig);
-                self.network.broadcast_to_shard(shard, &batch);
+                let batch = ExecutionCertificatesNotification::new(owned, self.validator_id, sig);
+                let recipients = self.peers_for_shard(shard);
+                self.network.notify(&recipients, &batch);
             }
         }
     }
@@ -2301,8 +2310,8 @@ where
         // ── Livelock ──
         metrics::set_livelock_deferred_count(self.state.livelock().stats().pending_deferrals);
 
-        // ── Gossip cert verification tracking ──
-        metrics::set_pending_gossiped_cert_batch_size(self.pending_gossip_verifications.len());
+        // ── Certificate verification tracking ──
+        metrics::set_pending_cert_verification_count(self.pending_cert_verifications.len());
     }
 
     /// Capture a snapshot of node state for external status APIs.

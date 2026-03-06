@@ -199,8 +199,8 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record a backpressure event.
     fn record_backpressure_event(&self, source: &str) {}
 
-    /// Set pending gossiped cert batch size gauge.
-    fn set_pending_gossiped_cert_batch_size(&self, size: usize) {}
+    /// Set pending certificate verification count gauge.
+    fn set_pending_cert_verification_count(&self, size: usize) {}
 
     /// Record an early arrival eviction.
     fn record_early_arrival_eviction(&self) {}
@@ -584,10 +584,10 @@ pub fn record_backpressure_event(source: &str) {
     recorder().record_backpressure_event(source);
 }
 
-/// Set pending gossiped cert batch size gauge.
+/// Set pending certificate verification count gauge.
 #[inline]
-pub fn set_pending_gossiped_cert_batch_size(size: usize) {
-    recorder().set_pending_gossiped_cert_batch_size(size);
+pub fn set_pending_cert_verification_count(size: usize) {
+    recorder().set_pending_cert_verification_count(size);
 }
 
 /// Record an early arrival eviction.

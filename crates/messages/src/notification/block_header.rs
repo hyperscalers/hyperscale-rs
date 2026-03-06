@@ -1,12 +1,12 @@
-//! BlockHeader gossip message.
+//! BlockHeader notification message.
 
 use hyperscale_types::{
     block_header_message, BlockHeader, BlockManifest, Bls12381G2Signature, MessagePriority,
-    NetworkMessage, ShardMessage,
+    NetworkMessage,
 };
 use sbor::prelude::BasicSbor;
 
-/// Gossips a block proposal (header + manifest, not full block).
+/// Notifies committee members of a block proposal (header + manifest, not full block).
 /// Validators construct the full Block locally from header + mempool transactions.
 ///
 /// Transaction hashes are split into three priority sections in the manifest:
@@ -15,11 +15,10 @@ use sbor::prelude::BasicSbor;
 /// 3. **tx_hashes**: All other transactions
 ///
 /// The `proposer_signature` is a BLS signature by the proposer over a domain-separated
-/// message, ensuring that block proposals cannot be forged by non-proposers. This
-/// enables gossipsub to operate in anonymous mode without transport-level signing.
+/// message, ensuring that block proposals cannot be forged by non-proposers.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct BlockHeaderGossip {
-    /// The block header being gossiped.
+pub struct BlockHeaderNotification {
+    /// The block header being proposed.
     pub header: BlockHeader,
 
     /// Block contents manifest (transaction hashes, certificates, deferrals, etc.)
@@ -30,8 +29,8 @@ pub struct BlockHeaderGossip {
     pub proposer_signature: Bls12381G2Signature,
 }
 
-impl BlockHeaderGossip {
-    /// Create a block header gossip message.
+impl BlockHeaderNotification {
+    /// Create a block header notification message.
     pub fn new(
         header: BlockHeader,
         manifest: BlockManifest,
@@ -61,7 +60,7 @@ impl BlockHeaderGossip {
 }
 
 // Network message implementation
-impl NetworkMessage for BlockHeaderGossip {
+impl NetworkMessage for BlockHeaderNotification {
     fn message_type_id() -> &'static str {
         "block.header"
     }
@@ -70,8 +69,6 @@ impl NetworkMessage for BlockHeaderGossip {
         MessagePriority::Critical
     }
 }
-
-impl ShardMessage for BlockHeaderGossip {}
 
 #[cfg(test)]
 mod tests {
@@ -110,7 +107,7 @@ mod tests {
             ..Default::default()
         };
 
-        let gossip = BlockHeaderGossip::new(header.clone(), manifest.clone(), zero_sig());
+        let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
         assert_eq!(gossip.header, header);
         assert_eq!(gossip.manifest, manifest);
         assert_eq!(gossip.manifest.transaction_count(), 4);
@@ -124,7 +121,7 @@ mod tests {
             ..Default::default()
         };
 
-        let gossip = BlockHeaderGossip::new(header.clone(), manifest.clone(), zero_sig());
+        let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
         let (h, m, _sig) = gossip.into_parts();
         assert_eq!(h, header);
         assert_eq!(m, manifest);
@@ -136,7 +133,7 @@ mod tests {
         let priority = Hash::from_bytes(b"priority");
         let other = Hash::from_bytes(b"other");
 
-        let gossip = BlockHeaderGossip::new(
+        let gossip = BlockHeaderNotification::new(
             make_header(1),
             BlockManifest {
                 retry_hashes: vec![retry],

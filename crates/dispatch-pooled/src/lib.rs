@@ -123,7 +123,7 @@ impl ThreadPoolConfig {
     ///   - Execution: 25% (Radix Engine)
     ///   - TX Validation: 15% (transaction signature verification)
     ///   - I/O: 15% (network, storage, timers)
-    ///   - Crypto: remainder (provisions, execution votes, gossiped cert verification)
+    ///   - Crypto: remainder (provisions, execution votes, certificate verification)
     ///
     /// On systems with fewer than 8 cores, all pools get 1 thread each.
     pub fn auto() -> Self {
@@ -156,7 +156,7 @@ impl ThreadPoolConfig {
             // - Execution: 25% (Radix Engine)
             // - TX Validation: 15% (transaction signature verification, bursty)
             // - I/O: 15% (network, storage, timers)
-            // - Crypto: remainder (provisions, execution votes, gossiped cert verification)
+            // - Crypto: remainder (provisions, execution votes, certificate verification)
             let execution = (pool_budget * 25 / 100).max(1);
             let tx_validation = (pool_budget * 15 / 100).max(1);
             let io = (pool_budget * 15 / 100).max(1);

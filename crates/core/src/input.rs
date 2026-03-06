@@ -50,11 +50,11 @@ pub enum NodeInput {
     /// Client submitted a transaction.
     SubmitTransaction { tx: Arc<RoutableTransaction> },
 
-    /// Received a finalized transaction certificate via gossip.
+    /// Received a finalized transaction certificate via notification.
     TransactionCertificateReceived { certificate: TransactionCertificate },
 
-    /// A shard's signature in a gossiped certificate has been verified.
-    GossipedCertificateSignatureVerified {
+    /// A shard's signature in a received certificate has been verified.
+    CertificateSignatureVerified {
         tx_hash: Hash,
         shard: ShardGroupId,
         valid: bool,
@@ -116,7 +116,7 @@ pub enum NodeInput {
     /// Provisions built by the execution pool, ready for network broadcast.
     ///
     /// Returned from delegated `FetchAndBroadcastProvisions` action.
-    /// The I/O loop broadcasts one `StateProvisionBatch` per target shard.
+    /// The I/O loop sends one `StateProvisionsNotification` per target shard.
     ProvisionsReady {
         batches: Vec<(ShardGroupId, Vec<StateProvision>)>,
     },
@@ -166,7 +166,7 @@ impl NodeInput {
             },
             NodeInput::SubmitTransaction { .. } => EventPriority::Client,
             NodeInput::TransactionCertificateReceived { .. } => EventPriority::Network,
-            NodeInput::GossipedCertificateSignatureVerified { .. } => EventPriority::Internal,
+            NodeInput::CertificateSignatureVerified { .. } => EventPriority::Internal,
             NodeInput::SyncBlockResponseReceived { .. } => EventPriority::Internal,
             NodeInput::SyncBlockFetchFailed { .. } => EventPriority::Internal,
             NodeInput::FetchTick => EventPriority::Timer,
@@ -204,9 +204,7 @@ impl NodeInput {
             NodeInput::Protocol(pe) => pe.type_name(),
             NodeInput::SubmitTransaction { .. } => "SubmitTransaction",
             NodeInput::TransactionCertificateReceived { .. } => "TransactionCertificateReceived",
-            NodeInput::GossipedCertificateSignatureVerified { .. } => {
-                "GossipedCertificateSignatureVerified"
-            }
+            NodeInput::CertificateSignatureVerified { .. } => "CertificateSignatureVerified",
             NodeInput::SyncBlockResponseReceived { .. } => "SyncBlockResponseReceived",
             NodeInput::SyncBlockFetchFailed { .. } => "SyncBlockFetchFailed",
             NodeInput::FetchTick => "FetchTick",

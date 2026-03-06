@@ -1583,8 +1583,11 @@ mod tests {
 
     #[test]
     fn test_full_gossip_roundtrip() {
-        use hyperscale_messages::BlockVoteGossip;
-        use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash, ShardGroupId};
+        use hyperscale_messages::TransactionGossip;
+        use hyperscale_types::{
+            test_utils::{test_node, test_transaction_with_nodes},
+            ShardGroupId,
+        };
 
         let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 2,
@@ -1594,7 +1597,7 @@ mod tests {
         });
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
-        // Register per-type handlers for "block.vote" on each node.
+        // Register per-type handlers for "transaction.gossip" on each node.
         // Register directly on registry since we want raw recording handlers.
         use hyperscale_network::registry::RawGossipHandler;
         use hyperscale_network::GossipVerdict;
@@ -1607,23 +1610,21 @@ mod tests {
                     handler_clone.received.lock().unwrap().push(payload);
                     GossipVerdict::Accept
                 });
-                adapter.registry.register_raw_gossip("block.vote", raw);
+                adapter
+                    .registry
+                    .register_raw_gossip("transaction.gossip", raw);
                 handler
             })
             .collect();
 
         let adapter0 = network.create_adapter(0);
 
-        // Node 0 broadcasts a vote via its adapter
-        let gossip = BlockVoteGossip::new(BlockVote {
-            block_hash: Hash::from_bytes(b"test_block"),
-            shard_group_id: ShardGroupId(0),
-            height: BlockHeight(42),
-            round: 0,
-            voter: ValidatorId(0),
-            signature: zero_bls_signature(),
-            timestamp: 1_000_000_000_000,
-        });
+        // Node 0 broadcasts a transaction via its adapter
+        let gossip = TransactionGossip::new(test_transaction_with_nodes(
+            &[1, 2, 3],
+            vec![test_node(1)],
+            vec![test_node(2)],
+        ));
         hyperscale_network::Network::broadcast_to_shard(&adapter0, ShardGroupId(0), &gossip);
 
         // Drain and deliver via accept_gossip + flush_gossip
@@ -1640,7 +1641,7 @@ mod tests {
 
         network.flush_gossip(FAR_FUTURE);
 
-        // Node 1 should have received the vote gossip
+        // Node 1 should have received the transaction gossip
         let payloads = handlers[1].payloads();
         assert_eq!(payloads.len(), 1);
         assert!(!payloads[0].is_empty());

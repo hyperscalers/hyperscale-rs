@@ -252,10 +252,10 @@ pub enum ProtocolEvent {
     },
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Gossiped Certificate (verified by IoLoop)
+    // Transaction Certificate (verified by IoLoop)
     // ═══════════════════════════════════════════════════════════════════════
-    /// A gossiped TransactionCertificate has been fully verified.
-    GossipedCertificateVerified {
+    /// A received TransactionCertificate has been fully verified.
+    TransactionCertificateVerified {
         certificate: Arc<TransactionCertificate>,
     },
 
@@ -414,8 +414,10 @@ impl ProtocolEvent {
             ProtocolEvent::CertificateFetchDelivered { .. } => "CertificateFetchDelivered",
             ProtocolEvent::FetchedCertificateVerified { .. } => "FetchedCertificateVerified",
 
-            // Gossiped Certificate
-            ProtocolEvent::GossipedCertificateVerified { .. } => "GossipedCertificateVerified",
+            // Transaction Certificate
+            ProtocolEvent::TransactionCertificateVerified { .. } => {
+                "TransactionCertificateVerified"
+            }
 
             // Storage Callbacks
             ProtocolEvent::BlockFetched { .. } => "BlockFetched",

@@ -92,10 +92,10 @@ pub fn committed_block_header_message(
 /// Distinct from `DOMAIN_BLOCK_VOTE` to prevent cross-protocol replay.
 pub const DOMAIN_BLOCK_HEADER: &[u8] = b"BLOCK_HEADER";
 
-/// Build the signing message for a block header proposal gossip.
+/// Build the signing message for a block header proposal.
 ///
 /// This is used for:
-/// - Proposer signature on BlockHeaderGossip (authenticated proposals)
+/// - Proposer signature on BlockHeaderNotification (authenticated proposals)
 /// - Verification before admitting proposals to the BFT state machine
 pub fn block_header_message(
     shard_group: ShardGroupId,

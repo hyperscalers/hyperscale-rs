@@ -133,7 +133,7 @@ pub struct Metrics {
     pub network_request_retries: CounterVec,
     pub early_arrival_evictions: Counter,
     pub backpressure_events: CounterVec,
-    pub pending_gossiped_cert_batch_size: Gauge,
+    pub pending_cert_verification_count: Gauge,
 }
 
 impl Metrics {
@@ -684,9 +684,9 @@ impl Metrics {
             )
             .unwrap(),
 
-            pending_gossiped_cert_batch_size: register_gauge!(
-                "hyperscale_pending_gossiped_cert_batch_size",
-                "Number of gossiped certificates waiting for batch verification"
+            pending_cert_verification_count: register_gauge!(
+                "hyperscale_pending_cert_verification_count",
+                "Number of certificates waiting for signature verification"
             )
             .unwrap(),
         }
@@ -967,9 +967,9 @@ impl MetricsRecorder for PrometheusRecorder {
             .inc();
     }
 
-    fn set_pending_gossiped_cert_batch_size(&self, size: usize) {
+    fn set_pending_cert_verification_count(&self, size: usize) {
         self.metrics
-            .pending_gossiped_cert_batch_size
+            .pending_cert_verification_count
             .set(size as f64);
     }
 

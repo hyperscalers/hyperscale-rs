@@ -1256,8 +1256,11 @@ impl BftState {
 
         // Create gossip message (fallback blocks have no transactions, deferrals, or aborts)
         let sig = self.sign_block_header(&header, block_hash);
-        let gossip =
-            hyperscale_messages::BlockHeaderGossip::new(header, BlockManifest::default(), sig);
+        let gossip = hyperscale_messages::BlockHeaderNotification::new(
+            header,
+            BlockManifest::default(),
+            sig,
+        );
 
         // Track proposal time for rate limiting
         self.last_proposal_time = self.now;
@@ -1375,8 +1378,11 @@ impl BftState {
 
         // Create gossip message (sync blocks have no transactions, deferrals, or aborts)
         let sig = self.sign_block_header(&header, block_hash);
-        let gossip =
-            hyperscale_messages::BlockHeaderGossip::new(header, BlockManifest::default(), sig);
+        let gossip = hyperscale_messages::BlockHeaderNotification::new(
+            header,
+            BlockManifest::default(),
+            sig,
+        );
 
         // Track proposal time for rate limiting
         self.last_proposal_time = self.now;
@@ -1466,7 +1472,7 @@ impl BftState {
 
         // Create and broadcast the gossip message - include commitment proofs for ordering validation
         let sig = self.sign_block_header(&header, block_hash);
-        let gossip = hyperscale_messages::BlockHeaderGossip::new(header, manifest, sig);
+        let gossip = hyperscale_messages::BlockHeaderNotification::new(header, manifest, sig);
 
         actions.push(Action::BroadcastBlockHeader {
             shard: self.local_shard(),
@@ -2570,7 +2576,7 @@ impl BftState {
         );
 
         // Broadcast vote
-        let gossip = hyperscale_messages::BlockVoteGossip { vote: vote.clone() };
+        let gossip = hyperscale_messages::BlockVoteNotification { vote: vote.clone() };
 
         // **BFT Safety Critical**: Persist the vote BEFORE broadcasting.
         // If we crash after broadcasting but before persisting, we could vote
@@ -3313,7 +3319,7 @@ impl BftState {
         }
 
         let sig = self.sign_block_header(&block.header, block_hash);
-        let gossip = hyperscale_messages::BlockHeaderGossip::new(
+        let gossip = hyperscale_messages::BlockHeaderNotification::new(
             block.header.clone(),
             pending_block.manifest().clone(),
             sig,

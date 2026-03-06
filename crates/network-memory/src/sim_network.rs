@@ -231,26 +231,25 @@ impl Network for SimNetworkAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_messages::BlockVoteGossip;
-    use hyperscale_types::{zero_bls_signature, BlockHeight, BlockVote, Hash, ShardGroupId};
+    use hyperscale_messages::TransactionGossip;
+    use hyperscale_types::{
+        test_utils::{test_node, test_transaction_with_nodes},
+        BlockHeight, ShardGroupId,
+    };
     use std::sync::Mutex as StdMutex;
 
-    fn test_vote_gossip() -> BlockVoteGossip {
-        BlockVoteGossip::new(BlockVote {
-            block_hash: Hash::from_bytes(b"test"),
-            shard_group_id: ShardGroupId(0),
-            height: BlockHeight(1),
-            round: 0,
-            voter: ValidatorId(0),
-            signature: zero_bls_signature(),
-            timestamp: 1_000_000_000_000,
-        })
+    fn test_gossip() -> TransactionGossip {
+        TransactionGossip::new(test_transaction_with_nodes(
+            &[1, 2, 3],
+            vec![test_node(1)],
+            vec![test_node(2)],
+        ))
     }
 
     #[test]
     fn test_broadcast_to_shard_creates_outbox_entry() {
         let adapter = SimNetworkAdapter::default();
-        let gossip = test_vote_gossip();
+        let gossip = test_gossip();
         let shard = ShardGroupId(3);
 
         adapter.broadcast_to_shard(shard, &gossip);
@@ -258,28 +257,28 @@ mod tests {
         let entries = adapter.drain_outbox();
         assert_eq!(entries.len(), 1);
         assert!(matches!(entries[0].target, BroadcastTarget::Shard(s) if s == shard));
-        assert_eq!(entries[0].message_type, "block.vote");
+        assert_eq!(entries[0].message_type, "transaction.gossip");
         assert!(!entries[0].data.is_empty());
     }
 
     #[test]
     fn test_broadcast_global_creates_outbox_entry() {
         let adapter = SimNetworkAdapter::default();
-        let gossip = test_vote_gossip();
+        let gossip = test_gossip();
 
         adapter.broadcast_global(&gossip);
 
         let entries = adapter.drain_outbox();
         assert_eq!(entries.len(), 1);
         assert!(matches!(entries[0].target, BroadcastTarget::Global));
-        assert_eq!(entries[0].message_type, "block.vote");
+        assert_eq!(entries[0].message_type, "transaction.gossip");
         assert!(!entries[0].data.is_empty());
     }
 
     #[test]
     fn test_drain_outbox_returns_and_clears() {
         let adapter = SimNetworkAdapter::default();
-        let gossip = test_vote_gossip();
+        let gossip = test_gossip();
 
         adapter.broadcast_global(&gossip);
         adapter.broadcast_global(&gossip);

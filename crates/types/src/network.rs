@@ -37,8 +37,8 @@ pub enum MessagePriority {
     /// Liveness-critical consensus messages.
     ///
     /// Includes:
-    /// - `BlockHeaderGossip` - block proposals
-    /// - `BlockVoteGossip` - votes on proposals
+    /// - `BlockHeaderNotification` - block proposals
+    /// - `BlockVoteNotification` - votes on proposals
     /// - `GetTransactionsRequest/Response` - unblock pending blocks
     /// - `GetCertificatesRequest/Response` - unblock pending blocks
     ///
@@ -48,9 +48,9 @@ pub enum MessagePriority {
     /// Cross-shard coordination messages.
     ///
     /// Includes:
-    /// - `StateProvisionBatch` - cross-shard state delivery with merkle proofs
-    /// - `ExecutionVoteBatch` - execution result votes
-    /// - `ExecutionCertificateBatch` - 2PC completion certificates
+    /// - `StateProvisionsNotification` - cross-shard state delivery with merkle proofs
+    /// - `ExecutionVotesNotification` - execution result votes
+    /// - `ExecutionCertificatesNotification` - 2PC completion certificates
     ///
     /// High priority but may be batched for efficiency.
     Coordination = 1,
@@ -58,7 +58,7 @@ pub enum MessagePriority {
     /// Finalization messages.
     ///
     /// Includes:
-    /// - `TransactionCertificateGossip` - certificates for committed txs
+    /// - `TransactionCertificateNotification` - certificates for committed txs
     ///
     /// Important for progress but not liveness-critical.
     Finalization = 2,

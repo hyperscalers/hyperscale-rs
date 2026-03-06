@@ -707,8 +707,8 @@ impl NodeStateMachine {
         actions
     }
 
-    /// Handle a gossiped certificate that has been fully verified.
-    fn on_gossiped_certificate_verified(
+    /// Handle a received certificate that has been fully verified.
+    fn on_transaction_certificate_verified(
         &mut self,
         certificate: Arc<TransactionCertificate>,
     ) -> Vec<Action> {
@@ -899,8 +899,8 @@ impl StateMachine for NodeStateMachine {
                 self.bft
                     .on_certificate_fetch_received(block_hash, vec![Arc::new(certificate)])
             }
-            ProtocolEvent::GossipedCertificateVerified { certificate } => {
-                self.on_gossiped_certificate_verified(certificate)
+            ProtocolEvent::TransactionCertificateVerified { certificate } => {
+                self.on_transaction_certificate_verified(certificate)
             }
 
             // ── Storage / Sync ───────────────────────────────────────────

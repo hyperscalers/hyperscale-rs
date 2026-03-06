@@ -2,7 +2,8 @@
 
 use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{
-    BlockHeaderGossip, BlockVoteGossip, TransactionCertificateGossip, TransactionGossip,
+    BlockHeaderNotification, BlockVoteNotification, TransactionCertificateNotification,
+    TransactionGossip,
 };
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
@@ -50,13 +51,13 @@ pub enum Action {
     /// Broadcast a block header (proposal) to the local shard.
     BroadcastBlockHeader {
         shard: ShardGroupId,
-        header: Box<BlockHeaderGossip>,
+        header: Box<BlockHeaderNotification>,
     },
 
     /// Broadcast a block vote to the local shard.
     BroadcastBlockVote {
         shard: ShardGroupId,
-        vote: BlockVoteGossip,
+        vote: BlockVoteNotification,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -71,7 +72,7 @@ pub enum Action {
     /// Broadcast a transaction certificate gossip to the local shard.
     BroadcastTransactionCertificate {
         shard: ShardGroupId,
-        gossip: TransactionCertificateGossip,
+        gossip: TransactionCertificateNotification,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -481,7 +482,7 @@ pub enum Action {
         round: u64,
         block_hash: Hash,
         shard: ShardGroupId,
-        vote: BlockVoteGossip,
+        vote: BlockVoteNotification,
     },
 
     // ═══════════════════════════════════════════════════════════════════════

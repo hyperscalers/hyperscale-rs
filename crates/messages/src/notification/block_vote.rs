@@ -1,17 +1,20 @@
-//! BlockVote gossip message.
+//! BlockVote notification message.
 
-use hyperscale_types::{BlockVote, MessagePriority, NetworkMessage, ShardMessage};
+use hyperscale_types::{BlockVote, MessagePriority, NetworkMessage};
 use sbor::prelude::BasicSbor;
 
 /// Vote on a block proposal. 2f+1 matching votes create a QuorumCertificate.
+///
+/// Sent via unicast notification to committee members. The inner `BlockVote`
+/// contains the voter identity and BLS signature, making it self-authenticating.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct BlockVoteGossip {
-    /// The block vote being gossiped
+pub struct BlockVoteNotification {
+    /// The block vote.
     pub vote: BlockVote,
 }
 
-impl BlockVoteGossip {
-    /// Create a new block vote gossip message.
+impl BlockVoteNotification {
+    /// Create a new block vote notification message.
     pub fn new(vote: BlockVote) -> Self {
         Self { vote }
     }
@@ -28,7 +31,7 @@ impl BlockVoteGossip {
 }
 
 // Network message implementation
-impl NetworkMessage for BlockVoteGossip {
+impl NetworkMessage for BlockVoteNotification {
     fn message_type_id() -> &'static str {
         "block.vote"
     }
@@ -37,8 +40,6 @@ impl NetworkMessage for BlockVoteGossip {
         MessagePriority::Critical
     }
 }
-
-impl ShardMessage for BlockVoteGossip {}
 
 #[cfg(test)]
 mod tests {
@@ -58,7 +59,7 @@ mod tests {
             timestamp: 1000000000000,
         };
 
-        let gossip = BlockVoteGossip::new(vote.clone());
+        let gossip = BlockVoteNotification::new(vote.clone());
         assert_eq!(gossip.vote(), &vote);
     }
 
@@ -74,7 +75,7 @@ mod tests {
             timestamp: 1000000000000,
         };
 
-        let gossip = BlockVoteGossip::new(vote.clone());
+        let gossip = BlockVoteNotification::new(vote.clone());
         let extracted = gossip.into_vote();
         assert_eq!(extracted, vote);
     }

@@ -553,7 +553,7 @@ impl Block {
 /// Hash-level description of a block's contents (transactions, certificates,
 /// deferrals, aborts, and commitment proofs).
 ///
-/// This is the common denominator shared by `BlockHeaderGossip`, `BlockMetadata`,
+/// This is the common denominator shared by `BlockHeaderNotification`, `BlockMetadata`,
 /// and `ProtocolEvent::BlockHeaderReceived`. Extracting it into a standalone type
 /// eliminates copy-paste of 7 fields across those three sites.
 #[derive(Debug, Clone, Default, PartialEq, Eq, BasicSbor)]
