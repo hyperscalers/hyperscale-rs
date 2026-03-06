@@ -16,6 +16,7 @@ use crate::adapter::Libp2pAdapter;
 use crate::stream_framing;
 use dashmap::DashMap;
 use futures::AsyncWriteExt;
+use hyperscale_metrics as metrics;
 use libp2p::PeerId;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -161,21 +162,26 @@ impl NotifyStreamPool {
 
         // Read frames from channel and write to stream.
         while let Some(frame) = frame_rx.recv().await {
-            if let Err(e) = stream_framing::write_typed_frame_no_close(
+            match stream_framing::write_typed_frame_no_close(
                 &mut stream,
                 frame.type_id,
                 &frame.sbor_data,
             )
             .await
             {
-                debug!(
-                    peer = %peer_id,
-                    error = ?e,
-                    "Persistent notify stream write failed"
-                );
-                Self::apply_backoff(&backoff_map, &peer_id);
-                peers.remove(&peer_id);
-                return;
+                Ok(wire_bytes) => {
+                    metrics::record_libp2p_bandwidth(0, wire_bytes as u64);
+                }
+                Err(e) => {
+                    debug!(
+                        peer = %peer_id,
+                        error = ?e,
+                        "Persistent notify stream write failed"
+                    );
+                    Self::apply_backoff(&backoff_map, &peer_id);
+                    peers.remove(&peer_id);
+                    return;
+                }
             }
         }
 

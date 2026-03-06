@@ -11,6 +11,7 @@ use crate::adapter::{Libp2pAdapter, NOTIFY_PROTOCOL, REQUEST_PROTOCOL};
 use crate::stream_framing::{self, FrameError, MAX_FRAME_SIZE};
 use dashmap::DashMap;
 use futures::{AsyncWriteExt, StreamExt};
+use hyperscale_metrics as metrics;
 use hyperscale_network::HandlerRegistry;
 use libp2p::{PeerId, Stream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -202,13 +203,15 @@ impl InboundRouter {
         mut stream: Stream,
     ) -> Result<(), StreamError> {
         // Read typed frame: type_id header + compressed SBOR payload.
-        let (type_id, sbor_payload) = tokio::time::timeout(
+        let (type_id, sbor_payload, req_wire_bytes) = tokio::time::timeout(
             STREAM_IO_TIMEOUT,
             stream_framing::read_typed_frame(&mut stream, MAX_FRAME_SIZE),
         )
         .await
         .map_err(|_| StreamError::Timeout)?
         .map_err(StreamError::Frame)?;
+
+        metrics::record_libp2p_bandwidth(req_wire_bytes as u64, 0);
 
         // Look up the per-type request handler.
         let handler = self
@@ -220,13 +223,15 @@ impl InboundRouter {
         let response_sbor = handler(&sbor_payload);
 
         // Write length-prefixed compressed response with timeout.
-        tokio::time::timeout(
+        let resp_wire_bytes = tokio::time::timeout(
             STREAM_IO_TIMEOUT,
             stream_framing::write_frame(&mut stream, &response_sbor),
         )
         .await
         .map_err(|_| StreamError::Timeout)?
         .map_err(StreamError::Io)?;
+
+        metrics::record_libp2p_bandwidth(0, resp_wire_bytes as u64);
 
         Ok(())
     }
@@ -248,7 +253,7 @@ impl InboundRouter {
             )
             .await;
 
-            let (type_id, sbor_payload) = match read_result {
+            let (type_id, sbor_payload, wire_bytes) = match read_result {
                 Ok(Ok(frame)) => frame,
                 Ok(Err(FrameError::Io(ref e))) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     // Clean stream closure by sender.
@@ -266,6 +271,8 @@ impl InboundRouter {
                     return Ok(());
                 }
             };
+
+            metrics::record_libp2p_bandwidth(wire_bytes as u64, 0);
 
             // Look up the per-type notification handler.
             if let Some(handler) = self.registry.get_notification(&type_id) {

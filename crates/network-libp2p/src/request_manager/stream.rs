@@ -9,6 +9,7 @@ use crate::adapter::{Libp2pAdapter, NetworkError};
 use crate::stream_framing::{self, MAX_FRAME_SIZE};
 use bytes::Bytes;
 use futures::AsyncReadExt;
+use hyperscale_metrics as metrics;
 use hyperscale_network::compression;
 use libp2p::PeerId;
 use std::sync::Arc;
@@ -202,7 +203,9 @@ impl RequestManager {
         .await;
 
         match write_result {
-            Ok(Ok(())) => {}
+            Ok(Ok(wire_bytes)) => {
+                metrics::record_libp2p_bandwidth(0, wire_bytes as u64);
+            }
             Ok(Err(e)) => return Err(NetworkError::StreamIo(format!("write failed: {}", e))),
             Err(_) => return Err(NetworkError::Timeout),
         }
@@ -267,6 +270,9 @@ impl RequestManager {
                 }
             }
         }
+
+        // Record inbound bandwidth: 4-byte length prefix + compressed response body
+        metrics::record_libp2p_bandwidth((4 + response_len) as u64, 0);
 
         // Decompress response
         compression::decompress(&compressed_response)

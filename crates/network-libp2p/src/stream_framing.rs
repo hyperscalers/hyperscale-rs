@@ -50,17 +50,19 @@ impl From<io::Error> for FrameError {
 }
 
 /// Compress `data`, write it as a length-prefixed frame, flush, and close the write side.
+///
+/// Returns the number of bytes written on the wire (length prefix + compressed payload).
 pub(crate) async fn write_frame<S: AsyncWrite + Unpin>(
     stream: &mut S,
     data: &[u8],
-) -> Result<(), io::Error> {
+) -> Result<usize, io::Error> {
     let compressed = compression::compress(data);
     let len = compressed.len() as u32;
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(&compressed).await?;
     stream.flush().await?;
     stream.close().await?;
-    Ok(())
+    Ok(4 + compressed.len())
 }
 
 /// Read a length-prefixed, compressed frame and decompress it.
@@ -104,14 +106,15 @@ const MAX_TYPE_ID_LEN: usize = 256;
 /// Write a typed request frame: type_id header followed by compressed SBOR payload.
 ///
 /// Flushes and half-closes the write side so the receiver knows the request is complete.
+/// Returns the number of bytes written on the wire.
 pub(crate) async fn write_typed_frame<S: AsyncWrite + Unpin>(
     stream: &mut S,
     type_id: &str,
     sbor_data: &[u8],
-) -> Result<(), io::Error> {
-    write_typed_frame_no_close(stream, type_id, sbor_data).await?;
+) -> Result<usize, io::Error> {
+    let wire_bytes = write_typed_frame_no_close(stream, type_id, sbor_data).await?;
     stream.close().await?;
-    Ok(())
+    Ok(wire_bytes)
 }
 
 /// Write a typed frame WITHOUT closing the stream.
@@ -119,11 +122,13 @@ pub(crate) async fn write_typed_frame<S: AsyncWrite + Unpin>(
 /// Used by persistent notification streams where multiple frames are sent over
 /// the same stream. Flushes after writing to ensure the frame is delivered
 /// immediately, but does NOT half-close the write side.
+///
+/// Returns the number of bytes written on the wire (type header + compressed payload).
 pub(crate) async fn write_typed_frame_no_close<S: AsyncWrite + Unpin>(
     stream: &mut S,
     type_id: &str,
     sbor_data: &[u8],
-) -> Result<(), io::Error> {
+) -> Result<usize, io::Error> {
     // Type-id header (uncompressed)
     let type_id_bytes = type_id.as_bytes();
     let type_id_len = type_id_bytes.len() as u16;
@@ -136,16 +141,16 @@ pub(crate) async fn write_typed_frame_no_close<S: AsyncWrite + Unpin>(
     stream.write_all(&len.to_be_bytes()).await?;
     stream.write_all(&compressed).await?;
     stream.flush().await?;
-    Ok(())
+    Ok(2 + type_id_bytes.len() + 4 + compressed.len())
 }
 
 /// Read a typed request frame: type_id header followed by compressed SBOR payload.
 ///
-/// Returns `(type_id, decompressed_payload)`.
+/// Returns `(type_id, decompressed_payload, wire_bytes_read)`.
 pub(crate) async fn read_typed_frame<S: AsyncReadExt + Unpin>(
     stream: &mut S,
     max_size: usize,
-) -> Result<(String, Vec<u8>), FrameError> {
+) -> Result<(String, Vec<u8>, usize), FrameError> {
     // Read type-id header
     let mut type_id_len_bytes = [0u8; 2];
     stream.read_exact(&mut type_id_len_bytes).await?;
@@ -164,10 +169,19 @@ pub(crate) async fn read_typed_frame<S: AsyncReadExt + Unpin>(
         ))
     })?;
 
-    // Read compressed payload (reuse existing read_frame logic)
-    let payload = read_frame(stream, max_size).await?;
+    // Read compressed payload length
+    let compressed_len = read_frame_len(stream, max_size).await?;
 
-    Ok((type_id, payload))
+    // Read compressed payload body
+    let mut compressed = vec![0u8; compressed_len];
+    stream.read_exact(&mut compressed).await?;
+
+    let payload = compression::decompress(&compressed).map_err(FrameError::Decompress)?;
+
+    // Wire bytes: 2 (type_id_len) + type_id + 4 (payload_len) + compressed payload
+    let wire_bytes = 2 + type_id_len + 4 + compressed_len;
+
+    Ok((type_id, payload, wire_bytes))
 }
 
 #[cfg(test)]
@@ -296,18 +310,21 @@ mod tests {
         let type_id = "block.request";
         let payload = b"some sbor data here";
         let buf = write_typed_to_buf(type_id, payload).await;
+        let expected_wire_bytes = buf.len();
         let mut cursor = futures::io::Cursor::new(buf);
-        let (parsed_type_id, parsed_payload) =
+        let (parsed_type_id, parsed_payload, wire_bytes) =
             read_typed_frame(&mut cursor, MAX_FRAME_SIZE).await.unwrap();
         assert_eq!(parsed_type_id, type_id);
         assert_eq!(parsed_payload, payload);
+        assert_eq!(wire_bytes, expected_wire_bytes);
     }
 
     #[tokio::test]
     async fn test_typed_frame_empty_payload() {
         let buf = write_typed_to_buf("test", b"").await;
         let mut cursor = futures::io::Cursor::new(buf);
-        let (type_id, payload) = read_typed_frame(&mut cursor, MAX_FRAME_SIZE).await.unwrap();
+        let (type_id, payload, _wire_bytes) =
+            read_typed_frame(&mut cursor, MAX_FRAME_SIZE).await.unwrap();
         assert_eq!(type_id, "test");
         assert!(payload.is_empty());
     }
@@ -340,7 +357,8 @@ mod tests {
         // Read them back sequentially from the same cursor.
         let mut cursor = futures::io::Cursor::new(buf);
         for (expected_type_id, expected_payload) in &frames {
-            let (type_id, payload) = read_typed_frame(&mut cursor, MAX_FRAME_SIZE).await.unwrap();
+            let (type_id, payload, _wire_bytes) =
+                read_typed_frame(&mut cursor, MAX_FRAME_SIZE).await.unwrap();
             assert_eq!(type_id, *expected_type_id);
             assert_eq!(payload, *expected_payload);
         }
