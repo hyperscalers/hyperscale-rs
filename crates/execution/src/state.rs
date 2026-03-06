@@ -23,7 +23,8 @@
 //!
 //! ## Phase 4: Vote Aggregation
 //! Validators broadcast votes to their local shard. When 2f+1 voting power agrees
-//! on the same merkle root, an ExecutionCertificate is created and broadcast.
+//! on the same merkle root, an ExecutionCertificate is created and broadcast to
+//! remote participating shards (local peers form it independently).
 //!
 //! ## Phase 5: Finalization
 //! Validators collect ExecutionCertificates from all participating shards. When all
@@ -1048,8 +1049,14 @@ impl ExecutionState {
         self.execution_certificates
             .insert(tx_hash, Arc::clone(&certificate));
 
-        // Broadcast certificate to all participating shards
+        // Broadcast certificate to remote participating shards only.
+        // Local shard peers independently form the same certificate from the
+        // same execution votes, so sending it intra-shard is redundant.
+        let local_shard = self.local_shard();
         for target_shard in pending.participating_shards {
+            if target_shard == local_shard {
+                continue;
+            }
             actions.push(Action::BroadcastExecutionCertificate {
                 shard: target_shard,
                 certificate: Arc::clone(&certificate),

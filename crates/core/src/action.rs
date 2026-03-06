@@ -87,8 +87,10 @@ pub enum Action {
         vote: ExecutionVote,
     },
 
-    /// Broadcast an execution certificate to participating shards.
+    /// Broadcast an execution certificate to a remote participating shard.
     ///
+    /// Only emitted for remote shards — local shard peers independently form
+    /// the same certificate from the same execution votes.
     /// The runner may batch multiple certificates into a single network message
     /// for efficiency. State machines emit individual certificates.
     BroadcastExecutionCertificate {
