@@ -61,6 +61,7 @@ pub(super) async fn run(
     validation_tx: mpsc::UnboundedSender<ValidationReport>,
     mut validation_rx: mpsc::UnboundedReceiver<ValidationReport>,
     bind_trigger_tx: mpsc::UnboundedSender<Libp2pPeerId>,
+    bootstrap_peers: Vec<Multiaddr>,
 ) {
     // Track whether we've bootstrapped Kademlia (do it once after first connection)
     let mut kademlia_bootstrapped = false;
@@ -121,6 +122,20 @@ pub(super) async fn run(
                         } else {
                             // No known address, try to find via Kademlia
                             debug!(peer = %peer, "No known address for peer, relying on Kademlia discovery");
+                        }
+                    }
+                }
+
+                // Re-dial bootstrap peers if Kademlia hasn't bootstrapped yet.
+                // Handles the case where bootstrap peers were down at startup.
+                if !kademlia_bootstrapped && !bootstrap_peers.is_empty() {
+                    for addr in &bootstrap_peers {
+                        if let Err(e) = swarm.dial(addr.clone()) {
+                            debug!(
+                                addr = %addr,
+                                error = ?e,
+                                "Failed to re-dial bootstrap peer"
+                            );
                         }
                     }
                 }

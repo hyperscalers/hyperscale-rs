@@ -230,6 +230,7 @@ impl Libp2pAdapter {
         // crash the entire node. The process supervisor (systemd/k8s) should restart.
         let event_loop_validator_peers = validator_peers.clone();
         let bind_trigger_tx = bind_handle.bind_tx.clone();
+        let bootstrap_peers = config.bootstrap_peers.clone();
         tokio::spawn(async move {
             // Keep bind_handle alive for the lifetime of the event loop.
             let _bind_handle = bind_handle;
@@ -250,6 +251,7 @@ impl Libp2pAdapter {
                 validation_tx,
                 validation_rx,
                 bind_trigger_tx,
+                bootstrap_peers,
             ))
             .catch_unwind()
             .await;

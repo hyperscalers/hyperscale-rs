@@ -12,6 +12,7 @@ use hyperscale_network::{
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use libp2p::PeerId;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -37,6 +38,8 @@ pub struct ProdNetwork {
     registry: Arc<HandlerRegistry>,
     /// Local shard for deriving topic subscriptions.
     local_shard: ShardGroupId,
+    /// Count of PeerUnreachable errors (cold-start diagnostics).
+    peer_unreachable_count: AtomicUsize,
     /// Inbound router handle — spawned eagerly at construction.
     /// Kept alive to prevent the background task from being aborted.
     _inbound_router: InboundRouterHandle,
@@ -61,6 +64,7 @@ impl ProdNetwork {
             tokio_handle,
             registry,
             local_shard,
+            peer_unreachable_count: AtomicUsize::new(0),
             _inbound_router: inbound_router,
         }
     }
@@ -130,6 +134,21 @@ impl Network for ProdNetwork {
             .collect();
 
         if resolved_peers.is_empty() {
+            let count = self.peer_unreachable_count.fetch_add(1, Ordering::Relaxed);
+            if count == 0 {
+                info!(
+                    request_type = R::message_type_id(),
+                    peer_count = peers.len(),
+                    "No validator-to-peer mappings resolved yet \
+                     (expected during cold start, protocol-level retries will resolve)"
+                );
+            } else if count.is_multiple_of(100) {
+                debug!(
+                    request_type = R::message_type_id(),
+                    total_unreachable = count,
+                    "PeerUnreachable errors continue (validator-bind still in progress)"
+                );
+            }
             on_response(Err(RequestError::PeerUnreachable(
                 preferred_peer.unwrap_or(ValidatorId(0)),
             )));
