@@ -405,9 +405,12 @@ impl Spammer {
             let mut all_ready = true;
 
             for client in self.clients.iter() {
-                if !client.is_ready().await {
-                    all_ready = false;
-                    break;
+                match client.get_status().await {
+                    Ok(status) if status.block_height > 0 => {}
+                    _ => {
+                        all_ready = false;
+                        break;
+                    }
                 }
             }
 

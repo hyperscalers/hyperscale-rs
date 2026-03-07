@@ -322,24 +322,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if wait_ready {
                 println!("Waiting for nodes to be ready...");
                 let start = Instant::now();
-                let ready_timeout = Duration::from_secs(60);
+                let ready_timeout: Duration = *timeout;
 
                 loop {
                     if start.elapsed() > ready_timeout {
-                        eprintln!("ERROR: Nodes not ready within timeout");
+                        eprintln!("ERROR: Cluster not ready within {ready_timeout:?}");
+                        eprintln!("  Nodes must be reachable and producing blocks (height > 0)");
                         std::process::exit(1);
                     }
 
                     let mut all_ready = true;
                     for client in &clients {
-                        if !client.is_ready().await {
-                            all_ready = false;
-                            break;
+                        match client.get_status().await {
+                            Ok(status) if status.block_height > 0 => {}
+                            _ => {
+                                all_ready = false;
+                                break;
+                            }
                         }
                     }
 
                     if all_ready {
-                        println!("All nodes ready.");
+                        println!("All nodes ready (producing blocks).");
                         break;
                     }
 

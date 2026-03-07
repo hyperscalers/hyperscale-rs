@@ -568,8 +568,6 @@ echo "PIDs written to: $PID_FILE"
 # Run smoke test to verify the cluster is working
 echo ""
 echo "=== Running Smoke Test ==="
-echo "Waiting for cluster to stabilize..."
-sleep 3
 
 # Temporarily disable exit-on-error for smoke test
 set +e
