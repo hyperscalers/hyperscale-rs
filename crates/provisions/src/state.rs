@@ -365,6 +365,12 @@ impl ProvisionCoordinator {
                 .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
             self.verified_remote_headers
                 .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
+            // Prune expected provisions and buffered provisions whose headers
+            // have been evicted — they can never be resolved.
+            self.expected_provisions
+                .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
+            self.pending_provisions
+                .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
         }
 
         // Track expected provisions: if this block's provision_targets includes
@@ -491,6 +497,22 @@ impl ProvisionCoordinator {
             // Collect ALL unverified candidates (one per validator sender)
             let candidates: Vec<CommittedBlockHeader> = by_sender.values().cloned().collect();
             return self.emit_provision_verification(to_verify, candidates);
+        }
+
+        // If the header for this height has already been pruned (below the
+        // retention window), the provision can never be verified — discard it.
+        if let Some(&tip) = self.remote_header_tips.get(&source_shard) {
+            let cutoff = tip.0.saturating_sub(REMOTE_HEADER_RETENTION_BLOCKS);
+            if block_height.0 < cutoff {
+                debug!(
+                    source_shard = source_shard.0,
+                    block_height = block_height.0,
+                    tip = tip.0,
+                    count = to_verify.len(),
+                    "Discarding provisions (header already pruned)"
+                );
+                return vec![];
+            }
         }
 
         // No header yet — buffer all provisions
@@ -1708,5 +1730,77 @@ mod tests {
                 "Should not request at height {h} (provision already verified)"
             );
         }
+    }
+
+    #[test]
+    fn test_expected_and_pending_provisions_pruned_with_headers() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        let source_shard = ShardGroupId(1);
+
+        // Receive headers at heights 1..=50 targeting our shard
+        for h in 1..=50 {
+            let header = make_committed_header_with_targets(source_shard, h, vec![ShardGroupId(0)]);
+            coordinator.on_remote_block_committed(header, ValidatorId(3));
+        }
+        assert_eq!(coordinator.expected_provisions.len(), 50);
+
+        // Buffer a provision for height 10 (no verification — just buffered)
+        let provision = make_provision(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
+        // Header exists, so this will emit a verify action, not buffer.
+        // Instead, buffer one for a height without a header yet.
+        // Actually, we need to buffer provisions that have no header. Let's
+        // remove the unverified header for height 10 to force buffering.
+        coordinator
+            .unverified_remote_headers
+            .remove(&(source_shard, BlockHeight(10)));
+        let actions = coordinator.on_state_provisions_received(vec![provision]);
+        assert!(actions.is_empty(), "Should buffer (no header)");
+        assert_eq!(coordinator.pending_provisions.len(), 1);
+
+        // Now advance the remote header tip to 200 — cutoff = 100
+        // Heights 1..50 are all below cutoff, should all be pruned.
+        let header = make_committed_header_with_targets(source_shard, 200, vec![ShardGroupId(0)]);
+        coordinator.on_remote_block_committed(header, ValidatorId(3));
+
+        // Only height 200 should remain in expected_provisions
+        assert_eq!(
+            coordinator.expected_provisions.len(),
+            1,
+            "Old expected provisions should be pruned"
+        );
+        assert!(coordinator
+            .expected_provisions
+            .contains_key(&(source_shard, BlockHeight(200))));
+
+        // Pending provisions for height 10 should be pruned
+        assert_eq!(
+            coordinator.pending_provisions.len(),
+            0,
+            "Old pending provisions should be pruned"
+        );
+    }
+
+    #[test]
+    fn test_provisions_discarded_when_header_already_pruned() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
+
+        let source_shard = ShardGroupId(1);
+
+        // Advance remote header tip to 200 so cutoff = 100
+        let header = make_committed_header_with_targets(source_shard, 200, vec![ShardGroupId(0)]);
+        coordinator.on_remote_block_committed(header, ValidatorId(3));
+
+        // Provision arrives for height 50 (below cutoff 100) — should be discarded
+        let provision = make_provision(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 50);
+        let actions = coordinator.on_state_provisions_received(vec![provision]);
+        assert!(actions.is_empty());
+        assert_eq!(
+            coordinator.pending_provisions.len(),
+            0,
+            "Should not buffer provisions for pruned heights"
+        );
     }
 }
