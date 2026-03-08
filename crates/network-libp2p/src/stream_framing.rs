@@ -58,11 +58,13 @@ pub(crate) async fn write_frame<S: AsyncWrite + Unpin>(
 ) -> Result<usize, io::Error> {
     let compressed = compression::compress(data);
     let len = compressed.len() as u32;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&compressed).await?;
+    let mut buf = Vec::with_capacity(4 + compressed.len());
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(&compressed);
+    stream.write_all(&buf).await?;
     stream.flush().await?;
     stream.close().await?;
-    Ok(4 + compressed.len())
+    Ok(buf.len())
 }
 
 /// Read a length-prefixed, compressed frame and decompress it.
@@ -145,18 +147,20 @@ pub(crate) async fn write_precompressed_typed_frame_no_close<S: AsyncWrite + Unp
     type_id: &str,
     compressed_data: &[u8],
 ) -> Result<usize, io::Error> {
-    // Type-id header (uncompressed)
     let type_id_bytes = type_id.as_bytes();
     let type_id_len = type_id_bytes.len() as u16;
-    stream.write_all(&type_id_len.to_le_bytes()).await?;
-    stream.write_all(type_id_bytes).await?;
+    let payload_len = compressed_data.len() as u32;
+    let wire_len = 2 + type_id_bytes.len() + 4 + compressed_data.len();
 
-    // Pre-compressed payload
-    let len = compressed_data.len() as u32;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(compressed_data).await?;
+    let mut buf = Vec::with_capacity(wire_len);
+    buf.extend_from_slice(&type_id_len.to_le_bytes());
+    buf.extend_from_slice(type_id_bytes);
+    buf.extend_from_slice(&payload_len.to_be_bytes());
+    buf.extend_from_slice(compressed_data);
+
+    stream.write_all(&buf).await?;
     stream.flush().await?;
-    Ok(2 + type_id_bytes.len() + 4 + compressed_data.len())
+    Ok(wire_len)
 }
 
 /// Read a typed request frame: type_id header followed by compressed SBOR payload.
