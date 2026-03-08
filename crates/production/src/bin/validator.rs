@@ -1201,20 +1201,19 @@ async fn main() -> Result<()> {
     use arc_swap::ArcSwap;
     use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState};
     use std::sync::atomic::AtomicBool;
-    use tokio::sync::RwLock;
 
     let rpc_ready = Arc::new(AtomicBool::new(false));
     // Use ArcSwap for lock-free reads of sync status from HTTP handlers
     let rpc_sync_status = Arc::new(ArcSwap::new(Arc::new(
         hyperscale_production::SyncStatus::default(),
     )));
-    let rpc_node_status = Arc::new(RwLock::new(NodeStatusState {
+    let rpc_node_status = Arc::new(ArcSwap::new(Arc::new(NodeStatusState {
         validator_id: config.node.validator_id,
         shard: config.node.shard,
         num_shards: config.node.num_shards,
         ..Default::default()
-    }));
-    let rpc_mempool_snapshot = Arc::new(RwLock::new(MempoolSnapshot::default()));
+    })));
+    let rpc_mempool_snapshot = Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default())));
 
     // Create production runner first (before RPC server)
     // The runner creates the crossbeam event channel that the RPC server needs

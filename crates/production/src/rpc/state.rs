@@ -8,7 +8,6 @@ use quick_cache::sync::Cache as QuickCache;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::RwLock;
 
 /// Type alias for the transaction submission channel.
 ///
@@ -24,7 +23,7 @@ pub struct RpcState {
     /// Sync status provider.
     pub sync_status: Arc<ArcSwap<SyncStatus>>,
     /// Node status provider.
-    pub node_status: Arc<RwLock<NodeStatusState>>,
+    pub node_status: Arc<ArcSwap<NodeStatusState>>,
     /// Channel to submit transactions to the IoLoop.
     ///
     /// RPC-submitted transactions are sent as `Event::SubmitTransaction` directly
@@ -41,7 +40,7 @@ pub struct RpcState {
     /// the pinned thread, reads happen here on the RPC thread, no locking needed.
     pub tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
     /// Mempool snapshot for querying mempool stats.
-    pub mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
+    pub mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
     /// Number of blocks behind before rejecting transaction submissions.
     ///
     /// When set and the node is this many blocks behind, new transaction

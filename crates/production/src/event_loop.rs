@@ -24,7 +24,6 @@ use hyperscale_storage_rocksdb::SharedStorage;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock as TokioRwLock;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -53,9 +52,9 @@ pub struct PinnedLoopConfig {
     /// Timer ops from genesis initialization that need to be processed
     /// before the event loop starts (e.g. the initial ProposalTimer).
     pub initial_timer_ops: Vec<TimerOp>,
-    pub rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
+    pub rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
     pub sync_status: Option<Arc<ArcSwap<SyncStatus>>>,
-    pub mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
+    pub mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -135,43 +134,47 @@ fn wall_clock_duration() -> Duration {
 }
 
 /// Push a [`NodeStatusSnapshot`] into the shared RPC state objects.
-///
-/// Called once per metrics tick (~1s) on the pinned thread. Uses `try_write()`
-/// so it never blocks — if an RPC handler holds a read lock, the update is
-/// simply skipped and retried next tick.
 fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
     if let Some(ref rpc_status) = config.rpc_status {
-        if let Ok(mut status) = rpc_status.try_write() {
-            status.block_height = snapshot.committed_height;
-            status.view = snapshot.view;
-            status.state_version = snapshot.state_version;
-            status.state_root_hash = hex::encode(snapshot.state_root.as_bytes());
-        }
+        let current = rpc_status.load();
+        rpc_status.store(Arc::new(NodeStatusState {
+            block_height: snapshot.committed_height,
+            view: snapshot.view,
+            state_version: snapshot.state_version,
+            state_root_hash: hex::encode(snapshot.state_root.as_bytes()),
+            // Preserve fields set by other writers (runner sets connected_peers)
+            validator_id: current.validator_id,
+            shard: current.shard,
+            num_shards: current.num_shards,
+            connected_peers: current.connected_peers,
+        }));
     }
 
     if let Some(ref sync_status) = config.sync_status {
+        let current = sync_status.load();
         sync_status.store(Arc::new(SyncStatus {
             state: snapshot.sync.state.clone(),
             current_height: snapshot.sync.current_height,
             target_height: snapshot.sync.target_height,
             blocks_behind: snapshot.sync.blocks_behind,
-            sync_peers: 0, // Set by runner's collect_metrics (has Libp2pNetwork access)
+            // Preserve sync_peers set by runner's collect_metrics
+            sync_peers: current.sync_peers,
             pending_fetches: snapshot.sync.pending_fetches,
             queued_heights: snapshot.sync.queued_heights,
         }));
     }
 
     if let Some(ref mempool_snapshot) = config.mempool_snapshot {
-        if let Ok(mut snapshot_guard) = mempool_snapshot.try_write() {
-            snapshot_guard.pending_count = snapshot.mempool_pending;
-            snapshot_guard.committed_count = snapshot.mempool_committed;
-            snapshot_guard.executed_count = snapshot.mempool_executed;
-            snapshot_guard.total_count = snapshot.mempool_total;
-            snapshot_guard.deferred_count = snapshot.mempool_deferred;
-            snapshot_guard.accepting_rpc_transactions = snapshot.accepting_rpc_transactions;
-            snapshot_guard.at_pending_limit = snapshot.at_pending_limit;
-            snapshot_guard.updated_at = Some(Instant::now());
-        }
+        mempool_snapshot.store(Arc::new(MempoolSnapshot {
+            pending_count: snapshot.mempool_pending,
+            committed_count: snapshot.mempool_committed,
+            executed_count: snapshot.mempool_executed,
+            total_count: snapshot.mempool_total,
+            deferred_count: snapshot.mempool_deferred,
+            accepting_rpc_transactions: snapshot.accepting_rpc_transactions,
+            at_pending_limit: snapshot.at_pending_limit,
+            updated_at: Some(Instant::now()),
+        }));
     }
 }
 

@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use thiserror::Error;
-use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
@@ -60,11 +59,11 @@ pub struct RpcServerHandle {
     /// Sync status provider for updates.
     sync_status: Arc<ArcSwap<SyncStatus>>,
     /// Node status provider for updates.
-    node_status: Arc<RwLock<NodeStatusState>>,
+    node_status: Arc<ArcSwap<NodeStatusState>>,
     /// Transaction status cache (shared from IoLoop's QuickCache).
     tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
     /// Mempool snapshot for updates.
-    mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
+    mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
 }
 
 impl RpcServerHandle {
@@ -79,7 +78,7 @@ impl RpcServerHandle {
     }
 
     /// Get a reference to the node status for updates.
-    pub fn node_status(&self) -> &Arc<RwLock<NodeStatusState>> {
+    pub fn node_status(&self) -> &Arc<ArcSwap<NodeStatusState>> {
         &self.node_status
     }
 
@@ -89,7 +88,7 @@ impl RpcServerHandle {
     }
 
     /// Get a reference to the mempool snapshot for updates.
-    pub fn mempool_snapshot(&self) -> &Arc<RwLock<MempoolSnapshot>> {
+    pub fn mempool_snapshot(&self) -> &Arc<ArcSwap<MempoolSnapshot>> {
         &self.mempool_snapshot
     }
 
@@ -127,11 +126,11 @@ impl RpcServer {
         let state = RpcState {
             ready: Arc::new(AtomicBool::new(false)),
             sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
-            node_status: Arc::new(RwLock::new(NodeStatusState::default())),
+            node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
             tx_submission_tx,
             start_time: Instant::now(),
             tx_status_cache,
-            mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
+            mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold,
         };
 
@@ -146,10 +145,10 @@ impl RpcServer {
         config: RpcServerConfig,
         ready: Arc<AtomicBool>,
         sync_status: Arc<ArcSwap<SyncStatus>>,
-        node_status: Arc<RwLock<NodeStatusState>>,
+        node_status: Arc<ArcSwap<NodeStatusState>>,
         tx_submission_tx: TxSubmissionSender,
         tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
-        mempool_snapshot: Arc<RwLock<MempoolSnapshot>>,
+        mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
     ) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;
         let state = RpcState {

@@ -42,7 +42,6 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Instant;
-    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     fn create_test_state() -> RpcState {
@@ -50,7 +49,7 @@ mod tests {
         RpcState {
             ready: Arc::new(AtomicBool::new(true)),
             sync_status: Arc::new(ArcSwap::new(Arc::new(crate::status::SyncStatus::default()))),
-            node_status: Arc::new(RwLock::new(NodeStatusState {
+            node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState {
                 validator_id: 1,
                 shard: 0,
                 num_shards: 2,
@@ -59,11 +58,11 @@ mod tests {
                 connected_peers: 5,
                 state_version: 42,
                 state_root_hash: "0".repeat(64),
-            })),
+            }))),
             tx_submission_tx,
             start_time: Instant::now(),
             tx_status_cache: Arc::new(quick_cache::sync::Cache::new(1000)),
-            mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
+            mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
         }
     }

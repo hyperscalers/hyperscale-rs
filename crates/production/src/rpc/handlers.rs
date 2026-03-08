@@ -71,8 +71,8 @@ pub async fn metrics_handler() -> impl IntoResponse {
 
 /// Handler for `GET /api/v1/status` - node status.
 pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse {
-    let node_status = state.node_status.read().await;
-    let mempool_snapshot = state.mempool_snapshot.read().await;
+    let node_status = state.node_status.load();
+    let mempool_snapshot = state.mempool_snapshot.load();
     let uptime = state.start_time.elapsed().as_secs();
 
     Json(NodeStatusResponse {
@@ -158,7 +158,7 @@ pub async fn submit_transaction_handler(
     // Check mempool backpressure conditions.
     // This prevents unbounded mempool growth when arrival rate exceeds processing.
     {
-        let snapshot = state.mempool_snapshot.read().await;
+        let snapshot = state.mempool_snapshot.load();
 
         // Check if in-flight hard limit reached
         if !snapshot.accepting_rpc_transactions {
@@ -388,7 +388,7 @@ fn format_transaction_status(
 
 /// Handler for `GET /api/v1/mempool` - mempool status.
 pub async fn mempool_handler(State(state): State<RpcState>) -> impl IntoResponse {
-    let snapshot = state.mempool_snapshot.read().await;
+    let snapshot = state.mempool_snapshot.load();
     Json(MempoolStatusResponse {
         pending_count: snapshot.pending_count,
         committed_count: snapshot.committed_count,
@@ -409,7 +409,6 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Instant;
-    use tokio::sync::RwLock;
     use tower::ServiceExt;
 
     fn create_test_state() -> RpcState {
@@ -417,11 +416,11 @@ mod tests {
         RpcState {
             ready: Arc::new(AtomicBool::new(false)),
             sync_status: Arc::new(ArcSwap::new(Arc::new(SyncStatus::default()))),
-            node_status: Arc::new(RwLock::new(NodeStatusState::default())),
+            node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
             tx_submission_tx,
             start_time: Instant::now(),
             tx_status_cache: Arc::new(quick_cache::sync::Cache::new(1000)),
-            mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
+            mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
         }
     }
@@ -701,14 +700,14 @@ mod tests {
         let state = create_test_state();
 
         // Update the mempool snapshot
-        {
-            let mut snapshot = state.mempool_snapshot.write().await;
-            snapshot.pending_count = 10;
-            snapshot.committed_count = 3;
-            snapshot.executed_count = 2;
-            snapshot.deferred_count = 2;
-            snapshot.total_count = 17;
-        }
+        state.mempool_snapshot.store(Arc::new(MempoolSnapshot {
+            pending_count: 10,
+            committed_count: 3,
+            executed_count: 2,
+            deferred_count: 2,
+            total_count: 17,
+            ..MempoolSnapshot::default()
+        }));
 
         let app = Router::new()
             .route("/mempool", axum::routing::get(mempool_handler))
@@ -761,11 +760,11 @@ mod tests {
         let state = RpcState {
             ready: Arc::new(AtomicBool::new(true)),
             sync_status: Arc::new(ArcSwap::new(Arc::new(sync_status))),
-            node_status: Arc::new(RwLock::new(NodeStatusState::default())),
+            node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
             tx_submission_tx,
             start_time: Instant::now(),
             tx_status_cache: Arc::new(quick_cache::sync::Cache::new(1000)),
-            mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
+            mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
         };
 
@@ -824,11 +823,11 @@ mod tests {
         let state = RpcState {
             ready: Arc::new(AtomicBool::new(true)),
             sync_status: Arc::new(ArcSwap::new(Arc::new(sync_status))),
-            node_status: Arc::new(RwLock::new(NodeStatusState::default())),
+            node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
             tx_submission_tx,
             start_time: Instant::now(),
             tx_status_cache: Arc::new(quick_cache::sync::Cache::new(1000)),
-            mempool_snapshot: Arc::new(RwLock::new(MempoolSnapshot::default())),
+            mempool_snapshot: Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default()))),
             sync_backpressure_threshold: Some(10),
         };
 

@@ -68,7 +68,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::oneshot;
-use tokio::sync::RwLock as TokioRwLock;
 use tracing::{info, warn};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -178,8 +177,8 @@ pub struct ProductionRunnerBuilder {
     storage: Option<Arc<RocksDbStorage>>,
     network_config: Option<Libp2pConfig>,
     channel_capacity: usize,
-    rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
-    mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
+    rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
+    mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
     sync_status: Option<Arc<ArcSwap<crate::status::SyncStatus>>>,
     /// Optional genesis configuration for initial state.
     genesis_config: Option<hyperscale_engine::GenesisConfig>,
@@ -288,12 +287,12 @@ impl ProductionRunnerBuilder {
         self
     }
 
-    pub fn rpc_status(mut self, status: Arc<TokioRwLock<NodeStatusState>>) -> Self {
+    pub fn rpc_status(mut self, status: Arc<ArcSwap<NodeStatusState>>) -> Self {
         self.rpc_status = Some(status);
         self
     }
 
-    pub fn mempool_snapshot(mut self, snapshot: Arc<TokioRwLock<MempoolSnapshot>>) -> Self {
+    pub fn mempool_snapshot(mut self, snapshot: Arc<ArcSwap<MempoolSnapshot>>) -> Self {
         self.mempool_snapshot = Some(snapshot);
         self
     }
@@ -557,8 +556,8 @@ pub struct ProductionRunner {
     local_shard: ShardGroupId,
 
     // ── RPC state ────────────────────────────────────────────────────────
-    rpc_status: Option<Arc<TokioRwLock<NodeStatusState>>>,
-    mempool_snapshot: Option<Arc<TokioRwLock<MempoolSnapshot>>>,
+    rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
+    mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
     sync_status: Option<Arc<ArcSwap<crate::status::SyncStatus>>>,
 
     // ── Genesis ──────────────────────────────────────────────────────────
@@ -870,8 +869,11 @@ impl ProductionRunner {
 
         // ── Update RPC status with peer count ────────────────────────────
         if let Some(ref rpc_status) = self.rpc_status {
-            if let Ok(mut status) = rpc_status.try_write() {
-                status.connected_peers = peer_count;
+            let current = rpc_status.load();
+            if current.connected_peers != peer_count {
+                let mut updated = (**current).clone();
+                updated.connected_peers = peer_count;
+                rpc_status.store(Arc::new(updated));
             }
         }
 
