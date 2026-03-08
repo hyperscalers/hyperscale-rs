@@ -148,13 +148,16 @@ fn verify_single_tier(
         let is_right = bit_iter.next_back().unwrap_or(false);
         let sibling_bytes = radix_common::crypto::Hash(sibling.to_bytes());
 
-        let (left, right) = if is_right {
-            (sibling_bytes, current_hash)
+        let mut buf = [0u8; 64];
+        if is_right {
+            buf[..32].copy_from_slice(&sibling_bytes.0);
+            buf[32..].copy_from_slice(&current_hash.0);
         } else {
-            (current_hash, sibling_bytes)
-        };
+            buf[..32].copy_from_slice(&current_hash.0);
+            buf[32..].copy_from_slice(&sibling_bytes.0);
+        }
 
-        current_hash = blake2b_hash([left.0, right.0].concat());
+        current_hash = blake2b_hash(buf);
     }
 
     Some(current_hash.0)
