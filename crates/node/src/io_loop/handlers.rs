@@ -1,5 +1,6 @@
 //! Network handler registration (gossip, notifications, requests).
 
+use super::verify::{resolve_sender_key, verify_bls_with_metrics, verify_sender_signature};
 use super::IoLoop;
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
@@ -7,7 +8,6 @@ use hyperscale_messages::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
     ExecutionVotesNotification, TransactionCertificateNotification, TransactionGossip,
 };
-use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use std::sync::Arc;
@@ -106,23 +106,9 @@ where
                         return GossipVerdict::Accept;
                     }
 
-                    // Verify sender is in the source shard's committee.
-                    let committee = topology.committee_for_shard(header_shard);
-                    if !committee.contains(&sender) {
-                        warn!(
-                            sender = sender.0,
-                            header_shard = header_shard.0,
-                            "Committed header sender not in source shard committee"
-                        );
-                        return GossipVerdict::Reject;
-                    }
-
-                    // Resolve sender's public key.
-                    let Some(public_key) = topology.public_key(sender) else {
-                        warn!(
-                            sender = sender.0,
-                            "Could not resolve public key for committed header sender"
-                        );
+                    let Some(public_key) =
+                        resolve_sender_key(&*topology, sender, header_shard, "committed header")
+                    else {
                         return GossipVerdict::Reject;
                     };
 
@@ -165,17 +151,12 @@ where
                         return;
                     };
                     let msg = gossip.signing_message();
-                    let start = std::time::Instant::now();
-                    let valid = hyperscale_types::verify_bls12381_v1(
+                    if !verify_bls_with_metrics(
                         &msg,
                         &public_key,
                         &gossip.proposer_signature,
-                    );
-                    metrics::record_signature_verification_latency(
                         "block_header",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
+                    ) {
                         warn!(
                             proposer = proposer.0,
                             height = gossip.header.height.0,
@@ -201,39 +182,16 @@ where
             .register_notification_handler::<TransactionCertificateNotification>(
                 move |gossip: TransactionCertificateNotification| {
                     let sender = gossip.sender;
-                    let committee = topology.committee_for_shard(local_shard);
-                    if !committee.contains(&sender) {
-                        warn!(
-                            sender = sender.0,
-                            "Transaction certificate sender not in local shard committee"
-                        );
-                        return;
-                    }
-
-                    let Some(public_key) = topology.public_key(sender) else {
-                        warn!(
-                            sender = sender.0,
-                            "Could not resolve public key for transaction certificate sender"
-                        );
-                        return;
-                    };
-
                     let msg = gossip.signing_message(local_shard);
-                    let start = std::time::Instant::now();
-                    let valid = hyperscale_types::verify_bls12381_v1(
+                    if !verify_sender_signature(
+                        &*topology,
+                        sender,
+                        local_shard,
                         &msg,
-                        &public_key,
                         &gossip.sender_signature,
-                    );
-                    metrics::record_signature_verification_latency(
                         "tx_cert_gossip",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        warn!(
-                            sender = sender.0,
-                            "Transaction certificate sender signature invalid — dropping"
-                        );
+                        "transaction certificate",
+                    ) {
                         return;
                     }
 
@@ -256,44 +214,16 @@ where
 
                     let sender = batch.sender;
                     let source_shard = batch.provisions[0].source_shard;
-
-                    // Verify sender is in the source shard's committee.
-                    let committee = topology.committee_for_shard(source_shard);
-                    if !committee.contains(&sender) {
-                        warn!(
-                            sender = sender.0,
-                            source_shard = source_shard.0,
-                            "State provision sender not in source shard committee"
-                        );
-                        return;
-                    }
-
-                    // Resolve sender's public key.
-                    let Some(public_key) = topology.public_key(sender) else {
-                        warn!(
-                            sender = sender.0,
-                            "Could not resolve public key for state provision sender"
-                        );
-                        return;
-                    };
-
                     let msg = batch.signing_message();
-                    let start = std::time::Instant::now();
-                    let valid = hyperscale_types::verify_bls12381_v1(
+                    if !verify_sender_signature(
+                        &*topology,
+                        sender,
+                        source_shard,
                         &msg,
-                        &public_key,
                         &batch.sender_signature,
-                    );
-                    metrics::record_signature_verification_latency(
                         "state_provision_batch",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        warn!(
-                            sender = sender.0,
-                            source_shard = source_shard.0,
-                            "State provision sender signature invalid — dropping"
-                        );
+                        "state provision",
+                    ) {
                         return;
                     }
 
@@ -317,39 +247,16 @@ where
                     }
 
                     let sender = batch.sender;
-                    let committee = topology.committee_for_shard(local_shard);
-                    if !committee.contains(&sender) {
-                        warn!(
-                            sender = sender.0,
-                            "Execution vote batch sender not in local shard committee"
-                        );
-                        return;
-                    }
-
-                    let Some(public_key) = topology.public_key(sender) else {
-                        warn!(
-                            sender = sender.0,
-                            "Could not resolve public key for execution vote batch sender"
-                        );
-                        return;
-                    };
-
                     let msg = batch.signing_message(local_shard);
-                    let start = std::time::Instant::now();
-                    let valid = hyperscale_types::verify_bls12381_v1(
+                    if !verify_sender_signature(
+                        &*topology,
+                        sender,
+                        local_shard,
                         &msg,
-                        &public_key,
                         &batch.sender_signature,
-                    );
-                    metrics::record_signature_verification_latency(
                         "exec_vote_batch",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        warn!(
-                            sender = sender.0,
-                            "Execution vote batch sender signature invalid — dropping"
-                        );
+                        "execution vote batch",
+                    ) {
                         return;
                     }
 
@@ -389,40 +296,16 @@ where
                         );
                         return;
                     }
-                    let committee = topology.committee_for_shard(source_shard);
-                    if !committee.contains(&sender) {
-                        warn!(
-                            sender = sender.0,
-                            source_shard = source_shard.0,
-                            "Execution certificate batch sender not in source shard committee"
-                        );
-                        return;
-                    }
-
-                    let Some(public_key) = topology.public_key(sender) else {
-                        warn!(
-                            sender = sender.0,
-                            "Could not resolve public key for execution certificate batch sender"
-                        );
-                        return;
-                    };
-
                     let msg = batch.signing_message(local_shard);
-                    let start = std::time::Instant::now();
-                    let valid = hyperscale_types::verify_bls12381_v1(
+                    if !verify_sender_signature(
+                        &*topology,
+                        sender,
+                        source_shard,
                         &msg,
-                        &public_key,
                         &batch.sender_signature,
-                    );
-                    metrics::record_signature_verification_latency(
                         "exec_cert_batch",
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if !valid {
-                        warn!(
-                            sender = sender.0,
-                            "Execution certificate batch sender signature invalid — dropping"
-                        );
+                        "execution certificate batch",
+                    ) {
                         return;
                     }
 

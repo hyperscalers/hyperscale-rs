@@ -1,5 +1,6 @@
 //! Batch accumulation and flushing for verification and broadcast.
 
+use super::verify::verify_bls_with_metrics;
 use super::{ExecutionVoteVerificationItem, IoLoop};
 use hyperscale_core::{CrossShardExecutionRequest, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
@@ -264,17 +265,16 @@ where
         let event_tx = self.event_sender.clone();
         self.dispatch.spawn_crypto(move || {
             for (committed_header, sender, public_key, sender_signature) in items {
-                let start = std::time::Instant::now();
                 let msg = hyperscale_types::committed_block_header_message(
                     committed_header.header.shard_group_id,
                     committed_header.header.height.0,
                     &committed_header.header.hash(),
                 );
-                let valid =
-                    hyperscale_types::verify_bls12381_v1(&msg, &public_key, &sender_signature);
-                metrics::record_signature_verification_latency(
+                let valid = verify_bls_with_metrics(
+                    &msg,
+                    &public_key,
+                    &sender_signature,
                     "committed_header",
-                    start.elapsed().as_secs_f64(),
                 );
                 if valid {
                     let _ = event_tx.send(NodeInput::CommittedHeaderValidated {

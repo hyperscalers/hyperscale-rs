@@ -23,6 +23,7 @@ mod batches;
 mod cert_verification;
 mod handlers;
 mod protocols;
+mod verify;
 
 use crate::batch_accumulator::{BatchAccumulator, ShardedBatchAccumulator};
 use crate::config::NodeConfig;
