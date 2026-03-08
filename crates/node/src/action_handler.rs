@@ -346,22 +346,23 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
 
             // Check merkle proofs per provision against the verified header's state root.
             let merkle_start = std::time::Instant::now();
+            let valid_flags: Vec<bool> = ctx.dispatch.map_crypto(&provisions, |provision| {
+                verified_header.as_ref().is_some_and(|header| {
+                    hyperscale_storage::proofs::verify_all_merkle_proofs(
+                        &provision.entries,
+                        &provision.merkle_proofs,
+                        header.header.state_root,
+                    )
+                })
+            });
             let results: Vec<ProvisionVerificationResult> = provisions
                 .into_iter()
-                .map(|provision| {
-                    let valid = verified_header.as_ref().is_some_and(|header| {
-                        hyperscale_storage::proofs::verify_all_merkle_proofs(
-                            &provision.entries,
-                            &provision.merkle_proofs,
-                            header.header.state_root,
-                        )
-                    });
-                    ProvisionVerificationResult {
-                        tx_hash: provision.transaction_hash,
-                        source_shard: provision.source_shard,
-                        valid,
-                        provision,
-                    }
+                .zip(valid_flags)
+                .map(|(provision, valid)| ProvisionVerificationResult {
+                    tx_hash: provision.transaction_hash,
+                    source_shard: provision.source_shard,
+                    valid,
+                    provision,
                 })
                 .collect();
             metrics::record_signature_verification_latency(
