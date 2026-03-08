@@ -276,7 +276,7 @@ impl InboundRouter {
 
             // Look up the per-type notification handler.
             if let Some(handler) = self.registry.get_notification(&type_id) {
-                handler(sbor_payload);
+                tokio::spawn(async move { handler(sbor_payload) });
             } else {
                 debug!(
                     peer = %peer,
