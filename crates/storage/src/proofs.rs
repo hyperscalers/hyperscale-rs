@@ -9,8 +9,11 @@ use crate::jmt::{
     SparseMerkleProof, SubstateTier,
 };
 use crate::keys::decompose_storage_key;
+use blake2::digest::{consts::U32, Digest};
 use hyperscale_types::{Hash, MerkleInclusionProof, SubstateInclusionProof};
 use radix_common::crypto::hash as blake2b_hash;
+
+type Blake2b256 = blake2::Blake2b<U32>;
 
 /// Convert a vendor `SparseMerkleProof` to our serializable `MerkleInclusionProof`.
 fn to_merkle_inclusion_proof(proof: SparseMerkleProof) -> MerkleInclusionProof {
@@ -124,10 +127,10 @@ fn verify_single_tier(
     }
 
     // Compute leaf hash: blake2b(leaf_key || leaf_value_hash)
-    let mut leaf_data = Vec::with_capacity(leaf_key.len() + 32);
-    leaf_data.extend_from_slice(leaf_key);
-    leaf_data.extend_from_slice(leaf_value_hash.as_bytes());
-    let mut current_hash = blake2b_hash(leaf_data);
+    let mut hasher = Blake2b256::new();
+    hasher.update(leaf_key);
+    hasher.update(leaf_value_hash.as_bytes());
+    let mut current_hash = radix_common::crypto::Hash(hasher.finalize().into());
 
     // Walk up the tree using sibling hashes
     // The key bits (from MSB) determine left/right placement
@@ -146,18 +149,18 @@ fn verify_single_tier(
 
     for sibling in &proof.siblings {
         let is_right = bit_iter.next_back().unwrap_or(false);
-        let sibling_bytes = radix_common::crypto::Hash(sibling.to_bytes());
+        let sibling_bytes = sibling.to_bytes();
 
-        let mut buf = [0u8; 64];
+        let mut hasher = Blake2b256::new();
         if is_right {
-            buf[..32].copy_from_slice(&sibling_bytes.0);
-            buf[32..].copy_from_slice(&current_hash.0);
+            hasher.update(sibling_bytes);
+            hasher.update(current_hash.0);
         } else {
-            buf[..32].copy_from_slice(&current_hash.0);
-            buf[32..].copy_from_slice(&sibling_bytes.0);
+            hasher.update(current_hash.0);
+            hasher.update(sibling_bytes);
         }
 
-        current_hash = blake2b_hash(buf);
+        current_hash = radix_common::crypto::Hash(hasher.finalize().into());
     }
 
     Some(current_hash.0)

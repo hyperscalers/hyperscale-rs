@@ -16,6 +16,9 @@ radix-substate-store-impls.workspace = true
 # Key encoding
 indexmap.workspace = true
 
+# Hashing (incremental blake2b for proof verification)
+blake2.workspace = true
+
 [features]
 test-utils = []
 
