@@ -24,11 +24,16 @@ use tracing::{debug, trace};
 pub struct ProvisionFetchConfig {
     /// Maximum number of concurrent provision fetch operations.
     pub max_concurrent: usize,
+    /// Maximum full rounds through all peers before giving up.
+    pub max_rounds: u32,
 }
 
 impl Default for ProvisionFetchConfig {
     fn default() -> Self {
-        Self { max_concurrent: 4 }
+        Self {
+            max_concurrent: 4,
+            max_rounds: 3,
+        }
     }
 }
 
@@ -80,6 +85,7 @@ struct PendingProvisionFetch {
     preferred_peer: ValidatorId,
     tried: HashSet<ValidatorId>,
     in_flight: bool,
+    rounds: u32,
 }
 
 /// Provision fetch protocol state machine.
@@ -147,9 +153,10 @@ impl ProvisionFetchProtocol {
         let key = (source_shard, block_height);
 
         if let Some(existing) = self.pending.get_mut(&key) {
-            // Duplicate request: refresh peer list but keep tried set.
+            // Duplicate request: refresh peer list, reset rounds for fresh retry cycle.
             existing.peers = peers;
             existing.preferred_peer = preferred_peer;
+            existing.rounds = 0;
             trace!(
                 source_shard = source_shard.0,
                 block_height = block_height.0,
@@ -173,6 +180,7 @@ impl ProvisionFetchProtocol {
                 preferred_peer,
                 tried: HashSet::new(),
                 in_flight: false,
+                rounds: 0,
             },
         );
         vec![]
@@ -271,13 +279,24 @@ impl ProvisionFetchProtocol {
                     });
                 }
                 None => {
-                    // All peers exhausted — drop entry so coordinator can re-emit.
-                    debug!(
-                        source_shard = source_shard.0,
-                        block_height = block_height.0,
-                        "All peers exhausted for provision fetch, dropping entry"
-                    );
-                    to_remove.push((source_shard, block_height));
+                    state.rounds += 1;
+                    if state.rounds >= self.config.max_rounds {
+                        debug!(
+                            source_shard = source_shard.0,
+                            block_height = block_height.0,
+                            rounds = state.rounds,
+                            "Provision fetch exhausted all rounds, dropping"
+                        );
+                        to_remove.push((source_shard, block_height));
+                    } else {
+                        debug!(
+                            source_shard = source_shard.0,
+                            block_height = block_height.0,
+                            round = state.rounds,
+                            "Provision fetch starting new round"
+                        );
+                        state.tried.clear();
+                    }
                 }
             }
         }
@@ -418,6 +437,7 @@ mod tests {
     fn test_config_defaults() {
         let config = ProvisionFetchConfig::default();
         assert_eq!(config.max_concurrent, 4);
+        assert_eq!(config.max_rounds, 3);
     }
 
     #[test]
@@ -504,8 +524,12 @@ mod tests {
     }
 
     #[test]
-    fn test_all_peers_exhausted() {
-        let mut protocol = ProvisionFetchProtocol::new(default_config());
+    fn test_all_peers_exhausted_after_max_rounds() {
+        let config = ProvisionFetchConfig {
+            max_rounds: 2,
+            ..default_config()
+        };
+        let mut protocol = ProvisionFetchProtocol::new(config);
 
         protocol.handle(ProvisionFetchInput::Request {
             source_shard: shard(1),
@@ -515,24 +539,51 @@ mod tests {
             preferred_peer: vid(1),
         });
 
+        // --- Round 0 ---
         // Try vid(1).
         protocol.handle(ProvisionFetchInput::Tick);
         protocol.handle(ProvisionFetchInput::Failed {
             source_shard: shard(1),
             block_height: height(10),
         });
-
         // Try vid(2).
         protocol.handle(ProvisionFetchInput::Tick);
         protocol.handle(ProvisionFetchInput::Failed {
             source_shard: shard(1),
             block_height: height(10),
         });
+        // All peers exhausted → round 0→1, tried reset, still pending.
+        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        assert!(outputs.is_empty()); // No fetch yet (just reset)
+        assert!(
+            protocol.has_pending(),
+            "Should still be pending after round 0"
+        );
 
-        // All peers exhausted — tick should drop the entry.
+        // --- Round 1: peers are retried from scratch ---
+        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        assert_eq!(outputs.len(), 1, "Should retry vid(1) in round 1");
+        assert!(matches!(
+            &outputs[0],
+            ProvisionFetchOutput::Fetch { peer, .. } if *peer == vid(1)
+        ));
+        protocol.handle(ProvisionFetchInput::Failed {
+            source_shard: shard(1),
+            block_height: height(10),
+        });
+        // Try vid(2) again.
+        protocol.handle(ProvisionFetchInput::Tick);
+        protocol.handle(ProvisionFetchInput::Failed {
+            source_shard: shard(1),
+            block_height: height(10),
+        });
+        // All peers exhausted → round 1→2, but max_rounds=2 → drop.
         let outputs = protocol.handle(ProvisionFetchInput::Tick);
         assert!(outputs.is_empty());
-        assert!(!protocol.has_pending());
+        assert!(
+            !protocol.has_pending(),
+            "Should be dropped after max_rounds"
+        );
     }
 
     #[test]
@@ -604,7 +655,10 @@ mod tests {
 
     #[test]
     fn test_max_concurrent_respected() {
-        let config = ProvisionFetchConfig { max_concurrent: 2 };
+        let config = ProvisionFetchConfig {
+            max_concurrent: 2,
+            ..default_config()
+        };
         let mut protocol = ProvisionFetchProtocol::new(config);
 
         // Submit 3 requests.

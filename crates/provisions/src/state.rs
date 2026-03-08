@@ -31,22 +31,15 @@ const REMOTE_HEADER_RETENTION_BLOCKS: u64 = 100;
 /// This gives the source shard proposer time to send provisions normally.
 const PROVISION_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
 
-/// Minimum interval (in local committed blocks) between retry requests for
-/// the same missing provision, to avoid flooding the network.
-const PROVISION_RETRY_INTERVAL_BLOCKS: u64 = 10;
-
 /// Tracks an expected provision that hasn't arrived yet.
 ///
-/// Created when a remote block header's `provision_targets` includes our shard,
-/// indicating that provisions should be forthcoming. If they don't arrive within
-/// `PROVISION_FALLBACK_TIMEOUT_BLOCKS`, a `RequestMissingProvisions` action is emitted.
+/// Created when a remote block header's `provision_targets` includes our shard.
+/// Emits a single `RequestMissingProvisions` after the timeout; the fetch
+/// protocol owns retries from that point.
 #[derive(Debug, Clone)]
 struct ExpectedProvision {
-    /// Local committed height when we first discovered this expected provision.
     discovered_at: BlockHeight,
-    /// Local committed height when we last requested this provision (for retry throttling).
-    last_requested_at: Option<BlockHeight>,
-    /// The block proposer from the remote shard, preferred peer for fallback requests.
+    requested: bool,
     proposer: ValidatorId,
 }
 
@@ -255,17 +248,13 @@ impl ProvisionCoordinator {
         let current_height = self.local_committed_height.0;
 
         for (&(source_shard, block_height), expected) in self.expected_provisions.iter_mut() {
-            let age = current_height.saturating_sub(expected.discovered_at.0);
-            if age < PROVISION_FALLBACK_TIMEOUT_BLOCKS {
+            if expected.requested {
                 continue;
             }
 
-            // Check retry throttling
-            if let Some(last_req) = expected.last_requested_at {
-                let since_last = current_height.saturating_sub(last_req.0);
-                if since_last < PROVISION_RETRY_INTERVAL_BLOCKS {
-                    continue;
-                }
+            let age = current_height.saturating_sub(expected.discovered_at.0);
+            if age < PROVISION_FALLBACK_TIMEOUT_BLOCKS {
+                continue;
             }
 
             warn!(
@@ -275,7 +264,7 @@ impl ProvisionCoordinator {
                 "Provision timeout — requesting missing provisions via fallback"
             );
 
-            expected.last_requested_at = Some(self.local_committed_height);
+            expected.requested = true;
             actions.push(Action::RequestMissingProvisions {
                 source_shard,
                 block_height,
@@ -365,8 +354,6 @@ impl ProvisionCoordinator {
                 .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
             self.verified_remote_headers
                 .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
-            // Prune expected provisions and buffered provisions whose headers
-            // have been evicted — they can never be resolved.
             self.expected_provisions
                 .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
             self.pending_provisions
@@ -392,7 +379,7 @@ impl ProvisionCoordinator {
                 );
                 ExpectedProvision {
                     discovered_at: self.local_committed_height,
-                    last_requested_at: None,
+                    requested: false,
                     proposer,
                 }
             });
@@ -499,8 +486,7 @@ impl ProvisionCoordinator {
             return self.emit_provision_verification(to_verify, candidates);
         }
 
-        // If the header for this height has already been pruned (below the
-        // retention window), the provision can never be verified — discard it.
+        // Header already pruned — provision can never be verified.
         if let Some(&tip) = self.remote_header_tips.get(&source_shard) {
             let cutoff = tip.0.saturating_sub(REMOTE_HEADER_RETENTION_BLOCKS);
             if block_height.0 < cutoff {
@@ -1674,32 +1660,26 @@ mod tests {
     }
 
     #[test]
-    fn test_retry_throttled() {
+    fn test_no_re_emission_after_initial_request() {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new(ShardGroupId(0), topology);
 
         let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(0)]);
         coordinator.on_remote_block_committed(header, ValidatorId(3));
 
-        // Advance past timeout to trigger first request at height 10
-        // (discovered_at=0, age=10 >= 10 → fires, last_requested_at=10)
+        // Advance past timeout to trigger the one-time request at height 10
         for h in 1..=10 {
             coordinator.on_block_committed(&make_block(h));
         }
 
-        // Heights 11..=19 should be throttled (since_last = 1..9, all < 10)
-        for h in 11..=19 {
+        // Coordinator is fire-and-forget: no further emissions at any height.
+        for h in 11..=100 {
             let actions = coordinator.on_block_committed(&make_block(h));
-            assert!(actions.is_empty(), "Should throttle retry at height {h}");
+            assert!(
+                actions.is_empty(),
+                "Should never re-emit after initial request (height {h})"
+            );
         }
-
-        // At height 20, retry should trigger (since_last = 20 - 10 = 10 >= 10)
-        let actions = coordinator.on_block_committed(&make_block(20));
-        assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            &actions[0],
-            Action::RequestMissingProvisions { .. }
-        ));
     }
 
     #[test]
