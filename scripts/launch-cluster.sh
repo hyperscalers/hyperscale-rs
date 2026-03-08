@@ -470,6 +470,10 @@ EOF
     echo "  Created config for validator $i (shard $shard, rpc port $rpc_port)"
 done
 
+# Apply network conditions before starting validators so they experience
+# realistic conditions from the first message exchange
+apply_network_conditions
+
 # Launch validators
 echo ""
 echo "Launching validators..."
@@ -521,9 +525,6 @@ if [ "$FAILED" = true ]; then
     done
     exit 1
 fi
-
-# Apply network conditions after validators are running
-apply_network_conditions
 
 echo ""
 echo "=== Cluster Started ==="
