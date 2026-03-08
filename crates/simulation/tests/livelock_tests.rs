@@ -430,7 +430,7 @@ fn test_retry_completion_after_winner() {
         println!("\n✅ Retry Completion Test PASSED!");
         println!("   ✅ Transaction was committed");
     } else {
-        // Cross-shard 2PC may still be in progress - verify mempool has the TX
+        // Cross-shard execution may still be in progress - verify mempool has the TX
         let node0 = runner.node(0).unwrap();
         let status = node0.mempool().status(&tx_hash);
         println!("\n⚠️  Transaction still processing: {:?}", status);

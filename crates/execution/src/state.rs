@@ -5,20 +5,20 @@
 //! # Transaction Types
 //!
 //! - **Single-shard**: Execute locally, then vote within shard for BLS signature aggregation.
-//! - **Cross-shard**: 2PC protocol with provisioning, voting, and finalization.
+//! - **Cross-shard**: Atomic execution protocol with provisioning, voting, and finalization.
 //!
-//! # Cross-Shard 2PC Protocol
+//! # Cross-Shard Atomic Execution Protocol
 //!
-//! ## Phase 1: Provisioning Broadcast
+//! ## Phase 1: State Provisioning
 //! When a block commits with cross-shard transactions, the block proposer broadcasts
 //! state provisions (with merkle inclusion proofs) to target shards.
 //!
-//! ## Phase 2: Provisioning Reception
+//! ## Phase 2: Provision Verification
 //! Target shards receive provisions, verify the QC signature and merkle proofs
 //! against the committed state root, then mark provisioning complete.
 //!
-//! ## Phase 3: Cross-Shard Execution
-//! With provisioned state, validators execute the transaction and create a
+//! ## Phase 3: Deterministic Execution
+//! With provisioned state, validators execute the transaction and create
 //! an ExecutionVote with merkle root of execution results.
 //!
 //! ## Phase 4: Vote Aggregation
@@ -476,7 +476,7 @@ impl ExecutionState {
             });
         }
 
-        // Handle cross-shard transactions (2PC)
+        // Handle cross-shard transactions
         let mut provision_requests = Vec::new();
         let local_shard = self.local_shard();
         let is_proposer = self.validator_id() == proposer;
@@ -596,7 +596,7 @@ impl ExecutionState {
         actions
     }
 
-    /// Start cross-shard execution (2PC Phase 1: Provisioning).
+    /// Start cross-shard execution (Phase 1: State Provisioning).
     ///
     /// Provision broadcasting is handled at the block level via
     /// `FetchAndBroadcastProvisions` — this method only sets up tracking.
@@ -1160,7 +1160,7 @@ impl ExecutionState {
             return self.handle_fetched_cert_verified(tx_hash, shard, valid);
         }
 
-        // Otherwise, it's a gossiped certificate for 2PC flow
+        // Otherwise, it's a gossiped certificate for cross-shard execution flow
         self.pending_cert_verifications.remove(&(tx_hash, shard));
         // Update reverse index
         if let Some(keys) = self.pending_verifications_by_tx.get_mut(&tx_hash) {

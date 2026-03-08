@@ -4,7 +4,7 @@
 //! state machine. It handles:
 //!
 //! - Single-shard transaction execution
-//! - Cross-shard coordination (2PC)
+//! - Cross-shard coordination (atomic execution protocol)
 //! - State provisioning
 //! - Vote aggregation and certificate formation
 

@@ -5,7 +5,7 @@ use hyperscale_types::{MessagePriority, NetworkMessage, RoutableTransaction, Sha
 use std::sync::Arc;
 
 /// Gossips a transaction to all shard groups with state touched by it.
-/// Broadcast to union of write_shards (2PC consensus) and read_shards (provisioning).
+/// Broadcast to union of write_shards (cross-shard execution) and read_shards (provisioning).
 ///
 /// When serializing for network transmission, the transaction data is fully copied.
 #[derive(Debug, Clone)]

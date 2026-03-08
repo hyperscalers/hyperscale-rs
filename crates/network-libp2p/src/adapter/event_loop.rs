@@ -2,7 +2,7 @@
 //!
 //! Commands are processed in priority order:
 //! 1. Critical priority (BFT consensus)
-//! 2. Coordination priority (cross-shard 2PC)
+//! 2. Coordination priority (cross-shard execution)
 //! 3. Finalization priority (certificate gossip)
 //! 4. Propagation priority (transaction gossip)
 //! 5. Background priority (sync operations)
@@ -175,7 +175,7 @@ pub(super) async fn run(
                 drain_channel(&mut swarm, &mut critical_rx);
             }
 
-            // Coordination priority - Cross-shard 2PC messages
+            // Coordination priority - Cross-shard execution messages
             Some(cmd) = coordination_rx.recv() => {
                 drain_channel(&mut swarm, &mut critical_rx);
                 handle_command(&mut swarm, cmd);

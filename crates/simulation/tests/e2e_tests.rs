@@ -495,7 +495,7 @@ fn test_e2e_multi_shard_consensus() {
 
 /// Test cross-shard transaction flow.
 ///
-/// This test verifies the 2PC (two-phase commit) protocol:
+/// This test verifies the cross-shard atomic execution protocol:
 /// 1. Transaction touches accounts on both shards
 /// 2. Both shards execute and create certificates
 /// 3. Certificates are exchanged and aggregated
@@ -594,7 +594,7 @@ fn test_e2e_cross_shard_transaction() {
     );
 
     // Poll for transaction status progression
-    println!("Running 2PC protocol...");
+    println!("Running cross-shard execution protocol...");
 
     let start_time = runner.now();
     let mut in_mempool = false;
@@ -735,7 +735,7 @@ fn test_e2e_cross_shard_transaction() {
         "Transaction should have been committed to a block"
     );
     assert!(executed, "Transaction should have been executed");
-    // Note: finalized may or may not be true depending on 2PC completion
+    // Note: finalized may or may not be true depending on cross-shard execution completion
 
     println!("\n✅ E2E Cross-Shard Test PASSED!");
     println!("   ✅ Both shards initialized");
@@ -746,7 +746,7 @@ fn test_e2e_cross_shard_transaction() {
     if finalized {
         println!("   ✅ Cross-shard transaction finalized with certificate");
     } else {
-        println!("   ⚠️  Cross-shard finalization not yet complete (2PC still in progress)");
+        println!("   ⚠️  Cross-shard finalization not yet complete (execution still in progress)");
     }
     println!(
         "   ✅ Both shards made progress (S0: {}, S1: {})",

@@ -20,7 +20,7 @@ Rust implementation of Hyperscale consensus protocol.
 | `hyperscale-core` | The `StateMachine` and `SubStateMachine` traits that everything implements |
 | `hyperscale-messages` | Network message serialization (SBOR encoding) |
 | `hyperscale-bft` | BFT consensus: block proposal, voting, QC formation, view changes |
-| `hyperscale-execution` | Transaction execution with cross-shard 2PC coordination |
+| `hyperscale-execution` | Transaction execution with cross-shard coordination |
 | `hyperscale-mempool` | Transaction pool management |
 | `hyperscale-livelock` | Cross-shard deadlock detection and prevention |
 | `hyperscale-node` | Composes all sub-state machines into the main `NodeStateMachine` |

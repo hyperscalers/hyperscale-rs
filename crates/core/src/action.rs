@@ -402,7 +402,7 @@ pub enum Action {
 
     /// Execute a cross-shard transaction with provisioned state.
     ///
-    /// Used after 2PC provisioning completes. The runner accumulates these actions
+    /// Used after cross-shard provisioning completes. The runner accumulates these actions
     /// and executes them in parallel batches for efficiency.
     /// Returns `ProtocolEvent::CrossShardTransactionsExecuted` when the batch completes.
     ExecuteCrossShardTransaction {

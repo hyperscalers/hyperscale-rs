@@ -1,7 +1,7 @@
 //! Vote tracker for cross-shard execution voting.
 //!
 //! Tracks the collection of execution votes during Phase 4 of the
-//! cross-shard 2PC protocol.
+//! cross-shard atomic execution protocol.
 //!
 //! ## Deferred Verification Optimization
 //!

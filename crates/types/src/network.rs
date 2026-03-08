@@ -9,7 +9,7 @@
 //! 1. **Critical** - BFT consensus messages (BlockHeader, BlockVote) and
 //!    requests that unblock pending blocks. Never dropped.
 //!
-//! 2. **Coordination** - Cross-shard 2PC messages (StateProvision, ExecutionVote,
+//! 2. **Coordination** - Cross-shard execution messages (StateProvision, ExecutionVote,
 //!    ExecutionCertificate). High priority, may be batched for efficiency.
 //!
 //! 3. **Finalization** - Transaction certificate gossip. Important for progress
@@ -50,7 +50,7 @@ pub enum MessagePriority {
     /// Includes:
     /// - `StateProvisionsNotification` - cross-shard state delivery with merkle proofs
     /// - `ExecutionVotesNotification` - execution result votes
-    /// - `ExecutionCertificatesNotification` - 2PC completion certificates
+    /// - `ExecutionCertificatesNotification` - cross-shard execution certificates
     ///
     /// High priority but may be batched for efficiency.
     Coordination = 1,

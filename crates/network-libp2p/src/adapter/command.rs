@@ -62,7 +62,7 @@ pub(super) struct PriorityCommandChannels {
     /// Never dropped, processed immediately.
     critical: mpsc::UnboundedSender<SwarmCommand>,
 
-    /// Coordination priority - Cross-shard 2PC messages.
+    /// Coordination priority - Cross-shard execution messages.
     /// High priority, may be batched.
     coordination: mpsc::UnboundedSender<SwarmCommand>,
 

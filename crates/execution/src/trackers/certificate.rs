@@ -1,7 +1,7 @@
 //! Certificate tracker for cross-shard finalization.
 //!
 //! Tracks the collection of execution certificates from all participating shards
-//! during Phase 5 of the cross-shard 2PC protocol.
+//! during Phase 5 of the cross-shard atomic execution protocol.
 
 use hyperscale_types::{
     ExecutionCertificate, Hash, ShardGroupId, TransactionCertificate, TransactionDecision,
