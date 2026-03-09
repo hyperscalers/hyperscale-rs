@@ -14,11 +14,22 @@
 
 use thiserror::Error;
 
+/// Maximum decompressed payload size (64 MB).
+///
+/// Prevents allocation bombs where a small compressed frame claims a huge
+/// uncompressed size in its LZ4 header. The compressed wire frame is already
+/// capped at 10 MB; 64 MB allows for highly compressible SBOR payloads while
+/// blocking multi-GB allocations from malicious peers.
+pub const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+
 /// Errors from compression/decompression.
 #[derive(Debug, Error)]
 pub enum CompressionError {
     #[error("decompression failed: {0}")]
     DecompressionFailed(String),
+
+    #[error("claimed uncompressed size {0} exceeds limit {1}")]
+    TooLarge(usize, usize),
 }
 
 /// Compress data for transmission over the network.
@@ -33,8 +44,20 @@ pub fn compress(data: &[u8]) -> Vec<u8> {
 /// Decompress data received from the network.
 ///
 /// Expects LZ4 block format with prepended size header.
+/// Rejects payloads whose claimed uncompressed size exceeds
+/// [`MAX_DECOMPRESSED_SIZE`] to prevent allocation bombs.
 #[inline]
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
+    let (claimed_size, _) = lz4_flex::block::uncompressed_size(data)
+        .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))?;
+
+    if claimed_size > MAX_DECOMPRESSED_SIZE {
+        return Err(CompressionError::TooLarge(
+            claimed_size,
+            MAX_DECOMPRESSED_SIZE,
+        ));
+    }
+
     lz4_flex::decompress_size_prepended(data)
         .map_err(|e| CompressionError::DecompressionFailed(e.to_string()))
 }
@@ -80,6 +103,19 @@ mod tests {
     fn test_invalid_data() {
         let garbage = b"not valid lz4 data";
         assert!(decompress(garbage).is_err());
+    }
+
+    #[test]
+    fn test_rejects_forged_huge_uncompressed_size() {
+        // Craft a payload that claims a 128 MB uncompressed size but contains
+        // only a tiny compressed body. This simulates an allocation bomb.
+        let fake_size: u32 = 128 * 1024 * 1024;
+        let mut malicious = fake_size.to_le_bytes().to_vec();
+        malicious.extend_from_slice(&[0u8; 16]); // garbage compressed body
+        let err = decompress(&malicious).unwrap_err();
+        assert!(
+            matches!(err, CompressionError::TooLarge(claimed, _) if claimed == fake_size as usize),
+        );
     }
 
     #[test]
