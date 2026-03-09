@@ -5,6 +5,9 @@ edition.workspace = true
 description = "Core types for Hyperscale consensus"
 
 [dependencies]
+# Lock-free concurrent reads
+arc-swap.workspace = true
+
 # Cryptographic primitives
 blake3 = "1.5"
 hex = "0.4"

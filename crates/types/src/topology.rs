@@ -46,7 +46,7 @@ pub trait Topology: Send + Sync {
     fn public_key(&self, validator_id: ValidatorId) -> Option<Bls12381G1PublicKey>;
 
     /// Get the global validator set.
-    fn global_validator_set(&self) -> &ValidatorSet;
+    fn global_validator_set(&self) -> Arc<ValidatorSet>;
 
     /// Get the validator ID at a specific index in the local committee.
     ///
@@ -275,7 +275,7 @@ pub struct StaticTopology {
     num_shards: u64,
     shard_committees: HashMap<ShardGroupId, ShardCommittee>,
     validator_info: HashMap<ValidatorId, ValidatorInfoInternal>,
-    global_validator_set: ValidatorSet,
+    global_validator_set: Arc<ValidatorSet>,
 }
 
 impl StaticTopology {
@@ -327,7 +327,7 @@ impl StaticTopology {
             num_shards,
             shard_committees,
             validator_info,
-            global_validator_set: validator_set,
+            global_validator_set: Arc::new(validator_set),
         }
     }
 
@@ -383,7 +383,7 @@ impl StaticTopology {
             num_shards,
             shard_committees,
             validator_info,
-            global_validator_set: validator_set,
+            global_validator_set: Arc::new(validator_set),
         }
     }
 
@@ -440,7 +440,7 @@ impl StaticTopology {
             num_shards,
             shard_committees: committees,
             validator_info,
-            global_validator_set: global_validator_set.clone(),
+            global_validator_set: Arc::new(global_validator_set.clone()),
         }
     }
 }
@@ -484,8 +484,8 @@ impl Topology for StaticTopology {
         self.validator_info.get(&validator_id).map(|v| v.public_key)
     }
 
-    fn global_validator_set(&self) -> &ValidatorSet {
-        &self.global_validator_set
+    fn global_validator_set(&self) -> Arc<ValidatorSet> {
+        Arc::clone(&self.global_validator_set)
     }
 }
 
@@ -494,6 +494,7 @@ impl Topology for StaticTopology {
 // ═══════════════════════════════════════════════════════════════════════════
 
 use crate::{BlockHeight, EpochConfig, ValidatorShardState};
+use arc_swap::ArcSwap;
 use std::collections::HashSet;
 use std::sync::RwLock;
 
@@ -510,6 +511,9 @@ use std::sync::RwLock;
 pub struct DynamicTopology {
     /// Local validator ID (immutable).
     local_validator_id: ValidatorId,
+
+    /// Global validator set, swapped atomically at epoch transitions.
+    validator_set: ArcSwap<ValidatorSet>,
 
     /// Mutable state protected by RwLock.
     inner: RwLock<DynamicTopologyInner>,
@@ -580,8 +584,11 @@ impl DynamicTopology {
             })
             .collect();
 
+        let validator_set = ArcSwap::from_pointee(epoch.validator_set.clone());
+
         Ok(Self {
             local_validator_id,
+            validator_set,
             inner: RwLock::new(DynamicTopologyInner {
                 current: epoch,
                 next: None,
@@ -644,6 +651,10 @@ impl DynamicTopology {
 
         inner.local_shard = new_shard;
         inner.local_state = new_state;
+
+        self.validator_set
+            .store(Arc::new(next.validator_set.clone()));
+
         inner.current = next;
 
         // Clear splitting shards on epoch transition
@@ -735,29 +746,8 @@ impl Topology for DynamicTopology {
             .map(|v| v.public_key)
     }
 
-    fn global_validator_set(&self) -> &ValidatorSet {
-        // This is safe because ValidatorSet is immutable within an epoch,
-        // but we need to be careful about lifetimes with RwLock.
-        // For now, we'll return a reference that lives as long as self.
-        // This works because the validator set is in the EpochConfig which
-        // is stored in inner.current.
-        //
-        // Note: This is a slight compromise - if we truly needed interior
-        // mutability of the validator set, we'd need to return Cow here too.
-        // But ValidatorSet doesn't change within an epoch.
-        //
-        // Safety: We hold a read lock for the duration of the borrow.
-        // This is safe as long as callers don't hold the reference across
-        // yield points.
-        unsafe {
-            let inner = self.inner.read().expect("RwLock poisoned");
-            let ptr = &inner.current.validator_set as *const ValidatorSet;
-            // Extend the lifetime - this is safe because:
-            // 1. The validator set lives in self.inner.current
-            // 2. We never replace current without going through transition_to_next_epoch
-            // 3. The caller should not hold this reference across await points
-            &*ptr
-        }
+    fn global_validator_set(&self) -> Arc<ValidatorSet> {
+        self.validator_set.load_full()
     }
 
     // Epoch-awareness overrides

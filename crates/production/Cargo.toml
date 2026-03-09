@@ -60,7 +60,7 @@ crossbeam.workspace = true
 core_affinity = "0.8"
 
 # Lock-free concurrent data structures
-arc-swap = "1.8.0"
+arc-swap.workspace = true
 dashmap = "6.1.0"
 quick_cache = "0.6"
 

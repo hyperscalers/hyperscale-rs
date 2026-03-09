@@ -496,7 +496,7 @@ mod tests {
             }
         }
 
-        fn global_validator_set(&self) -> &hyperscale_types::ValidatorSet {
+        fn global_validator_set(&self) -> std::sync::Arc<hyperscale_types::ValidatorSet> {
             unimplemented!("not needed for bind tests")
         }
     }
