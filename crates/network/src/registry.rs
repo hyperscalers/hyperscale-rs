@@ -172,19 +172,27 @@ impl HandlerRegistry {
 
     /// Look up the gossip handler for a message type.
     pub fn get_gossip(&self, message_type_id: &str) -> Option<Arc<RawGossipHandler>> {
-        self.gossip.read().unwrap().get(message_type_id).cloned()
+        self.gossip
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(message_type_id)
+            .cloned()
     }
 
     /// Look up the request handler for a message type.
     pub fn get_request(&self, message_type_id: &str) -> Option<Arc<RawRequestHandler>> {
-        self.request.read().unwrap().get(message_type_id).cloned()
+        self.request
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(message_type_id)
+            .cloned()
     }
 
     /// Look up the notification handler for a message type.
     pub fn get_notification(&self, message_type_id: &str) -> Option<Arc<RawNotificationHandler>> {
         self.notification
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(message_type_id)
             .cloned()
     }
