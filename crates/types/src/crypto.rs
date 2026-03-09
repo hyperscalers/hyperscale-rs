@@ -188,6 +188,9 @@ pub fn batch_verify_bls_different_messages_all_or_nothing(
         let mut rand_bytes = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rng, &mut rand_bytes);
         let mut scalar = blst::blst_scalar::default();
+        // SAFETY: `scalar` is a valid `blst_scalar` (zero-initialised above) and
+        // `rand_bytes` is a 32-byte array whose pointer is valid for 32 bytes.
+        // `blst_scalar_from_bendian` reads exactly 32 bytes from the pointer.
         unsafe {
             blst::blst_scalar_from_bendian(&mut scalar, rand_bytes.as_ptr());
         }
