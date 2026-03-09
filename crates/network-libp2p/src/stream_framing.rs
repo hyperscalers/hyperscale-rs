@@ -57,7 +57,15 @@ pub(crate) async fn write_frame<S: AsyncWrite + Unpin>(
     data: &[u8],
 ) -> Result<usize, io::Error> {
     let compressed = compression::compress(data);
-    let len = compressed.len() as u32;
+    let len: u32 = compressed.len().try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "compressed payload too large for u32 length prefix: {} bytes",
+                compressed.len()
+            ),
+        )
+    })?;
     let mut buf = Vec::with_capacity(4 + compressed.len());
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(&compressed);
@@ -148,8 +156,24 @@ pub(crate) async fn write_precompressed_typed_frame_no_close<S: AsyncWrite + Unp
     compressed_data: &[u8],
 ) -> Result<usize, io::Error> {
     let type_id_bytes = type_id.as_bytes();
-    let type_id_len = type_id_bytes.len() as u16;
-    let payload_len = compressed_data.len() as u32;
+    let type_id_len: u16 = type_id_bytes.len().try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "type_id too long for u16 length prefix: {} bytes",
+                type_id_bytes.len()
+            ),
+        )
+    })?;
+    let payload_len: u32 = compressed_data.len().try_into().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "compressed payload too large for u32 length prefix: {} bytes",
+                compressed_data.len()
+            ),
+        )
+    })?;
     let wire_len = 2 + type_id_bytes.len() + 4 + compressed_data.len();
 
     let mut buf = Vec::with_capacity(wire_len);
