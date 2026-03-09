@@ -38,4 +38,4 @@ pub use action::{Action, CrossShardExecutionRequest, ProvisionRequest, Transacti
 pub use input::{EventPriority, NodeInput};
 pub use protocol_event::{ProtocolEvent, ProvisionVerificationResult};
 pub use timer::{TimerId, TimerScheduler};
-pub use traits::{NoOpStateRootComputer, StateMachine, StateRootComputer};
+pub use traits::StateMachine;
