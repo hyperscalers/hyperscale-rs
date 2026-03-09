@@ -314,6 +314,15 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 }
 
+/// Maximum items in a single collection during SBOR decoding.
+///
+/// Prevents allocation bombs where a crafted SBOR payload claims millions of
+/// items, causing multi-GB `Vec::with_capacity()` pre-allocations. This limit
+/// is generous enough for any legitimate block content while blocking malicious
+/// payloads. Applied to transaction arrays, certificate arrays, and commitment
+/// proof maps.
+const MAX_SBOR_COLLECTION_SIZE: usize = 10_000;
+
 /// Helper to decode a Vec<Arc<RoutableTransaction>> from an SBOR array.
 fn decode_tx_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
     decoder: &mut D,
@@ -321,6 +330,12 @@ fn decode_tx_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
     decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
     decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
     let count = decoder.read_size()?;
+    if count > MAX_SBOR_COLLECTION_SIZE {
+        return Err(sbor::DecodeError::UnexpectedSize {
+            expected: MAX_SBOR_COLLECTION_SIZE,
+            actual: count,
+        });
+    }
     let mut txs = Vec::with_capacity(count);
     for _ in 0..count {
         let tx: RoutableTransaction =
@@ -356,6 +371,12 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
         decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
         let cert_count = decoder.read_size()?;
+        if cert_count > MAX_SBOR_COLLECTION_SIZE {
+            return Err(sbor::DecodeError::UnexpectedSize {
+                expected: MAX_SBOR_COLLECTION_SIZE,
+                actual: cert_count,
+            });
+        }
         let mut certificates = Vec::with_capacity(cert_count);
         for _ in 0..cert_count {
             let cert: TransactionCertificate =
@@ -370,6 +391,12 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
         decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
         let proof_count = decoder.read_size()?;
+        if proof_count > MAX_SBOR_COLLECTION_SIZE {
+            return Err(sbor::DecodeError::UnexpectedSize {
+                expected: MAX_SBOR_COLLECTION_SIZE,
+                actual: proof_count,
+            });
+        }
         let mut commitment_proofs = HashMap::with_capacity(proof_count);
         for _ in 0..proof_count {
             let tx_hash: Hash = decoder.decode()?;

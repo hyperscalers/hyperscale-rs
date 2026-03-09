@@ -105,6 +105,12 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
         decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
         let tx_count = decoder.read_size()?;
+        if tx_count > 1_000 {
+            return Err(sbor::DecodeError::UnexpectedSize {
+                expected: 1_000,
+                actual: tx_count,
+            });
+        }
         let mut transactions = Vec::with_capacity(tx_count);
         for _ in 0..tx_count {
             let tx: RoutableTransaction =
