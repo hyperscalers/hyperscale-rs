@@ -460,11 +460,26 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             for req in requests {
                 // Fetch state entries from storage at the block's state version.
                 // This is the proactive path — the proposer just committed this
-                // block, so the state version must still be available.
-                let entries = ctx
-                    .executor
-                    .fetch_state_entries(ctx.storage, &req.nodes, state_version)
-                    .expect("proactive provision path: state version must be available");
+                // block, so the state version should still be available. If it
+                // was garbage-collected (aggressive GC + slow dispatch), skip
+                // this request — the target shard will recover via fallback.
+                let entries =
+                    match ctx
+                        .executor
+                        .fetch_state_entries(ctx.storage, &req.nodes, state_version)
+                    {
+                        Some(entries) => entries,
+                        None => {
+                            tracing::warn!(
+                                state_version,
+                                block_height = block_height.0,
+                                tx_hash = ?req.tx_hash,
+                                "Proactive provision: state version unavailable, \
+                                 skipping (target shard will use fallback recovery)"
+                            );
+                            continue;
+                        }
+                    };
                 let storage_keys: Vec<Vec<u8>> =
                     entries.iter().map(|e| e.storage_key.clone()).collect();
                 let merkle_proofs = ctx
