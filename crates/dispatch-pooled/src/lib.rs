@@ -650,44 +650,29 @@ impl Dispatch for PooledDispatch {
 }
 
 /// Pin the current thread to a specific CPU core.
-#[cfg(target_os = "linux")]
+///
+/// Uses `core_affinity` which validates the core ID against the set of
+/// available cores, avoiding out-of-bounds issues with raw libc calls.
 fn pin_thread_to_core(core_id: usize) -> Result<(), ThreadPoolError> {
-    use std::mem;
+    let core_ids = core_affinity::get_core_ids().ok_or_else(|| {
+        ThreadPoolError::CorePinningError("failed to enumerate CPU cores".to_string())
+    })?;
 
-    unsafe {
-        let mut cpuset: libc::cpu_set_t = mem::zeroed();
-        libc::CPU_ZERO(&mut cpuset);
-        libc::CPU_SET(core_id, &mut cpuset);
+    let target = core_ids
+        .into_iter()
+        .find(|c| c.id == core_id)
+        .ok_or_else(|| {
+            ThreadPoolError::CorePinningError(format!("core {} not in available core set", core_id))
+        })?;
 
-        let result = libc::sched_setaffinity(0, mem::size_of::<libc::cpu_set_t>(), &cpuset);
-
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(ThreadPoolError::CorePinningError(format!(
-                "sched_setaffinity failed for core {}",
-                core_id
-            )))
-        }
+    if core_affinity::set_for_current(target) {
+        Ok(())
+    } else {
+        Err(ThreadPoolError::CorePinningError(format!(
+            "set_for_current failed for core {}",
+            core_id
+        )))
     }
-}
-
-#[cfg(target_os = "macos")]
-fn pin_thread_to_core(core_id: usize) -> Result<(), ThreadPoolError> {
-    tracing::debug!(
-        core = core_id,
-        "Core pinning on macOS is best-effort (using affinity hints)"
-    );
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn pin_thread_to_core(core_id: usize) -> Result<(), ThreadPoolError> {
-    tracing::warn!(
-        core = core_id,
-        "Core pinning not implemented for this platform"
-    );
-    Ok(())
 }
 
 #[cfg(test)]

@@ -96,6 +96,7 @@ hyperscale-types = { path = "crates/types" }
 
 # External dependencies
 arc-swap = "1.8.0"
+core_affinity = "0.8"
 im = "15.1"
 indexmap = "2.12.1"
 rand = "0.8.5"

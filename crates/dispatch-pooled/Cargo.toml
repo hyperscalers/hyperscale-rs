@@ -5,10 +5,8 @@ edition.workspace = true
 description = "Rayon thread pool dispatch for production"
 
 [dependencies]
+core_affinity.workspace = true
 hyperscale-dispatch.workspace = true
 rayon.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"

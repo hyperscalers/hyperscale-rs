@@ -57,7 +57,7 @@ tracing.workspace = true
 tokio.workspace = true
 parking_lot = "0.12"
 crossbeam.workspace = true
-core_affinity = "0.8"
+core_affinity.workspace = true
 
 # Lock-free concurrent data structures
 arc-swap.workspace = true
