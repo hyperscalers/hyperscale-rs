@@ -461,6 +461,7 @@ listen_addr = "0.0.0.0:$rpc_port"
 enabled = $TRACING
 otlp_endpoint = "http://localhost:4317"
 service_name = "hyperscale-validator"
+log_file = "$DATA_DIR/validator-$i/output.log"
 
 $GENESIS_VALIDATORS
 
@@ -491,7 +492,9 @@ for i in $(seq 0 $((TOTAL_VALIDATORS - 1))); do
     # Build RUST_LOG based on log level
     # Always suppress noisy dependencies, but let hyperscale crates use the specified level
     # libp2p_gossipsub=error to suppress "duplicate message" warnings which are normal in gossip
-    RUST_LOG="warn,hyperscale=$LOG_LEVEL,hyperscale_production=$LOG_LEVEL,libp2p_gossipsub=error" "$VALIDATOR_BIN" --config "$CONFIG_FILE" > "$LOG_FILE" 2>&1 &
+    # Tracing output goes to log_file (configured in TOML) with ANSI disabled.
+    # Stderr redirect captures panics/crash output only.
+    RUST_LOG="warn,hyperscale=$LOG_LEVEL,hyperscale_production=$LOG_LEVEL,libp2p_gossipsub=error" "$VALIDATOR_BIN" --config "$CONFIG_FILE" 2>> "$DATA_DIR/validator-$i/crash.log" &
     PID=$!
     VALIDATOR_PIDS[$i]=$PID
     echo "$PID" >> "$PID_FILE"
