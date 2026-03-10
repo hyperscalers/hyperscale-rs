@@ -185,6 +185,13 @@ pub enum ProtocolEvent {
     /// Received an execution vote for cross-shard execution.
     ExecutionVoteReceived { vote: ExecutionVote },
 
+    /// Batch of execution votes from a single dispatch (ExecuteTransactions / SpeculativeExecute).
+    ///
+    /// Replaces N individual `ExecutionVoteReceived` callback events with one batch,
+    /// reducing channel sends and state-machine `handle()` calls proportionally to
+    /// the number of transactions in a block.
+    ExecutionVoteBatchReceived { votes: Vec<ExecutionVote> },
+
     /// Received an execution certificate for cross-shard execution.
     ExecutionCertificateReceived { cert: ExecutionCertificate },
 
@@ -392,6 +399,7 @@ impl ProtocolEvent {
 
             // Execution
             ProtocolEvent::ExecutionVoteReceived { .. } => "ExecutionVoteReceived",
+            ProtocolEvent::ExecutionVoteBatchReceived { .. } => "ExecutionVoteBatchReceived",
             ProtocolEvent::ExecutionCertificateReceived { .. } => "ExecutionCertificateReceived",
             ProtocolEvent::ExecutionVotesVerifiedAndAggregated { .. } => {
                 "ExecutionVotesVerifiedAndAggregated"

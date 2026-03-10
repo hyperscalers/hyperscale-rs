@@ -909,6 +909,13 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ExecutionVoteReceived { vote } => {
                 self.execution.on_vote(self.topology.snapshot(), vote)
             }
+            ProtocolEvent::ExecutionVoteBatchReceived { votes } => {
+                let mut actions = Vec::new();
+                for vote in votes {
+                    actions.extend(self.execution.on_vote(self.topology.snapshot(), vote));
+                }
+                actions
+            }
             ProtocolEvent::ExecutionCertificateReceived { cert } => self
                 .execution
                 .on_certificate(self.topology.snapshot(), cert),

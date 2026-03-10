@@ -699,10 +699,20 @@ where
             NodeInput::Protocol(pe) => {
                 // Broadcast self-generated execution votes returning from dispatch.
                 // Votes from peers arrive via network gossip.
-                if let ProtocolEvent::ExecutionVoteReceived { ref vote } = pe {
-                    if vote.validator == self.validator_id {
-                        self.accumulate_broadcast_vote(self.local_shard, vote.clone());
+                match &pe {
+                    ProtocolEvent::ExecutionVoteReceived { ref vote } => {
+                        if vote.validator == self.validator_id {
+                            self.accumulate_broadcast_vote(self.local_shard, vote.clone());
+                        }
                     }
+                    ProtocolEvent::ExecutionVoteBatchReceived { ref votes } => {
+                        for vote in votes {
+                            if vote.validator == self.validator_id {
+                                self.accumulate_broadcast_vote(self.local_shard, vote.clone());
+                            }
+                        }
+                    }
+                    _ => {}
                 }
 
                 self.feed_event(pe);

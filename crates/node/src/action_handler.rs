@@ -396,13 +396,10 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 )
             });
 
-            let events = votes
-                .into_iter()
-                .map(|vote| NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived { vote }))
-                .collect();
-
             Some(DelegatedResult {
-                events,
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::ExecutionVoteBatchReceived { votes },
+                )],
                 prepared_commit: None,
             })
         }
@@ -423,19 +420,15 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             });
 
             let tx_hashes: Vec<Hash> = votes.iter().map(|v| v.transaction_hash).collect();
-            let mut events: Vec<NodeInput> = votes
-                .into_iter()
-                .map(|vote| NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived { vote }))
-                .collect();
-            events.push(NodeInput::Protocol(
-                ProtocolEvent::SpeculativeExecutionComplete {
-                    block_hash,
-                    tx_hashes,
-                },
-            ));
 
             Some(DelegatedResult {
-                events,
+                events: vec![
+                    NodeInput::Protocol(ProtocolEvent::ExecutionVoteBatchReceived { votes }),
+                    NodeInput::Protocol(ProtocolEvent::SpeculativeExecutionComplete {
+                        block_hash,
+                        tx_hashes,
+                    }),
+                ],
                 prepared_commit: None,
             })
         }
