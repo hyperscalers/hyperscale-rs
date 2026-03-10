@@ -3979,11 +3979,6 @@ impl BftState {
                     sender_signature: cbh_sig,
                 },
             });
-            actions.push(Action::Continuation(ProtocolEvent::BlockCommitted {
-                block_hash: current_hash,
-                height,
-                block: block.clone(),
-            }));
 
             // Check if the next height is buffered
             let next_height = height + 1;
@@ -4295,11 +4290,6 @@ impl BftState {
                     sender_signature: cbh_sig,
                 },
             },
-            Action::Continuation(ProtocolEvent::BlockCommitted {
-                block_hash,
-                height,
-                block: block.clone(),
-            }),
         ];
 
         // Cancel any pending fetches for removed blocks

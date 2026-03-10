@@ -42,8 +42,8 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
-    ExecutionVote, Hash, RoutableTransaction, ShardGroupId, TopologySnapshot,
+    Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
+    ExecutionVote, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot,
     TransactionCertificate, ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
@@ -218,6 +218,12 @@ where
     cert_broadcast_recipients: HashMap<ShardGroupId, Vec<ValidatorId>>,
     committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
 
+    // Block commit accumulator — collects EmitCommittedBlock actions within a
+    // single feed_event/handle_actions batch, then spawns a single closure on
+    // the execution pool to commit them sequentially. This keeps JMT writes
+    // off the pinned IoLoop thread while preserving commit ordering.
+    pending_block_commits: Vec<(Block, QuorumCertificate)>,
+
     // Transaction status cache — retains the latest status for every transaction
     // that has emitted a status notification. Bounded LRU cache shared (via Arc)
     // with external consumers (e.g. RPC handlers in production).
@@ -310,6 +316,7 @@ where
                 b.committed_header_max,
                 b.committed_header_window,
             ),
+            pending_block_commits: Vec::new(),
             cached_local_peers,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             emitted_statuses: Vec::new(),
@@ -353,6 +360,7 @@ where
         for action in actions {
             self.process_action(action);
         }
+        self.flush_block_commits();
     }
 
     /// Access storage mutably and executor simultaneously.
@@ -743,6 +751,7 @@ where
         for action in actions {
             self.process_action(action);
         }
+        self.flush_block_commits();
     }
 
     /// Flush any batch accumulators whose deadlines have expired.
@@ -894,6 +903,7 @@ where
     ///
     /// Called during shutdown or when immediate delivery is needed.
     pub fn flush_all_batches(&mut self) {
+        self.flush_block_commits();
         self.flush_validation_batch();
         self.flush_cross_shard_executions();
         self.flush_execution_vote_verifications();

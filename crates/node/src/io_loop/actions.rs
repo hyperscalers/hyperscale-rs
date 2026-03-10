@@ -139,7 +139,7 @@ where
             // Block commit + notifications
             // ═══════════════════════════════════════════════════════════
             Action::EmitCommittedBlock { block, qc } => {
-                self.process_block_commit(block, qc);
+                self.accumulate_block_commit(block, qc);
             }
             Action::EmitTransactionStatus {
                 tx_hash,
@@ -277,8 +277,10 @@ where
         }
     }
 
-    /// Process a committed block — apply state, emit metrics, feed sync protocol.
-    fn process_block_commit(
+    /// Accumulate a block commit for batched dispatch. Records metrics
+    /// immediately (on the pinned thread) and feeds the sync protocol, then
+    /// defers the heavy JMT/metadata writes to [`flush_block_commits`].
+    fn accumulate_block_commit(
         &mut self,
         block: hyperscale_types::Block,
         qc: hyperscale_types::QuorumCertificate,
@@ -301,41 +303,94 @@ where
         }
         metrics::set_livelock_deferred_count(self.state.livelock().stats().pending_deferrals);
 
-        let prepared = self.prepared_commits.lock().unwrap().remove(&block_hash);
-
-        // Commit state writes (fast path uses prepared handle, slow
-        // path recomputes from certificates).
-        if !block.certificates.is_empty() {
-            let result = if let Some(prepared) = prepared {
-                self.storage.commit_prepared_block(prepared)
-            } else {
-                self.storage
-                    .commit_block(&block.certificates, self.local_shard)
-            };
-
-            // Persist committed metadata AFTER state is applied.
-            ConsensusStore::set_committed_state(&*self.storage, height, block_hash, &qc);
-            ConsensusStore::prune_own_votes(&*self.storage, height.0);
-
-            let _ =
-                self.event_sender
-                    .send(NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
-                        height: height.0,
-                        state_version: result.state_version,
-                        state_root: result.state_root,
-                    }));
-        } else {
-            // Empty block — no state changes, but still update
-            // committed metadata.
-            ConsensusStore::set_committed_state(&*self.storage, height, block_hash, &qc);
-            ConsensusStore::prune_own_votes(&*self.storage, height.0);
-        }
-
-        // Feed committed height to sync protocol.
+        // Feed committed height to sync protocol (just tracks progress,
+        // doesn't need JMT state).
         let outputs = self
             .sync_protocol
             .handle(SyncInput::BlockCommitted { height: height.0 });
         self.process_sync_outputs(outputs);
+
+        self.pending_block_commits.push((block, qc));
+    }
+
+    /// Flush accumulated block commits. If all blocks are empty (no
+    /// certificates), commits synchronously. Otherwise spawns a single
+    /// closure on the execution pool that commits all blocks sequentially,
+    /// sending `StateCommitComplete` and `BlockCommitted` events after each.
+    pub(super) fn flush_block_commits(&mut self) {
+        let commits = std::mem::take(&mut self.pending_block_commits);
+        if commits.is_empty() {
+            return;
+        }
+
+        let has_non_empty = commits.iter().any(|(b, _)| !b.certificates.is_empty());
+
+        if !has_non_empty {
+            // All empty blocks — synchronous (metadata only, very fast).
+            for (block, qc) in commits {
+                let height = block.header.height;
+                let block_hash = block.hash();
+                ConsensusStore::set_committed_state(&*self.storage, height, block_hash, &qc);
+                ConsensusStore::prune_own_votes(&*self.storage, height.0);
+                let _ =
+                    self.event_sender
+                        .send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
+                            block_hash,
+                            height: height.0,
+                            block,
+                        }));
+            }
+            return;
+        }
+
+        // Extract prepared commit handles for each block in the batch.
+        let mut prepared_map = {
+            let mut cache = self.prepared_commits.lock().unwrap();
+            let mut map = Vec::with_capacity(commits.len());
+            for (block, _) in &commits {
+                map.push(cache.remove(&block.hash()));
+            }
+            map
+        };
+
+        let storage = Arc::clone(&self.storage);
+        let event_tx = self.event_sender.clone();
+        let local_shard = self.local_shard;
+
+        self.dispatch.spawn_execution(move || {
+            for (i, (block, qc)) in commits.into_iter().enumerate() {
+                let block_hash = block.hash();
+                let height = block.header.height;
+
+                if !block.certificates.is_empty() {
+                    let prepared = prepared_map[i].take();
+                    let result = if let Some(prepared) = prepared {
+                        storage.commit_prepared_block(prepared)
+                    } else {
+                        storage.commit_block(&block.certificates, local_shard)
+                    };
+
+                    ConsensusStore::set_committed_state(&*storage, height, block_hash, &qc);
+                    ConsensusStore::prune_own_votes(&*storage, height.0);
+
+                    let _ =
+                        event_tx.send(NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
+                            height: height.0,
+                            state_version: result.state_version,
+                            state_root: result.state_root,
+                        }));
+                } else {
+                    ConsensusStore::set_committed_state(&*storage, height, block_hash, &qc);
+                    ConsensusStore::prune_own_votes(&*storage, height.0);
+                }
+
+                let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
+                    block_hash,
+                    height: height.0,
+                    block,
+                }));
+            }
+        });
     }
 
     /// Process sync, fetch, and provision recovery actions.
