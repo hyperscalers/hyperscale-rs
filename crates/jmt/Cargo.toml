@@ -1,0 +1,14 @@
+[package]
+name = "hyperscale-jmt"
+version.workspace = true
+edition.workspace = true
+description = "Jellyfish Merkle Tree (JMT) implementation using Blake3"
+
+[dependencies]
+hyperscale-types.workspace = true
+blake3.workspace = true
+sbor.workspace = true
+radix-common.workspace = true
+radix-substate-store-interface.workspace = true
+indexmap.workspace = true
+itertools.workspace = true

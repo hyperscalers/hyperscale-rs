@@ -126,7 +126,7 @@ impl SharedJmtState {
                 // In simulation, tests are short-lived so retaining all nodes is fine.
                 tree_store: TypedInMemoryTreeStore::new(),
                 current_version: 0,
-                current_root_hash: StateRootHash([0u8; 32]),
+                current_root_hash: Hash::ZERO,
                 associations: HashMap::new(),
             }),
         }
@@ -139,7 +139,7 @@ impl SharedJmtState {
     /// Get the current JMT root as a Hash.
     pub(crate) fn current_jmt_root(&self) -> Hash {
         let inner = self.inner.lock().unwrap();
-        Hash::from_hash_bytes(&inner.current_root_hash.0)
+        inner.current_root_hash
     }
 
     /// Compute speculative state root from pre-converted DatabaseUpdates.
@@ -164,7 +164,7 @@ impl SharedJmtState {
         let inner = self.inner.lock().unwrap();
         let base_root = inner.current_root_hash;
         let base_version = inner.current_version;
-        let current_root_hash = Hash::from_hash_bytes(&base_root.0);
+        let current_root_hash = base_root;
 
         if updates_per_cert.is_empty() {
             let snapshot = JmtSnapshot {
@@ -208,10 +208,9 @@ impl SharedJmtState {
             current_version += 1;
         }
 
-        let result_hash = Hash::from_hash_bytes(&result_root.0);
         let snapshot = overlay.into_snapshot(base_root, base_version, result_root, num_versions);
 
-        (result_hash, snapshot)
+        (result_root, snapshot)
     }
 
     /// Apply a JMT snapshot directly, inserting precomputed nodes and associations.
@@ -735,7 +734,7 @@ impl CommitStore for SimStorage {
     fn commit_prepared_block(&self, prepared: Self::PreparedCommit) -> CommitResult {
         let current_root = self.state_root_hash();
         let current_version = self.current_jmt_version();
-        let snapshot_base = Hash::from_hash_bytes(&prepared.snapshot.base_root.0);
+        let snapshot_base = prepared.snapshot.base_root;
         let use_fast_path =
             current_root == snapshot_base && current_version == prepared.snapshot.base_version;
 

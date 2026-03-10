@@ -1,37 +1,25 @@
 //! Merkle proof generation and verification for 3-tier JMT.
 //!
 //! Provides functions to generate and verify `SubstateInclusionProof`s against
-//! the Jellyfish Merkle Tree. Uses blake2b-256 (the JMT's native hash function)
-//! for all proof computations.
+//! the Jellyfish Merkle Tree. Uses Blake3 for all proof computations.
 
 use crate::jmt::{
     EntityTier, IteratedLeafKey, LeafKey, PartitionTier, ReadableTier, ReadableTreeStore,
     SparseMerkleProof, SubstateTier,
 };
 use crate::keys::decompose_storage_key;
-use blake2::digest::{consts::U32, Digest};
 use hyperscale_types::{Hash, MerkleInclusionProof, SubstateInclusionProof};
-use radix_common::crypto::hash as blake2b_hash;
 
-type Blake2b256 = blake2::Blake2b<U32>;
-
-/// Convert a vendor `SparseMerkleProof` to our serializable `MerkleInclusionProof`.
+/// Convert a JMT `SparseMerkleProof` to our serializable `MerkleInclusionProof`.
 fn to_merkle_inclusion_proof(proof: SparseMerkleProof) -> MerkleInclusionProof {
     let (leaf_key, leaf_value_hash) = match proof.leaf() {
-        Some(leaf) => (
-            Some(leaf.key().bytes.clone()),
-            Some(Hash::from_hash_bytes(&leaf.value_hash().0)),
-        ),
+        Some(leaf) => (Some(leaf.key().bytes.clone()), Some(*leaf.value_hash())),
         None => (None, None),
     };
     MerkleInclusionProof {
         leaf_key,
         leaf_value_hash,
-        siblings: proof
-            .siblings()
-            .iter()
-            .map(|h| Hash::from_hash_bytes(&h.0))
-            .collect(),
+        siblings: proof.siblings().to_vec(),
     }
 }
 
@@ -102,7 +90,7 @@ pub fn generate_merkle_proofs<S: ReadableTreeStore>(
         .collect()
 }
 
-/// Verify a single-tier merkle proof using blake2b-256.
+/// Verify a single-tier merkle proof using Blake3.
 ///
 /// Recomputes the root hash bottom-up from the leaf and sibling hashes.
 /// Returns the computed root hash, or `None` if the proof is malformed.
@@ -126,11 +114,8 @@ fn verify_single_tier(
         return None;
     }
 
-    // Compute leaf hash: blake2b(leaf_key || leaf_value_hash)
-    let mut hasher = Blake2b256::new();
-    hasher.update(leaf_key);
-    hasher.update(leaf_value_hash.as_bytes());
-    let mut current_hash = radix_common::crypto::Hash(hasher.finalize().into());
+    // Compute leaf hash: blake3(leaf_key || leaf_value_hash)
+    let mut current_hash = Hash::from_parts(&[leaf_key, leaf_value_hash.as_bytes()]);
 
     // Walk up the tree using sibling hashes
     // The key bits (from MSB) determine left/right placement
@@ -149,32 +134,26 @@ fn verify_single_tier(
 
     for sibling in &proof.siblings {
         let is_right = bit_iter.next_back().unwrap_or(false);
-        let sibling_bytes = sibling.to_bytes();
 
-        let mut hasher = Blake2b256::new();
-        if is_right {
-            hasher.update(sibling_bytes);
-            hasher.update(current_hash.0);
+        current_hash = if is_right {
+            Hash::from_parts(&[sibling.as_bytes(), current_hash.as_bytes()])
         } else {
-            hasher.update(current_hash.0);
-            hasher.update(sibling_bytes);
-        }
-
-        current_hash = radix_common::crypto::Hash(hasher.finalize().into());
+            Hash::from_parts(&[current_hash.as_bytes(), sibling.as_bytes()])
+        };
     }
 
-    Some(current_hash.0)
+    Some(current_hash.to_bytes())
 }
 
 /// Verify a 3-tier substate inclusion proof against an expected state root.
 ///
-/// Performs chained verification using **blake2b-256**:
-/// 1. Verify the substate proof → compute `substate_tier_root`
-/// 2. Verify the partition proof (with `substate_tier_root` as value) → compute `partition_tier_root`
-/// 3. Verify the entity proof (with `partition_tier_root` as value) → compute `entity_root`
+/// Performs chained verification using **Blake3**:
+/// 1. Verify the substate proof -> compute `substate_tier_root`
+/// 2. Verify the partition proof (with `substate_tier_root` as value) -> compute `partition_tier_root`
+/// 3. Verify the entity proof (with `partition_tier_root` as value) -> compute `entity_root`
 /// 4. Compare `entity_root` against `expected_state_root`
 ///
-/// The `value` parameter is the raw substate value (will be blake2b-hashed).
+/// The `value` parameter is the raw substate value (will be Blake3-hashed).
 /// Pass `None` for deleted/non-existent substates.
 pub fn verify_substate_inclusion_proof(
     proof: &SubstateInclusionProof,
@@ -186,26 +165,26 @@ pub fn verify_substate_inclusion_proof(
         return false;
     };
 
-    // Hash the value with blake2b-256
+    // Hash the value with Blake3
     let value_hash = match value {
-        Some(v) => blake2b_hash(v).0,
+        Some(v) => Hash::from_bytes(v).to_bytes(),
         None => [0u8; 32], // Zero hash for non-existent/deleted substates
     };
 
-    // 1. Verify substate tier proof → get substate_tier_root
+    // 1. Verify substate tier proof -> get substate_tier_root
     let Some(substate_tier_root) = verify_single_tier(&proof.substate, sort_key, &value_hash)
     else {
         return false;
     };
 
-    // 2. Verify partition tier proof (value = substate_tier_root) → get partition_tier_root
+    // 2. Verify partition tier proof (value = substate_tier_root) -> get partition_tier_root
     let Some(partition_tier_root) =
         verify_single_tier(&proof.partition, &[partition_num], &substate_tier_root)
     else {
         return false;
     };
 
-    // 3. Verify entity tier proof (value = partition_tier_root) → get entity_root
+    // 3. Verify entity tier proof (value = partition_tier_root) -> get entity_root
     let Some(entity_root) = verify_single_tier(&proof.entity, entity_key, &partition_tier_root)
     else {
         return false;
@@ -303,10 +282,9 @@ mod tests {
 
         // Commit the substate to the JMT
         let updates = make_update(&entity_key, partition, &sort_key, &value);
-        let root_hash = put_at_next_version(&tree_store, None, &updates);
+        let state_root = put_at_next_version(&tree_store, None, &updates);
         let state_version = 1u64;
 
-        let state_root = Hash::from_hash_bytes(&root_hash.0);
         let storage_key = build_storage_key(&entity_key, partition, &sort_key);
 
         // Generate proof
@@ -336,8 +314,7 @@ mod tests {
         let value = vec![1, 2, 3];
 
         let updates = make_update(&entity_key, partition, &sort_key, &value);
-        let root_hash = put_at_next_version(&tree_store, None, &updates);
-        let state_root = Hash::from_hash_bytes(&root_hash.0);
+        let state_root = put_at_next_version(&tree_store, None, &updates);
         let storage_key = build_storage_key(&entity_key, partition, &sort_key);
 
         let proofs = generate_merkle_proofs(&tree_store, std::slice::from_ref(&storage_key), 1);
@@ -390,8 +367,7 @@ mod tests {
         let updates_b = make_update(&entity_b, 0, &[2], &value_b);
         updates.node_updates.extend(updates_b.node_updates);
 
-        let root_hash = put_at_next_version(&tree_store, None, &updates);
-        let state_root = Hash::from_hash_bytes(&root_hash.0);
+        let state_root = put_at_next_version(&tree_store, None, &updates);
 
         let key_a = build_storage_key(&entity_a, 0, &[1]);
         let key_b = build_storage_key(&entity_b, 0, &[2]);

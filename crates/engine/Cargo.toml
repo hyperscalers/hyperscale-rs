@@ -21,6 +21,3 @@ radix-engine.workspace = true
 radix-engine-interface.workspace = true
 radix-transactions.workspace = true
 radix-substate-store-interface.workspace = true
-radix-substate-store-impls.workspace = true
-
-[dev-dependencies]

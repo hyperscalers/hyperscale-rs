@@ -6,7 +6,7 @@ description = "Core types for Hyperscale consensus"
 
 [dependencies]
 # Cryptographic primitives
-blake3 = "1.5"
+blake3.workspace = true
 hex = "0.4"
 ed25519-dalek = { version = "2.1", features = ["rand_core", "batch"] }
 blst = "0.3"

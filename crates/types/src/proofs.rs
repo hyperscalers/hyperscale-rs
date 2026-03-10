@@ -35,7 +35,7 @@ use std::sync::Arc;
 /// # Verification
 ///
 /// To verify inclusion, call `verify(key, value_hash, expected_root)`:
-/// 1. Compute leaf hash = blake2b-256(leaf_key || leaf_value_hash)
+/// 1. Compute leaf hash = blake3(leaf_key || leaf_value_hash)
 /// 2. Walk up the tree using sibling hashes, with the key bits determining left/right
 /// 3. Compare the computed root to `expected_root`
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,7 +119,7 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for MerkleInclusionProof {
 /// 2. **Partition proof**: proves the partition's substate-tier root hash against the entity root
 /// 3. **Substate proof**: proves the substate value hash against the partition root
 ///
-/// Verification is done in the storage crate using blake2b-256 (the JMT's hash function).
+/// Verification is done in the storage crate using Blake3 (the JMT's hash function).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubstateInclusionProof {
     /// Entity-tier inclusion proof.

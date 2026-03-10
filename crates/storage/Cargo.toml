@@ -7,17 +7,14 @@ description = "Storage traits and shared types"
 [dependencies]
 # Internal crates
 hyperscale-types.workspace = true
+hyperscale-jmt.workspace = true
 
-# Radix dependencies (for SubstateDatabase, JMT types)
+# Radix dependencies (for SubstateDatabase, DatabaseUpdates, etc.)
 radix-common.workspace = true
 radix-substate-store-interface.workspace = true
-radix-substate-store-impls.workspace = true
 
 # Key encoding
 indexmap.workspace = true
-
-# Hashing (incremental blake2b for proof verification)
-blake2.workspace = true
 
 [features]
 test-utils = []

@@ -155,11 +155,11 @@ impl RocksDbStorage {
             .get(b"jmt:root_hash")
             .expect("BFT CRITICAL: failed to read jmt:root_hash")
             .map(|v| {
-                StateRootHash(
-                    <[u8; 32]>::try_from(v.as_slice()).expect("jmt:root_hash must be 32 bytes"),
+                StateRootHash::from_hash_bytes(
+                    &<[u8; 32]>::try_from(v.as_slice()).expect("jmt:root_hash must be 32 bytes"),
                 )
             })
-            .unwrap_or(StateRootHash([0u8; 32]));
+            .unwrap_or(StateRootHash::ZERO);
 
         (version, root_hash)
     }
@@ -213,7 +213,7 @@ impl RocksDbStorage {
 
         // JMT metadata
         batch.put(b"jmt:version", new_version.to_be_bytes());
-        batch.put(b"jmt:root_hash", snapshot.result_root.0);
+        batch.put(b"jmt:root_hash", snapshot.result_root.to_bytes());
     }
 
     /// Internal: iterate over a key range in the state CF.
@@ -424,11 +424,12 @@ impl<'a> SnapshotTreeStore<'a> {
             .get(b"jmt:root_hash")
             .expect("BFT CRITICAL: failed to read jmt:root_hash from snapshot")
             .map(|bytes| {
-                StateRootHash(
-                    <[u8; 32]>::try_from(bytes.as_slice()).expect("jmt:root_hash must be 32 bytes"),
+                StateRootHash::from_hash_bytes(
+                    &<[u8; 32]>::try_from(bytes.as_slice())
+                        .expect("jmt:root_hash must be 32 bytes"),
                 )
             })
-            .unwrap_or(StateRootHash([0u8; 32]));
+            .unwrap_or(StateRootHash::ZERO);
 
         (version, root_hash)
     }
@@ -631,7 +632,7 @@ impl SubstateStore for RocksDbStorage {
 
     fn state_root_hash(&self) -> hyperscale_types::Hash {
         let (_, root_hash) = self.read_jmt_metadata();
-        hyperscale_types::Hash::from_hash_bytes(&root_hash.0)
+        root_hash
     }
 
     fn list_substates_for_node_at_version(
@@ -738,7 +739,7 @@ impl RocksDbStorage {
         let snapshot_store = SnapshotTreeStore::new(&self.db);
         let (base_version, base_root) = snapshot_store.read_jmt_metadata();
 
-        let current_root = hyperscale_types::Hash::from_hash_bytes(&base_root.0);
+        let current_root = base_root;
 
         // If no certificates, return current root with empty snapshot.
         if updates_per_cert.is_empty() {
@@ -780,10 +781,9 @@ impl RocksDbStorage {
             current_version += 1;
         }
 
-        let result_root = hyperscale_types::Hash::from_hash_bytes(&root.0);
         let snapshot = overlay.into_snapshot(base_root, base_version, root, num_versions);
 
-        (result_root, snapshot)
+        (root, snapshot)
     }
 
     /// Build a WriteBatch for all certificates in a block.
@@ -901,7 +901,7 @@ impl RocksDbStorage {
 
         tracing::debug!(
             new_version,
-            new_root = %hex::encode(new_root.0),
+            new_root = %hex::encode(new_root.to_bytes()),
             nodes_count,
             stale_count,
             associations_count,
@@ -1688,7 +1688,7 @@ impl RocksDbStorage {
             tx_hash = %certificate.transaction_hash,
             write_count = writes.len(),
             new_version,
-            new_root = %hex::encode(new_root.0),
+            new_root = %hex::encode(new_root.to_bytes()),
             "JMT updated after certificate commit"
         );
 

@@ -7,6 +7,7 @@ members = [
     "crates/dispatch-pooled",
     "crates/dispatch-sync",
     "crates/engine",
+    "crates/jmt",
     "crates/execution",
     "crates/livelock",
     "crates/mempool",
@@ -38,6 +39,7 @@ default-members = [
     "crates/dispatch-pooled",
     "crates/dispatch-sync",
     "crates/engine",
+    "crates/jmt",
     "crates/execution",
     "crates/livelock",
     "crates/mempool",
@@ -80,6 +82,7 @@ hyperscale-storage = { path = "crates/storage" }
 hyperscale-storage-memory = { path = "crates/storage-memory" }
 hyperscale-storage-rocksdb = { path = "crates/storage-rocksdb" }
 hyperscale-engine = { path = "crates/engine" }
+hyperscale-jmt = { path = "crates/jmt" }
 hyperscale-execution = { path = "crates/execution" }
 hyperscale-livelock = { path = "crates/livelock" }
 hyperscale-mempool = { path = "crates/mempool" }
@@ -137,6 +140,7 @@ bencher = { version = "0.1.5" }
 bincode = { version = "2.0.0-rc.1", default-features = false, features = ["derive"] }
 bitflags = { version = "1.3" }
 blake2 = { version = "0.10.6", default-features = false }
+blake3 = "1.5"
 blst = { version = "0.3.11", default-features = false, features = ["portable"] }
 bnum = { version = "0.11.0", default-features = false, features = ["numtraits"] }
 colored = { version = "2.0.0", default-features = false }

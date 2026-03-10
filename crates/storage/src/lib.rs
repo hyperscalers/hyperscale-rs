@@ -49,7 +49,7 @@ pub use store::{SubstateStore, RADIX_PREFIX};
 pub use writes::{extract_writes_per_cert, substate_writes_to_database_updates};
 
 // Re-export commonly needed Radix types for storage implementations
-pub use radix_common::crypto::Hash as StateRootHash;
+pub use hyperscale_types::Hash as StateRootHash;
 pub use radix_common::prelude::{DatabaseUpdate, DbSubstateValue};
 pub use radix_substate_store_interface::interface::{
     CommittableSubstateDatabase, DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates,
@@ -61,23 +61,21 @@ pub use radix_substate_store_interface::interface::{
 /// These are implementation details needed by `storage-memory` and `storage-rocksdb`.
 /// They are not part of the abstract storage interface.
 pub mod jmt {
-    pub use radix_substate_store_impls::state_tree::put_at_next_version;
-    pub use radix_substate_store_impls::state_tree::tree_store::{
+    pub use hyperscale_jmt::put_at_next_version;
+    pub use hyperscale_jmt::tree_store::{
         encode_key, AssociatedSubstateValue, ReadableTreeStore, StaleTreePart, StoredTreeNodeKey,
         TreeNode, TypedInMemoryTreeStore, Version as StateVersion, VersionedTreeNode,
         WriteableTreeStore,
     };
 
     // Re-export types needed for proof generation and verification
-    pub use radix_substate_store_impls::state_tree::types::{
+    pub use hyperscale_jmt::types::{
         IteratedLeafKey, LeafKey, SparseMerkleLeafNode, SparseMerkleProof,
     };
 
     // Re-export tier types for proof generation and historical reads
-    pub use radix_substate_store_impls::state_tree::entity_tier::EntityTier;
-    pub use radix_substate_store_impls::state_tree::partition_tier::PartitionTier;
-    pub use radix_substate_store_impls::state_tree::substate_tier::{
-        SubstateSummary, SubstateTier,
-    };
-    pub use radix_substate_store_impls::state_tree::tier_framework::ReadableTier;
+    pub use hyperscale_jmt::entity_tier::EntityTier;
+    pub use hyperscale_jmt::partition_tier::PartitionTier;
+    pub use hyperscale_jmt::substate_tier::{SubstateSummary, SubstateTier};
+    pub use hyperscale_jmt::tier_framework::ReadableTier;
 }
