@@ -330,15 +330,27 @@ fn default_view_change_cooldown_rounds() -> u64 {
 /// Thread pool configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ThreadsConfig {
+    /// Number of consensus crypto threads (0 = auto, default 2).
+    /// These are liveness-critical for block vote and QC verification.
+    #[serde(default)]
+    pub consensus_crypto_threads: usize,
+
     /// Number of crypto verification threads (0 = auto)
     #[serde(default)]
     pub crypto_threads: usize,
+
+    /// Number of transaction validation threads (0 = auto).
+    /// Isolated from general crypto to prevent transaction floods
+    /// from blocking provision/execution vote verification.
+    #[serde(default)]
+    pub tx_validation_threads: usize,
 
     /// Number of execution threads (0 = auto)
     #[serde(default)]
     pub execution_threads: usize,
 
-    /// Number of I/O threads (0 = auto)
+    /// Number of tokio runtime worker threads (0 = auto).
+    /// Controls the async I/O runtime used for networking, timers, and RPC.
     #[serde(default)]
     pub io_threads: usize,
 
@@ -824,8 +836,14 @@ fn build_engine_genesis_config(config: &GenesisConfig) -> Result<hyperscale_engi
 fn build_thread_pool_config(config: &ThreadsConfig) -> ThreadPoolConfig {
     let mut builder = ThreadPoolConfig::builder();
 
+    if config.consensus_crypto_threads > 0 {
+        builder = builder.consensus_crypto_threads(config.consensus_crypto_threads);
+    }
     if config.crypto_threads > 0 {
         builder = builder.crypto_threads(config.crypto_threads);
+    }
+    if config.tx_validation_threads > 0 {
+        builder = builder.tx_validation_threads(config.tx_validation_threads);
     }
     if config.execution_threads > 0 {
         builder = builder.execution_threads(config.execution_threads);
@@ -1055,14 +1073,28 @@ async fn setup_upnp(config: &NetworkConfig) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Load configuration first (before logging init) to check if telemetry is enabled
+    // Load configuration first (before runtime construction) to read io_threads
     let mut config = ValidatorConfig::load(&cli.config)?;
     config.apply_overrides(&cli);
 
+    // Build tokio runtime with configurable worker threads.
+    // io_threads = 0 means auto (tokio default: one thread per CPU core).
+    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
+    rt_builder.enable_all();
+    if config.threads.io_threads > 0 {
+        rt_builder.worker_threads(config.threads.io_threads);
+    }
+    let rt = rt_builder
+        .build()
+        .context("Failed to build tokio runtime")?;
+
+    rt.block_on(async_main(cli, config))
+}
+
+async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     // Initialize telemetry/logging
     // If telemetry is enabled, init_telemetry sets up the global subscriber with OTLP export.
     // Otherwise, use basic fmt subscriber.

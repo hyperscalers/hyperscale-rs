@@ -137,7 +137,9 @@ max_certificates_per_block = 4096
 rpc_mempool_limit = 16384
 
 [threads]
+consensus_crypto_threads = 0
 crypto_threads = 0
+tx_validation_threads = 0
 execution_threads = 0
 io_threads = 0
 pin_cores = false

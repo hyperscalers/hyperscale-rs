@@ -77,13 +77,19 @@ rpc_mempool_limit = 16384
 # ═══════════════════════════════════════════════════════════════════════════════
 
 [threads]
-# Threads for BLS signature verification (0 = auto-detect)
+# Threads for consensus-critical crypto (block votes, QC verification) (0 = auto, default 2)
+consensus_crypto_threads = 0
+
+# Threads for general crypto verification (provisions, execution votes) (0 = auto-detect)
 crypto_threads = 0
+
+# Threads for transaction signature validation (0 = auto-detect)
+tx_validation_threads = 0
 
 # Threads for transaction execution (0 = auto-detect)
 execution_threads = 0
 
-# Threads for async I/O (network, storage) (0 = auto-detect)
+# Tokio runtime worker threads for async I/O (network, timers, RPC) (0 = auto-detect)
 io_threads = 0
 
 # Pin threads to specific CPU cores for better cache locality
