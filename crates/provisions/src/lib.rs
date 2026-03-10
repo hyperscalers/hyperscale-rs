@@ -1,14 +1,18 @@
-//! Centralized provision coordination for cross-shard transactions.
+//! This crate encapsulates the provision coordination logic for cross-shard transactions.
 //!
-//! This crate provides the `ProvisionCoordinator`, which centralizes all provision
-//! tracking and verification for cross-shard transactions.
+//! It defines the `ProvisionCoordinator`, which manages the tracking, validation,
+//! and completion of state provisions exchanged between shards.
 //!
 //! ## Provision Flow
 //!
-//! 1. Source shard proposer broadcasts `StateProvision` batch with JMT inclusion proofs
-//! 2. Target shard receives batch, joins with remote block headers
-//! 3. `VerifyStateProvisions` validates the QC signature once and merkle proofs per provision
-//! 4. Verified provisions are stored and trigger completion events
+//! 1. The source shard proposer broadcasts a `StateProvision` batch containing
+//!    Jellyfish Merkle Tree (JMT) inclusion proofs.
+//! 2. The target shard receives the batch and associates the provisions with
+//!    the corresponding remote block headers.
+//! 3. `VerifyStateProvisions` validates the quorum certificate (QC) signature
+//!    once per batch and verifies the Merkle inclusion proof for each provision.
+//! 4. Verified provisions are persisted and emit completion events for downstream
+//!    transaction execution.
 //!
 //! # Components
 //!
