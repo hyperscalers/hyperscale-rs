@@ -33,6 +33,7 @@ hyperscale-storage.workspace = true
 hyperscale-storage-rocksdb.workspace = true
 hyperscale-node.workspace = true
 hyperscale-provisions.workspace = true
+hyperscale-topology.workspace = true
 hyperscale-types.workspace = true
 hyperscale-messages.workspace = true
 hyperscale-network.workspace = true

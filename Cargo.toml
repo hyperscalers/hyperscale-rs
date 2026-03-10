@@ -27,6 +27,7 @@ members = [
     "crates/storage-memory",
     "crates/storage-rocksdb",
     "crates/test-helpers",
+    "crates/topology",
     "crates/types",
 ]
 
@@ -57,6 +58,7 @@ default-members = [
     "crates/storage-memory",
     "crates/storage-rocksdb",
     "crates/test-helpers",
+    "crates/topology",
     "crates/types",
 ]
 
@@ -92,6 +94,7 @@ hyperscale-simulation = { path = "crates/simulation" }
 hyperscale-simulator = { path = "crates/simulator" }
 hyperscale-spammer = { path = "crates/spammer" }
 hyperscale-test-helpers = { path = "crates/test-helpers" }
+hyperscale-topology = { path = "crates/topology" }
 hyperscale-types = { path = "crates/types" }
 
 # External dependencies

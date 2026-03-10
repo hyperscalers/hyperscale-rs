@@ -1,0 +1,13 @@
+[package]
+name = "hyperscale-topology"
+version.workspace = true
+edition.workspace = true
+description = "Topology state for shard committee management"
+
+[dependencies]
+hyperscale-types.workspace = true
+
+thiserror.workspace = true
+
+[dev-dependencies]
+hyperscale-test-helpers.workspace = true

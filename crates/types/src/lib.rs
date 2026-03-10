@@ -55,7 +55,7 @@ pub use crypto::{
 };
 pub use epoch::{
     EpochConfig, EpochId, GlobalConsensusConfig, GlobalValidatorInfo, ShardCommitteeConfig,
-    ShardHashRange, ValidatorRating, ValidatorShardState, DEFAULT_EPOCH_LENGTH,
+    ValidatorRating, ValidatorShardState, DEFAULT_EPOCH_LENGTH,
 };
 pub use hash::{compute_merkle_root, Hash};
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
@@ -79,9 +79,7 @@ pub use signer_bitfield::SignerBitfield;
 pub use state::{
     ExecutionCertificate, ExecutionResult, ExecutionVote, StateEntry, StateProvision, SubstateWrite,
 };
-pub use topology::{
-    shard_for_node, DynamicTopology, DynamicTopologyError, StaticTopology, Topology, TopologyError,
-};
+pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
     sign_and_notarize, sign_and_notarize_with_options, AbortReason, DeferReason, ReadyTransactions,
     RetryDetails, RoutableTransaction, TransactionAbort, TransactionCertificate,

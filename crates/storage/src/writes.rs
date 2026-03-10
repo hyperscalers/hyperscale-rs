@@ -260,11 +260,11 @@ mod tests {
             ],
         ));
 
-        let result_shard0 = extract_writes_per_cert(&[cert.clone()], ShardGroupId(0));
+        let result_shard0 = extract_writes_per_cert(std::slice::from_ref(&cert), ShardGroupId(0));
         assert_eq!(result_shard0.len(), 1);
         assert_eq!(result_shard0[0], shard0_writes);
 
-        let result_shard1 = extract_writes_per_cert(&[cert.clone()], ShardGroupId(1));
+        let result_shard1 = extract_writes_per_cert(std::slice::from_ref(&cert), ShardGroupId(1));
         assert_eq!(result_shard1.len(), 1);
         assert_eq!(result_shard1[0], shard1_writes);
 

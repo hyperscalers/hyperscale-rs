@@ -14,7 +14,7 @@
 use hyperscale_messages::request::GetProvisionsRequest;
 use hyperscale_messages::response::GetProvisionsResponse;
 use hyperscale_storage::{ConsensusStore, SubstateStore};
-use hyperscale_types::{BlockHeight, ShardGroupId, StateProvision, Topology, ValidatorId};
+use hyperscale_types::{BlockHeight, ShardGroupId, StateProvision, ValidatorId};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, trace};
@@ -318,9 +318,13 @@ impl ProvisionFetchProtocol {
 /// Looks up the block at the requested height, identifies transactions
 /// that involve the requesting shard, collects the local state entries
 /// and merkle proofs, and returns them as `StateProvision`s.
+///
+/// Takes `local_shard` and `num_shards` instead of `&TopologyState`
+/// to avoid topology dependency in the I/O layer.
 pub fn serve_provision_request(
     storage: &(impl ConsensusStore + SubstateStore),
-    topology: &dyn Topology,
+    local_shard: ShardGroupId,
+    num_shards: u64,
     req: GetProvisionsRequest,
 ) -> GetProvisionsResponse {
     trace!(
@@ -328,8 +332,6 @@ pub fn serve_provision_request(
         target_shard = req.target_shard.0,
         "Handling provision request"
     );
-
-    let local_shard = topology.local_shard();
 
     let (block, _qc) = match storage.get_block(req.block_height) {
         Some(pair) => pair,
@@ -352,8 +354,15 @@ pub fn serve_provision_request(
         .chain(block.transactions.iter());
 
     for tx in all_txs {
-        let shards = topology.all_shards_for_transaction(tx);
-        if !shards.contains(&req.target_shard) {
+        // Check if this transaction involves the requesting target shard
+        let involves_target = tx
+            .declared_reads
+            .iter()
+            .chain(tx.declared_writes.iter())
+            .any(|node_id| {
+                hyperscale_types::shard_for_node(node_id, num_shards) == req.target_shard
+            });
+        if !involves_target {
             continue;
         }
 
@@ -361,7 +370,7 @@ pub fn serve_provision_request(
             .declared_reads
             .iter()
             .chain(tx.declared_writes.iter())
-            .filter(|&node_id| topology.shard_for_node_id(node_id) == local_shard)
+            .filter(|&node_id| hyperscale_types::shard_for_node(node_id, num_shards) == local_shard)
             .copied()
             .collect();
         owned_nodes.sort();

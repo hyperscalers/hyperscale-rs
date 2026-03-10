@@ -6,10 +6,9 @@
 use crate::tracker::{CommittedCrossShardTracker, ProvisionTracker, RemoteStateNeeds};
 use hyperscale_types::{
     BlockHeight, CommitmentProof, DeferReason, Hash, NodeId, RoutableTransaction, ShardGroupId,
-    Topology, TransactionDefer,
+    TopologySnapshot, TransactionDefer,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, trace, warn};
 
@@ -46,12 +45,6 @@ impl Default for LivelockConfig {
 /// - Status updates (handled by MempoolState)
 /// - Provision quorum tracking (handled by ExecutionState)
 pub struct LivelockState {
-    /// This node's shard group.
-    local_shard: ShardGroupId,
-
-    /// Network topology for shard lookups.
-    topology: Arc<dyn Topology>,
-
     /// Tracks committed cross-shard TXs and which shards they need provisions from.
     committed_tracker: CommittedCrossShardTracker,
 
@@ -86,7 +79,6 @@ pub struct LivelockState {
 impl std::fmt::Debug for LivelockState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LivelockState")
-            .field("local_shard", &self.local_shard)
             .field("committed_tracker_len", &self.committed_tracker.len())
             .field("provision_tracker_len", &self.provision_tracker.len())
             .field("deferred_tombstones_len", &self.deferred_tombstones.len())
@@ -95,21 +87,21 @@ impl std::fmt::Debug for LivelockState {
     }
 }
 
+impl Default for LivelockState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LivelockState {
     /// Create a new LivelockState.
-    pub fn new(local_shard: ShardGroupId, topology: Arc<dyn Topology>) -> Self {
-        Self::with_config(local_shard, topology, LivelockConfig::default())
+    pub fn new() -> Self {
+        Self::with_config(LivelockConfig::default())
     }
 
     /// Create a new LivelockState with custom configuration.
-    pub fn with_config(
-        local_shard: ShardGroupId,
-        topology: Arc<dyn Topology>,
-        config: LivelockConfig,
-    ) -> Self {
+    pub fn with_config(config: LivelockConfig) -> Self {
         Self {
-            local_shard,
-            topology,
             committed_tracker: CommittedCrossShardTracker::new(),
             provision_tracker: ProvisionTracker::new(),
             deferred_tombstones: HashMap::new(),
@@ -130,11 +122,16 @@ impl LivelockState {
     ///
     /// Registers the transaction for cycle detection by tracking which
     /// shards and specific nodes it needs provisions from.
-    pub fn on_cross_shard_committed(&mut self, tx: &RoutableTransaction, height: BlockHeight) {
+    pub fn on_cross_shard_committed(
+        &mut self,
+        topology: &TopologySnapshot,
+        tx: &RoutableTransaction,
+        height: BlockHeight,
+    ) {
         let tx_hash = tx.hash();
 
         // Determine which shards and nodes we need provisions from
-        let needs = self.compute_remote_state_needs(tx);
+        let needs = self.compute_remote_state_needs(topology, tx);
 
         if needs.shards.is_empty() {
             // Not actually cross-shard, nothing to track
@@ -152,15 +149,19 @@ impl LivelockState {
     }
 
     /// Compute which remote shards and nodes a transaction needs provisions from.
-    fn compute_remote_state_needs(&self, tx: &RoutableTransaction) -> RemoteStateNeeds {
-        let local_shard = self.local_shard;
+    fn compute_remote_state_needs(
+        &self,
+        topology: &TopologySnapshot,
+        tx: &RoutableTransaction,
+    ) -> RemoteStateNeeds {
+        let local_shard = topology.local_shard();
 
         // Collect all reads and writes, grouped by shard
         let mut nodes_by_shard: HashMap<ShardGroupId, HashSet<NodeId>> = HashMap::new();
 
         // Add read nodes (provisions come from read shards)
         for node_id in &tx.declared_reads {
-            let shard = self.topology.shard_for_node_id(node_id);
+            let shard = topology.shard_for_node_id(node_id);
             if shard != local_shard {
                 nodes_by_shard.entry(shard).or_default().insert(*node_id);
             }
@@ -168,7 +169,7 @@ impl LivelockState {
 
         // Add write nodes from remote shards (for read-your-writes scenarios)
         for node_id in &tx.declared_writes {
-            let shard = self.topology.shard_for_node_id(node_id);
+            let shard = topology.shard_for_node_id(node_id);
             if shard != local_shard {
                 nodes_by_shard.entry(shard).or_default().insert(*node_id);
             }
@@ -467,8 +468,11 @@ impl LivelockState {
     }
 
     /// Check if a transaction is cross-shard (needs provisions from other shards).
-    pub fn is_cross_shard(&self, tx: &RoutableTransaction) -> bool {
-        !self.compute_remote_state_needs(tx).shards.is_empty()
+    pub fn is_cross_shard(&self, topology: &TopologySnapshot, tx: &RoutableTransaction) -> bool {
+        !self
+            .compute_remote_state_needs(topology, tx)
+            .shards
+            .is_empty()
     }
 
     /// Get statistics for metrics.
@@ -496,27 +500,8 @@ pub struct LivelockStats {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        generate_bls_keypair, zero_bls_signature, SignerBitfield, StateEntry, StaticTopology,
-        SubstateInclusionProof, ValidatorId, ValidatorInfo, ValidatorSet,
+        zero_bls_signature, SignerBitfield, StateEntry, SubstateInclusionProof, ValidatorId,
     };
-
-    fn make_test_topology(local_shard: ShardGroupId) -> Arc<dyn Topology> {
-        // Create a simple topology with 3 validators per shard
-        let validators: Vec<_> = (0..6)
-            .map(|i| ValidatorInfo {
-                validator_id: ValidatorId(i),
-                public_key: generate_bls_keypair().public_key(),
-                voting_power: 1,
-            })
-            .collect();
-
-        Arc::new(StaticTopology::with_local_shard(
-            ValidatorId(local_shard.0 * 3), // First validator in shard
-            local_shard,
-            2,
-            ValidatorSet::new(validators),
-        ))
-    }
 
     fn make_test_node_id(id: u8) -> NodeId {
         // Create a simple NodeId from bytes
@@ -637,8 +622,7 @@ mod tests {
 
     #[test]
     fn test_cycle_detection_basic() {
-        let topology = make_test_topology(ShardGroupId(0));
-        let mut state = LivelockState::new(ShardGroupId(0), topology);
+        let mut state = LivelockState::new();
 
         // Create hashes with predictable ordering
         // local_tx has higher first byte (0xFF) so it loses
@@ -673,8 +657,7 @@ mod tests {
 
     #[test]
     fn test_no_cycle_when_we_win() {
-        let topology = make_test_topology(ShardGroupId(0));
-        let mut state = LivelockState::new(ShardGroupId(0), topology);
+        let mut state = LivelockState::new();
 
         // Create hashes with predictable ordering
         // local_tx has lower first byte (0x00) so it wins
@@ -703,8 +686,7 @@ mod tests {
 
     #[test]
     fn test_no_cycle_when_no_node_overlap() {
-        let topology = make_test_topology(ShardGroupId(0));
-        let mut state = LivelockState::new(ShardGroupId(0), topology);
+        let mut state = LivelockState::new();
 
         // local_tx would lose by hash comparison
         let local_tx = hash_with_prefix(0xFF);
@@ -731,8 +713,7 @@ mod tests {
 
     #[test]
     fn test_tombstone_filters_late_provisions() {
-        let topology = make_test_topology(ShardGroupId(0));
-        let mut state = LivelockState::new(ShardGroupId(0), topology);
+        let mut state = LivelockState::new();
 
         let tx = Hash::from_bytes(b"deferred_tx");
 
@@ -751,8 +732,7 @@ mod tests {
 
     #[test]
     fn test_cleanup_expired_tombstones() {
-        let topology = make_test_topology(ShardGroupId(0));
-        let mut state = LivelockState::new(ShardGroupId(0), topology);
+        let mut state = LivelockState::new();
 
         let tx1 = Hash::from_bytes(b"tx1");
         let tx2 = Hash::from_bytes(b"tx2");
@@ -776,8 +756,7 @@ mod tests {
 
     #[test]
     fn test_pending_deferral_deduplication() {
-        let topology = make_test_topology(ShardGroupId(0));
-        let mut state = LivelockState::new(ShardGroupId(0), topology);
+        let mut state = LivelockState::new();
 
         // Create hashes with predictable ordering
         let local_tx = hash_with_prefix(0xFF); // Higher hash (will lose)
@@ -822,8 +801,7 @@ mod tests {
 
     #[test]
     fn test_committed_tracker_cleanup_on_deferral() {
-        let topology = make_test_topology(ShardGroupId(0));
-        let mut state = LivelockState::new(ShardGroupId(0), topology);
+        let mut state = LivelockState::new();
 
         let tx = hash_with_prefix(0xFF);
         let node = make_test_node_id(1);
@@ -887,8 +865,7 @@ mod tests {
 
     #[test]
     fn test_committed_tracker_cleanup_on_certificate() {
-        let topology = make_test_topology(ShardGroupId(0));
-        let mut state = LivelockState::new(ShardGroupId(0), topology);
+        let mut state = LivelockState::new();
 
         let tx = hash_with_prefix(0xAA);
         let node = make_test_node_id(1);
@@ -943,8 +920,7 @@ mod tests {
     #[test]
     fn test_no_false_positive_unidirectional() {
         // Test that unidirectional dependencies don't trigger cycle detection
-        let topology = make_test_topology(ShardGroupId(0));
-        let mut state = LivelockState::new(ShardGroupId(0), topology);
+        let mut state = LivelockState::new();
 
         let local_tx = hash_with_prefix(0xFF);
         let remote_tx = hash_with_prefix(0x00);

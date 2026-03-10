@@ -22,5 +22,5 @@ pub use registry::{HandlerRegistry, RawGossipHandler, RawNotificationHandler, Ra
 pub use topic::{parse_topic, ParsedTopic, Topic};
 pub use traits::{
     GossipHandler, GossipVerdict, Network, NotificationHandler, RequestError, RequestHandler,
-    TopicScope,
+    TopicScope, ValidatorKeyMap,
 };

@@ -55,9 +55,10 @@ use hyperscale_production::{
     init_telemetry, PooledDispatch, ProductionRunner, RocksDbConfig, RocksDbStorage,
     TelemetryConfig, ThreadPoolConfig,
 };
+use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     bls_keypair_from_seed, generate_bls_keypair, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    ShardGroupId, StaticTopology, ValidatorId, ValidatorInfo, ValidatorSet,
+    ShardGroupId, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use radix_common::network::NetworkDefinition;
 use radix_common::prelude::AddressBech32Decoder;
@@ -674,7 +675,7 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1Priv
 fn build_topology(
     config: &ValidatorConfig,
     local_keypair: &Bls12381G1PrivateKey,
-) -> Result<Arc<dyn hyperscale_types::Topology>> {
+) -> Result<TopologyState> {
     use std::collections::HashMap;
 
     let local_validator_id = ValidatorId(config.node.validator_id);
@@ -753,14 +754,13 @@ fn build_topology(
             "Building topology with explicit shard assignments"
         );
 
-        Ok(StaticTopology::with_shard_committees(
+        Ok(TopologyState::with_shard_committees(
             local_validator_id,
             local_shard,
             num_shards,
             &validator_set,
             shard_committees,
-        )
-        .into_arc())
+        ))
     } else {
         // Legacy mode: all validators in genesis belong to local shard only
         // This only works for single-shard deployments
@@ -771,13 +771,12 @@ fn build_topology(
             );
         }
 
-        Ok(StaticTopology::with_local_shard(
+        Ok(TopologyState::with_local_shard(
             local_validator_id,
             local_shard,
             num_shards,
             validator_set,
-        )
-        .into_arc())
+        ))
     }
 }
 
@@ -1174,8 +1173,8 @@ async fn main() -> Result<()> {
     // Build topology
     let topology = build_topology(&config, &signing_keypair)?;
     info!(
-        committee_size = topology.local_committee_size(),
-        quorum_threshold = topology.local_quorum_threshold(),
+        committee_size = topology.snapshot().local_committee_size(),
+        quorum_threshold = topology.snapshot().local_quorum_threshold(),
         "Topology initialized"
     );
 

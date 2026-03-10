@@ -2,7 +2,7 @@
 
 use hyperscale_metrics as metrics;
 use hyperscale_types::{
-    Bls12381G1PublicKey, Bls12381G2Signature, ShardGroupId, Topology, ValidatorId,
+    Bls12381G1PublicKey, Bls12381G2Signature, ShardGroupId, TopologySnapshot, ValidatorId,
 };
 use tracing::warn;
 
@@ -24,7 +24,7 @@ pub(super) fn verify_bls_with_metrics(
 /// Returns `None` (with a warning) if the sender is not in the shard's
 /// committee or their public key cannot be resolved.
 pub(super) fn resolve_sender_key(
-    topology: &dyn Topology,
+    topology: &TopologySnapshot,
     sender: ValidatorId,
     shard: ShardGroupId,
     context: &str,
@@ -54,7 +54,7 @@ pub(super) fn resolve_sender_key(
 ///
 /// Returns `false` (with warnings) on any failure.
 pub(super) fn verify_sender_signature(
-    topology: &dyn Topology,
+    topology: &TopologySnapshot,
     sender: ValidatorId,
     shard: ShardGroupId,
     msg: &[u8],

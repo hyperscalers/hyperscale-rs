@@ -31,10 +31,9 @@ pub type NodeIndex = u32;
 use hyperscale_types::{
     block_header_message, committed_block_header_message, Block, BlockHeader, BlockHeight,
     BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommitmentProof, Hash,
-    QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, Topology,
+    QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot,
     TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
 };
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -159,13 +158,6 @@ pub struct BftState {
 
     /// Signing key for votes and proposals.
     signing_key: Bls12381G1PrivateKey,
-
-    /// Network topology (single source of truth for committee/shard info).
-    topology: Arc<dyn Topology>,
-
-    /// Shard group identifier for vote signature domain separation.
-    /// Prevents cross-shard replay attacks when validators participate in multiple shards.
-    shard_group: ShardGroupId,
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Chain State
@@ -378,9 +370,6 @@ impl std::fmt::Debug for BftState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BftState")
             .field("node_index", &self.node_index)
-            .field("validator_id", &self.topology.local_validator_id())
-            .field("shard", &self.topology.local_shard())
-            .field("committee_size", &self.topology.local_committee_size())
             .field("view", &self.view)
             .field("committed_height", &self.committed_height)
             .field("pending_blocks", &self.pending_blocks.len())
@@ -396,19 +385,16 @@ impl BftState {
     ///
     /// * `node_index` - Deterministic node index for ordering
     /// * `signing_key` - Key for signing votes and proposals
-    /// * `topology` - Network topology (single source of truth)
+    /// * `topology` - Network topology
     /// * `config` - BFT configuration
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
     pub fn new(
         node_index: NodeIndex,
         signing_key: Bls12381G1PrivateKey,
-        topology: Arc<dyn Topology>,
+        _topology: &TopologySnapshot,
         config: BftConfig,
         recovered: RecoveredState,
     ) -> Self {
-        // Get shard group for vote signature domain separation
-        let shard_group = topology.local_shard();
-
         // Filter out votes for heights at or below committed height (stale votes from storage)
         let voted_heights: HashMap<u64, (Hash, u64)> = recovered
             .voted_heights
@@ -419,8 +405,6 @@ impl BftState {
         Self {
             node_index,
             signing_key,
-            shard_group,
-            topology,
             view: 0,
             view_at_height_start: 0,
             committed_height: recovered.committed_height,
@@ -463,50 +447,6 @@ impl BftState {
         }
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Topology Accessors
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Get the local validator ID.
-    fn validator_id(&self) -> ValidatorId {
-        self.topology.local_validator_id()
-    }
-
-    /// Get the local shard.
-    fn local_shard(&self) -> ShardGroupId {
-        self.topology.local_shard()
-    }
-
-    /// Get the local committee.
-    fn committee(&self) -> Cow<'_, [ValidatorId]> {
-        self.topology.local_committee()
-    }
-
-    /// Get the total voting power.
-    fn total_voting_power(&self) -> u64 {
-        self.topology.local_voting_power()
-    }
-
-    /// Get voting power for a validator.
-    fn voting_power(&self, validator_id: ValidatorId) -> u64 {
-        self.topology.voting_power(validator_id).unwrap_or(0)
-    }
-
-    /// Get public key for a validator.
-    fn public_key(&self, validator_id: ValidatorId) -> Option<Bls12381G1PublicKey> {
-        self.topology.public_key(validator_id)
-    }
-
-    /// Get proposer for height and round.
-    fn proposer_for(&self, height: u64, round: u64) -> ValidatorId {
-        self.topology.proposer_for(height, round)
-    }
-
-    /// Check if we should propose.
-    fn should_propose(&self, height: u64, round: u64) -> bool {
-        self.topology.should_propose(height, round)
-    }
-
     /// Compute vote recipients for a vote at the given height/round.
     ///
     /// Returns up to `k` distinct next proposers (for rounds 0, 1, …),
@@ -514,14 +454,19 @@ impl BftState {
     /// Sending to k=2 provides redundancy: if the primary next proposer
     /// crashes before broadcasting its block, the secondary already has
     /// the votes and can form the QC on view change without re-collection.
-    fn vote_recipients(&self, height: u64, round: u64) -> Vec<ValidatorId> {
+    fn vote_recipients(
+        &self,
+        topology: &TopologySnapshot,
+        height: u64,
+        round: u64,
+    ) -> Vec<ValidatorId> {
         const K: usize = 2;
-        let committee_len = self.committee().len();
-        let self_id = self.validator_id();
+        let committee_len = topology.local_committee().len();
+        let self_id = topology.local_validator_id();
         let mut recipients = Vec::with_capacity(K);
 
         for offset in 0..committee_len as u64 {
-            let proposer = self.proposer_for(height + 1, round + offset);
+            let proposer = topology.proposer_for(height + 1, round + offset);
             if proposer != self_id && !recipients.contains(&proposer) {
                 recipients.push(proposer);
                 if recipients.len() >= K {
@@ -531,11 +476,6 @@ impl BftState {
         }
 
         recipients
-    }
-
-    /// Get committee index for a validator.
-    fn committee_index(&self, validator_id: ValidatorId) -> Option<usize> {
-        self.topology.local_committee_index(validator_id)
     }
 
     /// Get the chain-committed state version.
@@ -607,15 +547,15 @@ impl BftState {
     /// When syncing:
     /// - Proposer will create empty "sync blocks" instead of skipping their turn
     /// - View changes are suppressed (we're intentionally behind)
-    fn set_syncing(&mut self, syncing: bool) {
+    fn set_syncing(&mut self, topology: &TopologySnapshot, syncing: bool) {
         if syncing && !self.syncing {
             info!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 "Entering sync mode - will propose empty blocks if selected"
             );
         } else if !syncing && self.syncing {
             info!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 "Exiting sync mode - resuming normal block production"
             );
             // Reset leader activity timeout since we've caught up
@@ -642,12 +582,17 @@ impl BftState {
     /// - The state machine accurately reflects that we're waiting for sync data
     ///
     /// The syncing flag will be cleared when `Event::SyncComplete` arrives.
-    fn start_sync(&mut self, target_height: u64, target_hash: Hash) -> Vec<Action> {
+    fn start_sync(
+        &mut self,
+        topology: &TopologySnapshot,
+        target_height: u64,
+        target_hash: Hash,
+    ) -> Vec<Action> {
         // Don't restart sync if we're already syncing
         // The runner's SyncManager handles target updates internally
         if self.syncing {
             debug!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 target_height,
                 "Already syncing, skipping duplicate start_sync"
             );
@@ -655,7 +600,7 @@ impl BftState {
         }
 
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             target_height,
             target_hash = ?target_hash,
             committed_height = self.committed_height,
@@ -666,7 +611,7 @@ impl BftState {
         // - Enables sync block proposals if we're the proposer
         // - Suppresses fetch requests (check_pending_block_fetches returns empty)
         // - Signals to other code that we're catching up
-        self.set_syncing(true);
+        self.set_syncing(topology, true);
 
         vec![Action::StartSync {
             target_height,
@@ -677,6 +622,7 @@ impl BftState {
     /// Handle a synced block ready to apply (from runner via Event::SyncBlockReadyToApply).
     pub fn on_sync_block_ready_to_apply(
         &mut self,
+        topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
     ) -> Vec<Action> {
@@ -686,7 +632,7 @@ impl BftState {
         // Late-arriving sync blocks can arrive after sync completes.
         if block_height <= self.committed_height {
             debug!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 block_height,
                 committed_height = self.committed_height,
                 "Ignoring stale synced block - already committed"
@@ -694,7 +640,7 @@ impl BftState {
             return vec![];
         }
 
-        self.on_synced_block_ready(block, qc)
+        self.on_synced_block_ready(topology, block, qc)
     }
 
     /// Handle sync complete (from runner via Event::SyncComplete).
@@ -702,18 +648,18 @@ impl BftState {
     /// Re-enables normal block proposals and view changes.
     /// Also triggers fetch requests for any pending blocks that still need data,
     /// since fetching was suppressed during sync.
-    pub fn on_sync_complete(&mut self) -> Vec<Action> {
+    pub fn on_sync_complete(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             "Sync complete, resuming normal consensus"
         );
-        self.set_syncing(false);
+        self.set_syncing(topology, false);
 
         // Resume fetching for any pending blocks that still need data.
         // During sync, check_pending_block_fetches() returns empty because we
         // don't want to compete with sync for network resources. Now that sync
         // is done, we need to fetch any missing transactions/certificates.
-        self.check_pending_block_fetches()
+        self.check_pending_block_fetches(topology)
     }
 
     /// Record leader activity (resets the view change timeout).
@@ -813,7 +759,7 @@ impl BftState {
     ///
     /// If a view change occurs, the caller should NOT proceed to call
     /// `on_proposal_timer` in the same event handling cycle.
-    pub fn check_round_timeout(&mut self) -> Option<Vec<Action>> {
+    pub fn check_round_timeout(&mut self, topology: &TopologySnapshot) -> Option<Vec<Action>> {
         if !self.should_advance_round() {
             return None;
         }
@@ -827,18 +773,22 @@ impl BftState {
         let rounds_at_height = self.view.saturating_sub(self.view_at_height_start);
 
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             view = self.view,
             rounds_at_height = rounds_at_height,
             timeout_ms = timeout.as_millis(),
             "Round timeout - advancing round (implicit view change)"
         );
 
-        Some(self.advance_round())
+        Some(self.advance_round(topology))
     }
 
     /// Initialize with genesis block (for fresh start).
-    pub fn initialize_genesis(&mut self, genesis: Block) -> Vec<Action> {
+    pub fn initialize_genesis(
+        &mut self,
+        topology: &TopologySnapshot,
+        genesis: Block,
+    ) -> Vec<Action> {
         let hash = genesis.hash();
 
         // CRITICAL: Set chain-committed state version from genesis block header.
@@ -851,7 +801,7 @@ impl BftState {
         self.committed_hash = hash;
 
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             genesis_hash = ?hash,
             genesis_state_version = self.last_chain_committed_state_version,
             "Initialized genesis block"
@@ -874,9 +824,9 @@ impl BftState {
     ///
     /// Call this on startup to restore state from persistent storage.
     /// The runner will respond with `Event::ChainMetadataFetched`.
-    pub fn request_recovery(&self) -> Vec<Action> {
+    pub fn request_recovery(&self, topology: &TopologySnapshot) -> Vec<Action> {
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             "Requesting chain metadata for recovery"
         );
         vec![Action::FetchChainMetadata]
@@ -888,6 +838,7 @@ impl BftState {
     #[instrument(skip(self, qc), fields(height = height.0, has_hash = hash.is_some(), has_qc = qc.is_some()))]
     pub fn on_chain_metadata_fetched(
         &mut self,
+        topology: &TopologySnapshot,
         height: BlockHeight,
         hash: Option<Hash>,
         qc: Option<QuorumCertificate>,
@@ -895,7 +846,7 @@ impl BftState {
         if height.0 == 0 && hash.is_none() {
             // No committed blocks - this is a fresh start
             info!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 "No committed blocks found - fresh start"
             );
             return vec![];
@@ -916,7 +867,7 @@ impl BftState {
         let removed_blocks = self.cleanup_old_state(height.0);
 
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             committed_height = self.committed_height,
             committed_hash = ?self.committed_hash,
             has_qc = qc.is_some(),
@@ -960,6 +911,7 @@ impl BftState {
     ))]
     pub fn on_proposal_timer(
         &mut self,
+        topology: &TopologySnapshot,
         ready_txs: &ReadyTransactions,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
@@ -977,7 +929,7 @@ impl BftState {
         let round = self.view;
 
         debug!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             height = next_height,
             round = round,
             "Proposal timer fired"
@@ -990,10 +942,10 @@ impl BftState {
         }];
 
         // Check if we should propose
-        if !self.should_propose(next_height, round) {
+        if !topology.should_propose(next_height, round) {
             trace!(
-                validator = ?self.validator_id(),
-                expected = ?self.proposer_for(next_height, round),
+                validator = ?topology.local_validator_id(),
+                expected = ?topology.proposer_for(next_height, round),
                 "Not the proposer for this height/round"
             );
             return actions;
@@ -1005,7 +957,7 @@ impl BftState {
         // which we cannot vote for (vote locking).
         if self.voted_heights.contains_key(&next_height) {
             trace!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 height = next_height,
                 round = round,
                 "Already voted at this height, skipping proposal"
@@ -1016,7 +968,7 @@ impl BftState {
         // If we're syncing, propose an empty sync block instead of a full block.
         // This keeps the chain advancing while we catch up on execution state.
         if self.syncing {
-            return self.build_and_broadcast_sync_block(next_height, round);
+            return self.build_and_broadcast_sync_block(topology, next_height, round);
         }
 
         // Build and broadcast block - parent is the latest certified block
@@ -1041,10 +993,8 @@ impl BftState {
         let deferred_with_height: Vec<TransactionDefer> = deferred
             .into_iter()
             .filter(|d| {
-                let quorum_threshold = self
-                    .topology
-                    .quorum_threshold_for_shard(d.proof.source_shard);
-                let (_, voting_power) = self.resolve_commitment_proof_signers(&d.proof);
+                let quorum_threshold = topology.quorum_threshold_for_shard(d.proof.source_shard);
+                let (_, voting_power) = self.resolve_commitment_proof_signers(topology, &d.proof);
                 if voting_power < quorum_threshold {
                     trace!(
                         tx_hash = %d.tx_hash,
@@ -1134,7 +1084,7 @@ impl BftState {
         });
 
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             height = next_height,
             round = round,
             transactions = retry_transactions.len() + priority_transactions.len() + other_transactions.len(),
@@ -1145,15 +1095,15 @@ impl BftState {
         // Compute provision_targets: which remote shards need provisions from
         // this block's cross-shard transactions. This is QC-attested (part of the
         // block hash), so target shards can detect missing provisions.
-        let local_shard = self.local_shard();
+        let local_shard = topology.local_shard();
         let mut provision_target_set = std::collections::BTreeSet::new();
         for tx in retry_transactions
             .iter()
             .chain(priority_transactions.iter())
             .chain(other_transactions.iter())
         {
-            if !self.topology.is_single_shard_transaction(tx) {
-                for shard in self.topology.all_shards_for_transaction(tx) {
+            if !topology.is_single_shard_transaction(tx) {
+                for shard in topology.all_shards_for_transaction(tx) {
                     if shard != local_shard {
                         provision_target_set.insert(shard);
                     }
@@ -1171,8 +1121,8 @@ impl BftState {
                 duration: self.config.proposal_interval,
             },
             Action::BuildProposal {
-                shard_group_id: self.local_shard(),
-                proposer: self.validator_id(),
+                shard_group_id: topology.local_shard(),
+                proposer: topology.local_validator_id(),
                 height: block_height,
                 round,
                 parent_hash,
@@ -1208,7 +1158,12 @@ impl BftState {
     /// # Returns
     ///
     /// Actions to broadcast the fallback block header and vote on it.
-    fn build_and_broadcast_fallback_block(&mut self, height: u64, round: u64) -> Vec<Action> {
+    fn build_and_broadcast_fallback_block(
+        &mut self,
+        topology: &TopologySnapshot,
+        height: u64,
+        round: u64,
+    ) -> Vec<Action> {
         let mut actions = vec![];
 
         // Get parent info from latest QC
@@ -1236,11 +1191,11 @@ impl BftState {
         let state_root = parent_state_root;
 
         let header = BlockHeader {
-            shard_group_id: self.local_shard(),
+            shard_group_id: topology.local_shard(),
             height: BlockHeight(height),
             parent_hash,
             parent_qc: parent_qc.clone(),
-            proposer: self.validator_id(),
+            proposer: topology.local_validator_id(),
             timestamp,
             round,
             is_fallback: true,
@@ -1264,7 +1219,7 @@ impl BftState {
         let block_hash = block.hash();
 
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             height = height,
             round = round,
             block_hash = ?block_hash,
@@ -1295,12 +1250,12 @@ impl BftState {
         self.record_leader_activity();
 
         actions.push(Action::BroadcastBlockHeader {
-            shard: self.local_shard(),
+            shard: topology.local_shard(),
             header: Box::new(gossip),
         });
 
         // Vote for our own fallback block
-        actions.extend(self.create_vote(block_hash, height, round));
+        actions.extend(self.create_vote(topology, block_hash, height, round));
 
         // Set proposal timer in case this fallback block doesn't get quorum.
         // Without this timer, consensus could stall if the block doesn't reach quorum.
@@ -1329,7 +1284,12 @@ impl BftState {
     ///
     /// Sync blocks use normal timestamps because the proposer is online with
     /// an accurate clock - they just can't execute transactions.
-    fn build_and_broadcast_sync_block(&mut self, height: u64, round: u64) -> Vec<Action> {
+    fn build_and_broadcast_sync_block(
+        &mut self,
+        topology: &TopologySnapshot,
+        height: u64,
+        round: u64,
+    ) -> Vec<Action> {
         let mut actions = vec![];
 
         // Get parent info from latest QC
@@ -1358,11 +1318,11 @@ impl BftState {
         let state_root = parent_state_root;
 
         let header = BlockHeader {
-            shard_group_id: self.local_shard(),
+            shard_group_id: topology.local_shard(),
             height: BlockHeight(height),
             parent_hash,
             parent_qc: parent_qc.clone(),
-            proposer: self.validator_id(),
+            proposer: topology.local_validator_id(),
             timestamp,
             round,
             is_fallback: false, // Not a fallback - just empty due to sync
@@ -1386,7 +1346,7 @@ impl BftState {
         let block_hash = block.hash();
 
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             height = height,
             round = round,
             block_hash = ?block_hash,
@@ -1417,12 +1377,12 @@ impl BftState {
         self.record_leader_activity();
 
         actions.push(Action::BroadcastBlockHeader {
-            shard: self.local_shard(),
+            shard: topology.local_shard(),
             header: Box::new(gossip),
         });
 
         // Vote for our own sync block
-        actions.extend(self.create_vote(block_hash, height, round));
+        actions.extend(self.create_vote(topology, block_hash, height, round));
 
         // Set proposal timer for next round
         actions.push(Action::SetTimer {
@@ -1452,7 +1412,12 @@ impl BftState {
     ///
     /// Actions to re-broadcast the block header. We do NOT create a new vote since
     /// we already voted for this block at this height.
-    fn repropose_locked_block(&mut self, block_hash: Hash, height: u64) -> Vec<Action> {
+    fn repropose_locked_block(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        height: u64,
+    ) -> Vec<Action> {
         let mut actions = vec![];
 
         // Try to get the pending block we voted for
@@ -1460,7 +1425,7 @@ impl BftState {
             // Block not in pending_blocks - might have been cleaned up or committed
             // Fall back to just setting the proposal timer
             warn!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 height = height,
                 block_hash = ?block_hash,
                 "Cannot re-propose: locked block not found in pending_blocks"
@@ -1487,7 +1452,7 @@ impl BftState {
         let manifest = pending.manifest().clone();
 
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             height = height,
             original_round = original_round,
             block_hash = ?block_hash,
@@ -1501,7 +1466,7 @@ impl BftState {
         let gossip = hyperscale_messages::BlockHeaderNotification::new(header, manifest, sig);
 
         actions.push(Action::BroadcastBlockHeader {
-            shard: self.local_shard(),
+            shard: topology.local_shard(),
             header: Box::new(gossip),
         });
 
@@ -1542,6 +1507,7 @@ impl BftState {
     ))]
     pub fn on_block_header(
         &mut self,
+        topology: &TopologySnapshot,
         header: BlockHeader,
         manifest: BlockManifest,
         mempool: &HashMap<Hash, Arc<RoutableTransaction>>,
@@ -1552,7 +1518,7 @@ impl BftState {
         let round = header.round;
 
         debug!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             proposer = ?header.proposer,
             height = height,
             round = round,
@@ -1590,7 +1556,7 @@ impl BftState {
                 let target_hash = parent_block_hash;
 
                 info!(
-                    validator = ?self.validator_id(),
+                    validator = ?topology.local_validator_id(),
                     committed_height = self.committed_height,
                     parent_height = parent_height,
                     target_height = target_height,
@@ -1600,7 +1566,7 @@ impl BftState {
                 // Queue sync action but DON'T return - continue processing the header.
                 // This allows us to build QCs and propose sync blocks while syncing.
                 // start_sync sets the syncing flag immediately and returns StartSync action.
-                sync_actions = self.start_sync(target_height, target_hash);
+                sync_actions = self.start_sync(topology, target_height, target_hash);
             }
 
             // Only update latest_qc if we actually have the parent block it references.
@@ -1614,12 +1580,12 @@ impl BftState {
                     .is_none_or(|existing| header.parent_qc.height.0 > existing.height.0);
             if should_update_qc {
                 debug!(
-                    validator = ?self.validator_id(),
+                    validator = ?topology.local_validator_id(),
                     qc_height = header.parent_qc.height.0,
                     "Updated latest_qc from received block header"
                 );
                 self.latest_qc = Some(header.parent_qc.clone());
-                self.maybe_unlock_for_qc(&header.parent_qc);
+                self.maybe_unlock_for_qc(topology, &header.parent_qc);
 
                 // Persist the now-certified parent block for sync availability.
                 // With targeted votes, only the next proposer forms the QC via
@@ -1643,7 +1609,7 @@ impl BftState {
                 // ancestor block. This is essential when votes are targeted
                 // to the next proposer only — non-proposers learn about QCs
                 // via block headers rather than forming them locally.
-                sync_actions.extend(self.try_two_chain_commit(&header.parent_qc));
+                sync_actions.extend(self.try_two_chain_commit(topology, &header.parent_qc));
             }
         }
 
@@ -1653,7 +1619,7 @@ impl BftState {
         // faster than waiting for QC-based sync alone.
         if round > self.view {
             info!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 old_view = self.view,
                 new_view = round,
                 header_height = height,
@@ -1663,9 +1629,9 @@ impl BftState {
         }
 
         // Basic validation
-        if let Err(e) = self.validate_header(&header) {
+        if let Err(e) = self.validate_header(topology, &header) {
             warn!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 error = %e,
                 "Invalid block header"
             );
@@ -1718,7 +1684,7 @@ impl BftState {
         }
 
         // Check if we should trigger verification now that we have the header
-        let mut actions = self.maybe_trigger_vote_verification(block_hash);
+        let mut actions = self.maybe_trigger_vote_verification(topology, block_hash);
 
         // Always include sync actions if we need to sync
         actions.extend(sync_actions);
@@ -1750,7 +1716,7 @@ impl BftState {
             }
 
             // Trigger QC verification (for non-genesis) or vote directly (for genesis)
-            actions.extend(self.trigger_qc_verification_or_vote(block_hash));
+            actions.extend(self.trigger_qc_verification_or_vote(topology, block_hash));
             return actions;
         }
 
@@ -1764,7 +1730,7 @@ impl BftState {
         // - Certificates can be created locally from execution certificates
         if let Some(pending) = self.pending_blocks.get(&block_hash) {
             debug!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 block_hash = ?block_hash,
                 missing_txs = pending.missing_transaction_count(),
                 missing_certs = pending.missing_certificate_count(),
@@ -1780,15 +1746,19 @@ impl BftState {
     /// Collect public keys for QC signers (helper for delegated verification).
     ///
     /// Returns the public keys for all signers in committee order, or None if any key is missing.
-    fn collect_qc_signer_keys(&self, _qc: &QuorumCertificate) -> Option<Vec<Bls12381G1PublicKey>> {
-        let committee_size = self.topology.local_committee_size();
+    fn collect_qc_signer_keys(
+        &self,
+        topology: &TopologySnapshot,
+        _qc: &QuorumCertificate,
+    ) -> Option<Vec<Bls12381G1PublicKey>> {
+        let committee_size = topology.local_committee_size();
         let mut pubkeys = Vec::with_capacity(committee_size);
 
         // We need to pass ALL committee keys in order, and the runner will filter
         // by the bitfield. This ensures consistent ordering.
         for idx in 0..committee_size {
-            if let Some(validator_id) = self.topology.local_validator_at_index(idx) {
-                if let Some(pk) = self.public_key(validator_id) {
+            if let Some(validator_id) = topology.local_validator_at_index(idx) {
+                if let Some(pk) = topology.public_key(validator_id) {
                     pubkeys.push(pk);
                 } else {
                     warn!(validator_id = ?validator_id, "Missing public key for committee member");
@@ -1808,7 +1778,11 @@ impl BftState {
     /// Key insight: we validate the header's *internal consistency* and its parent_qc,
     /// but we don't require the header to match our current state. The header might
     /// be ahead of us (we'll catch up via the parent_qc it carries).
-    fn validate_header(&self, header: &BlockHeader) -> Result<(), String> {
+    fn validate_header(
+        &self,
+        topology: &TopologySnapshot,
+        header: &BlockHeader,
+    ) -> Result<(), String> {
         let height = header.height.0;
         let round = header.round;
 
@@ -1821,7 +1795,7 @@ impl BftState {
         }
 
         // Check proposer is correct for this height/round
-        let expected_proposer = self.proposer_for(height, round);
+        let expected_proposer = topology.proposer_for(height, round);
         if header.proposer != expected_proposer {
             return Err(format!(
                 "wrong proposer: expected {:?}, got {:?}",
@@ -1831,15 +1805,15 @@ impl BftState {
 
         // Verify parent QC has quorum (if not genesis)
         if !header.parent_qc.is_genesis() {
-            let committee = self.committee();
+            let committee = topology.local_committee();
             let qc_power: u64 = header
                 .parent_qc
                 .signers
                 .set_indices()
                 .filter_map(|i| committee.get(i))
-                .map(|&vid| self.voting_power(vid))
+                .map(|&vid| topology.voting_power(vid).unwrap_or(0))
                 .sum();
-            if !VotePower::has_quorum(qc_power, self.total_voting_power()) {
+            if !VotePower::has_quorum(qc_power, topology.local_voting_power()) {
                 return Err("parent QC does not have quorum".to_string());
             }
 
@@ -1941,7 +1915,11 @@ impl BftState {
     ///
     /// SAFETY: This must be called instead of `try_vote_on_block` directly to ensure
     /// QC signatures are always verified before voting.
-    fn trigger_qc_verification_or_vote(&mut self, block_hash: Hash) -> Vec<Action> {
+    fn trigger_qc_verification_or_vote(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+    ) -> Vec<Action> {
         let Some(pending) = self.pending_blocks.get(&block_hash) else {
             warn!(
                 "trigger_qc_verification_or_vote: no pending block for {}",
@@ -1968,7 +1946,7 @@ impl BftState {
                     block_hash = ?block_hash,
                     "QC already verified, skipping re-verification"
                 );
-                return self.try_vote_on_block(block_hash, height, round);
+                return self.try_vote_on_block(topology, block_hash, height, round);
             }
 
             // Check if we already have pending verification for this block
@@ -1978,7 +1956,7 @@ impl BftState {
             }
 
             // Collect public keys for verification
-            let Some(public_keys) = self.collect_qc_signer_keys(&header.parent_qc) else {
+            let Some(public_keys) = self.collect_qc_signer_keys(topology, &header.parent_qc) else {
                 warn!("Failed to collect public keys for QC verification");
                 return vec![];
             };
@@ -2000,14 +1978,20 @@ impl BftState {
         }
 
         // Genesis QC - vote directly (no signature to verify)
-        self.try_vote_on_block(block_hash, height, round)
+        self.try_vote_on_block(topology, block_hash, height, round)
     }
 
     /// Try to vote on a block after it's complete and QC is verified.
     ///
     /// NOTE: This should only be called after QC verification completes.
     /// For the main entry point, use `trigger_qc_verification_or_vote`.
-    fn try_vote_on_block(&mut self, block_hash: Hash, height: u64, round: u64) -> Vec<Action> {
+    fn try_vote_on_block(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        height: u64,
+        round: u64,
+    ) -> Vec<Action> {
         // Check vote locking - have we already voted for a block at this height?
         // BFT Safety: A validator must not vote for conflicting blocks at the same height
         // in the same round. Across rounds, the vote lock may be released on timeout if
@@ -2016,7 +2000,7 @@ impl BftState {
             if existing_hash == block_hash {
                 // Already voted for this exact block (possibly in an earlier round)
                 trace!(
-                    validator = ?self.validator_id(),
+                    validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
                     height = height,
                     round = round,
@@ -2030,7 +2014,7 @@ impl BftState {
                 // proposes a different block, but we're locked to our original vote.
                 // This is BFT safety working correctly, not a violation.
                 debug!(
-                    validator = ?self.validator_id(),
+                    validator = ?topology.local_validator_id(),
                     existing = ?existing_hash,
                     existing_round = existing_round,
                     new = ?block_hash,
@@ -2048,7 +2032,7 @@ impl BftState {
                 // Validate deferrals and aborts
                 if let Err(e) = self.validate_deferrals_and_aborts(&block) {
                     warn!(
-                        validator = ?self.validator_id(),
+                        validator = ?topology.local_validator_id(),
                         block_hash = ?block_hash,
                         error = %e,
                         "Block has invalid deferrals/aborts - not voting"
@@ -2059,7 +2043,7 @@ impl BftState {
                 // Validate transaction ordering
                 if let Err(e) = self.validate_transaction_ordering(&block) {
                     warn!(
-                        validator = ?self.validator_id(),
+                        validator = ?topology.local_validator_id(),
                         block_hash = ?block_hash,
                         error = %e,
                         "Block has invalid transaction ordering - not voting"
@@ -2068,9 +2052,9 @@ impl BftState {
                 }
 
                 // Validate provision_targets: recompute from transactions and compare
-                if let Err(e) = self.validate_provision_targets(&block) {
+                if let Err(e) = self.validate_provision_targets(topology, &block) {
                     warn!(
-                        validator = ?self.validator_id(),
+                        validator = ?topology.local_validator_id(),
                         block_hash = ?block_hash,
                         error = %e,
                         "Block has invalid provision_targets - not voting"
@@ -2084,8 +2068,9 @@ impl BftState {
 
                 // If block has deferrals with CommitmentProofs, initiate async verification.
                 if self.block_needs_commitment_proof_verification(&block) {
-                    verification_actions
-                        .extend(self.initiate_commitment_proof_verification(block_hash, &block));
+                    verification_actions.extend(
+                        self.initiate_commitment_proof_verification(topology, block_hash, &block),
+                    );
                 }
 
                 // Verify state root if block has committed certificates.
@@ -2108,7 +2093,7 @@ impl BftState {
         }
 
         // Create and send vote
-        self.create_vote(block_hash, height, round)
+        self.create_vote(topology, block_hash, height, round)
     }
 
     /// Check if a block needs CommitmentProof verification before voting.
@@ -2141,6 +2126,7 @@ impl BftState {
     /// Voting is deferred until all verifications complete successfully.
     fn initiate_commitment_proof_verification(
         &mut self,
+        topology: &TopologySnapshot,
         block_hash: Hash,
         block: &Block,
     ) -> Vec<Action> {
@@ -2173,7 +2159,8 @@ impl BftState {
                 let proof = &deferral.proof;
 
                 // Resolve public keys and voting power from signer bitfield
-                let (public_keys, voting_power) = self.resolve_commitment_proof_signers(proof);
+                let (public_keys, voting_power) =
+                    self.resolve_commitment_proof_signers(topology, proof);
 
                 if public_keys.is_empty() {
                     warn!(
@@ -2184,7 +2171,7 @@ impl BftState {
                     // Will fail verification with empty keys
                 }
 
-                let quorum_threshold = self.topology.quorum_threshold_for_shard(proof.source_shard);
+                let quorum_threshold = topology.quorum_threshold_for_shard(proof.source_shard);
 
                 Action::VerifyCommitmentProof {
                     block_hash,
@@ -2201,9 +2188,10 @@ impl BftState {
     /// Resolve public keys and total voting power from a CommitmentProof's signer bitfield.
     fn resolve_commitment_proof_signers(
         &self,
+        topology: &TopologySnapshot,
         proof: &CommitmentProof,
     ) -> (Vec<Bls12381G1PublicKey>, u64) {
-        let committee = self.topology.committee_for_shard(proof.source_shard);
+        let committee = topology.committee_for_shard(proof.source_shard);
 
         // Collect ALL committee public keys in order — verify_qc_signature
         // uses positional indexing via the signer bitfield, so it needs the
@@ -2211,7 +2199,7 @@ impl BftState {
         let public_keys: Vec<_> = committee
             .iter()
             .map(|&validator_id| {
-                self.topology
+                topology
                     .public_key(validator_id)
                     .expect("committee member must have a public key")
             })
@@ -2221,7 +2209,7 @@ impl BftState {
         let mut voting_power = 0u64;
         for idx in proof.qc.signers.set_indices() {
             if let Some(&validator_id) = committee.get(idx) {
-                voting_power += self.voting_power(validator_id);
+                voting_power += topology.voting_power(validator_id).unwrap_or(0);
             }
         }
 
@@ -2552,12 +2540,16 @@ impl BftState {
     /// Recomputes provision targets from the block's transactions using the
     /// topology, then compares with the header's claimed value. This prevents
     /// a byzantine proposer from lying about which shards need provisions.
-    fn validate_provision_targets(&self, block: &Block) -> Result<(), String> {
-        let local_shard = self.local_shard();
+    fn validate_provision_targets(
+        &self,
+        topology: &TopologySnapshot,
+        block: &Block,
+    ) -> Result<(), String> {
+        let local_shard = topology.local_shard();
         let mut expected = std::collections::BTreeSet::new();
         for tx in block.all_transactions() {
-            if !self.topology.is_single_shard_transaction(tx) {
-                for shard in self.topology.all_shards_for_transaction(tx) {
+            if !topology.is_single_shard_transaction(tx) {
+                for shard in topology.all_shards_for_transaction(tx) {
                     if shard != local_shard {
                         expected.insert(shard);
                     }
@@ -2597,7 +2589,13 @@ impl BftState {
         round = round,
         sign_us = tracing::field::Empty,
     ))]
-    fn create_vote(&mut self, block_hash: Hash, height: u64, round: u64) -> Vec<Action> {
+    fn create_vote(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        height: u64,
+        round: u64,
+    ) -> Vec<Action> {
         // Record that we voted for this block at this height.
         // Core safety invariant: we will not vote for a different block at this height
         // unless the vote lock is released on timeout (see `advance_round`) or by
@@ -2608,17 +2606,17 @@ impl BftState {
         let sign_start = std::time::Instant::now();
         let vote = BlockVote::new(
             block_hash,
-            self.shard_group,
+            topology.local_shard(),
             BlockHeight(height),
             round,
-            self.validator_id(),
+            topology.local_validator_id(),
             &self.signing_key,
             timestamp,
         );
         tracing::Span::current().record("sign_us", sign_start.elapsed().as_micros() as u64);
 
         debug!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             height = height,
             round = round,
             block_hash = ?block_hash,
@@ -2633,19 +2631,19 @@ impl BftState {
         // for a different block at this height after restart (equivocation).
         // Using the combined action allows the runner to optimize the flow
         // while guaranteeing persist-before-broadcast ordering.
-        let recipients = self.vote_recipients(height, round);
+        let recipients = self.vote_recipients(topology, height, round);
 
         let mut actions = vec![Action::PersistAndBroadcastVote {
             height: BlockHeight(height),
             round,
             block_hash,
-            shard: self.local_shard(),
+            shard: topology.local_shard(),
             vote: gossip,
             recipients,
         }];
 
         // Also process our own vote locally
-        actions.extend(self.on_block_vote_internal(vote));
+        actions.extend(self.on_block_vote_internal(topology, vote));
 
         actions
     }
@@ -2667,15 +2665,15 @@ impl BftState {
         voter = ?vote.voter,
         block_hash = ?vote.block_hash
     ))]
-    pub fn on_block_vote(&mut self, vote: BlockVote) -> Vec<Action> {
+    pub fn on_block_vote(&mut self, topology: &TopologySnapshot, vote: BlockVote) -> Vec<Action> {
         trace!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             voter = ?vote.voter,
             block_hash = ?vote.block_hash,
             "Received block vote"
         );
 
-        self.on_block_vote_internal(vote)
+        self.on_block_vote_internal(topology, vote)
     }
 
     /// Internal vote processing with deferred verification.
@@ -2684,10 +2682,14 @@ impl BftState {
     /// batch verification + QC building in a single operation.
     ///
     /// For our own vote, we add it directly as verified (we just signed it).
-    fn on_block_vote_internal(&mut self, vote: BlockVote) -> Vec<Action> {
+    fn on_block_vote_internal(
+        &mut self,
+        topology: &TopologySnapshot,
+        vote: BlockVote,
+    ) -> Vec<Action> {
         let block_hash = vote.block_hash;
         let height = vote.height.0;
-        let is_own_vote = vote.voter == self.validator_id();
+        let is_own_vote = vote.voter == topology.local_validator_id();
 
         // Early out: skip votes for already-committed heights.
         // This prevents wasting crypto resources verifying stale votes.
@@ -2702,7 +2704,7 @@ impl BftState {
         }
 
         // Validate voter is in committee
-        let voter_index = match self.committee_index(vote.voter) {
+        let voter_index = match topology.local_committee_index(vote.voter) {
             Some(idx) => idx,
             None => {
                 warn!("Vote from validator {:?} not in committee", vote.voter);
@@ -2711,7 +2713,7 @@ impl BftState {
         };
 
         // Get voting power
-        let voting_power = self.voting_power(vote.voter);
+        let voting_power = topology.voting_power(vote.voter).unwrap_or(0);
         if voting_power == 0 {
             warn!(
                 "Vote from validator {:?} with zero voting power",
@@ -2721,9 +2723,9 @@ impl BftState {
         }
 
         // Pre-compute topology values before mutable borrows
-        let committee_size = self.committee().len();
-        let total_power = self.total_voting_power();
-        let validator_id = self.validator_id();
+        let committee_size = topology.local_committee().len();
+        let total_power = topology.local_voting_power();
+        let validator_id = topology.local_validator_id();
         let header_for_vote = self
             .pending_blocks
             .get(&block_hash)
@@ -2731,7 +2733,7 @@ impl BftState {
 
         // Get public key for verification (do this before mutable borrow of vote_sets)
         let public_key = if !is_own_vote {
-            match self.public_key(vote.voter) {
+            match topology.public_key(vote.voter) {
                 Some(pk) => Some(pk),
                 None => {
                     warn!("No public key for validator {:?}", vote.voter);
@@ -2763,7 +2765,7 @@ impl BftState {
             vote_set.add_verified_vote(voter_index, vote.clone(), voting_power);
 
             // Check if we should trigger verification for buffered votes
-            return self.maybe_trigger_vote_verification(block_hash);
+            return self.maybe_trigger_vote_verification(topology, block_hash);
         }
 
         // Buffer the unverified vote (public_key is guaranteed Some since !is_own_vote)
@@ -2780,15 +2782,19 @@ impl BftState {
         );
 
         // Check if we should trigger batch verification
-        self.maybe_trigger_vote_verification(block_hash)
+        self.maybe_trigger_vote_verification(topology, block_hash)
     }
 
     /// Check if we should trigger batch vote verification for a block.
     ///
     /// Triggers when we have enough total power (verified + unverified) to
     /// possibly reach quorum.
-    fn maybe_trigger_vote_verification(&mut self, block_hash: Hash) -> Vec<Action> {
-        let total_power = self.total_voting_power();
+    fn maybe_trigger_vote_verification(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+    ) -> Vec<Action> {
+        let total_power = topology.local_voting_power();
 
         let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
             return vec![];
@@ -2824,7 +2830,7 @@ impl BftState {
 
         vec![Action::VerifyAndBuildQuorumCertificate {
             block_hash,
-            shard_group_id: self.shard_group,
+            shard_group_id: topology.local_shard(),
             height,
             round,
             parent_block_hash,
@@ -2848,6 +2854,7 @@ impl BftState {
     ))]
     pub fn on_qc_result(
         &mut self,
+        topology: &TopologySnapshot,
         block_hash: Hash,
         qc: Option<QuorumCertificate>,
         verified_votes: Vec<(usize, BlockVote, u64)>,
@@ -2878,7 +2885,7 @@ impl BftState {
         // Only verified votes are recorded in received_votes_by_height.
         //
         // TODO: Collect both conflicting votes as slashing proof for economic penalties.
-        let validator_id = self.validator_id();
+        let validator_id = topology.local_validator_id();
         for (_, vote, _) in &verified_votes {
             // View synchronization
             if vote.round > self.view {
@@ -2952,7 +2959,7 @@ impl BftState {
         }
 
         // Check if more unverified votes arrived while we were verifying
-        self.maybe_trigger_vote_verification(block_hash)
+        self.maybe_trigger_vote_verification(topology, block_hash)
     }
 
     /// Handle QC signature verification result.
@@ -2960,7 +2967,12 @@ impl BftState {
     /// Called when the runner completes `Action::VerifyQcSignature`.
     /// If valid, we proceed to vote on the block (for consensus) or apply the block (for sync).
     #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
-    pub fn on_qc_signature_verified(&mut self, block_hash: Hash, valid: bool) -> Vec<Action> {
+    pub fn on_qc_signature_verified(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        valid: bool,
+    ) -> Vec<Action> {
         // Check if this is a synced block verification
         info!(
             block_hash = ?block_hash,
@@ -2996,7 +3008,7 @@ impl BftState {
                 .insert(block_hash, pending_sync);
 
             // Try to apply all consecutive verified blocks starting from committed_height + 1
-            return self.try_apply_verified_synced_blocks();
+            return self.try_apply_verified_synced_blocks(topology);
         }
 
         // Otherwise, it's a consensus block QC verification
@@ -3040,7 +3052,7 @@ impl BftState {
         // QC is valid - proceed to vote on the block
         let height = pending.header.height.0;
         let round = pending.header.round;
-        self.try_vote_on_block(block_hash, height, round)
+        self.try_vote_on_block(topology, block_hash, height, round)
     }
 
     /// Handle CommitmentProof signature verification result.
@@ -3051,6 +3063,7 @@ impl BftState {
     #[instrument(skip(self), fields(block_hash = ?block_hash, deferral_index = deferral_index, valid = valid))]
     pub fn on_commitment_proof_verified(
         &mut self,
+        topology: &TopologySnapshot,
         block_hash: Hash,
         deferral_index: usize,
         valid: bool,
@@ -3144,7 +3157,7 @@ impl BftState {
         let round = pending_block.header().round;
 
         // All verifications complete - vote
-        self.create_vote(block_hash, height, round)
+        self.create_vote(topology, block_hash, height, round)
     }
 
     /// Handle state root verification result.
@@ -3153,7 +3166,12 @@ impl BftState {
     /// is invalid, the block is rejected (proposer included incorrect state commitment).
     /// If valid, proceeds to vote for the block.
     #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
-    pub fn on_state_root_verified(&mut self, block_hash: Hash, valid: bool) -> Vec<Action> {
+    pub fn on_state_root_verified(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        valid: bool,
+    ) -> Vec<Action> {
         // Remove from in-flight regardless of outcome
         self.state_root_verifications_in_flight.remove(&block_hash);
 
@@ -3199,7 +3217,7 @@ impl BftState {
         let round = pending_block.header().round;
 
         // All verifications complete - vote
-        self.create_vote(block_hash, height, round)
+        self.create_vote(topology, block_hash, height, round)
     }
 
     /// Check if a block needs transaction root verification before voting.
@@ -3262,7 +3280,12 @@ impl BftState {
     /// transaction root is invalid, the block is rejected. If valid, proceeds to
     /// vote for the block (assuming other verifications are also complete).
     #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
-    pub fn on_transaction_root_verified(&mut self, block_hash: Hash, valid: bool) -> Vec<Action> {
+    pub fn on_transaction_root_verified(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        valid: bool,
+    ) -> Vec<Action> {
         // Remove from in-flight regardless of outcome
         self.transaction_root_verifications_in_flight
             .remove(&block_hash);
@@ -3310,7 +3333,7 @@ impl BftState {
         let round = pending_block.header().round;
 
         // All verifications complete - vote
-        self.create_vote(block_hash, height, round)
+        self.create_vote(topology, block_hash, height, round)
     }
 
     /// Handle proposal built by the runner.
@@ -3321,6 +3344,7 @@ impl BftState {
     #[instrument(skip(self, block), fields(height = %height.0, round = round))]
     pub fn on_proposal_built(
         &mut self,
+        topology: &TopologySnapshot,
         height: BlockHeight,
         round: u64,
         block: Arc<Block>,
@@ -3356,7 +3380,7 @@ impl BftState {
 
         let total_tx_count = pending_block.transaction_count();
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             height = height.0,
             round = round,
             block_hash = ?block_hash,
@@ -3384,12 +3408,12 @@ impl BftState {
         self.record_leader_activity();
 
         let mut actions = vec![Action::BroadcastBlockHeader {
-            shard: self.local_shard(),
+            shard: topology.local_shard(),
             header: Box::new(gossip),
         }];
 
         // Vote for our own block
-        actions.extend(self.create_vote(block_hash, height.0, round));
+        actions.extend(self.create_vote(topology, block_hash, height.0, round));
 
         actions
     }
@@ -3412,9 +3436,10 @@ impl BftState {
     ///
     /// # Returns
     /// Actions to verify any state roots that were waiting for this commit.
-    #[instrument(skip(self), fields(validator = ?self.validator_id()))]
+    #[instrument(skip(self, _topology), fields(state_version, state_root = ?state_root))]
     pub fn on_state_commit_complete(
         &mut self,
+        _topology: &TopologySnapshot,
         state_version: u64,
         state_root: Hash,
     ) -> Vec<Action> {
@@ -3572,6 +3597,7 @@ impl BftState {
     #[allow(clippy::too_many_arguments)]
     pub fn on_qc_formed(
         &mut self,
+        topology: &TopologySnapshot,
         block_hash: Hash,
         qc: QuorumCertificate,
         ready_txs: &ReadyTransactions,
@@ -3583,7 +3609,7 @@ impl BftState {
         let height = qc.height.0;
 
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             block_hash = ?block_hash,
             height = height,
             "QC formed"
@@ -3603,7 +3629,7 @@ impl BftState {
 
             // HotStuff-2 unlock: when a QC forms, we can safely unlock
             // our vote locks at or below that QC's height
-            self.maybe_unlock_for_qc(&qc);
+            self.maybe_unlock_for_qc(topology, &qc);
         }
 
         let mut actions = vec![];
@@ -3621,7 +3647,7 @@ impl BftState {
 
         if let Some(block) = block {
             debug!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 height = height,
                 block_hash = ?block_hash,
                 "Persisting certified block for sync availability"
@@ -3634,14 +3660,14 @@ impl BftState {
             // Block not yet complete - this can happen if we're still fetching
             // transactions/certificates. The block will be persisted when it commits.
             debug!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 height = height,
                 block_hash = ?block_hash,
                 "Cannot persist certified block - not yet complete"
             );
         }
 
-        actions.extend(self.try_two_chain_commit(&qc));
+        actions.extend(self.try_two_chain_commit(topology, &qc));
 
         // Immediately try to propose the next block if there's content to include.
         // This is how the QC propagates to other validators - the next block
@@ -3680,6 +3706,7 @@ impl BftState {
             // If certificates is empty, on_proposal_timer will inherit parent state.
             // State version is derived from chain history inside on_proposal_timer.
             actions.extend(self.on_proposal_timer(
+                topology,
                 ready_txs,
                 deferred,
                 aborted,
@@ -3688,7 +3715,7 @@ impl BftState {
             ));
         } else if should_try_proposal && rate_limited {
             trace!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 next_height = next_height,
                 time_since_last_ms = time_since_last_proposal.as_millis(),
                 min_interval_ms = self.config.min_block_interval.as_millis(),
@@ -3705,7 +3732,11 @@ impl BftState {
     /// `on_block_header` (when we learn about a QC via the next block's
     /// parent_qc). This ensures all validators commit regardless of whether
     /// they received votes directly.
-    fn try_two_chain_commit(&self, qc: &QuorumCertificate) -> Vec<Action> {
+    fn try_two_chain_commit(
+        &self,
+        topology: &TopologySnapshot,
+        qc: &QuorumCertificate,
+    ) -> Vec<Action> {
         if !qc.has_committable_block() {
             return vec![];
         }
@@ -3730,7 +3761,7 @@ impl BftState {
             block.header.parent_qc.clone()
         } else {
             warn!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 block_hash = ?block_hash,
                 committable_hash = ?committable_hash,
                 "Cannot find block to extract certifying QC for committable block"
@@ -3751,6 +3782,7 @@ impl BftState {
     ))]
     pub fn on_block_ready_to_commit(
         &mut self,
+        topology: &TopologySnapshot,
         block_hash: Hash,
         qc: QuorumCertificate,
     ) -> Vec<Action> {
@@ -3768,7 +3800,7 @@ impl BftState {
                 // Only buffer if not already committed
                 if height > self.committed_height {
                     debug!(
-                        validator = ?self.validator_id(),
+                        validator = ?topology.local_validator_id(),
                         block_hash = ?block_hash,
                         height = height,
                         missing_txs = pending.missing_transaction_count(),
@@ -3782,7 +3814,7 @@ impl BftState {
                 // Block not in pending_blocks - check if it's in certified_blocks
                 let in_certified = self.certified_blocks.contains_key(&block_hash);
                 warn!(
-                    validator = ?self.validator_id(),
+                    validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
                     qc_height = qc.height.0,
                     committed_height = self.committed_height,
@@ -3821,7 +3853,7 @@ impl BftState {
         }
 
         // Commit this block and any buffered subsequent blocks
-        self.commit_block_and_buffered(block_hash, qc)
+        self.commit_block_and_buffered(topology, block_hash, qc)
     }
 
     /// Check if a block that just became complete has a pending commit waiting for it.
@@ -3829,15 +3861,19 @@ impl BftState {
     /// When `BlockReadyToCommit` fires but the block data (transactions/certificates) hasn't
     /// arrived yet, we buffer the commit in `pending_commits_awaiting_data`. This method
     /// checks that buffer and retries the commit now that the block is complete.
-    fn try_commit_pending_data(&mut self, block_hash: Hash) -> Vec<Action> {
+    fn try_commit_pending_data(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+    ) -> Vec<Action> {
         if let Some((height, qc)) = self.pending_commits_awaiting_data.remove(&block_hash) {
             info!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 block_hash = ?block_hash,
                 height = height,
                 "Retrying commit after block data arrived"
             );
-            self.on_block_ready_to_commit(block_hash, qc)
+            self.on_block_ready_to_commit(topology, block_hash, qc)
         } else {
             vec![]
         }
@@ -3850,6 +3886,7 @@ impl BftState {
     /// them in order.
     fn commit_block_and_buffered(
         &mut self,
+        topology: &TopologySnapshot,
         block_hash: Hash,
         certifying_qc: QuorumCertificate,
     ) -> Vec<Action> {
@@ -3885,7 +3922,7 @@ impl BftState {
             }
 
             info!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 height = height,
                 block_hash = ?current_hash,
                 transactions = block.transactions.len(),
@@ -3938,7 +3975,7 @@ impl BftState {
             actions.push(Action::BroadcastCommittedBlockHeader {
                 gossip: hyperscale_messages::CommittedBlockHeaderGossip {
                     committed_header,
-                    sender: self.validator_id(),
+                    sender: topology.local_validator_id(),
                     sender_signature: cbh_sig,
                 },
             });
@@ -3966,7 +4003,7 @@ impl BftState {
         // After consensus commits, try to drain buffered synced blocks.
         // Consensus may have committed blocks that sync was waiting for,
         // so now those buffered synced blocks may be ready for verification.
-        actions.extend(self.try_drain_buffered_synced_blocks());
+        actions.extend(self.try_drain_buffered_synced_blocks(topology));
 
         actions
     }
@@ -3982,7 +4019,12 @@ impl BftState {
         height = block.header.height.0,
         block_hash = ?block.hash()
     ))]
-    fn on_synced_block_ready(&mut self, block: Block, qc: QuorumCertificate) -> Vec<Action> {
+    fn on_synced_block_ready(
+        &mut self,
+        topology: &TopologySnapshot,
+        block: Block,
+        qc: QuorumCertificate,
+    ) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header.height.0;
 
@@ -4037,7 +4079,7 @@ impl BftState {
         // Check if this block is the next one we need
         if height == next_needed {
             // This is exactly what we need - submit for verification immediately
-            return self.submit_synced_block_for_verification(block, qc);
+            return self.submit_synced_block_for_verification(topology, block, qc);
         }
 
         // Block is not the next sequential height. Check if we should buffer it
@@ -4051,7 +4093,7 @@ impl BftState {
             self.buffered_synced_blocks.insert(height, (block, qc));
 
             // Check if we can drain any buffered blocks starting from next_needed
-            return self.try_drain_buffered_synced_blocks();
+            return self.try_drain_buffered_synced_blocks(topology);
         }
 
         // height < next_needed but > committed_height - this shouldn't happen
@@ -4070,6 +4112,7 @@ impl BftState {
     /// Called for in-order blocks or when draining the buffer.
     fn submit_synced_block_for_verification(
         &mut self,
+        topology: &TopologySnapshot,
         block: Block,
         qc: QuorumCertificate,
     ) -> Vec<Action> {
@@ -4079,11 +4122,11 @@ impl BftState {
         // Genesis QC doesn't need signature verification
         if qc.is_genesis() {
             debug!(height, "Synced block has genesis QC, applying directly");
-            return self.apply_synced_block(block, qc);
+            return self.apply_synced_block(topology, block, qc);
         }
 
         // Collect public keys for QC verification
-        let Some(public_keys) = self.collect_qc_signer_keys(&qc) else {
+        let Some(public_keys) = self.collect_qc_signer_keys(topology, &qc) else {
             warn!("Failed to collect public keys for synced block QC verification");
             return vec![];
         };
@@ -4126,7 +4169,7 @@ impl BftState {
     /// We submit up to `max_parallel_sync_verifications` blocks for parallel QC
     /// verification. This allows sync to make progress on multiple blocks at once
     /// instead of waiting for each block to verify sequentially.
-    fn try_drain_buffered_synced_blocks(&mut self) -> Vec<Action> {
+    fn try_drain_buffered_synced_blocks(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = Vec::new();
 
         // How many blocks are already pending verification?
@@ -4159,7 +4202,7 @@ impl BftState {
         while submitted < slots_available {
             if let Some((block, qc)) = self.buffered_synced_blocks.remove(&next_height) {
                 debug!(height = next_height, "Draining buffered synced block");
-                actions.extend(self.submit_synced_block_for_verification(block, qc));
+                actions.extend(self.submit_synced_block_for_verification(topology, block, qc));
                 next_height += 1;
                 submitted += 1;
             } else {
@@ -4171,12 +4214,17 @@ impl BftState {
     }
 
     /// Apply a synced block after QC verification (or for genesis QC).
-    fn apply_synced_block(&mut self, block: Block, qc: QuorumCertificate) -> Vec<Action> {
+    fn apply_synced_block(
+        &mut self,
+        topology: &TopologySnapshot,
+        block: Block,
+        qc: QuorumCertificate,
+    ) -> Vec<Action> {
         let block_hash = block.hash();
         let height = block.header.height.0;
 
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             height = height,
             block_hash = ?block_hash,
             transactions = block.transactions.len(),
@@ -4202,7 +4250,7 @@ impl BftState {
         {
             self.latest_qc = Some(qc.clone());
             // HotStuff-2 unlock for synced QC
-            self.maybe_unlock_for_qc(&qc);
+            self.maybe_unlock_for_qc(topology, &qc);
         }
 
         // Also cache the parent_qc from the block header if it's newer
@@ -4214,7 +4262,7 @@ impl BftState {
         {
             self.latest_qc = Some(block.header.parent_qc.clone());
             // HotStuff-2 unlock for parent QC
-            self.maybe_unlock_for_qc(&block.header.parent_qc);
+            self.maybe_unlock_for_qc(topology, &block.header.parent_qc);
         }
 
         // Clean up old state
@@ -4243,7 +4291,7 @@ impl BftState {
             Action::BroadcastCommittedBlockHeader {
                 gossip: hyperscale_messages::CommittedBlockHeaderGossip {
                     committed_header,
-                    sender: self.validator_id(),
+                    sender: topology.local_validator_id(),
                     sender_signature: cbh_sig,
                 },
             },
@@ -4265,7 +4313,7 @@ impl BftState {
         // 2. Blocks N+1, N+2, ... were complete but buffered in pending_commits
         // 3. Sync provided block N
         // 4. Now we can drain the pending_commits buffer
-        actions.extend(self.drain_pending_commits());
+        actions.extend(self.drain_pending_commits(topology));
 
         actions
     }
@@ -4274,7 +4322,7 @@ impl BftState {
     ///
     /// Called after committing a block (via sync or normal consensus) to check
     /// if there are buffered commits at subsequent heights that can now proceed.
-    fn drain_pending_commits(&mut self) -> Vec<Action> {
+    fn drain_pending_commits(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = Vec::new();
 
         loop {
@@ -4286,7 +4334,7 @@ impl BftState {
             };
 
             debug!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 height = next_height,
                 block_hash = ?block_hash,
                 "Processing buffered commit after sync"
@@ -4294,7 +4342,7 @@ impl BftState {
 
             // Try to commit this block - it should be complete since it was buffered
             // in pending_commits (not pending_commits_awaiting_data)
-            let commit_actions = self.on_block_ready_to_commit(block_hash, qc);
+            let commit_actions = self.on_block_ready_to_commit(topology, block_hash, qc);
             actions.extend(commit_actions);
 
             // If on_block_ready_to_commit didn't actually commit (e.g., block not found),
@@ -4312,7 +4360,7 @@ impl BftState {
     /// Called after a synced block's QC is verified. Applies all verified blocks
     /// in height order starting from committed_height + 1, then drains any
     /// buffered out-of-order blocks that can now be submitted for verification.
-    fn try_apply_verified_synced_blocks(&mut self) -> Vec<Action> {
+    fn try_apply_verified_synced_blocks(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let mut actions = Vec::new();
 
         // First, apply all consecutive verified blocks
@@ -4358,11 +4406,11 @@ impl BftState {
                 .pending_synced_block_verifications
                 .remove(&hash)
                 .unwrap();
-            actions.extend(self.apply_synced_block(pending.block, pending.qc));
+            actions.extend(self.apply_synced_block(topology, pending.block, pending.qc));
         }
 
         // After applying blocks, drain more buffered blocks for parallel verification
-        actions.extend(self.try_drain_buffered_synced_blocks());
+        actions.extend(self.try_drain_buffered_synced_blocks(topology));
 
         actions
     }
@@ -4381,7 +4429,7 @@ impl BftState {
     ///
     /// Returns actions to propose if we're the new proposer.
     #[instrument(skip(self), fields(new_round = self.view + 1))]
-    fn advance_round(&mut self) -> Vec<Action> {
+    fn advance_round(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This matches on_proposal_timer behavior.
         let height = self
@@ -4394,7 +4442,7 @@ impl BftState {
         self.view_changes += 1;
 
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             height = height,
             old_round = old_round,
             new_round = self.view,
@@ -4416,7 +4464,7 @@ impl BftState {
 
             if had_vote || cleared_votes > 0 {
                 info!(
-                    validator = ?self.validator_id(),
+                    validator = ?topology.local_validator_id(),
                     height = height,
                     new_round = self.view,
                     latest_qc_height = latest_qc_height,
@@ -4427,28 +4475,28 @@ impl BftState {
         }
 
         // Check if we're the new proposer for this height/round
-        if self.should_propose(height, self.view) {
+        if topology.should_propose(height, self.view) {
             // Check if we've already voted at this height - if so, we're locked
             if let Some(&(existing_hash, _)) = self.voted_heights.get(&height) {
                 info!(
-                    validator = ?self.validator_id(),
+                    validator = ?topology.local_validator_id(),
                     height = height,
                     new_round = self.view,
                     existing_block = ?existing_hash,
                     "Vote-locked at this height, re-proposing"
                 );
-                return self.repropose_locked_block(existing_hash, height);
+                return self.repropose_locked_block(topology, existing_hash, height);
             }
 
             info!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 height = height,
                 new_round = self.view,
                 "We are the new proposer after round advance - building block"
             );
 
             // Build and broadcast a new block (use fallback block builder)
-            return self.build_and_broadcast_fallback_block(height, self.view);
+            return self.build_and_broadcast_fallback_block(topology, height, self.view);
         }
 
         // Not the proposer - just reschedule the timer
@@ -4491,7 +4539,7 @@ impl BftState {
     /// This is the key mechanism that prevents view divergence: nodes that fall behind
     /// (e.g., due to network partitions or slow clocks) will catch up when they see
     /// QCs from the rest of the network.
-    fn maybe_unlock_for_qc(&mut self, qc: &QuorumCertificate) {
+    fn maybe_unlock_for_qc(&mut self, topology: &TopologySnapshot, qc: &QuorumCertificate) {
         if qc.is_genesis() {
             return;
         }
@@ -4505,7 +4553,7 @@ impl BftState {
         // - The proposer for the next height will use their current view
         if qc.round > self.view {
             info!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 old_view = self.view,
                 new_view = qc.round,
                 qc_height = qc.height.0,
@@ -4529,7 +4577,7 @@ impl BftState {
         for height in unlocked {
             if self.voted_heights.remove(&height).is_some() {
                 trace!(
-                    validator = ?self.validator_id(),
+                    validator = ?topology.local_validator_id(),
                     height = height,
                     qc_height = qc_height,
                     "Unlocked vote due to higher QC"
@@ -4549,10 +4597,11 @@ impl BftState {
     #[instrument(skip(self, transactions), fields(block_hash = ?block_hash, tx_count = transactions.len()))]
     pub fn on_transaction_fetch_received(
         &mut self,
+        topology: &TopologySnapshot,
         block_hash: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
     ) -> Vec<Action> {
-        let validator_id = self.validator_id();
+        let validator_id = topology.local_validator_id();
 
         // First phase: add transactions and check state
         let (added, still_missing, is_complete, needs_construct) = {
@@ -4649,10 +4698,10 @@ impl BftState {
         );
 
         // Trigger QC verification (for non-genesis) or vote directly (for genesis)
-        let mut actions = self.trigger_qc_verification_or_vote(block_hash);
+        let mut actions = self.trigger_qc_verification_or_vote(topology, block_hash);
 
         // Check if this block had a pending commit waiting for data
-        actions.extend(self.try_commit_pending_data(block_hash));
+        actions.extend(self.try_commit_pending_data(topology, block_hash));
 
         actions
     }
@@ -4671,10 +4720,11 @@ impl BftState {
     #[instrument(skip(self, certificates), fields(block_hash = ?block_hash, cert_count = certificates.len()))]
     pub fn on_certificate_fetch_received(
         &mut self,
+        topology: &TopologySnapshot,
         block_hash: Hash,
         certificates: Vec<Arc<TransactionCertificate>>,
     ) -> Vec<Action> {
-        let validator_id = self.validator_id();
+        let validator_id = topology.local_validator_id();
 
         // First phase: add certificates and check state
         let (added, still_missing, is_complete, needs_construct) = {
@@ -4771,10 +4821,10 @@ impl BftState {
         );
 
         // Trigger QC verification (for non-genesis) or vote directly (for genesis)
-        let mut actions = self.trigger_qc_verification_or_vote(block_hash);
+        let mut actions = self.trigger_qc_verification_or_vote(topology, block_hash);
 
         // Check if this block had a pending commit waiting for data
-        actions.extend(self.try_commit_pending_data(block_hash));
+        actions.extend(self.try_commit_pending_data(topology, block_hash));
 
         actions
     }
@@ -4790,6 +4840,7 @@ impl BftState {
     /// blocks and triggers voting if any are now complete.
     pub fn check_pending_blocks_for_transaction(
         &mut self,
+        topology: &TopologySnapshot,
         tx_hash: Hash,
         mempool: &HashMap<Hash, Arc<RoutableTransaction>>,
     ) -> Vec<Action> {
@@ -4820,7 +4871,7 @@ impl BftState {
                     }
 
                     debug!(
-                        validator = ?self.validator_id(),
+                        validator = ?topology.local_validator_id(),
                         block_hash = ?block_hash,
                         tx_hash = ?tx_hash,
                         "Pending block completed after transaction arrived"
@@ -4830,10 +4881,10 @@ impl BftState {
                     // This is CRITICAL: we must verify QC signatures before voting, even when
                     // transactions arrive late. Previously this called try_vote_on_block directly,
                     // which skipped QC verification - a safety bug.
-                    actions.extend(self.trigger_qc_verification_or_vote(block_hash));
+                    actions.extend(self.trigger_qc_verification_or_vote(topology, block_hash));
 
                     // Check if this block had a pending commit waiting for data
-                    actions.extend(self.try_commit_pending_data(block_hash));
+                    actions.extend(self.try_commit_pending_data(topology, block_hash));
                 }
             }
         }
@@ -4848,6 +4899,7 @@ impl BftState {
     /// triggers voting if any are now complete.
     pub fn check_pending_blocks_for_certificate(
         &mut self,
+        topology: &TopologySnapshot,
         cert_hash: Hash,
         certificates: &HashMap<Hash, Arc<TransactionCertificate>>,
     ) -> Vec<Action> {
@@ -4879,7 +4931,7 @@ impl BftState {
                     }
 
                     debug!(
-                        validator = ?self.validator_id(),
+                        validator = ?topology.local_validator_id(),
                         block_hash = ?block_hash,
                         cert_hash = ?cert_hash,
                         "Pending block completed after certificate finalized"
@@ -4889,10 +4941,10 @@ impl BftState {
                     // This is CRITICAL: we must verify QC signatures before voting, even when
                     // certificates arrive late. Previously this called try_vote_on_block directly,
                     // which skipped QC verification - a safety bug.
-                    actions.extend(self.trigger_qc_verification_or_vote(block_hash));
+                    actions.extend(self.trigger_qc_verification_or_vote(topology, block_hash));
 
                     // Check if this block had a pending commit waiting for data
-                    actions.extend(self.try_commit_pending_data(block_hash));
+                    actions.extend(self.try_commit_pending_data(topology, block_hash));
                 }
             }
         }
@@ -5052,7 +5104,7 @@ impl BftState {
     ///
     /// - `transaction_fetch_timeout`: How long to wait before fetching missing txs
     /// - `certificate_fetch_timeout`: How long to wait before fetching missing certs
-    pub fn check_pending_block_fetches(&self) -> Vec<Action> {
+    pub fn check_pending_block_fetches(&self, topology: &TopologySnapshot) -> Vec<Action> {
         // Don't fetch for gossip blocks while syncing.
         // Sync delivers complete blocks that will supersede these pending blocks.
         // This prevents FetchManager from consuming all request slots and starving sync.
@@ -5082,7 +5134,7 @@ impl BftState {
             let missing_txs = pending.missing_transactions();
             if !missing_txs.is_empty() && age >= tx_timeout {
                 debug!(
-                    validator = ?self.validator_id(),
+                    validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
                     missing_tx_count = missing_txs.len(),
                     age_ms = age.as_millis(),
@@ -5100,7 +5152,7 @@ impl BftState {
             let missing_certs = pending.missing_certificates();
             if !missing_certs.is_empty() && age >= cert_timeout {
                 debug!(
-                    validator = ?self.validator_id(),
+                    validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
                     missing_cert_count = missing_certs.len(),
                     age_ms = age.as_millis(),
@@ -5129,7 +5181,7 @@ impl BftState {
     /// - Block headers are dropped
     /// - Transaction/certificate fetches fail permanently
     /// - A block in the middle of the chain is incomplete while later blocks are ready
-    pub fn check_sync_health(&mut self) -> Vec<Action> {
+    pub fn check_sync_health(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
         let Some(latest_qc) = &self.latest_qc else {
             return vec![];
         };
@@ -5165,7 +5217,7 @@ impl BftState {
             let pending_commit_count = self.pending_commits.len();
             let pending_data_count = self.pending_commits_awaiting_data.len();
             debug!(
-                validator = ?self.validator_id(),
+                validator = ?topology.local_validator_id(),
                 committed_height = self.committed_height,
                 next_needed_height = next_needed_height,
                 qc_height = qc_height,
@@ -5189,14 +5241,14 @@ impl BftState {
                 // hashes than what the QCs reference.
                 if gap > 10 {
                     warn!(
-                        validator = ?self.validator_id(),
+                        validator = ?topology.local_validator_id(),
                         committed_height = self.committed_height,
                         next_needed_height = next_needed_height,
                         qc_height = qc_height,
                         gap = gap,
                         "Have complete block and pending commit but significantly behind - triggering sync to recover"
                     );
-                    return self.start_sync(qc_height, qc_hash);
+                    return self.start_sync(topology, qc_height, qc_hash);
                 }
                 return vec![];
             }
@@ -5210,14 +5262,14 @@ impl BftState {
             // QC N+1, we have no way to commit block N. Trigger sync to recover.
             if gap > 3 {
                 warn!(
-                    validator = ?self.validator_id(),
+                    validator = ?topology.local_validator_id(),
                     committed_height = self.committed_height,
                     next_needed_height = next_needed_height,
                     qc_height = qc_height,
                     gap = gap,
                     "Have complete block but no pending commit (missing QC) - triggering sync to recover"
                 );
-                return self.start_sync(qc_height, qc_hash);
+                return self.start_sync(topology, qc_height, qc_hash);
             }
             // Gap is small, give normal consensus time to catch up
             return vec![];
@@ -5227,14 +5279,14 @@ impl BftState {
         // missing entirely or incomplete (waiting for transactions/certificates).
         // Trigger sync to get the complete block data.
         info!(
-            validator = ?self.validator_id(),
+            validator = ?topology.local_validator_id(),
             committed_height = self.committed_height,
             next_needed_height = next_needed_height,
             qc_height = qc_height,
             "Sync health check: can't make progress, triggering catch-up sync"
         );
 
-        self.start_sync(qc_height, qc_hash)
+        self.start_sync(topology, qc_height, qc_hash)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -5271,13 +5323,13 @@ impl BftState {
     }
 
     /// Check if we are the proposer for the current height and round.
-    pub fn is_current_proposer(&self) -> bool {
+    pub fn is_current_proposer(&self, topology: &TopologySnapshot) -> bool {
         let next_height = self
             .latest_qc
             .as_ref()
             .map(|qc| qc.height.0 + 1)
             .unwrap_or(self.committed_height + 1);
-        self.should_propose(next_height, self.view)
+        topology.should_propose(next_height, self.view)
     }
 
     /// Get the BFT configuration.
@@ -5351,7 +5403,7 @@ impl BftState {
     ///
     /// This is used to avoid destructively taking certificates from execution
     /// state when we won't actually be proposing a block.
-    pub fn will_propose_next(&self) -> bool {
+    pub fn will_propose_next(&self, topology: &TopologySnapshot) -> bool {
         let next_height = self
             .latest_qc
             .as_ref()
@@ -5359,24 +5411,25 @@ impl BftState {
             .unwrap_or(self.committed_height + 1);
         let round = self.view;
 
-        self.should_propose(next_height, round) && !self.voted_heights.contains_key(&next_height)
+        topology.should_propose(next_height, round)
+            && !self.voted_heights.contains_key(&next_height)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_types::TopologySnapshot;
     use hyperscale_types::{
         batch_verify_bls_same_message, generate_bls_keypair, verify_bls12381_v1,
-        zero_bls_signature, Bls12381G2Signature, SignerBitfield, StaticTopology, ValidatorInfo,
-        ValidatorSet,
+        zero_bls_signature, Bls12381G2Signature, SignerBitfield, ValidatorInfo, ValidatorSet,
     };
 
-    fn make_test_state() -> BftState {
+    fn make_test_state() -> (BftState, TopologySnapshot) {
         make_test_state_with_validators(4)
     }
 
-    fn make_test_state_with_validators(n: usize) -> BftState {
+    fn make_test_state_with_validators(n: usize) -> (BftState, TopologySnapshot) {
         let keys: Vec<Bls12381G1PrivateKey> = (0..n).map(|_| generate_bls_keypair()).collect();
 
         // Create validator set with ValidatorInfo
@@ -5392,45 +5445,46 @@ mod tests {
         let validator_set = ValidatorSet::new(validators);
 
         // Create topology
-        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
 
         // Clone key bytes to create a new keypair since Bls12381G1PrivateKey doesn't impl Clone
         let key_bytes = keys[0].to_bytes();
         let signing_key = Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
 
-        BftState::new(
+        let state = BftState::new(
             0,
             signing_key,
-            topology,
+            &topology,
             BftConfig::default(),
             RecoveredState::default(),
-        )
+        );
+        (state, topology)
     }
 
     #[test]
     fn test_proposer_rotation() {
-        let state = make_test_state();
+        let (_state, topology) = make_test_state();
 
         // Height 0, round 0 -> validator 0
-        assert_eq!(state.proposer_for(0, 0), ValidatorId(0));
+        assert_eq!(topology.proposer_for(0, 0), ValidatorId(0));
         // Height 1, round 0 -> validator 1
-        assert_eq!(state.proposer_for(1, 0), ValidatorId(1));
+        assert_eq!(topology.proposer_for(1, 0), ValidatorId(1));
         // Height 2, round 0 -> validator 2
-        assert_eq!(state.proposer_for(2, 0), ValidatorId(2));
+        assert_eq!(topology.proposer_for(2, 0), ValidatorId(2));
         // Height 0, round 1 -> validator 1
-        assert_eq!(state.proposer_for(0, 1), ValidatorId(1));
+        assert_eq!(topology.proposer_for(0, 1), ValidatorId(1));
     }
 
     #[test]
     fn test_should_propose() {
-        let state = make_test_state();
+        let (_state, topology) = make_test_state();
 
         // Validator 0 should propose at height 0, round 0
-        assert!(state.should_propose(0, 0));
+        assert!(topology.should_propose(0, 0));
         // But not at height 1
-        assert!(!state.should_propose(1, 0));
+        assert!(!topology.should_propose(1, 0));
         // Or height 0, round 1
-        assert!(!state.should_propose(0, 1));
+        assert!(!topology.should_propose(0, 1));
     }
 
     fn make_header_at_height(height: u64, timestamp: u64) -> BlockHeader {
@@ -5452,7 +5506,7 @@ mod tests {
 
     #[test]
     fn test_timestamp_validation_skips_genesis() {
-        let mut state = make_test_state();
+        let (mut state, _topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         // Genesis block (height 0) should skip timestamp validation even with timestamp 0
@@ -5477,7 +5531,7 @@ mod tests {
 
     #[test]
     fn test_timestamp_validation_accepts_within_bounds() {
-        let mut state = make_test_state();
+        let (mut state, _topology) = make_test_state();
         // Set clock to 100 seconds
         state.set_time(Duration::from_secs(100));
 
@@ -5496,7 +5550,7 @@ mod tests {
 
     #[test]
     fn test_timestamp_validation_rejects_too_old() {
-        let mut state = make_test_state();
+        let (mut state, _topology) = make_test_state();
         // Set clock to 100 seconds
         state.set_time(Duration::from_secs(100));
 
@@ -5509,7 +5563,7 @@ mod tests {
 
     #[test]
     fn test_timestamp_validation_rejects_too_far_ahead() {
-        let mut state = make_test_state();
+        let (mut state, _topology) = make_test_state();
         // Set clock to 100 seconds
         state.set_time(Duration::from_secs(100));
 
@@ -5522,7 +5576,7 @@ mod tests {
 
     #[test]
     fn test_timestamp_validation_at_boundary() {
-        let mut state = make_test_state();
+        let (mut state, _topology) = make_test_state();
         // Set clock to 100 seconds
         state.set_time(Duration::from_secs(100));
 
@@ -5545,7 +5599,7 @@ mod tests {
 
     #[test]
     fn test_timestamp_validation_skips_fallback_blocks() {
-        let mut state = make_test_state();
+        let (mut state, _topology) = make_test_state();
         // Set clock to 100 seconds
         state.set_time(Duration::from_secs(100));
 
@@ -5614,14 +5668,14 @@ mod tests {
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(1), 1, validator_set);
         let mut state = BftState::new(
             1,
             {
                 let key_bytes = keys[1].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             BftConfig::default(),
             RecoveredState::default(),
         );
@@ -5669,6 +5723,7 @@ mod tests {
 
         // Process the block header
         let actions = state.on_block_header(
+            &topology,
             header,
             BlockManifest::default(),
             &HashMap::new(), // mempool
@@ -5698,14 +5753,14 @@ mod tests {
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(1), 1, validator_set);
         let mut state = BftState::new(
             1,
             {
                 let key_bytes = keys[1].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             BftConfig::default(),
             RecoveredState::default(),
         );
@@ -5754,6 +5809,7 @@ mod tests {
 
         // First, process header to trigger QC verification
         let _ = state.on_block_header(
+            &topology,
             header,
             BlockManifest::default(),
             &HashMap::new(),
@@ -5761,7 +5817,7 @@ mod tests {
         );
 
         // Now simulate QC signature verified successfully
-        let actions = state.on_qc_signature_verified(block_hash, true);
+        let actions = state.on_qc_signature_verified(&topology, block_hash, true);
 
         // Should produce a vote (PersistAndBroadcastVote)
         let has_vote = actions
@@ -5785,14 +5841,14 @@ mod tests {
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(1), 1, validator_set);
         let mut state = BftState::new(
             1,
             {
                 let key_bytes = keys[1].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             BftConfig::default(),
             RecoveredState::default(),
         );
@@ -5841,6 +5897,7 @@ mod tests {
 
         // Process header to add pending verification
         let _ = state.on_block_header(
+            &topology,
             header,
             BlockManifest::default(),
             &HashMap::new(),
@@ -5851,7 +5908,7 @@ mod tests {
         assert!(state.pending_blocks.contains_key(&block_hash));
 
         // Simulate QC signature verification FAILED
-        let actions = state.on_qc_signature_verified(block_hash, false);
+        let actions = state.on_qc_signature_verified(&topology, block_hash, false);
 
         // Should NOT produce any actions (no vote)
         assert!(
@@ -5881,14 +5938,14 @@ mod tests {
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        let topology = Arc::new(StaticTopology::new(ValidatorId(1), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(1), 1, validator_set);
         let mut state = BftState::new(
             1,
             {
                 let key_bytes = keys[1].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             BftConfig::default(),
             RecoveredState::default(),
         );
@@ -5913,6 +5970,7 @@ mod tests {
 
         // Process header
         let actions = state.on_block_header(
+            &topology,
             header,
             BlockManifest::default(),
             &HashMap::new(),
@@ -5938,11 +5996,11 @@ mod tests {
 
     #[test]
     fn test_advance_round_increments_view() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         let initial_view = state.view;
-        let _actions = state.advance_round();
+        let _actions = state.advance_round(&topology);
 
         assert_eq!(state.view, initial_view + 1, "View should increment by 1");
     }
@@ -5964,14 +6022,14 @@ mod tests {
         let validator_set = ValidatorSet::new(validators);
 
         // Validator 2 - will be proposer at (height=1, round=1) since (1+1)%4 = 2
-        let topology = Arc::new(StaticTopology::new(ValidatorId(2), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(2), 1, validator_set);
         let mut state = BftState::new(
             2,
             {
                 let key_bytes = keys[2].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             BftConfig::default(),
             RecoveredState::default(),
         );
@@ -5979,7 +6037,7 @@ mod tests {
         state.set_time(Duration::from_secs(100));
 
         // Advance to round 1 - validator 2 becomes proposer
-        let actions = state.advance_round();
+        let actions = state.advance_round(&topology);
 
         // Should broadcast a fallback block
         let has_broadcast = actions
@@ -5993,7 +6051,7 @@ mod tests {
 
     #[test]
     fn test_advance_round_unlocks_when_no_qc() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         // Simulate having voted at height 1
@@ -6001,7 +6059,7 @@ mod tests {
         state.voted_heights.insert(1, (block_hash, 0));
 
         // Advance round - should unlock since no QC at height 1
-        let _actions = state.advance_round();
+        let _actions = state.advance_round(&topology);
 
         assert!(
             !state.voted_heights.contains_key(&1),
@@ -6011,7 +6069,7 @@ mod tests {
 
     #[test]
     fn test_maybe_unlock_for_qc() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
 
         // Set up vote locks at heights 1, 2, 3
         state
@@ -6037,7 +6095,7 @@ mod tests {
             weighted_timestamp_ms: 100_000,
         };
 
-        state.maybe_unlock_for_qc(&qc);
+        state.maybe_unlock_for_qc(&topology, &qc);
 
         assert!(
             !state.voted_heights.contains_key(&1),
@@ -6055,7 +6113,7 @@ mod tests {
 
     #[test]
     fn test_view_sync_on_higher_qc() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
 
         // Start at view 5
         state.view = 5;
@@ -6073,14 +6131,14 @@ mod tests {
             weighted_timestamp_ms: 100_000,
         };
 
-        state.maybe_unlock_for_qc(&qc);
+        state.maybe_unlock_for_qc(&topology, &qc);
 
         assert_eq!(state.view, 10, "View should sync to QC's round");
     }
 
     #[test]
     fn test_view_sync_does_not_regress() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
 
         // Start at view 15
         state.view = 15;
@@ -6098,21 +6156,21 @@ mod tests {
             weighted_timestamp_ms: 100_000,
         };
 
-        state.maybe_unlock_for_qc(&qc);
+        state.maybe_unlock_for_qc(&topology, &qc);
 
         assert_eq!(state.view, 15, "View should NOT regress to lower QC round");
     }
 
     #[test]
     fn test_genesis_qc_does_not_sync_view() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
 
         // Start at view 5
         state.view = 5;
 
         // Genesis QC should not affect view
         let genesis_qc = QuorumCertificate::genesis();
-        state.maybe_unlock_for_qc(&genesis_qc);
+        state.maybe_unlock_for_qc(&topology, &genesis_qc);
 
         assert_eq!(state.view, 5, "Genesis QC should not change view");
     }
@@ -6176,7 +6234,7 @@ mod tests {
 
     #[test]
     fn test_validate_deferral_hash_ordering() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Use raw hash bytes to control ordering deterministically
         // Loser must have higher hash, winner must have lower hash
@@ -6224,7 +6282,7 @@ mod tests {
 
     #[test]
     fn test_validate_deferral_not_stale_winner() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Use raw hash bytes for deterministic ordering
         let loser_bytes = [0xFFu8; 32]; // Higher hash
@@ -6256,7 +6314,7 @@ mod tests {
 
     #[test]
     fn test_validate_deferral_not_stale_loser() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Use raw hash bytes for deterministic ordering
         let loser_bytes = [0xFFu8; 32]; // Higher hash
@@ -6288,7 +6346,7 @@ mod tests {
 
     #[test]
     fn test_validate_deferral_proof_winner_hash_mismatch() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Use raw hash bytes for deterministic ordering
         let loser_bytes = [0xFFu8; 32]; // Higher hash
@@ -6318,7 +6376,7 @@ mod tests {
 
     #[test]
     fn test_validate_abort_execution_timeout() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Valid: timeout at block 35 for TX committed at block 1
         let valid_abort = TransactionAbort {
@@ -6347,7 +6405,7 @@ mod tests {
 
     #[test]
     fn test_validate_abort_too_many_retries() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Valid: retry_count > 0
         let valid_abort = TransactionAbort {
@@ -6372,7 +6430,7 @@ mod tests {
 
     #[test]
     fn test_validate_abort_execution_rejected() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // ExecutionRejected always passes (no structural validation)
         let abort = TransactionAbort {
@@ -6391,7 +6449,7 @@ mod tests {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Helper to create a state with multiple validators for vote testing
-    fn make_multi_validator_state() -> (BftState, Vec<Bls12381G1PrivateKey>) {
+    fn make_multi_validator_state() -> (BftState, TopologySnapshot, Vec<Bls12381G1PrivateKey>) {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
@@ -6403,23 +6461,23 @@ mod tests {
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
         let state = BftState::new(
             0,
             {
                 let key_bytes = keys[0].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             BftConfig::default(),
             RecoveredState::default(),
         );
-        (state, keys)
+        (state, topology, keys)
     }
 
     #[test]
     fn test_vote_locking_prevents_voting_for_different_block_at_same_height() {
-        let (mut state, _keys) = make_multi_validator_state();
+        let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         let height = 1u64;
@@ -6460,7 +6518,7 @@ mod tests {
         let block_b_hash = block_b.hash();
 
         // Vote for block A at height 1, round 0
-        let actions = state.try_vote_on_block(block_a_hash, height, round_0);
+        let actions = state.try_vote_on_block(&topology, block_a_hash, height, round_0);
         assert!(
             !actions.is_empty(),
             "Should be able to vote for first block"
@@ -6472,7 +6530,7 @@ mod tests {
 
         // Try to vote for block B at height 1, round 1 (different block, same height)
         // This should be REJECTED due to vote locking
-        let actions = state.try_vote_on_block(block_b_hash, height, round_1);
+        let actions = state.try_vote_on_block(&topology, block_b_hash, height, round_1);
         assert!(
             actions.is_empty(),
             "Vote locking should prevent voting for different block at same height"
@@ -6484,7 +6542,7 @@ mod tests {
 
     #[test]
     fn test_vote_locking_allows_revoting_same_block() {
-        let (mut state, _keys) = make_multi_validator_state();
+        let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         let height = 1u64;
@@ -6505,12 +6563,12 @@ mod tests {
         let block_hash = block.hash();
 
         // Vote for block at round 0
-        let actions = state.try_vote_on_block(block_hash, height, 0);
+        let actions = state.try_vote_on_block(&topology, block_hash, height, 0);
         assert!(!actions.is_empty(), "Should vote for block");
 
         // Try to vote for SAME block at round 1 (after view change)
         // This should return empty (already voted) but NOT log a warning
-        let actions = state.try_vote_on_block(block_hash, height, 1);
+        let actions = state.try_vote_on_block(&topology, block_hash, height, 1);
         assert!(
             actions.is_empty(),
             "Should not re-broadcast vote for same block"
@@ -6522,7 +6580,7 @@ mod tests {
 
     #[test]
     fn test_vote_locking_cleaned_up_on_commit() {
-        let (mut state, _keys) = make_multi_validator_state();
+        let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         // Vote at heights 1, 2, 3
@@ -6541,7 +6599,7 @@ mod tests {
                 transaction_root: Hash::ZERO,
                 provision_targets: vec![],
             };
-            state.try_vote_on_block(block.hash(), height, 0);
+            state.try_vote_on_block(&topology, block.hash(), height, 0);
         }
 
         assert_eq!(state.voted_heights.len(), 3);
@@ -6571,7 +6629,7 @@ mod tests {
     fn test_equivocation_detected_same_height_same_round_different_block() {
         // Byzantine validator votes for two different blocks at the same (height, round).
         // The second vote should be detected as equivocation.
-        let (mut state, _keys) = make_multi_validator_state();
+        let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         let height = 5u64;
@@ -6594,7 +6652,7 @@ mod tests {
 
         // Simulate verified vote being processed (no QC formed)
         let verified_votes_a = vec![(0usize, vote_a, 1u64)];
-        let _actions = state.on_qc_result(block_a, None, verified_votes_a);
+        let _actions = state.on_qc_result(&topology, block_a, None, verified_votes_a);
 
         // Verify first vote was recorded
         assert!(state
@@ -6620,7 +6678,7 @@ mod tests {
 
         // Process second verified vote - equivocation should be detected and logged
         let verified_votes_b = vec![(0usize, vote_b, 1u64)];
-        let _actions = state.on_qc_result(block_b, None, verified_votes_b);
+        let _actions = state.on_qc_result(&topology, block_b, None, verified_votes_b);
 
         // Original vote should still be recorded (equivocating vote skipped)
         let (recorded_hash, _) = state
@@ -6637,7 +6695,7 @@ mod tests {
     fn test_no_equivocation_same_height_different_round() {
         // Validator votes for different blocks at same height but different rounds.
         // This is ALLOWED per HotStuff-2 (unlock on round advancement).
-        let (mut state, _keys) = make_multi_validator_state();
+        let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         let height = 5u64;
@@ -6657,7 +6715,7 @@ mod tests {
             timestamp: 100_000,
         };
         let verified_votes_a = vec![(0usize, vote_a, 1u64)];
-        let _actions = state.on_qc_result(block_a, None, verified_votes_a);
+        let _actions = state.on_qc_result(&topology, block_a, None, verified_votes_a);
 
         // Vote for DIFFERENT block at DIFFERENT round - this is allowed!
         let vote_b = BlockVote {
@@ -6670,7 +6728,7 @@ mod tests {
             timestamp: 100_000,
         };
         let verified_votes_b = vec![(0usize, vote_b, 1u64)];
-        let _actions = state.on_qc_result(block_b, None, verified_votes_b);
+        let _actions = state.on_qc_result(&topology, block_b, None, verified_votes_b);
 
         // Second vote should be recorded (overwrites first since different round is allowed)
         let (recorded_hash, recorded_round) = state
@@ -6687,7 +6745,7 @@ mod tests {
     #[test]
     fn test_equivocation_detection_independent_per_height() {
         // Votes at different heights should not interfere with each other.
-        let (mut state, _keys) = make_multi_validator_state();
+        let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         let voter = ValidatorId(2);
@@ -6704,7 +6762,7 @@ mod tests {
             timestamp: 100_000,
         };
         let verified_votes_h5 = vec![(0usize, vote_h5.clone(), 1u64)];
-        let _actions = state.on_qc_result(vote_h5.block_hash, None, verified_votes_h5);
+        let _actions = state.on_qc_result(&topology, vote_h5.block_hash, None, verified_votes_h5);
 
         // Vote for DIFFERENT block at height 6 - this is fine (different height)
         let vote_h6 = BlockVote {
@@ -6717,7 +6775,7 @@ mod tests {
             timestamp: 100_000,
         };
         let verified_votes_h6 = vec![(0usize, vote_h6.clone(), 1u64)];
-        let _actions = state.on_qc_result(vote_h6.block_hash, None, verified_votes_h6);
+        let _actions = state.on_qc_result(&topology, vote_h6.block_hash, None, verified_votes_h6);
 
         // Both should be recorded
         assert!(state.received_votes_by_height.contains_key(&(5, voter)));
@@ -6738,7 +6796,7 @@ mod tests {
         // 6. Only real vote is recorded - no equivocation detected
         //
         // We test step 5-6 by simulating on_qc_result with only the legitimate vote.
-        let (mut state, _keys) = make_multi_validator_state();
+        let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         let height = 5u64;
@@ -6760,7 +6818,7 @@ mod tests {
 
         // Simulate verification result - only legitimate vote verified
         let verified_votes = vec![(0usize, legitimate_vote, 1u64)];
-        let _actions = state.on_qc_result(block_b, None, verified_votes);
+        let _actions = state.on_qc_result(&topology, block_b, None, verified_votes);
 
         // Legitimate vote should be recorded
         assert!(state
@@ -6778,7 +6836,7 @@ mod tests {
 
     #[test]
     fn test_received_votes_cleaned_up_on_commit() {
-        let (mut state, _keys) = make_multi_validator_state();
+        let (mut state, _topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         // Record votes at heights 1, 2, 3 from different validators
@@ -6816,7 +6874,7 @@ mod tests {
         // 5. The re-proposed block should keep round=0 (not change to 31)
         //    so the block hash stays the same
 
-        let (mut state, _keys) = make_multi_validator_state();
+        let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         let height = 1u64;
@@ -6852,7 +6910,7 @@ mod tests {
             .insert(height, (original_block_hash, original_round));
 
         // Now call repropose_locked_block (simulating view change where we're the new leader)
-        let actions = state.repropose_locked_block(original_block_hash, height);
+        let actions = state.repropose_locked_block(&topology, original_block_hash, height);
 
         // Should have broadcast action
         let broadcast_action = actions
@@ -6895,7 +6953,7 @@ mod tests {
         // Verify that a re-proposed block with original round passes validate_header
         // This is the receiving validator's perspective
 
-        let (state, _keys) = make_multi_validator_state();
+        let (state, topology, _keys) = make_multi_validator_state();
 
         let height = 1u64;
         let original_round = 0u64;
@@ -6920,7 +6978,7 @@ mod tests {
         // Even though the receiving validator might be at view=31,
         // validation should pass because:
         // - proposer_for(1, 0) = ValidatorId(1) matches header.proposer
-        let result = state.validate_header(&header);
+        let result = state.validate_header(&topology, &header);
         assert!(
             result.is_ok(),
             "Re-proposed block with original round should pass validation: {:?}",
@@ -6932,7 +6990,7 @@ mod tests {
     fn test_reproposed_block_with_wrong_proposer_fails_validation() {
         // If someone tries to re-propose with a different proposer, it should fail
 
-        let (state, _keys) = make_multi_validator_state();
+        let (state, topology, _keys) = make_multi_validator_state();
 
         let height = 1u64;
 
@@ -6953,7 +7011,7 @@ mod tests {
             provision_targets: vec![],
         };
 
-        let result = state.validate_header(&header);
+        let result = state.validate_header(&topology, &header);
         assert!(
             result.is_err(),
             "Block with wrong proposer for round should fail validation"
@@ -6980,7 +7038,7 @@ mod tests {
         //
         // The flow is: unlock -> check if proposer -> create fallback -> vote for it
         // So the old vote is replaced with a new vote for the fallback block.
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         let height = 1u64;
@@ -6997,7 +7055,7 @@ mod tests {
         // proposer_for(1, 1) = (1+1)%4 = 2 = ValidatorId(2)
         // So ValidatorId(0) is NOT the proposer at round 1.
         state.view = 0; // Reset for clean test
-        let _actions = state.advance_round();
+        let _actions = state.advance_round(&topology);
         assert_eq!(state.view, 1);
         // Vote lock should be cleared (no QC at height 1, latest_qc_height = 0 < 1)
         // Since we're NOT the proposer, no new vote is created
@@ -7012,7 +7070,7 @@ mod tests {
 
         // Round 2: Second view change - not proposer, should unlock
         // proposer_for(1, 2) = (1+2)%4 = 3 = ValidatorId(3)
-        let _actions = state.advance_round();
+        let _actions = state.advance_round(&topology);
         assert_eq!(state.view, 2);
         assert!(
             !state.voted_heights.contains_key(&height),
@@ -7025,7 +7083,7 @@ mod tests {
 
         // Round 3: Third view change - not proposer, should unlock
         // proposer_for(1, 3) = (1+3)%4 = 0 = ValidatorId(0) - WE ARE THE PROPOSER!
-        let actions = state.advance_round();
+        let actions = state.advance_round(&topology);
         assert_eq!(state.view, 3);
         // Since we're the proposer, we create a fallback block and vote for it
         // So there WILL be a vote at height 1 (for the new fallback block)
@@ -7052,7 +7110,7 @@ mod tests {
         // Scenario: We have a QC at height 1, so we're now proposing for height 2.
         // advance_round should only try to unlock at height 2, not at height 1.
         // Vote locks at lower heights are preserved (they'll be cleaned up on commit).
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         // Set up: We have a QC at height 1 (meaning consensus decided for height 1)
@@ -7079,7 +7137,7 @@ mod tests {
         // View change advances round. With QC at height 1, we propose for height 2.
         // The unlock check is: latest_qc_height (1) < height (2)? Yes.
         // So it unlocks at height 2, NOT at height 1.
-        let _actions = state.advance_round();
+        let _actions = state.advance_round(&topology);
 
         // Vote at height 1 should still be there (advance_round doesn't touch it)
         assert!(
@@ -7098,7 +7156,7 @@ mod tests {
     fn test_qc_arriving_during_view_change_scenario() {
         // Scenario: We're in the middle of view changes, then receive a QC.
         // The QC should unlock votes at and below its height.
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         // Set up vote locks at multiple heights
@@ -7128,7 +7186,7 @@ mod tests {
             weighted_timestamp_ms: 100_000,
         };
 
-        state.maybe_unlock_for_qc(&qc);
+        state.maybe_unlock_for_qc(&topology, &qc);
 
         // Heights 1 and 2 should be unlocked
         assert!(
@@ -7150,7 +7208,7 @@ mod tests {
     fn test_unlock_for_qc_at_same_height_different_block() {
         // Scenario: We voted for block A at height H, but QC forms for block B at height H.
         // This proves B won consensus, so our lock on A is now irrelevant and safe to remove.
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
 
         let block_a = Hash::from_bytes(b"block_a");
         let block_b = Hash::from_bytes(b"block_b");
@@ -7172,7 +7230,7 @@ mod tests {
             weighted_timestamp_ms: 100_000,
         };
 
-        state.maybe_unlock_for_qc(&qc);
+        state.maybe_unlock_for_qc(&topology, &qc);
 
         // Our vote lock should be removed - block A can never get a QC now
         // (2f+1 voted for B, only f+1 honest validators could have voted for A)
@@ -7187,7 +7245,7 @@ mod tests {
     fn test_safety_cannot_vote_for_conflicting_block_after_voting() {
         // This is the core safety test: once we vote for block A at height H,
         // we must NEVER vote for a different block B at height H (in any round).
-        let (mut state, _keys) = make_multi_validator_state();
+        let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         let height = 1u64;
@@ -7198,7 +7256,7 @@ mod tests {
         state.voted_heights.insert(height, (block_a, 0));
 
         // Try to vote for block B at the same height - should be blocked
-        let actions = state.try_vote_on_block(block_b, height, 1); // Different round doesn't help
+        let actions = state.try_vote_on_block(&topology, block_b, height, 1); // Different round doesn't help
 
         assert!(
             actions.is_empty(),
@@ -7215,7 +7273,7 @@ mod tests {
     fn test_can_vote_for_same_block_at_different_round() {
         // If we already voted for block A at round 0, we can "re-vote" for
         // block A at round 1 (though it's a no-op since same block).
-        let (mut state, _keys) = make_multi_validator_state();
+        let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         let height = 1u64;
@@ -7225,7 +7283,7 @@ mod tests {
         state.voted_heights.insert(height, (block_a, 0));
 
         // Try to vote for same block A at round 1 - should be a no-op (already voted)
-        let actions = state.try_vote_on_block(block_a, height, 1);
+        let actions = state.try_vote_on_block(&topology, block_a, height, 1);
 
         // Should be empty because we already voted for this block
         assert!(
@@ -7258,14 +7316,14 @@ mod tests {
         let validator_set = ValidatorSet::new(validators);
 
         // Validator 0 will be proposer at (height=1, round=3): (1+3)%4 = 0
-        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
         let mut state = BftState::new(
             0,
             {
                 let key_bytes = keys[0].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             BftConfig::default(),
             RecoveredState::default(),
         );
@@ -7297,7 +7355,7 @@ mod tests {
         // Since no QC at height 1, vote lock is cleared, then we create fallback
         state.view = 2; // Will become 3 after advance_round
 
-        let actions = state.advance_round();
+        let actions = state.advance_round(&topology);
 
         // The old vote should be replaced with a vote for the new fallback block.
         // advance_round: 1) unlocks at height 1, 2) creates fallback, 3) votes for it
@@ -7365,14 +7423,14 @@ mod tests {
         let validator_set = ValidatorSet::new(validators);
 
         // Validator 0 will be proposer at (height=1, round=3): (1+3)%4 = 0
-        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
         let mut state = BftState::new(
             0,
             {
                 let key_bytes = keys[0].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             BftConfig::default(),
             RecoveredState::default(),
         );
@@ -7383,7 +7441,7 @@ mod tests {
 
         // Advance to round 3 where we become proposer
         state.view = 2;
-        let actions = state.advance_round();
+        let actions = state.advance_round(&topology);
 
         // Should create and broadcast a fallback block
         let broadcast_action = actions
@@ -7413,7 +7471,7 @@ mod tests {
     #[test]
     fn test_multiple_heights_vote_locking_independent() {
         // Verify that vote locks at different heights are independent.
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         let block_h1 = Hash::from_bytes(b"block_height_1");
@@ -7437,7 +7495,7 @@ mod tests {
 
             weighted_timestamp_ms: 100_000,
         };
-        state.maybe_unlock_for_qc(&qc_h1);
+        state.maybe_unlock_for_qc(&topology, &qc_h1);
 
         assert!(
             !state.voted_heights.contains_key(&1),
@@ -7456,14 +7514,14 @@ mod tests {
     #[test]
     fn test_genesis_qc_does_not_unlock() {
         // Genesis QC should not trigger any unlocks (edge case).
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
 
         state
             .voted_heights
             .insert(1, (Hash::from_bytes(b"block_1"), 0));
 
         let genesis_qc = QuorumCertificate::genesis();
-        state.maybe_unlock_for_qc(&genesis_qc);
+        state.maybe_unlock_for_qc(&topology, &genesis_qc);
 
         assert!(
             state.voted_heights.contains_key(&1),
@@ -7474,7 +7532,7 @@ mod tests {
     #[test]
     fn test_clear_vote_tracking_for_height() {
         // Test the helper function that clears vote tracking during HotStuff-2 unlock.
-        let mut state = make_test_state();
+        let (mut state, _topology) = make_test_state();
 
         // Add vote tracking for multiple validators at height 5
         let height = 5u64;
@@ -7516,7 +7574,7 @@ mod tests {
         // This is critical to prevent losing accumulated votes during view changes.
         use crate::vote_set::VoteSet;
 
-        let (mut state, keys) = make_multi_validator_state();
+        let (mut state, _topology, keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         let height = 5u64;
@@ -7704,7 +7762,7 @@ mod tests {
         // When a QC forms and there's no content (empty mempool, no deferrals,
         // no aborts, no certificates), we should NOT immediately propose.
         // This avoids wasting resources on empty block pipelining.
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
@@ -7722,6 +7780,7 @@ mod tests {
 
         // Call on_qc_formed with empty content
         let actions = state.on_qc_formed(
+            &topology,
             qc.block_hash,
             qc,
             &ReadyTransactions::default(), // empty mempool
@@ -7746,7 +7805,7 @@ mod tests {
     fn test_qc_formed_proposes_when_has_deferrals() {
         // When a QC forms and there IS content (e.g., deferrals), we SHOULD
         // immediately propose to pipeline block production.
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
@@ -7770,6 +7829,7 @@ mod tests {
 
         // Call on_qc_formed with a deferral
         let actions = state.on_qc_formed(
+            &topology,
             qc.block_hash,
             qc,
             &ReadyTransactions::default(), // empty mempool
@@ -7783,7 +7843,7 @@ mod tests {
         // After the refactor, proposal building is async - we emit BuildProposal
         // and the runner calls back with ProposalBuilt which triggers the broadcast.
         let has_build_proposal = actions.iter().any(
-            |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight(4)),
+            |a| matches!(a, Action::BuildProposal { height, .. } if height == &BlockHeight(4)),
         );
 
         assert!(
@@ -7810,14 +7870,14 @@ mod tests {
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
         let mut state = BftState::new(
             1,
             {
                 let key_bytes = keys[0].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             BftConfig::default(),
             RecoveredState::default(),
         );
@@ -7865,6 +7925,7 @@ mod tests {
 
         // Process first block header
         let actions1 = state.on_block_header(
+            &topology,
             header1,
             BlockManifest::default(),
             &HashMap::new(),
@@ -7899,6 +7960,7 @@ mod tests {
 
         // Process second block header
         let actions2 = state.on_block_header(
+            &topology,
             header2,
             BlockManifest::default(),
             &HashMap::new(),
@@ -8036,14 +8098,14 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_ordering_empty_block() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
         let block = make_test_block_with_transactions(5, vec![]);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
     #[test]
     fn test_validate_transaction_ordering_single_tx() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
         let tx = make_test_tx(1, false);
         let block = make_test_block_with_transactions(5, vec![tx]);
         assert!(state.validate_transaction_ordering(&block).is_ok());
@@ -8051,7 +8113,7 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_ordering_valid_no_proofs() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Create TXs and sort by hash
         let mut txs = vec![
@@ -8067,7 +8129,7 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_ordering_invalid_no_proofs() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Create TXs, sort, then reverse (invalid order)
         let mut txs = vec![
@@ -8086,7 +8148,7 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_ordering_valid_with_proofs_first() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Create TXs for priority group and non-priority group
         let (tx1, proof1) = make_test_tx_with_proof(10, true);
@@ -8113,7 +8175,7 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_ordering_invalid_proof_group_unsorted() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Create priority TXs with proofs
         let (tx1, proof1) = make_test_tx_with_proof(10, true);
@@ -8139,7 +8201,7 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_ordering_invalid_non_priority_before_priority() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Non-priority TX in priority section without proof - invalid
         let (no_proof_tx, _) = make_test_tx_with_proof(10, false);
@@ -8158,7 +8220,7 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_ordering_all_have_proofs() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // All TXs have proofs - valid as long as sorted, all in priority section
         let (tx1, proof1) = make_test_tx_with_proof(10, true);
@@ -8180,7 +8242,7 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_ordering_retries_first() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Create retry TXs, proof TXs, and regular TXs
         let retry1 = make_retry_tx(10);
@@ -8206,7 +8268,7 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_ordering_invalid_retry_after_proof() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Create a retry and a proof TX
         let retry = make_retry_tx(10);
@@ -8227,7 +8289,7 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_ordering_invalid_retry_after_other() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Create a retry and a regular TX
         let retry = make_retry_tx(10);
@@ -8244,7 +8306,7 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_ordering_retries_only() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // All retries in retry section - valid as long as sorted
         let mut retries = vec![make_retry_tx(10), make_retry_tx(20), make_retry_tx(30)];
@@ -8256,7 +8318,7 @@ mod tests {
 
     #[test]
     fn test_validate_transaction_ordering_retries_unsorted() {
-        let state = make_test_state();
+        let (state, _topology) = make_test_state();
 
         // Retries not sorted by hash in retry section
         let mut retries = vec![make_retry_tx(10), make_retry_tx(20), make_retry_tx(30)];
@@ -8276,7 +8338,7 @@ mod tests {
         // When a QC forms with content but we proposed too recently,
         // the immediate proposal should be rate-limited.
 
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
 
         // Set current time and simulate that we just proposed
         state.set_time(Duration::from_millis(1000));
@@ -8304,6 +8366,7 @@ mod tests {
         );
 
         let actions = state.on_qc_formed(
+            &topology,
             qc.block_hash,
             qc,
             &ReadyTransactions::default(), // empty mempool
@@ -8329,7 +8392,7 @@ mod tests {
         // When enough time has passed since the last proposal,
         // immediate proposals should be allowed.
 
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
 
         // Set current time and simulate that we proposed long enough ago
         state.set_time(Duration::from_millis(1000));
@@ -8357,6 +8420,7 @@ mod tests {
         );
 
         let actions = state.on_qc_formed(
+            &topology,
             qc.block_hash,
             qc,
             &ReadyTransactions::default(), // empty mempool
@@ -8370,7 +8434,7 @@ mod tests {
         // After the refactor, proposal building is async - we emit BuildProposal
         // and the runner calls back with ProposalBuilt which triggers the broadcast.
         let has_build_proposal = actions.iter().any(
-            |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight(4)),
+            |a| matches!(a, Action::BuildProposal { height, .. } if height == &BlockHeight(4)),
         );
 
         assert!(
@@ -8394,7 +8458,7 @@ mod tests {
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
 
         // Create config with longer min_block_interval
         let config = BftConfig {
@@ -8408,7 +8472,7 @@ mod tests {
                 let key_bytes = keys[0].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             config,
             RecoveredState::default(),
         );
@@ -8437,6 +8501,7 @@ mod tests {
         );
 
         let actions = state.on_qc_formed(
+            &topology,
             qc.block_hash,
             qc,
             &ReadyTransactions::default(),
@@ -8471,7 +8536,7 @@ mod tests {
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
 
         // Create config with zero min_block_interval (disabled)
         let config = BftConfig {
@@ -8485,7 +8550,7 @@ mod tests {
                 let key_bytes = keys[0].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             config,
             RecoveredState::default(),
         );
@@ -8512,6 +8577,7 @@ mod tests {
         );
 
         let actions = state.on_qc_formed(
+            &topology,
             qc.block_hash,
             qc,
             &ReadyTransactions::default(),
@@ -8525,7 +8591,7 @@ mod tests {
         // After the refactor, proposal building is async - we emit BuildProposal
         // and the runner calls back with ProposalBuilt which triggers the broadcast.
         let has_build_proposal = actions.iter().any(
-            |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight(4)),
+            |a| matches!(a, Action::BuildProposal { height, .. } if height == &BlockHeight(4)),
         );
 
         assert!(
@@ -8539,7 +8605,7 @@ mod tests {
         // Verify that on_proposal_built updates last_proposal_time when a proposal is broadcast.
         // After the refactor, on_proposal_timer emits BuildProposal, and the runner calls back
         // with on_proposal_built which updates last_proposal_time and broadcasts the block.
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_millis(5000));
 
         // Ensure last_proposal_time starts at zero
@@ -8564,6 +8630,7 @@ mod tests {
 
         // Now next_height = 4, (4+0)%4=0, so validator 0 proposes
         let actions = state.on_proposal_timer(
+            &topology,
             &ReadyTransactions::default(),
             vec![],
             vec![],
@@ -8573,7 +8640,7 @@ mod tests {
 
         // Check that a BuildProposal action was emitted (async proposal)
         let build_proposal = actions.iter().any(
-            |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight(4)),
+            |a| matches!(a, Action::BuildProposal { height, .. } if height == &BlockHeight(4)),
         );
 
         assert!(
@@ -8611,7 +8678,8 @@ mod tests {
         let block_hash = block.hash();
         let block_arc = Arc::new(block);
 
-        let broadcast_actions = state.on_proposal_built(BlockHeight(4), 0, block_arc, block_hash);
+        let broadcast_actions =
+            state.on_proposal_built(&topology, BlockHeight(4), 0, block_arc, block_hash);
 
         // Check that a BlockHeader broadcast was emitted
         let has_broadcast = broadcast_actions
@@ -8814,7 +8882,7 @@ mod tests {
 
     #[test]
     fn test_syncing_validator_proposes_empty_block() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         // Set up a QC so we propose for height 4 (validator 0's turn: (4+0)%4=0)
@@ -8833,7 +8901,7 @@ mod tests {
 
         // Enter sync mode
         assert!(!state.is_syncing());
-        state.set_syncing(true);
+        state.set_syncing(&topology, true);
         assert!(state.is_syncing());
 
         // Trigger proposal timer with transactions (which should be ignored)
@@ -8843,7 +8911,14 @@ mod tests {
             others: vec![Arc::new(hyperscale_types::test_utils::test_transaction(1))],
         };
 
-        let actions = state.on_proposal_timer(&ready_txs, vec![], vec![], vec![], HashMap::new());
+        let actions = state.on_proposal_timer(
+            &topology,
+            &ready_txs,
+            vec![],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
 
         // Should have broadcast a block header
         let has_block_header = actions
@@ -8890,7 +8965,7 @@ mod tests {
 
     #[test]
     fn test_syncing_validator_uses_current_timestamp() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         let current_time = Duration::from_secs(12345);
         state.set_time(current_time);
 
@@ -8910,9 +8985,10 @@ mod tests {
         state.latest_qc = Some(qc);
 
         // Enter sync mode
-        state.set_syncing(true);
+        state.set_syncing(&topology, true);
 
         let actions = state.on_proposal_timer(
+            &topology,
             &ReadyTransactions::default(),
             vec![],
             vec![],
@@ -8945,14 +9021,14 @@ mod tests {
 
     #[test]
     fn test_sync_complete_exits_sync_mode() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
 
         // Enter sync mode
-        state.set_syncing(true);
+        state.set_syncing(&topology, true);
         assert!(state.is_syncing());
 
         // Exit sync mode
-        let actions = state.on_sync_complete();
+        let actions = state.on_sync_complete(&topology);
         assert!(!state.is_syncing());
 
         // May return fetch actions for pending blocks (or empty if no pending blocks)
@@ -8966,11 +9042,11 @@ mod tests {
 
     #[test]
     fn test_syncing_validator_can_vote_for_others_blocks() {
-        let (mut state, _keys) = make_multi_validator_state();
+        let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         // Enter sync mode
-        state.set_syncing(true);
+        state.set_syncing(&topology, true);
 
         // Create a block from another proposer (validator 1 proposes height 1)
         let block_hash = Hash::from_bytes(b"other_proposer_block");
@@ -8978,7 +9054,7 @@ mod tests {
         let round = 0u64;
 
         // Directly call try_vote_on_block (simulating after QC verification)
-        let actions = state.try_vote_on_block(block_hash, height, round);
+        let actions = state.try_vote_on_block(&topology, block_hash, height, round);
 
         // Should have created a vote
         let has_vote = actions
@@ -8998,7 +9074,7 @@ mod tests {
 
     #[test]
     fn test_view_changes_allowed_during_sync() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
 
         // Set up time so that view change would trigger
         state.set_time(Duration::from_secs(100));
@@ -9011,7 +9087,7 @@ mod tests {
         );
 
         // Enter sync mode
-        state.set_syncing(true);
+        state.set_syncing(&topology, true);
 
         // Syncing nodes SHOULD still participate in view changes.
         // They receive headers at the current height/round and need to help
@@ -9023,7 +9099,7 @@ mod tests {
         );
 
         // Verify check_round_timeout returns actions (view change)
-        let timeout_actions = state.check_round_timeout();
+        let timeout_actions = state.check_round_timeout(&topology);
         assert!(
             timeout_actions.is_some(),
             "check_round_timeout should trigger view change even while syncing"
@@ -9032,15 +9108,15 @@ mod tests {
 
     #[test]
     fn test_sync_mode_resets_leader_activity_on_exit() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
 
         // Set up stale leader activity
         state.set_time(Duration::from_secs(100));
         state.last_leader_activity = Duration::from_secs(0);
 
         // Enter and exit sync mode
-        state.set_syncing(true);
-        state.on_sync_complete();
+        state.set_syncing(&topology, true);
+        state.on_sync_complete(&topology);
 
         // Leader activity should be reset to current time
         assert_eq!(
@@ -9052,18 +9128,18 @@ mod tests {
 
     #[test]
     fn test_syncing_validator_vote_locking_preserved() {
-        let (mut state, _keys) = make_multi_validator_state();
+        let (mut state, topology, _keys) = make_multi_validator_state();
         state.set_time(Duration::from_secs(100));
 
         // Enter sync mode
-        state.set_syncing(true);
+        state.set_syncing(&topology, true);
 
         let height = 1u64;
         let block_a = Hash::from_bytes(b"block_a");
         let block_b = Hash::from_bytes(b"block_b");
 
         // Vote for block A
-        let actions = state.try_vote_on_block(block_a, height, 0);
+        let actions = state.try_vote_on_block(&topology, block_a, height, 0);
         assert!(
             actions
                 .iter()
@@ -9072,7 +9148,7 @@ mod tests {
         );
 
         // Try to vote for block B at same height - should be blocked
-        let actions = state.try_vote_on_block(block_b, height, 1);
+        let actions = state.try_vote_on_block(&topology, block_b, height, 1);
         assert!(
             !actions
                 .iter()
@@ -9090,7 +9166,7 @@ mod tests {
 
     #[test]
     fn test_start_sync_sets_syncing_flag() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         assert!(!state.is_syncing(), "Should not be syncing initially");
@@ -9111,7 +9187,7 @@ mod tests {
 
         // check_sync_health should trigger sync since we're behind (committed=0, qc=5)
         // and gap > 3 without a pending commit
-        let actions = state.check_sync_health();
+        let actions = state.check_sync_health(&topology);
 
         assert!(
             state.is_syncing(),
@@ -9127,7 +9203,7 @@ mod tests {
 
     #[test]
     fn test_stale_sync_block_ignored() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
         state.committed_height = 10; // Already committed past height 1
 
@@ -9169,7 +9245,7 @@ mod tests {
         };
 
         // Should return empty actions since block is stale
-        let actions = state.on_sync_block_ready_to_apply(block, qc);
+        let actions = state.on_sync_block_ready_to_apply(&topology, block, qc);
         assert!(actions.is_empty(), "Stale sync block should be ignored");
 
         // Should NOT have set syncing flag
@@ -9181,7 +9257,7 @@ mod tests {
 
     #[test]
     fn test_sync_block_records_leader_activity() {
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
         state.last_leader_activity = Duration::from_secs(0);
 
@@ -9200,10 +9276,11 @@ mod tests {
         state.latest_qc = Some(qc);
 
         // Enter sync mode
-        state.set_syncing(true);
+        state.set_syncing(&topology, true);
 
         // Propose (which builds sync block)
         let _actions = state.on_proposal_timer(
+            &topology,
             &ReadyTransactions::default(),
             vec![],
             vec![],
@@ -9222,7 +9299,7 @@ mod tests {
     #[test]
     fn test_sync_block_vs_fallback_block_differences() {
         // This test verifies the key differences between sync blocks and fallback blocks
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         // Set up QC with specific timestamp
@@ -9241,9 +9318,9 @@ mod tests {
         state.latest_qc = Some(qc);
 
         // Test 1: Build sync block
-        state.set_syncing(true);
-        let sync_actions = state.build_and_broadcast_sync_block(4, 0);
-        state.set_syncing(false);
+        state.set_syncing(&topology, true);
+        let sync_actions = state.build_and_broadcast_sync_block(&topology, 4, 0);
+        state.set_syncing(&topology, false);
 
         // Reset state for fallback test
         state.pending_blocks.clear();
@@ -9252,7 +9329,7 @@ mod tests {
         state.voted_heights.clear();
 
         // Test 2: Build fallback block
-        let fallback_actions = state.build_and_broadcast_fallback_block(4, 1);
+        let fallback_actions = state.build_and_broadcast_fallback_block(&topology, 4, 1);
 
         // Extract headers
         let sync_header = sync_actions
@@ -9302,7 +9379,7 @@ mod tests {
     #[test]
     fn test_chain_advances_with_syncing_proposer() {
         // Simulate a scenario where a syncing proposer keeps the chain advancing
-        let mut state = make_test_state();
+        let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         // Set up initial QC
@@ -9320,10 +9397,11 @@ mod tests {
         state.latest_qc = Some(qc);
 
         // Enter sync mode
-        state.set_syncing(true);
+        state.set_syncing(&topology, true);
 
         // Propose first sync block
         let actions1 = state.on_proposal_timer(
+            &topology,
             &ReadyTransactions::default(),
             vec![],
             vec![],
@@ -9352,7 +9430,7 @@ mod tests {
 
     #[test]
     fn test_linear_backoff_timeout() {
-        let mut state = make_test_state();
+        let (mut state, _topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         // Default config: base = 3s, increment = 500ms
@@ -9395,7 +9473,7 @@ mod tests {
 
     #[test]
     fn test_linear_backoff_resets_on_height_advance() {
-        let mut state = make_test_state();
+        let (mut state, _topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
         let base_timeout = Duration::from_secs(3);
@@ -9443,7 +9521,7 @@ mod tests {
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
 
         let config = BftConfig::default().with_view_change_timeout_increment(Duration::ZERO);
 
@@ -9453,7 +9531,7 @@ mod tests {
                 let key_bytes = keys[0].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             config,
             RecoveredState::default(),
         );
@@ -9481,7 +9559,7 @@ mod tests {
 
     #[test]
     fn test_linear_backoff_affects_should_advance_round() {
-        let mut state = make_test_state();
+        let (mut state, _topology) = make_test_state();
 
         // Set up: we're at round 0, last_leader_activity = 0
         state.view = 0;
@@ -9547,7 +9625,7 @@ mod tests {
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
 
         // Configure with a 10s max cap (default is 30s)
         let config =
@@ -9559,7 +9637,7 @@ mod tests {
                 let key_bytes = keys[0].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             config,
             RecoveredState::default(),
         );
@@ -9616,7 +9694,7 @@ mod tests {
             })
             .collect();
         let validator_set = ValidatorSet::new(validators);
-        let topology = Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set));
+        let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
 
         // Configure with no cap (Tendermint behavior)
         let config = BftConfig::default().with_view_change_timeout_max(None);
@@ -9627,7 +9705,7 @@ mod tests {
                 let key_bytes = keys[0].to_bytes();
                 Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes")
             },
-            topology,
+            &topology,
             config,
             RecoveredState::default(),
         );
@@ -9662,13 +9740,13 @@ mod tests {
     fn test_vote_recipients_targets_next_proposers() {
         // 4 validators (V0-V3), self = V0.
         // Proposer formula: committee[(height + round) % 4].
-        let state = make_test_state();
+        let (state, topology) = make_test_state();
 
         // Voting at height 0, round 0. Next proposers for height 1:
         //   round 0: (1+0)%4 = 1 -> V1 (primary)
         //   round 1: (1+1)%4 = 2 -> V2 (secondary)
         assert_eq!(
-            state.vote_recipients(0, 0),
+            state.vote_recipients(&topology, 0, 0),
             vec![ValidatorId(1), ValidatorId(2)]
         );
 
@@ -9676,7 +9754,7 @@ mod tests {
         //   round 0: (2+0)%4 = 2 -> V2 (primary)
         //   round 1: (2+1)%4 = 3 -> V3 (secondary)
         assert_eq!(
-            state.vote_recipients(1, 0),
+            state.vote_recipients(&topology, 1, 0),
             vec![ValidatorId(2), ValidatorId(3)]
         );
     }
@@ -9687,9 +9765,9 @@ mod tests {
         //   round 0: (4+0)%4 = 0 -> V0 (self, skipped)
         //   round 1: (4+1)%4 = 1 -> V1 (primary)
         //   round 2: (4+2)%4 = 2 -> V2 (secondary)
-        let state = make_test_state();
+        let (state, topology) = make_test_state();
         assert_eq!(
-            state.vote_recipients(3, 0),
+            state.vote_recipients(&topology, 3, 0),
             vec![ValidatorId(1), ValidatorId(2)]
         );
     }
@@ -9700,9 +9778,9 @@ mod tests {
         //   round 2: (1+2)%4 = 3 -> V3 (primary)
         //   round 3: (1+3)%4 = 0 -> V0 (self, skipped)
         //   round 4: (1+4)%4 = 1 -> V1 (secondary)
-        let state = make_test_state();
+        let (state, topology) = make_test_state();
         assert_eq!(
-            state.vote_recipients(0, 2),
+            state.vote_recipients(&topology, 0, 2),
             vec![ValidatorId(3), ValidatorId(1)]
         );
     }
@@ -9710,7 +9788,7 @@ mod tests {
     #[test]
     fn test_vote_recipients_empty_when_solo_validator() {
         // Solo validator — no one to send to (own vote processed internally).
-        let state = make_test_state_with_validators(1);
-        assert!(state.vote_recipients(0, 0).is_empty());
+        let (state, topology) = make_test_state_with_validators(1);
+        assert!(state.vote_recipients(&topology, 0, 0).is_empty());
     }
 }

@@ -744,6 +744,9 @@ mod tests {
     use super::*;
     use rand::SeedableRng;
 
+    type SharedRequestResult =
+        Arc<std::sync::Mutex<Option<Result<Vec<u8>, hyperscale_network::RequestError>>>>;
+
     #[test]
     fn test_shard_assignment() {
         let network = SimulatedNetwork::new(NetworkConfig {
@@ -994,10 +997,7 @@ mod tests {
     fn make_request_with_capture(
         peers: Vec<ValidatorId>,
         preferred_peer: Option<ValidatorId>,
-    ) -> (
-        PendingRequest,
-        Arc<std::sync::Mutex<Option<Result<Vec<u8>, hyperscale_network::RequestError>>>>,
-    ) {
+    ) -> (PendingRequest, SharedRequestResult) {
         let result = Arc::new(std::sync::Mutex::new(None));
         let result_clone = result.clone();
         let request = PendingRequest {

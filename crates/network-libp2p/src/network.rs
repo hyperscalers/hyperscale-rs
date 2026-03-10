@@ -9,7 +9,7 @@ use crate::notify_pool::NotifyStreamPool;
 use crate::request_manager::{RequestManager, RequestPriority};
 use hyperscale_network::{
     compression, GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError,
-    RequestHandler, Topic, TopicScope,
+    RequestHandler, Topic, TopicScope, ValidatorKeyMap,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
 use libp2p::PeerId;
@@ -81,6 +81,10 @@ impl Libp2pNetwork {
 }
 
 impl Network for Libp2pNetwork {
+    fn update_validator_keys(&self, keys: Arc<ValidatorKeyMap>) {
+        self.adapter.update_validator_keys(keys);
+    }
+
     fn broadcast_to_shard<M: ShardMessage>(&self, shard: ShardGroupId, message: &M) {
         let topic = Topic::shard(M::message_type_id(), shard);
         let data = compression::compress(&sbor::basic_encode(message).expect("SBOR encode failed"));

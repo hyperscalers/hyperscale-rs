@@ -2,13 +2,13 @@
 //!
 //! Provides deterministic test setup including key generation and topology construction.
 
+use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    bls_keypair_from_seed, Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardGroupId, StaticTopology,
-    Topology, ValidatorId, ValidatorInfo, ValidatorSet,
+    bls_keypair_from_seed, Bls12381G1PrivateKey, Bls12381G1PublicKey, ShardGroupId, ValidatorId,
+    ValidatorInfo, ValidatorSet,
 };
 use libp2p::{identity, Multiaddr};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Test fixtures for deterministic test setup.
 ///
@@ -22,7 +22,7 @@ pub struct TestFixtures {
     pub ed25519_keys: Vec<identity::Keypair>,
 
     /// Per-validator topologies.
-    topologies: Vec<Arc<dyn Topology>>,
+    topologies: Vec<TopologyState>,
 
     /// Number of validators.
     pub num_validators: u32,
@@ -101,19 +101,19 @@ impl TestFixtures {
         }
 
         // Create per-validator topologies
-        let topologies: Vec<Arc<dyn Topology>> = (0..num_validators)
+        let topologies: Vec<TopologyState> = (0..num_validators)
             .map(|i| {
                 let shard_id = i as u64 / validators_per_shard as u64;
                 let shard = ShardGroupId(shard_id);
                 let validator_id = ValidatorId(i as u64);
 
-                Arc::new(StaticTopology::with_shard_committees(
+                TopologyState::with_shard_committees(
                     validator_id,
                     shard,
                     num_shards,
                     &global_validator_set,
                     shard_committees.clone(),
-                )) as Arc<dyn Topology>
+                )
             })
             .collect();
 
@@ -128,8 +128,24 @@ impl TestFixtures {
     }
 
     /// Get the topology for a validator by index.
-    pub fn topology(&self, index: u32) -> Arc<dyn Topology> {
+    pub fn topology(&self, index: u32) -> TopologyState {
         self.topologies[index as usize].clone()
+    }
+
+    /// Extract a validator key map for network adapter construction.
+    pub fn validator_key_map(
+        &self,
+        index: u32,
+    ) -> std::sync::Arc<hyperscale_network::ValidatorKeyMap> {
+        let snapshot = self.topologies[index as usize].snapshot();
+        std::sync::Arc::new(
+            snapshot
+                .global_validator_set()
+                .validators
+                .iter()
+                .map(|v| (v.validator_id, v.public_key))
+                .collect(),
+        )
     }
 
     /// Get the BLS signing key for a validator.
@@ -239,10 +255,10 @@ mod tests {
         let fixtures = TestFixtures::new(42, 4);
 
         let topology = fixtures.topology(0);
-        assert_eq!(topology.local_validator_id(), ValidatorId(0));
-        assert_eq!(topology.local_shard(), ShardGroupId(0));
+        assert_eq!(topology.snapshot().local_validator_id(), ValidatorId(0));
+        assert_eq!(topology.snapshot().local_shard(), ShardGroupId(0));
 
         let topology2 = fixtures.topology(2);
-        assert_eq!(topology2.local_validator_id(), ValidatorId(2));
+        assert_eq!(topology2.snapshot().local_validator_id(), ValidatorId(2));
     }
 }

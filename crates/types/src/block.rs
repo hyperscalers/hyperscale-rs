@@ -804,8 +804,8 @@ mod tests {
         let notarized = crate::sign_and_notarize(manifest, &network, 1, &key).unwrap();
         let tx = Arc::new(RoutableTransaction::try_from(notarized).unwrap());
 
-        let root1 = compute_transaction_root(&[], &[], &[tx.clone()]);
-        let root2 = compute_transaction_root(&[], &[], &[tx.clone()]);
+        let root1 = compute_transaction_root(&[], &[], std::slice::from_ref(&tx));
+        let root2 = compute_transaction_root(&[], &[], std::slice::from_ref(&tx));
         assert_eq!(root1, root2);
         assert_ne!(root1, Hash::ZERO);
     }
@@ -823,9 +823,9 @@ mod tests {
         let tx = Arc::new(RoutableTransaction::try_from(notarized).unwrap());
 
         // Same tx in different slots should produce different roots
-        let root_retry = compute_transaction_root(&[tx.clone()], &[], &[]);
-        let root_priority = compute_transaction_root(&[], &[tx.clone()], &[]);
-        let root_normal = compute_transaction_root(&[], &[], &[tx.clone()]);
+        let root_retry = compute_transaction_root(std::slice::from_ref(&tx), &[], &[]);
+        let root_priority = compute_transaction_root(&[], std::slice::from_ref(&tx), &[]);
+        let root_normal = compute_transaction_root(&[], &[], std::slice::from_ref(&tx));
 
         assert_ne!(root_retry, root_priority);
         assert_ne!(root_priority, root_normal);

@@ -15,8 +15,7 @@ use hyperscale_production::{ProductionRunner, RocksDbStorage};
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
     generate_bls_keypair, validator_bind_message, Block, BlockHeader, BlockHeight, Hash,
-    QuorumCertificate, ShardGroupId, StaticTopology, Topology, ValidatorId, ValidatorInfo,
-    ValidatorSet,
+    QuorumCertificate, ShardGroupId, ValidatorId,
 };
 use serial_test::serial;
 use std::sync::Arc;
@@ -97,25 +96,21 @@ async fn test_storage_operations() {
 // Network Tests (localhost QUIC)
 // ============================================================================
 
-/// Create a dummy bind signature + topology for tests that create adapters directly.
+/// Create a dummy bind signature + validator key map for tests that create adapters directly.
 fn test_bind_args(
     keypair: &libp2p::identity::Keypair,
     validator_id: ValidatorId,
-) -> (hyperscale_types::Bls12381G2Signature, Arc<dyn Topology>) {
+) -> (
+    hyperscale_types::Bls12381G2Signature,
+    Arc<hyperscale_network::ValidatorKeyMap>,
+) {
     let bls_key = generate_bls_keypair();
     let pubkey = bls_key.public_key();
     let peer_id = libp2p::PeerId::from(keypair.public());
     let sig = bls_key.sign_v1(&validator_bind_message(&peer_id.to_bytes()));
-    let topo = Arc::new(StaticTopology::new(
-        validator_id,
-        1,
-        ValidatorSet::new(vec![ValidatorInfo {
-            validator_id,
-            public_key: pubkey,
-            voting_power: 1,
-        }]),
-    )) as Arc<dyn Topology>;
-    (sig, topo)
+    let mut keys = hyperscale_network::ValidatorKeyMap::new();
+    keys.insert(validator_id, pubkey);
+    (sig, Arc::new(keys))
 }
 
 #[tokio::test]
@@ -312,7 +307,7 @@ async fn test_validator_bind_success() {
         ShardGroupId(0),
         Arc::new(hyperscale_network::HandlerRegistry::new()),
         bind_sig0,
-        fixtures.topology(0),
+        fixtures.validator_key_map(0),
     )
     .await
     .unwrap();
@@ -337,7 +332,7 @@ async fn test_validator_bind_success() {
         ShardGroupId(0),
         Arc::new(hyperscale_network::HandlerRegistry::new()),
         bind_sig1,
-        fixtures.topology(1),
+        fixtures.validator_key_map(1),
     )
     .await
     .unwrap();
@@ -393,7 +388,7 @@ async fn test_validator_bind_rejects_wrong_key() {
         ShardGroupId(0),
         Arc::new(hyperscale_network::HandlerRegistry::new()),
         bind_sig0,
-        fixtures.topology(0),
+        fixtures.validator_key_map(0),
     )
     .await
     .unwrap();
@@ -420,7 +415,7 @@ async fn test_validator_bind_rejects_wrong_key() {
         ShardGroupId(0),
         Arc::new(hyperscale_network::HandlerRegistry::new()),
         wrong_sig,
-        fixtures.topology(1),
+        fixtures.validator_key_map(1),
     )
     .await
     .unwrap();
@@ -476,7 +471,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
         ShardGroupId(0),
         Arc::new(hyperscale_network::HandlerRegistry::new()),
         bind_sig0,
-        fixtures.topology(0),
+        fixtures.validator_key_map(0),
     )
     .await
     .unwrap();
@@ -501,7 +496,7 @@ async fn test_validator_bind_evicted_on_disconnect() {
         ShardGroupId(0),
         Arc::new(hyperscale_network::HandlerRegistry::new()),
         bind_sig1,
-        fixtures.topology(1),
+        fixtures.validator_key_map(1),
     )
     .await
     .unwrap();

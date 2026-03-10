@@ -20,9 +20,11 @@
 //! The receiver verifies the signature using the BLS public key from topology.
 
 use crate::stream_framing;
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use hyperscale_network::ValidatorKeyMap;
 use hyperscale_types::{
-    validator_bind_message, verify_bls12381_v1, Bls12381G2Signature, Topology, ValidatorId,
+    validator_bind_message, verify_bls12381_v1, Bls12381G2Signature, ValidatorId,
 };
 use libp2p::{PeerId as Libp2pPeerId, StreamProtocol};
 use libp2p_stream as stream;
@@ -30,6 +32,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
+
+/// Shared validator key map, updated atomically on epoch transitions.
+type SharedValidatorKeys = Arc<ArcSwap<ValidatorKeyMap>>;
 
 /// Stream protocol identifier for the validator-bind handshake.
 pub(crate) const VALIDATOR_BIND_PROTOCOL: StreamProtocol =
@@ -67,19 +72,19 @@ fn decode_bind_message(data: &[u8]) -> Option<(ValidatorId, Bls12381G2Signature)
 // ─── Verification ───────────────────────────────────────────────────────
 
 /// Verify a bind message: the BLS signature over the peer's PeerId must be
-/// valid for the claimed ValidatorId's public key from topology.
+/// valid for the claimed ValidatorId's public key.
 fn verify_bind(
     peer_id: &Libp2pPeerId,
     claimed_vid: ValidatorId,
     signature: &Bls12381G2Signature,
-    topology: &dyn Topology,
+    keys: &ValidatorKeyMap,
 ) -> Result<(), BindError> {
-    let pubkey = topology
-        .public_key(claimed_vid)
+    let pubkey = keys
+        .get(&claimed_vid)
         .ok_or(BindError::UnknownValidator(claimed_vid))?;
 
     let message = validator_bind_message(&peer_id.to_bytes());
-    if verify_bls12381_v1(&message, &pubkey, signature) {
+    if verify_bls12381_v1(&message, pubkey, signature) {
         Ok(())
     } else {
         Err(BindError::InvalidSignature(claimed_vid))
@@ -142,7 +147,7 @@ pub(crate) fn spawn_validator_bind_service(
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
     local_validator_id: ValidatorId,
     local_bind_signature: Bls12381G2Signature,
-    topology: Arc<dyn Topology>,
+    validator_keys: SharedValidatorKeys,
 ) -> ValidatorBindHandle {
     let (bind_tx, bind_rx) = mpsc::unbounded_channel();
 
@@ -165,7 +170,7 @@ pub(crate) fn spawn_validator_bind_service(
             validator_peers,
             local_validator_id,
             local_bind_signature,
-            topology,
+            validator_keys,
         )
         .await;
 
@@ -186,7 +191,7 @@ async fn run_service(
     validator_peers: Arc<DashMap<ValidatorId, Libp2pPeerId>>,
     local_vid: ValidatorId,
     local_sig: Bls12381G2Signature,
-    topology: Arc<dyn Topology>,
+    validator_keys: SharedValidatorKeys,
 ) {
     use futures::StreamExt;
 
@@ -195,11 +200,12 @@ async fn run_service(
             // Inbound: a remote peer initiated the bind exchange.
             Some((peer_id, stream)) = incoming.next() => {
                 let vp = validator_peers.clone();
-                let topo = topology.clone();
+                let keys = validator_keys.clone();
                 let sig = local_sig;
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_inbound(peer_id, stream, &vp, local_vid, &sig, topo.as_ref()).await {
+                    let keys_guard = keys.load();
+                    if let Err(e) = handle_inbound(peer_id, stream, &vp, local_vid, &sig, &keys_guard).await {
                         debug!(peer = %peer_id, error = %e, "Inbound validator-bind failed");
                     }
                 });
@@ -217,11 +223,12 @@ async fn run_service(
 
                 let ctrl = control.clone();
                 let vp = validator_peers.clone();
-                let topo = topology.clone();
+                let keys = validator_keys.clone();
                 let sig = local_sig;
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_outbound(peer_id, ctrl, &vp, local_vid, &sig, topo.as_ref()).await {
+                    let keys_guard = keys.load();
+                    if let Err(e) = handle_outbound(peer_id, ctrl, &vp, local_vid, &sig, &keys_guard).await {
                         debug!(peer = %peer_id, error = %e, "Outbound validator-bind failed");
                     }
                 });
@@ -244,7 +251,7 @@ async fn handle_inbound(
     validator_peers: &DashMap<ValidatorId, Libp2pPeerId>,
     local_vid: ValidatorId,
     local_sig: &Bls12381G2Signature,
-    topology: &dyn Topology,
+    keys: &ValidatorKeyMap,
 ) -> Result<(), BindError> {
     let result = tokio::time::timeout(BIND_TIMEOUT, async {
         // Read remote's bind message.
@@ -256,7 +263,7 @@ async fn handle_inbound(
             decode_bind_message(&remote_bytes).ok_or(BindError::InvalidMessage)?;
 
         // Verify remote's BLS signature over their PeerId.
-        verify_bind(&peer_id, remote_vid, &remote_sig, topology)?;
+        verify_bind(&peer_id, remote_vid, &remote_sig, keys)?;
 
         // Verified — register the binding.
         info!(
@@ -295,7 +302,7 @@ async fn handle_outbound(
     validator_peers: &DashMap<ValidatorId, Libp2pPeerId>,
     local_vid: ValidatorId,
     local_sig: &Bls12381G2Signature,
-    topology: &dyn Topology,
+    keys: &ValidatorKeyMap,
 ) -> Result<(), BindError> {
     let result = tokio::time::timeout(BIND_TIMEOUT, async {
         // Open a stream to the remote peer.
@@ -331,7 +338,7 @@ async fn handle_outbound(
             decode_bind_message(&remote_bytes).ok_or(BindError::InvalidMessage)?;
 
         // Verify remote's BLS signature over their PeerId.
-        verify_bind(&peer_id, remote_vid, &remote_sig, topology)?;
+        verify_bind(&peer_id, remote_vid, &remote_sig, keys)?;
 
         // Verified — register the binding.
         info!(
@@ -354,7 +361,17 @@ async fn handle_outbound(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{generate_bls_keypair, zero_bls_signature, Bls12381G1PublicKey};
+    use hyperscale_types::{generate_bls_keypair, zero_bls_signature};
+
+    /// Build a single-validator key map for bind tests.
+    fn make_bind_keys(
+        vid: ValidatorId,
+        pubkey: hyperscale_types::Bls12381G1PublicKey,
+    ) -> ValidatorKeyMap {
+        let mut keys = ValidatorKeyMap::new();
+        keys.insert(vid, pubkey);
+        keys
+    }
 
     #[test]
     fn test_encode_decode_roundtrip() {
@@ -386,9 +403,8 @@ mod tests {
         let msg = validator_bind_message(&peer_id.to_bytes());
         let sig = keypair.sign_v1(&msg);
 
-        // Build a minimal topology for testing.
-        let topo = TestTopology { vid, pubkey };
-        assert!(verify_bind(&peer_id, vid, &sig, &topo).is_ok());
+        let keys = make_bind_keys(vid, pubkey);
+        assert!(verify_bind(&peer_id, vid, &sig, &keys).is_ok());
     }
 
     #[test]
@@ -403,8 +419,8 @@ mod tests {
         let msg = validator_bind_message(&peer_a.to_bytes());
         let sig = keypair.sign_v1(&msg);
 
-        let topo = TestTopology { vid, pubkey };
-        assert!(verify_bind(&peer_b, vid, &sig, &topo).is_err());
+        let keys = make_bind_keys(vid, pubkey);
+        assert!(verify_bind(&peer_b, vid, &sig, &keys).is_err());
     }
 
     #[test]
@@ -416,13 +432,10 @@ mod tests {
         let msg = validator_bind_message(&peer_id.to_bytes());
         let sig = keypair.sign_v1(&msg);
 
-        // Topology knows validator 7 but we claim to be validator 99.
-        let topo = TestTopology {
-            vid: ValidatorId(7),
-            pubkey,
-        };
+        // Key map has validator 7 but we claim to be validator 99.
+        let keys = make_bind_keys(ValidatorId(7), pubkey);
         assert!(matches!(
-            verify_bind(&peer_id, ValidatorId(99), &sig, &topo),
+            verify_bind(&peer_id, ValidatorId(99), &sig, &keys),
             Err(BindError::UnknownValidator(ValidatorId(99)))
         ));
     }
@@ -434,70 +447,14 @@ mod tests {
         let peer_id = Libp2pPeerId::random();
         let vid = ValidatorId(7);
 
-        // Sign with key_a but topology has key_b for this validator.
+        // Sign with key_a but key map has key_b for this validator.
         let msg = validator_bind_message(&peer_id.to_bytes());
         let sig = keypair_a.sign_v1(&msg);
 
-        let topo = TestTopology {
-            vid,
-            pubkey: keypair_b.public_key(),
-        };
+        let keys = make_bind_keys(vid, keypair_b.public_key());
         assert!(matches!(
-            verify_bind(&peer_id, vid, &sig, &topo),
+            verify_bind(&peer_id, vid, &sig, &keys),
             Err(BindError::InvalidSignature(ValidatorId(7)))
         ));
-    }
-
-    // ── Minimal test topology ────────────────────────────────────────────
-
-    /// Single-validator topology for unit tests.
-    struct TestTopology {
-        vid: ValidatorId,
-        pubkey: Bls12381G1PublicKey,
-    }
-
-    impl Topology for TestTopology {
-        fn local_validator_id(&self) -> ValidatorId {
-            self.vid
-        }
-
-        fn local_shard(&self) -> hyperscale_types::ShardGroupId {
-            hyperscale_types::ShardGroupId(0)
-        }
-
-        fn num_shards(&self) -> u64 {
-            1
-        }
-
-        fn committee_for_shard(
-            &self,
-            _shard: hyperscale_types::ShardGroupId,
-        ) -> std::borrow::Cow<'_, [ValidatorId]> {
-            std::borrow::Cow::Owned(vec![self.vid])
-        }
-
-        fn voting_power_for_shard(&self, _shard: hyperscale_types::ShardGroupId) -> u64 {
-            1
-        }
-
-        fn voting_power(&self, vid: ValidatorId) -> Option<u64> {
-            if vid == self.vid {
-                Some(1)
-            } else {
-                None
-            }
-        }
-
-        fn public_key(&self, vid: ValidatorId) -> Option<Bls12381G1PublicKey> {
-            if vid == self.vid {
-                Some(self.pubkey)
-            } else {
-                None
-            }
-        }
-
-        fn global_validator_set(&self) -> std::sync::Arc<hyperscale_types::ValidatorSet> {
-            unimplemented!("not needed for bind tests")
-        }
     }
 }

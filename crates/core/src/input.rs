@@ -118,7 +118,8 @@ pub enum NodeInput {
     /// Returned from delegated `FetchAndBroadcastProvisions` action.
     /// The I/O loop sends one `StateProvisionsNotification` per target shard.
     ProvisionsReady {
-        batches: Vec<(ShardGroupId, Vec<StateProvision>)>,
+        /// (shard, provisions, recipients) per target shard.
+        batches: Vec<(ShardGroupId, Vec<StateProvision>, Vec<ValidatorId>)>,
     },
 
     /// Provisions successfully received from a provision fetch request.

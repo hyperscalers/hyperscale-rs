@@ -9,7 +9,8 @@ use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
     CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId,
     QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision,
-    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
+    TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId,
+    VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -96,6 +97,8 @@ pub enum Action {
     BroadcastExecutionCertificate {
         shard: ShardGroupId,
         certificate: Arc<ExecutionCertificate>,
+        /// Target shard peers (excluding self) for the broadcast.
+        recipients: Vec<ValidatorId>,
     },
 
     /// Fetch state entries and broadcast provisions for all cross-shard txs in a block.
@@ -111,6 +114,8 @@ pub enum Action {
         block_height: BlockHeight,
         block_timestamp: u64,
         state_version: u64,
+        /// Per-shard recipients for provision broadcasts (excluding self).
+        shard_recipients: HashMap<ShardGroupId, Vec<ValidatorId>>,
     },
 
     /// Broadcast a committed block header globally to all shards.
@@ -217,8 +222,8 @@ pub enum Action {
         votes: Vec<ExecutionVote>,
         /// Read nodes (for certificate).
         read_nodes: Vec<NodeId>,
-        /// Committee size (for SignerBitfield capacity).
-        committee_size: usize,
+        /// Ordered committee for the shard (for SignerBitfield index mapping).
+        committee: Vec<ValidatorId>,
     },
 
     /// Batch verify execution votes and aggregate valid ones (cross-shard Phase 4).
@@ -537,7 +542,7 @@ pub enum Action {
     /// Initiate epoch transition.
     ///
     /// Called when EpochTransitionReady event is received.
-    /// Updates the DynamicTopology and notifies subsystems.
+    /// Updates the topology and notifies subsystems.
     TransitionEpoch {
         /// The epoch we're transitioning from.
         from_epoch: EpochId,
@@ -546,6 +551,14 @@ pub enum Action {
         /// The finalized configuration for the new epoch.
         next_config: Box<EpochConfig>,
     },
+
+    /// Propagate updated topology to the io_loop / network layer.
+    ///
+    /// Emitted by the state machine after any topology mutation (epoch
+    /// transition, shard split/merge). The io_loop stores the snapshot
+    /// into its shared topology snapshot (`ArcSwap`), rebuilds
+    /// `cached_local_peers`, and updates `local_shard` / `num_shards`.
+    TopologyChanged { topology: Arc<TopologySnapshot> },
 
     /// Mark this validator as ready for the new epoch.
     ///
@@ -694,6 +707,8 @@ pub enum Action {
         block_height: BlockHeight,
         /// The block proposer from the source shard (preferred peer for the request).
         proposer: ValidatorId,
+        /// All validators in the source shard (candidate peers for the request).
+        peers: Vec<ValidatorId>,
     },
 }
 
@@ -806,6 +821,7 @@ impl Action {
             Action::ProposeGlobalBlock { .. } => "ProposeGlobalBlock",
             Action::BroadcastGlobalBlockVote { .. } => "BroadcastGlobalBlockVote",
             Action::TransitionEpoch { .. } => "TransitionEpoch",
+            Action::TopologyChanged { .. } => "TopologyChanged",
             Action::MarkValidatorReady { .. } => "MarkValidatorReady",
             Action::InitiateShardSplit { .. } => "InitiateShardSplit",
             Action::CompleteShardSplit { .. } => "CompleteShardSplit",

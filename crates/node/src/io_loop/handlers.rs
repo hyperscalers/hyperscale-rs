@@ -10,7 +10,6 @@ use hyperscale_messages::{
 };
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
-use std::sync::Arc;
 use tracing::warn;
 
 impl<S, N, D> IoLoop<S, N, D>
@@ -30,6 +29,7 @@ where
         use hyperscale_messages::request::{
             GetBlockRequest, GetCertificatesRequest, GetProvisionsRequest, GetTransactionsRequest,
         };
+        use std::sync::Arc;
 
         // ── block.request → sync protocol ────────────────────────────
 
@@ -60,10 +60,11 @@ where
         // ── provision.request → provision fetch protocol ─────────────
 
         let storage = Arc::clone(&self.storage);
-        let topology = Arc::clone(&self.topology);
+        let topology = self.topology.clone();
         self.network
             .register_request_handler::<GetProvisionsRequest>(move |req| {
-                serve_provision_request(&*storage, &*topology, req)
+                let topo = topology.load();
+                serve_provision_request(&*storage, topo.local_shard(), topo.num_shards(), req)
             });
     }
 
@@ -92,22 +93,22 @@ where
         // ── block.committed → pre-filter, then NodeInput::CommittedBlockGossipReceived ─
 
         let tx = self.event_sender.clone();
-        let topology = Arc::clone(&self.topology);
-        let local_shard = self.local_shard;
+        let topology = self.topology.clone();
         self.network
             .register_gossip_handler::<hyperscale_messages::CommittedBlockHeaderGossip>(
                 TopicScope::Global,
                 move |gossip: hyperscale_messages::CommittedBlockHeaderGossip| -> GossipVerdict {
                     let sender = gossip.sender;
                     let header_shard = gossip.committed_header.header.shard_group_id;
+                    let topo = topology.load();
 
                     // Own-shard headers are valid but not needed — accept to forward.
-                    if header_shard == local_shard {
+                    if header_shard == topo.local_shard() {
                         return GossipVerdict::Accept;
                     }
 
                     let Some(public_key) =
-                        resolve_sender_key(&*topology, sender, header_shard, "committed header")
+                        resolve_sender_key(&topo, sender, header_shard, "committed header")
                     else {
                         return GossipVerdict::Reject;
                     };
@@ -141,12 +142,13 @@ where
         // ── block.header → verify proposer sig, then ProtocolEvent::BlockHeaderReceived ─
 
         let tx = self.event_sender.clone();
-        let topology = Arc::clone(&self.topology);
+        let topology = self.topology.clone();
         self.network
             .register_notification_handler::<BlockHeaderNotification>(
                 move |gossip: BlockHeaderNotification| {
+                    let topo = topology.load();
                     let proposer = gossip.header.proposer;
-                    let Some(public_key) = topology.public_key(proposer) else {
+                    let Some(public_key) = topo.public_key(proposer) else {
                         warn!(proposer = proposer.0, "Unknown proposer for block header");
                         return;
                     };
@@ -176,15 +178,16 @@ where
         // ── transaction.certificate → verify sender sig, then NodeInput::TransactionCertificateReceived ─
 
         let tx = self.event_sender.clone();
-        let topology = Arc::clone(&self.topology);
-        let local_shard = self.local_shard;
+        let topology = self.topology.clone();
         self.network
             .register_notification_handler::<TransactionCertificateNotification>(
                 move |gossip: TransactionCertificateNotification| {
+                    let topo = topology.load();
+                    let local_shard = topo.local_shard();
                     let sender = gossip.sender;
                     let msg = gossip.signing_message(local_shard);
                     if !verify_sender_signature(
-                        &*topology,
+                        &topo,
                         sender,
                         local_shard,
                         &msg,
@@ -204,7 +207,7 @@ where
         // ── state.provision.batch → verify sender sig, then ProtocolEvent::StateProvisionsReceived ─
 
         let tx = self.event_sender.clone();
-        let topology = Arc::clone(&self.topology);
+        let topology = self.topology.clone();
         self.network
             .register_notification_handler::<hyperscale_messages::StateProvisionsNotification>(
                 move |batch: hyperscale_messages::StateProvisionsNotification| {
@@ -212,11 +215,12 @@ where
                         return;
                     }
 
+                    let topo = topology.load();
                     let sender = batch.sender;
                     let source_shard = batch.provisions[0].source_shard;
                     let msg = batch.signing_message();
                     if !verify_sender_signature(
-                        &*topology,
+                        &topo,
                         sender,
                         source_shard,
                         &msg,
@@ -237,8 +241,7 @@ where
         // ── execution.vote.batch → verify sender sig, then ProtocolEvent::ExecutionVoteReceived ─
 
         let tx = self.event_sender.clone();
-        let topology = Arc::clone(&self.topology);
-        let local_shard = self.local_shard;
+        let topology = self.topology.clone();
         self.network
             .register_notification_handler::<ExecutionVotesNotification>(
                 move |batch: ExecutionVotesNotification| {
@@ -246,10 +249,12 @@ where
                         return;
                     }
 
+                    let topo = topology.load();
+                    let local_shard = topo.local_shard();
                     let sender = batch.sender;
                     let msg = batch.signing_message(local_shard);
                     if !verify_sender_signature(
-                        &*topology,
+                        &topo,
                         sender,
                         local_shard,
                         &msg,
@@ -272,8 +277,7 @@ where
         // ── execution.certificate.batch → verify sender sig, then ProtocolEvent::ExecutionCertificateReceived ─
 
         let tx = self.event_sender.clone();
-        let topology = Arc::clone(&self.topology);
-        let local_shard = self.local_shard;
+        let topology = self.topology.clone();
         self.network
             .register_notification_handler::<ExecutionCertificatesNotification>(
                 move |batch: ExecutionCertificatesNotification| {
@@ -281,6 +285,8 @@ where
                         return;
                     }
 
+                    let topo = topology.load();
+                    let local_shard = topo.local_shard();
                     let sender = batch.sender;
                     // The sender is from the shard that produced the certificates,
                     // which may differ from the local shard in cross-shard transactions.
@@ -298,7 +304,7 @@ where
                     }
                     let msg = batch.signing_message(local_shard);
                     if !verify_sender_signature(
-                        &*topology,
+                        &topo,
                         sender,
                         source_shard,
                         &msg,

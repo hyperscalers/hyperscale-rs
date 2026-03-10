@@ -18,9 +18,10 @@ use hyperscale_node::io_loop::{IoLoop, StepOutput};
 use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp};
 use hyperscale_storage::ConsensusStore;
 use hyperscale_storage_memory::SimStorage;
+use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     bls_keypair_from_seed, Bls12381G1PrivateKey, Bls12381G1PublicKey, Hash as TxHash, ShardGroupId,
-    StaticTopology, Topology, TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
+    TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
 };
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
@@ -175,21 +176,26 @@ impl SimulationRunner {
                 let node_index = shard_start + v;
                 let validator_id = ValidatorId(node_index as u64);
 
-                let topology: Arc<dyn Topology> = Arc::new(StaticTopology::with_shard_committees(
+                let topology_state = TopologyState::with_shard_committees(
                     validator_id,
                     shard,
                     network_config.num_shards as u64,
                     &global_validator_set,
                     shard_committees.clone(),
-                ));
+                );
 
                 let key_bytes = keys[node_index as usize].to_bytes();
                 let signing_key =
                     Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
 
+                // Clone the current snapshot for IoLoop (state machine owns TopologyState)
+                let topology_arc = Arc::new(arc_swap::ArcSwap::from(Arc::clone(
+                    topology_state.snapshot(),
+                )));
+
                 let state = NodeStateMachine::with_speculative_config(
                     node_index as NodeIndex,
-                    topology.clone(),
+                    topology_state,
                     // Clone key for state machine (it needs its own copy)
                     Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes"),
                     BftConfig::default(),
@@ -214,7 +220,7 @@ impl SimulationRunner {
                     SyncDispatch,
                     event_tx,
                     signing_key,
-                    topology,
+                    topology_arc,
                     NodeConfig::default(),
                     tx_validator,
                 );

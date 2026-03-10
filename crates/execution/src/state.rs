@@ -33,10 +33,9 @@
 use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionVote, Hash, NodeId,
-    RoutableTransaction, ShardGroupId, StateProvision, Topology, TransactionCertificate,
+    RoutableTransaction, ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate,
     TransactionDecision, ValidatorId,
 };
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,9 +93,6 @@ pub struct SpeculativeResult {
 ///
 /// Handles transaction execution after blocks are committed.
 pub struct ExecutionState {
-    /// Network topology (single source of truth for committee/shard info).
-    topology: Arc<dyn Topology>,
-
     /// Current time.
     now: Duration,
 
@@ -241,16 +237,22 @@ pub struct ExecutionState {
     speculative_invalidated_count: u64,
 }
 
+impl Default for ExecutionState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Default maximum transactions for speculative execution (in-flight + cached).
 pub const DEFAULT_SPECULATIVE_MAX_TXS: usize = 500;
 
 /// Default number of rounds to pause speculation after a view change.
 pub const DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS: u64 = 3;
+
 impl ExecutionState {
     /// Create a new execution state machine with default settings.
-    pub fn new(topology: Arc<dyn Topology>) -> Self {
+    pub fn new() -> Self {
         Self::with_speculative_config(
-            topology,
             DEFAULT_SPECULATIVE_MAX_TXS,
             DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS,
         )
@@ -262,12 +264,10 @@ impl ExecutionState {
     /// * `speculative_max_txs` - Maximum transactions to track speculatively (in-flight + cached)
     /// * `view_change_cooldown_rounds` - Rounds to pause speculation after a view change
     pub fn with_speculative_config(
-        topology: Arc<dyn Topology>,
         speculative_max_txs: usize,
         view_change_cooldown_rounds: u64,
     ) -> Self {
         Self {
-            topology,
             now: Duration::ZERO,
             executed_txs: HashMap::new(),
             finalized_certificates: BTreeMap::new(),
@@ -310,58 +310,6 @@ impl ExecutionState {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Topology Accessors
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Get the local validator ID.
-    fn validator_id(&self) -> ValidatorId {
-        self.topology.local_validator_id()
-    }
-
-    /// Get the local shard.
-    fn local_shard(&self) -> ShardGroupId {
-        self.topology.local_shard()
-    }
-
-    /// Get the local committee.
-    fn committee(&self) -> Cow<'_, [ValidatorId]> {
-        self.topology.local_committee()
-    }
-
-    /// Get voting power for a validator.
-    fn voting_power(&self, validator_id: ValidatorId) -> u64 {
-        self.topology.voting_power(validator_id).unwrap_or(0)
-    }
-
-    /// Get public key for a validator.
-    fn public_key(&self, validator_id: ValidatorId) -> Option<Bls12381G1PublicKey> {
-        self.topology.public_key(validator_id)
-    }
-
-    /// Get quorum threshold.
-    fn quorum_threshold(&self) -> u64 {
-        self.topology.local_quorum_threshold()
-    }
-
-    /// Check if a transaction is single-shard.
-    fn is_single_shard(&self, tx: &RoutableTransaction) -> bool {
-        self.topology.is_single_shard_transaction(tx)
-    }
-
-    /// Get all shards for a transaction.
-    fn all_shards_for_tx(&self, tx: &RoutableTransaction) -> BTreeSet<ShardGroupId> {
-        self.topology
-            .all_shards_for_transaction(tx)
-            .into_iter()
-            .collect()
-    }
-
-    /// Determine shard for a node ID.
-    fn shard_for_node(&self, node_id: &NodeId) -> ShardGroupId {
-        self.topology.shard_for_node_id(node_id)
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
     // Block Commit Handling
     // ═══════════════════════════════════════════════════════════════════════════
 
@@ -371,8 +319,10 @@ impl ExecutionState {
         block_hash = ?block_hash,
         tx_count = transactions.len()
     ))]
+    #[allow(clippy::too_many_arguments)]
     pub fn on_block_committed(
         &mut self,
+        topology: &TopologySnapshot,
         block_hash: Hash,
         height: u64,
         block_timestamp: u64,
@@ -414,8 +364,9 @@ impl ExecutionState {
         self.prune_verified_votes();
 
         // Separate single-shard and cross-shard transactions
-        let (single_shard, cross_shard): (Vec<_>, Vec<_>) =
-            new_txs.into_iter().partition(|tx| self.is_single_shard(tx));
+        let (single_shard, cross_shard): (Vec<_>, Vec<_>) = new_txs
+            .into_iter()
+            .partition(|tx| topology.is_single_shard_transaction(tx));
 
         // Handle single-shard transactions (now use voting like cross-shard)
         // All WRITE operations need BLS signature aggregation
@@ -438,7 +389,7 @@ impl ExecutionState {
                     "SPECULATIVE HIT: Votes already sent, skipping execution"
                 );
                 // Just start tracking (vote trackers, etc.) - votes will arrive via ExecutionVoteReceived
-                actions.extend(self.start_single_shard_execution(tx.clone()));
+                actions.extend(self.start_single_shard_execution(topology, tx.clone()));
             } else if self.speculative_in_flight_txs.contains(&tx_hash) {
                 // Speculation in-flight - votes will be sent when it completes
                 // This counts as a hit since we're skipping re-execution
@@ -448,7 +399,7 @@ impl ExecutionState {
                     "SPECULATIVE IN-FLIGHT: Votes will arrive soon, skipping execution"
                 );
                 // Just start tracking - votes will arrive via ExecutionVoteReceived
-                actions.extend(self.start_single_shard_execution(tx.clone()));
+                actions.extend(self.start_single_shard_execution(topology, tx.clone()));
             } else {
                 // No speculation at all - execute normally
                 tracing::debug!(
@@ -464,7 +415,7 @@ impl ExecutionState {
 
         // Start execution tracking for transactions that need execution
         for tx in &txs_needing_execution {
-            actions.extend(self.start_single_shard_execution(tx.clone()));
+            actions.extend(self.start_single_shard_execution(topology, tx.clone()));
         }
 
         // Batch execute transactions that didn't have cached results
@@ -478,8 +429,8 @@ impl ExecutionState {
 
         // Handle cross-shard transactions
         let mut provision_requests = Vec::new();
-        let local_shard = self.local_shard();
-        let is_proposer = self.validator_id() == proposer;
+        let local_shard = topology.local_shard();
+        let is_proposer = topology.local_validator_id() == proposer;
 
         for tx in cross_shard {
             // Collect provision requests (proposer only)
@@ -488,15 +439,15 @@ impl ExecutionState {
                     .declared_reads
                     .iter()
                     .chain(tx.declared_writes.iter())
-                    .filter(|&node_id| self.shard_for_node(node_id) == local_shard)
+                    .filter(|&node_id| topology.shard_for_node_id(node_id) == local_shard)
                     .copied()
                     .collect();
                 owned_nodes.sort();
                 owned_nodes.dedup();
 
                 if !owned_nodes.is_empty() {
-                    let target_shards: Vec<_> = self
-                        .all_shards_for_tx(&tx)
+                    let target_shards: Vec<_> = topology
+                        .all_shards_for_transaction(&tx)
                         .into_iter()
                         .filter(|&s| s != local_shard)
                         .collect();
@@ -511,17 +462,33 @@ impl ExecutionState {
                 }
             }
 
-            actions.extend(self.start_cross_shard_execution(tx, height));
+            actions.extend(self.start_cross_shard_execution(topology, tx, height));
         }
 
         // Emit a single action for all provision fetches + broadcasts
         if !provision_requests.is_empty() {
+            // Build recipients for each target shard.
+            let local_vid = topology.local_validator_id();
+            let mut shard_recipients = HashMap::new();
+            for req in &provision_requests {
+                for &target_shard in &req.target_shards {
+                    shard_recipients.entry(target_shard).or_insert_with(|| {
+                        topology
+                            .committee_for_shard(target_shard)
+                            .iter()
+                            .copied()
+                            .filter(|&v| v != local_vid)
+                            .collect()
+                    });
+                }
+            }
             actions.push(Action::FetchAndBroadcastProvisions {
                 requests: provision_requests,
                 source_shard: local_shard,
                 block_height: BlockHeight(height),
                 block_timestamp,
                 state_version,
+                shard_recipients,
             });
         }
 
@@ -537,10 +504,14 @@ impl ExecutionState {
     /// 4. Vote aggregator collects votes and creates certificate when quorum reached
     ///
     /// This requires BLS signature aggregation for all transactions, not just cross-shard ones.
-    fn start_single_shard_execution(&mut self, tx: Arc<RoutableTransaction>) -> Vec<Action> {
+    fn start_single_shard_execution(
+        &mut self,
+        topology: &TopologySnapshot,
+        tx: Arc<RoutableTransaction>,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = tx.hash();
-        let local_shard = self.local_shard();
+        let local_shard = topology.local_shard();
 
         tracing::debug!(
             tx_hash = ?tx_hash,
@@ -549,7 +520,7 @@ impl ExecutionState {
         );
 
         // Step 1: Start tracking votes (same as cross-shard)
-        let quorum = self.quorum_threshold();
+        let quorum = topology.local_quorum_threshold();
         let vote_tracker = VoteTracker::new(
             tx_hash,
             vec![local_shard], // Only our shard participates
@@ -574,7 +545,7 @@ impl ExecutionState {
             );
             for vote in early_votes {
                 // Use on_vote() to ensure signature verification happens
-                actions.extend(self.on_vote(vote));
+                actions.extend(self.on_vote(topology, vote));
             }
         }
 
@@ -589,7 +560,7 @@ impl ExecutionState {
             );
             for cert in early_certs {
                 // Use on_certificate() to ensure signature verification happens
-                actions.extend(self.on_certificate(cert));
+                actions.extend(self.on_certificate(topology, cert));
             }
         }
 
@@ -602,15 +573,19 @@ impl ExecutionState {
     /// `FetchAndBroadcastProvisions` — this method only sets up tracking.
     fn start_cross_shard_execution(
         &mut self,
+        topology: &TopologySnapshot,
         tx: Arc<RoutableTransaction>,
         height: u64,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = tx.hash();
-        let local_shard = self.local_shard();
+        let local_shard = topology.local_shard();
 
         // Identify all participating shards
-        let participating_shards = self.all_shards_for_tx(&tx);
+        let participating_shards: BTreeSet<ShardGroupId> = topology
+            .all_shards_for_transaction(&tx)
+            .into_iter()
+            .collect();
 
         tracing::debug!(
             tx_hash = ?tx_hash,
@@ -655,12 +630,12 @@ impl ExecutionState {
                     count = provisions.len(),
                     "Replaying early ProvisioningComplete"
                 );
-                actions.extend(self.on_provisioning_complete(tx_hash, provisions));
+                actions.extend(self.on_provisioning_complete(topology, tx_hash, provisions));
             }
         }
 
         // Phase 3-4: Start tracking votes
-        let quorum = self.quorum_threshold();
+        let quorum = topology.local_quorum_threshold();
         let vote_tracker = VoteTracker::new(
             tx_hash,
             participating_shards.iter().copied().collect(),
@@ -680,7 +655,7 @@ impl ExecutionState {
             tracing::debug!(tx_hash = ?tx_hash, count = early_votes.len(), "Replaying early votes");
             for vote in early_votes {
                 // Use on_vote() to ensure signature verification happens
-                actions.extend(self.on_vote(vote));
+                actions.extend(self.on_vote(topology, vote));
             }
         }
 
@@ -691,7 +666,7 @@ impl ExecutionState {
             tracing::debug!(tx_hash = ?tx_hash, count = early_certs.len(), "Replaying early certificates");
             for cert in early_certs {
                 // Use on_certificate() to ensure signature verification happens
-                actions.extend(self.on_certificate(cert));
+                actions.extend(self.on_certificate(topology, cert));
             }
         }
 
@@ -713,10 +688,11 @@ impl ExecutionState {
     #[instrument(skip(self, provisions), fields(tx_hash = ?tx_hash))]
     pub fn on_provisioning_complete(
         &mut self,
+        topology: &TopologySnapshot,
         tx_hash: Hash,
         provisions: Vec<StateProvision>,
     ) -> Vec<Action> {
-        let local_shard = self.local_shard();
+        let local_shard = topology.local_shard();
 
         // Get the transaction waiting for provisions
         let Some((tx, _height)) = self.pending_provisioning.remove(&tx_hash) else {
@@ -765,7 +741,7 @@ impl ExecutionState {
         validator = ?vote.validator,
         success = vote.success
     ))]
-    pub fn on_vote(&mut self, vote: ExecutionVote) -> Vec<Action> {
+    pub fn on_vote(&mut self, topology: &TopologySnapshot, vote: ExecutionVote) -> Vec<Action> {
         let tx_hash = vote.transaction_hash;
         let validator_id = vote.validator;
 
@@ -788,12 +764,12 @@ impl ExecutionState {
 
         // Skip verification for our own vote - we just signed it, so we trust it.
         // This can happen when our vote is gossiped back to us via the network.
-        if validator_id == self.validator_id() {
+        if validator_id == topology.local_validator_id() {
             tracing::trace!(
                 tx_hash = ?tx_hash,
                 "Skipping verification for own vote"
             );
-            return self.handle_verified_vote(vote);
+            return self.handle_verified_vote(topology, vote);
         }
 
         // Check if we've already verified this exact vote (by tx_hash + validator).
@@ -807,11 +783,11 @@ impl ExecutionState {
                 validator = validator_id.0,
                 "Execution vote already verified, skipping re-verification"
             );
-            return self.handle_verified_vote(vote);
+            return self.handle_verified_vote(topology, vote);
         }
 
         // Get public key for signature verification
-        let Some(public_key) = self.public_key(validator_id) else {
+        let Some(public_key) = topology.public_key(validator_id) else {
             tracing::warn!(
                 tx_hash = ?tx_hash,
                 validator = validator_id.0,
@@ -821,7 +797,7 @@ impl ExecutionState {
         };
 
         // Get voting power
-        let voting_power = self.voting_power(validator_id);
+        let voting_power = topology.voting_power(validator_id).unwrap_or(0);
 
         // Get the tracker and buffer the vote
         let tracker = self.vote_trackers.get_mut(&tx_hash).unwrap();
@@ -873,6 +849,7 @@ impl ExecutionState {
     ))]
     pub fn on_execution_votes_verified(
         &mut self,
+        topology: &TopologySnapshot,
         tx_hash: Hash,
         verified_votes: Vec<(ExecutionVote, u64)>,
     ) -> Vec<Action> {
@@ -922,7 +899,7 @@ impl ExecutionState {
         }
 
         // Check for quorum after adding all verified votes
-        actions.extend(self.check_vote_quorum(tx_hash));
+        actions.extend(self.check_vote_quorum(topology, tx_hash));
 
         // Check if more votes arrived while we were verifying
         actions.extend(self.maybe_trigger_execution_vote_verification(tx_hash));
@@ -933,9 +910,13 @@ impl ExecutionState {
     /// Handle a verified vote (own vote or already-verified vote).
     ///
     /// Adds the vote to the tracker and checks for quorum.
-    fn handle_verified_vote(&mut self, vote: ExecutionVote) -> Vec<Action> {
+    fn handle_verified_vote(
+        &mut self,
+        topology: &TopologySnapshot,
+        vote: ExecutionVote,
+    ) -> Vec<Action> {
         let tx_hash = vote.transaction_hash;
-        let voting_power = self.voting_power(vote.validator);
+        let voting_power = topology.voting_power(vote.validator).unwrap_or(0);
 
         let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
             return vec![];
@@ -957,14 +938,14 @@ impl ExecutionState {
 
         tracker.add_verified_vote(vote, voting_power);
 
-        self.check_vote_quorum(tx_hash)
+        self.check_vote_quorum(topology, tx_hash)
     }
 
     /// Check if quorum is reached for a transaction's votes.
     ///
     /// If quorum is reached, triggers BLS signature aggregation.
-    fn check_vote_quorum(&mut self, tx_hash: Hash) -> Vec<Action> {
-        let local_shard = self.local_shard();
+    fn check_vote_quorum(&mut self, topology: &TopologySnapshot, tx_hash: Hash) -> Vec<Action> {
+        let local_shard = topology.local_shard();
 
         let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
             return vec![];
@@ -998,7 +979,7 @@ impl ExecutionState {
         );
 
         // Delegate BLS signature aggregation to crypto pool
-        let committee_size = self.committee().len();
+        let committee = topology.local_committee().to_vec();
 
         // Remove vote tracker (we've extracted what we need)
         self.vote_trackers.remove(&tx_hash);
@@ -1009,7 +990,7 @@ impl ExecutionState {
             writes_commitment,
             votes,
             read_nodes,
-            committee_size,
+            committee,
         }]
     }
 
@@ -1024,6 +1005,7 @@ impl ExecutionState {
     ))]
     pub fn on_execution_certificate_aggregated(
         &mut self,
+        topology: &TopologySnapshot,
         tx_hash: Hash,
         certificate: ExecutionCertificate,
     ) -> Vec<Action> {
@@ -1052,19 +1034,27 @@ impl ExecutionState {
         // Broadcast certificate to remote participating shards only.
         // Local shard peers independently form the same certificate from the
         // same execution votes, so sending it intra-shard is redundant.
-        let local_shard = self.local_shard();
+        let local_shard = topology.local_shard();
+        let local_vid = topology.local_validator_id();
         for target_shard in pending.participating_shards {
             if target_shard == local_shard {
                 continue;
             }
+            let recipients: Vec<ValidatorId> = topology
+                .committee_for_shard(target_shard)
+                .iter()
+                .copied()
+                .filter(|&v| v != local_vid)
+                .collect();
             actions.push(Action::BroadcastExecutionCertificate {
                 shard: target_shard,
                 certificate: Arc::clone(&certificate),
+                recipients,
             });
         }
 
         // Handle our own certificate
-        actions.extend(self.handle_certificate_internal(certificate));
+        actions.extend(self.handle_certificate_internal(topology, certificate));
 
         actions
     }
@@ -1082,7 +1072,11 @@ impl ExecutionState {
         shard = cert.shard_group_id.0,
         success = cert.success
     ))]
-    pub fn on_certificate(&mut self, cert: ExecutionCertificate) -> Vec<Action> {
+    pub fn on_certificate(
+        &mut self,
+        topology: &TopologySnapshot,
+        cert: ExecutionCertificate,
+    ) -> Vec<Action> {
         let tx_hash = cert.transaction_hash;
         let shard = cert.shard_group_id;
 
@@ -1103,10 +1097,10 @@ impl ExecutionState {
         }
 
         // Get public keys for the signers in the certificate's source shard
-        let committee = self.topology.committee_for_shard(shard);
+        let committee = topology.committee_for_shard(shard);
         let public_keys: Vec<Bls12381G1PublicKey> = committee
             .iter()
-            .filter_map(|&vid| self.topology.public_key(vid))
+            .filter_map(|&vid| topology.public_key(vid))
             .collect();
 
         if public_keys.len() != committee.len() {
@@ -1146,6 +1140,7 @@ impl ExecutionState {
     ))]
     pub fn on_certificate_verified(
         &mut self,
+        topology: &TopologySnapshot,
         certificate: ExecutionCertificate,
         valid: bool,
     ) -> Vec<Action> {
@@ -1176,7 +1171,7 @@ impl ExecutionState {
             return vec![];
         }
 
-        self.handle_certificate_internal(Arc::new(certificate))
+        self.handle_certificate_internal(topology, Arc::new(certificate))
     }
 
     /// Handle verification result for a fetched certificate's ExecutionCertificate.
@@ -1244,6 +1239,7 @@ impl ExecutionState {
     /// When all verify successfully, a FetchedCertificateVerified event is emitted.
     pub fn verify_fetched_certificate(
         &mut self,
+        topology: &TopologySnapshot,
         block_hash: Hash,
         certificate: TransactionCertificate,
     ) -> Vec<Action> {
@@ -1283,10 +1279,10 @@ impl ExecutionState {
         // Emit verification action for each embedded ExecutionCertificate
         for (shard_id, execution_cert) in &certificate.shard_proofs {
             // Get public keys for this shard's committee
-            let committee = self.topology.committee_for_shard(*shard_id);
+            let committee = topology.committee_for_shard(*shard_id);
             let public_keys: Vec<Bls12381G1PublicKey> = committee
                 .iter()
-                .filter_map(|&vid| self.topology.public_key(vid))
+                .filter_map(|&vid| topology.public_key(vid))
                 .collect();
 
             if public_keys.len() != committee.len() {
@@ -1317,12 +1313,16 @@ impl ExecutionState {
         tx_hash = %cert.transaction_hash,
         cert_shard = cert.shard_group_id.0,
     ))]
-    fn handle_certificate_internal(&mut self, cert: Arc<ExecutionCertificate>) -> Vec<Action> {
+    fn handle_certificate_internal(
+        &mut self,
+        topology: &TopologySnapshot,
+        cert: Arc<ExecutionCertificate>,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = cert.transaction_hash;
         let cert_shard = cert.shard_group_id;
 
-        let local_shard = self.local_shard();
+        let local_shard = topology.local_shard();
         let Some(tracker) = self.certificate_trackers.get_mut(&tx_hash) else {
             tracing::debug!(
                 tx_hash = ?tx_hash,
@@ -1786,6 +1786,7 @@ impl ExecutionState {
     /// Returns an action to execute the transactions speculatively.
     pub fn trigger_speculative_execution(
         &mut self,
+        topology: &TopologySnapshot,
         block_hash: Hash,
         height: u64,
         transactions: Vec<Arc<RoutableTransaction>>,
@@ -1808,7 +1809,7 @@ impl ExecutionState {
         // Filter to single-shard transactions that haven't been executed, cached, or in-flight
         let single_shard_txs: Vec<_> = transactions
             .into_iter()
-            .filter(|tx| self.is_single_shard(tx))
+            .filter(|tx| topology.is_single_shard_transaction(tx))
             .filter(|tx| !self.speculative_results.contains_key(&tx.hash()))
             .filter(|tx| !self.speculative_in_flight_txs.contains(&tx.hash()))
             .filter(|tx| !self.executed_txs.contains_key(&tx.hash()))
@@ -2109,8 +2110,6 @@ impl ExecutionState {
 impl std::fmt::Debug for ExecutionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutionState")
-            .field("validator_id", &self.validator_id())
-            .field("shard", &self.local_shard())
             .field("executed_txs", &self.executed_txs.len())
             .field("finalized_certificates", &self.finalized_certificates.len())
             .field("pending_provisioning", &self.pending_provisioning.len())
@@ -2125,11 +2124,10 @@ mod tests {
     use super::*;
     use hyperscale_types::test_utils::test_transaction;
     use hyperscale_types::{
-        generate_bls_keypair, verify_bls12381_v1, Bls12381G1PrivateKey, StaticTopology,
-        ValidatorInfo, ValidatorSet,
+        generate_bls_keypair, verify_bls12381_v1, Bls12381G1PrivateKey, ValidatorInfo, ValidatorSet,
     };
 
-    fn make_test_topology() -> Arc<dyn Topology> {
+    fn make_test_topology() -> TopologySnapshot {
         let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
 
         let validators: Vec<ValidatorInfo> = keys
@@ -2143,12 +2141,11 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
 
-        Arc::new(StaticTopology::new(ValidatorId(0), 1, validator_set))
+        TopologySnapshot::new(ValidatorId(0), 1, validator_set)
     }
 
     fn make_test_state() -> ExecutionState {
-        let topology = make_test_topology();
-        ExecutionState::new(topology)
+        ExecutionState::new()
     }
 
     #[test]
@@ -2160,6 +2157,7 @@ mod tests {
     #[test]
     fn test_single_shard_execution_flow() {
         let mut state = make_test_state();
+        let topology = make_test_topology();
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
@@ -2167,6 +2165,7 @@ mod tests {
 
         // Block committed with transaction
         let actions = state.on_block_committed(
+            &topology,
             block_hash,
             1,
             1000,
@@ -2192,8 +2191,8 @@ mod tests {
         // Simulate that by creating a vote and calling on_vote.
         let writes_commitment = Hash::ZERO;
         let success = true;
-        let local_shard = state.local_shard();
-        let validator_id = state.validator_id();
+        let local_shard = topology.local_shard();
+        let validator_id = topology.local_validator_id();
 
         // Create a signed vote (simulating what the runner does)
         let signing_key = generate_bls_keypair();
@@ -2212,7 +2211,7 @@ mod tests {
         };
 
         // Simulate runner sending ExecutionVoteReceived for our own vote
-        let actions = state.on_vote(vote);
+        let actions = state.on_vote(&topology, vote);
 
         // Should not emit any broadcast action (runner handles broadcast)
         // Our vote is handled internally - might trigger certificate aggregation if quorum reached
@@ -2228,12 +2227,14 @@ mod tests {
     #[test]
     fn test_deduplication() {
         let mut state = make_test_state();
+        let topology = make_test_topology();
 
         let tx = test_transaction(1);
         let block_hash = Hash::from_bytes(b"block1");
 
         // First commit - should produce status change + execute transaction actions
         let actions1 = state.on_block_committed(
+            &topology,
             block_hash,
             1,
             1000,
@@ -2245,8 +2246,15 @@ mod tests {
 
         // Second commit of same transaction
         let block_hash2 = Hash::from_bytes(b"block2");
-        let actions2 =
-            state.on_block_committed(block_hash2, 2, 2000, ValidatorId(0), 2, vec![Arc::new(tx)]);
+        let actions2 = state.on_block_committed(
+            &topology,
+            block_hash2,
+            2,
+            2000,
+            ValidatorId(0),
+            2,
+            vec![Arc::new(tx)],
+        );
 
         // Should be empty (deduplicated)
         assert!(actions2.is_empty());
@@ -2257,6 +2265,7 @@ mod tests {
         // Scenario: Speculation completes BEFORE block commits (normal HIT)
         // With inline signing, votes are already sent - we just skip re-execution.
         let mut state = make_test_state();
+        let topology = make_test_topology();
 
         let tx = Arc::new(test_transaction(1));
         let tx_hash = tx.hash();
@@ -2266,7 +2275,8 @@ mod tests {
         let height = 10;
 
         // Trigger speculative execution
-        let actions = state.trigger_speculative_execution(block_hash, height, vec![tx.clone()]);
+        let actions =
+            state.trigger_speculative_execution(&topology, block_hash, height, vec![tx.clone()]);
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::SpeculativeExecute { .. })));
@@ -2282,11 +2292,12 @@ mod tests {
 
         // Now block commits - should skip execution (votes already sent)
         let actions = state.on_block_committed(
+            &topology,
             block_hash,
             height,
             10000,
             ValidatorId(0),
-            height as u64,
+            height,
             vec![tx],
         );
 
@@ -2303,6 +2314,7 @@ mod tests {
         // Scenario: Block commits WHILE speculation is in-flight
         // With inline signing, we just wait - votes will arrive soon.
         let mut state = make_test_state();
+        let topology = make_test_topology();
 
         let tx = Arc::new(test_transaction(1));
         let tx_hash = tx.hash();
@@ -2312,7 +2324,8 @@ mod tests {
         let height = 10;
 
         // Trigger speculative execution
-        let actions = state.trigger_speculative_execution(block_hash, height, vec![tx.clone()]);
+        let actions =
+            state.trigger_speculative_execution(&topology, block_hash, height, vec![tx.clone()]);
         assert!(actions
             .iter()
             .any(|a| matches!(a, Action::SpeculativeExecute { .. })));
@@ -2320,11 +2333,12 @@ mod tests {
 
         // Block commits WHILE speculation is in-flight
         let commit_actions = state.on_block_committed(
+            &topology,
             block_hash,
             height,
             10000,
             ValidatorId(0),
-            height as u64,
+            height,
             vec![tx],
         );
 
@@ -2349,12 +2363,14 @@ mod tests {
     fn test_speculative_miss_no_speculation() {
         // Scenario: No speculation was triggered (MISS - normal execution)
         let mut state = make_test_state();
+        let topology = make_test_topology();
 
         let tx = Arc::new(test_transaction(1));
         let block_hash = Hash::from_bytes(b"block1");
 
         // Block commits without any speculation
-        let actions = state.on_block_committed(block_hash, 1, 1000, ValidatorId(0), 1, vec![tx]);
+        let actions =
+            state.on_block_committed(&topology, block_hash, 1, 1000, ValidatorId(0), 1, vec![tx]);
 
         // Should emit ExecuteTransactions (no speculation to use)
         assert!(actions

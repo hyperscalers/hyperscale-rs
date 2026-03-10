@@ -6,10 +6,11 @@ use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
 use hyperscale_provisions::ProvisionCoordinator;
+use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommitmentProof,
     CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction,
-    ShardGroupId, Topology, TransactionAbort, TransactionCertificate, TransactionDefer,
+    ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,8 +46,8 @@ pub struct NodeStateMachine {
     /// This node's index (simulation-only, for routing).
     node_index: NodeIndex,
 
-    /// Network topology (single source of truth).
-    topology: Arc<dyn Topology>,
+    /// Network topology — passed by reference to subsystem methods.
+    topology: TopologyState,
 
     /// BFT consensus state (includes implicit round advancement).
     bft: BftState,
@@ -81,7 +82,7 @@ impl std::fmt::Debug for NodeStateMachine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeStateMachine")
             .field("node_index", &self.node_index)
-            .field("shard", &self.topology.local_shard())
+            .field("shard", &self.topology.snapshot().local_shard())
             .field("bft", &self.bft)
             .field("now", &self.now)
             .finish()
@@ -106,13 +107,13 @@ impl NodeStateMachine {
     /// # Arguments
     ///
     /// * `node_index` - Deterministic node index for ordering
-    /// * `topology` - Network topology (single source of truth)
+    /// * `topology` - Network topology
     /// * `signing_key` - Key for signing votes and proposals
     /// * `bft_config` - BFT configuration
     /// * `recovered` - State recovered from storage. Use `RecoveredState::default()` for fresh start.
     pub fn new(
         node_index: NodeIndex,
-        topology: Arc<dyn Topology>,
+        topology: TopologyState,
         signing_key: Bls12381G1PrivateKey,
         bft_config: BftConfig,
         recovered: RecoveredState,
@@ -133,7 +134,7 @@ impl NodeStateMachine {
     #[allow(clippy::too_many_arguments)]
     pub fn with_speculative_config(
         node_index: NodeIndex,
-        topology: Arc<dyn Topology>,
+        topology: TopologyState,
         signing_key: Bls12381G1PrivateKey,
         bft_config: BftConfig,
         recovered: RecoveredState,
@@ -141,8 +142,6 @@ impl NodeStateMachine {
         view_change_cooldown_rounds: u64,
         mempool_config: MempoolConfig,
     ) -> Self {
-        let local_shard = topology.local_shard();
-
         // Clone key bytes to create a new keypair since Bls12381G1PrivateKey doesn't impl Clone
         let key_bytes = signing_key.to_bytes();
         let bft_signing_key =
@@ -155,22 +154,21 @@ impl NodeStateMachine {
 
         Self {
             node_index,
-            topology: topology.clone(),
             bft: BftState::new(
                 node_index,
                 bft_signing_key,
-                topology.clone(),
+                topology.snapshot(),
                 bft_config.clone(),
                 recovered,
             ),
             execution: ExecutionState::with_speculative_config(
-                topology.clone(),
                 speculative_max_txs,
                 view_change_cooldown_rounds,
             ),
-            mempool: MempoolState::with_config(topology.clone(), mempool_config),
-            provisions: ProvisionCoordinator::new(local_shard, topology.clone()),
-            livelock: LivelockState::new(local_shard, topology),
+            mempool: MempoolState::with_config(mempool_config),
+            provisions: ProvisionCoordinator::new(),
+            livelock: LivelockState::new(),
+            topology,
             // Use recovered JMT state - critical for correct state root computation
             last_committed_state: (initial_height, jmt_version, jmt_root),
             now: Duration::ZERO,
@@ -186,12 +184,12 @@ impl NodeStateMachine {
 
     /// Get this node's shard.
     pub fn shard(&self) -> ShardGroupId {
-        self.topology.local_shard()
+        self.topology.snapshot().local_shard()
     }
 
-    /// Get a reference to the topology.
-    pub fn topology(&self) -> &Arc<dyn Topology> {
-        &self.topology
+    /// Get the current topology snapshot.
+    pub fn topology(&self) -> &TopologySnapshot {
+        self.topology.snapshot()
     }
 
     /// Get a reference to the mempool state.
@@ -233,7 +231,8 @@ impl NodeStateMachine {
     ///
     /// Returns actions to be processed (e.g., initial timers).
     pub fn initialize_genesis(&mut self, genesis: Block) -> Vec<Action> {
-        self.bft.initialize_genesis(genesis)
+        self.bft
+            .initialize_genesis(self.topology.snapshot(), genesis)
         // Note: No separate view change timer - round advancement is handled
         // implicitly via the proposal timer (HotStuff-2 style)
     }
@@ -310,12 +309,15 @@ impl NodeStateMachine {
         // Check pending blocks that need fetch requests.
         // We delay fetching to give gossip and local certificate creation
         // time to fill in missing data first.
-        actions.extend(self.bft.check_pending_block_fetches());
+        actions.extend(
+            self.bft
+                .check_pending_block_fetches(self.topology.snapshot()),
+        );
 
         // Check if we're behind and need to catch up via sync.
         // This handles the case where we have a higher latest_qc than committed_height,
         // meaning the network has progressed but we're stuck.
-        actions.extend(self.bft.check_sync_health());
+        actions.extend(self.bft.check_sync_health(self.topology.snapshot()));
 
         // Clean up old tombstones in mempool to prevent unbounded memory growth.
         let current_height = BlockHeight(self.bft.committed_height());
@@ -333,7 +335,7 @@ impl NodeStateMachine {
     fn on_proposal_timer(&mut self) -> Vec<Action> {
         // Check if we should advance the round due to timeout.
         // Delegated to BftState which owns timeout tracking.
-        if let Some(actions) = self.bft.check_round_timeout() {
+        if let Some(actions) = self.bft.check_round_timeout(self.topology.snapshot()) {
             let current_height = BlockHeight(self.bft.committed_height() + 1);
 
             // Notify execution of view change to pause speculation temporarily
@@ -369,6 +371,7 @@ impl NodeStateMachine {
 
         // BftState handles state_root computation internally after filtering certificates
         self.bft.on_proposal_timer(
+            self.topology.snapshot(),
             &ready_txs,
             deferred,
             aborted,
@@ -453,13 +456,20 @@ impl NodeStateMachine {
             .iter()
             .filter_map(|h| mempool_txs.get(*h).cloned())
             .collect();
-        let spec_actions =
-            self.execution
-                .trigger_speculative_execution(block_hash, height, transactions);
+        let spec_actions = self.execution.trigger_speculative_execution(
+            self.topology.snapshot(),
+            block_hash,
+            height,
+            transactions,
+        );
 
-        let mut actions = self
-            .bft
-            .on_block_header(header, manifest, &mempool_txs, &local_certs);
+        let mut actions = self.bft.on_block_header(
+            self.topology.snapshot(),
+            header,
+            manifest,
+            &mempool_txs,
+            &local_certs,
+        );
         actions.extend(spec_actions);
         actions
     }
@@ -478,6 +488,7 @@ impl NodeStateMachine {
 
         // BftState handles state_root computation internally after filtering certificates
         self.bft.on_qc_formed(
+            self.topology.snapshot(),
             block_hash,
             qc,
             &inputs.ready_txs,
@@ -519,7 +530,8 @@ impl NodeStateMachine {
         // Notify BFT so it can update its committed state tracking.
         // BFT uses this as the source of truth for state_version in block headers,
         // preventing speculative version propagation that causes deadlocks.
-        self.bft.on_state_commit_complete(state_version, state_root)
+        self.bft
+            .on_state_commit_complete(self.topology.snapshot(), state_version, state_root)
     }
 
     /// Handle block committed — notify all subsystems in the correct order.
@@ -535,8 +547,9 @@ impl NodeStateMachine {
         // Register newly committed cross-shard TXs with livelock for cycle detection.
         // Must happen BEFORE livelock.on_block_committed() processes deferrals.
         for tx in block.all_transactions() {
-            if self.livelock.is_cross_shard(tx) {
-                self.livelock.on_cross_shard_committed(tx, block_height);
+            if self.livelock.is_cross_shard(self.topology.snapshot(), tx) {
+                self.livelock
+                    .on_cross_shard_committed(self.topology.snapshot(), tx, block_height);
             }
         }
 
@@ -584,6 +597,7 @@ impl NodeStateMachine {
         // will be processed by the coordinator via Continuation actions.
         let all_txs: Vec<_> = block.all_transactions().cloned().collect();
         let exec_actions = self.execution.on_block_committed(
+            self.topology.snapshot(),
             block_hash,
             height,
             block.header.timestamp,
@@ -612,10 +626,31 @@ impl NodeStateMachine {
         actions.extend(exec_actions);
 
         // Also let mempool handle it (marks transactions as committed, processes deferrals/aborts)
-        actions.extend(self.mempool.on_block_committed_full(&block));
+        actions.extend(
+            self.mempool
+                .on_block_committed_full(self.topology.snapshot(), &block),
+        );
 
-        // Let provisions coordinator handle cleanup (certificates, aborts, deferrals)
-        actions.extend(self.provisions.on_block_committed(&block));
+        // Let provisions coordinator handle cleanup (certificates, aborts, deferrals).
+        // Enrich RequestMissingProvisions actions with the source shard's committee.
+        let mut provision_actions = self
+            .provisions
+            .on_block_committed(self.topology.snapshot(), &block);
+        for action in &mut provision_actions {
+            if let Action::RequestMissingProvisions {
+                source_shard,
+                peers,
+                ..
+            } = action
+            {
+                *peers = self
+                    .topology
+                    .snapshot()
+                    .committee_for_shard(*source_shard)
+                    .to_vec();
+            }
+        }
+        actions.extend(provision_actions);
 
         actions
     }
@@ -631,21 +666,27 @@ impl NodeStateMachine {
                 self.mempool.on_provision_verified(result.tx_hash);
             }
         }
-        self.provisions
-            .on_state_provisions_verified(results, committed_header)
+        self.provisions.on_state_provisions_verified(
+            self.topology.snapshot(),
+            results,
+            committed_header,
+        )
     }
 
     /// Handle transaction executed — notify mempool and check pending blocks.
     fn on_transaction_executed(&mut self, tx_hash: Hash, accepted: bool) -> Vec<Action> {
         // Notify mempool
-        let mut actions = self.mempool.on_transaction_executed(tx_hash, accepted);
+        let mut actions =
+            self.mempool
+                .on_transaction_executed(self.topology.snapshot(), tx_hash, accepted);
 
         // Check if any pending blocks are now complete with this certificate
         let local_certs = self.execution.finalized_certificates_by_hash();
-        actions.extend(
-            self.bft
-                .check_pending_blocks_for_certificate(tx_hash, &local_certs),
-        );
+        actions.extend(self.bft.check_pending_blocks_for_certificate(
+            self.topology.snapshot(),
+            tx_hash,
+            &local_certs,
+        ));
 
         actions
     }
@@ -658,28 +699,29 @@ impl NodeStateMachine {
     ) -> Vec<Action> {
         // Only add to our mempool if this transaction involves our shard.
         // Cross-shard transactions that don't touch our shard should be ignored.
-        if !self.topology.involves_local_shard(&tx) {
+        if !self.topology.snapshot().involves_local_shard(&tx) {
             return vec![];
         }
 
         let tx_hash = tx.hash();
-        let mut actions = self
-            .mempool
-            .on_transaction_gossip_arc(tx, submitted_locally);
+        let mut actions =
+            self.mempool
+                .on_transaction_gossip_arc(self.topology.snapshot(), tx, submitted_locally);
 
         // Check if any pending blocks are now complete
         let mempool_map = self.mempool.as_hash_map();
-        actions.extend(
-            self.bft
-                .check_pending_blocks_for_transaction(tx_hash, &mempool_map),
-        );
+        actions.extend(self.bft.check_pending_blocks_for_transaction(
+            self.topology.snapshot(),
+            tx_hash,
+            &mempool_map,
+        ));
 
         actions
     }
 
     /// Handle sync complete — resume cleanup timer.
     fn on_sync_complete(&mut self) -> Vec<Action> {
-        let mut actions = self.bft.on_sync_complete();
+        let mut actions = self.bft.on_sync_complete(self.topology.snapshot());
         // Reschedule the cleanup timer. During sync, the cleanup timer
         // fires StartSync actions which don't reschedule the timer.
         // Now that sync is complete, we need to restart the cleanup timer
@@ -702,7 +744,11 @@ impl NodeStateMachine {
         // from Byzantine peers.
         let mut actions = Vec::new();
         for cert in certificates {
-            actions.extend(self.execution.verify_fetched_certificate(block_hash, cert));
+            actions.extend(self.execution.verify_fetched_certificate(
+                self.topology.snapshot(),
+                block_hash,
+                cert,
+            ));
         }
         actions
     }
@@ -732,7 +778,7 @@ impl NodeStateMachine {
 impl StateMachine for NodeStateMachine {
     #[instrument(skip(self), fields(
         node = self.node_index,
-        shard = self.topology.local_shard().0,
+        shard = self.topology.snapshot().local_shard().0,
         event = %event.type_name(),
         height = self.bft.committed_height(),
     ))]
@@ -752,40 +798,55 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::RemoteBlockCommitted {
                 committed_header,
                 sender,
-            } => self
-                .provisions
-                .on_remote_block_committed(committed_header, sender),
-            ProtocolEvent::BlockVoteReceived { vote } => self.bft.on_block_vote(vote),
-            ProtocolEvent::BlockReadyToCommit { block_hash, qc } => {
-                self.bft.on_block_ready_to_commit(block_hash, qc)
+            } => self.provisions.on_remote_block_committed(
+                self.topology.snapshot(),
+                committed_header,
+                sender,
+            ),
+            ProtocolEvent::BlockVoteReceived { vote } => {
+                self.bft.on_block_vote(self.topology.snapshot(), vote)
             }
+            ProtocolEvent::BlockReadyToCommit { block_hash, qc } => self
+                .bft
+                .on_block_ready_to_commit(self.topology.snapshot(), block_hash, qc),
             ProtocolEvent::QuorumCertificateResult {
                 block_hash,
                 qc,
                 verified_votes,
-            } => self.bft.on_qc_result(block_hash, qc, verified_votes),
-            ProtocolEvent::QcSignatureVerified { block_hash, valid } => {
-                self.bft.on_qc_signature_verified(block_hash, valid)
-            }
+            } => self
+                .bft
+                .on_qc_result(self.topology.snapshot(), block_hash, qc, verified_votes),
+            ProtocolEvent::QcSignatureVerified { block_hash, valid } => self
+                .bft
+                .on_qc_signature_verified(self.topology.snapshot(), block_hash, valid),
             ProtocolEvent::CommitmentProofVerified {
                 block_hash,
                 deferral_index,
                 valid,
-            } => self
+            } => self.bft.on_commitment_proof_verified(
+                self.topology.snapshot(),
+                block_hash,
+                deferral_index,
+                valid,
+            ),
+            ProtocolEvent::StateRootVerified { block_hash, valid } => self
                 .bft
-                .on_commitment_proof_verified(block_hash, deferral_index, valid),
-            ProtocolEvent::StateRootVerified { block_hash, valid } => {
-                self.bft.on_state_root_verified(block_hash, valid)
-            }
-            ProtocolEvent::TransactionRootVerified { block_hash, valid } => {
-                self.bft.on_transaction_root_verified(block_hash, valid)
-            }
+                .on_state_root_verified(self.topology.snapshot(), block_hash, valid),
+            ProtocolEvent::TransactionRootVerified { block_hash, valid } => self
+                .bft
+                .on_transaction_root_verified(self.topology.snapshot(), block_hash, valid),
             ProtocolEvent::ProposalBuilt {
                 height,
                 round,
                 block,
                 block_hash,
-            } => self.bft.on_proposal_built(height, round, block, block_hash),
+            } => self.bft.on_proposal_built(
+                self.topology.snapshot(),
+                height,
+                round,
+                block,
+                block_hash,
+            ),
 
             // ── State Commit ─────────────────────────────────────────────
             ProtocolEvent::StateCommitComplete {
@@ -802,9 +863,9 @@ impl StateMachine for NodeStateMachine {
             } => self.on_block_committed(block_hash, height, block),
 
             // ── Provisions ───────────────────────────────────────────────
-            ProtocolEvent::StateProvisionsReceived { provisions } => {
-                self.provisions.on_state_provisions_received(provisions)
-            }
+            ProtocolEvent::StateProvisionsReceived { provisions } => self
+                .provisions
+                .on_state_provisions_received(self.topology.snapshot(), provisions),
             ProtocolEvent::StateProvisionsVerified {
                 results,
                 committed_header,
@@ -838,28 +899,38 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ProvisioningComplete {
                 tx_hash,
                 provisions,
-            } => self.execution.on_provisioning_complete(tx_hash, provisions),
+            } => self.execution.on_provisioning_complete(
+                self.topology.snapshot(),
+                tx_hash,
+                provisions,
+            ),
 
             // ── Execution ────────────────────────────────────────────────
-            ProtocolEvent::ExecutionVoteReceived { vote } => self.execution.on_vote(vote),
-            ProtocolEvent::ExecutionCertificateReceived { cert } => {
-                self.execution.on_certificate(cert)
+            ProtocolEvent::ExecutionVoteReceived { vote } => {
+                self.execution.on_vote(self.topology.snapshot(), vote)
             }
+            ProtocolEvent::ExecutionCertificateReceived { cert } => self
+                .execution
+                .on_certificate(self.topology.snapshot(), cert),
             ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
                 tx_hash,
                 verified_votes,
-            } => self
+            } => self.execution.on_execution_votes_verified(
+                self.topology.snapshot(),
+                tx_hash,
+                verified_votes,
+            ),
+            ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => self
                 .execution
-                .on_execution_votes_verified(tx_hash, verified_votes),
-            ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => {
-                self.execution.on_certificate_verified(certificate, valid)
-            }
+                .on_certificate_verified(self.topology.snapshot(), certificate, valid),
             ProtocolEvent::ExecutionCertificateAggregated {
                 tx_hash,
                 certificate,
-            } => self
-                .execution
-                .on_execution_certificate_aggregated(tx_hash, certificate),
+            } => self.execution.on_execution_certificate_aggregated(
+                self.topology.snapshot(),
+                tx_hash,
+                certificate,
+            ),
             ProtocolEvent::SpeculativeExecutionComplete {
                 block_hash,
                 tx_hashes,
@@ -883,9 +954,11 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::TransactionFetchDelivered {
                 block_hash,
                 transactions,
-            } => self
-                .bft
-                .on_transaction_fetch_received(block_hash, transactions),
+            } => self.bft.on_transaction_fetch_received(
+                self.topology.snapshot(),
+                block_hash,
+                transactions,
+            ),
             ProtocolEvent::CertificateFetchDelivered {
                 block_hash,
                 certificates,
@@ -896,8 +969,11 @@ impl StateMachine for NodeStateMachine {
             } => {
                 self.execution
                     .cancel_certificate_building(&certificate.transaction_hash);
-                self.bft
-                    .on_certificate_fetch_received(block_hash, vec![Arc::new(certificate)])
+                self.bft.on_certificate_fetch_received(
+                    self.topology.snapshot(),
+                    block_hash,
+                    vec![Arc::new(certificate)],
+                )
             }
             ProtocolEvent::TransactionCertificateVerified { certificate } => {
                 self.on_transaction_certificate_verified(certificate)
@@ -905,17 +981,22 @@ impl StateMachine for NodeStateMachine {
 
             // ── Storage / Sync ───────────────────────────────────────────
             ProtocolEvent::BlockFetched { .. } => vec![],
-            ProtocolEvent::SyncBlockReadyToApply { block, qc } => {
-                self.bft.on_sync_block_ready_to_apply(block, qc)
-            }
+            ProtocolEvent::SyncBlockReadyToApply { block, qc } => self
+                .bft
+                .on_sync_block_ready_to_apply(self.topology.snapshot(), block, qc),
             ProtocolEvent::SyncComplete { .. } => self.on_sync_complete(),
-            ProtocolEvent::ChainMetadataFetched { height, hash, qc } => {
-                self.bft.on_chain_metadata_fetched(height, hash, qc)
-            }
+            ProtocolEvent::ChainMetadataFetched { height, hash, qc } => self
+                .bft
+                .on_chain_metadata_fetched(self.topology.snapshot(), height, hash, qc),
 
             // ── Global Consensus / Epoch (not yet implemented) ───────────
             // When implemented, route to GlobalConsensusState.
             // The #[instrument] span already logs the specific event name.
+            //
+            // TODO(epoch): After transition_to_next_epoch() / mark_shard_splitting() /
+            // clear_shard_splitting() mutates self.topology, emit
+            // Action::TopologyChanged { topology: Arc::clone(self.topology.snapshot()) }
+            // so the io_loop updates its shared topology snapshot.
             ProtocolEvent::GlobalConsensusTimer
             | ProtocolEvent::GlobalBlockReceived { .. }
             | ProtocolEvent::GlobalBlockVoteReceived { .. }

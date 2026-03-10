@@ -15,6 +15,8 @@ hyperscale-metrics.workspace = true
 hyperscale-network.workspace = true
 hyperscale-types.workspace = true
 
+arc-swap.workspace = true
+
 # Networking - libp2p with QUIC transport
 libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "quic", "tcp", "noise", "yamux", "tokio", "macros", "identify"] }
 libp2p-stream = "0.4.0-alpha"

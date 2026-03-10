@@ -13,16 +13,13 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{CommitStore, SubstateStore};
-use hyperscale_types::{
-    Bls12381G1PrivateKey, ExecutionVote, Hash, ShardGroupId, Topology, ValidatorId,
-};
+use hyperscale_types::{Bls12381G1PrivateKey, ExecutionVote, Hash, ShardGroupId, ValidatorId};
 use std::sync::Arc;
 
 /// Context for executing delegated actions.
 pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore, D: Dispatch> {
     pub storage: &'a S,
     pub executor: &'a RadixExecutor,
-    pub topology: &'a dyn Topology,
     pub signing_key: &'a Bls12381G1PrivateKey,
     pub local_shard: ShardGroupId,
     pub validator_id: ValidatorId,
@@ -286,7 +283,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             writes_commitment,
             votes,
             read_nodes,
-            committee_size,
+            committee,
         } => {
             let certificate = hyperscale_execution::handlers::aggregate_execution_certificate(
                 tx_hash,
@@ -294,8 +291,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 writes_commitment,
                 &votes,
                 read_nodes,
-                committee_size,
-                ctx.topology,
+                &committee,
             );
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
@@ -451,6 +447,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             block_height,
             block_timestamp,
             state_version,
+            shard_recipients,
         } => {
             use hyperscale_types::StateProvision;
             use std::collections::HashMap;
@@ -512,7 +509,13 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 }
             }
 
-            let batches: Vec<_> = batches.into_iter().collect();
+            let batches: Vec<_> = batches
+                .into_iter()
+                .map(|(shard, provisions)| {
+                    let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
+                    (shard, provisions, recipients)
+                })
+                .collect();
             Some(DelegatedResult {
                 events: vec![NodeInput::ProvisionsReady { batches }],
                 prepared_commit: None,

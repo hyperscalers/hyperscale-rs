@@ -3051,7 +3051,7 @@ mod tests {
         let s_prepared = RocksDbStorage::open(temp_dir1.path()).unwrap();
         let parent_root = s_prepared.state_root_hash();
         let (spec_root, prepared) =
-            s_prepared.prepare_block_commit(parent_root, &[cert.clone()], shard);
+            s_prepared.prepare_block_commit(parent_root, std::slice::from_ref(&cert), shard);
         let result_prepared = s_prepared.commit_prepared_block(prepared);
 
         // Direct path

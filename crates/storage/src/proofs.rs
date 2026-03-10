@@ -310,7 +310,11 @@ mod tests {
         let storage_key = build_storage_key(&entity_key, partition, &sort_key);
 
         // Generate proof
-        let proofs = generate_merkle_proofs(&tree_store, &[storage_key.clone()], state_version);
+        let proofs = generate_merkle_proofs(
+            &tree_store,
+            std::slice::from_ref(&storage_key),
+            state_version,
+        );
         assert_eq!(proofs.len(), 1);
 
         // Verify proof
@@ -336,7 +340,7 @@ mod tests {
         let state_root = Hash::from_hash_bytes(&root_hash.0);
         let storage_key = build_storage_key(&entity_key, partition, &sort_key);
 
-        let proofs = generate_merkle_proofs(&tree_store, &[storage_key.clone()], 1);
+        let proofs = generate_merkle_proofs(&tree_store, std::slice::from_ref(&storage_key), 1);
 
         // Wrong value should fail
         let wrong_value = vec![99, 99, 99];
@@ -362,7 +366,7 @@ mod tests {
         put_at_next_version(&tree_store, None, &updates);
         let storage_key = build_storage_key(&entity_key, partition, &sort_key);
 
-        let proofs = generate_merkle_proofs(&tree_store, &[storage_key.clone()], 1);
+        let proofs = generate_merkle_proofs(&tree_store, std::slice::from_ref(&storage_key), 1);
 
         // Wrong state root should fail
         let wrong_root = Hash::from_bytes(b"definitely_wrong_root");

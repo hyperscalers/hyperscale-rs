@@ -197,40 +197,6 @@ impl ShardCommitteeConfig {
     }
 }
 
-/// Shard configuration with hash range for dynamic topology.
-#[derive(Debug, Clone, BasicSbor)]
-pub struct ShardHashRange {
-    pub shard_id: ShardGroupId,
-    /// Inclusive start of hash range.
-    pub hash_range_start: u64,
-    /// Exclusive end of hash range.
-    pub hash_range_end: u64,
-}
-
-impl ShardHashRange {
-    /// Check if a hash value falls within this range.
-    pub fn contains(&self, hash_value: u64) -> bool {
-        hash_value >= self.hash_range_start && hash_value < self.hash_range_end
-    }
-
-    /// Split this range into two equal halves.
-    pub fn split(&self, new_shard_id: ShardGroupId) -> (ShardHashRange, ShardHashRange) {
-        let midpoint = self.hash_range_start + (self.hash_range_end - self.hash_range_start) / 2;
-        (
-            ShardHashRange {
-                shard_id: self.shard_id,
-                hash_range_start: self.hash_range_start,
-                hash_range_end: midpoint,
-            },
-            ShardHashRange {
-                shard_id: new_shard_id,
-                hash_range_start: midpoint,
-                hash_range_end: self.hash_range_end,
-            },
-        )
-    }
-}
-
 /// Configuration for a single epoch.
 #[derive(Debug, Clone, BasicSbor)]
 pub struct EpochConfig {
@@ -260,9 +226,6 @@ pub struct EpochConfig {
 
     /// Expected end heights (start + EPOCH_LENGTH).
     pub expected_end_heights: HashMap<ShardGroupId, BlockHeight>,
-
-    /// Hash ranges for each shard (for NodeId -> Shard mapping).
-    pub shard_ranges: Vec<ShardHashRange>,
 }
 
 impl EpochConfig {
@@ -271,7 +234,6 @@ impl EpochConfig {
         let mut shard_committees = HashMap::new();
         let mut start_heights = HashMap::new();
         let mut expected_end_heights = HashMap::new();
-        let mut shard_ranges = Vec::new();
 
         // Distribute validators across shards using modulo
         let mut shard_validators: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
@@ -290,8 +252,6 @@ impl EpochConfig {
             .map(|v| (v.validator_id, v.voting_power))
             .collect();
 
-        // Create hash ranges (divide u64 space evenly)
-        let range_size = u64::MAX / num_shards;
         for shard_id in 0..num_shards {
             let shard = ShardGroupId(shard_id);
 
@@ -302,19 +262,6 @@ impl EpochConfig {
             // Heights
             start_heights.insert(shard, BlockHeight(0));
             expected_end_heights.insert(shard, BlockHeight(DEFAULT_EPOCH_LENGTH));
-
-            // Hash range
-            let start = shard_id * range_size;
-            let end = if shard_id == num_shards - 1 {
-                u64::MAX
-            } else {
-                (shard_id + 1) * range_size
-            };
-            shard_ranges.push(ShardHashRange {
-                shard_id: shard,
-                hash_range_start: start,
-                hash_range_end: end,
-            });
         }
 
         Self {
@@ -326,7 +273,6 @@ impl EpochConfig {
             randomness_seed: Hash::ZERO,
             start_heights,
             expected_end_heights,
-            shard_ranges,
         }
     }
 
@@ -359,27 +305,9 @@ impl EpochConfig {
         self.shard_committees.get(&shard)
     }
 
-    /// Get the hash range for a shard.
-    pub fn hash_range_for_shard(&self, shard: ShardGroupId) -> Option<&ShardHashRange> {
-        self.shard_ranges.iter().find(|r| r.shard_id == shard)
-    }
-
-    /// Determine which shard a NodeId belongs to based on hash ranges.
+    /// Determine which shard a NodeId belongs to (hash-modulo).
     pub fn shard_for_node_id(&self, node_id: &crate::NodeId) -> ShardGroupId {
-        let hash = blake3::hash(&node_id.0);
-        let bytes = hash.as_bytes();
-        let hash_value = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        ]);
-
-        for range in &self.shard_ranges {
-            if range.contains(hash_value) {
-                return range.shard_id;
-            }
-        }
-
-        // Fallback to modulo (should never happen if ranges are set up correctly)
-        ShardGroupId(hash_value % self.num_shards)
+        crate::shard_for_node(node_id, self.num_shards)
     }
 }
 
@@ -473,22 +401,6 @@ mod tests {
         let shard1 = config.committee_for_shard(ShardGroupId(1)).unwrap();
         assert_eq!(shard0.active_validators.len(), 4);
         assert_eq!(shard1.active_validators.len(), 4);
-    }
-
-    #[test]
-    fn test_shard_hash_range_split() {
-        let range = ShardHashRange {
-            shard_id: ShardGroupId(0),
-            hash_range_start: 0,
-            hash_range_end: 1000,
-        };
-
-        let (left, right) = range.split(ShardGroupId(1));
-
-        assert_eq!(left.hash_range_start, 0);
-        assert_eq!(left.hash_range_end, 500);
-        assert_eq!(right.hash_range_start, 500);
-        assert_eq!(right.hash_range_end, 1000);
     }
 
     #[test]

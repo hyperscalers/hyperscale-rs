@@ -69,11 +69,11 @@ where
 
         let storage = Arc::clone(&self.storage);
         let executor = self.executor.clone();
-        let topology = Arc::clone(&self.topology);
         let signing_key = Arc::clone(&self.signing_key);
         let dispatch = self.dispatch.clone();
         let local_shard = self.local_shard;
         let validator_id = self.validator_id;
+        let num_shards = self.num_shards;
         let event_tx = self.event_sender.clone();
 
         self.dispatch.spawn_execution(move || {
@@ -88,7 +88,7 @@ where
                     &signing_key,
                     local_shard,
                     validator_id,
-                    &*topology,
+                    num_shards,
                 )
             });
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
@@ -246,10 +246,19 @@ where
                 let msg = hyperscale_types::exec_cert_batch_message(shard, &owned);
                 let sig = self.signing_key.sign_v1(&msg);
                 let batch = ExecutionCertificatesNotification::new(owned, self.validator_id, sig);
-                let recipients = self.peers_for_shard(shard);
-                self.network.notify(&recipients, &batch);
+                if let Some(recipients) = self.cert_broadcast_recipients.remove(&shard) {
+                    self.network.notify(&recipients, &batch);
+                } else {
+                    tracing::warn!(
+                        shard = shard.0,
+                        cert_count = batch.certificates.len(),
+                        "Dropping execution certificate broadcast: no recipients recorded for shard"
+                    );
+                }
             }
         }
+        // Clear any stale entries for shards that had no certs to flush.
+        self.cert_broadcast_recipients.clear();
     }
 
     /// Flush accumulated committed header sender-signature verifications.

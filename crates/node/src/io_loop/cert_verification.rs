@@ -69,11 +69,12 @@ where
         );
 
         // Dispatch BLS signature verification for each shard proof.
+        let topo = self.topology.load();
         for (shard_id, execution_cert) in &certificate.shard_proofs {
-            let committee = self.topology.committee_for_shard(*shard_id);
+            let committee = topo.committee_for_shard(*shard_id);
             let public_keys: Vec<hyperscale_types::Bls12381G1PublicKey> = committee
                 .iter()
-                .filter_map(|&vid| self.topology.public_key(vid))
+                .filter_map(|&vid| topo.public_key(vid))
                 .collect();
 
             if public_keys.len() != committee.len() {

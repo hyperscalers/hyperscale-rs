@@ -62,8 +62,10 @@ use quick_cache::sync::Cache as QuickCache;
 
 use hyperscale_core::NodeInput;
 use hyperscale_node::io_loop::{IoLoop, TimerOp};
+use hyperscale_node::SharedTopologySnapshot;
 use hyperscale_node::{NodeConfig, NodeStateMachine};
-use hyperscale_types::{Block, Bls12381G1PrivateKey, Hash, ShardGroupId, Topology, ValidatorId};
+use hyperscale_topology::TopologyState;
+use hyperscale_types::{Block, Bls12381G1PrivateKey, Hash, ShardGroupId, ValidatorId};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -170,7 +172,7 @@ impl Drop for ShutdownHandle {
 /// - `dispatch` - Dispatch implementation (defaults to auto-configured)
 /// - `channel_capacity` - Event channel capacity (defaults to 10,000)
 pub struct ProductionRunnerBuilder {
-    topology: Option<Arc<dyn Topology>>,
+    topology: Option<TopologyState>,
     signing_key: Option<Bls12381G1PrivateKey>,
     bft_config: Option<BftConfig>,
     dispatch: Option<Arc<PooledDispatch>>,
@@ -228,7 +230,7 @@ impl ProductionRunnerBuilder {
     }
 
     /// Set the network topology.
-    pub fn topology(mut self, topology: Arc<dyn Topology>) -> Self {
+    pub fn topology(mut self, topology: TopologyState) -> Self {
         self.topology = Some(topology);
         self
     }
@@ -323,7 +325,7 @@ impl ProductionRunnerBuilder {
 
         // ── Extract required fields ──────────────────────────────────────
 
-        let topology = self
+        let topology_state = self
             .topology
             .ok_or_else(|| RunnerError::SendError("topology is required".into()))?;
         let signing_key = self
@@ -347,8 +349,26 @@ impl ProductionRunnerBuilder {
 
         let ed25519_keypair = generate_random_keypair();
 
-        let validator_id = topology.local_validator_id();
-        let local_shard = topology.local_shard();
+        let validator_id = topology_state.snapshot().local_validator_id();
+        let local_shard = topology_state.snapshot().local_shard();
+
+        // Clone the current snapshot for IoLoop (state machine owns TopologyState).
+        // ArcSwap allows the io_loop to atomically update the snapshot when
+        // Action::TopologyChanged is processed.
+        let topology: SharedTopologySnapshot = Arc::new(arc_swap::ArcSwap::from(Arc::clone(
+            topology_state.snapshot(),
+        )));
+
+        // Extract initial validator keys for network-layer bind verification.
+        let initial_validator_keys: Arc<hyperscale_network::ValidatorKeyMap> = Arc::new(
+            topology_state
+                .snapshot()
+                .global_validator_set()
+                .validators
+                .iter()
+                .map(|v| (v.validator_id, v.public_key))
+                .collect(),
+        );
 
         // Clone signing key bytes BEFORE passing to state machine (which consumes it).
         // Bls12381G1PrivateKey doesn't impl Clone, so we round-trip through bytes.
@@ -383,7 +403,7 @@ impl ProductionRunnerBuilder {
         // ── Create NodeStateMachine ──────────────────────────────────────
         let state = NodeStateMachine::with_speculative_config(
             0, // node_index not meaningful in production
-            topology.clone(),
+            topology_state,
             signing_key,
             bft_config,
             recovered,
@@ -427,7 +447,7 @@ impl ProductionRunnerBuilder {
             local_shard,
             registry.clone(),
             local_bind_signature,
-            topology.clone(),
+            initial_validator_keys,
         )
         .await?;
 
@@ -545,8 +565,8 @@ pub struct ProductionRunner {
     // ── Infrastructure ───────────────────────────────────────────────────
     /// Libp2p network adapter (shared with InboundRouter, RequestManager).
     network: Arc<Libp2pAdapter>,
-    /// Network topology.
-    topology: Arc<dyn Topology>,
+    /// Network topology snapshot (lock-free ArcSwap, updated on epoch transitions).
+    topology: SharedTopologySnapshot,
     /// RocksDB storage (for InboundRouter and genesis).
     #[allow(dead_code)]
     storage: Arc<RocksDbStorage>,
@@ -700,6 +720,7 @@ impl ProductionRunner {
         // Create genesis block.
         let first_validator = self
             .topology
+            .load()
             .committee_for_shard(self.local_shard)
             .first()
             .copied()

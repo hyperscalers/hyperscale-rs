@@ -7,7 +7,17 @@
 //! `GossipHandler<M>` and `register_request_handler<R>` accepts a `RequestHandler<R>`.
 //! The `HandlerRegistry` owns SBOR serialization — `Network` impls just forward.
 
-use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
+use hyperscale_types::{
+    Bls12381G1PublicKey, NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId,
+};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Maps ValidatorId to BLS public key for identity verification (e.g. validator-bind).
+///
+/// Extracted from the topology snapshot and pushed to the network layer via
+/// [`Network::update_validator_keys`] on epoch transitions.
+pub type ValidatorKeyMap = HashMap<ValidatorId, Bls12381G1PublicKey>;
 
 /// Error returned when a network request fails.
 #[derive(Debug, thiserror::Error)]
@@ -157,6 +167,15 @@ pub trait Network: Send + Sync {
         &self,
         handler: impl NotificationHandler<M>,
     );
+
+    // ── Topology updates ──
+
+    /// Update the validator key map used for identity verification.
+    ///
+    /// Called by the io_loop when topology changes (epoch transitions).
+    /// Production implementations use this to update the validator-bind
+    /// handshake's key lookup. Default is a no-op (simulation doesn't need it).
+    fn update_validator_keys(&self, _keys: Arc<ValidatorKeyMap>) {}
 
     // ── Request-response ──
 

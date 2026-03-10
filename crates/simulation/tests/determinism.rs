@@ -1521,13 +1521,13 @@ fn test_cross_shard_latency() {
 /// Test that Topology correctly identifies cross-shard transactions.
 #[test]
 fn test_cross_shard_transaction_detection() {
+    use hyperscale_topology::TopologyState;
     use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
     use hyperscale_types::{
-        generate_bls_keypair, Bls12381G1PrivateKey, ShardGroupId, StaticTopology, Topology,
-        ValidatorId, ValidatorInfo, ValidatorSet,
+        generate_bls_keypair, Bls12381G1PrivateKey, ShardGroupId, ValidatorId, ValidatorInfo,
+        ValidatorSet,
     };
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     // Create a 2-shard network with 2 validators per shard
     let keys: Vec<Bls12381G1PrivateKey> = (0..4).map(|_| generate_bls_keypair()).collect();
@@ -1547,22 +1547,22 @@ fn test_cross_shard_transaction_detection() {
     shard_committees.insert(ShardGroupId(0), vec![ValidatorId(0), ValidatorId(1)]);
     shard_committees.insert(ShardGroupId(1), vec![ValidatorId(2), ValidatorId(3)]);
 
-    let topology: Arc<dyn Topology> = Arc::new(StaticTopology::with_shard_committees(
+    let topology = TopologyState::with_shard_committees(
         ValidatorId(0),
         ShardGroupId(0),
         2, // num_shards
         &validator_set,
         shard_committees,
-    ));
+    );
 
     // Create nodes that hash to different shards
     let node_a = test_node(0);
     let node_b = test_node(1);
     let node_c = test_node(100);
 
-    let shard_a = topology.shard_for_node_id(&node_a);
-    let shard_b = topology.shard_for_node_id(&node_b);
-    let shard_c = topology.shard_for_node_id(&node_c);
+    let shard_a = topology.snapshot().shard_for_node_id(&node_a);
+    let shard_b = topology.snapshot().shard_for_node_id(&node_b);
+    let shard_c = topology.snapshot().shard_for_node_id(&node_c);
 
     println!("Node A shard: {:?}", shard_a);
     println!("Node B shard: {:?}", shard_b);
@@ -1571,7 +1571,7 @@ fn test_cross_shard_transaction_detection() {
     // Create a single-shard transaction (all nodes in same shard)
     let same_shard_nodes: Vec<_> = (0..10u8)
         .map(test_node)
-        .filter(|n| topology.shard_for_node_id(n) == ShardGroupId(0))
+        .filter(|n| topology.snapshot().shard_for_node_id(n) == ShardGroupId(0))
         .take(2)
         .collect();
 
@@ -1581,7 +1581,7 @@ fn test_cross_shard_transaction_detection() {
             vec![same_shard_nodes[0]],
             vec![same_shard_nodes[1]],
         );
-        let shards = topology.all_shards_for_transaction(&tx);
+        let shards = topology.snapshot().all_shards_for_transaction(&tx);
         println!("Single-shard tx touches shards: {:?}", shards);
         assert_eq!(shards.len(), 1, "Single-shard tx should touch 1 shard");
     }
@@ -1589,14 +1589,14 @@ fn test_cross_shard_transaction_detection() {
     // Create a cross-shard transaction (nodes in different shards)
     let shard0_node = (0..255u8)
         .map(test_node)
-        .find(|n| topology.shard_for_node_id(n) == ShardGroupId(0));
+        .find(|n| topology.snapshot().shard_for_node_id(n) == ShardGroupId(0));
     let shard1_node = (0..255u8)
         .map(test_node)
-        .find(|n| topology.shard_for_node_id(n) == ShardGroupId(1));
+        .find(|n| topology.snapshot().shard_for_node_id(n) == ShardGroupId(1));
 
     if let (Some(node0), Some(node1)) = (shard0_node, shard1_node) {
         let tx = test_transaction_with_nodes(b"cross_shard_tx", vec![node0], vec![node1]);
-        let shards = topology.all_shards_for_transaction(&tx);
+        let shards = topology.snapshot().all_shards_for_transaction(&tx);
         println!("Cross-shard tx touches shards: {:?}", shards);
         assert_eq!(shards.len(), 2, "Cross-shard tx should touch 2 shards");
     }
@@ -1939,7 +1939,6 @@ fn test_packet_loss_application() {
         cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,
         packet_loss_rate: 0.10, // 10% packet loss
-        ..Default::default()
     };
 
     let mut runner = SimulationRunner::new(config, 42);
@@ -1995,7 +1994,6 @@ fn test_packet_loss_determinism() {
         cross_shard_latency: Duration::from_millis(50),
         jitter_fraction: 0.1,
         packet_loss_rate: 0.2, // 20% packet loss for more variation
-        ..Default::default()
     };
 
     let seed = 12345u64;

@@ -4,11 +4,13 @@ use super::behaviour::{Behaviour, NOTIFY_PROTOCOL, REQUEST_PROTOCOL};
 use super::command::{PriorityCommandChannels, SwarmCommand};
 use super::error::NetworkError;
 use crate::config::Libp2pConfig;
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures::FutureExt;
 use hyperscale_metrics as metrics;
 use hyperscale_network::HandlerRegistry;
-use hyperscale_types::{Bls12381G2Signature, MessagePriority, ShardGroupId, Topology, ValidatorId};
+use hyperscale_network::ValidatorKeyMap;
+use hyperscale_types::{Bls12381G2Signature, MessagePriority, ShardGroupId, ValidatorId};
 use libp2p::{gossipsub, identify, identity, kad, Multiaddr, PeerId as Libp2pPeerId, Stream};
 use libp2p_stream as stream;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -48,6 +50,10 @@ pub struct Libp2pAdapter {
     /// Stream control handle for opening outbound streams.
     /// Cloneable and thread-safe.
     stream_control: stream::Control,
+
+    /// Validator BLS public keys for identity verification.
+    /// Shared with the validator-bind service; updated on epoch transitions.
+    validator_keys: Arc<ArcSwap<ValidatorKeyMap>>,
 }
 
 impl Libp2pAdapter {
@@ -61,7 +67,7 @@ impl Libp2pAdapter {
     /// * `shard` - Local shard assignment
     /// * `registry` - Shared handler registry for per-type message dispatch
     /// * `local_bind_signature` - Pre-computed BLS signature over our PeerId (for validator-bind)
-    /// * `topology` - Validator set for BLS public key lookups during bind verification
+    /// * `validator_keys` - Initial validator key map for bind verification
     ///
     /// # Returns
     ///
@@ -73,7 +79,7 @@ impl Libp2pAdapter {
         shard: ShardGroupId,
         registry: Arc<HandlerRegistry>,
         local_bind_signature: Bls12381G2Signature,
-        topology: Arc<dyn Topology>,
+        validator_keys: Arc<ValidatorKeyMap>,
     ) -> Result<Arc<Self>, NetworkError> {
         let local_peer_id = Libp2pPeerId::from(keypair.public());
 
@@ -206,6 +212,9 @@ impl Libp2pAdapter {
 
         let cached_peer_count = Arc::new(AtomicUsize::new(0));
 
+        // Wrap validator keys in ArcSwap for lock-free updates on epoch transitions.
+        let shared_keys = Arc::new(ArcSwap::from(validator_keys));
+
         // Spawn the validator-bind service. This handles cryptographic
         // ValidatorId ↔ PeerId binding via BLS signatures.
         let bind_handle = crate::validator_bind::spawn_validator_bind_service(
@@ -213,7 +222,7 @@ impl Libp2pAdapter {
             validator_peers.clone(),
             validator_id,
             local_bind_signature,
-            topology,
+            Arc::clone(&shared_keys),
         );
 
         let adapter = Arc::new(Self {
@@ -224,6 +233,7 @@ impl Libp2pAdapter {
             shutdown_tx: Some(shutdown_tx),
             cached_peer_count: cached_peer_count.clone(),
             stream_control,
+            validator_keys: shared_keys,
         });
 
         // Spawn with panic catching - network loop panics are critical but shouldn't
@@ -283,6 +293,13 @@ impl Libp2pAdapter {
         });
 
         Ok(adapter)
+    }
+
+    /// Update the validator key map for bind verification.
+    ///
+    /// Called by `Libp2pNetwork::update_validator_keys` on epoch transitions.
+    pub fn update_validator_keys(&self, keys: Arc<ValidatorKeyMap>) {
+        self.validator_keys.store(keys);
     }
 
     /// Subscribe to a gossipsub topic.

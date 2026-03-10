@@ -17,7 +17,7 @@ use hyperscale_types::{
     batch_verify_bls_different_messages, batch_verify_bls_same_message, exec_vote_message,
     verify_bls12381_v1, zero_bls_signature, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     Bls12381G2Signature, ExecutionCertificate, ExecutionVote, Hash, NodeId, RoutableTransaction,
-    ShardGroupId, SignerBitfield, StateProvision, Topology, ValidatorId,
+    ShardGroupId, SignerBitfield, StateProvision, ValidatorId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,17 +28,15 @@ pub type UnverifiedExecutionVote = (ExecutionVote, Bls12381G1PublicKey, u64);
 /// Aggregate verified execution votes into an `ExecutionCertificate`.
 ///
 /// Deduplicates votes by validator, aggregates BLS signatures, builds a signer
-/// bitfield using the topology's committee indices, and extracts state_writes
+/// bitfield using the committee's indices, and extracts state_writes
 /// from the first vote.
-#[allow(clippy::too_many_arguments)]
 pub fn aggregate_execution_certificate(
     tx_hash: Hash,
     shard: ShardGroupId,
     writes_commitment: Hash,
     votes: &[ExecutionVote],
     read_nodes: Vec<NodeId>,
-    committee_size: usize,
-    topology: &dyn Topology,
+    committee: &[ValidatorId],
 ) -> ExecutionCertificate {
     // Deduplicate votes by validator to avoid aggregating the same signature multiple times
     let mut seen_validators = std::collections::HashSet::new();
@@ -58,10 +56,10 @@ pub fn aggregate_execution_certificate(
         zero_bls_signature()
     };
 
-    // Create signer bitfield using topology for correct committee index mapping
-    let mut signers = SignerBitfield::new(committee_size);
+    // Create signer bitfield using committee ordering for correct index mapping
+    let mut signers = SignerBitfield::new(committee.len());
     for vote in &unique_votes {
-        if let Some(idx) = topology.committee_index_for_shard(shard, vote.validator) {
+        if let Some(idx) = committee.iter().position(|&v| v == vote.validator) {
             signers.set(idx);
         }
     }
@@ -364,10 +362,10 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
     signing_key: &Bls12381G1PrivateKey,
     local_shard: ShardGroupId,
     validator_id: ValidatorId,
-    topology: &dyn Topology,
+    num_shards: u64,
 ) -> ExecutionVote {
     let is_local_node = |node_id: &hyperscale_types::NodeId| -> bool {
-        topology.shard_for_node_id(node_id) == local_shard
+        hyperscale_types::shard_for_node(node_id, num_shards) == local_shard
     };
 
     let (result_hash, success, writes_commitment, state_writes) = match executor

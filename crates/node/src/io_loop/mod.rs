@@ -31,6 +31,7 @@ use crate::protocol::fetch::{FetchInput, FetchKind, FetchProtocol};
 use crate::protocol::provision_fetch::{ProvisionFetchInput, ProvisionFetchProtocol};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use crate::NodeStateMachine;
+use arc_swap::ArcSwap;
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, NodeInput, ProtocolEvent, StateMachine, TimerId,
 };
@@ -42,14 +43,20 @@ use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
     Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
-    ExecutionVote, Hash, RoutableTransaction, ShardGroupId, Topology, TransactionCertificate,
-    ValidatorId,
+    ExecutionVote, Hash, RoutableTransaction, ShardGroupId, TopologySnapshot,
+    TransactionCertificate, ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::warn;
+
+/// Lock-free shared topology snapshot for handler closures and dispatch.
+///
+/// Updated by the io_loop when `Action::TopologyChanged` is processed.
+/// Handler closures call `.load()` to get the current snapshot atomically.
+pub type SharedTopologySnapshot = Arc<ArcSwap<TopologySnapshot>>;
 
 /// Default certificate cache capacity.
 const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
@@ -171,9 +178,10 @@ where
 
     // Identity
     signing_key: Arc<Bls12381G1PrivateKey>,
-    topology: Arc<dyn Topology>,
+    topology: SharedTopologySnapshot,
     local_shard: ShardGroupId,
     validator_id: ValidatorId,
+    num_shards: u64,
 
     // Prepared commit cache (shared with dispatch closures)
     prepared_commits: Arc<Mutex<HashMap<Hash, S::PreparedCommit>>>,
@@ -206,6 +214,8 @@ where
     execution_certificate_batch: BatchAccumulator<(ExecutionCertificate, Vec<Bls12381G1PublicKey>)>,
     broadcast_vote_batch: ShardedBatchAccumulator<ExecutionVote>,
     broadcast_cert_batch: ShardedBatchAccumulator<Arc<ExecutionCertificate>>,
+    /// Recipients per shard for cert broadcast batching, populated from Action data.
+    cert_broadcast_recipients: HashMap<ShardGroupId, Vec<ValidatorId>>,
     committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
 
     // Transaction status cache — retains the latest status for every transaction
@@ -238,13 +248,14 @@ where
         dispatch: D,
         event_sender: crossbeam::channel::Sender<NodeInput>,
         signing_key: Bls12381G1PrivateKey,
-        topology: Arc<dyn Topology>,
+        topology: SharedTopologySnapshot,
         config: NodeConfig,
         tx_validator: Arc<TransactionValidation>,
     ) -> Self {
-        let local_shard = topology.local_shard();
-        let validator_id = topology.local_validator_id();
-        let cached_local_peers: Vec<ValidatorId> = topology
+        let topo = topology.load();
+        let local_shard = topo.local_shard();
+        let validator_id = topo.local_validator_id();
+        let cached_local_peers: Vec<ValidatorId> = topo
             .committee_for_shard(local_shard)
             .iter()
             .filter(|&&v| v != validator_id)
@@ -265,6 +276,7 @@ where
             topology,
             local_shard,
             validator_id,
+            num_shards: topo.num_shards(),
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             cert_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
@@ -293,6 +305,7 @@ where
                 b.broadcast_cert_max,
                 b.broadcast_cert_window,
             ),
+            cert_broadcast_recipients: HashMap::new(),
             committed_header_batch: BatchAccumulator::new(
                 b.committed_header_max,
                 b.committed_header_window,
@@ -303,6 +316,21 @@ where
             actions_generated: 0,
             pending_timer_ops: Vec::new(),
         }
+    }
+
+    /// Rebuild derived topology state (`local_shard`, `cached_local_peers`)
+    /// from a topology snapshot. Called after storing a new topology via
+    /// `Action::TopologyChanged`.
+    fn rebuild_topology_cache_from(&mut self, topology: &hyperscale_types::TopologySnapshot) {
+        self.local_shard = topology.local_shard();
+        self.validator_id = topology.local_validator_id();
+        self.num_shards = topology.num_shards();
+        self.cached_local_peers = topology
+            .committee_for_shard(self.local_shard)
+            .iter()
+            .filter(|&&v| v != self.validator_id)
+            .copied()
+            .collect();
     }
 
     // ─── Time ────────────────────────────────────────────────────────────
@@ -467,8 +495,14 @@ where
             NodeInput::SubmitTransaction { tx } => {
                 let tx_hash = tx.hash();
 
-                // Gossip to all relevant shards.
-                for shard in self.topology.all_shards_for_transaction(&tx) {
+                // Gossip to all relevant shards (reads + writes).
+                let shards: std::collections::BTreeSet<ShardGroupId> = tx
+                    .declared_reads
+                    .iter()
+                    .chain(tx.declared_writes.iter())
+                    .map(|node_id| hyperscale_types::shard_for_node(node_id, self.num_shards))
+                    .collect();
+                for shard in shards {
                     let gossip = TransactionGossip::from_arc(Arc::clone(&tx));
                     self.network.broadcast_to_shard(shard, &gossip);
                 }
@@ -644,7 +678,7 @@ where
             // The FetchAndBroadcastProvisions delegated action built provisions
             // grouped by target shard. Broadcast one batch per shard.
             NodeInput::ProvisionsReady { batches } => {
-                for (shard, provisions) in batches {
+                for (shard, provisions, recipients) in batches {
                     let msg = hyperscale_types::state_provision_batch_message(
                         self.local_shard,
                         shard,
@@ -657,7 +691,6 @@ where
                         self.validator_id,
                         sig,
                     );
-                    let recipients = self.peers_for_shard(shard);
                     self.network.notify(&recipients, &batch);
                 }
             }

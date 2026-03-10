@@ -11,7 +11,7 @@ use hyperscale_messages::TransactionCertificateNotification;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
-use hyperscale_types::{ShardGroupId, ValidatorId};
+use hyperscale_types::ValidatorId;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
@@ -68,7 +68,23 @@ where
             Action::BroadcastExecutionVote { shard, vote } => {
                 self.accumulate_broadcast_vote(shard, vote);
             }
-            Action::BroadcastExecutionCertificate { shard, certificate } => {
+            Action::BroadcastExecutionCertificate {
+                shard,
+                certificate,
+                recipients,
+            } => {
+                // Use the first recipients list for each shard within a batch window.
+                // All certificates for the same shard should target the same committee,
+                // so subsequent entries are expected to be identical.
+                debug_assert!(
+                    !self.cert_broadcast_recipients.contains_key(&shard)
+                        || self.cert_broadcast_recipients[&shard] == recipients,
+                    "BroadcastExecutionCertificate recipients changed within batch for shard {}",
+                    shard.0
+                );
+                self.cert_broadcast_recipients
+                    .entry(shard)
+                    .or_insert(recipients);
                 self.accumulate_broadcast_cert(shard, certificate);
             }
             // ═══════════════════════════════════════════════════════════
@@ -151,6 +167,29 @@ where
             | Action::CancelFetch { .. }
             | Action::RequestMissingProvisions { .. } => {
                 self.process_sync_fetch_action(action);
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            // Topology propagation
+            // ═══════════════════════════════════════════════════════════
+            Action::TopologyChanged { topology } => {
+                self.topology.store(Arc::clone(&topology));
+                self.rebuild_topology_cache_from(&topology);
+
+                // Push updated validator keys to the network layer for bind verification.
+                let keys: hyperscale_network::ValidatorKeyMap = topology
+                    .global_validator_set()
+                    .validators
+                    .iter()
+                    .map(|v| (v.validator_id, v.public_key))
+                    .collect();
+                self.network.update_validator_keys(Arc::new(keys));
+
+                tracing::info!(
+                    local_shard = self.local_shard.0,
+                    local_peers = self.cached_local_peers.len(),
+                    "Network topology updated"
+                );
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -348,9 +387,15 @@ where
                 source_shard,
                 block_height,
                 proposer,
+                peers,
             } => {
-                let peers: Vec<ValidatorId> =
-                    self.topology.committee_for_shard(source_shard).into_owned();
+                debug_assert!(
+                    !peers.is_empty(),
+                    "RequestMissingProvisions for shard {} height {} has no peers — \
+                     was the action enriched by NodeStateMachine?",
+                    source_shard.0,
+                    block_height.0,
+                );
                 debug!(
                     source_shard = source_shard.0,
                     block_height = block_height.0,
@@ -395,7 +440,6 @@ where
         // Clone cheap shared state for the 'static spawn closure.
         let storage = Arc::clone(&self.storage);
         let executor = self.executor.clone();
-        let topology = Arc::clone(&self.topology);
         let signing_key = Arc::clone(&self.signing_key);
         let dispatch = self.dispatch.clone();
         let local_shard = self.local_shard;
@@ -408,7 +452,6 @@ where
             let ctx = ActionContext {
                 storage: &*storage,
                 executor: &executor,
-                topology: &*topology,
                 signing_key: &signing_key,
                 local_shard,
                 validator_id,
@@ -443,16 +486,5 @@ where
     /// to `network.request()`.
     pub(super) fn local_peers(&self) -> &[ValidatorId] {
         &self.cached_local_peers
-    }
-
-    /// Committee for a shard excluding self, for use as notify recipients.
-    pub(super) fn peers_for_shard(&self, shard: ShardGroupId) -> Vec<ValidatorId> {
-        let vid = self.validator_id;
-        self.topology
-            .committee_for_shard(shard)
-            .iter()
-            .copied()
-            .filter(|&v| v != vid)
-            .collect()
     }
 }
