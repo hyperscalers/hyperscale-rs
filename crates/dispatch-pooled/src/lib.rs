@@ -13,15 +13,11 @@
 //! ```no_run
 //! use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 //!
-//! // Auto-detect cores and use default ratios
-//! let config = ThreadPoolConfig::auto();
-//! let dispatch = PooledDispatch::new(config).unwrap();
-//!
-//! // Or customize
 //! let config = ThreadPoolConfig::builder()
+//!     .consensus_crypto_threads(2)
 //!     .crypto_threads(4)
 //!     .execution_threads(6)
-//!     .io_threads(2)
+//!     .tx_validation_threads(2)
 //!     .build()
 //!     .unwrap();
 //!
@@ -49,11 +45,14 @@ pub enum ThreadPoolError {
     CorePinningError(String),
 }
 
-/// Configuration for production thread pools.
+/// Configuration for production rayon thread pools.
 ///
-/// Determines how many threads/cores are allocated to each workload type.
-/// Use `ThreadPoolConfig::auto()` to automatically detect available cores
-/// and allocate them using recommended ratios.
+/// Specifies how many threads are allocated to each rayon pool.
+/// All thread counts are mandatory — the caller is responsible for
+/// computing appropriate values (e.g. based on available cores).
+///
+/// This config does **not** include I/O (tokio) thread counts — those are
+/// a runtime concern owned by the binary that constructs the tokio runtime.
 #[derive(Debug, Clone)]
 pub struct ThreadPoolConfig {
     /// Number of threads for consensus-critical crypto operations (block votes, QC verification).
@@ -75,11 +74,6 @@ pub struct ThreadPoolConfig {
     /// These run the Radix Engine and are CPU/memory intensive.
     pub execution_threads: usize,
 
-    /// Number of threads for the tokio async runtime (network, storage, timers).
-    /// These are mostly I/O-bound. Not used by dispatch itself — provided for
-    /// runner configuration.
-    pub io_threads: usize,
-
     /// Whether to pin threads to specific CPU cores.
     /// Improves cache locality but reduces flexibility.
     pub pin_cores: bool,
@@ -93,9 +87,6 @@ pub struct ThreadPoolConfig {
     /// Starting core index for execution pool (if pinning enabled).
     pub execution_core_start: Option<usize>,
 
-    /// Starting core index for I/O pool (if pinning enabled).
-    pub io_core_start: Option<usize>,
-
     /// Core index for the state machine thread (if pinning enabled).
     /// The state machine always runs on a single thread.
     pub state_machine_core: Option<usize>,
@@ -107,85 +98,7 @@ pub struct ThreadPoolConfig {
     pub execution_stack_size: usize,
 }
 
-impl Default for ThreadPoolConfig {
-    fn default() -> Self {
-        Self::auto()
-    }
-}
-
 impl ThreadPoolConfig {
-    /// Automatically configure based on available CPU cores.
-    ///
-    /// Uses the following allocation ratios:
-    /// - State Machine: 1 core (always)
-    /// - Consensus Crypto: 2 threads (dedicated for block votes/QC - liveness critical)
-    /// - After reserving state machine and consensus crypto, remaining cores are split:
-    ///   - Execution: 25% (Radix Engine)
-    ///   - TX Validation: 15% (transaction signature verification)
-    ///   - I/O: 15% (network, storage, timers)
-    ///   - Crypto: remainder (provisions, execution votes, certificate verification)
-    ///
-    /// On systems with fewer than 8 cores, all pools get 1 thread each.
-    pub fn auto() -> Self {
-        let available = std::thread::available_parallelism()
-            .map(NonZeroUsize::get)
-            .unwrap_or(4);
-
-        Self::for_core_count(available)
-    }
-
-    /// Configure for a specific number of available cores.
-    ///
-    /// Useful for testing or when you want to limit resource usage.
-    pub fn for_core_count(total_cores: usize) -> Self {
-        // Reserve 1 core for state machine + 2 for consensus crypto.
-        // Floor at 6 so small machines still get 1 thread per pool (over-subscribing is fine).
-        let pool_budget = total_cores.saturating_sub(3).max(6);
-
-        // Allocation:
-        // - Consensus crypto is fixed at 2 threads (liveness critical for block votes/QC)
-        // - All other pools use percentage-based allocation from pool_budget
-        let (consensus_crypto, tx_validation, crypto, execution, io) = if pool_budget <= 6 {
-            // Minimum viable: 1 each for variable pools, 2 for consensus crypto
-            (2, 1, 1, 1, 1)
-        } else {
-            // Consensus crypto: fixed 2 threads (enough for ~1000 votes/sec)
-            let consensus_crypto = 2;
-
-            // Pool budget split by percentage:
-            // - Execution: 25% (Radix Engine)
-            // - TX Validation: 15% (transaction signature verification, bursty)
-            // - I/O: 15% (network, storage, timers)
-            // - Crypto: remainder (provisions, execution votes, certificate verification)
-            let execution = (pool_budget * 25 / 100).max(1);
-            let tx_validation = (pool_budget * 15 / 100).max(1);
-            let io = (pool_budget * 15 / 100).max(1);
-            // Crypto gets the remainder to ensure all cores are used
-            let crypto = pool_budget
-                .saturating_sub(execution)
-                .saturating_sub(tx_validation)
-                .saturating_sub(io)
-                .max(1);
-            (consensus_crypto, tx_validation, crypto, execution, io)
-        };
-
-        Self {
-            consensus_crypto_threads: consensus_crypto,
-            crypto_threads: crypto,
-            tx_validation_threads: tx_validation,
-            execution_threads: execution,
-            io_threads: io,
-            pin_cores: false,
-            consensus_crypto_core_start: None,
-            crypto_core_start: None,
-            execution_core_start: None,
-            io_core_start: None,
-            state_machine_core: None,
-            crypto_stack_size: 2 * 1024 * 1024,    // 2MB
-            execution_stack_size: 8 * 1024 * 1024, // 8MB for Radix Engine
-        }
-    }
-
     /// Create a builder for custom configuration.
     pub fn builder() -> ThreadPoolConfigBuilder {
         ThreadPoolConfigBuilder::new()
@@ -198,25 +111,22 @@ impl ThreadPoolConfig {
             crypto_threads: 1,
             tx_validation_threads: 1,
             execution_threads: 1,
-            io_threads: 1,
             pin_cores: false,
             consensus_crypto_core_start: None,
             crypto_core_start: None,
             execution_core_start: None,
-            io_core_start: None,
             state_machine_core: None,
             crypto_stack_size: 2 * 1024 * 1024,
             execution_stack_size: 8 * 1024 * 1024,
         }
     }
 
-    /// Total number of threads that will be spawned (excluding state machine).
+    /// Total number of rayon pool threads (excluding state machine and I/O).
     pub fn total_threads(&self) -> usize {
         self.consensus_crypto_threads
             + self.crypto_threads
             + self.tx_validation_threads
             + self.execution_threads
-            + self.io_threads
     }
 
     /// Validate the configuration.
@@ -241,11 +151,6 @@ impl ThreadPoolConfig {
                 "execution_threads must be at least 1".to_string(),
             ));
         }
-        if self.io_threads == 0 {
-            return Err(ThreadPoolError::InvalidConfig(
-                "io_threads must be at least 1".to_string(),
-            ));
-        }
 
         // If pinning is enabled, check that core assignments don't overlap
         if self.pin_cores {
@@ -253,12 +158,12 @@ impl ThreadPoolConfig {
                 .map(NonZeroUsize::get)
                 .unwrap_or(4);
 
+            // +1 for the state machine thread
             let total_needed = 1
                 + self.consensus_crypto_threads
                 + self.crypto_threads
                 + self.tx_validation_threads
-                + self.execution_threads
-                + self.io_threads;
+                + self.execution_threads;
             if total_needed > available {
                 return Err(ThreadPoolError::InvalidConfig(format!(
                     "Configuration requires {} cores but only {} are available",
@@ -278,10 +183,10 @@ pub struct ThreadPoolConfigBuilder {
 }
 
 impl ThreadPoolConfigBuilder {
-    /// Create a new builder with auto-detected defaults.
+    /// Create a new builder starting from minimal defaults (1 thread per pool).
     pub fn new() -> Self {
         Self {
-            config: ThreadPoolConfig::auto(),
+            config: ThreadPoolConfig::minimal(),
         }
     }
 
@@ -307,12 +212,6 @@ impl ThreadPoolConfigBuilder {
     /// Set the number of execution threads.
     pub fn execution_threads(mut self, count: usize) -> Self {
         self.config.execution_threads = count;
-        self
-    }
-
-    /// Set the number of I/O threads.
-    pub fn io_threads(mut self, count: usize) -> Self {
-        self.config.io_threads = count;
         self
     }
 
@@ -346,13 +245,6 @@ impl ThreadPoolConfigBuilder {
     /// Set the starting core for the execution pool.
     pub fn execution_core_start(mut self, core: usize) -> Self {
         self.config.execution_core_start = Some(core);
-        self.config.pin_cores = true;
-        self
-    }
-
-    /// Set the starting core for the I/O pool.
-    pub fn io_core_start(mut self, core: usize) -> Self {
-        self.config.io_core_start = Some(core);
         self.config.pin_cores = true;
         self
     }
@@ -425,7 +317,6 @@ impl PooledDispatch {
             crypto_threads = config.crypto_threads,
             tx_validation_threads = config.tx_validation_threads,
             execution_threads = config.execution_threads,
-            io_threads = config.io_threads,
             pin_cores = config.pin_cores,
             "Thread pools initialized"
         );
@@ -441,11 +332,6 @@ impl PooledDispatch {
             tx_validation_pending: Arc::new(AtomicUsize::new(0)),
             execution_pending: Arc::new(AtomicUsize::new(0)),
         })
-    }
-
-    /// Create with auto-detected configuration.
-    pub fn auto() -> Result<Self, ThreadPoolError> {
-        Self::new(ThreadPoolConfig::auto())
     }
 
     /// Get the configuration.
@@ -680,63 +566,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_auto_config() {
-        let config = ThreadPoolConfig::auto();
-        assert!(config.consensus_crypto_threads >= 1);
-        assert!(config.crypto_threads >= 1);
-        assert!(config.tx_validation_threads >= 1);
-        assert!(config.execution_threads >= 1);
-        assert!(config.io_threads >= 1);
-        config.validate().unwrap();
-    }
-
-    #[test]
-    fn test_for_core_count() {
-        // 6 cores: pool_budget = max(6-3, 6) = 6, so minimum viable mode
-        // 2 consensus_crypto + 1 each for other pools
-        let config = ThreadPoolConfig::for_core_count(6);
-        assert_eq!(config.consensus_crypto_threads, 2);
-        assert_eq!(config.crypto_threads, 1);
-        assert_eq!(config.tx_validation_threads, 1);
-        assert_eq!(config.execution_threads, 1);
-        assert_eq!(config.io_threads, 1);
-
-        // 12 cores: pool_budget = 12 - 3 = 9 (percentage mode)
-        // execution 25% = 2, tx_validation 15% = 1, io 15% = 1, crypto = remainder = 5
-        let config = ThreadPoolConfig::for_core_count(12);
-        assert_eq!(config.consensus_crypto_threads, 2);
-        assert_eq!(config.crypto_threads, 5);
-        assert_eq!(config.execution_threads, 2);
-        assert_eq!(config.tx_validation_threads, 1);
-        assert_eq!(config.io_threads, 1);
-
-        // 18 cores: pool_budget = 18 - 3 = 15 (percentage mode)
-        // execution 25% = 3, tx_validation 15% = 2, io 15% = 2, crypto = remainder = 8
-        let config = ThreadPoolConfig::for_core_count(18);
-        assert_eq!(config.consensus_crypto_threads, 2);
-        assert_eq!(config.crypto_threads, 8);
-        assert_eq!(config.execution_threads, 3);
-        assert_eq!(config.tx_validation_threads, 2);
-        assert_eq!(config.io_threads, 2);
-
-        // 32 cores: pool_budget = 32 - 3 = 29 (percentage mode)
-        // execution 25% = 7, tx_validation 15% = 4, io 15% = 4, crypto = remainder = 14
-        let config = ThreadPoolConfig::for_core_count(32);
-        assert_eq!(config.consensus_crypto_threads, 2);
-        assert_eq!(config.crypto_threads, 14);
-        assert_eq!(config.execution_threads, 7);
-        assert_eq!(config.tx_validation_threads, 4);
-        assert_eq!(config.io_threads, 4);
-    }
-
-    #[test]
     fn test_minimal_config() {
         let config = ThreadPoolConfig::minimal();
         assert_eq!(config.consensus_crypto_threads, 1);
         assert_eq!(config.crypto_threads, 1);
         assert_eq!(config.tx_validation_threads, 1);
         assert_eq!(config.execution_threads, 1);
-        assert_eq!(config.io_threads, 1);
         config.validate().unwrap();
     }
 
@@ -745,13 +580,11 @@ mod tests {
         let config = ThreadPoolConfig::builder()
             .crypto_threads(4)
             .execution_threads(8)
-            .io_threads(2)
             .build()
             .unwrap();
 
         assert_eq!(config.crypto_threads, 4);
         assert_eq!(config.execution_threads, 8);
-        assert_eq!(config.io_threads, 2);
     }
 
     #[test]
@@ -759,12 +592,10 @@ mod tests {
         let config = ThreadPoolConfig::builder()
             .crypto_threads(2)
             .execution_threads(4)
-            .io_threads(2)
             .state_machine_core(0)
             .consensus_crypto_core_start(1)
             .crypto_core_start(3)
             .execution_core_start(5)
-            .io_core_start(9)
             .build_unchecked();
 
         assert!(config.pin_cores);
@@ -772,7 +603,6 @@ mod tests {
         assert_eq!(config.consensus_crypto_core_start, Some(1));
         assert_eq!(config.crypto_core_start, Some(3));
         assert_eq!(config.execution_core_start, Some(5));
-        assert_eq!(config.io_core_start, Some(9));
     }
 
     #[test]
@@ -781,9 +611,6 @@ mod tests {
         assert!(result.is_err());
 
         let result = ThreadPoolConfig::builder().execution_threads(0).build();
-        assert!(result.is_err());
-
-        let result = ThreadPoolConfig::builder().io_threads(0).build();
         assert!(result.is_err());
     }
 
@@ -845,9 +672,8 @@ mod tests {
             .crypto_threads(4)
             .tx_validation_threads(3)
             .execution_threads(6)
-            .io_threads(2)
             .build_unchecked();
 
-        assert_eq!(config.total_threads(), 17); // 2 + 4 + 3 + 6 + 2
+        assert_eq!(config.total_threads(), 15); // 2 + 4 + 3 + 6
     }
 }

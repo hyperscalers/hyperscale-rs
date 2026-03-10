@@ -40,27 +40,25 @@
 //! use hyperscale_production::{ThreadPoolConfig, PooledDispatch, ProductionRunner};
 //! use std::sync::Arc;
 //!
-//! // Auto-detect cores and use default ratios (25% crypto, 50% execution, 25% I/O)
-//! let config = ThreadPoolConfig::auto();
-//!
-//! // Or customize for your hardware
+//! // Configure thread pools with explicit counts
 //! let config = ThreadPoolConfig::builder()
+//!     .consensus_crypto_threads(2)
 //!     .crypto_threads(4)
 //!     .execution_threads(8)
-//!     .io_threads(2)
+//!     .tx_validation_threads(2)
 //!     .build()
 //!     .unwrap();
 //!
 //! // Enable core pinning for cache locality (Linux only)
 //! let config = ThreadPoolConfig::builder()
+//!     .consensus_crypto_threads(2)
 //!     .crypto_threads(4)
 //!     .execution_threads(8)
-//!     .io_threads(2)
+//!     .tx_validation_threads(2)
 //!     .pin_cores(true)
 //!     .state_machine_core(0)    // Pin state machine to core 0
-//!     .crypto_core_start(1)     // Crypto pool on cores 1-4
-//!     .execution_core_start(5)  // Execution pool on cores 5-12
-//!     .io_core_start(13)        // I/O pool on cores 13-14
+//!     .crypto_core_start(3)     // Crypto pool on cores 3-6
+//!     .execution_core_start(7)  // Execution pool on cores 7-14
 //!     .build()
 //!     .unwrap();
 //!

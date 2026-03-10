@@ -832,25 +832,75 @@ fn build_engine_genesis_config(config: &GenesisConfig) -> Result<hyperscale_engi
     Ok(engine_config)
 }
 
-/// Build thread pool configuration from TOML config.
-fn build_thread_pool_config(config: &ThreadsConfig) -> ThreadPoolConfig {
-    let mut builder = ThreadPoolConfig::builder();
+/// Compute rayon pool thread counts for a given number of available cores.
+///
+/// Reserves 1 core for the state machine thread, then splits the remainder:
+/// - Consensus Crypto: 2 threads (fixed, liveness-critical for block votes/QC)
+/// - Execution: 25% of pool budget (Radix Engine)
+/// - TX Validation: 15% of pool budget (transaction signature verification)
+/// - Crypto: remainder (provisions, execution votes, certificate verification)
+///
+/// On systems with fewer than 8 cores, all variable pools get 1 thread each.
+fn for_core_count(total_cores: usize) -> (usize, usize, usize, usize) {
+    // Reserve 1 core for state machine + 2 for consensus crypto.
+    // Floor at 5 so small machines still get 1 thread per pool (over-subscribing is fine).
+    // 5 = 2 (consensus crypto) + 1 (crypto) + 1 (tx validation) + 1 (execution)
+    let pool_budget = total_cores.saturating_sub(3).max(5);
 
-    if config.consensus_crypto_threads > 0 {
-        builder = builder.consensus_crypto_threads(config.consensus_crypto_threads);
+    if pool_budget <= 5 {
+        // Minimum viable: 2 consensus crypto + 1 each for other pools
+        (2, 1, 1, 1)
+    } else {
+        let consensus_crypto = 2;
+        let execution = (pool_budget * 25 / 100).max(1);
+        let tx_validation = (pool_budget * 15 / 100).max(1);
+        let crypto = pool_budget
+            .saturating_sub(execution)
+            .saturating_sub(tx_validation)
+            .max(1);
+        (consensus_crypto, crypto, tx_validation, execution)
     }
-    if config.crypto_threads > 0 {
-        builder = builder.crypto_threads(config.crypto_threads);
-    }
-    if config.tx_validation_threads > 0 {
-        builder = builder.tx_validation_threads(config.tx_validation_threads);
-    }
-    if config.execution_threads > 0 {
-        builder = builder.execution_threads(config.execution_threads);
-    }
-    if config.io_threads > 0 {
-        builder = builder.io_threads(config.io_threads);
-    }
+}
+
+/// Build thread pool configuration from TOML config.
+///
+/// When TOML values are 0 (auto), computes thread counts based on available cores.
+/// The I/O (tokio) thread count is returned separately since it is not part of
+/// the rayon pool configuration.
+fn build_thread_pool_config(config: &ThreadsConfig) -> ThreadPoolConfig {
+    // If all pool counts are zero, auto-detect based on available cores.
+    let all_auto = config.consensus_crypto_threads == 0
+        && config.crypto_threads == 0
+        && config.tx_validation_threads == 0
+        && config.execution_threads == 0;
+
+    let mut builder = if all_auto {
+        let available = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4);
+        let (cc, crypto, tx_val, exec) = for_core_count(available);
+        ThreadPoolConfig::builder()
+            .consensus_crypto_threads(cc)
+            .crypto_threads(crypto)
+            .tx_validation_threads(tx_val)
+            .execution_threads(exec)
+    } else {
+        let mut b = ThreadPoolConfig::builder();
+        if config.consensus_crypto_threads > 0 {
+            b = b.consensus_crypto_threads(config.consensus_crypto_threads);
+        }
+        if config.crypto_threads > 0 {
+            b = b.crypto_threads(config.crypto_threads);
+        }
+        if config.tx_validation_threads > 0 {
+            b = b.tx_validation_threads(config.tx_validation_threads);
+        }
+        if config.execution_threads > 0 {
+            b = b.execution_threads(config.execution_threads);
+        }
+        b
+    };
+
     if config.pin_cores {
         builder = builder.pin_cores(true);
     }
@@ -1368,4 +1418,71 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
     info!("Validator shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_for_core_count() {
+        // 6 cores: pool_budget = max(6-3, 5) = 5, minimum viable mode
+        let (cc, crypto, tx_val, exec) = for_core_count(6);
+        assert_eq!(cc, 2);
+        assert_eq!(crypto, 1);
+        assert_eq!(tx_val, 1);
+        assert_eq!(exec, 1);
+
+        // 12 cores: pool_budget = 9 (percentage mode)
+        // execution 25% = 2, tx_validation 15% = 1, crypto = remainder = 6
+        let (cc, crypto, tx_val, exec) = for_core_count(12);
+        assert_eq!(cc, 2);
+        assert_eq!(crypto, 6);
+        assert_eq!(tx_val, 1);
+        assert_eq!(exec, 2);
+
+        // 18 cores: pool_budget = 15
+        // execution 25% = 3, tx_validation 15% = 2, crypto = remainder = 10
+        let (cc, crypto, tx_val, exec) = for_core_count(18);
+        assert_eq!(cc, 2);
+        assert_eq!(crypto, 10);
+        assert_eq!(tx_val, 2);
+        assert_eq!(exec, 3);
+
+        // 32 cores: pool_budget = 29
+        // execution 25% = 7, tx_validation 15% = 4, crypto = remainder = 18
+        let (cc, crypto, tx_val, exec) = for_core_count(32);
+        assert_eq!(cc, 2);
+        assert_eq!(crypto, 18);
+        assert_eq!(tx_val, 4);
+        assert_eq!(exec, 7);
+    }
+
+    #[test]
+    fn test_build_thread_pool_config_auto() {
+        let config = ThreadsConfig::default();
+        let pool_config = build_thread_pool_config(&config);
+        // All auto → should have at least 1 thread per pool
+        assert!(pool_config.consensus_crypto_threads >= 1);
+        assert!(pool_config.crypto_threads >= 1);
+        assert!(pool_config.tx_validation_threads >= 1);
+        assert!(pool_config.execution_threads >= 1);
+    }
+
+    #[test]
+    fn test_build_thread_pool_config_explicit() {
+        let config = ThreadsConfig {
+            consensus_crypto_threads: 3,
+            crypto_threads: 8,
+            tx_validation_threads: 4,
+            execution_threads: 10,
+            io_threads: 0,
+            pin_cores: false,
+        };
+        let pool_config = build_thread_pool_config(&config);
+        assert_eq!(pool_config.consensus_crypto_threads, 3);
+        assert_eq!(pool_config.crypto_threads, 8);
+        assert_eq!(pool_config.tx_validation_threads, 4);
+        assert_eq!(pool_config.execution_threads, 10);
+    }
 }

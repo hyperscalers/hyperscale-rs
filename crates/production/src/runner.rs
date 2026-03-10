@@ -336,9 +336,10 @@ impl ProductionRunnerBuilder {
             .ok_or_else(|| RunnerError::SendError("bft_config is required".into()))?;
         let dispatch = match self.dispatch {
             Some(pools) => pools,
-            None => {
-                Arc::new(PooledDispatch::auto().map_err(|e| RunnerError::SendError(e.to_string()))?)
-            }
+            None => Arc::new(
+                PooledDispatch::new(hyperscale_dispatch_pooled::ThreadPoolConfig::minimal())
+                    .map_err(|e| RunnerError::SendError(e.to_string()))?,
+            ),
         };
         let storage = self
             .storage
@@ -797,7 +798,6 @@ impl ProductionRunner {
             shard = ?self.local_shard,
             crypto_threads = config.crypto_threads,
             execution_threads = config.execution_threads,
-            io_threads = config.io_threads,
             pin_cores = config.pin_cores,
             "Starting production runner (IoLoop architecture)"
         );
