@@ -1,6 +1,7 @@
 // Forked from radixdlt-scrypto (originally from Aptos). Modified to use Blake3.
 
 use super::types::*;
+use hyperscale_dispatch::Dispatch;
 use hyperscale_types::Hash;
 use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
@@ -8,6 +9,8 @@ use std::marker::PhantomData;
 // Safety limit on tree depth. Entity keys are 50 bytes (100 nibbles), sort keys
 // are typically <100 bytes. 256 nibbles (128-byte keys) provides ample headroom.
 const SANITY_NIBBLE_LIMIT: usize = 256;
+
+type ChildInsertResult<P> = Result<(Nibble, Option<Node<P>>, TreeUpdateBatch<P>), StorageError>;
 
 // SOURCE: https://github.com/aptos-labs/aptos-core/blob/1.0.4/storage/jellyfish-merkle/src/lib.rs#L329
 /// The Jellyfish Merkle tree data structure. See [`crate`] for description.
@@ -83,13 +86,18 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
     /// the returned batch, the state `S_{i+1}` is ready to be read from the tree by calling
     /// [`get_with_proof`](struct.JellyfishMerkleTree.html#method.get_with_proof). Anything inside
     /// the batch is not reachable from public interfaces before being committed.
-    pub fn batch_put_value_set(
+    pub fn batch_put_value_set<D: Dispatch>(
         &self,
         value_set: BTreeMap<LeafKey, Option<(Hash, P)>>,
         node_hashes: Option<&HashMap<NibblePath, Hash>>,
         persisted_version: Option<Version>,
         version: Version,
-    ) -> Result<(Hash, TreeUpdateBatch<P>), StorageError> {
+        dispatch: &D,
+    ) -> Result<(Hash, TreeUpdateBatch<P>), StorageError>
+    where
+        R: Sync,
+        P: Send + Sync,
+    {
         let deduped_and_sorted_kvs = value_set
             .iter()
             .map(|(key, entry)| (key, entry.as_ref()))
@@ -104,6 +112,7 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
                 0,
                 &node_hashes,
                 &mut batch,
+                dispatch,
             )
         } else {
             Self::batch_update_subtree(
@@ -113,6 +122,7 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
                 0,
                 &node_hashes,
                 &mut batch,
+                dispatch,
             )
         }?;
 
@@ -129,7 +139,8 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
         Ok((root_hash, batch))
     }
 
-    fn batch_insert_at(
+    #[allow(clippy::too_many_arguments)]
+    fn batch_insert_at<D: Dispatch>(
         &self,
         node_key: &TreeNodeKey,
         version: Version,
@@ -137,19 +148,24 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
         depth: usize,
         hash_cache: &Option<&HashMap<NibblePath, Hash>>,
         batch: &mut TreeUpdateBatch<P>,
-    ) -> Result<Option<Node<P>>, StorageError> {
+        dispatch: &D,
+    ) -> Result<Option<Node<P>>, StorageError>
+    where
+        R: Sync,
+        P: Send + Sync,
+    {
         let node = self.reader.get_node(node_key)?;
         batch.put_stale_node(node_key.clone(), version, &node);
 
         match node {
             Node::Internal(internal_node) => {
-                // There is a small possibility that the old internal node is intact.
-                // Traverse all the path touched by `kvs` from this internal node.
-                let range_iter = NibbleRangeIterator::new(kvs, depth);
-                // INITIAL-MODIFICATION: there was a par_iter (conditionally) used here
-                let new_children: Vec<_> = range_iter
-                    .map(|(left, right)| {
-                        self.insert_at_child(
+                // Collect ranges to Vec because map_local takes &[T]. Max 16 entries.
+                let ranges: Vec<(usize, usize)> = NibbleRangeIterator::new(kvs, depth).collect();
+
+                let child_results: Vec<ChildInsertResult<P>> = if ranges.len() >= 3 {
+                    dispatch.map_local(&ranges, |&(left, right)| {
+                        let mut child_batch = TreeUpdateBatch::new();
+                        let result = self.insert_at_child(
                             node_key,
                             &internal_node,
                             version,
@@ -158,15 +174,45 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
                             right,
                             depth,
                             hash_cache,
-                            batch,
-                        )
+                            &mut child_batch,
+                            dispatch,
+                        );
+                        result.map(|(nibble, node_opt)| (nibble, node_opt, child_batch))
                     })
-                    .collect::<Result<_, StorageError>>()?;
+                } else {
+                    ranges
+                        .iter()
+                        .map(|&(left, right)| {
+                            let mut child_batch = TreeUpdateBatch::new();
+                            let result = self.insert_at_child(
+                                node_key,
+                                &internal_node,
+                                version,
+                                kvs,
+                                left,
+                                right,
+                                depth,
+                                hash_cache,
+                                &mut child_batch,
+                                dispatch,
+                            );
+                            result.map(|(nibble, node_opt)| (nibble, node_opt, child_batch))
+                        })
+                        .collect()
+                };
+
+                // Merge child batches and collect results
+                let mut new_children_vec = Vec::with_capacity(child_results.len());
+                for result in child_results {
+                    let (nibble, node_opt, child_batch) = result?;
+                    batch.merge(child_batch);
+                    new_children_vec.push((nibble, node_opt));
+                }
 
                 // Reuse the current `InternalNode` in memory to create a new internal node.
                 let mut old_children: Children = internal_node.into();
                 let mut new_created_children: HashMap<Nibble, Node<P>> = HashMap::new();
-                for (child_nibble, child_option) in new_children {
+                for (child_nibble, child_option) in new_children_vec {
                     if let Some(child) = child_option {
                         new_created_children.insert(child_nibble, child);
                     } else {
@@ -215,17 +261,17 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
                 Ok(Some(new_internal_node.into()))
             }
             Node::Leaf(leaf_node) => Self::batch_update_subtree_with_existing_leaf(
-                node_key, version, leaf_node, kvs, depth, hash_cache, batch,
+                node_key, version, leaf_node, kvs, depth, hash_cache, batch, dispatch,
             ),
             Node::Null => {
                 assert_eq!(depth, 0, "Null node can only exist at depth 0");
-                Self::batch_update_subtree(node_key, version, kvs, 0, hash_cache, batch)
+                Self::batch_update_subtree(node_key, version, kvs, 0, hash_cache, batch, dispatch)
             }
         }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn insert_at_child(
+    fn insert_at_child<D: Dispatch>(
         &self,
         node_key: &TreeNodeKey,
         internal_node: &InternalNode,
@@ -236,7 +282,12 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
         depth: usize,
         hash_cache: &Option<&HashMap<NibblePath, Hash>>,
         batch: &mut TreeUpdateBatch<P>,
-    ) -> Result<(Nibble, Option<Node<P>>), StorageError> {
+        dispatch: &D,
+    ) -> Result<(Nibble, Option<Node<P>>), StorageError>
+    where
+        R: Sync,
+        P: Send + Sync,
+    {
         let child_index = kvs[left].0.get_nibble(depth);
         let child = internal_node.child(child_index);
 
@@ -248,6 +299,7 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
                 depth + 1,
                 hash_cache,
                 batch,
+                dispatch,
             )?,
             None => Self::batch_update_subtree(
                 &node_key.gen_child_node_key(version, child_index),
@@ -256,6 +308,7 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
                 depth + 1,
                 hash_cache,
                 batch,
+                dispatch,
             )?,
         };
 
@@ -263,7 +316,7 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn batch_update_subtree_with_existing_leaf(
+    fn batch_update_subtree_with_existing_leaf<D: Dispatch>(
         node_key: &TreeNodeKey,
         version: Version,
         existing_leaf_node: LeafNode<P>,
@@ -271,7 +324,11 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
         depth: usize,
         hash_cache: &Option<&HashMap<NibblePath, Hash>>,
         batch: &mut TreeUpdateBatch<P>,
-    ) -> Result<Option<Node<P>>, StorageError> {
+        dispatch: &D,
+    ) -> Result<Option<Node<P>>, StorageError>
+    where
+        P: Send + Sync,
+    {
         let existing_leaf_key = existing_leaf_node.leaf_key();
 
         if kvs.len() == 1 && kvs[0].0 == existing_leaf_key {
@@ -299,6 +356,7 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
                         depth + 1,
                         hash_cache,
                         batch,
+                        dispatch,
                     )?
                 } else {
                     Self::batch_update_subtree(
@@ -308,6 +366,7 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
                         depth + 1,
                         hash_cache,
                         batch,
+                        dispatch,
                     )?
                 } {
                     children.push((child_index, new_child_node));
@@ -351,14 +410,18 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
         }
     }
 
-    fn batch_update_subtree(
+    fn batch_update_subtree<D: Dispatch>(
         node_key: &TreeNodeKey,
         version: Version,
         kvs: &[(&LeafKey, Option<&(Hash, P)>)],
         depth: usize,
         hash_cache: &Option<&HashMap<NibblePath, Hash>>,
         batch: &mut TreeUpdateBatch<P>,
-    ) -> Result<Option<Node<P>>, StorageError> {
+        dispatch: &D,
+    ) -> Result<Option<Node<P>>, StorageError>
+    where
+        P: Send + Sync,
+    {
         if kvs.len() == 1 {
             if let (key, Some((value_hash, payload))) = kvs[0] {
                 let new_leaf_node =
@@ -368,21 +431,56 @@ impl<'a, R: 'a + TreeReader<P> + ?Sized, P: Clone> JellyfishMerkleTree<'a, R, P>
                 Ok(None)
             }
         } else {
+            // Collect ranges to Vec for potential parallel dispatch.
+            let ranges: Vec<(usize, usize)> = NibbleRangeIterator::new(kvs, depth).collect();
+
+            let child_results: Vec<ChildInsertResult<P>> = if ranges.len() >= 3 {
+                dispatch.map_local(&ranges, |&(left, right)| {
+                    let child_index = kvs[left].0.get_nibble(depth);
+                    let child_node_key = node_key.gen_child_node_key(version, child_index);
+                    let mut child_batch = TreeUpdateBatch::new();
+                    let result = Self::batch_update_subtree(
+                        &child_node_key,
+                        version,
+                        &kvs[left..=right],
+                        depth + 1,
+                        hash_cache,
+                        &mut child_batch,
+                        dispatch,
+                    );
+                    result.map(|node_opt| (child_index, node_opt, child_batch))
+                })
+            } else {
+                ranges
+                    .iter()
+                    .map(|&(left, right)| {
+                        let child_index = kvs[left].0.get_nibble(depth);
+                        let child_node_key = node_key.gen_child_node_key(version, child_index);
+                        let mut child_batch = TreeUpdateBatch::new();
+                        let result = Self::batch_update_subtree(
+                            &child_node_key,
+                            version,
+                            &kvs[left..=right],
+                            depth + 1,
+                            hash_cache,
+                            &mut child_batch,
+                            dispatch,
+                        );
+                        result.map(|node_opt| (child_index, node_opt, child_batch))
+                    })
+                    .collect()
+            };
+
+            // Merge child batches and collect results.
             let mut children = vec![];
-            for (left, right) in NibbleRangeIterator::new(kvs, depth) {
-                let child_index = kvs[left].0.get_nibble(depth);
-                let child_node_key = node_key.gen_child_node_key(version, child_index);
-                if let Some(new_child_node) = Self::batch_update_subtree(
-                    &child_node_key,
-                    version,
-                    &kvs[left..=right],
-                    depth + 1,
-                    hash_cache,
-                    batch,
-                )? {
-                    children.push((child_index, new_child_node))
+            for result in child_results {
+                let (child_index, node_opt, child_batch) = result?;
+                batch.merge(child_batch);
+                if let Some(new_child_node) = node_opt {
+                    children.push((child_index, new_child_node));
                 }
             }
+
             if children.is_empty() {
                 Ok(None)
             } else if children.len() == 1 && children[0].1.is_leaf() {
@@ -652,6 +750,37 @@ impl<P: Clone> TreeUpdateBatch<P> {
             node_key,
             stale_since_version,
         });
+    }
+
+    /// Merge another batch into this one.
+    ///
+    /// Used to combine per-child batches after parallel processing.
+    /// Order doesn't matter — nodes are keyed by `TreeNodeKey`, not position.
+    pub fn merge(&mut self, mut other: Self) {
+        assert_eq!(
+            self.node_batch.len(),
+            1,
+            "TreeUpdateBatch expects exactly one node_batch slot"
+        );
+        assert_eq!(
+            other.node_batch.len(),
+            1,
+            "TreeUpdateBatch expects exactly one node_batch slot"
+        );
+        assert_eq!(
+            self.stale_node_index_batch.len(),
+            1,
+            "TreeUpdateBatch expects exactly one stale_node_index_batch slot"
+        );
+        assert_eq!(
+            other.stale_node_index_batch.len(),
+            1,
+            "TreeUpdateBatch expects exactly one stale_node_index_batch slot"
+        );
+        self.node_batch[0].append(&mut other.node_batch[0]);
+        self.stale_node_index_batch[0].append(&mut other.stale_node_index_batch[0]);
+        self.num_new_leaves += other.num_new_leaves;
+        self.num_stale_leaves += other.num_stale_leaves;
     }
 }
 

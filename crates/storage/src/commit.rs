@@ -4,16 +4,23 @@
 //! `prepare_block_commit` returns an opaque `PreparedCommit` handle that
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
-use hyperscale_types::{Hash, ShardGroupId, SubstateWrite, TransactionCertificate};
+use hyperscale_types::{
+    BlockHeight, Hash, QuorumCertificate, ShardGroupId, TransactionCertificate,
+};
 use std::sync::Arc;
 
-/// Result of committing a block's state writes.
-#[must_use]
-pub struct CommitResult {
-    /// The state version after commit.
-    pub state_version: u64,
-    /// The state root hash after commit.
-    pub state_root: Hash,
+/// Consensus metadata to be committed atomically with JMT + substate writes.
+///
+/// When provided, the storage backend folds this into the same atomic write
+/// as the JMT and substate data, preventing crash-recovery inconsistencies
+/// where JMT advances to height H but consensus metadata is still at H-1.
+pub struct ConsensusCommitData {
+    /// The committed block height.
+    pub height: BlockHeight,
+    /// The committed block hash.
+    pub hash: Hash,
+    /// The quorum certificate for this block.
+    pub qc: QuorumCertificate,
 }
 
 /// Abstracts state commitment for both simulation and production storage.
@@ -39,12 +46,16 @@ pub trait CommitStore: Send + Sync {
     /// computes the speculative JMT root, and bundles all work into a
     /// `PreparedCommit` handle for efficient commit later.
     ///
+    /// `block_height` is the height of the block being prepared (used as JMT version
+    /// after certificate merging).
+    ///
     /// Returns `(computed_state_root, prepared_commit_handle)`.
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
         certificates: &[Arc<TransactionCertificate>],
         local_shard: ShardGroupId,
+        block_height: u64,
     ) -> (Hash, Self::PreparedCommit);
 
     /// Commit a block using precomputed work from `prepare_block_commit`.
@@ -52,18 +63,29 @@ pub trait CommitStore: Send + Sync {
     /// This is the fast path: applies the cached `WriteBatch`/`JmtSnapshot`
     /// directly. Falls back to per-certificate recompute if the prepared
     /// data is stale (base root/version mismatch).
-    fn commit_prepared_block(&self, prepared: Self::PreparedCommit) -> CommitResult;
+    ///
+    /// When `consensus` is provided, the consensus metadata is written
+    /// atomically in the same batch as the JMT + substate data.
+    fn commit_prepared_block(
+        &self,
+        prepared: Self::PreparedCommit,
+        consensus: Option<ConsensusCommitData>,
+    ) -> Hash;
 
     /// Commit a block's state writes from scratch (no prepared handle).
     ///
     /// Used when no `PreparedCommit` is available (e.g., sync blocks,
     /// cache eviction, or proposer fast-path not applicable).
+    ///
+    /// `block_height` is the height of the block being committed (used as JMT version).
+    ///
+    /// When `consensus` is provided, the consensus metadata is written
+    /// atomically in the same batch as the JMT + substate data.
     fn commit_block(
         &self,
         certificates: &[Arc<TransactionCertificate>],
         local_shard: ShardGroupId,
-    ) -> CommitResult;
-
-    /// Commit a single certificate's writes (individual/deferred commits).
-    fn commit_certificate(&self, certificate: &TransactionCertificate, writes: &[SubstateWrite]);
+        block_height: u64,
+        consensus: Option<ConsensusCommitData>,
+    ) -> Hash;
 }

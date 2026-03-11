@@ -11,9 +11,9 @@
 //! substate values. These associations are persisted to enable querying
 //! historical state at any past version (within the retention window).
 
-use crate::jmt::{StaleTreePart, StoredTreeNodeKey, TreeNode};
+use crate::jmt::{StaleTreePart, StoredTreeNodeKey, TierCollectedWrites, TreeNode};
+use crate::overlay::SubstateLookup;
 use crate::StateRootHash;
-use std::collections::HashMap;
 
 /// Associates a JMT leaf node with the substate value it represents.
 ///
@@ -46,10 +46,9 @@ pub struct LeafSubstateKeyAssociation {
 /// # Usage
 ///
 /// ```ignore
-/// // During verification (in production storage)
-/// let overlay = OverlayTreeStore::new(&storage);
-/// let root = compute_root(&overlay, writes);
-/// let snapshot = overlay.into_snapshot(base_root, base_version, root, num_certs);
+/// // During verification (speculative computation)
+/// let (root, collected) = put_at_version(&store, parent_version, height, &updates, dispatch);
+/// let snapshot = JmtSnapshot::from_collected_writes(collected, base_root, base_ver, root, height, Some(&lookup));
 /// cache.insert(block_hash, snapshot);
 ///
 /// // During commit
@@ -69,20 +68,19 @@ pub struct JmtSnapshot {
     /// Used to verify the JMT is in the expected state before applying.
     pub base_root: StateRootHash,
 
-    /// The JMT version this snapshot was computed from.
+    /// The JMT version (= parent block height) this snapshot was computed from.
     /// Used together with base_root to verify the JMT is in the expected state.
     pub base_version: u64,
 
     /// The resulting state root after applying all certificate writes.
     pub result_root: StateRootHash,
 
-    /// Number of JMT versions this snapshot advances.
-    /// Equal to the number of certificates processed.
-    pub num_versions: u64,
+    /// The new JMT version (= block height) after applying this snapshot.
+    pub new_version: u64,
 
     /// Nodes created during speculative computation.
     /// These are inserted directly into the real JMT on apply.
-    pub nodes: HashMap<StoredTreeNodeKey, TreeNode>,
+    pub nodes: Vec<(StoredTreeNodeKey, TreeNode)>,
 
     /// Stale tree parts to prune when applying the snapshot.
     pub stale_tree_parts: Vec<StaleTreePart>,
@@ -92,4 +90,44 @@ pub struct JmtSnapshot {
     /// Only populated when historical substate values are enabled.
     /// These should be persisted to enable historical state queries.
     pub leaf_substate_associations: Vec<LeafSubstateKeyAssociation>,
+}
+
+impl JmtSnapshot {
+    /// Create a snapshot from tier-collected writes.
+    ///
+    /// When `lookup` is `Some`, `Unchanged` associations are resolved by looking up
+    /// the actual substate value. When `None`, associations are discarded.
+    pub fn from_collected_writes(
+        collected: TierCollectedWrites,
+        base_root: StateRootHash,
+        base_version: u64,
+        result_root: StateRootHash,
+        new_version: u64,
+        lookup: Option<&(dyn SubstateLookup + Sync)>,
+    ) -> Self {
+        let leaf_substate_associations = match lookup {
+            Some(lookup) => collected
+                .associations
+                .into_iter()
+                .filter_map(|a| {
+                    let (tree_node_key, substate_value) =
+                        a.resolve(|pk, sk| lookup.lookup_substate(pk, sk))?;
+                    Some(LeafSubstateKeyAssociation {
+                        tree_node_key,
+                        substate_value,
+                    })
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        Self {
+            base_root,
+            base_version,
+            result_root,
+            new_version,
+            nodes: collected.nodes,
+            stale_tree_parts: collected.stale_tree_parts,
+            leaf_substate_associations,
+        }
+    }
 }

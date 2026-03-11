@@ -47,9 +47,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{instrument, Level};
 
-/// Fetch state entries for the given nodes from storage at a specific JMT version.
+/// Fetch state entries for the given nodes from storage at a specific block height (= JMT version).
 ///
-/// Reads substates at the given `state_version` using historical JMT traversal
+/// Reads substates at the given `block_height` using historical JMT traversal
 /// and the leaf association table. Both data and proofs must come from the same
 /// version to pass verification against the block header's `state_root`.
 ///
@@ -59,7 +59,7 @@ use tracing::{instrument, Level};
 pub fn fetch_state_entries<S: SubstateStore>(
     storage: &S,
     nodes: &[NodeId],
-    state_version: u64,
+    block_height: u64,
 ) -> Option<Vec<StateEntry>> {
     use hyperscale_storage::RADIX_PREFIX;
     use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
@@ -71,7 +71,7 @@ pub fn fetch_state_entries<S: SubstateStore>(
         let radix_node_id = radix_common::types::NodeId(node.0);
         let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
 
-        let substates = storage.list_substates_for_node_at_version(node, state_version)?;
+        let substates = storage.list_substates_for_node_at_height(node, block_height)?;
 
         for (partition_num, db_sort_key, value) in substates {
             // Build full storage key
@@ -369,18 +369,18 @@ impl RadixExecutor {
         }
     }
 
-    /// Fetch state entries for the given nodes from storage at a specific JMT version.
+    /// Fetch state entries for the given nodes from storage at a specific block height (= JMT version).
     ///
-    /// Reads substates at the given `state_version` using historical JMT traversal.
+    /// Reads substates at the given `block_height` using historical JMT traversal.
     /// Both data and proofs must come from the same version.
     /// Returns `None` if the version is unavailable (GC'd or not yet committed).
     pub fn fetch_state_entries<S: SubstateStore>(
         &self,
         storage: &S,
         nodes: &[NodeId],
-        state_version: u64,
+        block_height: u64,
     ) -> Option<Vec<StateEntry>> {
-        fetch_state_entries(storage, nodes, state_version)
+        fetch_state_entries(storage, nodes, block_height)
     }
 
     /// Compute writes commitment from state writes.

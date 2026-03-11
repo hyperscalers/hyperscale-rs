@@ -34,7 +34,7 @@ fn to_merkle_inclusion_proof(proof: SparseMerkleProof) -> MerkleInclusionProof {
 pub fn generate_merkle_proofs<S: ReadableTreeStore>(
     tree_store: &S,
     storage_keys: &[Vec<u8>],
-    state_version: u64,
+    block_height: u64,
 ) -> Vec<SubstateInclusionProof> {
     storage_keys
         .iter()
@@ -43,11 +43,11 @@ pub fn generate_merkle_proofs<S: ReadableTreeStore>(
                 decompose_storage_key(storage_key).expect("invalid storage key format");
 
             // Entity tier: get proof + payload (partition tier root version)
-            let entity_tier = EntityTier::new(tree_store, Some(state_version));
+            let entity_tier = EntityTier::new(tree_store, Some(block_height));
             let entity_leaf_key = LeafKey::new(entity_key);
             let (entity_data, entity_proof) = entity_tier
                 .jmt()
-                .get_with_proof(&entity_leaf_key, state_version)
+                .get_with_proof(&entity_leaf_key, block_height)
                 .expect("entity tier JMT error");
 
             let (_entity_value_hash, partition_root_version, _) =
@@ -233,8 +233,9 @@ pub fn verify_all_merkle_proofs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jmt::{put_at_next_version, TypedInMemoryTreeStore};
+    use crate::jmt::{put_at_version_and_apply, TypedInMemoryTreeStore};
     use crate::keys::to_storage_key;
+    use hyperscale_dispatch_sync::SyncDispatch;
     use radix_common::prelude::DatabaseUpdate;
     use radix_substate_store_interface::interface::{
         DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
@@ -291,8 +292,9 @@ mod tests {
 
         // Commit the substate to the JMT
         let updates = make_update(&entity_key, partition, &sort_key, &value);
-        let state_root = put_at_next_version(&tree_store, None, &updates);
-        let state_version = 1u64;
+        let state_root =
+            put_at_version_and_apply(&tree_store, None, 1, &updates, &SyncDispatch::new());
+        let block_height = 1u64;
 
         let storage_key = build_storage_key(&entity_key, partition, &sort_key);
 
@@ -300,7 +302,7 @@ mod tests {
         let proofs = generate_merkle_proofs(
             &tree_store,
             std::slice::from_ref(&storage_key),
-            state_version,
+            block_height,
         );
         assert_eq!(proofs.len(), 1);
 
@@ -323,7 +325,8 @@ mod tests {
         let value = vec![1, 2, 3];
 
         let updates = make_update(&entity_key, partition, &sort_key, &value);
-        let state_root = put_at_next_version(&tree_store, None, &updates);
+        let state_root =
+            put_at_version_and_apply(&tree_store, None, 1, &updates, &SyncDispatch::new());
         let storage_key = build_storage_key(&entity_key, partition, &sort_key);
 
         let proofs = generate_merkle_proofs(&tree_store, std::slice::from_ref(&storage_key), 1);
@@ -349,7 +352,7 @@ mod tests {
         let value = vec![1, 2, 3];
 
         let updates = make_update(&entity_key, partition, &sort_key, &value);
-        put_at_next_version(&tree_store, None, &updates);
+        put_at_version_and_apply(&tree_store, None, 1, &updates, &SyncDispatch::new());
         let storage_key = build_storage_key(&entity_key, partition, &sort_key);
 
         let proofs = generate_merkle_proofs(&tree_store, std::slice::from_ref(&storage_key), 1);
@@ -376,7 +379,8 @@ mod tests {
         let updates_b = make_update(&entity_b, 0, &[2], &value_b);
         updates.node_updates.extend(updates_b.node_updates);
 
-        let state_root = put_at_next_version(&tree_store, None, &updates);
+        let state_root =
+            put_at_version_and_apply(&tree_store, None, 1, &updates, &SyncDispatch::new());
 
         let key_a = build_storage_key(&entity_a, 0, &[1]);
         let key_b = build_storage_key(&entity_b, 0, &[2]);

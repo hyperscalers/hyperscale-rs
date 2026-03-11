@@ -327,7 +327,6 @@ impl ExecutionState {
         height: u64,
         block_timestamp: u64,
         proposer: ValidatorId,
-        state_version: u64,
         transactions: Vec<Arc<RoutableTransaction>>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
@@ -487,7 +486,6 @@ impl ExecutionState {
                 source_shard: local_shard,
                 block_height: BlockHeight(height),
                 block_timestamp,
-                state_version,
                 shard_recipients,
             });
         }
@@ -2170,7 +2168,6 @@ mod tests {
             1,
             1000,
             ValidatorId(0),
-            1,
             vec![Arc::new(tx.clone())],
         );
 
@@ -2239,7 +2236,6 @@ mod tests {
             1,
             1000,
             ValidatorId(0),
-            1,
             vec![Arc::new(tx.clone())],
         );
         assert!(!actions1.is_empty()); // Status change + execute
@@ -2252,7 +2248,6 @@ mod tests {
             2,
             2000,
             ValidatorId(0),
-            2,
             vec![Arc::new(tx)],
         );
 
@@ -2297,7 +2292,6 @@ mod tests {
             height,
             10000,
             ValidatorId(0),
-            height,
             vec![tx],
         );
 
@@ -2338,7 +2332,6 @@ mod tests {
             height,
             10000,
             ValidatorId(0),
-            height,
             vec![tx],
         );
 
@@ -2370,7 +2363,7 @@ mod tests {
 
         // Block commits without any speculation
         let actions =
-            state.on_block_committed(&topology, block_hash, 1, 1000, ValidatorId(0), 1, vec![tx]);
+            state.on_block_committed(&topology, block_hash, 1, 1000, ValidatorId(0), vec![tx]);
 
         // Should emit ExecuteTransactions (no speculation to use)
         assert!(actions

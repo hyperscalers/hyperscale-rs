@@ -138,7 +138,6 @@ pub struct StepOutput {
 pub struct NodeStatusSnapshot {
     pub committed_height: u64,
     pub view: u64,
-    pub state_version: u64,
     pub state_root: Hash,
     pub sync: SyncStatus,
     pub mempool_pending: usize,
@@ -879,14 +878,13 @@ where
 
     /// Capture a snapshot of node state for external status APIs.
     pub fn status_snapshot(&self) -> NodeStatusSnapshot {
-        let (_, state_version, state_root) = self.state.last_committed_state();
+        let state_root = self.state.last_committed_jmt_root();
         let mempool = self.state.mempool();
         let contention = mempool.lock_contention_stats();
 
         NodeStatusSnapshot {
             committed_height: self.state.bft().committed_height(),
             view: self.state.bft().view(),
-            state_version,
             state_root,
             sync: self.sync_protocol.status(),
             mempool_pending: contention.pending_count as usize,

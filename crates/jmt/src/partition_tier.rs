@@ -4,6 +4,7 @@ use super::substate_tier::*;
 use super::tier_framework::*;
 use super::tree_store::*;
 use super::types::*;
+use hyperscale_dispatch::Dispatch;
 use hyperscale_types::Hash;
 use radix_substate_store_interface::interface::NodeDatabaseUpdates;
 use radix_substate_store_interface::interface::*;
@@ -103,45 +104,43 @@ impl<'s, S: ReadableTreeStore> ReadableTier for PartitionTier<'s, S> {
     }
 }
 
-impl<'s, S: WriteableTreeStore> WriteableTier for PartitionTier<'s, S> {
-    fn insert_local_node(&self, local_key: &TreeNodeKey, node: Self::StoredNode) {
-        self.base_store
-            .insert_node(self.stored_node_key(local_key), node);
-    }
-
-    fn record_stale_local_node(&self, local_key: &TreeNodeKey) {
-        self.base_store
-            .record_stale_tree_part(StaleTreePart::Node(self.stored_node_key(local_key)))
-    }
-
-    fn set_root_version(&mut self, new_version: Option<Version>) {
-        self.root_version = new_version;
-    }
-}
-
-impl<'s, S: ReadableTreeStore + WriteableTreeStore> PartitionTier<'s, S> {
-    pub(crate) fn apply_entity_updates(
+impl<'s, S: ReadableTreeStore + Sync> PartitionTier<'s, S> {
+    pub(crate) fn apply_entity_updates<D: Dispatch>(
         &mut self,
         next_version: Version,
         updates: &NodeDatabaseUpdates,
-    ) -> Option<Hash> {
-        let leaf_updates =
-            updates
-                .partition_updates
-                .iter()
-                .map(|(partition, partition_database_updates)| {
-                    let new_partition_root_hash = self
-                        .get_partition_substate_tier(*partition)
-                        .apply_partition_updates(next_version, partition_database_updates);
-                    let new_leaf = new_partition_root_hash.map(|new_partition_root_hash| {
-                        let new_leaf_hash = new_partition_root_hash;
-                        let new_leaf_payload = next_version;
-                        (new_leaf_hash, new_leaf_payload)
-                    });
-                    (partition, new_leaf)
-                });
-        let update_batch = self.generate_tier_update_batch(next_version, leaf_updates);
-        self.apply_tier_update_batch(&update_batch);
-        update_batch.new_root_hash
+        dispatch: &D,
+    ) -> (Option<Hash>, TierCollectedWrites) {
+        // Phase 1: parallel partition processing.
+        let self_ref: &Self = &*self;
+        let partitions: Vec<_> = updates.partition_updates.iter().collect();
+        let results: Vec<_> = dispatch.map_local(&partitions, |(partition, part_updates)| {
+            let mut st = self_ref.get_partition_substate_tier(**partition);
+            let (root, collected) =
+                st.apply_partition_updates(next_version, part_updates, dispatch);
+            (*partition, root.map(|h| (h, next_version)), collected)
+        });
+
+        // Merge collected writes from all partitions.
+        let mut collected = TierCollectedWrites::default();
+        let leaf_updates: Vec<_> = results
+            .into_iter()
+            .map(|(pk, root, writes)| {
+                collected.merge(writes);
+                (pk, root)
+            })
+            .collect();
+
+        // Phase 2: partition-tier JMT.
+        let update_batch = self.generate_tier_update_batch(
+            next_version,
+            leaf_updates.iter().map(|(k, v)| (*k, *v)),
+            dispatch,
+        );
+
+        // Phase 3: collect partition-tier writes.
+        collected.collect_from_tier_batch(&update_batch, |k| self.stored_node_key(k));
+        self.root_version = Some(update_batch.new_version);
+        (update_batch.new_root_hash, collected)
     }
 }

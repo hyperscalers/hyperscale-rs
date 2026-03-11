@@ -96,7 +96,6 @@ pub fn make_test_block(height: u64) -> Block {
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         },

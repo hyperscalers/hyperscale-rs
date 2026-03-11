@@ -9,6 +9,7 @@ hyperscale-storage.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-types.workspace = true
 hyperscale-bft.workspace = true
+hyperscale-dispatch.workspace = true
 rocksdb.workspace = true
 sbor.workspace = true
 hex.workspace = true
@@ -16,5 +17,6 @@ tracing.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+hyperscale-dispatch-sync.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true

@@ -326,12 +326,29 @@ where
         let has_non_empty = commits.iter().any(|(b, _)| !b.certificates.is_empty());
 
         if !has_non_empty {
-            // All empty blocks — synchronous (metadata only, very fast).
+            // All empty blocks — synchronous fast path.
+            // Still advance JMT version so it matches block height.
             for (block, qc) in commits {
                 let height = block.header.height;
                 let block_hash = block.hash();
-                ConsensusStore::set_committed_state(&*self.storage, height, block_hash, &qc);
+                let consensus = hyperscale_storage::ConsensusCommitData {
+                    height,
+                    hash: block_hash,
+                    qc: qc.clone(),
+                };
+                let result = self.storage.commit_block(
+                    &block.certificates,
+                    self.local_shard,
+                    height.0,
+                    Some(consensus),
+                );
                 ConsensusStore::prune_own_votes(&*self.storage, height.0);
+                let _ = self.event_sender.send(NodeInput::Protocol(
+                    ProtocolEvent::StateCommitComplete {
+                        height: height.0,
+                        state_root: result,
+                    },
+                ));
                 let _ =
                     self.event_sender
                         .send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
@@ -362,27 +379,33 @@ where
                 let block_hash = block.hash();
                 let height = block.header.height;
 
-                if !block.certificates.is_empty() {
-                    let prepared = prepared_map[i].take();
-                    let result = if let Some(prepared) = prepared {
-                        storage.commit_prepared_block(prepared)
-                    } else {
-                        storage.commit_block(&block.certificates, local_shard)
-                    };
+                let consensus = hyperscale_storage::ConsensusCommitData {
+                    height,
+                    hash: block_hash,
+                    qc: qc.clone(),
+                };
 
-                    ConsensusStore::set_committed_state(&*storage, height, block_hash, &qc);
-                    ConsensusStore::prune_own_votes(&*storage, height.0);
-
-                    let _ =
-                        event_tx.send(NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
-                            height: height.0,
-                            state_version: result.state_version,
-                            state_root: result.state_root,
-                        }));
+                // Always commit — even empty blocks advance the JMT version
+                // to match block height, so provision lookups succeed.
+                // Consensus metadata is folded into the same atomic write.
+                let prepared = prepared_map[i].take();
+                let result = if let Some(prepared) = prepared {
+                    storage.commit_prepared_block(prepared, Some(consensus))
                 } else {
-                    ConsensusStore::set_committed_state(&*storage, height, block_hash, &qc);
-                    ConsensusStore::prune_own_votes(&*storage, height.0);
-                }
+                    storage.commit_block(
+                        &block.certificates,
+                        local_shard,
+                        height.0,
+                        Some(consensus),
+                    )
+                };
+
+                ConsensusStore::prune_own_votes(&*storage, height.0);
+
+                let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
+                    height: height.0,
+                    state_root: result,
+                }));
 
                 let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::BlockCommitted {
                     block_hash,

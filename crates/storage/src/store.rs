@@ -3,9 +3,7 @@
 //! This module defines the storage abstraction used by runners to persist Radix state.
 
 use hyperscale_types::{Hash, NodeId, SubstateInclusionProof};
-use radix_substate_store_interface::interface::{
-    CommittableSubstateDatabase, DbSortKey, SubstateDatabase,
-};
+use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 
 /// Extension trait for substate storage with snapshots, node listing, and JMT state roots.
 ///
@@ -13,14 +11,14 @@ use radix_substate_store_interface::interface::{
 /// for deterministic simulation and state commitment:
 /// - `snapshot()` - Create isolated views for parallel execution
 /// - `list_substates_for_node()` - Enumerate substates for cross-shard provisioning
-/// - `state_version()` / `state_root_hash()` - JMT state commitment
+/// - `jmt_version()` / `state_root_hash()` - JMT state commitment
 ///
 /// All implementations use Jellyfish Merkle Tree (JMT) internally to maintain
-/// cryptographic state roots. This is handled automatically on each `commit()`.
+/// cryptographic state roots, updated on each `commit_block()`.
 ///
 /// Runner storage types (`SimStorage`, `RocksDbStorage`) implement this trait
-/// along with `SubstateDatabase` and `CommittableSubstateDatabase`.
-pub trait SubstateStore: SubstateDatabase + CommittableSubstateDatabase + Send + Sync {
+/// along with `SubstateDatabase`.
+pub trait SubstateStore: SubstateDatabase + Send + Sync {
     /// The snapshot type returned by this storage.
     type Snapshot<'a>: SubstateDatabase + Send + Sync
     where
@@ -46,11 +44,11 @@ pub trait SubstateStore: SubstateDatabase + CommittableSubstateDatabase + Send +
         node_id: &NodeId,
     ) -> Box<dyn Iterator<Item = (u8, DbSortKey, Vec<u8>)> + '_>;
 
-    /// Current state version.
+    /// Returns the block height of the last committed JMT state.
     ///
-    /// This is a monotonically increasing counter that increments on each `commit()`.
-    /// Version 0 means no commits have occurred (empty/genesis state).
-    fn state_version(&self) -> u64;
+    /// This equals the block height because JMT version = block height.
+    /// Returns 0 for fresh/genesis state.
+    fn jmt_version(&self) -> u64;
 
     /// Current JMT state root hash.
     ///
@@ -61,28 +59,28 @@ pub trait SubstateStore: SubstateDatabase + CommittableSubstateDatabase + Send +
     /// Returns a zero hash if no commits have occurred.
     fn state_root_hash(&self) -> Hash;
 
-    /// List all substates for a node at a specific historical JMT version.
+    /// List all substates for a node at a specific historical block height (= JMT version).
     ///
-    /// Traverses the 3-tier JMT at `state_version` and looks up raw substate
+    /// Traverses the 3-tier JMT at the given height and looks up raw substate
     /// values from the leaf association table.
     ///
     /// Returns `Some(entries)` on success (may be empty if the node has no
-    /// substates at that version), or `None` if the version is unavailable
+    /// substates at that height), or `None` if the height is unavailable
     /// (e.g. garbage-collected or not yet committed).
     ///
     /// Used by cross-shard provision paths to serve historical state that
     /// can be verified against the original block's `state_root`.
-    fn list_substates_for_node_at_version(
+    fn list_substates_for_node_at_height(
         &self,
         node_id: &NodeId,
-        state_version: u64,
+        block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>>;
 
     /// Generate 3-tier JMT inclusion proofs for the given storage keys.
     fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
-        state_version: u64,
+        block_height: u64,
     ) -> Vec<SubstateInclusionProof>;
 }
 

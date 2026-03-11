@@ -5,8 +5,6 @@ use super::tier_framework::StoredNode;
 pub use super::types::{Nibble, NibblePath, TreeNodeKey, Version};
 use super::{Node, StorageError, TreeReader};
 use hyperscale_types::Hash;
-use radix_common::prelude::DbSubstateValue;
-use radix_substate_store_interface::interface::*;
 use sbor::prelude::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;
@@ -175,52 +173,17 @@ pub trait WriteableTreeStore {
     /// Inserts the node under a new, unique key (i.e. never an update).
     fn insert_node(&self, global_key: StoredTreeNodeKey, node: TreeNode);
 
-    /// Associates an inserted Substate-Tier tree leaf with the Substate it represents.
-    ///
-    /// This method will be called after the [`Self::insert_node()`] of Substate-Tier leaf nodes,
-    /// and allows the storage to keep correlated historical values, if required. The correlation
-    /// may be implemented either directly (i.e. to the given `substate_value`) or via the given
-    /// `partition_key` + `sort_key` (if it makes sense e.g. for performance reasons).
-    fn associate_substate(
-        &self,
-        state_tree_leaf_key: &StoredTreeNodeKey,
-        partition_key: &DbPartitionKey,
-        sort_key: &DbSortKey,
-        substate_value: AssociatedSubstateValue,
-    );
-
     /// Marks the given tree part for a (potential) future removal by an arbitrary external pruning
     /// process.
     fn record_stale_tree_part(&self, global_tree_part: StaleTreePart);
 }
-
-/// A Substate value associated with a tree leaf (see [`WriteableTreeStore#associate_substate()`]).
-///
-/// Implementation note: _("why can't we simply pass `&DbSubstateValue` there?")_
-/// In JMT, a new leaf node may be inserted *not* only due to Substate upsert, but also as a result
-/// of a "tree restructuring" (an internal JMT behavior, needed e.g. when a previously-only-child
-/// gains a sibling). In such cases, the associated Substate itself is actually untouched, and we
-/// would have to load it from the [`SubstateDatabase`] (only to pass its value). We choose to
-/// avoid this potential performance implication by having an explicit way of associating an
-/// "unchanged" Substate with its new tree leaf.
-pub enum AssociatedSubstateValue<'v> {
-    Upserted(&'v [u8]),
-    Unchanged,
-}
-
-/// A complete tree node storage SPI.
-pub trait TreeStore: ReadableTreeStore + WriteableTreeStore {}
-impl<S: ReadableTreeStore + WriteableTreeStore> TreeStore for S {}
 
 /// A `TreeStore` based on memory object copies (i.e. no serialization).
 #[derive(Debug)]
 pub struct TypedInMemoryTreeStore {
     pub tree_nodes: RwLock<HashMap<StoredTreeNodeKey, TreeNode>>,
     pub stale_part_buffer: RwLock<Vec<StaleTreePart>>,
-    pub associated_substates:
-        RwLock<HashMap<StoredTreeNodeKey, (DbSubstateKey, Option<DbSubstateValue>)>>,
     pub pruning_enabled: bool,
-    pub store_associated_substates: bool,
 }
 
 impl TypedInMemoryTreeStore {
@@ -228,22 +191,13 @@ impl TypedInMemoryTreeStore {
         Self {
             tree_nodes: RwLock::new(HashMap::new()),
             stale_part_buffer: RwLock::new(Vec::new()),
-            associated_substates: RwLock::new(HashMap::new()),
             pruning_enabled: false,
-            store_associated_substates: false,
         }
     }
 
     pub fn with_pruning_enabled(self) -> Self {
         Self {
             pruning_enabled: true,
-            ..self
-        }
-    }
-
-    pub fn storing_associated_substates(self) -> Self {
-        Self {
-            store_associated_substates: true,
             ..self
         }
     }
@@ -277,25 +231,6 @@ impl ReadableTreeStore for TypedInMemoryTreeStore {
 impl WriteableTreeStore for TypedInMemoryTreeStore {
     fn insert_node(&self, key: StoredTreeNodeKey, node: TreeNode) {
         self.tree_nodes.write().unwrap().insert(key, node);
-    }
-
-    fn associate_substate(
-        &self,
-        state_tree_leaf_key: &StoredTreeNodeKey,
-        partition_key: &DbPartitionKey,
-        sort_key: &DbSortKey,
-        substate_value: AssociatedSubstateValue,
-    ) {
-        if self.store_associated_substates {
-            let substate_value = match substate_value {
-                AssociatedSubstateValue::Upserted(value) => Some(value.to_owned()),
-                AssociatedSubstateValue::Unchanged => None,
-            };
-            self.associated_substates.write().unwrap().insert(
-                state_tree_leaf_key.clone(),
-                ((partition_key.clone(), sort_key.clone()), substate_value),
-            );
-        }
     }
 
     fn record_stale_tree_part(&self, part: StaleTreePart) {

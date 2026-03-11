@@ -8,7 +8,7 @@
 //!  ┌──────────────────────────────────────────────────────────────────────┐
 //!  │  Core 0 (pinned std::thread)                                         │
 //!  │  ┌────────────────────────────────────────────────────────────────┐  │
-//!  │  │  IoLoop<SharedStorage, Libp2pNetwork, PooledDispatch>            │  │
+//!  │  │  IoLoop<SharedStorage, Libp2pNetwork, PooledDispatch>          │  │
 //!  │  │    - State machine event processing                            │  │
 //!  │  │    - Storage I/O (RocksDB)                                     │  │
 //!  │  │    - Action handling (timers, broadcasts, crypto dispatch)     │  │
@@ -53,10 +53,7 @@ use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_network_libp2p::{
     generate_random_keypair, Libp2pAdapter, Libp2pConfig, NetworkError,
 };
-use hyperscale_storage::{
-    CommittableSubstateDatabase, ConsensusStore, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    DbSubstateValue, PartitionEntry, SubstateDatabase,
-};
+use hyperscale_storage::{ConsensusStore, GenesisWrapper};
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use quick_cache::sync::Cache as QuickCache;
 
@@ -72,42 +69,8 @@ use thiserror::Error;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
-// ═══════════════════════════════════════════════════════════════════════════
-// GenesisMutWrapper — bridges RocksDB &self commit with Radix Engine &mut self
-// ═══════════════════════════════════════════════════════════════════════════
-
-/// Wrapper that bridges `RocksDbStorage`'s `&self` commit with the Radix Engine's
-/// `&mut self` `CommittableSubstateDatabase` trait, used only for genesis execution.
-///
-/// Takes `&RocksDbStorage` (accessed via `SharedStorage` deref) because the
-/// production runner wraps storage in `SharedStorage` (newtype over `Arc<RocksDbStorage>`)
-/// for shared ownership between the pinned thread and async tasks.
-struct GenesisMutWrapper<'a>(&'a RocksDbStorage);
-
-impl SubstateDatabase for GenesisMutWrapper<'_> {
-    fn get_raw_substate_by_db_key(
-        &self,
-        partition_key: &DbPartitionKey,
-        sort_key: &DbSortKey,
-    ) -> Option<DbSubstateValue> {
-        self.0.get_raw_substate_by_db_key(partition_key, sort_key)
-    }
-
-    fn list_raw_values_from_db_key(
-        &self,
-        partition_key: &DbPartitionKey,
-        from_sort_key: Option<&DbSortKey>,
-    ) -> Box<dyn Iterator<Item = PartitionEntry> + '_> {
-        self.0
-            .list_raw_values_from_db_key(partition_key, from_sort_key)
-    }
-}
-
-impl CommittableSubstateDatabase for GenesisMutWrapper<'_> {
-    fn commit(&mut self, updates: &DatabaseUpdates) {
-        self.0.commit(updates).expect("genesis commit failed");
-    }
-}
+/// Type alias for the production genesis wrapper.
+type GenesisMutWrapper<'a> = GenesisWrapper<'a, RocksDbStorage<PooledDispatch>>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RunnerError
@@ -176,7 +139,7 @@ pub struct ProductionRunnerBuilder {
     signing_key: Option<Bls12381G1PrivateKey>,
     bft_config: Option<BftConfig>,
     dispatch: Option<Arc<PooledDispatch>>,
-    storage: Option<Arc<RocksDbStorage>>,
+    storage: Option<Arc<RocksDbStorage<PooledDispatch>>>,
     network_config: Option<Libp2pConfig>,
     channel_capacity: usize,
     rpc_status: Option<Arc<ArcSwap<NodeStatusState>>>,
@@ -254,7 +217,7 @@ impl ProductionRunnerBuilder {
     }
 
     /// Set the RocksDB storage for persistence and crash recovery.
-    pub fn storage(mut self, storage: Arc<RocksDbStorage>) -> Self {
+    pub fn storage(mut self, storage: Arc<RocksDbStorage<PooledDispatch>>) -> Self {
         self.storage = Some(storage);
         self
     }
@@ -570,7 +533,7 @@ pub struct ProductionRunner {
     topology: SharedTopologySnapshot,
     /// RocksDB storage (for InboundRouter and genesis).
     #[allow(dead_code)]
-    storage: Arc<RocksDbStorage>,
+    storage: Arc<RocksDbStorage<PooledDispatch>>,
     /// Thread pool dispatch.
     dispatch: Arc<PooledDispatch>,
     /// Local shard for network broadcasts.
@@ -686,13 +649,15 @@ impl ProductionRunner {
         );
 
         // Run Radix Engine genesis to set up initial state.
-        // Uses GenesisMutWrapper to bridge RocksDbStorage's &self commit()
-        // with the Radix Engine's &mut self CommittableSubstateDatabase trait.
+        //
+        // GenesisMutWrapper writes substates only (no JMT) during bootstrap, then
+        // we compute the JMT once at version 0. This ensures block 1 cleanly
+        // writes at JMT version 1 without colliding with genesis versions.
         let genesis_config = self.genesis_config.take();
-        let result = io_loop.with_storage_and_executor(|storage, executor| {
+        let genesis_jmt_root = io_loop.with_storage_and_executor(|storage, executor| {
             // SharedStorage derefs to &RocksDbStorage.
-            let mut wrapper = GenesisMutWrapper(storage);
-            if let Some(config) = genesis_config {
+            let mut wrapper = GenesisMutWrapper::new(storage);
+            let result = if let Some(config) = genesis_config {
                 info!(
                     xrd_balances = config.xrd_balances.len(),
                     "Running genesis with custom configuration"
@@ -700,20 +665,18 @@ impl ProductionRunner {
                 executor.run_genesis_with_config(&mut wrapper, config)
             } else {
                 executor.run_genesis(&mut wrapper)
+            };
+
+            if let Err(e) = result {
+                panic!("Radix Engine genesis failed: {e:?}");
             }
+
+            // Compute JMT once at version 0 from merged genesis updates.
+            let merged = wrapper.into_merged();
+            storage.finalize_genesis_jmt(&merged)
         });
 
-        if let Err(e) = result {
-            panic!("Radix Engine genesis failed: {e:?}");
-        }
-
-        // Get the JMT state AFTER genesis bootstrap.
-        use hyperscale_storage::SubstateStore;
-        let genesis_jmt_version = io_loop.storage().state_version();
-        let genesis_jmt_root = io_loop.storage().state_root_hash();
-
         info!(
-            genesis_jmt_version,
             genesis_jmt_root = ?genesis_jmt_root,
             "JMT state after genesis bootstrap"
         );
@@ -727,12 +690,7 @@ impl ProductionRunner {
             .copied()
             .unwrap_or(ValidatorId(0));
 
-        let genesis_block = Block::genesis(
-            self.local_shard,
-            first_validator,
-            genesis_jmt_root,
-            genesis_jmt_version,
-        );
+        let genesis_block = Block::genesis(self.local_shard, first_validator, genesis_jmt_root);
 
         let genesis_hash = genesis_block.hash();
         info!(
@@ -760,13 +718,11 @@ impl ProductionRunner {
         let genesis_commit_output = io_loop.step(NodeInput::Protocol(
             hyperscale_core::ProtocolEvent::StateCommitComplete {
                 height: 0,
-                state_version: genesis_jmt_version,
                 state_root: genesis_jmt_root,
             },
         ));
 
         info!(
-            genesis_jmt_version,
             genesis_jmt_root = ?genesis_jmt_root,
             actions = genesis_commit_output.actions_generated,
             "Updated state machine with genesis JMT state"

@@ -913,7 +913,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::from_bytes(format!("root_{shard}_{height}").as_bytes()),
-            state_version: height,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -1032,7 +1031,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::from_bytes(b"root"),
-            state_version: 10,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -1062,7 +1060,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::from_bytes(b"root"),
-            state_version: 10,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -1093,7 +1090,6 @@ mod tests {
             source_shard,
             block_height: BlockHeight(height),
             block_timestamp: 1000 + height,
-            state_version: height,
             entries: Arc::new(vec![]),
             merkle_proofs: Arc::new(vec![]),
         }
@@ -1592,7 +1588,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::from_bytes(format!("root_{shard}_{height}").as_bytes()),
-            state_version: height,
             transaction_root: Hash::ZERO,
             provision_targets,
         };
@@ -1605,7 +1600,7 @@ mod tests {
 
     /// Make a minimal Block at the given height for on_block_committed calls.
     fn make_block(height: u64) -> hyperscale_types::Block {
-        hyperscale_types::Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO, 0)
+        hyperscale_types::Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO)
             .tap_mut(|b| b.header.height = BlockHeight(height))
     }
 

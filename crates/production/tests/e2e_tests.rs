@@ -11,6 +11,8 @@ mod fixtures;
 
 use fixtures::TestFixtures;
 use hyperscale_bft::BftConfig;
+use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
+use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_production::{ProductionRunner, RocksDbStorage};
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
@@ -45,7 +47,7 @@ async fn test_storage_operations() {
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_db");
 
-    let storage = RocksDbStorage::open(&db_path).unwrap();
+    let storage = RocksDbStorage::open(&db_path, SyncDispatch::new()).unwrap();
 
     // Test block storage
     let header = BlockHeader {
@@ -58,7 +60,6 @@ async fn test_storage_operations() {
         round: 1,
         is_fallback: false,
         state_root: Hash::ZERO,
-        state_version: 0,
         transaction_root: Hash::ZERO,
         provision_targets: vec![],
     };
@@ -553,7 +554,8 @@ async fn test_production_runner_with_network() {
     // Create temp storage
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_db");
-    let storage = RocksDbStorage::open(&db_path).unwrap();
+    let dispatch = PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap();
+    let storage = RocksDbStorage::open(&db_path, dispatch).unwrap();
     let storage = Arc::new(storage);
 
     let network_config = Libp2pConfig {
@@ -617,7 +619,8 @@ async fn test_graceful_shutdown() {
     // Create temp storage
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test_db");
-    let storage = RocksDbStorage::open(&db_path).unwrap();
+    let dispatch = PooledDispatch::new(ThreadPoolConfig::minimal()).unwrap();
+    let storage = RocksDbStorage::open(&db_path, dispatch).unwrap();
     let storage = Arc::new(storage);
 
     let network_config = Libp2pConfig {

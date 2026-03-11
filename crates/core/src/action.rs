@@ -113,7 +113,6 @@ pub enum Action {
         source_shard: ShardGroupId,
         block_height: BlockHeight,
         block_timestamp: u64,
-        state_version: u64,
         /// Per-shard recipients for provision broadcasts (excluding self).
         shard_recipients: HashMap<ShardGroupId, Vec<ValidatorId>>,
     },
@@ -321,6 +320,8 @@ pub enum Action {
         expected_root: Hash,
         /// Certificates whose writes will be applied to compute the new root.
         certificates: Vec<Arc<TransactionCertificate>>,
+        /// Block height (used as JMT version for certificate merging).
+        block_height: u64,
     },
 
     /// Verify a block's transaction root.
@@ -365,8 +366,6 @@ pub enum Action {
         is_fallback: bool,
         /// Parent's state root. Certs included only if local JMT matches this.
         parent_state_root: Hash,
-        /// Parent's state version (base for computing new state_version).
-        parent_state_version: u64,
         retry_transactions: Vec<Arc<RoutableTransaction>>,
         priority_transactions: Vec<Arc<RoutableTransaction>>,
         transactions: Vec<Arc<RoutableTransaction>>,

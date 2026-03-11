@@ -16,7 +16,7 @@ use hyperscale_network_memory::{
 };
 use hyperscale_node::io_loop::{IoLoop, StepOutput};
 use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp};
-use hyperscale_storage::ConsensusStore;
+use hyperscale_storage::{ConsensusStore, GenesisWrapper};
 use hyperscale_storage_memory::SimStorage;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
@@ -32,7 +32,10 @@ use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
 /// Type alias for the simulation's concrete IoLoop.
-type SimIoLoop = IoLoop<SimStorage, SimNetworkAdapter, SyncDispatch>;
+type SimIoLoop = IoLoop<SimStorage<SyncDispatch>, SimNetworkAdapter, SyncDispatch>;
+
+/// Type alias for the simulation's genesis wrapper.
+type SimGenesisWrapper<'a> = GenesisWrapper<'a, SimStorage<SyncDispatch>>;
 
 /// Deterministic simulation runner.
 ///
@@ -214,7 +217,7 @@ impl SimulationRunner {
 
                 let io_loop = IoLoop::new(
                     state,
-                    SimStorage::new(),
+                    SimStorage::new(SyncDispatch),
                     RadixExecutor::new(network_def),
                     network.create_adapter(node_index),
                     SyncDispatch,
@@ -284,7 +287,7 @@ impl SimulationRunner {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Get a reference to a node's storage.
-    pub fn node_storage(&self, node: NodeIndex) -> Option<&SimStorage> {
+    pub fn node_storage(&self, node: NodeIndex) -> Option<&SimStorage<SyncDispatch>> {
         self.io_loops.get(node as usize).map(|nl| nl.storage())
     }
 
@@ -365,13 +368,19 @@ impl SimulationRunner {
     /// Initialize all nodes with genesis blocks and start consensus.
     pub fn initialize_genesis(&mut self) {
         // Run Radix Engine genesis on each node's storage.
+        // SimGenesisWrapper writes substates only (no JMT) during bootstrap,
+        // then computes JMT once at version 0 to avoid collisions with block 1.
         for node_idx in 0..self.io_loops.len() {
             if !self.genesis_executed[node_idx] {
-                let result = self.io_loops[node_idx]
-                    .with_storage_and_executor(|storage, executor| executor.run_genesis(storage));
-                if let Err(e) = result {
-                    warn!(node = node_idx, "Radix Engine genesis failed: {:?}", e);
-                }
+                self.io_loops[node_idx].with_storage_and_executor(|storage, executor| {
+                    let mut wrapper = SimGenesisWrapper::new(storage);
+                    if let Err(e) = executor.run_genesis(&mut wrapper) {
+                        warn!(node = node_idx, "Radix Engine genesis failed: {:?}", e);
+                        return;
+                    }
+                    let merged = wrapper.into_merged();
+                    storage.finalize_genesis_jmt(&merged);
+                });
                 self.genesis_executed[node_idx] = true;
             }
         }
@@ -394,20 +403,24 @@ impl SimulationRunner {
         use hyperscale_engine::GenesisConfig;
 
         // Run Radix Engine genesis on each node's storage with balances.
+        // SimGenesisWrapper writes substates only (no JMT) during bootstrap,
+        // then computes JMT once at version 0 to avoid collisions with block 1.
         for node_idx in 0..self.io_loops.len() {
             if !self.genesis_executed[node_idx] {
                 let balances = balances.clone();
-                let result =
-                    self.io_loops[node_idx].with_storage_and_executor(|storage, executor| {
-                        let config = GenesisConfig {
-                            xrd_balances: balances,
-                            ..GenesisConfig::test_default()
-                        };
-                        executor.run_genesis_with_config(storage, config)
-                    });
-                if let Err(e) = result {
-                    warn!(node = node_idx, "Radix Engine genesis failed: {:?}", e);
-                }
+                self.io_loops[node_idx].with_storage_and_executor(|storage, executor| {
+                    let mut wrapper = SimGenesisWrapper::new(storage);
+                    let config = GenesisConfig {
+                        xrd_balances: balances,
+                        ..GenesisConfig::test_default()
+                    };
+                    if let Err(e) = executor.run_genesis_with_config(&mut wrapper, config) {
+                        warn!(node = node_idx, "Radix Engine genesis failed: {:?}", e);
+                        return;
+                    }
+                    let merged = wrapper.into_merged();
+                    storage.finalize_genesis_jmt(&merged);
+                });
                 self.genesis_executed[node_idx] = true;
             }
         }
@@ -435,12 +448,10 @@ impl SimulationRunner {
         for shard_id in 0..num_shards {
             let shard_start = shard_id * validators_per_shard;
             let first_node_storage = self.io_loops[shard_start as usize].storage();
-            let genesis_jmt_version = first_node_storage.state_version();
             let genesis_jmt_root = first_node_storage.state_root_hash();
 
             info!(
                 shard = shard_id,
-                genesis_jmt_version,
                 genesis_jmt_root = ?genesis_jmt_root,
                 "JMT state after genesis bootstrap"
             );
@@ -450,7 +461,6 @@ impl SimulationRunner {
                 hyperscale_types::ShardGroupId(shard_id as u64),
                 proposer,
                 genesis_jmt_root,
-                genesis_jmt_version,
             );
 
             let shard_end = shard_start + validators_per_shard;
@@ -471,7 +481,6 @@ impl SimulationRunner {
                 let genesis_commit_event =
                     NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
                         height: 0,
-                        state_version: genesis_jmt_version,
                         state_root: genesis_jmt_root,
                     });
                 self.schedule_event(node_index, self.now, genesis_commit_event);

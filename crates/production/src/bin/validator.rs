@@ -420,16 +420,16 @@ pub struct StorageConfig {
     #[serde(default = "default_keep_log_file_num")]
     pub keep_log_file_num: usize,
 
-    /// Number of state versions to retain before garbage collection.
+    /// Number of block heights of JMT history to retain before garbage collection.
     ///
-    /// Stale JMT nodes and their associations are kept for this many versions
+    /// Stale JMT nodes and their associations are kept for this many heights
     /// before being eligible for deletion. This enables historical queries within
     /// this window.
     ///
     /// Set to 0 for immediate deletion (no history retention).
-    /// Defaults to 60,000 versions (matching Babylon's default).
-    #[serde(default = "default_state_version_history_length")]
-    pub state_version_history_length: u64,
+    /// Defaults to 60,000 (matching Babylon's default).
+    #[serde(default = "default_jmt_history_length")]
+    pub jmt_history_length: u64,
 }
 
 impl Default for StorageConfig {
@@ -443,12 +443,12 @@ impl Default for StorageConfig {
             bloom_filter_bits: default_bloom_filter_bits(),
             bytes_per_sync_mb: default_bytes_per_sync_mb(),
             keep_log_file_num: default_keep_log_file_num(),
-            state_version_history_length: default_state_version_history_length(),
+            jmt_history_length: default_jmt_history_length(),
         }
     }
 }
 
-fn default_state_version_history_length() -> u64 {
+fn default_jmt_history_length() -> u64 {
     60_000 // Match Babylon's default
 }
 
@@ -999,7 +999,7 @@ fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
         bloom_filter_bits: config.bloom_filter_bits,
         bytes_per_sync: config.bytes_per_sync_mb * 1024 * 1024,
         keep_log_file_num: config.keep_log_file_num,
-        state_version_history_length: config.state_version_history_length,
+        jmt_history_length: config.jmt_history_length,
         ..RocksDbConfig::default()
     }
 }
@@ -1272,7 +1272,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
     // Open storage
     let db_path = config.node.data_dir.join("db");
-    let storage = RocksDbStorage::open_with_config(&db_path, rocksdb_config)
+    let storage = RocksDbStorage::open_with_config(&db_path, rocksdb_config, (*dispatch).clone())
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
     let storage = Arc::new(storage);
     info!("Storage opened at {}", db_path.display());

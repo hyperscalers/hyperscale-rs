@@ -200,6 +200,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             parent_state_root,
             expected_root,
             certificates,
+            block_height,
         } => {
             let start = std::time::Instant::now();
             let result = hyperscale_bft::handlers::verify_state_root(
@@ -208,6 +209,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 expected_root,
                 &certificates,
                 ctx.local_shard,
+                block_height,
             );
             metrics::record_signature_verification_latency(
                 "state_root",
@@ -233,7 +235,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             timestamp,
             is_fallback,
             parent_state_root,
-            parent_state_version,
             retry_transactions,
             priority_transactions,
             transactions,
@@ -253,7 +254,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 timestamp,
                 is_fallback,
                 parent_state_root,
-                parent_state_version,
                 retry_transactions,
                 priority_transactions,
                 transactions,
@@ -439,7 +439,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             source_shard,
             block_height,
             block_timestamp,
-            state_version,
             shard_recipients,
         } => {
             use hyperscale_types::StateProvision;
@@ -448,23 +447,22 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             let mut batches: HashMap<ShardGroupId, Vec<StateProvision>> = HashMap::new();
 
             for req in requests {
-                // Fetch state entries from storage at the block's state version.
+                // Fetch state entries from storage at the block's height (= JMT version).
                 // This is the proactive path — the proposer just committed this
-                // block, so the state version should still be available. If it
-                // was garbage-collected (aggressive GC + slow dispatch), skip
-                // this request — the target shard will recover via fallback.
+                // block, so the version should still be available. If it was
+                // garbage-collected (aggressive GC + slow dispatch), skip this
+                // request — the target shard will recover via fallback.
                 let entries =
                     match ctx
                         .executor
-                        .fetch_state_entries(ctx.storage, &req.nodes, state_version)
+                        .fetch_state_entries(ctx.storage, &req.nodes, block_height.0)
                     {
                         Some(entries) => entries,
                         None => {
                             tracing::warn!(
-                                state_version,
                                 block_height = block_height.0,
                                 tx_hash = ?req.tx_hash,
-                                "Proactive provision: state version unavailable, \
+                                "Proactive provision: JMT version unavailable, \
                                  skipping (target shard will use fallback recovery)"
                             );
                             continue;
@@ -474,7 +472,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                     entries.iter().map(|e| e.storage_key.clone()).collect();
                 let merkle_proofs = ctx
                     .storage
-                    .generate_merkle_proofs(&storage_keys, state_version);
+                    .generate_merkle_proofs(&storage_keys, block_height.0);
 
                 assert_eq!(
                     entries.len(),
@@ -494,7 +492,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                         source_shard,
                         block_height,
                         block_timestamp,
-                        state_version,
                         entries: Arc::clone(&entries),
                         merkle_proofs: Arc::clone(&merkle_proofs),
                     };

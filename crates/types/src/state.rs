@@ -309,14 +309,11 @@ pub struct StateProvision {
     /// Source shard (the shard providing the state).
     pub source_shard: ShardGroupId,
 
-    /// Block height when this provision was created.
+    /// Block height when this provision was created (= JMT version for merkle proofs).
     pub block_height: BlockHeight,
 
     /// Unix timestamp (milliseconds) of the block that triggered this provision.
     pub block_timestamp: u64,
-
-    /// JMT version for the merkle proofs.
-    pub state_version: u64,
 
     /// The state entries with pre-computed storage keys.
     /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
@@ -335,7 +332,6 @@ impl PartialEq for StateProvision {
             && self.source_shard == other.source_shard
             && self.block_height == other.block_height
             && self.block_timestamp == other.block_timestamp
-            && self.state_version == other.state_version
             && *self.entries == *other.entries
             && *self.merkle_proofs == *other.merkle_proofs
     }
@@ -352,13 +348,12 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(8)?;
+        encoder.write_size(7)?;
         encoder.encode(&self.transaction_hash)?;
         encoder.encode(&self.target_shard)?;
         encoder.encode(&self.source_shard)?;
         encoder.encode(&self.block_height)?;
         encoder.encode(&self.block_timestamp)?;
-        encoder.encode(&self.state_version)?;
         encoder.encode(self.entries.as_ref())?;
         encoder.encode(self.merkle_proofs.as_ref())?;
         Ok(())
@@ -375,9 +370,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 8 {
+        if length != 7 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 8,
+                expected: 7,
                 actual: length,
             });
         }
@@ -387,7 +382,6 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let source_shard: ShardGroupId = decoder.decode()?;
         let block_height: BlockHeight = decoder.decode()?;
         let block_timestamp: u64 = decoder.decode()?;
-        let state_version: u64 = decoder.decode()?;
         let entries: Vec<StateEntry> = decoder.decode()?;
         let merkle_proofs: Vec<crate::SubstateInclusionProof> = decoder.decode()?;
 
@@ -397,7 +391,6 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             source_shard,
             block_height,
             block_timestamp,
-            state_version,
             entries: Arc::new(entries),
             merkle_proofs: Arc::new(merkle_proofs),
         })

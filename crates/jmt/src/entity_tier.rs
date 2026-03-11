@@ -4,6 +4,7 @@ use super::partition_tier::*;
 use super::tier_framework::*;
 use super::tree_store::*;
 use super::types::*;
+use hyperscale_dispatch::Dispatch;
 use hyperscale_types::Hash;
 use radix_substate_store_interface::interface::DatabaseUpdates;
 use std::rc::Rc;
@@ -86,49 +87,45 @@ impl<'s, S: ReadableTreeStore> ReadableTier for EntityTier<'s, S> {
     }
 }
 
-impl<'s, S: WriteableTreeStore> WriteableTier for EntityTier<'s, S> {
-    fn insert_local_node(&self, local_key: &TreeNodeKey, node: Self::StoredNode) {
-        self.base_store
-            .insert_node(self.stored_node_key(local_key), node);
-    }
-
-    fn record_stale_local_node(&self, local_key: &TreeNodeKey) {
-        self.base_store
-            .record_stale_tree_part(StaleTreePart::Node(self.stored_node_key(local_key)))
-    }
-
-    fn set_root_version(&mut self, new_version: Option<Version>) {
-        self.root_version = new_version;
-    }
-}
-
-impl<'s, S: ReadableTreeStore + WriteableTreeStore> EntityTier<'s, S> {
-    pub fn put_next_version_entity_updates(&mut self, updates: &DatabaseUpdates) -> Option<Hash> {
-        self.put_entity_updates(self.root_version.unwrap_or(0) + 1, updates)
-    }
-
-    pub fn put_entity_updates(
+impl<'s, S: ReadableTreeStore + Sync> EntityTier<'s, S> {
+    pub fn put_entity_updates<D: Dispatch>(
         &mut self,
         next_version: Version,
         updates: &DatabaseUpdates,
-    ) -> Option<Hash> {
-        let leaf_updates =
-            updates
-                .node_updates
-                .iter()
-                .map(|(entity_key, entity_database_updates)| {
-                    let new_entity_root_hash = self
-                        .get_entity_partition_tier(entity_key.clone())
-                        .apply_entity_updates(next_version, entity_database_updates);
-                    let new_leaf = new_entity_root_hash.map(|new_entity_root_hash| {
-                        let new_leaf_hash = new_entity_root_hash;
-                        let new_leaf_payload = next_version;
-                        (new_leaf_hash, new_leaf_payload)
-                    });
-                    (entity_key, new_leaf)
-                });
-        let update_batch = self.generate_tier_update_batch(next_version, leaf_updates);
-        self.apply_tier_update_batch(&update_batch);
-        update_batch.new_root_hash
+        dispatch: &D,
+    ) -> (Option<Hash>, TierCollectedWrites) {
+        // Phase 1: parallel entity processing.
+        // Explicit reborrow of &mut self as &self — required because the Fn
+        // closure sent to map_local cannot capture &mut self.
+        let self_ref: &Self = &*self;
+        let entities: Vec<_> = updates.node_updates.iter().collect();
+        let results: Vec<_> = dispatch.map_local(&entities, |(entity_key, entity_db_updates)| {
+            let mut pt = self_ref.get_entity_partition_tier((*entity_key).clone());
+            let (root, collected) =
+                pt.apply_entity_updates(next_version, entity_db_updates, dispatch);
+            (*entity_key, root.map(|h| (h, next_version)), collected)
+        });
+
+        // Merge collected writes from all entities.
+        let mut collected = TierCollectedWrites::default();
+        let leaf_updates: Vec<_> = results
+            .into_iter()
+            .map(|(ek, root, writes)| {
+                collected.merge(writes);
+                (ek, root)
+            })
+            .collect();
+
+        // Phase 2: entity-tier JMT.
+        let update_batch = self.generate_tier_update_batch(
+            next_version,
+            leaf_updates.iter().map(|(k, v)| (*k, *v)),
+            dispatch,
+        );
+
+        // Phase 3: collect entity-tier writes (&mut self — shared borrow has been released).
+        collected.collect_from_tier_batch(&update_batch, |k| self.stored_node_key(k));
+        self.root_version = Some(update_batch.new_version);
+        (update_batch.new_root_hash, collected)
     }
 }

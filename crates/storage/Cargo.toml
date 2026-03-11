@@ -20,3 +20,4 @@ indexmap.workspace = true
 test-utils = []
 
 [dev-dependencies]
+hyperscale-dispatch-sync.workspace = true

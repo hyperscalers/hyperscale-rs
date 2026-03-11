@@ -9,7 +9,7 @@
 //! # JMT Integration
 //!
 //! Uses `TypedInMemoryTreeStore` for Jellyfish Merkle Tree tracking, providing
-//! `state_version()` and `state_root_hash()` for state commitment. This ensures
+//! `jmt_version()` and `state_root_hash()` for state commitment. This ensures
 //! simulation has identical JMT behavior to production.
 
 mod storage;

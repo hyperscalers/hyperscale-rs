@@ -79,6 +79,14 @@ impl Dispatch for SyncDispatch {
     {
         items.iter().map(f).collect()
     }
+
+    fn map_local<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
+    where
+        T: Sync,
+        R: Send,
+    {
+        items.iter().map(f).collect()
+    }
 }
 
 #[cfg(test)]

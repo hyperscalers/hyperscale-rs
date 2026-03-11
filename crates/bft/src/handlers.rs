@@ -263,9 +263,10 @@ pub fn verify_state_root<S: CommitStore>(
     expected_root: Hash,
     certificates: &[Arc<TransactionCertificate>],
     local_shard: ShardGroupId,
+    block_height: u64,
 ) -> StateRootResult<S::PreparedCommit> {
     let (computed_root, prepared) =
-        storage.prepare_block_commit(parent_state_root, certificates, local_shard);
+        storage.prepare_block_commit(parent_state_root, certificates, local_shard, block_height);
 
     let valid = computed_root == expected_root;
 
@@ -311,7 +312,6 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     timestamp: u64,
     is_fallback: bool,
     parent_state_root: Hash,
-    parent_state_version: u64,
     retry_transactions: Vec<Arc<RoutableTransaction>>,
     priority_transactions: Vec<Arc<RoutableTransaction>>,
     transactions: Vec<Arc<RoutableTransaction>>,
@@ -329,12 +329,11 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     // Can include certificates only if JMT is ready
     let include_certs = jmt_ready && !certificates.is_empty();
 
-    let (state_root, state_version, certs_to_include, prepared) = if include_certs {
+    let (state_root, certs_to_include, prepared) = if include_certs {
         // JMT ready - compute speculative root and get prepared commit handle
         let (root, prepared) =
-            storage.prepare_block_commit(parent_state_root, &certificates, local_shard);
-        let version = parent_state_version + certificates.len() as u64;
-        (root, version, certificates, Some(prepared))
+            storage.prepare_block_commit(parent_state_root, &certificates, local_shard, height.0);
+        (root, certificates, Some(prepared))
     } else {
         // Either no certificates, or JMT not ready - inherit parent state
         if !certificates.is_empty() {
@@ -347,7 +346,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
                 "JMT not ready - proposing without certificates"
             );
         }
-        (parent_state_root, parent_state_version, vec![], None)
+        (parent_state_root, vec![], None)
     };
 
     // Compute transaction root from all transaction sections
@@ -365,7 +364,6 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         round,
         is_fallback,
         state_root,
-        state_version,
         transaction_root,
         provision_targets,
     };

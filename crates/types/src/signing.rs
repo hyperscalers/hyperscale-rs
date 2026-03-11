@@ -351,7 +351,6 @@ mod tests {
             source_shard: ShardGroupId(1),
             block_height: BlockHeight(10),
             block_timestamp: 0,
-            state_version: 0,
             entries: Arc::new(vec![]),
             merkle_proofs: Arc::new(vec![]),
         }];

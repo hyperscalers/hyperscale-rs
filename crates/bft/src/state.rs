@@ -62,14 +62,13 @@ pub struct RecoveredState {
     /// Latest QC (certifies the highest certified block).
     pub latest_qc: Option<QuorumCertificate>,
 
-    /// Last committed JMT state (version, root_hash).
+    /// Last committed JMT root hash.
     ///
-    /// This is the actual JMT state from storage at startup. Used to ensure
-    /// block headers derive state_version from actual committed state, not
-    /// from the hardcoded genesis (0, Hash::ZERO).
+    /// Restored from storage at startup so proposals use the correct parent
+    /// state root instead of the default Hash::ZERO.
     ///
-    /// If not provided (None), defaults to (0, Hash::ZERO) for fresh start.
-    pub jmt_state: Option<(u64, Hash)>,
+    /// If not provided (None), defaults to Hash::ZERO for fresh start.
+    pub jmt_root: Option<Hash>,
 }
 
 /// Block header pending QC signature verification.
@@ -128,6 +127,8 @@ struct PendingStateRootVerification {
     /// Also used to pre-build the RocksDB WriteBatch during verification
     /// for efficient single-fsync commit later.
     certificates: Vec<std::sync::Arc<hyperscale_types::TransactionCertificate>>,
+    /// Block height (used as JMT version for certificate merging).
+    block_height: u64,
 }
 
 /// Tracks in-flight proposal for correlating `Event::ProposalBuilt` callback.
@@ -256,33 +257,10 @@ pub struct BftState {
     /// verifications can now proceed.
     pending_state_root_verifications: HashMap<Hash, PendingStateRootVerification>,
 
-    /// Last committed JMT state (version, root). Updated via StateCommitComplete.
+    /// Last committed JMT root hash. Updated via StateCommitComplete.
     ///
     /// Used to check if JMT is ready for state root verification.
-    /// NOT used for block header state_version (use `last_chain_committed_state_version`).
-    last_committed_jmt_state: (u64, Hash),
-
-    /// State version from the most recently COMMITTED block's header.
-    ///
-    /// Updated SYNCHRONOUSLY when blocks commit (in commit_block_and_buffered).
-    /// This tracks the state_version from the COMMITTED chain, which is what
-    /// verifiers can actually reach via JMT commits.
-    ///
-    /// CRITICAL: This must be used as the base for proposals, NOT the parent
-    /// block's state_version from the QC chain. The QC chain can grow speculatively
-    /// (blocks get certified but not committed during view changes), causing
-    /// state_version to increment without JMT advancing. Using committed state
-    /// ensures verifiers can always reach the required_base_version.
-    ///
-    /// Example of the bug this prevents:
-    /// - Block A (height 10) commits with 5 certs, state_version = 9
-    /// - Block B (height 11) gets QC with 40 certs, state_version = 49, but view changes
-    /// - Block C (height 12) extends B's QC with 10 certs, state_version = 59
-    /// - Verifier needs JMT at 49 to verify C, but JMT is at 9 (only A committed)
-    /// - DEADLOCK!
-    ///
-    /// Fix: Use committed state_version (9) as base, not parent's speculative version.
-    last_chain_committed_state_version: u64,
+    last_committed_jmt_root: Hash,
 
     /// Blocks with verified state roots (prevents re-verification).
     verified_state_roots: HashSet<Hash>,
@@ -424,10 +402,7 @@ impl BftState {
             pending_commitment_proof_verifications: HashMap::new(),
             state_root_verifications_in_flight: HashSet::new(),
             pending_state_root_verifications: HashMap::new(),
-            last_committed_jmt_state: recovered.jmt_state.unwrap_or((0, Hash::ZERO)),
-            // Chain-committed state starts at the JMT state (they're in sync at startup)
-            // This will be updated when blocks commit via 2-chain rule.
-            last_chain_committed_state_version: recovered.jmt_state.map(|(v, _)| v).unwrap_or(0),
+            last_committed_jmt_root: recovered.jmt_root.unwrap_or(Hash::ZERO),
             verified_state_roots: HashSet::new(),
             verified_transaction_roots: HashSet::new(),
             transaction_root_verifications_in_flight: HashSet::new(),
@@ -478,21 +453,6 @@ impl BftState {
         recipients
     }
 
-    /// Get the chain-committed state version.
-    ///
-    /// This returns the state_version from the most recently COMMITTED block.
-    /// Updated synchronously when blocks commit (in commit_block_and_buffered).
-    ///
-    /// CRITICAL: This must be used as the base for proposals with certificates.
-    /// Using the parent block's state_version from the QC chain would cause
-    /// deadlocks because the QC chain can grow speculatively during view changes
-    /// while JMT only advances when blocks actually commit.
-    ///
-    /// NodeStateMachine must use this same value when computing state_root.
-    pub fn get_chain_committed_state_version(&self) -> u64 {
-        self.last_chain_committed_state_version
-    }
-
     /// Get the local JMT state (version, root).
     ///
     /// This returns the actual JMT state from local async certificate commits.
@@ -501,14 +461,13 @@ impl BftState {
     /// Used by:
     /// - Verifiers to check if JMT is ready for state root verification
     /// - Fallback/sync blocks to get current root when no certs
-    fn get_local_jmt_state(&self) -> (u64, Hash) {
-        self.last_committed_jmt_state
+    fn get_local_jmt_root(&self) -> Hash {
+        self.last_committed_jmt_root
     }
 
     /// Get a block by its hash.
     ///
     /// Looks up the block in certified_blocks, pending_blocks, or genesis.
-    /// Used to walk the QC chain when computing state_version for proposals.
     fn get_block_by_hash(&self, block_hash: Hash) -> Option<Block> {
         if let Some(block) = self.certified_blocks.get(&block_hash) {
             return Some(block.clone());
@@ -791,19 +750,12 @@ impl BftState {
     ) -> Vec<Action> {
         let hash = genesis.hash();
 
-        // CRITICAL: Set chain-committed state version from genesis block header.
-        // The genesis block's state_version reflects the JMT state after genesis bootstrap
-        // (e.g., Radix Engine initialization). Without this, proposers would compute
-        // state_version starting from 0, while the JMT is actually at a higher version.
-        self.last_chain_committed_state_version = genesis.header.state_version;
-
         self.genesis_block = Some(genesis.clone());
         self.committed_hash = hash;
 
         info!(
             validator = ?topology.local_validator_id(),
             genesis_hash = ?hash,
-            genesis_state_version = self.last_chain_committed_state_version,
             "Initialized genesis block"
         );
 
@@ -1051,15 +1003,14 @@ impl BftState {
 
         // Get parent's state from its block header.
         // This is the base state that verifiers will use.
-        let (parent_state_root, parent_state_version) = self
+        let parent_state_root = self
             .get_block_by_hash(parent_hash)
-            .map(|b| (b.header.state_root, b.header.state_version))
+            .map(|b| b.header.state_root)
             .unwrap_or_else(|| {
                 // Parent not found - use local JMT state as fallback.
                 // This handles genesis case and edge cases where the parent block
                 // is missing from pending_blocks (e.g., after recovery or sync).
-                let (version, root) = self.get_local_jmt_state();
-                (root, version)
+                self.get_local_jmt_root()
             });
 
         // Build set of certificate hashes for stale deferral filtering
@@ -1130,7 +1081,6 @@ impl BftState {
                 timestamp,
                 is_fallback: false,
                 parent_state_root,
-                parent_state_version,
                 retry_transactions,
                 priority_transactions,
                 transactions: other_transactions,
@@ -1178,17 +1128,14 @@ impl BftState {
         let timestamp = parent_qc.weighted_timestamp_ms;
 
         // Fallback blocks have no certificates, so state doesn't change.
-        // We inherit state_root and state_version from the parent block's header.
-        let (parent_state_root, parent_state_version) = self
+        // We inherit state_root from the parent block's header.
+        let parent_state_root = self
             .get_block_by_hash(parent_hash)
-            .map(|b| (b.header.state_root, b.header.state_version))
+            .map(|b| b.header.state_root)
             .unwrap_or_else(|| {
                 // Genesis case - use local JMT state
-                let (version, root) = self.get_local_jmt_state();
-                (root, version)
+                self.get_local_jmt_root()
             });
-        let state_version = parent_state_version;
-        let state_root = parent_state_root;
 
         let header = BlockHeader {
             shard_group_id: topology.local_shard(),
@@ -1199,8 +1146,7 @@ impl BftState {
             timestamp,
             round,
             is_fallback: true,
-            state_root,
-            state_version,
+            state_root: parent_state_root,
             transaction_root: Hash::ZERO, // Fallback blocks have no transactions
             provision_targets: vec![],    // Empty - fallback blocks have no transactions
         };
@@ -1305,17 +1251,14 @@ impl BftState {
         let timestamp = self.now.as_millis() as u64;
 
         // Sync blocks have no certificates, so state doesn't change.
-        // We inherit state_root and state_version from the parent block's header.
-        let (parent_state_root, parent_state_version) = self
+        // We inherit state_root from the parent block's header.
+        let parent_state_root = self
             .get_block_by_hash(parent_hash)
-            .map(|b| (b.header.state_root, b.header.state_version))
+            .map(|b| b.header.state_root)
             .unwrap_or_else(|| {
                 // Genesis case - use local JMT state
-                let (version, root) = self.get_local_jmt_state();
-                (root, version)
+                self.get_local_jmt_root()
             });
-        let state_version = parent_state_version;
-        let state_root = parent_state_root;
 
         let header = BlockHeader {
             shard_group_id: topology.local_shard(),
@@ -1326,8 +1269,7 @@ impl BftState {
             timestamp,
             round,
             is_fallback: false, // Not a fallback - just empty due to sync
-            state_root,
-            state_version,
+            state_root: parent_state_root,
             transaction_root: Hash::ZERO, // Sync blocks have no transactions
             provision_targets: vec![],    // Empty - sync blocks have no transactions
         };
@@ -2286,24 +2228,17 @@ impl BftState {
     /// Initiate state root verification for a block.
     ///
     /// Collects state writes from the block's certificates for our local shard.
-    /// Uses the block header's state_version to derive the required base version, then
-    /// either verifies immediately (if JMT is ready) or queues for later.
+    /// Either verifies immediately (if JMT is ready) or queues for later.
     ///
     /// The verification computes: base_jmt_state + block.certificate_writes and compares
     /// against block.header.state_root.
     ///
-    /// The base version is derived from the block header, NOT our local committed state:
-    /// base_version = header.state_version - len(certificates)
-    ///
-    /// This ensures deterministic verification across validators, since all validators
-    /// see the same block header.
-    ///
-    /// If our JMT hasn't reached base_version yet, we queue the verification until
-    /// `StateCommitComplete` brings us there.
+    /// If our JMT hasn't reached the required base state yet, we queue the verification
+    /// until `StateCommitComplete` brings us there.
     fn initiate_state_root_verification(&mut self, block_hash: Hash, block: &Block) -> Vec<Action> {
         // Get the parent block's state_root. This is the base state that the proposer
         // used when computing the new state_root. We must verify from the same base.
-        let (_, current_root) = self.get_local_jmt_state();
+        let current_root = self.get_local_jmt_root();
         let parent_state_root = self
             .get_block_by_hash(block.header.parent_hash)
             .map(|parent| parent.header.state_root)
@@ -2330,6 +2265,7 @@ impl BftState {
                 parent_state_root,
                 expected_root: block.header.state_root,
                 certificates: block.certificates.clone(),
+                block_height: block.header.height.0,
             }]
         } else {
             // JMT not ready - queue for later
@@ -2348,6 +2284,7 @@ impl BftState {
                     required_root: parent_state_root,
                     expected_root: block.header.state_root,
                     certificates: block.certificates.clone(),
+                    block_height: block.header.height.0,
                 },
             );
 
@@ -3421,52 +3358,40 @@ impl BftState {
     /// Handle JMT state commit completion.
     ///
     /// Called when the runner has finished committing a block's state to the JMT.
-    /// This updates our tracked local JMT state (last_committed_jmt_state) and
+    /// This updates our tracked local JMT root (last_committed_jmt_root) and
     /// checks if any pending state root verifications can now proceed.
     ///
-    /// NOTE: This does NOT update last_chain_committed_state_version. That field
-    /// is updated synchronously when blocks commit (in commit_block_and_buffered)
-    /// to ensure all validators use the same base version for proposals. The JMT
-    /// state tracked here may lag behind the chain-committed version due to async
-    /// commit timing, which is fine - verifications are queued until JMT catches up.
-    ///
     /// # Arguments
-    /// * `state_version` - The JMT version after the commit
+    /// * `block_height` - The block height (= JMT version) after the commit
     /// * `state_root` - The JMT root hash after the commit
     ///
     /// # Returns
     /// Actions to verify any state roots that were waiting for this commit.
-    #[instrument(skip(self, _topology), fields(state_version, state_root = ?state_root))]
+    #[instrument(skip(self, _topology), fields(block_height, state_root = ?state_root))]
     pub fn on_state_commit_complete(
         &mut self,
         _topology: &TopologySnapshot,
-        state_version: u64,
+        block_height: u64,
         state_root: Hash,
     ) -> Vec<Action> {
-        let (current_version, _) = self.last_committed_jmt_state;
-
-        // Only advance version forward (avoid out-of-order updates)
-        if state_version <= current_version {
+        // Only advance forward (avoid out-of-order updates).
+        // Use strict `<` so that same-height updates are accepted: the BFT state
+        // machine advances `committed_height` in `commit_block_and_buffered`
+        // *before* the IO loop commits the JMT and sends `StateCommitComplete`.
+        // With `<=` the root update would be silently dropped.
+        if block_height < self.committed_height {
             return vec![];
         }
 
         debug!(
-            old_version = current_version,
-            new_version = state_version,
+            old_height = self.committed_height,
+            new_height = block_height,
             new_root = ?state_root,
             pending_verifications = self.pending_state_root_verifications.len(),
             "JMT state commit complete, checking for unblocked verifications"
         );
 
-        self.last_committed_jmt_state = (state_version, state_root);
-
-        // NOTE: We do NOT update last_chain_committed_state_version here.
-        // That field is updated synchronously in commit_block_and_buffered() when
-        // blocks commit. It tracks the CHAIN's committed state (from block headers),
-        // not the JMT's async commit state.
-        //
-        // This function only updates last_committed_jmt_state, which is used to
-        // check if JMT has caught up enough for verification to proceed.
+        self.last_committed_jmt_root = state_root;
 
         // Find all pending verifications where the JMT now has the required base root.
         // We compare roots, not versions, because that's what guarantees both proposer
@@ -3497,6 +3422,7 @@ impl BftState {
                     parent_state_root: pv.required_root,
                     expected_root: pv.expected_root,
                     certificates: pv.certificates,
+                    block_height: pv.block_height,
                 });
             }
         }
@@ -3587,9 +3513,7 @@ impl BftState {
     /// # State Root Parameter
     ///
     /// `state_root` is the computed JMT root after applying writes from the certificates.
-    /// If certificates is empty, this is ignored and parent state is inherited.
-    /// `state_version` is derived from chain history (parent.state_version + certificates.len())
-    /// to avoid race conditions with async JMT commits.
+    /// If certificates is empty, parent state is inherited.
     #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, commitment_proofs), fields(
         height = qc.height.0,
         block_hash = ?block_hash
@@ -3704,7 +3628,6 @@ impl BftState {
             // on_proposal_timer will check if we're the proposer, backpressure, etc.
             // State root is computed by NodeStateMachine and passed in.
             // If certificates is empty, on_proposal_timer will inherit parent state.
-            // State version is derived from chain history inside on_proposal_timer.
             actions.extend(self.on_proposal_timer(
                 topology,
                 ready_txs,
@@ -3932,17 +3855,6 @@ impl BftState {
             // Update committed state
             self.committed_height = height;
             self.committed_hash = current_hash;
-
-            // Update chain-committed state version from the committed block's header.
-            //
-            // CRITICAL: This must be updated SYNCHRONOUSLY when a block commits.
-            // This value is used as the base for proposals, ensuring verifiers can
-            // always reach the required_base_version (because it's based on actually
-            // committed blocks, not speculative QC chain).
-            //
-            // The StateCommitComplete event still updates last_committed_jmt_state
-            // separately, which is used to check if JMT has caught up for verification.
-            self.last_chain_committed_state_version = block.header.state_version;
 
             // Reset backoff tracking - new height means fresh round counting
             self.view_at_height_start = self.view;
@@ -4229,10 +4141,6 @@ impl BftState {
         // Update committed state
         self.committed_height = height;
         self.committed_hash = block_hash;
-
-        // Update chain-committed state version from the synced block's header.
-        // (Same reasoning as in commit_block_and_buffered)
-        self.last_chain_committed_state_version = block.header.state_version;
 
         // Reset backoff tracking - new height means fresh round counting
         self.view_at_height_start = self.view;
@@ -5488,7 +5396,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         }
@@ -5510,7 +5417,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -5606,7 +5512,6 @@ mod tests {
             round: 5,          // High round indicates view changes occurred
             is_fallback: true,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -5628,7 +5533,6 @@ mod tests {
             round: 5,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -5706,7 +5610,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -5790,7 +5693,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -5878,7 +5780,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -5953,7 +5854,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -6485,7 +6385,6 @@ mod tests {
             round: round_0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -6501,7 +6400,6 @@ mod tests {
             round: round_1,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -6546,7 +6444,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -6585,7 +6482,6 @@ mod tests {
                 round: 0,
                 is_fallback: false,
                 state_root: Hash::ZERO,
-                state_version: 0,
                 transaction_root: Hash::ZERO,
                 provision_targets: vec![],
             };
@@ -6883,7 +6779,6 @@ mod tests {
             round: original_round,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -6960,7 +6855,6 @@ mod tests {
             round: original_round,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -6996,7 +6890,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -7113,7 +7006,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 100_000,
         };
         state.latest_qc = Some(qc);
@@ -7172,7 +7064,6 @@ mod tests {
             round: 3, // Different round from our votes
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 100_000,
         };
 
@@ -7216,7 +7107,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 100_000,
         };
 
@@ -7330,7 +7220,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -7482,7 +7371,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 100_000,
         };
         state.maybe_unlock_for_qc(&topology, &qc_h1);
@@ -7580,7 +7468,6 @@ mod tests {
             round: 1,
             is_fallback: true,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -7596,7 +7483,6 @@ mod tests {
             round: 2,
             is_fallback: true,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -7612,7 +7498,6 @@ mod tests {
             round: 3,
             is_fallback: true,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -7629,7 +7514,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -7764,7 +7648,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 100_000,
         };
 
@@ -7807,7 +7690,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 100_000,
         };
 
@@ -7908,7 +7790,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -7943,7 +7824,6 @@ mod tests {
             round: 1,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -8345,7 +8225,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 1000,
         };
 
@@ -8399,7 +8278,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 1000,
         };
 
@@ -8481,7 +8359,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 1000,
         };
 
@@ -8557,7 +8434,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 1000,
         };
 
@@ -8613,7 +8489,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 5000,
         };
         state.latest_qc = Some(parent_qc.clone());
@@ -8653,7 +8528,6 @@ mod tests {
                 round: 0,
                 is_fallback: false,
                 state_root: Hash::ZERO,
-                state_version: 0,
                 transaction_root: Hash::ZERO,
                 provision_targets: vec![],
             },
@@ -8838,7 +8712,6 @@ mod tests {
         let shard = ShardGroupId(0);
         let height = 1u64;
         let round = 0u64;
-
         let message = hyperscale_types::block_vote_message(shard, height, round, &block_hash);
 
         // Simulate vote collection and aggregation (what vote_set.rs does)
@@ -8884,7 +8757,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 100_000,
         };
         state.latest_qc = Some(qc);
@@ -8969,7 +8841,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: old_timestamp,
         };
         state.latest_qc = Some(qc);
@@ -9171,7 +9042,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 1000,
         });
 
@@ -9209,7 +9079,6 @@ mod tests {
                 round: 0,
                 is_fallback: false,
                 state_root: Hash::ZERO,
-                state_version: 0,
                 transaction_root: Hash::ZERO,
                 provision_targets: vec![],
             },
@@ -9230,7 +9099,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 1000,
         };
 
@@ -9260,7 +9128,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 100_000,
         };
         state.latest_qc = Some(qc);
@@ -9302,7 +9169,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: parent_timestamp,
         };
         state.latest_qc = Some(qc);
@@ -9381,7 +9247,6 @@ mod tests {
             round: 0,
             signers: SignerBitfield::empty(),
             aggregated_signature: zero_bls_signature(),
-
             weighted_timestamp_ms: 100_000,
         };
         state.latest_qc = Some(qc);

@@ -56,7 +56,6 @@ mod tests {
                 block_height: 100,
                 view: 100,
                 connected_peers: 5,
-                state_version: 42,
                 state_root_hash: "0".repeat(64),
             }))),
             tx_submission_tx,

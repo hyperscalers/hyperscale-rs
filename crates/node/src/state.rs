@@ -64,15 +64,14 @@ pub struct NodeStateMachine {
     /// Livelock prevention state (cycle detection for cross-shard TXs).
     livelock: LivelockState,
 
-    /// Last committed JMT state (height, version, root).
+    /// Last committed JMT root hash.
     ///
     /// Updated when `StateCommitComplete` is received from the runner.
     /// Used by BftState (via StateCommitComplete) to track when JMT is ready
     /// for state root verification.
     ///
-    /// The version corresponds to the JMT version after applying all
-    /// certificates in the block at the given height.
-    last_committed_state: (u64, u64, Hash), // (height, version, root)
+    /// The JMT version always equals block height.
+    last_committed_jmt_root: Hash,
 
     /// Current time.
     now: Duration,
@@ -147,10 +146,9 @@ impl NodeStateMachine {
         let bft_signing_key =
             Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
 
-        // Initialize last_committed_state from recovered JMT state.
+        // Initialize last_committed_jmt_root from recovered JMT state.
         // This ensures we use actual persisted state, not genesis defaults.
-        let (jmt_version, jmt_root) = recovered.jmt_state.unwrap_or((0, Hash::ZERO));
-        let initial_height = recovered.committed_height;
+        let jmt_root = recovered.jmt_root.unwrap_or(Hash::ZERO);
 
         Self {
             node_index,
@@ -169,8 +167,8 @@ impl NodeStateMachine {
             provisions: ProvisionCoordinator::new(),
             livelock: LivelockState::new(),
             topology,
-            // Use recovered JMT state - critical for correct state root computation
-            last_committed_state: (initial_height, jmt_version, jmt_root),
+            // Use recovered JMT root - critical for correct state root computation
+            last_committed_jmt_root: jmt_root,
             now: Duration::ZERO,
         }
     }
@@ -222,9 +220,9 @@ impl NodeStateMachine {
         &self.provisions
     }
 
-    /// Get the last committed JMT state: (height, version, root_hash).
-    pub fn last_committed_state(&self) -> (u64, u64, Hash) {
-        self.last_committed_state
+    /// Get the last committed JMT root hash.
+    pub fn last_committed_jmt_root(&self) -> Hash {
+        self.last_committed_jmt_root
     }
 
     /// Initialize the node with a genesis block.
@@ -500,38 +498,29 @@ impl NodeStateMachine {
     }
 
     /// Handle JMT state commit completion — update tracked state and notify BFT.
-    fn on_state_commit_complete(
-        &mut self,
-        height: u64,
-        state_version: u64,
-        state_root: Hash,
-    ) -> Vec<Action> {
-        let (prev_height, prev_version, _) = self.last_committed_state;
+    fn on_state_commit_complete(&mut self, height: u64, state_root: Hash) -> Vec<Action> {
+        let prev_height = self.bft.committed_height();
 
-        // Update if this is a newer height OR if it's genesis bootstrap (height=0
-        // with a higher version than we started with). The genesis case handles
-        // when Radix Engine bootstrap populates the JMT at height 0 after state
-        // machine initialization.
-        let is_newer_height = height > prev_height;
-        let is_genesis_bootstrap = height == 0 && state_version > prev_version;
-
-        if is_newer_height || is_genesis_bootstrap {
-            self.last_committed_state = (height, state_version, state_root);
+        // Update if this is the current or a newer height. Use `>=` because
+        // the BFT state machine advances `committed_height` in
+        // `commit_block_and_buffered` *before* the IO loop commits the JMT
+        // and sends `StateCommitComplete`. With `>` the root update for the
+        // current height would be silently dropped.
+        if height >= prev_height {
+            self.last_committed_jmt_root = state_root;
 
             tracing::debug!(
                 height,
-                state_version,
                 state_root = ?state_root,
-                is_genesis_bootstrap,
                 "JMT state commit complete"
             );
         }
 
         // Notify BFT so it can update its committed state tracking.
-        // BFT uses this as the source of truth for state_version in block headers,
+        // BFT uses this as the source of truth for block height in block headers,
         // preventing speculative version propagation that causes deadlocks.
         self.bft
-            .on_state_commit_complete(self.topology.snapshot(), state_version, state_root)
+            .on_state_commit_complete(self.topology.snapshot(), height, state_root)
     }
 
     /// Handle block committed — notify all subsystems in the correct order.
@@ -602,7 +591,6 @@ impl NodeStateMachine {
             height,
             block.header.timestamp,
             block.header.proposer,
-            block.header.state_version,
             all_txs,
         );
 
@@ -849,11 +837,9 @@ impl StateMachine for NodeStateMachine {
             ),
 
             // ── State Commit ─────────────────────────────────────────────
-            ProtocolEvent::StateCommitComplete {
-                height,
-                state_version,
-                state_root,
-            } => self.on_state_commit_complete(height, state_version, state_root),
+            ProtocolEvent::StateCommitComplete { height, state_root } => {
+                self.on_state_commit_complete(height, state_root)
+            }
 
             // ── Block Committed ──────────────────────────────────────────
             ProtocolEvent::BlockCommitted {

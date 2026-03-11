@@ -26,25 +26,59 @@ mod conversions;
 mod tests;
 
 use entity_tier::EntityTier;
+use hyperscale_dispatch::Dispatch;
 use hyperscale_types::Hash;
+use tier_framework::TierCollectedWrites;
 use tree_store::*;
 use types::*;
 
-/// Inserts a new set of nodes at version `current_state_version` + 1 into the "3-Tier JMT"
-/// persisted within the given `TreeStore`.
+/// Computes new JMT nodes for the given database updates, returning the
+/// new root hash and all collected writes (nodes, stale parts, associations).
 ///
-/// Returns the hash of the newly-created root (i.e. representing state at version
-/// `current_state_version` + 1).
+/// The store only needs `ReadableTreeStore + Sync` — no writes are performed.
+/// The caller is responsible for applying the returned `TierCollectedWrites`.
 ///
-/// # Panics
-/// Panics if a root node for `current_state_version` does not exist. The caller should use `None`
-/// to denote an empty, initial state of the tree (i.e. inserting at version 1).
-pub fn put_at_next_version<S: TreeStore>(
+/// `parent_version` is the version of the existing root to read from
+/// (None for initial state). `new_version` is the version to write new
+/// nodes at (typically block height).
+pub fn put_at_version<S: ReadableTreeStore + Sync, D: Dispatch>(
     tree_store: &S,
-    current_state_version: Option<Version>,
+    parent_version: Option<Version>,
+    new_version: Version,
     database_updates: &radix_substate_store_interface::interface::DatabaseUpdates,
+    dispatch: &D,
+) -> (Hash, TierCollectedWrites) {
+    assert!(
+        parent_version.is_none_or(|pv| new_version > pv),
+        "put_at_version: new_version ({new_version}) must be greater than parent_version ({parent_version:?})"
+    );
+    let (root, collected) = EntityTier::new(tree_store, parent_version).put_entity_updates(
+        new_version,
+        database_updates,
+        dispatch,
+    );
+    (root.unwrap_or(Hash::ZERO), collected)
+}
+
+/// Compute and immediately apply JMT updates. Convenience for callers
+/// that own both read and write access to the same store (tests, direct commits).
+pub fn put_at_version_and_apply<S: ReadableTreeStore + WriteableTreeStore + Sync, D: Dispatch>(
+    tree_store: &S,
+    parent_version: Option<Version>,
+    new_version: Version,
+    database_updates: &radix_substate_store_interface::interface::DatabaseUpdates,
+    dispatch: &D,
 ) -> Hash {
-    EntityTier::new(tree_store, current_state_version)
-        .put_next_version_entity_updates(database_updates)
-        .unwrap_or(Hash::ZERO)
+    let (root, collected) = put_at_version(
+        tree_store,
+        parent_version,
+        new_version,
+        database_updates,
+        dispatch,
+    );
+    // Associations are for substate-tier leaf→value correlation used by inclusion
+    // proofs. This convenience path (tests, direct commits) doesn't need them;
+    // production callers use the two-phase put_at_version + collected.apply_to().
+    let _associations = collected.apply_to(tree_store);
+    root
 }

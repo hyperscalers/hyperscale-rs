@@ -344,7 +344,7 @@ pub fn serve_provision_request(
         }
     };
 
-    let block_state_version = block.header.state_version;
+    let jmt_version = block.header.height.0;
     let mut provisions = Vec::new();
 
     let all_txs = block
@@ -380,23 +380,19 @@ pub fn serve_provision_request(
             continue;
         }
 
-        let entries = match hyperscale_engine::fetch_state_entries(
-            storage,
-            &owned_nodes,
-            block_state_version,
-        ) {
-            Some(entries) => entries,
-            None => {
-                debug!(
-                    block_height = req.block_height.0,
-                    state_version = block_state_version,
-                    "Provision request: historical state version unavailable"
-                );
-                return GetProvisionsResponse { provisions: None };
-            }
-        };
+        let entries =
+            match hyperscale_engine::fetch_state_entries(storage, &owned_nodes, jmt_version) {
+                Some(entries) => entries,
+                None => {
+                    debug!(
+                        block_height = req.block_height.0,
+                        jmt_version, "Provision request: historical JMT version unavailable"
+                    );
+                    return GetProvisionsResponse { provisions: None };
+                }
+            };
         let storage_keys: Vec<Vec<u8>> = entries.iter().map(|e| e.storage_key.clone()).collect();
-        let merkle_proofs = storage.generate_merkle_proofs(&storage_keys, block_state_version);
+        let merkle_proofs = storage.generate_merkle_proofs(&storage_keys, jmt_version);
 
         provisions.push(StateProvision {
             transaction_hash: tx.hash(),
@@ -404,7 +400,6 @@ pub fn serve_provision_request(
             source_shard: local_shard,
             block_height: req.block_height,
             block_timestamp: block.header.timestamp,
-            state_version: block_state_version,
             entries: Arc::new(entries),
             merkle_proofs: Arc::new(merkle_proofs),
         });

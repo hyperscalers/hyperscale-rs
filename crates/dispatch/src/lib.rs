@@ -99,4 +99,18 @@ pub trait Dispatch: Send + Sync + Clone {
     where
         T: Sync,
         R: Send;
+
+    /// Map a function over items in parallel on the current pool.
+    ///
+    /// Unlike `map_execution`/`map_crypto` which hop to a specific pool,
+    /// this stays on whatever rayon pool the caller is already running on.
+    /// Used for nested parallelism within already-dispatched work.
+    ///
+    /// **Contract**: Must be called from within a rayon pool context
+    /// (i.e., inside a `spawn_*` closure). If called from the main thread,
+    /// falls to the global rayon pool in production.
+    fn map_local<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
+    where
+        T: Sync,
+        R: Send;
 }

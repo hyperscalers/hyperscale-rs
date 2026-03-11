@@ -96,9 +96,6 @@ pub struct BlockHeader {
     /// JMT state root hash after applying all certificates in this block.
     pub state_root: Hash,
 
-    /// JMT version corresponding to state_root. Increments by 1 per certificate with state writes.
-    pub state_version: u64,
-
     /// Merkle root of all transactions in this block.
     ///
     /// Computed over tagged transaction hashes from all three sections in order:
@@ -129,12 +126,7 @@ pub struct BlockHeader {
 
 impl BlockHeader {
     /// Create a genesis block header (height 0) with the given proposer and JMT state.
-    pub fn genesis(
-        shard_group_id: ShardGroupId,
-        proposer: ValidatorId,
-        state_root: Hash,
-        state_version: u64,
-    ) -> Self {
+    pub fn genesis(shard_group_id: ShardGroupId, proposer: ValidatorId, state_root: Hash) -> Self {
         Self {
             shard_group_id,
             height: BlockHeight(0),
@@ -145,7 +137,6 @@ impl BlockHeader {
             round: 0,
             is_fallback: false,
             state_root,
-            state_version,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         }
@@ -433,14 +424,9 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for Block {
 
 impl Block {
     /// Create an empty genesis block with the given proposer and JMT state.
-    pub fn genesis(
-        shard_group_id: ShardGroupId,
-        proposer: ValidatorId,
-        state_root: Hash,
-        state_version: u64,
-    ) -> Self {
+    pub fn genesis(shard_group_id: ShardGroupId, proposer: ValidatorId, state_root: Hash) -> Self {
         Self {
-            header: BlockHeader::genesis(shard_group_id, proposer, state_root, state_version),
+            header: BlockHeader::genesis(shard_group_id, proposer, state_root),
             retry_transactions: vec![],
             priority_transactions: vec![],
             transactions: vec![],
@@ -765,7 +751,6 @@ mod tests {
             round: 0,
             is_fallback: false,
             state_root: Hash::ZERO,
-            state_version: 0,
             transaction_root: Hash::ZERO,
             provision_targets: vec![],
         };
@@ -777,7 +762,7 @@ mod tests {
 
     #[test]
     fn test_genesis_block() {
-        let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO, 0);
+        let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
 
         assert!(genesis.is_genesis());
         assert_eq!(genesis.height(), BlockHeight(0));
