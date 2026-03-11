@@ -6,7 +6,7 @@ use super::tree_store::*;
 use super::types::*;
 use std::collections::HashMap;
 
-impl TreeInternalNode {
+impl From<&InternalNode> for TreeInternalNode {
     fn from(internal_node: &InternalNode) -> Self {
         let children = internal_node
             .children_sorted()
@@ -22,7 +22,7 @@ impl TreeInternalNode {
 }
 
 impl TreeLeafNode {
-    fn from(key: &TreeNodeKey, leaf_node: &LeafNode<Version>) -> Self {
+    fn from_jmt(key: &TreeNodeKey, leaf_node: &LeafNode<Version>) -> Self {
         TreeLeafNode {
             key_suffix: NibblePath::from_iter(
                 NibblePath::new_even(leaf_node.leaf_key().bytes.clone())
@@ -35,7 +35,7 @@ impl TreeLeafNode {
     }
 }
 
-impl InternalNode {
+impl From<&TreeInternalNode> for InternalNode {
     fn from(internal_node: &TreeInternalNode) -> Self {
         let child_map: HashMap<Nibble, Child> = internal_node
             .children
@@ -66,25 +66,23 @@ impl StoredNode for TreeNode {
 
     fn into_jmt_node(&self, key: &TreeNodeKey) -> Node<Version> {
         match self {
-            TreeNode::Internal(internal_node) => Node::Internal(InternalNode::from(internal_node)),
-            TreeNode::Leaf(leaf_node) => Node::Leaf(LeafNode::from(key, leaf_node)),
+            TreeNode::Internal(internal_node) => Node::Internal(internal_node.into()),
+            TreeNode::Leaf(leaf_node) => Node::Leaf(LeafNode::from_stored(key, leaf_node)),
             TreeNode::Null => Node::Null,
         }
     }
 
     fn from_jmt_node(node: &Node<Self::Payload>, key: &TreeNodeKey) -> Self {
         match node {
-            Node::Internal(internal_node) => {
-                TreeNode::Internal(TreeInternalNode::from(internal_node))
-            }
-            Node::Leaf(leaf_node) => TreeNode::Leaf(TreeLeafNode::from(key, leaf_node)),
+            Node::Internal(internal_node) => TreeNode::Internal(internal_node.into()),
+            Node::Leaf(leaf_node) => TreeNode::Leaf(TreeLeafNode::from_jmt(key, leaf_node)),
             Node::Null => TreeNode::Null,
         }
     }
 }
 
 impl LeafNode<Version> {
-    pub fn from(key: &TreeNodeKey, leaf_node: &TreeLeafNode) -> Self {
+    pub fn from_stored(key: &TreeNodeKey, leaf_node: &TreeLeafNode) -> Self {
         let full_key = NibblePath::from_iter(
             key.nibble_path()
                 .nibbles()
