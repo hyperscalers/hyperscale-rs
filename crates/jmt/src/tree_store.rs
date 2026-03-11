@@ -71,8 +71,9 @@ pub struct TreeChildEntry {
     pub version: u64,
     /// Cached child hash (i.e. needed only for performance).
     pub hash: Hash,
-    /// Cached child type indicator (i.e. needed only for performance).
-    pub is_leaf: bool,
+    /// Number of leaves under this child. A value of 1 with a leaf node type
+    /// indicates a direct leaf child; higher values indicate an internal subtree.
+    pub leaf_count: usize,
 }
 
 /// Leaf node.

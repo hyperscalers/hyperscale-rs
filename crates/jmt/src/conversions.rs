@@ -14,7 +14,7 @@ impl TreeInternalNode {
                 nibble: *nibble,
                 version: child.version,
                 hash: child.hash,
-                is_leaf: child.is_leaf(),
+                leaf_count: child.leaf_count(),
             })
             .collect::<Vec<TreeChildEntry>>();
         TreeInternalNode { children }
@@ -41,18 +41,19 @@ impl InternalNode {
             .children
             .iter()
             .map(|child_entry| {
-                let child: Child = Child::new(
-                    child_entry.hash,
-                    child_entry.version,
-                    if child_entry.is_leaf {
-                        NodeType::Leaf
-                    } else {
-                        // Note: the `0` passed here may be replaced with an actual value (which we
-                        // would have to persist) once we have use-cases for quick look-ups of leaf
-                        // counts.
-                        NodeType::Internal { leaf_count: 0 }
-                    },
-                );
+                let node_type = if child_entry.leaf_count == 1 {
+                    // A leaf_count of 1 could be either a direct leaf child or an
+                    // internal node with exactly one descendant leaf. We can't
+                    // distinguish from metadata alone, but since the JMT always
+                    // collapses single-leaf subtrees into leaf nodes, a count of 1
+                    // reliably indicates a leaf.
+                    NodeType::Leaf
+                } else {
+                    NodeType::Internal {
+                        leaf_count: child_entry.leaf_count,
+                    }
+                };
+                let child = Child::new(child_entry.hash, child_entry.version, node_type);
                 (child_entry.nibble, child)
             })
             .collect();
