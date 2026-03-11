@@ -182,7 +182,11 @@ impl SparseMerkleLeafNode {
     }
 
     pub fn hash(&self) -> Hash {
-        Hash::from_parts(&[self.key.bytes.as_slice(), self.value_hash.as_bytes()])
+        Hash::from_parts(&[
+            LEAF_HASH_DOMAIN,
+            self.key.bytes.as_slice(),
+            self.value_hash.as_bytes(),
+        ])
     }
 }
 
@@ -200,9 +204,19 @@ impl SparseMerkleInternalNode {
     }
 
     fn hash(&self) -> Hash {
-        Hash::from_parts(&[self.left_child.as_bytes(), self.right_child.as_bytes()])
+        Hash::from_parts(&[
+            INTERNAL_HASH_DOMAIN,
+            self.left_child.as_bytes(),
+            self.right_child.as_bytes(),
+        ])
     }
 }
+
+// Domain separation tags for JMT node hashing. These prevent second-preimage
+// attacks where a leaf hash could be reinterpreted as an internal node hash
+// or vice versa.
+pub const LEAF_HASH_DOMAIN: &[u8] = &[0x00];
+pub const INTERNAL_HASH_DOMAIN: &[u8] = &[0x01];
 
 // INITIAL-MODIFICATION: we propagate usage of our own `Hash` (instead of Aptos' `HashValue`) to avoid
 // sourcing the entire https://github.com/aptos-labs/aptos-core/blob/1.0.4/crates/aptos-crypto/src/hash.rs
@@ -1091,7 +1105,11 @@ impl<P: Clone> LeafNode<P> {
     /// changes within a sparse merkle tree (consider 2 trees, both containing a single element with
     /// the same value, but stored under different keys - we want their root hashes to differ).
     pub fn leaf_hash(&self) -> Hash {
-        Hash::from_parts(&[self.leaf_key.bytes.as_slice(), self.value_hash.as_bytes()])
+        Hash::from_parts(&[
+            LEAF_HASH_DOMAIN,
+            self.leaf_key.bytes.as_slice(),
+            self.value_hash.as_bytes(),
+        ])
     }
 }
 

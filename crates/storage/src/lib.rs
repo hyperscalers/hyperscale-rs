@@ -70,7 +70,8 @@ pub mod jmt {
 
     // Re-export types needed for proof generation and verification
     pub use hyperscale_jmt::types::{
-        IteratedLeafKey, LeafKey, SparseMerkleLeafNode, SparseMerkleProof,
+        IteratedLeafKey, LeafKey, SparseMerkleLeafNode, SparseMerkleProof, INTERNAL_HASH_DOMAIN,
+        LEAF_HASH_DOMAIN,
     };
 
     // Re-export tier types for proof generation and historical reads

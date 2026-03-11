@@ -5,7 +5,7 @@
 
 use crate::jmt::{
     EntityTier, IteratedLeafKey, LeafKey, PartitionTier, ReadableTier, ReadableTreeStore,
-    SparseMerkleProof, SubstateTier,
+    SparseMerkleProof, SubstateTier, INTERNAL_HASH_DOMAIN, LEAF_HASH_DOMAIN,
 };
 use crate::keys::decompose_storage_key;
 use hyperscale_types::{Hash, MerkleInclusionProof, SubstateInclusionProof};
@@ -114,8 +114,9 @@ fn verify_single_tier(
         return None;
     }
 
-    // Compute leaf hash: blake3(leaf_key || leaf_value_hash)
-    let mut current_hash = Hash::from_parts(&[leaf_key, leaf_value_hash.as_bytes()]);
+    // Compute leaf hash: blake3(LEAF_DOMAIN || leaf_key || leaf_value_hash)
+    let mut current_hash =
+        Hash::from_parts(&[LEAF_HASH_DOMAIN, leaf_key, leaf_value_hash.as_bytes()]);
 
     // Walk up the tree using sibling hashes
     // The key bits (from MSB) determine left/right placement
@@ -136,9 +137,17 @@ fn verify_single_tier(
         let is_right = bit_iter.next_back().unwrap_or(false);
 
         current_hash = if is_right {
-            Hash::from_parts(&[sibling.as_bytes(), current_hash.as_bytes()])
+            Hash::from_parts(&[
+                INTERNAL_HASH_DOMAIN,
+                sibling.as_bytes(),
+                current_hash.as_bytes(),
+            ])
         } else {
-            Hash::from_parts(&[current_hash.as_bytes(), sibling.as_bytes()])
+            Hash::from_parts(&[
+                INTERNAL_HASH_DOMAIN,
+                current_hash.as_bytes(),
+                sibling.as_bytes(),
+            ])
         };
     }
 
