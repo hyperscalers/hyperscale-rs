@@ -22,6 +22,9 @@ pub mod types;
 
 mod conversions;
 
+#[cfg(test)]
+mod tests;
+
 use entity_tier::EntityTier;
 use hyperscale_types::Hash;
 use tree_store::*;

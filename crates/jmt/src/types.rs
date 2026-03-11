@@ -203,7 +203,7 @@ impl SparseMerkleInternalNode {
         }
     }
 
-    fn hash(&self) -> Hash {
+    pub fn hash(&self) -> Hash {
         Hash::from_parts(&[
             INTERNAL_HASH_DOMAIN,
             self.left_child.as_bytes(),
