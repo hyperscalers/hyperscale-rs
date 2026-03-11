@@ -342,7 +342,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
 
             // Check merkle proofs per provision against the verified header's state root.
             let merkle_start = std::time::Instant::now();
-            let valid_flags: Vec<bool> = ctx.dispatch.map_crypto(&provisions, |provision| {
+            let valid_flags: Vec<bool> = ctx.dispatch.map_local(&provisions, |provision| {
                 verified_header.as_ref().is_some_and(|header| {
                     hyperscale_storage::proofs::verify_all_merkle_proofs(
                         &provision.entries,
@@ -385,7 +385,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             transactions,
             state_root: _,
         } => {
-            let votes: Vec<ExecutionVote> = ctx.dispatch.map_execution(&transactions, |tx| {
+            let votes: Vec<ExecutionVote> = ctx.dispatch.map_local(&transactions, |tx| {
                 hyperscale_execution::handlers::execute_and_sign_single_shard(
                     ctx.executor,
                     ctx.storage,
@@ -408,7 +408,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             block_hash,
             transactions,
         } => {
-            let votes: Vec<ExecutionVote> = ctx.dispatch.map_execution(&transactions, |tx| {
+            let votes: Vec<ExecutionVote> = ctx.dispatch.map_local(&transactions, |tx| {
                 hyperscale_execution::handlers::execute_and_sign_single_shard(
                     ctx.executor,
                     ctx.storage,

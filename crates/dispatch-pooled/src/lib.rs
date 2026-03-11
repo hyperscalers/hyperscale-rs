@@ -501,39 +501,6 @@ impl Dispatch for PooledDispatch {
         self.execution_pending.load(Ordering::Relaxed)
     }
 
-    fn map_execution<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
-    where
-        T: Sync,
-        R: Send,
-    {
-        self.execution_pool.install(|| {
-            use rayon::prelude::*;
-            items.par_iter().map(f).collect()
-        })
-    }
-
-    fn map_crypto<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
-    where
-        T: Sync,
-        R: Send,
-    {
-        self.crypto_pool.install(|| {
-            use rayon::prelude::*;
-            items.par_iter().map(f).collect()
-        })
-    }
-
-    fn map_tx_validation<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
-    where
-        T: Sync,
-        R: Send,
-    {
-        self.tx_validation_pool.install(|| {
-            use rayon::prelude::*;
-            items.par_iter().map(f).collect()
-        })
-    }
-
     fn map_local<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
     where
         T: Sync,

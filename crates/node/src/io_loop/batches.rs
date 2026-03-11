@@ -47,7 +47,7 @@ where
             // Validate in parallel across all tx_validation pool threads,
             // then send results sequentially to preserve ordering.
             let results: Vec<bool> =
-                dispatch.map_tx_validation(&batch, |tx| validator.validate_transaction(tx).is_ok());
+                dispatch.map_local(&batch, |tx| validator.validate_transaction(tx).is_ok());
 
             for (tx, valid) in batch.into_iter().zip(results) {
                 if valid {
@@ -78,7 +78,7 @@ where
 
         self.dispatch.spawn_execution(move || {
             let start = std::time::Instant::now();
-            let votes: Vec<_> = dispatch.map_execution(&requests, |req| {
+            let votes: Vec<_> = dispatch.map_local(&requests, |req| {
                 hyperscale_execution::handlers::execute_and_sign_cross_shard(
                     &executor,
                     &*storage,

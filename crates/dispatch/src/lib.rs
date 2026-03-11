@@ -69,42 +69,10 @@ pub trait Dispatch: Send + Sync + Clone {
     /// Current execution pool queue depth.
     fn execution_queue_depth(&self) -> usize;
 
-    /// Map a function over items on the execution pool, potentially in parallel.
-    ///
-    /// `PooledDispatch` uses `rayon::par_iter` for parallelism.
-    /// `SyncDispatch` uses sequential iteration (deterministic).
-    ///
-    /// This is a **blocking** call — it returns when all items are processed.
-    /// In production, call this from within a `spawn_execution` closure (already
-    /// off the event loop). In simulation, call inline.
-    fn map_execution<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
-    where
-        T: Sync,
-        R: Send;
-
-    /// Map a function over items on the crypto pool, potentially in parallel.
-    ///
-    /// Same semantics as `map_execution` but runs on the crypto pool.
-    /// Used for parallelizing pre-processing steps in batch crypto verification.
-    fn map_crypto<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
-    where
-        T: Sync,
-        R: Send;
-
-    /// Map a function over items on the tx validation pool, potentially in parallel.
-    ///
-    /// Same semantics as `map_execution` but runs on the tx validation pool.
-    /// Used for parallelizing batch transaction signature verification.
-    fn map_tx_validation<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
-    where
-        T: Sync,
-        R: Send;
-
     /// Map a function over items in parallel on the current pool.
     ///
-    /// Unlike `map_execution`/`map_crypto` which hop to a specific pool,
-    /// this stays on whatever rayon pool the caller is already running on.
-    /// Used for nested parallelism within already-dispatched work.
+    /// Uses `rayon::par_iter` in production, sequential iteration in simulation.
+    /// This is a **blocking** call — it returns when all items are processed.
     ///
     /// **Contract**: Must be called from within a rayon pool context
     /// (i.e., inside a `spawn_*` closure). If called from the main thread,
