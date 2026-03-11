@@ -5,8 +5,9 @@ use hyperscale_types::Hash;
 use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 
-// INITIAL-MODIFICATION: the original used a known key size (32) as a limit
-const SANITY_NIBBLE_LIMIT: usize = 1000;
+// Safety limit on tree depth. Entity keys are 50 bytes (100 nibbles), sort keys
+// are typically <100 bytes. 256 nibbles (128-byte keys) provides ample headroom.
+const SANITY_NIBBLE_LIMIT: usize = 256;
 
 // SOURCE: https://github.com/aptos-labs/aptos-core/blob/1.0.4/storage/jellyfish-merkle/src/lib.rs#L329
 /// The Jellyfish Merkle tree data structure. See [`crate`] for description.
