@@ -15,7 +15,7 @@ thiserror.workspace = true
 tracing.workspace = true
 indexmap.workspace = true
 
-# Radix dependencies (from vendor submodule)
+# Radix dependencies
 radix-common.workspace = true
 radix-engine.workspace = true
 radix-engine-interface.workspace = true
