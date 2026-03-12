@@ -59,8 +59,11 @@
 pub mod handlers;
 
 mod config;
+mod fetch;
 mod pending;
 mod state;
+mod sync;
+mod verification;
 mod vote_set;
 
 pub use config::BftConfig;

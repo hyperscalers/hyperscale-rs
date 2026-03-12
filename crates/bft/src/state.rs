@@ -34,13 +34,16 @@ use hyperscale_types::{
     QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot,
     TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, instrument, trace, warn};
 
 use crate::config::BftConfig;
+use crate::fetch::FetchCoordinator;
 use crate::pending::PendingBlock;
+use crate::sync::{SyncManager, SyncVerificationResult};
+use crate::verification::{VerificationPipeline, VerificationProgress};
 use crate::vote_set::VoteSet;
 
 /// State recovered from storage on startup.
@@ -69,66 +72,6 @@ pub struct RecoveredState {
     ///
     /// If not provided (None), defaults to Hash::ZERO for fresh start.
     pub jmt_root: Option<Hash>,
-}
-
-/// Block header pending QC signature verification.
-///
-/// When we receive a block header with a non-genesis parent_qc, we need to
-/// verify the QC's aggregated BLS signature before voting. This struct
-/// tracks the block header while waiting for verification.
-#[derive(Debug, Clone)]
-struct PendingQcVerification {
-    /// The block header we're considering voting on.
-    header: BlockHeader,
-}
-
-/// Synced block pending QC signature verification.
-///
-/// When we receive a synced block, we must verify its QC signature before
-/// applying it to our state.
-#[derive(Debug, Clone)]
-struct PendingSyncedBlockVerification {
-    /// The synced block awaiting QC verification.
-    block: Block,
-    /// The QC that certifies this block.
-    qc: QuorumCertificate,
-    /// Whether the QC signature has been verified.
-    verified: bool,
-}
-
-/// Tracks pending CommitmentProof verifications for a block.
-///
-/// When a block contains deferrals with CommitmentProofs, we need to verify each
-/// proof's BLS signature before voting on the block. This struct tracks the
-/// verification progress for a single block.
-#[derive(Debug, Clone)]
-struct PendingCommitmentProofVerifications {
-    /// Total number of deferrals needing verification.
-    total: usize,
-    /// Number of deferrals verified so far.
-    verified: usize,
-    /// Whether all verified proofs are valid so far.
-    all_valid: bool,
-}
-
-/// Pending state root verification waiting for JMT to be ready.
-///
-/// When a block arrives but its parent block's state hasn't been committed to
-/// the JMT yet, we queue the verification here. Once StateCommitComplete arrives
-/// with a root matching required_root, we can proceed with verification.
-#[derive(Debug, Clone)]
-struct PendingStateRootVerification {
-    /// The state root of the parent block. Verification waits until local JMT
-    /// reaches this root, ensuring proposer and verifier compute from same base.
-    required_root: Hash,
-    /// The state root claimed by the proposer (to verify against).
-    expected_root: Hash,
-    /// The certificates to commit. State writes are extracted from these.
-    /// Also used to pre-build the RocksDB WriteBatch during verification
-    /// for efficient single-fsync commit later.
-    certificates: Vec<std::sync::Arc<hyperscale_types::TransactionCertificate>>,
-    /// Block height (used as JMT version for certificate merging).
-    block_height: u64,
 }
 
 /// Tracks in-flight proposal for correlating `Event::ProposalBuilt` callback.
@@ -194,10 +137,8 @@ pub struct BftState {
     /// Pending blocks being assembled (hash -> pending block).
     pending_blocks: HashMap<Hash, PendingBlock>,
 
-    /// Tracks when each pending block was created (hash -> creation time).
-    /// Used for fetch timeout tracking - we delay fetching missing data to allow
-    /// gossip and local certificate creation time to fill in missing data first.
-    pending_block_created_at: HashMap<Hash, Duration>,
+    /// Fetch timeout tracking for pending blocks.
+    fetch: FetchCoordinator,
 
     /// Vote sets for blocks (hash -> vote set).
     vote_sets: HashMap<Hash, VoteSet>,
@@ -229,65 +170,11 @@ pub struct BftState {
     /// Maps block_hash -> Block.
     certified_blocks: HashMap<Hash, Block>,
 
-    /// Block headers pending QC signature verification.
-    /// Maps block_hash -> pending verification info.
-    /// When we receive a block header with non-genesis parent_qc, we must verify
-    /// the QC's aggregated BLS signature before voting on the block.
-    pending_qc_verifications: HashMap<Hash, PendingQcVerification>,
+    /// Async verification tracking (QC signatures, commitment proofs, state/tx roots).
+    verification: VerificationPipeline,
 
-    /// Synced blocks pending QC signature verification.
-    /// Maps block_hash -> pending synced block info.
-    /// When we receive a synced block, we must verify its QC's signature before applying.
-    pending_synced_block_verifications: HashMap<Hash, PendingSyncedBlockVerification>,
-
-    /// Blocks waiting for CommitmentProof verification before voting.
-    /// Maps block_hash -> pending verification state.
-    /// When a block contains deferrals with CommitmentProofs, we must verify each proof's
-    /// BLS signature before voting. This tracks the verification progress.
-    pending_commitment_proof_verifications: HashMap<Hash, PendingCommitmentProofVerifications>,
-
-    /// Blocks where state root verification is currently in-flight (being computed).
-    /// When verification completes, the block hash is moved to verified_state_roots
-    /// (if valid) or the block is rejected (if invalid).
-    state_root_verifications_in_flight: HashSet<Hash>,
-
-    /// Blocks waiting for JMT to reach the required version before verification can start.
-    /// When a block arrives but the JMT hasn't committed the parent block's state yet,
-    /// we queue it here. When StateCommitComplete arrives, we check if any queued
-    /// verifications can now proceed.
-    pending_state_root_verifications: HashMap<Hash, PendingStateRootVerification>,
-
-    /// Last committed JMT root hash. Updated via StateCommitComplete.
-    ///
-    /// Used to check if JMT is ready for state root verification.
-    last_committed_jmt_root: Hash,
-
-    /// Blocks with verified state roots (prevents re-verification).
-    verified_state_roots: HashSet<Hash>,
-
-    /// Blocks with verified transaction roots (prevents re-verification).
-    verified_transaction_roots: HashSet<Hash>,
-
-    /// Blocks where transaction root verification is currently in-flight.
-    transaction_root_verifications_in_flight: HashSet<Hash>,
-
-    /// Blocks with verified CommitmentProofs (prevents re-verification).
-    verified_commitment_proofs: HashSet<Hash>,
-
-    /// Cache of already-verified QC signatures.
-    /// Maps QC's block_hash (the block the QC certifies) -> height.
-    /// When we see the same QC in multiple block headers (e.g., during view changes
-    /// where multiple proposals at the same height share the same parent_qc), we can
-    /// skip re-verification and proceed directly to voting.
-    /// The height is stored to enable cleanup of old entries.
-    verified_qcs: HashMap<Hash, u64>,
-
-    /// Buffered out-of-order synced blocks waiting for earlier blocks.
-    /// Maps height -> (Block, QC).
-    /// When we receive a synced block for height N but we're still waiting for earlier
-    /// heights, we buffer it here. Once the earlier blocks are processed, we pull from
-    /// this buffer and submit for verification.
-    buffered_synced_blocks: std::collections::BTreeMap<u64, (Block, QuorumCertificate)>,
+    /// Sync coordination (block buffering, verification tracking, sync flag).
+    sync: SyncManager,
 
     /// Buffered commits waiting for earlier blocks to commit first.
     /// Maps height -> (block_hash, QC).
@@ -328,14 +215,6 @@ pub struct BftState {
     /// Prevents a Byzantine leader from spamming headers to delay view changes.
     /// We only reset once per (height, round) from the leader.
     last_header_reset: Option<(u64, u64)>,
-
-    // ═══════════════════════════════════════════════════════════════════════════
-    // Sync State
-    // ═══════════════════════════════════════════════════════════════════════════
-    /// Whether we are currently syncing (catching up to the network).
-    /// When syncing, we propose empty blocks instead of skipping our turn,
-    /// and view changes are suppressed since we're intentionally behind.
-    syncing: bool,
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Statistics
@@ -392,23 +271,13 @@ impl BftState {
             latest_qc: recovered.latest_qc,
             genesis_block: None,
             pending_blocks: HashMap::new(),
-            pending_block_created_at: HashMap::new(),
+            fetch: FetchCoordinator::new(),
             vote_sets: HashMap::new(),
             voted_heights,
             received_votes_by_height: HashMap::new(),
             certified_blocks: HashMap::new(),
-            pending_qc_verifications: HashMap::new(),
-            pending_synced_block_verifications: HashMap::new(),
-            pending_commitment_proof_verifications: HashMap::new(),
-            state_root_verifications_in_flight: HashSet::new(),
-            pending_state_root_verifications: HashMap::new(),
-            last_committed_jmt_root: recovered.jmt_root.unwrap_or(Hash::ZERO),
-            verified_state_roots: HashSet::new(),
-            verified_transaction_roots: HashSet::new(),
-            transaction_root_verifications_in_flight: HashSet::new(),
-            verified_commitment_proofs: HashSet::new(),
-            verified_qcs: HashMap::new(),
-            buffered_synced_blocks: std::collections::BTreeMap::new(),
+            verification: VerificationPipeline::new(recovered.jmt_root.unwrap_or(Hash::ZERO)),
+            sync: SyncManager::new(),
             pending_commits: std::collections::BTreeMap::new(),
             pending_commits_awaiting_data: HashMap::new(),
             pending_proposal: None,
@@ -417,7 +286,6 @@ impl BftState {
             last_proposal_time: Duration::ZERO,
             last_leader_activity: Duration::ZERO,
             last_header_reset: None,
-            syncing: false,
             view_changes: 0,
         }
     }
@@ -462,7 +330,7 @@ impl BftState {
     /// - Verifiers to check if JMT is ready for state root verification
     /// - Fallback/sync blocks to get current root when no certs
     fn get_local_jmt_root(&self) -> Hash {
-        self.last_committed_jmt_root
+        self.verification.jmt_root()
     }
 
     /// Get a block by its hash.
@@ -507,12 +375,12 @@ impl BftState {
     /// - Proposer will create empty "sync blocks" instead of skipping their turn
     /// - View changes are suppressed (we're intentionally behind)
     fn set_syncing(&mut self, topology: &TopologySnapshot, syncing: bool) {
-        if syncing && !self.syncing {
+        if syncing && !self.sync.is_syncing() {
             info!(
                 validator = ?topology.local_validator_id(),
                 "Entering sync mode - will propose empty blocks if selected"
             );
-        } else if !syncing && self.syncing {
+        } else if !syncing && self.sync.is_syncing() {
             info!(
                 validator = ?topology.local_validator_id(),
                 "Exiting sync mode - resuming normal block production"
@@ -520,12 +388,12 @@ impl BftState {
             // Reset leader activity timeout since we've caught up
             self.last_leader_activity = self.now;
         }
-        self.syncing = syncing;
+        self.sync.set_syncing(syncing);
     }
 
     /// Check if this validator is currently syncing.
     pub fn is_syncing(&self) -> bool {
-        self.syncing
+        self.sync.is_syncing()
     }
 
     /// Start syncing to catch up to the network.
@@ -549,7 +417,7 @@ impl BftState {
     ) -> Vec<Action> {
         // Don't restart sync if we're already syncing
         // The runner's SyncManager handles target updates internally
-        if self.syncing {
+        if self.sync.is_syncing() {
             debug!(
                 validator = ?topology.local_validator_id(),
                 target_height,
@@ -919,7 +787,7 @@ impl BftState {
 
         // If we're syncing, propose an empty sync block instead of a full block.
         // This keeps the chain advancing while we catch up on execution state.
-        if self.syncing {
+        if self.sync.is_syncing() {
             return self.build_and_broadcast_sync_block(topology, next_height, round);
         }
 
@@ -946,7 +814,8 @@ impl BftState {
             .into_iter()
             .filter(|d| {
                 let quorum_threshold = topology.quorum_threshold_for_shard(d.proof.source_shard);
-                let (_, voting_power) = self.resolve_commitment_proof_signers(topology, &d.proof);
+                let (_, voting_power) =
+                    VerificationPipeline::resolve_commitment_proof_signers(topology, &d.proof);
                 if voting_power < quorum_threshold {
                     trace!(
                         tx_hash = %d.tx_hash,
@@ -1176,7 +1045,7 @@ impl BftState {
         let mut pending = PendingBlock::from_manifest(header.clone(), BlockManifest::default());
         if let Ok(constructed) = pending.construct_block() {
             self.pending_blocks.insert(block_hash, pending);
-            self.pending_block_created_at.insert(block_hash, self.now);
+            self.fetch.track(block_hash, self.now);
             self.certified_blocks
                 .insert(block_hash, (*constructed).clone());
         }
@@ -1299,7 +1168,7 @@ impl BftState {
         let mut pending = PendingBlock::from_manifest(header.clone(), BlockManifest::default());
         if let Ok(constructed) = pending.construct_block() {
             self.pending_blocks.insert(block_hash, pending);
-            self.pending_block_created_at.insert(block_hash, self.now);
+            self.fetch.track(block_hash, self.now);
             self.certified_blocks
                 .insert(block_hash, (*constructed).clone());
         }
@@ -1612,7 +1481,7 @@ impl BftState {
 
         // Store pending block with creation timestamp for stale detection
         self.pending_blocks.insert(block_hash, pending);
-        self.pending_block_created_at.insert(block_hash, self.now);
+        self.fetch.track(block_hash, self.now);
 
         // Check if we have buffered votes for this block that can now trigger verification
         // (Votes may arrive before the header due to network timing)
@@ -1882,7 +1751,7 @@ impl BftState {
             // This happens during view changes when multiple proposals at the same
             // height share the same parent_qc. Avoids redundant crypto work.
             let qc_block_hash = header.parent_qc.block_hash;
-            if self.verified_qcs.contains_key(&qc_block_hash) {
+            if self.verification.is_qc_verified(&qc_block_hash) {
                 trace!(
                     qc_block_hash = ?qc_block_hash,
                     block_hash = ?block_hash,
@@ -1892,7 +1761,7 @@ impl BftState {
             }
 
             // Check if we already have pending verification for this block
-            if self.pending_qc_verifications.contains_key(&block_hash) {
+            if self.verification.has_pending_qc(&block_hash) {
                 trace!("QC verification already pending for block {}", block_hash);
                 return vec![];
             }
@@ -1904,12 +1773,8 @@ impl BftState {
             };
 
             // Store pending verification info
-            self.pending_qc_verifications.insert(
-                block_hash,
-                PendingQcVerification {
-                    header: header.clone(),
-                },
-            );
+            self.verification
+                .track_pending_qc(block_hash, header.clone());
 
             // Delegate verification to runner
             return vec![Action::VerifyQcSignature {
@@ -2009,22 +1874,40 @@ impl BftState {
                 let mut verification_actions = Vec::new();
 
                 // If block has deferrals with CommitmentProofs, initiate async verification.
-                if self.block_needs_commitment_proof_verification(&block) {
+                if self
+                    .verification
+                    .needs_commitment_proof_verification(&block)
+                {
                     verification_actions.extend(
-                        self.initiate_commitment_proof_verification(topology, block_hash, &block),
+                        self.verification
+                            .initiate_commitment_proof_verification(topology, block_hash, &block),
                     );
                 }
 
                 // Verify state root if block has committed certificates.
-                if self.block_needs_state_root_verification(&block) {
-                    verification_actions
-                        .extend(self.initiate_state_root_verification(block_hash, &block));
+                if self.verification.needs_state_root_verification(&block) {
+                    let parent_state_root = self
+                        .get_block_by_hash(block.header.parent_hash)
+                        .map(|parent| parent.header.state_root)
+                        .unwrap_or_else(|| self.get_local_jmt_root());
+                    verification_actions.extend(
+                        self.verification.initiate_state_root_verification(
+                            block_hash,
+                            &block,
+                            parent_state_root,
+                        ),
+                    );
                 }
 
                 // Verify transaction root if block has transactions.
-                if self.block_needs_transaction_root_verification(&block) {
-                    verification_actions
-                        .extend(self.initiate_transaction_root_verification(block_hash, &block));
+                if self
+                    .verification
+                    .needs_transaction_root_verification(&block)
+                {
+                    verification_actions.extend(
+                        self.verification
+                            .initiate_transaction_root_verification(block_hash, &block),
+                    );
                 }
 
                 // If any verifications were initiated, wait for them to complete.
@@ -2036,260 +1919,6 @@ impl BftState {
 
         // Create and send vote
         self.create_vote(topology, block_hash, height, round)
-    }
-
-    /// Check if a block needs CommitmentProof verification before voting.
-    ///
-    /// Returns true if the block has any deferrals with CommitmentProofs that haven't
-    /// been verified yet.
-    fn block_needs_commitment_proof_verification(&self, block: &Block) -> bool {
-        if block.deferred.is_empty() {
-            return false;
-        }
-
-        let block_hash = block.hash();
-
-        // Skip if already verified or verification in progress
-        if self.verified_commitment_proofs.contains(&block_hash)
-            || self
-                .pending_commitment_proof_verifications
-                .contains_key(&block_hash)
-        {
-            return false;
-        }
-
-        true
-    }
-
-    /// Initiate async CommitmentProof verification for a block's deferrals.
-    ///
-    /// This is called after structural validation passes. For each deferral,
-    /// we emit an `Action::VerifyCommitmentProof` to verify the BLS signature.
-    /// Voting is deferred until all verifications complete successfully.
-    fn initiate_commitment_proof_verification(
-        &mut self,
-        topology: &TopologySnapshot,
-        block_hash: Hash,
-        block: &Block,
-    ) -> Vec<Action> {
-        if block.deferred.is_empty() {
-            return vec![];
-        }
-
-        debug!(
-            block_hash = ?block_hash,
-            deferral_count = block.deferred.len(),
-            "Initiating CommitmentProof verification for block"
-        );
-
-        // Track pending verification
-        self.pending_commitment_proof_verifications.insert(
-            block_hash,
-            PendingCommitmentProofVerifications {
-                total: block.deferred.len(),
-                verified: 0,
-                all_valid: true,
-            },
-        );
-
-        // Generate verification actions for each deferral's proof
-        block
-            .deferred
-            .iter()
-            .enumerate()
-            .map(|(idx, deferral)| {
-                let proof = &deferral.proof;
-
-                // Resolve public keys and voting power from signer bitfield
-                let (public_keys, voting_power) =
-                    self.resolve_commitment_proof_signers(topology, proof);
-
-                if public_keys.is_empty() {
-                    warn!(
-                        block_hash = ?block_hash,
-                        deferral_index = idx,
-                        "No public keys resolved for CommitmentProof verification"
-                    );
-                    // Will fail verification with empty keys
-                }
-
-                let quorum_threshold = topology.quorum_threshold_for_shard(proof.source_shard);
-
-                Action::VerifyCommitmentProof {
-                    block_hash,
-                    deferral_index: idx,
-                    commitment_proof: proof.clone(),
-                    public_keys,
-                    voting_power,
-                    quorum_threshold,
-                }
-            })
-            .collect()
-    }
-
-    /// Resolve public keys and total voting power from a CommitmentProof's signer bitfield.
-    fn resolve_commitment_proof_signers(
-        &self,
-        topology: &TopologySnapshot,
-        proof: &CommitmentProof,
-    ) -> (Vec<Bls12381G1PublicKey>, u64) {
-        let committee = topology.committee_for_shard(proof.source_shard);
-
-        // Collect ALL committee public keys in order — verify_qc_signature
-        // uses positional indexing via the signer bitfield, so it needs the
-        // full array (not just signer keys).
-        let public_keys: Vec<_> = committee
-            .iter()
-            .map(|&validator_id| {
-                topology
-                    .public_key(validator_id)
-                    .expect("committee member must have a public key")
-            })
-            .collect();
-
-        // Compute voting power from signers only
-        let mut voting_power = 0u64;
-        for idx in proof.qc.signers.set_indices() {
-            if let Some(&validator_id) = committee.get(idx) {
-                voting_power += topology.voting_power(validator_id).unwrap_or(0);
-            }
-        }
-
-        (public_keys, voting_power)
-    }
-
-    /// Check if all async verifications are complete for a block.
-    ///
-    /// Returns true if:
-    /// - CommitmentProof verification is done (or not needed)
-    /// - State root verification is done (or not needed)
-    /// - Transaction root verification is done (or not needed)
-    ///
-    /// Used by verification callbacks to determine if it's safe to vote.
-    fn block_verifications_complete(&self, block: &Block) -> bool {
-        let block_hash = block.hash();
-
-        // Check CommitmentProof verification status
-        let commitment_proof_ok = if block.deferred.is_empty() {
-            // No deferrals - no verification needed
-            true
-        } else {
-            // Has deferrals - must be in verified set
-            self.verified_commitment_proofs.contains(&block_hash)
-        };
-
-        // Check state root verification status
-        let state_root_ok = if block.certificates.is_empty() {
-            // No certificates - no verification needed
-            true
-        } else {
-            // Has certificates - must be in verified set
-            self.verified_state_roots.contains(&block_hash)
-        };
-
-        // Check transaction root verification status
-        let transaction_root_ok = if block.transaction_count() == 0 {
-            // No transactions - no verification needed
-            true
-        } else {
-            // Has transactions - must be in verified set
-            self.verified_transaction_roots.contains(&block_hash)
-        };
-
-        commitment_proof_ok && state_root_ok && transaction_root_ok
-    }
-
-    /// Check if a block needs state root verification before voting.
-    ///
-    /// Returns true if the block has certificates (which change state)
-    /// and we haven't already verified or initiated verification.
-    fn block_needs_state_root_verification(&self, block: &Block) -> bool {
-        if block.certificates.is_empty() {
-            return false;
-        }
-
-        let block_hash = block.hash();
-
-        // Skip if already verified, in-flight, or queued
-        if self.verified_state_roots.contains(&block_hash)
-            || self
-                .state_root_verifications_in_flight
-                .contains(&block_hash)
-            || self
-                .pending_state_root_verifications
-                .contains_key(&block_hash)
-        {
-            return false;
-        }
-
-        true
-    }
-
-    /// Initiate state root verification for a block.
-    ///
-    /// Collects state writes from the block's certificates for our local shard.
-    /// Either verifies immediately (if JMT is ready) or queues for later.
-    ///
-    /// The verification computes: base_jmt_state + block.certificate_writes and compares
-    /// against block.header.state_root.
-    ///
-    /// If our JMT hasn't reached the required base state yet, we queue the verification
-    /// until `StateCommitComplete` brings us there.
-    fn initiate_state_root_verification(&mut self, block_hash: Hash, block: &Block) -> Vec<Action> {
-        // Get the parent block's state_root. This is the base state that the proposer
-        // used when computing the new state_root. We must verify from the same base.
-        let current_root = self.get_local_jmt_root();
-        let parent_state_root = self
-            .get_block_by_hash(block.header.parent_hash)
-            .map(|parent| parent.header.state_root)
-            .unwrap_or(current_root); // Genesis or missing parent - use current JMT root
-
-        // Check if our local JMT root matches the parent's state_root.
-        // This ensures we're computing from the same base state as the proposer.
-
-        if current_root == parent_state_root {
-            // JMT is ready - verify immediately
-            debug!(
-                block_hash = ?block_hash,
-                certificate_count = block.certificates.len(),
-                expected_root = ?block.header.state_root,
-                parent_state_root = ?parent_state_root,
-                current_jmt_root = ?current_root,
-                "JMT ready - initiating state root verification"
-            );
-
-            self.state_root_verifications_in_flight.insert(block_hash);
-
-            vec![Action::VerifyStateRoot {
-                block_hash,
-                parent_state_root,
-                expected_root: block.header.state_root,
-                certificates: block.certificates.clone(),
-                block_height: block.header.height.0,
-            }]
-        } else {
-            // JMT not ready - queue for later
-            debug!(
-                block_hash = ?block_hash,
-                certificate_count = block.certificates.len(),
-                expected_root = ?block.header.state_root,
-                parent_state_root = ?parent_state_root,
-                current_jmt_root = ?current_root,
-                "JMT not ready - queueing state root verification"
-            );
-
-            self.pending_state_root_verifications.insert(
-                block_hash,
-                PendingStateRootVerification {
-                    required_root: parent_state_root,
-                    expected_root: block.header.state_root,
-                    certificates: block.certificates.clone(),
-                    block_height: block.header.height.0,
-                },
-            );
-
-            vec![] // No action yet - will be triggered by StateCommitComplete
-        }
     }
 
     /// Validate deferrals and aborts in a proposed block (structural validation).
@@ -2914,42 +2543,19 @@ impl BftState {
         info!(
             block_hash = ?block_hash,
             valid,
-            pending_sync_count = self.pending_synced_block_verifications.len(),
-            pending_consensus_count = self.pending_qc_verifications.len(),
+            pending_sync_count = self.sync.pending_verification_count(),
+            pending_consensus_count = self.verification.pending_qc_count(),
             "on_qc_signature_verified: received callback"
         );
-        if let Some(mut pending_sync) = self.pending_synced_block_verifications.remove(&block_hash)
-        {
-            if !valid {
-                warn!(
-                    block_hash = ?block_hash,
-                    height = pending_sync.block.header.height.0,
-                    "Synced block QC signature verification FAILED - rejecting block"
-                );
-                // Clear all pending synced blocks since chain is broken
-                self.pending_synced_block_verifications.clear();
-                return vec![];
-            }
-
-            info!(
-                block_hash = ?block_hash,
-                height = pending_sync.block.header.height.0,
-                "Synced block QC verified successfully"
-            );
-
-            // Mark this block as verified
-            pending_sync.verified = true;
-
-            // Put it back temporarily to check ordering
-            self.pending_synced_block_verifications
-                .insert(block_hash, pending_sync);
-
-            // Try to apply all consecutive verified blocks starting from committed_height + 1
-            return self.try_apply_verified_synced_blocks(topology);
+        if let Some(result) = self.sync.on_qc_verified(block_hash, valid) {
+            return match result {
+                SyncVerificationResult::Failed => vec![],
+                SyncVerificationResult::Verified => self.try_apply_verified_synced_blocks(topology),
+            };
         }
 
         // Otherwise, it's a consensus block QC verification
-        let Some(pending) = self.pending_qc_verifications.remove(&block_hash) else {
+        let Some((header, is_valid)) = self.verification.on_qc_verified(block_hash, valid) else {
             warn!(
                 "QC signature verified but no pending verification for block {}",
                 block_hash
@@ -2958,10 +2564,10 @@ impl BftState {
         };
 
         // Check verification result
-        if !valid {
+        if !is_valid {
             warn!(
                 block_hash = ?block_hash,
-                height = pending.header.height.0,
+                height = header.height.0,
                 "QC signature verification FAILED - potential Byzantine attack! Rejecting block."
             );
             // Remove the pending block since we can't trust it
@@ -2971,24 +2577,20 @@ impl BftState {
 
         debug!(
             block_hash = ?block_hash,
-            height = pending.header.height.0,
+            height = header.height.0,
             "QC signature verified successfully, proceeding to vote"
         );
 
         // Cache the verified QC so we don't re-verify it for other blocks
         // with the same parent_qc (e.g., during view changes).
-        let qc_block_hash = pending.header.parent_qc.block_hash;
-        let qc_height = pending.header.parent_qc.height.0;
-        self.verified_qcs.insert(qc_block_hash, qc_height);
-        trace!(
-            qc_block_hash = ?qc_block_hash,
-            qc_height = qc_height,
-            "Cached verified QC"
-        );
+        let qc_block_hash = header.parent_qc.block_hash;
+        let qc_height = header.parent_qc.height.0;
+        self.verification
+            .cache_verified_qc(qc_block_hash, qc_height);
 
         // QC is valid - proceed to vote on the block
-        let height = pending.header.height.0;
-        let round = pending.header.round;
+        let height = header.height.0;
+        let round = header.round;
         self.try_vote_on_block(topology, block_hash, height, round)
     }
 
@@ -3005,69 +2607,22 @@ impl BftState {
         deferral_index: usize,
         valid: bool,
     ) -> Vec<Action> {
-        let pending = match self
-            .pending_commitment_proof_verifications
-            .get_mut(&block_hash)
+        match self
+            .verification
+            .on_commitment_proof_verified(block_hash, deferral_index, valid)
         {
-            Some(p) => p,
-            None => {
-                warn!(
+            VerificationProgress::StillPending | VerificationProgress::NotTracked => return vec![],
+            VerificationProgress::Failed => {
+                info!(
                     block_hash = ?block_hash,
-                    "CommitmentProof verification result for unknown block"
+                    "Block rejected due to invalid CommitmentProof(s)"
                 );
+                self.pending_blocks.remove(&block_hash);
                 return vec![];
             }
-        };
-
-        pending.verified += 1;
-
-        if !valid {
-            pending.all_valid = false;
-            warn!(
-                block_hash = ?block_hash,
-                deferral_index = deferral_index,
-                "CommitmentProof signature verification FAILED - potential Byzantine attack!"
-            );
-        } else {
-            trace!(
-                block_hash = ?block_hash,
-                deferral_index = deferral_index,
-                "CommitmentProof verified successfully"
-            );
+            VerificationProgress::AllComplete => {}
         }
 
-        // Check if all verifications are complete
-        if pending.verified < pending.total {
-            trace!(
-                block_hash = ?block_hash,
-                verified = pending.verified,
-                total = pending.total,
-                "Waiting for more CommitmentProof verifications"
-            );
-            return vec![];
-        }
-
-        // All verifications complete
-        let all_valid = pending.all_valid;
-        self.pending_commitment_proof_verifications
-            .remove(&block_hash);
-
-        if !all_valid {
-            info!(
-                block_hash = ?block_hash,
-                "Block rejected due to invalid CommitmentProof(s)"
-            );
-            // Remove the pending block since we can't trust it
-            self.pending_blocks.remove(&block_hash);
-            return vec![];
-        }
-
-        self.verified_commitment_proofs.insert(block_hash);
-
-        debug!(
-            block_hash = ?block_hash,
-            "All CommitmentProofs verified successfully"
-        );
         let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
             warn!(
                 block_hash = ?block_hash,
@@ -3082,7 +2637,7 @@ impl BftState {
         };
 
         // Check if all verifications are complete (state root may still be pending)
-        if !self.block_verifications_complete(&block) {
+        if !self.verification.is_block_verified(&block) {
             debug!(
                 block_hash = ?block_hash,
                 "CommitmentProofs done, waiting for other verifications"
@@ -3109,25 +2664,15 @@ impl BftState {
         block_hash: Hash,
         valid: bool,
     ) -> Vec<Action> {
-        // Remove from in-flight regardless of outcome
-        self.state_root_verifications_in_flight.remove(&block_hash);
-
-        if !valid {
+        if !self.verification.on_state_root_verified(block_hash, valid) {
             warn!(
                 block_hash = ?block_hash,
                 "State root verification FAILED - proposer included incorrect state_root!"
             );
-            // Remove the pending block since the proposer lied about state
             self.pending_blocks.remove(&block_hash);
             return vec![];
         }
 
-        self.verified_state_roots.insert(block_hash);
-
-        debug!(
-            block_hash = ?block_hash,
-            "State root verified successfully"
-        );
         let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
             warn!(
                 block_hash = ?block_hash,
@@ -3142,7 +2687,7 @@ impl BftState {
         };
 
         // Check if all verifications are complete (cycle proofs may still be pending)
-        if !self.block_verifications_complete(&block) {
+        if !self.verification.is_block_verified(&block) {
             debug!(
                 block_hash = ?block_hash,
                 "State root done, waiting for other verifications"
@@ -3157,60 +2702,6 @@ impl BftState {
         self.create_vote(topology, block_hash, height, round)
     }
 
-    /// Check if a block needs transaction root verification before voting.
-    ///
-    /// Returns true if the block has transactions and we haven't already verified
-    /// or initiated verification.
-    fn block_needs_transaction_root_verification(&self, block: &Block) -> bool {
-        if block.transaction_count() == 0 {
-            return false;
-        }
-
-        let block_hash = block.hash();
-
-        // Skip if already verified or in-flight
-        if self.verified_transaction_roots.contains(&block_hash)
-            || self
-                .transaction_root_verifications_in_flight
-                .contains(&block_hash)
-        {
-            return false;
-        }
-
-        true
-    }
-
-    /// Initiate transaction root verification for a block.
-    ///
-    /// Unlike state root verification, this doesn't depend on JMT state and can
-    /// be verified immediately. This runs in parallel with state root and cycle
-    /// proof verifications.
-    fn initiate_transaction_root_verification(
-        &mut self,
-        block_hash: Hash,
-        block: &Block,
-    ) -> Vec<Action> {
-        debug!(
-            block_hash = ?block_hash,
-            retry_count = block.retry_transactions.len(),
-            priority_count = block.priority_transactions.len(),
-            tx_count = block.transactions.len(),
-            expected_root = ?block.header.transaction_root,
-            "Initiating transaction root verification"
-        );
-
-        self.transaction_root_verifications_in_flight
-            .insert(block_hash);
-
-        vec![Action::VerifyTransactionRoot {
-            block_hash,
-            expected_root: block.header.transaction_root,
-            retry_transactions: block.retry_transactions.clone(),
-            priority_transactions: block.priority_transactions.clone(),
-            transactions: block.transactions.clone(),
-        }]
-    }
-
     /// Handle transaction root verification result.
     ///
     /// Called when the runner completes `Action::VerifyTransactionRoot`. If the
@@ -3223,26 +2714,17 @@ impl BftState {
         block_hash: Hash,
         valid: bool,
     ) -> Vec<Action> {
-        // Remove from in-flight regardless of outcome
-        self.transaction_root_verifications_in_flight
-            .remove(&block_hash);
-
-        if !valid {
+        if !self
+            .verification
+            .on_transaction_root_verified(block_hash, valid)
+        {
             warn!(
                 block_hash = ?block_hash,
                 "Transaction root verification FAILED - proposer included incorrect transaction_root!"
             );
-            // Remove the pending block since the proposer lied about transactions
             self.pending_blocks.remove(&block_hash);
             return vec![];
         }
-
-        self.verified_transaction_roots.insert(block_hash);
-
-        debug!(
-            block_hash = ?block_hash,
-            "Transaction root verified successfully"
-        );
 
         let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
             warn!(
@@ -3258,7 +2740,7 @@ impl BftState {
         };
 
         // Check if all verifications are complete (state root, cycle proofs may still be pending)
-        if !self.block_verifications_complete(&block) {
+        if !self.verification.is_block_verified(&block) {
             debug!(
                 block_hash = ?block_hash,
                 "Transaction root done, waiting for other verifications"
@@ -3340,7 +2822,7 @@ impl BftState {
         );
 
         self.pending_blocks.insert(block_hash, pending_block);
-        self.pending_block_created_at.insert(block_hash, self.now);
+        self.fetch.track(block_hash, self.now);
         self.last_proposal_time = self.now;
         self.record_leader_activity();
 
@@ -3387,47 +2869,11 @@ impl BftState {
             old_height = self.committed_height,
             new_height = block_height,
             new_root = ?state_root,
-            pending_verifications = self.pending_state_root_verifications.len(),
+            pending_verifications = self.verification.pending_state_root_count(),
             "JMT state commit complete, checking for unblocked verifications"
         );
 
-        self.last_committed_jmt_root = state_root;
-
-        // Find all pending verifications where the JMT now has the required base root.
-        // We compare roots, not versions, because that's what guarantees both proposer
-        // and verifier compute from the same base state.
-        let unblocked: Vec<Hash> = self
-            .pending_state_root_verifications
-            .iter()
-            .filter(|(_, pv)| pv.required_root == state_root)
-            .map(|(hash, _)| *hash)
-            .collect();
-
-        if unblocked.is_empty() {
-            return vec![];
-        }
-
-        debug!(
-            unblocked_count = unblocked.len(),
-            "Unblocking pending state root verifications"
-        );
-
-        // Move unblocked verifications from pending to in-flight and emit actions
-        let mut actions = Vec::new();
-        for block_hash in unblocked {
-            if let Some(pv) = self.pending_state_root_verifications.remove(&block_hash) {
-                self.state_root_verifications_in_flight.insert(block_hash);
-                actions.push(Action::VerifyStateRoot {
-                    block_hash,
-                    parent_state_root: pv.required_root,
-                    expected_root: pv.expected_root,
-                    certificates: pv.certificates,
-                    block_height: pv.block_height,
-                });
-            }
-        }
-
-        actions
+        self.verification.on_jmt_advanced(block_height, state_root)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3622,7 +3068,7 @@ impl BftState {
         //
         // All other checks (should_propose, backpressure, voted_heights)
         // are handled inside on_proposal_timer to avoid duplication.
-        let should_try_proposal = has_content || self.syncing;
+        let should_try_proposal = has_content || self.sync.is_syncing();
 
         if should_try_proposal && !rate_limited {
             // on_proposal_timer will check if we're the proposer, backpressure, etc.
@@ -3939,8 +3385,7 @@ impl BftState {
             height,
             block_hash = ?block_hash,
             committed_height = self.committed_height,
-            pending_verifications = self.pending_synced_block_verifications.len(),
-            buffered_blocks = self.buffered_synced_blocks.len(),
+            pending_verifications = self.sync.pending_verification_count(),
             "Received synced block"
         );
 
@@ -3964,17 +3409,14 @@ impl BftState {
         }
 
         // Check if we already have this block pending or buffered
-        if self
-            .pending_synced_block_verifications
-            .contains_key(&block_hash)
-        {
+        if self.sync.has_pending_verification(&block_hash) {
             info!(
                 height,
                 "Synced block already pending verification - filtering"
             );
             return vec![];
         }
-        if self.buffered_synced_blocks.contains_key(&height) {
+        if self.sync.has_buffered_height(height) {
             info!(height, "Synced block already buffered - filtering");
             return vec![];
         }
@@ -3993,11 +3435,7 @@ impl BftState {
         // or if we already have what we need and should try draining buffers.
         if height > next_needed {
             // Future block - buffer it for later
-            debug!(
-                height,
-                next_needed, "Buffering future synced block for later"
-            );
-            self.buffered_synced_blocks.insert(height, (block, qc));
+            self.sync.buffer_block(height, block, qc);
 
             // Check if we can drain any buffered blocks starting from next_needed
             return self.try_drain_buffered_synced_blocks(topology);
@@ -4045,20 +3483,9 @@ impl BftState {
             "Submitting synced block for QC verification"
         );
 
-        // Store pending verification info
-        info!(
-            height,
-            block_hash = ?block_hash,
-            "Inserting into pending_synced_block_verifications"
-        );
-        self.pending_synced_block_verifications.insert(
-            block_hash,
-            PendingSyncedBlockVerification {
-                block,
-                qc: qc.clone(),
-                verified: false,
-            },
-        );
+        // Store pending verification info via SyncManager
+        self.sync
+            .track_pending_verification(block_hash, block, qc.clone());
 
         // Delegate verification to runner
         vec![Action::VerifyQcSignature {
@@ -4080,7 +3507,7 @@ impl BftState {
         let mut actions = Vec::new();
 
         // How many blocks are already pending verification?
-        let pending_count = self.pending_synced_block_verifications.len();
+        let pending_count = self.sync.pending_verification_count();
 
         // Limit parallel verifications to avoid overwhelming the crypto pool.
         // This also bounds memory usage from buffered blocks.
@@ -4094,27 +3521,13 @@ impl BftState {
         let slots_available = MAX_PARALLEL_SYNC_VERIFICATIONS - pending_count;
 
         // Find the next height we need - accounting for what's already pending verification
-        let highest_pending_height = self
-            .pending_synced_block_verifications
-            .values()
-            .map(|p| p.block.header.height.0)
-            .max()
-            .unwrap_or(self.committed_height);
+        let highest_pending_height = self.sync.highest_pending_height(self.committed_height);
+        let start_height = highest_pending_height.max(self.committed_height) + 1;
 
-        let mut next_height = highest_pending_height.max(self.committed_height) + 1;
-        let mut submitted = 0;
-
-        // Keep draining as long as we have the next sequential block buffered
-        // and haven't hit the parallel verification limit
-        while submitted < slots_available {
-            if let Some((block, qc)) = self.buffered_synced_blocks.remove(&next_height) {
-                debug!(height = next_height, "Draining buffered synced block");
-                actions.extend(self.submit_synced_block_for_verification(topology, block, qc));
-                next_height += 1;
-                submitted += 1;
-            } else {
-                break;
-            }
+        // Drain buffered blocks from the SyncManager
+        let blocks = self.sync.drain_buffered(start_height, slots_available);
+        for (block, qc) in blocks {
+            actions.extend(self.submit_synced_block_for_verification(topology, block, qc));
         }
 
         actions
@@ -4266,45 +3679,16 @@ impl BftState {
             let next_height = self.committed_height + 1;
 
             // Log state for debugging
-            let verified_heights: Vec<_> = self
-                .pending_synced_block_verifications
-                .values()
-                .filter(|p| p.verified)
-                .map(|p| p.block.header.height.0)
-                .collect();
-            let unverified_heights: Vec<_> = self
-                .pending_synced_block_verifications
-                .values()
-                .filter(|p| !p.verified)
-                .map(|p| p.block.header.height.0)
-                .collect();
-            info!(
-                committed_height = self.committed_height,
-                next_height,
-                verified_heights = ?verified_heights,
-                unverified_heights = ?unverified_heights,
-                "try_apply_verified_synced_blocks: checking"
-            );
+            self.sync
+                .log_verification_state(self.committed_height, next_height);
 
-            // Find a verified block at the next height
-            let block_hash = self
-                .pending_synced_block_verifications
-                .iter()
-                .find(|(_, p)| p.verified && p.block.header.height.0 == next_height)
-                .map(|(h, _)| *h);
-
-            let Some(hash) = block_hash else {
-                // No verified block at next height - stop applying
+            // Take the next verified block at the expected height
+            let Some((block, qc)) = self.sync.take_verified_at_height(next_height) else {
                 info!(next_height, "No verified block at next height - stopping");
                 break;
             };
 
-            // Remove and apply the block
-            let pending = self
-                .pending_synced_block_verifications
-                .remove(&hash)
-                .unwrap();
-            actions.extend(self.apply_synced_block(topology, pending.block, pending.qc));
+            actions.extend(self.apply_synced_block(topology, block, qc));
         }
 
         // After applying blocks, drain more buffered blocks for parallel verification
@@ -4915,9 +4299,8 @@ impl BftState {
         self.pending_blocks
             .retain(|_, pending| pending.header().height.0 > committed_height);
 
-        // Also clean up pending_block_created_at to match pending_blocks
-        self.pending_block_created_at
-            .retain(|hash, _| self.pending_blocks.contains_key(hash));
+        // Also clean up fetch coordinator to match pending_blocks
+        self.fetch.cleanup(&self.pending_blocks);
 
         // Remove vote sets at or below committed height
         self.vote_sets
@@ -4939,56 +4322,12 @@ impl BftState {
         self.pending_commits_awaiting_data
             .retain(|_, (height, _)| *height > committed_height);
 
-        // Remove buffered synced blocks at or below committed height
-        self.buffered_synced_blocks
-            .retain(|height, _| *height > committed_height);
+        // Delegate sync state cleanup to the SyncManager
+        self.sync.cleanup(committed_height);
 
-        // Remove pending synced block verifications at or below committed height.
-        // These are synced blocks awaiting QC verification that are now stale because
-        // consensus has already committed past their height.
-        self.pending_synced_block_verifications
-            .retain(|_, pending| pending.block.header.height.0 > committed_height);
-
-        // Remove pending QC verifications for blocks at or below committed height.
-        // We look up the block hash in pending_blocks to get the height - if the block
-        // is no longer in pending_blocks (was just cleaned up above), we remove the
-        // pending verification since we won't need it.
-        self.pending_qc_verifications
-            .retain(|hash, _| self.pending_blocks.contains_key(hash));
-
-        // Remove pending CommitmentProof verifications for blocks no longer in pending_blocks.
-        self.pending_commitment_proof_verifications
-            .retain(|hash, _| self.pending_blocks.contains_key(hash));
-
-        // Remove verified CommitmentProofs for blocks no longer in pending_blocks.
-        self.verified_commitment_proofs
-            .retain(|hash| self.pending_blocks.contains_key(hash));
-
-        // Remove pending state root verifications for blocks no longer in pending_blocks.
-        self.pending_state_root_verifications
-            .retain(|hash, _| self.pending_blocks.contains_key(hash));
-
-        // Remove in-flight state root verifications for blocks no longer in pending_blocks.
-        self.state_root_verifications_in_flight
-            .retain(|hash| self.pending_blocks.contains_key(hash));
-
-        // Remove verified state roots for blocks no longer in pending_blocks.
-        self.verified_state_roots
-            .retain(|hash| self.pending_blocks.contains_key(hash));
-
-        // Remove in-flight transaction root verifications for blocks no longer in pending_blocks.
-        self.transaction_root_verifications_in_flight
-            .retain(|hash| self.pending_blocks.contains_key(hash));
-
-        // Remove verified transaction roots for blocks no longer in pending_blocks.
-        self.verified_transaction_roots
-            .retain(|hash| self.pending_blocks.contains_key(hash));
-
-        // Remove verified QC cache entries for heights at or below committed height.
-        // We keep entries slightly above committed_height in case of view changes
-        // where multiple proposals at the same height share the same parent_qc.
-        self.verified_qcs
-            .retain(|_, height| *height > committed_height.saturating_sub(2));
+        // Delegate verification state cleanup to the pipeline
+        self.verification
+            .cleanup(&self.pending_blocks, committed_height);
 
         removed_hashes
     }
@@ -5006,7 +4345,7 @@ impl BftState {
         // Don't fetch for gossip blocks while syncing.
         // Sync delivers complete blocks that will supersede these pending blocks.
         // This prevents FetchManager from consuming all request slots and starving sync.
-        if self.syncing {
+        if self.sync.is_syncing() {
             return vec![];
         }
 
@@ -5021,7 +4360,7 @@ impl BftState {
                 continue;
             }
 
-            let Some(&created_at) = self.pending_block_created_at.get(block_hash) else {
+            let Some(created_at) = self.fetch.created_at(block_hash) else {
                 continue;
             };
 
@@ -5093,7 +4432,7 @@ impl BftState {
         }
 
         // If we're already syncing, don't trigger another sync
-        if self.syncing {
+        if self.sync.is_syncing() {
             return vec![];
         }
 
@@ -5277,16 +4616,12 @@ impl BftState {
         }
 
         // In pending synced block verifications (synced blocks are always complete)
-        if self
-            .pending_synced_block_verifications
-            .values()
-            .any(|p| p.block.header.height.0 == height)
-        {
+        if self.sync.has_pending_at_height(height) {
             return true;
         }
 
         // In buffered synced blocks (synced blocks are always complete)
-        if self.buffered_synced_blocks.contains_key(&height) {
+        if self.sync.has_buffered_height(height) {
             return true;
         }
 
@@ -7811,7 +7146,7 @@ mod tests {
 
         // Simulate QC verification success by directly inserting into the cache.
         // In real operation, this happens in on_qc_signature_verified when valid=true.
-        state.verified_qcs.insert(parent_hash, 1);
+        state.verification.cache_verified_qc(parent_hash, 1);
 
         // Second block at height 2, round 1 (same parent QC - view change scenario)
         let header2 = BlockHeader {
@@ -9180,7 +8515,7 @@ mod tests {
 
         // Reset state for fallback test
         state.pending_blocks.clear();
-        state.pending_block_created_at.clear();
+        state.fetch.cleanup(&state.pending_blocks);
         state.certified_blocks.clear();
         state.voted_heights.clear();
 
