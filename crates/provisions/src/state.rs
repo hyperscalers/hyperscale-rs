@@ -197,24 +197,6 @@ impl ProvisionCoordinator {
         vec![]
     }
 
-    /// Handle cross-shard transaction completion.
-    ///
-    /// Cleans up all state for the transaction.
-    pub fn on_tx_completed(&mut self, tx_hash: &Hash) -> Vec<Action> {
-        self.cleanup_tx(tx_hash);
-        debug!(tx_hash = %tx_hash, "Cross-shard transaction completed");
-        vec![]
-    }
-
-    /// Handle cross-shard transaction abort.
-    ///
-    /// Cleans up all state for the transaction.
-    pub fn on_tx_aborted(&mut self, tx_hash: &Hash) -> Vec<Action> {
-        self.cleanup_tx(tx_hash);
-        debug!(tx_hash = %tx_hash, "Cross-shard transaction aborted");
-        vec![]
-    }
-
     /// Handle block committed - cleanup completed/aborted transactions and
     /// check for timed-out expected provisions.
     pub fn on_block_committed(

@@ -139,12 +139,6 @@ pub enum ProtocolEvent {
         committed_height: BlockHeight,
     },
 
-    /// Cross-shard transaction completed successfully.
-    CrossShardTxCompleted { tx_hash: Hash },
-
-    /// Cross-shard transaction aborted.
-    CrossShardTxAborted { tx_hash: Hash },
-
     /// A provision from a source shard has been verified and accepted.
     ProvisionAccepted {
         tx_hash: Hash,
@@ -225,14 +219,12 @@ pub enum ProtocolEvent {
         submitted_locally: bool,
     },
 
-    /// Transaction execution completed.
+    /// A transaction certificate has been verified and the execution outcome resolved.
+    ///
+    /// Emitted as a continuation after `TransactionCertificateVerified`, not after
+    /// speculative or normal execution. The `accepted` field comes from
+    /// `certificate.is_accepted()`.
     TransactionExecuted { tx_hash: Hash, accepted: bool },
-
-    /// A transaction's status has changed.
-    TransactionStatusChanged {
-        tx_hash: Hash,
-        status: hyperscale_types::TransactionStatus,
-    },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Fetch Delivery (from IoLoop after fetch protocol processing)
@@ -387,8 +379,6 @@ impl ProtocolEvent {
 
             // Provisions
             ProtocolEvent::CrossShardTxRegistered { .. } => "CrossShardTxRegistered",
-            ProtocolEvent::CrossShardTxCompleted { .. } => "CrossShardTxCompleted",
-            ProtocolEvent::CrossShardTxAborted { .. } => "CrossShardTxAborted",
             ProtocolEvent::ProvisionAccepted { .. } => "ProvisionAccepted",
             ProtocolEvent::ProvisioningComplete { .. } => "ProvisioningComplete",
             ProtocolEvent::StateProvisionsReceived { .. } => "StateProvisionsReceived",
@@ -412,7 +402,6 @@ impl ProtocolEvent {
             // Mempool / Transactions
             ProtocolEvent::TransactionGossipReceived { .. } => "TransactionGossipReceived",
             ProtocolEvent::TransactionExecuted { .. } => "TransactionExecuted",
-            ProtocolEvent::TransactionStatusChanged { .. } => "TransactionStatusChanged",
 
             // Fetch Delivery
             ProtocolEvent::TransactionFetchDelivered { .. } => "TransactionFetchDelivered",
