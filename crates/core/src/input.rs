@@ -116,9 +116,10 @@ pub enum NodeInput {
     /// Provisions built by the execution pool, ready for network broadcast.
     ///
     /// Returned from delegated `FetchAndBroadcastProvisions` action.
-    /// The I/O loop sends one `StateProvisionsNotification` per target shard.
+    /// The I/O loop sends one `StateProvisionsNotification` per target shard,
+    /// targeted to the specific recipients embedded in each batch tuple.
     ProvisionsReady {
-        /// (shard, provisions, recipients) per target shard.
+        /// (target_shard, provisions, recipients) per target shard.
         batches: Vec<(ShardGroupId, Vec<StateProvision>, Vec<ValidatorId>)>,
     },
 
@@ -159,10 +160,11 @@ impl NodeInput {
                 | ProtocolEvent::TransactionGossipReceived { .. }
                 | ProtocolEvent::GlobalBlockReceived { .. }
                 | ProtocolEvent::GlobalBlockVoteReceived { .. }
-                | ProtocolEvent::TransactionFetchDelivered { .. }
-                | ProtocolEvent::CertificateFetchDelivered { .. }
                 | ProtocolEvent::StateProvisionsReceived { .. } => EventPriority::Network,
 
+                // Fetch delivery events are processed callbacks from the fetch
+                // protocol, not raw network messages (analogous to
+                // CommittedHeaderValidated). They fall through to Internal.
                 _ => EventPriority::Internal,
             },
             NodeInput::SubmitTransaction { .. } => EventPriority::Client,

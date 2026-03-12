@@ -623,9 +623,7 @@ impl MempoolState {
 
         // Update transaction status to Committed and add locks.
         // This must happen synchronously to prevent the same transactions from being
-        // re-proposed before the status update is processed. The execution state machine
-        // also emits TransactionStatusChanged events, but those go through an async channel
-        // that may not be processed before the next proposal.
+        // re-proposed before the status update is processed.
         for tx in block.all_transactions() {
             let hash = tx.hash();
             if let Some(entry) = self.pool.get_mut(&hash) {

@@ -197,24 +197,6 @@ impl ProvisionCoordinator {
         vec![]
     }
 
-    /// Handle cross-shard transaction completion.
-    ///
-    /// Cleans up all state for the transaction.
-    pub fn on_tx_completed(&mut self, tx_hash: &Hash) -> Vec<Action> {
-        self.cleanup_tx(tx_hash);
-        debug!(tx_hash = %tx_hash, "Cross-shard transaction completed");
-        vec![]
-    }
-
-    /// Handle cross-shard transaction abort.
-    ///
-    /// Cleans up all state for the transaction.
-    pub fn on_tx_aborted(&mut self, tx_hash: &Hash) -> Vec<Action> {
-        self.cleanup_tx(tx_hash);
-        debug!(tx_hash = %tx_hash, "Cross-shard transaction aborted");
-        vec![]
-    }
-
     /// Handle block committed - cleanup completed/aborted transactions and
     /// check for timed-out expected provisions.
     pub fn on_block_committed(
@@ -859,43 +841,6 @@ mod tests {
     // Cleanup Tests
     // ═══════════════════════════════════════════════════════════════════════
 
-    #[test]
-    fn test_tx_aborted_cleans_up_state() {
-        let mut coordinator = ProvisionCoordinator::new();
-
-        let tx_hash = Hash::from_bytes(b"test_tx");
-        let registration = make_registration(vec![ShardGroupId(1)]);
-        coordinator.on_tx_registered(tx_hash, registration);
-
-        // Abort before any provisions
-        coordinator.on_tx_aborted(&tx_hash);
-
-        assert!(!coordinator.is_registered(&tx_hash));
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Cleanup Tests
-    // ═══════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_tx_completed_cleans_up_state() {
-        let mut coordinator = ProvisionCoordinator::new();
-
-        let tx_hash = Hash::from_bytes(b"test_tx");
-        let registration = make_registration(vec![ShardGroupId(1)]);
-        coordinator.on_tx_registered(tx_hash, registration);
-
-        // Verify registration exists
-        assert!(coordinator.is_registered(&tx_hash));
-
-        // Complete transaction
-        coordinator.on_tx_completed(&tx_hash);
-
-        // All state should be cleaned up
-        assert!(!coordinator.is_registered(&tx_hash));
-        assert!(!coordinator.has_any_verified_provisions(&tx_hash));
-    }
-
     // ═══════════════════════════════════════════════════════════════════════
     // Remote Block Header Tracking Tests (Unverified Buffer)
     // ═══════════════════════════════════════════════════════════════════════
@@ -1370,23 +1315,6 @@ mod tests {
         // After verification
         let txs = coordinator.txs_with_provisions_from(source_shard).unwrap();
         assert!(txs.contains(&tx_hash));
-    }
-
-    #[test]
-    fn test_cleanup_removes_pending_provisions() {
-        let topology = make_test_topology(ShardGroupId(0));
-        let mut coordinator = ProvisionCoordinator::new();
-
-        let tx_hash = Hash::from_bytes(b"tx1");
-        let source_shard = ShardGroupId(1);
-
-        // Buffer a provision (no header yet)
-        let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator.on_state_provisions_received(&topology, vec![provision]);
-
-        // Abort the tx — should clean up pending provisions too
-        coordinator.on_tx_aborted(&tx_hash);
-        assert!(!coordinator.is_registered(&tx_hash));
     }
 
     // ═══════════════════════════════════════════════════════════════════════

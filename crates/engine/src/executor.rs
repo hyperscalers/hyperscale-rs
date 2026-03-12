@@ -7,8 +7,8 @@
 //! # Design Principle
 //!
 //! State machines emit `Action::ExecuteTransactions` and receive
-//! `Event::TransactionsExecuted`. The runner owns the storage and executor,
-//! calling the executor methods to handle these actions.
+//! `ProtocolEvent::ExecutionVoteBatchReceived`. The runner owns the storage
+//! and executor, calling the executor methods to handle these actions.
 //!
 //! **IMPORTANT**: The executor is READ-ONLY. It does NOT commit state changes
 //! to storage. Writes are collected in the execution result and committed later
@@ -22,7 +22,7 @@
 //!      ↓
 //!      → executor.execute_single_shard(&storage, &transactions)  // READ-ONLY
 //!      ↓
-//! Runner → Event::TransactionsExecuted { results }  // results contain writes
+//! Runner → ProtocolEvent::ExecutionVoteBatchReceived { votes }
 //!      ↓
 //! ... voting, certificate creation, block inclusion ...
 //!      ↓

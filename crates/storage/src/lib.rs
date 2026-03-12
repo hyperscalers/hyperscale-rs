@@ -8,7 +8,7 @@
 //!
 //! Storage is an implementation detail of runners, not the state machine.
 //! The state machine emits `Action::ExecuteTransactions` and receives
-//! `Event::TransactionsExecuted` - it never touches storage directly.
+//! `ProtocolEvent::ExecutionVoteBatchReceived` - it never touches storage directly.
 //!
 //! Runners own storage and pass it to the executor:
 //! - `SimulationRunner` uses in-memory storage (`SimStorage`)

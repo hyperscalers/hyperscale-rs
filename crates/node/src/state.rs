@@ -867,12 +867,6 @@ impl StateMachine for NodeStateMachine {
                 };
                 self.provisions.on_tx_registered(tx_hash, registration)
             }
-            ProtocolEvent::CrossShardTxCompleted { tx_hash } => {
-                self.provisions.on_tx_completed(&tx_hash)
-            }
-            ProtocolEvent::CrossShardTxAborted { tx_hash } => {
-                self.provisions.on_tx_aborted(&tx_hash)
-            }
             ProtocolEvent::ProvisionAccepted {
                 tx_hash,
                 source_shard,
@@ -939,10 +933,6 @@ impl StateMachine for NodeStateMachine {
                 tx,
                 submitted_locally,
             } => self.on_transaction_gossip_received(tx, submitted_locally),
-            ProtocolEvent::TransactionStatusChanged { tx_hash, status } => {
-                self.mempool.update_status(&tx_hash, status)
-            }
-
             // ── Fetch Protocol ───────────────────────────────────────────
             ProtocolEvent::TransactionFetchDelivered {
                 block_hash,

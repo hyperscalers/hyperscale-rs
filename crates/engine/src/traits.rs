@@ -25,7 +25,7 @@ use hyperscale_types::{StateEntry, Hash, NodeId, RoutableTransaction, StateProvi
 /// This trait is synchronous. The deterministic runner handles async concerns:
 /// 1. Receives `Action::ExecuteTransactions` from state machine
 /// 2. Calls this backend (inline for sim, spawns for prod)
-/// 3. Sends `Event::TransactionsExecuted` when complete
+/// 3. Sends `ProtocolEvent::ExecutionVoteBatchReceived` when complete
 ///
 /// For simulation, steps 2-3 happen synchronously.
 /// For production, step 2 spawns a rayon task, step 3 uses a callback.

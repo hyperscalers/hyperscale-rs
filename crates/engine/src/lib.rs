@@ -15,7 +15,7 @@
 //!      │                                    │
 //!      ├─► Action::ExecuteTransactions ────►│ calls executor.execute(&storage, ...)
 //!      │                                    │
-//!      │◄─ Event::TransactionsExecuted  ◄───┤ (returns results)
+//!      │◄─ ExecutionVoteBatchReceived   ◄───┤ (returns votes)
 //! ```
 //!
 //! # Simulation vs Production

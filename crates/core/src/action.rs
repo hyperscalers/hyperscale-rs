@@ -346,12 +346,10 @@ pub enum Action {
 
     /// Build a complete block proposal.
     ///
-    /// The runner waits for the JMT to reach `parent_state_root`, computes the
-    /// new state root, builds the complete block, and caches the WriteBatch for
-    /// efficient commit later.
+    /// Computes the new state root from certificates, builds the complete block,
+    /// and caches the WriteBatch for efficient commit later.
     ///
-    /// Returns `ProtocolEvent::ProposalBuilt` with either the complete block or a
-    /// timeout if the JMT doesn't catch up within the specified duration.
+    /// Returns `ProtocolEvent::ProposalBuilt` with the complete block.
     ///
     /// This combines state root computation and block building into a single
     /// round-trip, enabling the proposer to use the fast commit path (1 fsync).
@@ -380,7 +378,7 @@ pub enum Action {
     /// Execute a batch of single-shard transactions.
     ///
     /// Delegated to the engine thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::TransactionsExecuted` when complete.
+    /// Returns `ProtocolEvent::ExecutionVoteBatchReceived` with all votes when complete.
     ExecuteTransactions {
         block_hash: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
@@ -406,9 +404,9 @@ pub enum Action {
 
     /// Execute a cross-shard transaction with provisioned state.
     ///
-    /// Used after cross-shard provisioning completes. The runner accumulates these actions
-    /// and executes them in parallel batches for efficiency.
-    /// Returns `ProtocolEvent::CrossShardTransactionsExecuted` when the batch completes.
+    /// Used after cross-shard provisioning completes. The IoLoop accumulates
+    /// these into a batch and flushes them to the execution pool as a group.
+    /// Each transaction produces an individual `ProtocolEvent::ExecutionVoteReceived`.
     ExecuteCrossShardTransaction {
         /// Transaction hash (for correlation).
         tx_hash: Hash,
