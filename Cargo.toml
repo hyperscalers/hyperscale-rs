@@ -103,21 +103,37 @@ hyperscale-types = { path = "crates/types" }
 # External dependencies
 arc-swap = "1.8.0"
 blake3 = "1.5"
+bytes = "1.9"
+clap = { version = "4", features = ["derive"] }
 core_affinity = "0.8"
 crossbeam = "0.8.2"
+dashmap = "6.1.0"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+futures = "0.3"
+hdrhistogram = "7.5"
 hex = { version = "0.4.3", default-features = false }
 im = "15.1"
 indexmap = "2.13.0"
 itertools = "0.14.0"
+libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "quic", "tcp", "noise", "yamux", "tokio", "macros", "identify"] }
+libp2p-stream = "0.4.0-alpha"
+opentelemetry = "0.31.0"
+opentelemetry_sdk = "0.31.0"
+parking_lot = "0.12"
+quick_cache = "0.6"
 rand = "0.8.5"
 rand_chacha = "0.3.1"
 rayon = "1.10"
 rocksdb = "0.24.0"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 tempfile = "3.8.0"
 thiserror = "2.0.18"
 tokio = { version = "1.0", features = ["full"] }
+toml = "0.8"
 tracing = "0.1.44"
+tracing-subscriber = "0.3"
+tracing-test = "0.2.5"
 
 # Radix dependencies (github.com/hyperscalers/radixdlt-scrypto @ 7d0b9a0)
 radix-common = { git = "https://github.com/hyperscalers/radixdlt-scrypto", rev = "7d0b9a0", default-features = false, features = ["std"] }

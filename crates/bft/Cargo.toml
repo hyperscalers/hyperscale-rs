@@ -16,5 +16,5 @@ tracing.workspace = true
 serde.workspace = true
 
 [dev-dependencies]
-tracing-test = "0.2"
+tracing-test.workspace = true
 hyperscale-test-helpers.workspace = true

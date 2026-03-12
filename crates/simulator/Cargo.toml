@@ -17,20 +17,20 @@ radix-common.workspace = true
 radix-transactions.workspace = true
 
 # Metrics
-hdrhistogram = "7.5"
+hdrhistogram.workspace = true
 
 thiserror.workspace = true
 tracing.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 
-clap = { version = "4", features = ["derive"] }
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+clap.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [[bin]]
 name = "hyperscale-sim"
 path = "src/bin/main.rs"
 
 [dev-dependencies]
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
-tracing-test = "0.2.5"
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-test.workspace = true
