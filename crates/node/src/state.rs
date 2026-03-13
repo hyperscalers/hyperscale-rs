@@ -649,6 +649,25 @@ impl NodeStateMachine {
         // They've been included in this block, so don't need to be proposed again.
         // Also invalidate any speculative results that conflict with these writes.
         for cert in &block.certificates {
+            // Debug cross-check: verify our local execution produced the same
+            // receipt_hash as the quorum-signed certificate. A mismatch indicates
+            // an engine determinism bug (different outcome/events for same input).
+            if let Some(local_receipt_hash) = self
+                .execution
+                .execution_cache()
+                .get_receipt_hash(&cert.transaction_hash)
+            {
+                if let Some(ec) = cert.shard_proofs.values().next() {
+                    debug_assert_eq!(
+                        local_receipt_hash,
+                        ec.receipt_hash,
+                        "receipt_hash mismatch for tx {}: local engine produced different \
+                         outcome/events than certificate. This indicates an engine determinism bug.",
+                        cert.transaction_hash,
+                    );
+                }
+            }
+
             self.execution
                 .remove_finalized_certificate(&cert.transaction_hash);
             // Invalidate speculative results that read from nodes being written
@@ -985,9 +1004,12 @@ impl StateMachine for NodeStateMachine {
 
                 // 2. Populate execution cache (in-memory, for block commit fast path)
                 for result in results {
-                    self.execution
-                        .execution_cache_mut()
-                        .insert(result.tx_hash, result.database_updates);
+                    let receipt_hash = result.ledger_receipt.receipt_hash();
+                    self.execution.execution_cache_mut().insert(
+                        result.tx_hash,
+                        result.database_updates,
+                        receipt_hash,
+                    );
                 }
 
                 // 3. Dispatch receipt storage (fire-and-forget, off main thread)

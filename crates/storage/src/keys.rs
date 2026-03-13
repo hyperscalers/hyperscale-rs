@@ -43,10 +43,10 @@ pub fn next_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Build a storage key directly from SubstateWrite fields.
+/// Build a storage key directly from node/partition/sort_key fields.
 ///
-/// This is equivalent to converting through `substate_writes_to_database_updates` +
-/// `to_storage_key`, but avoids the intermediate `DatabaseUpdates` allocation.
+/// Uses SpreadPrefixKeyMapper to compute the db_node_key and db_partition_num,
+/// then builds the composite storage key.
 pub fn storage_key_from_write(
     node_id: &NodeId,
     partition: &hyperscale_types::PartitionNumber,

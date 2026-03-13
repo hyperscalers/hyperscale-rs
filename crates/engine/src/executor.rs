@@ -7,7 +7,7 @@
 //! # Design Principle
 //!
 //! State machines emit `Action::ExecuteTransactions` and receive
-//! `ProtocolEvent::ExecutionVoteBatchReceived`. The runner owns the storage
+//! `ProtocolEvent::ExecutionBatchCompleted`. The runner owns the storage
 //! and executor, calling the executor methods to handle these actions.
 //!
 //! **IMPORTANT**: The executor is READ-ONLY. It does NOT commit state changes
@@ -22,11 +22,11 @@
 //!      ↓
 //!      → executor.execute_single_shard(&storage, &transactions)  // READ-ONLY
 //!      ↓
-//! Runner → ProtocolEvent::ExecutionVoteBatchReceived { votes }
+//! Runner → ProtocolEvent::ExecutionBatchCompleted { votes, results }
 //!      ↓
 //! ... voting, certificate creation, block inclusion ...
 //!      ↓
-//! Runner → Action::PersistTransactionCertificate  // WRITES COMMITTED HERE
+//! Block commit applies DatabaseUpdates from execution cache
 //! ```
 
 use crate::error::ExecutionError;

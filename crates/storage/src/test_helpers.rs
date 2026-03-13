@@ -1,6 +1,6 @@
 //! Shared test helpers for storage crate tests.
 //!
-//! Provides reusable builder functions for `DatabaseUpdates`, `SubstateWrite`,
+//! Provides reusable builder functions for `DatabaseUpdates`,
 //! `TransactionCertificate`, `Block`, and `QuorumCertificate` so that
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
@@ -11,10 +11,11 @@ use hyperscale_types::{
     zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, ExecutionCertificate,
     FeeSummary, Hash, LedgerTransactionOutcome, LedgerTransactionReceipt,
     LocalTransactionExecution, LogLevel, NodeId, PartitionNumber, QuorumCertificate, ReceiptBundle,
-    ShardGroupId, SignerBitfield, SubstateChange, SubstateChangeAction, SubstateRef, SubstateWrite,
+    ShardGroupId, SignerBitfield, SubstateChange, SubstateChangeAction, SubstateRef,
     TransactionCertificate, TransactionDecision, ValidatorId,
 };
 use radix_common::prelude::DatabaseUpdate;
+use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -44,27 +45,38 @@ pub fn make_database_update(
     updates
 }
 
-/// Build a `SubstateWrite` with a uniform `NodeId` derived from `node_seed`.
-pub fn make_substate_write(
+/// Build `DatabaseUpdates` from a logical node seed, using SpreadPrefixKeyMapper
+/// to compute the correct db_node_key — matching the storage format used in production.
+///
+/// The `NodeId` is `[node_seed; 30]`, consistent with other test helpers.
+pub fn make_mapped_database_update(
     node_seed: u8,
     partition: u8,
     sort_key: Vec<u8>,
     value: Vec<u8>,
-) -> SubstateWrite {
-    SubstateWrite {
-        node_id: NodeId([node_seed; 30]),
-        partition: PartitionNumber(partition),
-        sort_key,
-        value,
+) -> DatabaseUpdates {
+    let radix_node_id = radix_common::types::NodeId(NodeId([node_seed; 30]).0);
+    let radix_partition = radix_common::types::PartitionNumber(partition);
+    let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
+    let db_partition_num = SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
+    let db_sort_key = DbSortKey(sort_key);
+
+    let mut updates = DatabaseUpdates::default();
+    let node_updates = updates.node_updates.entry(db_node_key).or_default();
+    let partition_updates = node_updates
+        .partition_updates
+        .entry(db_partition_num)
+        .or_insert_with(|| PartitionDatabaseUpdates::Delta {
+            substate_updates: indexmap::IndexMap::new(),
+        });
+    if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
+        substate_updates.insert(db_sort_key, DatabaseUpdate::Set(value));
     }
+    updates
 }
 
 /// Build a `TransactionCertificate` with a deterministic hash derived from `tx_seed`.
-pub fn make_test_certificate(
-    tx_seed: u8,
-    shard: ShardGroupId,
-    _writes: Vec<SubstateWrite>,
-) -> TransactionCertificate {
+pub fn make_test_certificate(tx_seed: u8, shard: ShardGroupId) -> TransactionCertificate {
     let tx_hash = Hash::from_bytes(&[tx_seed; 32]);
     let execution_cert = ExecutionCertificate {
         transaction_hash: tx_hash,
@@ -115,15 +127,13 @@ pub fn make_test_block(height: u64) -> Block {
 }
 
 /// Build a `TransactionCertificate` with proofs for multiple shards.
-///
-/// Each entry in `shard_writes` maps a `ShardGroupId` to its writes.
 pub fn make_multi_shard_certificate(
     tx_seed: u8,
-    shard_writes: Vec<(ShardGroupId, Vec<SubstateWrite>)>,
+    shards: Vec<ShardGroupId>,
 ) -> TransactionCertificate {
     let tx_hash = Hash::from_bytes(&[tx_seed; 32]);
     let mut shard_proofs = BTreeMap::new();
-    for (shard, _writes) in shard_writes {
+    for shard in shards {
         let execution_cert = ExecutionCertificate {
             transaction_hash: tx_hash,
             shard_group_id: shard,

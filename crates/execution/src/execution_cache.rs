@@ -17,6 +17,15 @@ use std::collections::HashMap;
 /// Default maximum number of cached entries before LRU eviction.
 pub const DEFAULT_MAX_ENTRIES: usize = 10_000;
 
+/// Cached execution output for a single transaction.
+struct CachedExecution {
+    /// Raw write set from execution.
+    database_updates: DatabaseUpdates,
+    /// Hash of the ConsensusReceipt (outcome + event_root).
+    /// Used for debug_assert cross-checks at block commit time.
+    receipt_hash: Hash,
+}
+
 /// In-memory cache of execution write sets, keyed by transaction hash.
 ///
 /// Entries are evicted when:
@@ -27,7 +36,7 @@ pub const DEFAULT_MAX_ENTRIES: usize = 10_000;
 /// This cache does NOT persist across restarts. After restart, the node
 /// syncs (fetches receipts from peers) to rebuild state.
 pub struct ExecutionCache {
-    entries: HashMap<Hash, DatabaseUpdates>,
+    entries: HashMap<Hash, CachedExecution>,
     /// Insertion-order tracking for LRU eviction.
     insertion_order: Vec<Hash>,
     /// Maximum number of entries before LRU eviction.
@@ -45,10 +54,15 @@ impl ExecutionCache {
     }
 
     /// Insert execution results. If the cache is full, evict oldest entries.
-    pub fn insert(&mut self, tx_hash: Hash, updates: DatabaseUpdates) {
+    pub fn insert(&mut self, tx_hash: Hash, updates: DatabaseUpdates, receipt_hash: Hash) {
+        let entry = CachedExecution {
+            database_updates: updates,
+            receipt_hash,
+        };
+
         // If already present, update in-place without changing insertion order
         if let std::collections::hash_map::Entry::Occupied(mut e) = self.entries.entry(tx_hash) {
-            e.insert(updates);
+            e.insert(entry);
             return;
         }
 
@@ -62,20 +76,25 @@ impl ExecutionCache {
             }
         }
 
-        self.entries.insert(tx_hash, updates);
+        self.entries.insert(tx_hash, entry);
         self.insertion_order.push(tx_hash);
     }
 
     /// Look up cached writes for a transaction. Returns `None` if not cached.
     pub fn get(&self, tx_hash: &Hash) -> Option<&DatabaseUpdates> {
-        self.entries.get(tx_hash)
+        self.entries.get(tx_hash).map(|e| &e.database_updates)
+    }
+
+    /// Look up the cached receipt_hash for a transaction. Returns `None` if not cached.
+    pub fn get_receipt_hash(&self, tx_hash: &Hash) -> Option<Hash> {
+        self.entries.get(tx_hash).map(|e| e.receipt_hash)
     }
 
     /// Remove an entry (called after block commit or transaction rejection).
     pub fn remove(&mut self, tx_hash: &Hash) -> Option<DatabaseUpdates> {
-        if let Some(updates) = self.entries.remove(tx_hash) {
+        if let Some(entry) = self.entries.remove(tx_hash) {
             self.insertion_order.retain(|h| h != tx_hash);
-            Some(updates)
+            Some(entry.database_updates)
         } else {
             None
         }
@@ -137,7 +156,7 @@ mod tests {
         let updates = make_updates(1);
 
         assert!(cache.get(&h).is_none());
-        cache.insert(h, updates);
+        cache.insert(h, updates, Hash::ZERO);
         assert!(cache.get(&h).is_some());
         assert_eq!(cache.len(), 1);
     }
@@ -146,7 +165,7 @@ mod tests {
     fn test_remove() {
         let mut cache = ExecutionCache::new(100);
         let h = hash(1);
-        cache.insert(h, make_updates(1));
+        cache.insert(h, make_updates(1), Hash::ZERO);
 
         let removed = cache.remove(&h);
         assert!(removed.is_some());
@@ -164,7 +183,7 @@ mod tests {
     fn test_remove_batch() {
         let mut cache = ExecutionCache::new(100);
         for i in 0..5 {
-            cache.insert(hash(i), make_updates(i));
+            cache.insert(hash(i), make_updates(i), Hash::ZERO);
         }
         assert_eq!(cache.len(), 5);
 
@@ -180,13 +199,13 @@ mod tests {
     #[test]
     fn test_lru_eviction() {
         let mut cache = ExecutionCache::new(3);
-        cache.insert(hash(1), make_updates(1));
-        cache.insert(hash(2), make_updates(2));
-        cache.insert(hash(3), make_updates(3));
+        cache.insert(hash(1), make_updates(1), Hash::ZERO);
+        cache.insert(hash(2), make_updates(2), Hash::ZERO);
+        cache.insert(hash(3), make_updates(3), Hash::ZERO);
         assert_eq!(cache.len(), 3);
 
         // Inserting a 4th should evict hash(1) (oldest)
-        cache.insert(hash(4), make_updates(4));
+        cache.insert(hash(4), make_updates(4), Hash::ZERO);
         assert_eq!(cache.len(), 3);
         assert!(cache.get(&hash(1)).is_none(), "oldest should be evicted");
         assert!(cache.get(&hash(2)).is_some());
@@ -197,12 +216,12 @@ mod tests {
     #[test]
     fn test_insert_duplicate_does_not_evict() {
         let mut cache = ExecutionCache::new(3);
-        cache.insert(hash(1), make_updates(1));
-        cache.insert(hash(2), make_updates(2));
-        cache.insert(hash(3), make_updates(3));
+        cache.insert(hash(1), make_updates(1), Hash::ZERO);
+        cache.insert(hash(2), make_updates(2), Hash::ZERO);
+        cache.insert(hash(3), make_updates(3), Hash::ZERO);
 
         // Re-inserting hash(1) should NOT evict anything
-        cache.insert(hash(1), make_updates(1));
+        cache.insert(hash(1), make_updates(1), Hash::ZERO);
         assert_eq!(cache.len(), 3);
         assert!(cache.get(&hash(1)).is_some());
         assert!(cache.get(&hash(2)).is_some());
@@ -212,8 +231,8 @@ mod tests {
     #[test]
     fn test_has_all() {
         let mut cache = ExecutionCache::new(100);
-        cache.insert(hash(1), make_updates(1));
-        cache.insert(hash(2), make_updates(2));
+        cache.insert(hash(1), make_updates(1), Hash::ZERO);
+        cache.insert(hash(2), make_updates(2), Hash::ZERO);
 
         assert!(cache.has_all(&[hash(1), hash(2)]));
         assert!(!cache.has_all(&[hash(1), hash(3)]));
@@ -223,8 +242,8 @@ mod tests {
     #[test]
     fn test_missing() {
         let mut cache = ExecutionCache::new(100);
-        cache.insert(hash(1), make_updates(1));
-        cache.insert(hash(2), make_updates(2));
+        cache.insert(hash(1), make_updates(1), Hash::ZERO);
+        cache.insert(hash(2), make_updates(2), Hash::ZERO);
 
         let missing = cache.missing(&[hash(1), hash(2), hash(3)]);
         assert_eq!(missing, vec![hash(3)]);

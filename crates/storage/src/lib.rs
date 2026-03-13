@@ -8,7 +8,7 @@
 //!
 //! Storage is an implementation detail of runners, not the state machine.
 //! The state machine emits `Action::ExecuteTransactions` and receives
-//! `ProtocolEvent::ExecutionVoteBatchReceived` - it never touches storage directly.
+//! `ProtocolEvent::ExecutionBatchCompleted` - it never touches storage directly.
 //!
 //! Runners own storage and pass it to the executor:
 //! - `SimulationRunner` uses in-memory storage (`SimStorage`)
@@ -48,10 +48,7 @@ pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
 pub use jmt_snapshot::{JmtSnapshot, LeafSubstateKeyAssociation};
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use store::{SubstateStore, RADIX_PREFIX};
-pub use writes::{
-    filter_updates_to_shard, merge_database_updates, merge_into,
-    substate_writes_to_database_updates,
-};
+pub use writes::{filter_updates_to_shard, merge_database_updates, merge_into};
 
 /// Returns `None` when the JMT is truly empty (height 0 with zero root),
 /// indicating no parent node exists. Otherwise returns `Some(block_height)`.

@@ -1,49 +1,10 @@
-//! Conversion from SubstateWrites to DatabaseUpdates.
+//! Utilities for merging and filtering `DatabaseUpdates`.
 
-use hyperscale_types::{ShardGroupId, SubstateWrite};
+use hyperscale_types::ShardGroupId;
 use radix_common::prelude::DatabaseUpdate;
-use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 use radix_substate_store_interface::interface::{
-    DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
+    DatabaseUpdates, NodeDatabaseUpdates, PartitionDatabaseUpdates,
 };
-
-/// Convert SubstateWrites to DatabaseUpdates for committing to storage.
-///
-/// Used by test helpers to build `DatabaseUpdates` from `SubstateWrite` vectors.
-pub fn substate_writes_to_database_updates(writes: &[SubstateWrite]) -> DatabaseUpdates {
-    let mut updates = DatabaseUpdates::default();
-
-    for write in writes {
-        let radix_node_id = radix_common::types::NodeId(write.node_id.0);
-        let radix_partition = radix_common::types::PartitionNumber(write.partition.0);
-
-        let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
-        let db_partition_num = SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
-        let db_sort_key = DbSortKey(write.sort_key.clone());
-
-        let node_updates =
-            updates
-                .node_updates
-                .entry(db_node_key)
-                .or_insert_with(|| NodeDatabaseUpdates {
-                    partition_updates: indexmap::IndexMap::new(),
-                });
-
-        let partition_updates = node_updates
-            .partition_updates
-            .entry(db_partition_num)
-            .or_insert_with(|| PartitionDatabaseUpdates::Delta {
-                substate_updates: indexmap::IndexMap::new(),
-            });
-
-        let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates else {
-            unreachable!("writes conversion always creates Delta partitions");
-        };
-        substate_updates.insert(db_sort_key, DatabaseUpdate::Set(write.value.clone()));
-    }
-
-    updates
-}
 
 /// Merge a slice of per-certificate `DatabaseUpdates` into a single combined update.
 ///
@@ -161,100 +122,8 @@ pub fn filter_updates_to_shard(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::make_substate_write;
     use radix_common::prelude::DatabaseUpdate;
-
-    #[test]
-    fn test_substate_writes_to_database_updates_single() {
-        let writes = vec![make_substate_write(1, 0, vec![10, 20], vec![99, 88])];
-        let updates = substate_writes_to_database_updates(&writes);
-
-        assert_eq!(updates.node_updates.len(), 1);
-        let (_, node_updates) = updates.node_updates.iter().next().unwrap();
-        assert_eq!(node_updates.partition_updates.len(), 1);
-        let (_, partition_updates) = node_updates.partition_updates.iter().next().unwrap();
-        match partition_updates {
-            PartitionDatabaseUpdates::Delta { substate_updates } => {
-                assert_eq!(substate_updates.len(), 1);
-                let (sort_key, update) = substate_updates.iter().next().unwrap();
-                assert_eq!(sort_key.0, vec![10, 20]);
-                assert!(matches!(update, DatabaseUpdate::Set(v) if v == &vec![99, 88]));
-            }
-            _ => panic!("expected Delta partition updates"),
-        }
-    }
-
-    #[test]
-    fn test_substate_writes_to_database_updates_multiple_nodes() {
-        let writes = vec![
-            make_substate_write(1, 0, vec![10], vec![1]),
-            make_substate_write(2, 0, vec![20], vec![2]),
-        ];
-        let updates = substate_writes_to_database_updates(&writes);
-        assert_eq!(updates.node_updates.len(), 2);
-    }
-
-    #[test]
-    fn test_substate_writes_to_database_updates_same_partition() {
-        let writes = vec![
-            make_substate_write(1, 0, vec![10], vec![1]),
-            make_substate_write(1, 0, vec![20], vec![2]),
-        ];
-        let updates = substate_writes_to_database_updates(&writes);
-
-        assert_eq!(updates.node_updates.len(), 1);
-        let (_, node_updates) = updates.node_updates.iter().next().unwrap();
-        assert_eq!(node_updates.partition_updates.len(), 1);
-        let (_, partition_updates) = node_updates.partition_updates.iter().next().unwrap();
-        match partition_updates {
-            PartitionDatabaseUpdates::Delta { substate_updates } => {
-                assert_eq!(substate_updates.len(), 2);
-            }
-            _ => panic!("expected Delta partition updates"),
-        }
-    }
-
-    #[test]
-    fn test_substate_writes_to_database_updates_empty() {
-        let updates = substate_writes_to_database_updates(&[]);
-        assert!(updates.node_updates.is_empty());
-    }
-
-    #[test]
-    fn test_substate_writes_to_database_updates_multiple_partitions() {
-        let writes = vec![
-            make_substate_write(1, 0, vec![10], vec![1]),
-            make_substate_write(1, 3, vec![20], vec![2]),
-        ];
-        let updates = substate_writes_to_database_updates(&writes);
-
-        assert_eq!(updates.node_updates.len(), 1);
-        let (_, node_updates) = updates.node_updates.iter().next().unwrap();
-        assert_eq!(node_updates.partition_updates.len(), 2);
-    }
-
-    #[test]
-    fn test_substate_writes_last_write_wins() {
-        let writes = vec![
-            make_substate_write(1, 0, vec![10], vec![1]),
-            make_substate_write(1, 0, vec![10], vec![99]),
-        ];
-        let updates = substate_writes_to_database_updates(&writes);
-
-        let (_, node_updates) = updates.node_updates.iter().next().unwrap();
-        let (_, partition_updates) = node_updates.partition_updates.iter().next().unwrap();
-        match partition_updates {
-            PartitionDatabaseUpdates::Delta { substate_updates } => {
-                assert_eq!(substate_updates.len(), 1);
-                let (_, update) = substate_updates.iter().next().unwrap();
-                assert!(
-                    matches!(update, DatabaseUpdate::Set(v) if v == &vec![99]),
-                    "last write should win for duplicate sort keys"
-                );
-            }
-            _ => panic!("expected Delta partition updates"),
-        }
-    }
+    use radix_substate_store_interface::interface::DbSortKey;
 
     // Helper to create a Delta DatabaseUpdates with a single node/partition/substate.
     fn make_delta_updates(

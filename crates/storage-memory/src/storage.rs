@@ -182,7 +182,7 @@ impl<D: Dispatch + 'static> SimStorage<D> {
 
     /// Atomically commit a certificate and its state writes.
     ///
-    /// Applies substate state writes and stores certificate metadata.
+    /// Applies database updates and stores certificate metadata.
     /// JMT is deferred to block commit — this mirrors the production
     /// `RocksDbStorage::commit_certificate_with_writes()` to ensure DST
     /// catches timing bugs where code incorrectly assumes state is available
@@ -191,9 +191,8 @@ impl<D: Dispatch + 'static> SimStorage<D> {
     pub fn commit_certificate_with_writes(
         &self,
         certificate: &TransactionCertificate,
-        writes: &[hyperscale_types::SubstateWrite],
+        updates: &hyperscale_storage::DatabaseUpdates,
     ) {
-        let updates = hyperscale_storage::substate_writes_to_database_updates(writes);
         {
             let mut s = self.state.write().unwrap();
             apply_updates_to_ordmap(&mut s.data, &updates);
@@ -909,7 +908,7 @@ mod tests {
     use super::*;
     use hyperscale_dispatch_sync::SyncDispatch;
     use hyperscale_storage::test_helpers::{
-        make_database_update, make_substate_write, make_test_block, make_test_certificate,
+        make_database_update, make_mapped_database_update, make_test_block, make_test_certificate,
         make_test_qc,
     };
     use hyperscale_storage::{
@@ -1135,7 +1134,7 @@ mod tests {
     #[test]
     fn test_certificate_store_and_retrieve() {
         let storage = SimStorage::new(SyncDispatch::new());
-        let cert = make_test_certificate(1, ShardGroupId(0), vec![]);
+        let cert = make_test_certificate(1, ShardGroupId(0));
         let tx_hash = cert.transaction_hash;
 
         storage.store_certificate(&cert);
@@ -1261,8 +1260,8 @@ mod tests {
     #[test]
     fn test_certificates_batch() {
         let storage = SimStorage::new(SyncDispatch::new());
-        let cert1 = make_test_certificate(1, ShardGroupId(0), vec![]);
-        let cert2 = make_test_certificate(2, ShardGroupId(0), vec![]);
+        let cert1 = make_test_certificate(1, ShardGroupId(0));
+        let cert2 = make_test_certificate(2, ShardGroupId(0));
         let hash1 = cert1.transaction_hash;
         let hash2 = cert2.transaction_hash;
 
@@ -1276,7 +1275,7 @@ mod tests {
     #[test]
     fn test_certificates_batch_partial() {
         let storage = SimStorage::new(SyncDispatch::new());
-        let cert = make_test_certificate(1, ShardGroupId(0), vec![]);
+        let cert = make_test_certificate(1, ShardGroupId(0));
         let hash = cert.transaction_hash;
         storage.store_certificate(&cert);
 
@@ -1369,9 +1368,8 @@ mod tests {
     fn test_commit_block_single_cert() {
         let storage = SimStorage::new(SyncDispatch::new());
         let shard = ShardGroupId(0);
-        let writes = vec![make_substate_write(1, 0, vec![10], vec![42])];
-        let updates = hyperscale_storage::substate_writes_to_database_updates(&writes);
-        let cert = Arc::new(make_test_certificate(1, shard, writes));
+        let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
+        let cert = Arc::new(make_test_certificate(1, shard));
 
         let result = storage.commit_block(&updates, &[cert], 1, None);
         assert_ne!(result, Hash::ZERO);
@@ -1381,14 +1379,11 @@ mod tests {
     fn test_commit_block_multiple_certs() {
         let storage = SimStorage::new(SyncDispatch::new());
         let shard = ShardGroupId(0);
-        let writes1 = vec![make_substate_write(1, 0, vec![10], vec![1])];
-        let writes2 = vec![make_substate_write(2, 0, vec![20], vec![2])];
-        let merged = hyperscale_storage::merge_database_updates(&[
-            hyperscale_storage::substate_writes_to_database_updates(&writes1),
-            hyperscale_storage::substate_writes_to_database_updates(&writes2),
-        ]);
-        let cert1 = Arc::new(make_test_certificate(1, shard, writes1));
-        let cert2 = Arc::new(make_test_certificate(2, shard, writes2));
+        let updates1 = make_mapped_database_update(1, 0, vec![10], vec![1]);
+        let updates2 = make_mapped_database_update(2, 0, vec![20], vec![2]);
+        let merged = hyperscale_storage::merge_database_updates(&[updates1, updates2]);
+        let cert1 = Arc::new(make_test_certificate(1, shard));
+        let cert2 = Arc::new(make_test_certificate(2, shard));
 
         let result = storage.commit_block(&merged, &[cert1, cert2], 1, None);
         // Certificate merging: all certs applied as single JMT version = block_height
@@ -1410,8 +1405,7 @@ mod tests {
         let s_prepared = SimStorage::new(SyncDispatch::new());
         let s_direct = SimStorage::new(SyncDispatch::new());
         let shard = ShardGroupId(0);
-        let writes = vec![make_substate_write(1, 0, vec![10], vec![42])];
-        let cert = Arc::new(make_test_certificate(1, shard, writes));
+        let cert = Arc::new(make_test_certificate(1, shard));
 
         // Prepare path
         let parent_root = s_prepared.state_root_hash();
@@ -1436,11 +1430,7 @@ mod tests {
     fn test_prepare_commit_state_root_matches() {
         let storage = SimStorage::new(SyncDispatch::new());
         let shard = ShardGroupId(0);
-        let cert = Arc::new(make_test_certificate(
-            1,
-            shard,
-            vec![make_substate_write(1, 0, vec![10], vec![42])],
-        ));
+        let cert = Arc::new(make_test_certificate(1, shard));
 
         let parent_root = storage.state_root_hash();
         let (spec_root, prepared) =
@@ -1453,10 +1443,10 @@ mod tests {
     #[test]
     fn test_commit_certificate_individual() {
         let storage = SimStorage::new(SyncDispatch::new());
-        let writes = vec![make_substate_write(1, 0, vec![10], vec![42])];
-        let cert = make_test_certificate(1, ShardGroupId(0), writes.clone());
+        let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
+        let cert = make_test_certificate(1, ShardGroupId(0));
 
-        storage.commit_certificate_with_writes(&cert, &writes);
+        storage.commit_certificate_with_writes(&cert, &updates);
 
         // Individual cert commits persist substate data + certificate metadata,
         // but JMT is deferred to block commit.
@@ -1470,11 +1460,7 @@ mod tests {
     fn test_commit_block_stores_certificates() {
         let storage = SimStorage::new(SyncDispatch::new());
         let shard = ShardGroupId(0);
-        let cert = Arc::new(make_test_certificate(
-            1,
-            shard,
-            vec![make_substate_write(1, 0, vec![10], vec![42])],
-        ));
+        let cert = Arc::new(make_test_certificate(1, shard));
         let tx_hash = cert.transaction_hash;
 
         let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None);
@@ -1525,11 +1511,11 @@ mod tests {
         let node_id = NodeId([1; 30]);
 
         // Commit two substates for the same node
-        let write1 = make_substate_write(1, 0, vec![10], vec![100]);
-        let write2 = make_substate_write(1, 0, vec![20], vec![200]);
-        let writes = vec![write1, write2];
-        let cert = make_test_certificate(1, ShardGroupId(0), writes.clone());
-        storage.commit_certificate_with_writes(&cert, &writes);
+        let updates1 = make_mapped_database_update(1, 0, vec![10], vec![100]);
+        let updates2 = make_mapped_database_update(1, 0, vec![20], vec![200]);
+        let merged = hyperscale_storage::merge_database_updates(&[updates1, updates2]);
+        let cert = make_test_certificate(1, ShardGroupId(0));
+        storage.commit_certificate_with_writes(&cert, &merged);
 
         let substates: Vec<_> = storage.list_substates_for_node(&node_id).collect();
         assert_eq!(substates.len(), 2, "should find exactly 2 substates");
@@ -1555,16 +1541,14 @@ mod tests {
         let shard = ShardGroupId(0);
 
         // Block height 1: commit value [100] for node 1
-        let write1 = make_substate_write(1, 0, vec![10], vec![100]);
-        let updates1 = hyperscale_storage::substate_writes_to_database_updates(&[write1.clone()]);
-        let cert1 = Arc::new(make_test_certificate(1, shard, vec![write1]));
+        let updates1 = make_mapped_database_update(1, 0, vec![10], vec![100]);
+        let cert1 = Arc::new(make_test_certificate(1, shard));
         let result1 = storage.commit_block(&updates1, &[cert1], 1, None);
         let root_v1 = result1;
 
         // Block height 2: overwrite with value [200]
-        let write2 = make_substate_write(1, 0, vec![10], vec![200]);
-        let updates2 = hyperscale_storage::substate_writes_to_database_updates(&[write2.clone()]);
-        let cert2 = Arc::new(make_test_certificate(2, shard, vec![write2]));
+        let updates2 = make_mapped_database_update(1, 0, vec![10], vec![200]);
+        let cert2 = Arc::new(make_test_certificate(2, shard));
         let result2 = storage.commit_block(&updates2, &[cert2], 2, None);
         let root_v2 = result2;
         assert_ne!(root_v1, root_v2, "roots must differ after overwrite");

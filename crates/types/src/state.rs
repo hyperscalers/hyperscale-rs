@@ -2,43 +2,10 @@
 
 use crate::{
     exec_vote_message, zero_bls_signature, BlockHeight, Bls12381G2Signature, Hash, NodeId,
-    PartitionNumber, ShardGroupId, SignerBitfield, ValidatorId,
+    ShardGroupId, SignerBitfield, ValidatorId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
-
-/// A write to a substate.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
-pub struct SubstateWrite {
-    /// The node being written to.
-    pub node_id: NodeId,
-
-    /// Partition within the node.
-    pub partition: PartitionNumber,
-
-    /// Key within the partition (sort key).
-    pub sort_key: Vec<u8>,
-
-    /// New value.
-    pub value: Vec<u8>,
-}
-
-impl SubstateWrite {
-    /// Create a new substate write.
-    pub fn new(
-        node_id: NodeId,
-        partition: PartitionNumber,
-        sort_key: Vec<u8>,
-        value: Vec<u8>,
-    ) -> Self {
-        Self {
-            node_id,
-            partition,
-            sort_key,
-            value,
-        }
-    }
-}
 
 // ============================================================================
 // State entry types with pre-computed storage keys
