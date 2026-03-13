@@ -1,9 +1,9 @@
-//! Utilities for merging and filtering `DatabaseUpdates`.
+//! Utilities for merging, filtering, and reconstructing `DatabaseUpdates`.
 
-use hyperscale_types::ShardGroupId;
+use hyperscale_types::{LedgerTransactionReceipt, ShardGroupId, SubstateChangeAction};
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::{
-    DatabaseUpdates, NodeDatabaseUpdates, PartitionDatabaseUpdates,
+    DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
 };
 
 /// Merge a slice of per-certificate `DatabaseUpdates` into a single combined update.
@@ -89,6 +89,50 @@ fn merge_partition_updates(
             }
         }
     }
+}
+
+/// Reconstruct `DatabaseUpdates` from a ledger receipt's state changes.
+///
+/// This converts the receipt's `SubstateChange` entries into the `DatabaseUpdates`
+/// format used by the JMT commit path. Used by syncing nodes that receive receipts
+/// from peers instead of executing transactions locally.
+///
+/// The resulting `DatabaseUpdates` contain ALL nodes (not filtered to any shard).
+/// Call `filter_updates_to_shard` afterward to restrict to the local shard.
+pub fn receipt_to_database_updates(receipt: &LedgerTransactionReceipt) -> DatabaseUpdates {
+    use crate::keys::node_entity_key;
+    use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
+
+    let mut updates = DatabaseUpdates::default();
+
+    for change in &receipt.state_changes {
+        let db_node_key = node_entity_key(&change.substate_ref.node_id);
+        let radix_partition = radix_common::types::PartitionNumber(change.substate_ref.partition.0);
+        let db_partition_num = SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
+        let db_sort_key = DbSortKey(change.substate_ref.sort_key.clone());
+
+        let db_update = match &change.action {
+            SubstateChangeAction::Create { new_value } => DatabaseUpdate::Set(new_value.clone()),
+            SubstateChangeAction::Update { new_value, .. } => {
+                DatabaseUpdate::Set(new_value.clone())
+            }
+            SubstateChangeAction::Delete { .. } => DatabaseUpdate::Delete,
+        };
+
+        let node_updates = updates.node_updates.entry(db_node_key).or_default();
+        let partition_updates = node_updates
+            .partition_updates
+            .entry(db_partition_num)
+            .or_insert_with(|| PartitionDatabaseUpdates::Delta {
+                substate_updates: indexmap::IndexMap::new(),
+            });
+
+        if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
+            substate_updates.insert(db_sort_key, db_update);
+        }
+    }
+
+    updates
 }
 
 /// Filter DatabaseUpdates to only include writes for the local shard.
@@ -333,5 +377,158 @@ mod tests {
             matches!(get_delta_value(&merged, b"node1", 0, &[1]), Some(DatabaseUpdate::Set(v)) if v == vec![10]),
             "single-element merge should be identity"
         );
+    }
+
+    // ── receipt_to_database_updates tests ────────────────────────────────
+
+    mod receipt_conversion {
+        use super::super::receipt_to_database_updates;
+        use hyperscale_types::{
+            LedgerTransactionOutcome, LedgerTransactionReceipt, NodeId, PartitionNumber,
+            SubstateChange, SubstateChangeAction, SubstateRef,
+        };
+        use radix_common::prelude::DatabaseUpdate;
+        use radix_substate_store_interface::interface::PartitionDatabaseUpdates;
+
+        #[test]
+        fn test_empty_receipt_produces_empty_updates() {
+            let receipt = LedgerTransactionReceipt {
+                outcome: LedgerTransactionOutcome::Success,
+                state_changes: vec![],
+                application_events: vec![],
+            };
+            let updates = receipt_to_database_updates(&receipt);
+            assert!(updates.node_updates.is_empty());
+        }
+
+        #[test]
+        fn test_create_produces_set() {
+            let receipt = LedgerTransactionReceipt {
+                outcome: LedgerTransactionOutcome::Success,
+                state_changes: vec![SubstateChange {
+                    substate_ref: SubstateRef {
+                        node_id: NodeId([1; 30]),
+                        partition: PartitionNumber(0),
+                        sort_key: vec![10],
+                    },
+                    action: SubstateChangeAction::Create {
+                        new_value: vec![42],
+                    },
+                }],
+                application_events: vec![],
+            };
+            let updates = receipt_to_database_updates(&receipt);
+            assert_eq!(updates.node_updates.len(), 1);
+
+            let node = updates.node_updates.values().next().unwrap();
+            let part = node.partition_updates.values().next().unwrap();
+            match part {
+                PartitionDatabaseUpdates::Delta { substate_updates } => {
+                    assert_eq!(substate_updates.len(), 1);
+                    let val = substate_updates.values().next().unwrap();
+                    assert!(matches!(val, DatabaseUpdate::Set(v) if v == &vec![42]));
+                }
+                _ => panic!("expected Delta"),
+            }
+        }
+
+        #[test]
+        fn test_delete_produces_delete() {
+            let receipt = LedgerTransactionReceipt {
+                outcome: LedgerTransactionOutcome::Failure,
+                state_changes: vec![SubstateChange {
+                    substate_ref: SubstateRef {
+                        node_id: NodeId([2; 30]),
+                        partition: PartitionNumber(1),
+                        sort_key: vec![20],
+                    },
+                    action: SubstateChangeAction::Delete {
+                        previous_value: vec![99],
+                    },
+                }],
+                application_events: vec![],
+            };
+            let updates = receipt_to_database_updates(&receipt);
+            assert_eq!(updates.node_updates.len(), 1);
+
+            let node = updates.node_updates.values().next().unwrap();
+            let part = node.partition_updates.values().next().unwrap();
+            match part {
+                PartitionDatabaseUpdates::Delta { substate_updates } => {
+                    assert_eq!(substate_updates.len(), 1);
+                    let val = substate_updates.values().next().unwrap();
+                    assert!(matches!(val, DatabaseUpdate::Delete));
+                }
+                _ => panic!("expected Delta"),
+            }
+        }
+
+        #[test]
+        fn test_update_uses_new_value() {
+            let receipt = LedgerTransactionReceipt {
+                outcome: LedgerTransactionOutcome::Success,
+                state_changes: vec![SubstateChange {
+                    substate_ref: SubstateRef {
+                        node_id: NodeId([3; 30]),
+                        partition: PartitionNumber(2),
+                        sort_key: vec![30],
+                    },
+                    action: SubstateChangeAction::Update {
+                        previous_value: vec![10],
+                        new_value: vec![20],
+                    },
+                }],
+                application_events: vec![],
+            };
+            let updates = receipt_to_database_updates(&receipt);
+
+            let node = updates.node_updates.values().next().unwrap();
+            let part = node.partition_updates.values().next().unwrap();
+            match part {
+                PartitionDatabaseUpdates::Delta { substate_updates } => {
+                    let val = substate_updates.values().next().unwrap();
+                    assert!(
+                        matches!(val, DatabaseUpdate::Set(v) if v == &vec![20]),
+                        "should use new_value, not previous_value"
+                    );
+                }
+                _ => panic!("expected Delta"),
+            }
+        }
+
+        #[test]
+        fn test_multiple_changes_same_node_different_partitions() {
+            let receipt = LedgerTransactionReceipt {
+                outcome: LedgerTransactionOutcome::Success,
+                state_changes: vec![
+                    SubstateChange {
+                        substate_ref: SubstateRef {
+                            node_id: NodeId([4; 30]),
+                            partition: PartitionNumber(0),
+                            sort_key: vec![1],
+                        },
+                        action: SubstateChangeAction::Create {
+                            new_value: vec![10],
+                        },
+                    },
+                    SubstateChange {
+                        substate_ref: SubstateRef {
+                            node_id: NodeId([4; 30]),
+                            partition: PartitionNumber(5),
+                            sort_key: vec![2],
+                        },
+                        action: SubstateChangeAction::Create {
+                            new_value: vec![20],
+                        },
+                    },
+                ],
+                application_events: vec![],
+            };
+            let updates = receipt_to_database_updates(&receipt);
+            // Same node_id → same db_node_key → one entry
+            assert_eq!(updates.node_updates.len(), 1);
+            let node = updates.node_updates.values().next().unwrap();
+            assert_eq!(node.partition_updates.len(), 2);
+        }
     }
 }

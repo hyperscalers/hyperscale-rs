@@ -48,7 +48,9 @@ pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
 pub use jmt_snapshot::{JmtSnapshot, LeafSubstateKeyAssociation};
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use store::{SubstateStore, RADIX_PREFIX};
-pub use writes::{filter_updates_to_shard, merge_database_updates, merge_into};
+pub use writes::{
+    filter_updates_to_shard, merge_database_updates, merge_into, receipt_to_database_updates,
+};
 
 /// Returns `None` when the JMT is truly empty (height 0 with zero root),
 /// indicating no parent node exists. Otherwise returns `Some(block_height)`.

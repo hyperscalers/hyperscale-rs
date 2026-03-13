@@ -376,6 +376,8 @@ where
 
         let storage = Arc::clone(&self.storage);
         let event_tx = self.event_sender.clone();
+        let local_shard = self.local_shard;
+        let num_shards = self.num_shards;
 
         self.dispatch.spawn_execution(move || {
             for (i, (block, qc)) in commits.into_iter().enumerate() {
@@ -393,11 +395,36 @@ where
                 // Consensus metadata is folded into the same atomic write.
                 let prepared = prepared_map[i].take();
                 let result = if let Some(prepared) = prepared {
+                    // Normal path: prepared commit from VerifyStateRoot.
                     storage.commit_prepared_block(prepared, &block.certificates, Some(consensus))
+                } else if !block.certificates.is_empty() {
+                    // Sync path: no execution cache, reconstruct DatabaseUpdates
+                    // from receipts stored during sync.
+                    let per_cert: Vec<hyperscale_types::DatabaseUpdates> = block
+                        .certificates
+                        .iter()
+                        .map(|cert| {
+                            let receipt = storage
+                                .get_ledger_receipt(&cert.transaction_hash)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "Missing receipt for certificate {} at height {} — \
+                                         sync response was incomplete and pre-storage failed",
+                                        cert.transaction_hash, height.0,
+                                    )
+                                });
+                            let updates = hyperscale_storage::receipt_to_database_updates(&receipt);
+                            hyperscale_storage::filter_updates_to_shard(
+                                &updates,
+                                local_shard,
+                                num_shards,
+                            )
+                        })
+                        .collect();
+                    let merged = hyperscale_storage::merge_database_updates(&per_cert);
+                    storage.commit_block(&merged, &block.certificates, height.0, Some(consensus))
                 } else {
-                    // No prepared commit — fallback with empty updates.
-                    // The prepared path is the normal case; this only hits for
-                    // empty blocks or when the prepared commit was stale.
+                    // Empty block: no updates needed.
                     let empty_updates = hyperscale_types::DatabaseUpdates::default();
                     storage.commit_block(
                         &empty_updates,

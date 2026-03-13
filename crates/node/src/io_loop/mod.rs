@@ -539,7 +539,21 @@ where
             }
 
             // ── Sync protocol ──────────────────────────────────────────
-            NodeInput::SyncBlockResponseReceived { height, block } => {
+            NodeInput::SyncBlockResponseReceived {
+                height,
+                block,
+                ledger_receipts,
+            } => {
+                // Store receipts from sync peer BEFORE processing the block.
+                // Syncing nodes didn't execute locally, so local_execution is None.
+                for entry in &ledger_receipts {
+                    self.storage
+                        .store_receipt_bundle(&hyperscale_types::ReceiptBundle {
+                            tx_hash: entry.tx_hash,
+                            ledger_receipt: std::sync::Arc::new(entry.receipt.clone()),
+                            local_execution: None,
+                        });
+                }
                 let outputs = self
                     .sync_protocol
                     .handle(SyncInput::BlockResponseReceived { height, block });
@@ -570,7 +584,18 @@ where
             NodeInput::CertificateReceived {
                 block_hash,
                 certificates,
+                ledger_receipts,
             } => {
+                // Store receipts from fetch peer. Syncing nodes didn't execute
+                // locally, so local_execution is None.
+                for entry in &ledger_receipts {
+                    self.storage
+                        .store_receipt_bundle(&hyperscale_types::ReceiptBundle {
+                            tx_hash: entry.tx_hash,
+                            ledger_receipt: std::sync::Arc::new(entry.receipt.clone()),
+                            local_execution: None,
+                        });
+                }
                 let outputs = self
                     .fetch_protocol
                     .handle(FetchInput::CertificatesReceived {

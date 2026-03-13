@@ -3,8 +3,8 @@
 use crate::ProtocolEvent;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, Hash,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, StateProvision, TransactionCertificate,
-    ValidatorId,
+    LedgerReceiptEntry, QuorumCertificate, RoutableTransaction, ShardGroupId, StateProvision,
+    TransactionCertificate, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -64,6 +64,8 @@ pub enum NodeInput {
     SyncBlockResponseReceived {
         height: u64,
         block: Box<Option<(Block, QuorumCertificate)>>,
+        /// Ledger receipts for the block's certificates (from sync peer).
+        ledger_receipts: Vec<LedgerReceiptEntry>,
     },
 
     /// Sync block fetch failed from network callback.
@@ -88,6 +90,8 @@ pub enum NodeInput {
     CertificateReceived {
         block_hash: Hash,
         certificates: Vec<TransactionCertificate>,
+        /// Ledger receipts for the certificates (from fetch peer).
+        ledger_receipts: Vec<LedgerReceiptEntry>,
     },
 
     /// Transaction validated by the validation pipeline.

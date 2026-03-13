@@ -567,7 +567,8 @@ pub fn serve_transaction_request(
 /// Serve an inbound certificate fetch request.
 ///
 /// Checks the in-memory cache first (for recently built but not yet
-/// persisted certificates), then falls back to storage.
+/// persisted certificates), then falls back to storage. Includes ledger
+/// receipts for each found certificate.
 pub fn serve_certificate_request(
     storage: &impl ConsensusStore,
     cert_cache: &QuickCache<Hash, Arc<TransactionCertificate>>,
@@ -599,15 +600,28 @@ pub fn serve_certificate_request(
         found.extend(storage.get_certificates_batch(&missing));
     }
 
+    // Collect receipts for each found certificate.
+    let mut ledger_receipts = Vec::with_capacity(found.len());
+    for cert in &found {
+        let tx_hash = cert.transaction_hash;
+        if let Some(receipt) = storage.get_ledger_receipt(&tx_hash) {
+            ledger_receipts.push(hyperscale_types::LedgerReceiptEntry {
+                tx_hash,
+                receipt: (*receipt).clone(),
+            });
+        }
+    }
+
     let found_count = found.len();
     debug!(
         block_hash = ?req.block_hash,
         requested = requested_count,
         found = found_count,
+        receipts = ledger_receipts.len(),
         "Responding to certificate fetch request"
     );
     metrics::record_fetch_response_sent("certificate", found_count);
-    GetCertificatesResponse::new(found)
+    GetCertificatesResponse::new(found, ledger_receipts)
 }
 
 #[cfg(test)]

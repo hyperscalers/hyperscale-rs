@@ -40,14 +40,38 @@ where
                         },
                         Box::new(move |result| match result {
                             Ok(resp) => {
-                                let block = match (resp.block, resp.qc) {
+                                let (block_opt, qc_opt, ledger_receipts) = resp.into_parts();
+                                let block = match (block_opt, qc_opt) {
                                     (Some(b), Some(q)) => Some((b, q)),
                                     _ => None,
                                 };
-                                let _ = es.send(NodeInput::SyncBlockResponseReceived {
-                                    height,
-                                    block: Box::new(block),
+
+                                // Validate that the peer included receipts for every
+                                // certificate in the block. A missing receipt makes the
+                                // block unusable — treat it as a failed fetch so the
+                                // sync protocol retries from another peer.
+                                let receipts_complete = block.as_ref().is_none_or(|(b, _)| {
+                                    b.certificates.iter().all(|cert| {
+                                        ledger_receipts
+                                            .iter()
+                                            .any(|e| e.tx_hash == cert.transaction_hash)
+                                    })
                                 });
+
+                                if receipts_complete {
+                                    let _ = es.send(NodeInput::SyncBlockResponseReceived {
+                                        height,
+                                        block: Box::new(block),
+                                        ledger_receipts,
+                                    });
+                                } else {
+                                    tracing::warn!(
+                                        height,
+                                        "Sync peer sent block with incomplete receipts — \
+                                         treating as fetch failure"
+                                    );
+                                    let _ = es.send(NodeInput::SyncBlockFetchFailed { height });
+                                }
                             }
                             Err(_) => {
                                 let _ = es.send(NodeInput::SyncBlockFetchFailed { height });
@@ -123,9 +147,11 @@ where
                         GetCertificatesRequest::new(block_hash, cert_hashes),
                         Box::new(move |result| match result {
                             Ok(resp) => {
+                                let (certificates, ledger_receipts) = resp.into_parts();
                                 let _ = es.send(NodeInput::CertificateReceived {
                                     block_hash: bh,
-                                    certificates: resp.into_certificates(),
+                                    certificates,
+                                    ledger_receipts,
                                 });
                             }
                             Err(_) => {
