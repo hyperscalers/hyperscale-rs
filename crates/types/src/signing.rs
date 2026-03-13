@@ -31,7 +31,7 @@ pub const DOMAIN_BLOCK_VOTE: &[u8] = b"BLOCK_VOTE";
 
 /// Domain tag for execution votes.
 ///
-/// Format: `EXEC_VOTE` || tx_hash || state_root || shard_group || success
+/// Format: `EXEC_VOTE` || tx_hash || receipt_hash || shard_group || success
 ///
 /// Note: ExecutionCertificates aggregate signatures from ExecutionVotes, so they
 /// use the same domain tag since they verify the same underlying message.
@@ -263,14 +263,14 @@ pub fn validator_bind_message(peer_id_bytes: &[u8]) -> Vec<u8> {
 /// signatures from ExecutionVotes.
 pub fn exec_vote_message(
     tx_hash: &Hash,
-    writes_commitment: &Hash,
+    receipt_hash: &Hash,
     shard_group: ShardGroupId,
     success: bool,
 ) -> Vec<u8> {
     let mut message = Vec::new();
     message.extend_from_slice(DOMAIN_EXEC_VOTE);
     message.extend_from_slice(tx_hash.as_bytes());
-    message.extend_from_slice(writes_commitment.as_bytes());
+    message.extend_from_slice(receipt_hash.as_bytes());
     message.extend_from_slice(&shard_group.0.to_le_bytes());
     message.push(if success { 1 } else { 0 });
     message
@@ -379,9 +379,9 @@ mod tests {
         let votes = vec![ExecutionVote {
             transaction_hash: Hash::from_bytes(b"tx1"),
             shard_group_id: ShardGroupId(1),
-            writes_commitment: Hash::from_bytes(b"commit"),
+            receipt_hash: Hash::from_bytes(b"commit"),
             success: true,
-            state_writes: vec![],
+            write_nodes: vec![],
             validator: crate::ValidatorId(0),
             signature: crate::zero_bls_signature(),
         }];
@@ -402,7 +402,8 @@ mod tests {
             shard_group_id: ShardGroupId(1),
             read_nodes: vec![],
             state_writes: vec![],
-            writes_commitment: Hash::from_bytes(b"commit"),
+            write_nodes: vec![],
+            receipt_hash: Hash::from_bytes(b"commit"),
             success: true,
             aggregated_signature: crate::zero_bls_signature(),
             signers: SignerBitfield::new(4),

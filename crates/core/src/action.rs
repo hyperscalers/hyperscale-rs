@@ -215,12 +215,16 @@ pub enum Action {
         tx_hash: Hash,
         /// Shard group that executed.
         shard: ShardGroupId,
-        /// Deterministic hash-chain commitment over execution output writes.
-        writes_commitment: Hash,
+        /// Hash of the ConsensusReceipt (outcome + event_root).
+        receipt_hash: Hash,
         /// Votes to aggregate (with quorum).
         votes: Vec<ExecutionVote>,
         /// Read nodes (for certificate).
         read_nodes: Vec<NodeId>,
+        /// State writes from execution (temporarily carried here for cert building).
+        state_writes: Vec<hyperscale_types::SubstateWrite>,
+        /// Write nodes touched by this transaction's execution.
+        write_nodes: Vec<NodeId>,
         /// Ordered committee for the shard (for SignerBitfield index mapping).
         committee: Vec<ValidatorId>,
     },
@@ -378,7 +382,7 @@ pub enum Action {
     /// Execute a batch of single-shard transactions.
     ///
     /// Delegated to the engine thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::ExecutionVoteBatchReceived` with all votes when complete.
+    /// Returns `ProtocolEvent::ExecutionBatchCompleted` with all votes when complete.
     ExecuteTransactions {
         block_hash: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
@@ -504,6 +508,14 @@ pub enum Action {
     ///
     /// Stored so we don't re-execute if we crash and recover.
     PersistTransactionCertificate { certificate: TransactionCertificate },
+
+    /// Persist receipt bundles to disk. Fire-and-forget — no ProtocolEvent response.
+    ///
+    /// Dispatched by the state machine after populating the execution cache.
+    /// Only for canonical execution (not speculative).
+    StoreReceiptBundles {
+        bundles: Vec<hyperscale_types::ReceiptBundle>,
+    },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Global Consensus / Epoch Management
@@ -724,6 +736,7 @@ impl Action {
                 | Action::PersistBlock { .. }
                 | Action::PersistAndBroadcastVote { .. }
                 | Action::PersistTransactionCertificate { .. }
+                | Action::StoreReceiptBundles { .. }
                 | Action::RequestMissingProvisions { .. }
         )
     }
@@ -746,6 +759,7 @@ impl Action {
                 | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
                 | Action::FetchAndBroadcastProvisions { .. }
+                | Action::StoreReceiptBundles { .. }
                 | Action::FetchBlock { .. }
                 | Action::FetchChainMetadata
         )
@@ -809,6 +823,7 @@ impl Action {
 
             // Storage - Execution
             Action::PersistTransactionCertificate { .. } => "PersistTransactionCertificate",
+            Action::StoreReceiptBundles { .. } => "StoreReceiptBundles",
 
             // Storage - Read Requests
             Action::FetchBlock { .. } => "FetchBlock",

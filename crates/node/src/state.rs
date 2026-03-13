@@ -889,7 +889,7 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ExecutionVoteReceived { vote } => {
                 self.execution.on_vote(self.topology.snapshot(), vote)
             }
-            ProtocolEvent::ExecutionVoteBatchReceived { votes } => {
+            ProtocolEvent::ExecutionBatchCompleted { votes, results: _ } => {
                 let mut actions = Vec::new();
                 for vote in votes {
                     actions.extend(self.execution.on_vote(self.topology.snapshot(), vote));

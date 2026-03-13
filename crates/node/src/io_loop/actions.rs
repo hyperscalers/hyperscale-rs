@@ -204,7 +204,8 @@ where
             | Action::InitiateShardMerge { .. }
             | Action::CompleteShardMerge { .. }
             | Action::PersistEpochConfig { .. }
-            | Action::FetchEpochConfig { .. } => {}
+            | Action::FetchEpochConfig { .. }
+            | Action::StoreReceiptBundles { .. } => {}
         }
     }
 

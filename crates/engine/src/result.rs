@@ -1,6 +1,8 @@
 //! Execution result types.
 
-use hyperscale_types::{Hash, LedgerTransactionReceipt, LocalTransactionExecution, SubstateWrite};
+use hyperscale_types::{
+    ExecutionResult, Hash, LedgerTransactionReceipt, LocalTransactionExecution, SubstateWrite,
+};
 use radix_substate_store_interface::interface::DatabaseUpdates;
 
 /// Output from executing a batch of transactions.
@@ -51,12 +53,6 @@ pub struct SingleTxResult {
     /// Whether execution succeeded (committed).
     pub success: bool,
 
-    /// Deterministic hash-chain commitment over execution output writes.
-    ///
-    /// Used in the voting protocol to ensure all shards agree on results.
-    /// For failed transactions, this is a zero hash.
-    pub writes_commitment: Hash,
-
     /// State writes from execution (for certificate creation).
     ///
     /// Only populated for successful executions.
@@ -87,7 +83,6 @@ impl SingleTxResult {
     /// Create a successful result.
     pub fn success(
         tx_hash: Hash,
-        writes_commitment: Hash,
         state_writes: Vec<SubstateWrite>,
         receipt_hash: Hash,
         ledger_receipt: LedgerTransactionReceipt,
@@ -97,7 +92,6 @@ impl SingleTxResult {
         Self {
             tx_hash,
             success: true,
-            writes_commitment,
             state_writes,
             receipt_hash,
             ledger_receipt,
@@ -112,7 +106,6 @@ impl SingleTxResult {
         Self {
             tx_hash,
             success: false,
-            writes_commitment: Hash::ZERO,
             state_writes: vec![],
             receipt_hash: LedgerTransactionReceipt::failure().receipt_hash(),
             ledger_receipt: LedgerTransactionReceipt::failure(),
@@ -133,20 +126,17 @@ impl SingleTxResult {
     }
 }
 
-/// Execution output that travels alongside an ExecutionVote through the
-/// ProtocolEvent boundary from the thread pool to the state machine.
-///
-/// The state machine uses this to:
-/// 1. Populate the ExecutionCache (in-memory, for block commit fast path)
-/// 2. Dispatch receipt storage to disk (via StoreReceiptBundles action)
-#[derive(Debug, Clone)]
-pub struct ExecutionResult {
-    /// Hash of the executed transaction.
-    pub tx_hash: Hash,
-    /// Raw DatabaseUpdates for the execution cache.
-    pub database_updates: DatabaseUpdates,
-    /// Full ledger receipt with all state changes.
-    pub ledger_receipt: LedgerTransactionReceipt,
-    /// Local execution metadata (fees, logs, errors).
-    pub local_execution: LocalTransactionExecution,
+// ExecutionResult is defined in hyperscale_types::receipt and re-exported
+// from hyperscale_types. The engine crate re-exports it from lib.rs for
+// backward compatibility.
+
+impl From<SingleTxResult> for ExecutionResult {
+    fn from(r: SingleTxResult) -> Self {
+        Self {
+            tx_hash: r.tx_hash,
+            database_updates: r.database_updates,
+            ledger_receipt: r.ledger_receipt,
+            local_execution: r.local_execution,
+        }
+    }
 }

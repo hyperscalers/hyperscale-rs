@@ -296,6 +296,26 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle {
     }
 }
 
+// ─── Execution Result ────────────────────────────────────────────────────
+
+/// Execution output that travels alongside an ExecutionVote through the
+/// ProtocolEvent boundary from the thread pool to the state machine.
+///
+/// The state machine uses this to:
+/// 1. Populate the ExecutionCache (in-memory, for block commit fast path)
+/// 2. Dispatch receipt storage to disk (via StoreReceiptBundles action)
+#[derive(Debug, Clone)]
+pub struct ExecutionResult {
+    /// Hash of the executed transaction.
+    pub tx_hash: Hash,
+    /// Raw DatabaseUpdates for the execution cache.
+    pub database_updates: radix_substate_store_interface::interface::DatabaseUpdates,
+    /// Full ledger receipt with all state changes.
+    pub ledger_receipt: LedgerTransactionReceipt,
+    /// Local execution metadata (fees, logs, errors).
+    pub local_execution: LocalTransactionExecution,
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

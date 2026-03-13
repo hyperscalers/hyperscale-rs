@@ -8,8 +8,8 @@
 
 use hyperscale_storage::keys;
 use hyperscale_types::{
-    ApplicationEvent, FeeSummary, Hash, LedgerTransactionOutcome, LedgerTransactionReceipt,
-    LocalTransactionExecution, LogLevel, NodeId, PartitionNumber, StateEntry, SubstateChange,
+    ApplicationEvent, FeeSummary, LedgerTransactionOutcome, LedgerTransactionReceipt,
+    LocalTransactionExecution, LogLevel, PartitionNumber, StateEntry, SubstateChange,
     SubstateChangeAction, SubstateRef, SubstateWrite,
 };
 use radix_common::prelude::DatabaseUpdate;
@@ -46,12 +46,7 @@ pub fn extract_substate_writes(receipt: &TransactionReceipt) -> Vec<SubstateWrit
     let mut writes = Vec::new();
 
     for (db_node_key, node_updates) in &updates.node_updates {
-        // Convert DbNodeKey back to NodeId (extract 30-byte suffix after 20-byte hash prefix)
-        let node_id = if db_node_key.len() >= 50 {
-            let mut id = [0u8; 30];
-            id.copy_from_slice(&db_node_key[20..50]);
-            NodeId(id)
-        } else {
+        let Some(node_id) = keys::db_node_key_to_node_id(db_node_key) else {
             continue;
         };
 
@@ -74,39 +69,6 @@ pub fn extract_substate_writes(receipt: &TransactionReceipt) -> Vec<SubstateWrit
     }
 
     writes
-}
-
-/// Compute a deterministic commitment hash for a set of substate writes.
-///
-/// This is used for transaction certificates - validators vote on this hash
-/// to agree on execution results before the writes are applied to storage.
-///
-/// Note: This is distinct from `storage.state_root_hash()` which is the JMT
-/// root of the entire state tree. This function only hashes the writes from
-/// a single transaction for voting purposes.
-///
-/// Uses a simple hash chain over sorted writes for determinism.
-pub fn compute_writes_commitment(writes: &[SubstateWrite]) -> Hash {
-    if writes.is_empty() {
-        return Hash::ZERO;
-    }
-
-    // Sort writes for determinism
-    let mut sorted: Vec<_> = writes.iter().collect();
-    sorted.sort_by(|a, b| {
-        (&a.node_id.0, a.partition.0, &a.sort_key).cmp(&(&b.node_id.0, b.partition.0, &b.sort_key))
-    });
-
-    // Hash chain
-    let mut data = Vec::new();
-    for write in sorted {
-        data.extend_from_slice(&write.node_id.0);
-        data.push(write.partition.0);
-        data.extend_from_slice(&write.sort_key);
-        data.extend_from_slice(&write.value);
-    }
-
-    Hash::from_bytes(&data)
 }
 
 // ============================================================================
@@ -193,11 +155,7 @@ pub(crate) fn extract_state_changes(
     let mut changes = Vec::new();
 
     for (db_node_key, node_updates) in &db_updates.node_updates {
-        let node_id = if db_node_key.len() >= 50 {
-            let mut id = [0u8; 30];
-            id.copy_from_slice(&db_node_key[20..50]);
-            NodeId(id)
-        } else {
+        let Some(node_id) = keys::db_node_key_to_node_id(db_node_key) else {
             continue;
         };
 

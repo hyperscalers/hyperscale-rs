@@ -89,9 +89,9 @@ mod tests {
         let vote = ExecutionVote {
             transaction_hash: Hash::from_bytes(b"tx"),
             shard_group_id: ShardGroupId(0),
-            writes_commitment: Hash::from_bytes(b"commitment"),
+            receipt_hash: Hash::from_bytes(b"commitment"),
             success: true,
-            state_writes: vec![],
+            write_nodes: vec![],
             validator: ValidatorId(0),
             signature: zero_bls_signature(),
         };

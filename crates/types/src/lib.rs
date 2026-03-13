@@ -77,14 +77,12 @@ pub use block::{
 };
 pub use quorum_certificate::QuorumCertificate;
 pub use receipt::{
-    ApplicationEvent, ConsensusReceipt, FeeSummary, LedgerReceiptEntry, LedgerTransactionOutcome,
-    LedgerTransactionReceipt, LocalTransactionExecution, LogLevel, ReceiptBundle, SubstateChange,
-    SubstateChangeAction, SubstateRef,
+    ApplicationEvent, ConsensusReceipt, ExecutionResult, FeeSummary, LedgerReceiptEntry,
+    LedgerTransactionOutcome, LedgerTransactionReceipt, LocalTransactionExecution, LogLevel,
+    ReceiptBundle, SubstateChange, SubstateChangeAction, SubstateRef,
 };
 pub use signer_bitfield::SignerBitfield;
-pub use state::{
-    ExecutionCertificate, ExecutionResult, ExecutionVote, StateEntry, StateProvision, SubstateWrite,
-};
+pub use state::{ExecutionCertificate, ExecutionVote, StateEntry, StateProvision, SubstateWrite};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
     sign_and_notarize, sign_and_notarize_with_options, AbortReason, DeferReason, ReadyTransactions,

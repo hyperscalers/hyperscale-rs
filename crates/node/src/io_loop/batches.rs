@@ -92,7 +92,7 @@ where
                 )
             });
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
-            for vote in votes {
+            for (vote, _result) in votes {
                 let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived {
                     vote,
                 }));

@@ -144,17 +144,17 @@ pub struct ExecutionVote {
     /// Shard group that executed.
     pub shard_group_id: ShardGroupId,
 
-    /// Deterministic hash-chain commitment over execution output writes.
-    pub writes_commitment: Hash,
+    /// Hash of the ConsensusReceipt (outcome + event_root).
+    pub receipt_hash: Hash,
 
     /// Whether execution succeeded.
     pub success: bool,
 
-    /// State writes produced by execution.
+    /// NodeIds written during execution (for speculative invalidation).
     ///
-    /// Used to populate ExecutionCertificate.state_writes for speculative
-    /// execution invalidation.
-    pub state_writes: Vec<SubstateWrite>,
+    /// Deterministically ordered via BTreeSet so all validators within a
+    /// shard produce identical write_nodes vectors from identical execution.
+    pub write_nodes: Vec<NodeId>,
 
     /// Validator that executed and voted.
     pub validator: ValidatorId,
@@ -169,7 +169,7 @@ impl ExecutionVote {
         let mut data = Vec::new();
         data.extend_from_slice(self.transaction_hash.as_bytes());
         data.extend_from_slice(&self.shard_group_id.0.to_le_bytes());
-        data.extend_from_slice(self.writes_commitment.as_bytes());
+        data.extend_from_slice(self.receipt_hash.as_bytes());
         data.push(if self.success { 1 } else { 0 });
 
         Hash::from_bytes(&data)
@@ -185,7 +185,7 @@ impl ExecutionVote {
     pub fn signing_message(&self) -> Vec<u8> {
         exec_vote_message(
             &self.transaction_hash,
-            &self.writes_commitment,
+            &self.receipt_hash,
             self.shard_group_id,
             self.success,
         )
@@ -204,11 +204,17 @@ pub struct ExecutionCertificate {
     /// Node IDs that were READ during execution.
     pub read_nodes: Vec<NodeId>,
 
+    /// NodeIds written during execution (from first vote — all identical within shard).
+    pub write_nodes: Vec<NodeId>,
+
     /// Substate data that was WRITTEN during execution.
+    ///
+    /// **Temporary**: Kept for the block commit path (`extract_writes_per_cert`).
+    /// Will be removed in Phase 5 when the commit path switches to execution cache.
     pub state_writes: Vec<SubstateWrite>,
 
-    /// Deterministic hash-chain commitment over execution output writes.
-    pub writes_commitment: Hash,
+    /// Hash of the ConsensusReceipt (outcome + event_root).
+    pub receipt_hash: Hash,
 
     /// Whether execution succeeded.
     pub success: bool,
@@ -246,20 +252,20 @@ impl ExecutionCertificate {
         self.read_nodes.len()
     }
 
-    /// Get number of state writes.
+    /// Get number of write nodes.
     pub fn write_count(&self) -> usize {
-        self.state_writes.len()
+        self.write_nodes.len()
     }
 
-    /// Check if this certificate can be applied (has state writes).
+    /// Check if this certificate has writes.
     pub fn has_writes(&self) -> bool {
-        !self.state_writes.is_empty()
+        !self.write_nodes.is_empty()
     }
 
     /// Create a certificate for a single-shard transaction.
     pub fn single_shard(
         transaction_hash: Hash,
-        writes_commitment: Hash,
+        receipt_hash: Hash,
         shard_group_id: ShardGroupId,
         success: bool,
     ) -> Self {
@@ -267,8 +273,9 @@ impl ExecutionCertificate {
             transaction_hash,
             shard_group_id,
             read_nodes: vec![],
+            write_nodes: vec![],
             state_writes: vec![],
-            writes_commitment,
+            receipt_hash,
             success,
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::empty(),
@@ -286,7 +293,7 @@ impl ExecutionCertificate {
     pub fn signing_message(&self) -> Vec<u8> {
         exec_vote_message(
             &self.transaction_hash,
-            &self.writes_commitment,
+            &self.receipt_hash,
             self.shard_group_id,
             self.success,
         )
@@ -411,25 +418,6 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for StateProvision {
     }
 }
 
-/// Result of executing a transaction.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct ExecutionResult {
-    /// Hash of the transaction.
-    pub transaction_hash: Hash,
-
-    /// Whether execution succeeded.
-    pub success: bool,
-
-    /// Merkle root of the state changes.
-    pub state_root: Hash,
-
-    /// Writes produced by the transaction.
-    pub writes: Vec<SubstateWrite>,
-
-    /// Error message if execution failed.
-    pub error: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -452,7 +440,7 @@ mod tests {
     fn test_single_shard_certificate() {
         let cert = ExecutionCertificate::single_shard(
             Hash::from_bytes(b"tx"),
-            Hash::from_bytes(b"root"),
+            Hash::from_bytes(b"receipt"),
             ShardGroupId(0),
             true,
         );

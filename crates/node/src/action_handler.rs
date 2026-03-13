@@ -13,7 +13,9 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{CommitStore, SubstateStore};
-use hyperscale_types::{Bls12381G1PrivateKey, ExecutionVote, Hash, ShardGroupId, ValidatorId};
+use hyperscale_types::{
+    Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ShardGroupId, ValidatorId,
+};
 use std::sync::Arc;
 
 /// Context for executing delegated actions.
@@ -280,17 +282,21 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
         Action::AggregateExecutionCertificate {
             tx_hash,
             shard,
-            writes_commitment,
+            receipt_hash,
             votes,
             read_nodes,
+            state_writes,
+            write_nodes,
             committee,
         } => {
             let certificate = hyperscale_execution::handlers::aggregate_execution_certificate(
                 tx_hash,
                 shard,
-                writes_commitment,
+                receipt_hash,
                 &votes,
                 read_nodes,
+                state_writes,
+                write_nodes,
                 &committee,
             );
             Some(DelegatedResult {
@@ -385,7 +391,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             transactions,
             state_root: _,
         } => {
-            let votes: Vec<ExecutionVote> = ctx.dispatch.map_local(&transactions, |tx| {
+            let pairs = ctx.dispatch.map_local(&transactions, |tx| {
                 hyperscale_execution::handlers::execute_and_sign_single_shard(
                     ctx.executor,
                     ctx.storage,
@@ -396,9 +402,12 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 )
             });
 
+            let (votes, results): (Vec<ExecutionVote>, Vec<_>) = pairs.into_iter().unzip();
+            let results = results.into_iter().map(ExecutionResult::from).collect();
+
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
-                    ProtocolEvent::ExecutionVoteBatchReceived { votes },
+                    ProtocolEvent::ExecutionBatchCompleted { votes, results },
                 )],
                 prepared_commit: None,
             })
@@ -408,7 +417,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             block_hash,
             transactions,
         } => {
-            let votes: Vec<ExecutionVote> = ctx.dispatch.map_local(&transactions, |tx| {
+            let pairs = ctx.dispatch.map_local(&transactions, |tx| {
                 hyperscale_execution::handlers::execute_and_sign_single_shard(
                     ctx.executor,
                     ctx.storage,
@@ -419,11 +428,13 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 )
             });
 
+            let (votes, results): (Vec<ExecutionVote>, Vec<_>) = pairs.into_iter().unzip();
+            let results = results.into_iter().map(ExecutionResult::from).collect();
             let tx_hashes: Vec<Hash> = votes.iter().map(|v| v.transaction_hash).collect();
 
             Some(DelegatedResult {
                 events: vec![
-                    NodeInput::Protocol(ProtocolEvent::ExecutionVoteBatchReceived { votes }),
+                    NodeInput::Protocol(ProtocolEvent::ExecutionBatchCompleted { votes, results }),
                     NodeInput::Protocol(ProtocolEvent::SpeculativeExecutionComplete {
                         block_hash,
                         tx_hashes,

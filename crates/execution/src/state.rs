@@ -950,19 +950,26 @@ impl ExecutionState {
         };
 
         // Check for quorum
-        let Some((writes_commitment, total_power)) = tracker.check_quorum() else {
+        let Some((receipt_hash, total_power)) = tracker.check_quorum() else {
             return vec![];
         };
 
-        // Extract data from tracker - use take_votes_for_root to avoid cloning
-        let votes = tracker.take_votes_for_commitment(&writes_commitment);
+        // Extract data from tracker - use take_votes_for_receipt_hash to avoid cloning
+        let votes = tracker.take_votes_for_receipt_hash(&receipt_hash);
         let read_nodes = tracker.read_nodes().to_vec();
         let participating_shards = tracker.participating_shards().to_vec();
+
+        // Take write_nodes from the first vote — all votes within a shard have
+        // identical write_nodes (deterministic execution), so any vote suffices.
+        let write_nodes = votes
+            .first()
+            .map(|v| v.write_nodes.clone())
+            .unwrap_or_default();
 
         tracing::debug!(
             tx_hash = ?tx_hash,
             shard = local_shard.0,
-            writes_commitment = ?writes_commitment,
+            receipt_hash = ?receipt_hash,
             votes = votes.len(),
             power = total_power,
             "Vote quorum reached - delegating BLS aggregation"
@@ -985,9 +992,11 @@ impl ExecutionState {
         vec![Action::AggregateExecutionCertificate {
             tx_hash,
             shard: local_shard,
-            writes_commitment,
+            receipt_hash,
             votes,
             read_nodes,
+            state_writes: vec![],
+            write_nodes,
             committee,
         }]
     }
@@ -1926,7 +1935,7 @@ impl ExecutionState {
         let written_nodes: HashSet<NodeId> = certificate
             .shard_proofs
             .values()
-            .flat_map(|cert| cert.state_writes.iter().map(|w| w.node_id))
+            .flat_map(|cert| cert.write_nodes.iter().copied())
             .collect();
 
         if written_nodes.is_empty() {
@@ -2186,7 +2195,7 @@ mod tests {
 
         // In production, the runner executes + signs + sends ExecutionVoteReceived.
         // Simulate that by creating a vote and calling on_vote.
-        let writes_commitment = Hash::ZERO;
+        let receipt_hash = Hash::ZERO;
         let success = true;
         let local_shard = topology.local_shard();
         let validator_id = topology.local_validator_id();
@@ -2194,15 +2203,15 @@ mod tests {
         // Create a signed vote (simulating what the runner does)
         let signing_key = generate_bls_keypair();
         let message =
-            hyperscale_types::exec_vote_message(&tx_hash, &writes_commitment, local_shard, success);
+            hyperscale_types::exec_vote_message(&tx_hash, &receipt_hash, local_shard, success);
         let signature = signing_key.sign_v1(&message);
 
         let vote = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: local_shard,
-            writes_commitment,
+            receipt_hash,
             success,
-            state_writes: vec![],
+            write_nodes: vec![],
             validator: validator_id,
             signature,
         };
@@ -2381,7 +2390,7 @@ mod tests {
 
         let committee = TestCommittee::new(4, 42);
         let tx_hash = Hash::from_bytes(b"test_tx");
-        let writes_commitment = Hash::from_bytes(b"state_root");
+        let receipt_hash = Hash::from_bytes(b"state_root");
         let shard = ShardGroupId(0);
 
         // Create a properly signed execution vote
@@ -2389,7 +2398,7 @@ mod tests {
             &committee,
             0, // voter index
             tx_hash,
-            writes_commitment,
+            receipt_hash,
             shard,
             true,
         );
@@ -2410,7 +2419,7 @@ mod tests {
 
         let committee = TestCommittee::new(4, 42);
         let tx_hash = Hash::from_bytes(b"test_tx");
-        let writes_commitment = Hash::from_bytes(b"commitment");
+        let receipt_hash = Hash::from_bytes(b"commitment");
         let shard = ShardGroupId(0);
 
         // Create an execution certificate with real aggregated signatures
@@ -2418,7 +2427,7 @@ mod tests {
             &committee,
             &[0, 1, 2], // 3 voters
             tx_hash,
-            writes_commitment,
+            receipt_hash,
             shard,
             true,
         );

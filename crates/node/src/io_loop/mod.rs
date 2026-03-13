@@ -712,7 +712,7 @@ where
                             self.accumulate_broadcast_vote(self.local_shard, vote.clone());
                         }
                     }
-                    ProtocolEvent::ExecutionVoteBatchReceived { ref votes } => {
+                    ProtocolEvent::ExecutionBatchCompleted { ref votes, .. } => {
                         for vote in votes {
                             if vote.validator == self.validator_id {
                                 self.accumulate_broadcast_vote(self.local_shard, vote.clone());

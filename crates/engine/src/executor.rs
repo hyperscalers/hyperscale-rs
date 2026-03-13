@@ -31,15 +31,13 @@
 
 use crate::error::ExecutionError;
 use crate::execution::{
-    build_ledger_receipt, build_local_execution, compute_writes_commitment,
-    extract_database_updates, extract_substate_writes, is_commit_success, ProvisionedSnapshot,
+    build_ledger_receipt, build_local_execution, extract_database_updates, extract_substate_writes,
+    is_commit_success, ProvisionedSnapshot,
 };
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
 use hyperscale_storage::{CommittableSubstateDatabase, SubstateDatabase, SubstateStore};
-use hyperscale_types::{
-    Hash, NodeId, PartitionNumber, RoutableTransaction, StateEntry, StateProvision, SubstateWrite,
-};
+use hyperscale_types::{Hash, NodeId, RoutableTransaction, StateEntry, StateProvision};
 use radix_common::network::NetworkDefinition;
 use radix_engine::transaction::{execute_transaction, ExecutionConfig, TransactionReceipt};
 use radix_engine::vm::DefaultVmModules;
@@ -335,14 +333,12 @@ impl RadixExecutor {
 
         if success {
             let state_writes = extract_substate_writes(receipt);
-            let writes_commitment = compute_writes_commitment(&state_writes);
             let ledger_receipt = build_ledger_receipt(receipt, execution_snapshot);
             let local_execution = build_local_execution(receipt);
             let receipt_hash = ledger_receipt.receipt_hash();
             let database_updates = extract_database_updates(receipt);
             SingleTxResult::success(
                 tx_hash,
-                writes_commitment,
                 state_writes,
                 receipt_hash,
                 ledger_receipt,
@@ -387,14 +383,12 @@ impl RadixExecutor {
                 .filter(|w| declared_set.contains(&w.node_id))
                 .cloned()
                 .collect();
-            let writes_commitment = compute_writes_commitment(&filtered_writes);
             let ledger_receipt = build_ledger_receipt(receipt, execution_snapshot);
             let local_execution = build_local_execution(receipt);
             let receipt_hash = ledger_receipt.receipt_hash();
             let database_updates = extract_database_updates(receipt);
             SingleTxResult::success(
                 tx_hash,
-                writes_commitment,
                 filtered_writes,
                 receipt_hash,
                 ledger_receipt,
@@ -419,27 +413,6 @@ impl RadixExecutor {
         block_height: u64,
     ) -> Option<Vec<StateEntry>> {
         fetch_state_entries(storage, nodes, block_height)
-    }
-
-    /// Compute writes commitment from state writes.
-    ///
-    /// This is a simplified version that uses default partition/sort key.
-    /// Used for testing.
-    pub fn compute_writes_commitment_simple(&self, writes: &[(NodeId, Vec<u8>)]) -> Hash {
-        // Convert to SubstateWrite format
-        let substate_writes: Vec<_> = writes
-            .iter()
-            .map(|(node_id, value)| {
-                SubstateWrite::new(
-                    *node_id,
-                    PartitionNumber(0), // Default partition
-                    vec![],             // Default sort key
-                    value.clone(),
-                )
-            })
-            .collect();
-
-        compute_writes_commitment(&substate_writes)
     }
 
     /// Get reference to the network definition.

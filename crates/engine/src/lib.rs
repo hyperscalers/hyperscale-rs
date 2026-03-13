@@ -15,7 +15,7 @@
 //!      │                                    │
 //!      ├─► Action::ExecuteTransactions ────►│ calls executor.execute(&storage, ...)
 //!      │                                    │
-//!      │◄─ ExecutionVoteBatchReceived   ◄───┤ (returns votes)
+//!      │◄─ ExecutionBatchCompleted      ◄───┤ (returns votes)
 //! ```
 //!
 //! # Simulation vs Production
@@ -37,7 +37,8 @@ mod validation;
 pub use execution::ProvisionedSnapshot;
 pub use executor::{fetch_state_entries, RadixExecutor};
 pub use genesis::GenesisConfig;
-pub use result::ExecutionResult;
+pub use hyperscale_types::ExecutionResult;
+pub use result::SingleTxResult;
 pub use validation::TransactionValidation;
 
 // Re-export Radix types needed by engine callers (not storage-related)

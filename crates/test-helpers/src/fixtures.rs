@@ -136,19 +136,19 @@ pub fn make_signed_execution_vote(
     committee: &TestCommittee,
     voter_idx: usize,
     tx_hash: Hash,
-    writes_commitment: Hash,
+    receipt_hash: Hash,
     shard: ShardGroupId,
     success: bool,
 ) -> ExecutionVote {
-    let message = exec_vote_message(&tx_hash, &writes_commitment, shard, success);
+    let message = exec_vote_message(&tx_hash, &receipt_hash, shard, success);
     let signature = committee.keypair(voter_idx).sign_v1(&message);
 
     ExecutionVote {
         transaction_hash: tx_hash,
         shard_group_id: shard,
-        writes_commitment,
+        receipt_hash,
         success,
-        state_writes: vec![],
+        write_nodes: vec![],
         validator: committee.validator_id(voter_idx),
         signature,
     }
@@ -161,11 +161,11 @@ pub fn make_signed_execution_certificate(
     committee: &TestCommittee,
     voter_indices: &[usize],
     tx_hash: Hash,
-    writes_commitment: Hash,
+    receipt_hash: Hash,
     shard: ShardGroupId,
     success: bool,
 ) -> ExecutionCertificate {
-    let message = exec_vote_message(&tx_hash, &writes_commitment, shard, success);
+    let message = exec_vote_message(&tx_hash, &receipt_hash, shard, success);
 
     // Collect individual signatures
     let signatures: Vec<Bls12381G2Signature> = voter_indices
@@ -187,8 +187,9 @@ pub fn make_signed_execution_certificate(
         transaction_hash: tx_hash,
         shard_group_id: shard,
         read_nodes: vec![],
+        write_nodes: vec![],
         state_writes: vec![],
-        writes_commitment,
+        receipt_hash,
         success,
         aggregated_signature,
         signers,
