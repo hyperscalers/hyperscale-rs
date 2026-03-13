@@ -17,7 +17,7 @@ use hyperscale_types::{
     batch_verify_bls_different_messages, batch_verify_bls_same_message, exec_vote_message,
     verify_bls12381_v1, zero_bls_signature, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     Bls12381G2Signature, ExecutionCertificate, ExecutionVote, Hash, NodeId, RoutableTransaction,
-    ShardGroupId, SignerBitfield, StateProvision, SubstateWrite, ValidatorId,
+    ShardGroupId, SignerBitfield, StateProvision, ValidatorId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,7 +30,7 @@ pub type UnverifiedExecutionVote = (ExecutionVote, Bls12381G1PublicKey, u64);
 /// Deduplicates votes by validator, aggregates BLS signatures, and builds a
 /// signer bitfield using the committee's indices.
 ///
-/// The caller provides `state_writes` and `write_nodes` directly (from the
+/// The caller provides `read_nodes` and `write_nodes` directly (from the
 /// local execution result) rather than extracting them from votes, since votes
 /// are now lightweight (receipt_hash + write_nodes only).
 #[allow(clippy::too_many_arguments)]
@@ -40,7 +40,6 @@ pub fn aggregate_execution_certificate(
     receipt_hash: Hash,
     votes: &[ExecutionVote],
     read_nodes: Vec<NodeId>,
-    state_writes: Vec<SubstateWrite>,
     write_nodes: Vec<NodeId>,
     committee: &[ValidatorId],
 ) -> ExecutionCertificate {
@@ -77,7 +76,6 @@ pub fn aggregate_execution_certificate(
         shard_group_id: shard,
         read_nodes,
         write_nodes,
-        state_writes,
         receipt_hash,
         success,
         aggregated_signature,

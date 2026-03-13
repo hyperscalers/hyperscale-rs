@@ -41,6 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
 
+use crate::execution_cache::ExecutionCache;
 use crate::pending::{
     PendingCertificateAggregation, PendingCertificateVerification,
     PendingFetchedCertificateVerification,
@@ -95,6 +96,10 @@ pub struct SpeculativeResult {
 pub struct ExecutionState {
     /// Current time.
     now: Duration,
+
+    /// In-memory cache of execution write sets (DatabaseUpdates), keyed by tx hash.
+    /// Populated when execution completes, read during block commit, evicted after commit.
+    execution_cache: ExecutionCache,
 
     /// Transactions that have been executed (deduplication).
     /// Maps tx_hash -> block_height when executed, enabling height-based cleanup.
@@ -269,6 +274,7 @@ impl ExecutionState {
     ) -> Self {
         Self {
             now: Duration::ZERO,
+            execution_cache: ExecutionCache::new(crate::execution_cache::DEFAULT_MAX_ENTRIES),
             executed_txs: HashMap::new(),
             finalized_certificates: BTreeMap::new(),
             committed_height: 0,
@@ -307,6 +313,20 @@ impl ExecutionState {
     /// Set the current time.
     pub fn set_time(&mut self, now: Duration) {
         self.now = now;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Execution Cache
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Read access to the execution cache (for block commit / state root verification).
+    pub fn execution_cache(&self) -> &ExecutionCache {
+        &self.execution_cache
+    }
+
+    /// Mutable access to the execution cache (for inserting results / evicting after commit).
+    pub fn execution_cache_mut(&mut self) -> &mut ExecutionCache {
+        &mut self.execution_cache
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -995,7 +1015,6 @@ impl ExecutionState {
             receipt_hash,
             votes,
             read_nodes,
-            state_writes: vec![],
             write_nodes,
             committee,
         }]

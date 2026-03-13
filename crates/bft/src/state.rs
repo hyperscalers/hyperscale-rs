@@ -722,14 +722,15 @@ impl BftState {
     ///
     /// Takes ready transactions from mempool (already sectioned and hash-sorted),
     /// plus deferrals, aborts, and certificates from execution.
-    #[instrument(skip(self, ready_txs, deferred, aborted, certificates, commitment_proofs), fields(
+    #[instrument(skip(self, ready_txs, deferred, aborted, certificates, commitment_proofs, compute_merged_updates), fields(
         tx_count = ready_txs.len(),
         deferred_count = deferred.len(),
         aborted_count = aborted.len(),
         cert_count = certificates.len(),
         proof_count = commitment_proofs.len()
     ))]
-    pub fn on_proposal_timer(
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_proposal_timer<F>(
         &mut self,
         topology: &TopologySnapshot,
         ready_txs: &ReadyTransactions,
@@ -737,7 +738,11 @@ impl BftState {
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
         commitment_proofs: std::collections::HashMap<Hash, CommitmentProof>,
-    ) -> Vec<Action> {
+        compute_merged_updates: F,
+    ) -> Vec<Action>
+    where
+        F: FnOnce(&[Arc<TransactionCertificate>]) -> hyperscale_types::DatabaseUpdates,
+    {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This allows the chain to grow
         // while waiting for the two-chain commit rule to be satisfied.
@@ -932,6 +937,9 @@ impl BftState {
         }
         let provision_targets: Vec<ShardGroupId> = provision_target_set.into_iter().collect();
 
+        // Compute merged DatabaseUpdates from execution cache for the selected certificates.
+        let merged_updates = compute_merged_updates(&certificates_to_propose);
+
         // Always use BuildProposal - the runner handles JMT readiness and timeout.
         // This ensures transactions are always included regardless of certificate state.
         // Include SetTimer to reschedule the proposal timer.
@@ -954,6 +962,7 @@ impl BftState {
                 priority_transactions,
                 transactions: other_transactions,
                 certificates: certificates_to_propose,
+                merged_updates,
                 commitment_proofs,
                 deferred: deferred_filtered,
                 aborted: aborted_with_height,
@@ -1885,17 +1894,17 @@ impl BftState {
                 }
 
                 // Verify state root if block has committed certificates.
+                // The verification pipeline queues the request; NodeStateMachine
+                // will drain and enrich with merged_updates from the execution cache.
                 if self.verification.needs_state_root_verification(&block) {
                     let parent_state_root = self
                         .get_block_by_hash(block.header.parent_hash)
                         .map(|parent| parent.header.state_root)
                         .unwrap_or_else(|| self.get_local_jmt_root());
-                    verification_actions.extend(
-                        self.verification.initiate_state_root_verification(
-                            block_hash,
-                            &block,
-                            parent_state_root,
-                        ),
+                    self.verification.initiate_state_root_verification(
+                        block_hash,
+                        &block,
+                        parent_state_root,
                     );
                 }
 
@@ -2843,26 +2852,26 @@ impl BftState {
     /// This updates our tracked local JMT root (last_committed_jmt_root) and
     /// checks if any pending state root verifications can now proceed.
     ///
+    /// Unblocked verifications are pushed to the ready queue; the caller
+    /// (`NodeStateMachine`) drains them and computes `merged_updates`.
+    ///
     /// # Arguments
     /// * `block_height` - The block height (= JMT version) after the commit
     /// * `state_root` - The JMT root hash after the commit
-    ///
-    /// # Returns
-    /// Actions to verify any state roots that were waiting for this commit.
     #[instrument(skip(self, _topology), fields(block_height, state_root = ?state_root))]
     pub fn on_state_commit_complete(
         &mut self,
         _topology: &TopologySnapshot,
         block_height: u64,
         state_root: Hash,
-    ) -> Vec<Action> {
+    ) {
         // Only advance forward (avoid out-of-order updates).
         // Use strict `<` so that same-height updates are accepted: the BFT state
         // machine advances `committed_height` in `commit_block_and_buffered`
         // *before* the IO loop commits the JMT and sends `StateCommitComplete`.
         // With `<=` the root update would be silently dropped.
         if block_height < self.committed_height {
-            return vec![];
+            return;
         }
 
         debug!(
@@ -2873,7 +2882,7 @@ impl BftState {
             "JMT state commit complete, checking for unblocked verifications"
         );
 
-        self.verification.on_jmt_advanced(block_height, state_root)
+        self.verification.on_jmt_advanced(block_height, state_root);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2960,12 +2969,12 @@ impl BftState {
     ///
     /// `state_root` is the computed JMT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
-    #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, commitment_proofs), fields(
+    #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, commitment_proofs, compute_merged_updates), fields(
         height = qc.height.0,
         block_hash = ?block_hash
     ))]
     #[allow(clippy::too_many_arguments)]
-    pub fn on_qc_formed(
+    pub fn on_qc_formed<F>(
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
@@ -2975,7 +2984,11 @@ impl BftState {
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
         commitment_proofs: HashMap<Hash, CommitmentProof>,
-    ) -> Vec<Action> {
+        compute_merged_updates: F,
+    ) -> Vec<Action>
+    where
+        F: FnOnce(&[Arc<TransactionCertificate>]) -> hyperscale_types::DatabaseUpdates,
+    {
         let height = qc.height.0;
 
         info!(
@@ -3081,6 +3094,7 @@ impl BftState {
                 aborted,
                 certificates,
                 commitment_proofs,
+                compute_merged_updates,
             ));
         } else if should_try_proposal && rate_limited {
             trace!(
@@ -4529,6 +4543,17 @@ impl BftState {
     // ═══════════════════════════════════════════════════════════════════════════
     // Accessors
     // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Drain state root verifications that are ready to dispatch.
+    ///
+    /// Called by `NodeStateMachine` after each BFT method call. The caller
+    /// computes `merged_updates` from the execution cache for each entry
+    /// and emits `VerifyStateRoot` actions.
+    pub fn drain_ready_state_root_verifications(
+        &mut self,
+    ) -> Vec<crate::verification::ReadyStateRootVerification> {
+        self.verification.drain_ready_state_root_verifications()
+    }
 
     /// Get the current committed height.
     pub fn committed_height(&self) -> u64 {
@@ -6996,6 +7021,7 @@ mod tests {
             vec![],                        // no aborts
             vec![],                        // no certificates
             HashMap::new(),                // no commitment proofs
+            |_certs| hyperscale_types::DatabaseUpdates::default(),
         );
 
         // Should NOT contain a BlockHeader broadcast (no proposal)
@@ -7044,6 +7070,7 @@ mod tests {
             vec![],                        // no aborts
             vec![],                        // no certificates
             HashMap::new(),                // no commitment proofs
+            |_certs| hyperscale_types::DatabaseUpdates::default(),
         );
 
         // Should contain a BuildProposal action (proposal triggered)
@@ -7578,6 +7605,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| hyperscale_types::DatabaseUpdates::default(),
         );
 
         // Should NOT contain a BlockHeader broadcast (rate limited)
@@ -7631,6 +7659,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| hyperscale_types::DatabaseUpdates::default(),
         );
 
         // Should contain a BuildProposal action (enough time passed)
@@ -7711,6 +7740,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| hyperscale_types::DatabaseUpdates::default(),
         );
 
         let has_block_header = actions
@@ -7786,6 +7816,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| hyperscale_types::DatabaseUpdates::default(),
         );
 
         // Should contain a BuildProposal action (rate limiting disabled)
@@ -7836,6 +7867,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| hyperscale_types::DatabaseUpdates::default(),
         );
 
         // Check that a BuildProposal action was emitted (async proposal)
@@ -8115,6 +8147,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| hyperscale_types::DatabaseUpdates::default(),
         );
 
         // Should have broadcast a block header
@@ -8190,6 +8223,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| hyperscale_types::DatabaseUpdates::default(),
         );
 
         // Extract the block header
@@ -8478,6 +8512,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| hyperscale_types::DatabaseUpdates::default(),
         );
 
         // Leader activity should be updated
@@ -8597,6 +8632,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| hyperscale_types::DatabaseUpdates::default(),
         );
 
         // Verify we got a proposal (not skipped due to syncing)

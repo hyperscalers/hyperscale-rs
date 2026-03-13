@@ -7,10 +7,10 @@ use hyperscale_messages::{
 };
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
-    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision,
-    TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId,
-    VotePower,
+    CommittedBlockHeader, DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate,
+    ExecutionVote, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    SignerBitfield, StateProvision, TopologySnapshot, TransactionAbort, TransactionCertificate,
+    TransactionDefer, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -221,8 +221,6 @@ pub enum Action {
         votes: Vec<ExecutionVote>,
         /// Read nodes (for certificate).
         read_nodes: Vec<NodeId>,
-        /// State writes from execution (temporarily carried here for cert building).
-        state_writes: Vec<hyperscale_types::SubstateWrite>,
         /// Write nodes touched by this transaction's execution.
         write_nodes: Vec<NodeId>,
         /// Ordered committee for the shard (for SignerBitfield index mapping).
@@ -303,28 +301,27 @@ pub enum Action {
 
     /// Verify a block's state root against the JMT.
     ///
-    /// Computes the speculative state root from certificates and compares
+    /// Computes the speculative state root from pre-merged DatabaseUpdates and compares
     /// against the block header's claimed state_root. Returns `ProtocolEvent::StateRootVerified`.
-    ///
-    /// Each inner Vec represents one certificate's writes. They must be applied
-    /// incrementally (one JMT version per certificate) to match commit-time behavior.
     ///
     /// The verification flow:
     /// 1. Runner checks if local JMT root matches `parent_state_root`
-    /// 2. If match, extracts writes from certificates and computes new root
+    /// 2. Applies merged_updates to compute new JMT root
     /// 3. Compares computed root against `expected_root`
     /// 4. If valid, builds and caches a WriteBatch for efficient commit later
     ///
-    /// This ensures proposer and verifier compute from the same base state.
+    /// The caller (state machine) is responsible for sourcing writes from the
+    /// execution cache, filtering to local shard, and merging.
     VerifyStateRoot {
         block_hash: Hash,
         /// Base state root to verify from (must match local JMT before computing).
         parent_state_root: Hash,
-        /// Expected state root after applying certificate writes.
+        /// Expected state root after applying writes.
         expected_root: Hash,
-        /// Certificates whose writes will be applied to compute the new root.
-        certificates: Vec<Arc<TransactionCertificate>>,
-        /// Block height (used as JMT version for certificate merging).
+        /// Pre-merged DatabaseUpdates (filtered to local shard, from execution cache).
+        /// Wrapped in Arc to avoid expensive clones through the action dispatch pipeline.
+        merged_updates: Arc<DatabaseUpdates>,
+        /// Block height (used as JMT version).
         block_height: u64,
     },
 
@@ -372,6 +369,8 @@ pub enum Action {
         priority_transactions: Vec<Arc<RoutableTransaction>>,
         transactions: Vec<Arc<RoutableTransaction>>,
         certificates: Vec<Arc<TransactionCertificate>>,
+        /// Pre-merged DatabaseUpdates for certificates (filtered to local shard).
+        merged_updates: DatabaseUpdates,
         commitment_proofs: HashMap<Hash, CommitmentProof>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,

@@ -63,7 +63,7 @@ pub fn make_substate_write(
 pub fn make_test_certificate(
     tx_seed: u8,
     shard: ShardGroupId,
-    writes: Vec<SubstateWrite>,
+    _writes: Vec<SubstateWrite>,
 ) -> TransactionCertificate {
     let tx_hash = Hash::from_bytes(&[tx_seed; 32]);
     let execution_cert = ExecutionCertificate {
@@ -71,7 +71,6 @@ pub fn make_test_certificate(
         shard_group_id: shard,
         read_nodes: vec![],
         write_nodes: vec![],
-        state_writes: writes,
         receipt_hash: Hash::from_bytes(&[0; 32]),
         success: true,
         aggregated_signature: zero_bls_signature(),
@@ -124,13 +123,12 @@ pub fn make_multi_shard_certificate(
 ) -> TransactionCertificate {
     let tx_hash = Hash::from_bytes(&[tx_seed; 32]);
     let mut shard_proofs = BTreeMap::new();
-    for (shard, writes) in shard_writes {
+    for (shard, _writes) in shard_writes {
         let execution_cert = ExecutionCertificate {
             transaction_hash: tx_hash,
             shard_group_id: shard,
             read_nodes: vec![],
             write_nodes: vec![],
-            state_writes: writes,
             receipt_hash: Hash::from_bytes(&[0; 32]),
             success: true,
             aggregated_signature: zero_bls_signature(),

@@ -329,6 +329,34 @@ impl NodeStateMachine {
         actions
     }
 
+    /// Compute pre-merged `DatabaseUpdates` for a set of certificate tx_hashes.
+    ///
+    /// Same as `compute_merged_updates_for_certs` but works from tx_hashes
+    /// (used by the state root verification drain path).
+    fn compute_merged_updates_for_tx_hashes(
+        &self,
+        tx_hashes: &[Hash],
+    ) -> hyperscale_types::DatabaseUpdates {
+        let topology = self.topology.snapshot();
+        let local_shard = topology.local_shard();
+        let num_shards = topology.num_shards();
+        let cache = self.execution.execution_cache();
+
+        let per_cert: Vec<hyperscale_types::DatabaseUpdates> = tx_hashes
+            .iter()
+            .filter_map(|tx_hash| {
+                let raw = cache.get(tx_hash)?;
+                Some(hyperscale_storage::filter_updates_to_shard(
+                    raw,
+                    local_shard,
+                    num_shards,
+                ))
+            })
+            .collect();
+
+        hyperscale_storage::merge_database_updates(&per_cert)
+    }
+
     /// Handle proposal timer — propose a block or advance the round on timeout.
     fn on_proposal_timer(&mut self) -> Vec<Action> {
         // Check if we should advance the round due to timeout.
@@ -367,14 +395,36 @@ impl NodeStateMachine {
             MAX_RETRIES,
         );
 
-        // BftState handles state_root computation internally after filtering certificates
+        // Compute merged DatabaseUpdates from execution cache.
+        // The closure captures the execution cache and topology; BftState calls
+        // it with the final filtered certificate list after dedup.
+        let topology = self.topology.snapshot();
+        let local_shard = topology.local_shard();
+        let num_shards = topology.num_shards();
+        let cache = self.execution.execution_cache();
+        let compute_writes = |certs: &[Arc<TransactionCertificate>]| {
+            let per_cert: Vec<hyperscale_types::DatabaseUpdates> = certs
+                .iter()
+                .filter_map(|cert| {
+                    let raw = cache.get(&cert.transaction_hash)?;
+                    Some(hyperscale_storage::filter_updates_to_shard(
+                        raw,
+                        local_shard,
+                        num_shards,
+                    ))
+                })
+                .collect();
+            hyperscale_storage::merge_database_updates(&per_cert)
+        };
+
         self.bft.on_proposal_timer(
-            self.topology.snapshot(),
+            topology,
             &ready_txs,
             deferred,
             aborted,
             certificates,
             commitment_proofs,
+            compute_writes,
         )
     }
 
@@ -484,9 +534,28 @@ impl NodeStateMachine {
 
         let inputs = self.gather_proposal_inputs(pending_tx_count, pending_cert_count);
 
-        // BftState handles state_root computation internally after filtering certificates
+        // Build the closure for computing merged DatabaseUpdates from execution cache.
+        let topology = self.topology.snapshot();
+        let local_shard = topology.local_shard();
+        let num_shards = topology.num_shards();
+        let cache = self.execution.execution_cache();
+        let compute_writes = |certs: &[Arc<TransactionCertificate>]| {
+            let per_cert: Vec<hyperscale_types::DatabaseUpdates> = certs
+                .iter()
+                .filter_map(|cert| {
+                    let raw = cache.get(&cert.transaction_hash)?;
+                    Some(hyperscale_storage::filter_updates_to_shard(
+                        raw,
+                        local_shard,
+                        num_shards,
+                    ))
+                })
+                .collect();
+            hyperscale_storage::merge_database_updates(&per_cert)
+        };
+
         self.bft.on_qc_formed(
-            self.topology.snapshot(),
+            topology,
             block_hash,
             qc,
             &inputs.ready_txs,
@@ -494,6 +563,7 @@ impl NodeStateMachine {
             inputs.aborted,
             inputs.certificates,
             inputs.commitment_proofs,
+            compute_writes,
         )
     }
 
@@ -519,8 +589,11 @@ impl NodeStateMachine {
         // Notify BFT so it can update its committed state tracking.
         // BFT uses this as the source of truth for block height in block headers,
         // preventing speculative version propagation that causes deadlocks.
+        // Unblocked state root verifications are pushed to the ready queue
+        // and drained by handle() via drain_ready_state_root_verifications().
         self.bft
-            .on_state_commit_complete(self.topology.snapshot(), height, state_root)
+            .on_state_commit_complete(self.topology.snapshot(), height, state_root);
+        vec![]
     }
 
     /// Handle block committed — notify all subsystems in the correct order.
@@ -771,7 +844,7 @@ impl StateMachine for NodeStateMachine {
         height = self.bft.committed_height(),
     ))]
     fn handle(&mut self, event: ProtocolEvent) -> Vec<Action> {
-        match event {
+        let mut actions = match event {
             // ── Timers ───────────────────────────────────────────────────
             ProtocolEvent::CleanupTimer => self.on_cleanup_timer(),
             ProtocolEvent::ProposalTimer => self.on_proposal_timer(),
@@ -889,7 +962,15 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ExecutionVoteReceived { vote } => {
                 self.execution.on_vote(self.topology.snapshot(), vote)
             }
-            ProtocolEvent::ExecutionBatchCompleted { votes, results: _ } => {
+            ProtocolEvent::ExecutionBatchCompleted { votes, results } => {
+                // 1. Populate execution cache (in-memory, for block commit fast path)
+                for result in results {
+                    self.execution
+                        .execution_cache_mut()
+                        .insert(result.tx_hash, result.database_updates);
+                }
+
+                // 2. Process votes through VoteTracker
                 let mut actions = Vec::new();
                 for vote in votes {
                     actions.extend(self.execution.on_vote(self.topology.snapshot(), vote));
@@ -992,7 +1073,23 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ShardSplitComplete { .. }
             | ProtocolEvent::ShardMergeInitiated { .. }
             | ProtocolEvent::ShardMergeComplete { .. } => vec![],
+        };
+
+        // Drain any state root verifications that became ready during this event.
+        // The BFT verification pipeline queues these; we compute merged_updates
+        // from the execution cache and emit VerifyStateRoot actions.
+        for ready in self.bft.drain_ready_state_root_verifications() {
+            let merged = self.compute_merged_updates_for_tx_hashes(&ready.cert_tx_hashes);
+            actions.push(Action::VerifyStateRoot {
+                block_hash: ready.block_hash,
+                parent_state_root: ready.parent_state_root,
+                expected_root: ready.expected_root,
+                merged_updates: Arc::new(merged),
+                block_height: ready.block_height,
+            });
         }
+
+        actions
     }
 
     fn set_time(&mut self, now: Duration) {

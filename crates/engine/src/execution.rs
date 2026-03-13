@@ -10,7 +10,7 @@ use hyperscale_storage::keys;
 use hyperscale_types::{
     ApplicationEvent, FeeSummary, LedgerTransactionOutcome, LedgerTransactionReceipt,
     LocalTransactionExecution, LogLevel, PartitionNumber, StateEntry, SubstateChange,
-    SubstateChangeAction, SubstateRef, SubstateWrite,
+    SubstateChangeAction, SubstateRef,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_engine::transaction::{
@@ -35,40 +35,6 @@ pub fn extract_state_updates(receipt: &TransactionReceipt) -> Option<DatabaseUpd
 /// Check if a transaction receipt represents a successful commit.
 pub fn is_commit_success(receipt: &TransactionReceipt) -> bool {
     matches!(&receipt.result, TransactionResult::Commit(_))
-}
-
-/// Extract SubstateWrites from a receipt.
-pub fn extract_substate_writes(receipt: &TransactionReceipt) -> Vec<SubstateWrite> {
-    let Some(updates) = extract_state_updates(receipt) else {
-        return Vec::new();
-    };
-
-    let mut writes = Vec::new();
-
-    for (db_node_key, node_updates) in &updates.node_updates {
-        let Some(node_id) = keys::db_node_key_to_node_id(db_node_key) else {
-            continue;
-        };
-
-        for (partition_num, partition_updates) in &node_updates.partition_updates {
-            let partition = PartitionNumber(*partition_num);
-
-            if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
-                for (db_sort_key, update) in substate_updates {
-                    if let DatabaseUpdate::Set(value) = update {
-                        writes.push(SubstateWrite::new(
-                            node_id,
-                            partition,
-                            db_sort_key.0.clone(),
-                            value.clone(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    writes
 }
 
 // ============================================================================

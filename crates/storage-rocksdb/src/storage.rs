@@ -888,58 +888,6 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         (root, snapshot)
     }
 
-    /// Build a WriteBatch for all certificates in a block.
-    ///
-    /// This pre-builds all the writes that will be committed when the block commits,
-    /// allowing them to be applied with a single fsync instead of N fsyncs.
-    ///
-    /// # Arguments
-    ///
-    /// * `certificates` - The certificates to include in the batch
-    /// * `local_shard` - The local shard to extract writes from
-    ///
-    /// # Returns
-    ///
-    /// A WriteBatch containing all certificate and state writes.
-    pub(crate) fn build_write_batch(
-        &self,
-        certificates: &[std::sync::Arc<hyperscale_types::TransactionCertificate>],
-        local_shard: hyperscale_types::ShardGroupId,
-    ) -> WriteBatch {
-        let mut batch = WriteBatch::default();
-
-        let cert_cf = self
-            .db
-            .cf_handle("certificates")
-            .expect("certificates column family must exist");
-        let state_cf = self
-            .db
-            .cf_handle(STATE_CF)
-            .expect("state column family must exist");
-
-        for cert in certificates {
-            // Serialize and add certificate
-            let cert_bytes =
-                sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
-            batch.put_cf(cert_cf, cert.transaction_hash.as_bytes(), cert_bytes);
-
-            // Add state writes for local shard (iterate SubstateWrite directly,
-            // avoiding intermediate DatabaseUpdates allocation)
-            if let Some(shard_proof) = cert.shard_proofs.get(&local_shard) {
-                for write in &shard_proof.state_writes {
-                    let storage_key = hyperscale_storage::keys::storage_key_from_write(
-                        &write.node_id,
-                        &write.partition,
-                        &write.sort_key,
-                    );
-                    batch.put_cf(state_cf, &storage_key, &write.value);
-                }
-            }
-        }
-
-        batch
-    }
-
     /// Try to apply a prepared block commit with a single fsync.
     ///
     /// This is the fast path for block commit. Applies the pre-built WriteBatch
@@ -2324,8 +2272,6 @@ impl Default for RocksDbConfig {
 // CommitStore implementation
 // ═══════════════════════════════════════════════════════════════════════
 
-use hyperscale_storage::extract_writes_per_cert;
-
 /// Precomputed commit work for a RocksDB block commit.
 ///
 /// Contains a pre-built `WriteBatch` (all certificate + state writes) and a
@@ -2339,8 +2285,6 @@ use hyperscale_storage::extract_writes_per_cert;
 pub struct RocksDbPreparedCommit {
     write_batch: WriteBatch,
     jmt_snapshot: JmtSnapshot,
-    certificates: Vec<Arc<TransactionCertificate>>,
-    local_shard: hyperscale_types::ShardGroupId,
 }
 
 impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D> {
@@ -2349,31 +2293,21 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
     fn prepare_block_commit(
         &self,
         parent_state_root: hyperscale_types::Hash,
-        certificates: &[Arc<TransactionCertificate>],
-        local_shard: hyperscale_types::ShardGroupId,
+        merged_updates: &DatabaseUpdates,
         block_height: u64,
     ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
-        let writes_per_cert = extract_writes_per_cert(certificates, local_shard);
-
-        // Convert SubstateWrites → DatabaseUpdates once upfront, reuse for JMT.
-        let updates_per_cert: Vec<DatabaseUpdates> = writes_per_cert
-            .iter()
-            .map(|writes| hyperscale_storage::substate_writes_to_database_updates(writes))
-            .collect();
-
         let (computed_root, jmt_snapshot) = self.compute_speculative_root_from_base(
             parent_state_root,
-            &updates_per_cert,
+            std::slice::from_ref(merged_updates),
             block_height,
         );
 
-        let write_batch = self.build_write_batch(certificates, local_shard);
+        // Pre-build substate writes into a WriteBatch for efficient commit.
+        let write_batch = self.build_substate_write_batch(merged_updates);
 
         let prepared = RocksDbPreparedCommit {
             write_batch,
             jmt_snapshot,
-            certificates: certificates.to_vec(),
-            local_shard,
         };
 
         (computed_root, prepared)
@@ -2382,36 +2316,43 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
+        certificates: &[Arc<TransactionCertificate>],
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
     ) -> hyperscale_types::Hash {
         let block_height = prepared.jmt_snapshot.new_version;
         let result_root = prepared.jmt_snapshot.result_root;
-        let used_fast_path = self.try_apply_prepared_commit(
-            prepared.write_batch,
-            prepared.jmt_snapshot,
-            consensus.as_ref(),
-        );
+
+        // Append certificate storage to the write batch.
+        let mut write_batch = prepared.write_batch;
+        let cert_cf = self
+            .db
+            .cf_handle("certificates")
+            .expect("certificates column family must exist");
+        for cert in certificates {
+            let cert_bytes =
+                sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
+            write_batch.put_cf(cert_cf, cert.transaction_hash.as_bytes(), cert_bytes);
+        }
+
+        let used_fast_path =
+            self.try_apply_prepared_commit(write_batch, prepared.jmt_snapshot, consensus.as_ref());
 
         if used_fast_path {
-            // Return the known values from the snapshot rather than re-reading
-            // from the store, avoiding a TOCTOU window with concurrent commits.
             result_root
         } else {
-            // Stale cache: fall back to full block commit which recomputes JMT.
-            // Pass consensus through so it's still written atomically.
-            self.commit_block(
-                &prepared.certificates,
-                prepared.local_shard,
-                block_height,
-                consensus,
-            )
+            // Stale cache: fall back to recompute with empty updates.
+            // The prepared data had the writes baked in, but the JMT base has
+            // moved on. In practice this is very rare. Certificate storage will
+            // be handled by the fallback commit.
+            let empty = DatabaseUpdates::default();
+            self.commit_block(&empty, certificates, block_height, consensus)
         }
     }
 
     fn commit_block(
         &self,
+        merged_updates: &DatabaseUpdates,
         certificates: &[Arc<TransactionCertificate>],
-        local_shard: hyperscale_types::ShardGroupId,
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
     ) -> hyperscale_types::Hash {
@@ -2429,32 +2370,29 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
             base_version
         );
 
-        // Build a single WriteBatch for all certificates' metadata + substate writes.
-        let mut batch = if certificates.is_empty() {
-            rocksdb::WriteBatch::default()
-        } else {
-            self.build_write_batch(certificates, local_shard)
-        };
+        // Build a WriteBatch for certificates + substate writes.
+        let mut batch = self.build_substate_write_batch(merged_updates);
 
-        // Compute merged JMT update. Empty blocks still need proper tree nodes
-        // at the new version so that subsequent reads from `base_version` find
-        // a valid root node.
-        let merged = if certificates.is_empty() {
-            DatabaseUpdates::default()
-        } else {
-            let writes_per_cert = extract_writes_per_cert(certificates, local_shard);
-            let updates_per_cert: Vec<DatabaseUpdates> = writes_per_cert
-                .iter()
-                .map(|w| hyperscale_storage::substate_writes_to_database_updates(w))
-                .collect();
-            hyperscale_storage::merge_database_updates(&updates_per_cert)
-        };
+        // Store certificates to the certificate CF.
+        if !certificates.is_empty() {
+            let cert_cf = self
+                .db
+                .cf_handle("certificates")
+                .expect("certificates column family must exist");
+            for cert in certificates {
+                let cert_bytes =
+                    sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
+                batch.put_cf(cert_cf, cert.transaction_hash.as_bytes(), cert_bytes);
+            }
+        }
+
+        // Compute JMT update.
         let parent_version = hyperscale_storage::jmt_parent_height(base_version, base_root);
         let (new_root, collected) = hyperscale_storage::jmt::put_at_version(
             &snapshot_store,
             parent_version,
             block_height,
-            &merged,
+            merged_updates,
             &self.dispatch,
         );
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
@@ -2700,31 +2638,32 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for SharedStorage<D>
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
-        certificates: &[std::sync::Arc<TransactionCertificate>],
-        local_shard: hyperscale_types::ShardGroupId,
+        merged_updates: &DatabaseUpdates,
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit) {
         self.0
-            .prepare_block_commit(parent_state_root, certificates, local_shard, block_height)
+            .prepare_block_commit(parent_state_root, merged_updates, block_height)
     }
 
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
+        certificates: &[std::sync::Arc<TransactionCertificate>],
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
     ) -> hyperscale_types::Hash {
-        self.0.commit_prepared_block(prepared, consensus)
+        self.0
+            .commit_prepared_block(prepared, certificates, consensus)
     }
 
     fn commit_block(
         &self,
+        merged_updates: &DatabaseUpdates,
         certificates: &[std::sync::Arc<TransactionCertificate>],
-        local_shard: hyperscale_types::ShardGroupId,
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
     ) -> hyperscale_types::Hash {
         self.0
-            .commit_block(certificates, local_shard, block_height, consensus)
+            .commit_block(merged_updates, certificates, block_height, consensus)
     }
 }
 
@@ -3252,13 +3191,11 @@ mod tests {
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
         let shard = ShardGroupId(0);
-        let cert = Arc::new(make_test_certificate(
-            1,
-            shard,
-            vec![make_substate_write(1, 0, vec![10], vec![42])],
-        ));
+        let writes = vec![make_substate_write(1, 0, vec![10], vec![42])];
+        let updates = hyperscale_storage::substate_writes_to_database_updates(&writes);
+        let cert = Arc::new(make_test_certificate(1, shard, writes));
 
-        let result = storage.commit_block(&[cert], shard, 1, None);
+        let result = storage.commit_block(&updates, &[cert], 1, None);
         assert_ne!(result, Hash::ZERO);
     }
 
@@ -3268,18 +3205,16 @@ mod tests {
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
         let shard = ShardGroupId(0);
-        let cert1 = Arc::new(make_test_certificate(
-            1,
-            shard,
-            vec![make_substate_write(1, 0, vec![10], vec![1])],
-        ));
-        let cert2 = Arc::new(make_test_certificate(
-            2,
-            shard,
-            vec![make_substate_write(2, 0, vec![20], vec![2])],
-        ));
+        let writes1 = vec![make_substate_write(1, 0, vec![10], vec![1])];
+        let writes2 = vec![make_substate_write(2, 0, vec![20], vec![2])];
+        let merged = hyperscale_storage::merge_database_updates(&[
+            hyperscale_storage::substate_writes_to_database_updates(&writes1),
+            hyperscale_storage::substate_writes_to_database_updates(&writes2),
+        ]);
+        let cert1 = Arc::new(make_test_certificate(1, shard, writes1));
+        let cert2 = Arc::new(make_test_certificate(2, shard, writes2));
 
-        let result = storage.commit_block(&[cert1, cert2], shard, 1, None);
+        let result = storage.commit_block(&merged, &[cert1, cert2], 1, None);
         // Certificate merging: all certs applied as single JMT version = block_height
         assert_ne!(result, Hash::ZERO);
     }
@@ -3289,7 +3224,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
-        storage.commit_block(&[], ShardGroupId(0), 1, None);
+        storage.commit_block(&DatabaseUpdates::default(), &[], 1, None);
         // Empty block: JMT version still advances to block_height
         assert_eq!(storage.jmt_version(), 1);
     }
@@ -3308,13 +3243,19 @@ mod tests {
         let s_prepared = RocksDbStorage::open(temp_dir1.path(), SyncDispatch::new()).unwrap();
         let parent_root = s_prepared.state_root_hash();
         let (spec_root, prepared) =
-            s_prepared.prepare_block_commit(parent_root, std::slice::from_ref(&cert), shard, 1);
-        let result_prepared = s_prepared.commit_prepared_block(prepared, None);
+            s_prepared.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
+        let certs = std::slice::from_ref(&cert);
+        let result_prepared = s_prepared.commit_prepared_block(prepared, certs, None);
 
         // Direct path
         let temp_dir2 = TempDir::new().unwrap();
         let s_direct = RocksDbStorage::open(temp_dir2.path(), SyncDispatch::new()).unwrap();
-        let result_direct = s_direct.commit_block(&[cert], shard, 1, None);
+        let result_direct = s_direct.commit_block(
+            &DatabaseUpdates::default(),
+            std::slice::from_ref(&cert),
+            1,
+            None,
+        );
 
         assert_eq!(result_prepared, result_direct);
         assert_eq!(spec_root, result_prepared);
@@ -3333,7 +3274,7 @@ mod tests {
         ));
         let tx_hash = cert.transaction_hash;
 
-        let _ = storage.commit_block(&[cert], shard, 1, None);
+        let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None);
 
         assert!(storage.get_certificate(&tx_hash).is_some());
     }

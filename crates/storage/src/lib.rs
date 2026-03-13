@@ -49,7 +49,7 @@ pub use jmt_snapshot::{JmtSnapshot, LeafSubstateKeyAssociation};
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use store::{SubstateStore, RADIX_PREFIX};
 pub use writes::{
-    extract_writes_per_cert, merge_database_updates, merge_into,
+    filter_updates_to_shard, merge_database_updates, merge_into,
     substate_writes_to_database_updates,
 };
 

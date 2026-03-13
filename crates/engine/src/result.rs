@@ -1,7 +1,7 @@
 //! Execution result types.
 
 use hyperscale_types::{
-    ExecutionResult, Hash, LedgerTransactionReceipt, LocalTransactionExecution, SubstateWrite,
+    ExecutionResult, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
 };
 use radix_substate_store_interface::interface::DatabaseUpdates;
 
@@ -53,12 +53,7 @@ pub struct SingleTxResult {
     /// Whether execution succeeded (committed).
     pub success: bool,
 
-    /// State writes from execution (for certificate creation).
-    ///
-    /// Only populated for successful executions.
-    pub state_writes: Vec<SubstateWrite>,
-
-    // ─── New receipt fields ─────────────────────────────────────────────
+    // ─── Receipt fields ──────────────────────────────────────────────────
     /// Hash of ConsensusReceipt (outcome + event_root).
     pub receipt_hash: Hash,
 
@@ -83,7 +78,6 @@ impl SingleTxResult {
     /// Create a successful result.
     pub fn success(
         tx_hash: Hash,
-        state_writes: Vec<SubstateWrite>,
         receipt_hash: Hash,
         ledger_receipt: LedgerTransactionReceipt,
         local_execution: LocalTransactionExecution,
@@ -92,7 +86,6 @@ impl SingleTxResult {
         Self {
             tx_hash,
             success: true,
-            state_writes,
             receipt_hash,
             ledger_receipt,
             local_execution,
@@ -106,7 +99,6 @@ impl SingleTxResult {
         Self {
             tx_hash,
             success: false,
-            state_writes: vec![],
             receipt_hash: LedgerTransactionReceipt::failure().receipt_hash(),
             ledger_receipt: LedgerTransactionReceipt::failure(),
             local_execution: LocalTransactionExecution::failure(None),

@@ -170,7 +170,6 @@ mod tests {
             shard_group_id: shard,
             read_nodes: vec![],
             write_nodes: vec![],
-            state_writes: vec![],
             receipt_hash,
             success: true,
             aggregated_signature: zero_bls_signature(),

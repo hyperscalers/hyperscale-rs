@@ -201,7 +201,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             block_hash,
             parent_state_root,
             expected_root,
-            certificates,
+            merged_updates,
             block_height,
         } => {
             let start = std::time::Instant::now();
@@ -209,8 +209,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 ctx.storage,
                 parent_state_root,
                 expected_root,
-                &certificates,
-                ctx.local_shard,
+                &merged_updates,
                 block_height,
             );
             metrics::record_signature_verification_latency(
@@ -241,6 +240,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             priority_transactions,
             transactions,
             certificates,
+            merged_updates,
             commitment_proofs,
             deferred,
             aborted,
@@ -260,6 +260,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 priority_transactions,
                 transactions,
                 certificates,
+                merged_updates,
                 commitment_proofs,
                 deferred,
                 aborted,
@@ -285,7 +286,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             receipt_hash,
             votes,
             read_nodes,
-            state_writes,
             write_nodes,
             committee,
         } => {
@@ -295,7 +295,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 receipt_hash,
                 &votes,
                 read_nodes,
-                state_writes,
                 write_nodes,
                 &committee,
             );

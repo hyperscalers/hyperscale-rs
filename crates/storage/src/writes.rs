@@ -1,25 +1,15 @@
 //! Conversion from SubstateWrites to DatabaseUpdates.
 
-use hyperscale_types::{ShardGroupId, SubstateWrite, TransactionCertificate};
+use hyperscale_types::{ShardGroupId, SubstateWrite};
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 use radix_substate_store_interface::interface::{
     DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
 };
-use std::sync::Arc;
 
-/// Convert SubstateWrites back to DatabaseUpdates for committing to storage.
+/// Convert SubstateWrites to DatabaseUpdates for committing to storage.
 ///
-/// This is the inverse of `extract_substate_writes()`. Used when applying
-/// certificate state writes during `PersistTransactionCertificate`.
-///
-/// # Arguments
-///
-/// * `writes` - The substate writes to convert (typically from a certificate's shard_proofs)
-///
-/// # Returns
-///
-/// A `DatabaseUpdates` structure suitable for JMT and substate storage operations
+/// Used by test helpers to build `DatabaseUpdates` from `SubstateWrite` vectors.
 pub fn substate_writes_to_database_updates(writes: &[SubstateWrite]) -> DatabaseUpdates {
     let mut updates = DatabaseUpdates::default();
 
@@ -140,33 +130,38 @@ fn merge_partition_updates(
     }
 }
 
-/// Extract per-certificate state writes for a given local shard.
+/// Filter DatabaseUpdates to only include writes for the local shard.
 ///
-/// For each certificate, extracts the `state_writes` from the shard proof
-/// matching `local_shard`. Certificates without a proof for the local shard
-/// produce an empty `Vec`.
-pub fn extract_writes_per_cert(
-    certificates: &[Arc<TransactionCertificate>],
+/// Uses `db_node_key_to_node_id` to extract the NodeId from each db_node_key,
+/// then `shard_for_node` to determine ownership. Only updates for nodes
+/// owned by `local_shard` are included in the output.
+pub fn filter_updates_to_shard(
+    updates: &DatabaseUpdates,
     local_shard: ShardGroupId,
-) -> Vec<Vec<SubstateWrite>> {
-    certificates
-        .iter()
-        .map(|cert| {
-            cert.shard_proofs
-                .get(&local_shard)
-                .map(|proof| proof.state_writes.clone())
-                .unwrap_or_default()
-        })
-        .collect()
+    num_shards: u64,
+) -> DatabaseUpdates {
+    use crate::keys::db_node_key_to_node_id;
+    use hyperscale_types::shard_for_node;
+
+    let mut filtered = DatabaseUpdates::default();
+    for (db_node_key, node_updates) in &updates.node_updates {
+        let Some(node_id) = db_node_key_to_node_id(db_node_key) else {
+            continue;
+        };
+        if shard_for_node(&node_id, num_shards) != local_shard {
+            continue;
+        }
+        filtered
+            .node_updates
+            .insert(db_node_key.clone(), node_updates.clone());
+    }
+    filtered
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{
-        make_multi_shard_certificate, make_substate_write, make_test_certificate,
-    };
-    use hyperscale_types::ShardGroupId;
+    use crate::test_helpers::make_substate_write;
     use radix_common::prelude::DatabaseUpdate;
 
     #[test]
@@ -259,104 +254,6 @@ mod tests {
             }
             _ => panic!("expected Delta partition updates"),
         }
-    }
-
-    #[test]
-    fn test_extract_writes_per_cert_matching_shard() {
-        let shard = ShardGroupId(0);
-        let writes = vec![make_substate_write(1, 0, vec![10], vec![1])];
-        let cert = Arc::new(make_test_certificate(42, shard, writes.clone()));
-
-        let result = extract_writes_per_cert(&[cert], shard);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], writes);
-    }
-
-    #[test]
-    fn test_extract_writes_per_cert_missing_shard() {
-        let cert = Arc::new(make_test_certificate(42, ShardGroupId(0), vec![]));
-        let result = extract_writes_per_cert(&[cert], ShardGroupId(99));
-        assert_eq!(result.len(), 1);
-        assert!(result[0].is_empty());
-    }
-
-    #[test]
-    fn test_extract_writes_per_cert_mixed() {
-        let shard = ShardGroupId(0);
-        let other_shard = ShardGroupId(1);
-        let writes = vec![make_substate_write(1, 0, vec![10], vec![1])];
-
-        let cert_match = Arc::new(make_test_certificate(1, shard, writes.clone()));
-        let cert_miss = Arc::new(make_test_certificate(
-            2,
-            other_shard,
-            vec![make_substate_write(2, 0, vec![20], vec![2])],
-        ));
-
-        let result = extract_writes_per_cert(&[cert_match, cert_miss], shard);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], writes);
-        assert!(result[1].is_empty());
-    }
-
-    #[test]
-    fn test_extract_writes_per_cert_empty_certs() {
-        let result = extract_writes_per_cert(&[], ShardGroupId(0));
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_extract_writes_per_cert_preserves_order() {
-        let shard = ShardGroupId(0);
-        let cert1 = Arc::new(make_test_certificate(
-            1,
-            shard,
-            vec![make_substate_write(1, 0, vec![10], vec![1])],
-        ));
-        let cert2 = Arc::new(make_test_certificate(
-            2,
-            shard,
-            vec![make_substate_write(2, 0, vec![20], vec![2])],
-        ));
-        let cert3 = Arc::new(make_test_certificate(
-            3,
-            shard,
-            vec![make_substate_write(3, 0, vec![30], vec![3])],
-        ));
-
-        let result = extract_writes_per_cert(&[cert1, cert2, cert3], shard);
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0][0].value, vec![1]);
-        assert_eq!(result[1][0].value, vec![2]);
-        assert_eq!(result[2][0].value, vec![3]);
-    }
-
-    #[test]
-    fn test_extract_writes_per_cert_multi_shard_certificate() {
-        // A certificate with proofs for shard 0 AND shard 1.
-        // Extracting for shard 0 should return only shard 0's writes.
-        let shard0_writes = vec![make_substate_write(1, 0, vec![10], vec![1])];
-        let shard1_writes = vec![make_substate_write(2, 0, vec![20], vec![2])];
-        let cert = Arc::new(make_multi_shard_certificate(
-            1,
-            vec![
-                (ShardGroupId(0), shard0_writes.clone()),
-                (ShardGroupId(1), shard1_writes.clone()),
-            ],
-        ));
-
-        let result_shard0 = extract_writes_per_cert(std::slice::from_ref(&cert), ShardGroupId(0));
-        assert_eq!(result_shard0.len(), 1);
-        assert_eq!(result_shard0[0], shard0_writes);
-
-        let result_shard1 = extract_writes_per_cert(std::slice::from_ref(&cert), ShardGroupId(1));
-        assert_eq!(result_shard1.len(), 1);
-        assert_eq!(result_shard1[0], shard1_writes);
-
-        // Shard 2 has no proof — should return empty writes
-        let result_shard2 = extract_writes_per_cert(&[cert], ShardGroupId(2));
-        assert_eq!(result_shard2.len(), 1);
-        assert!(result_shard2[0].is_empty());
     }
 
     // Helper to create a Delta DatabaseUpdates with a single node/partition/substate.

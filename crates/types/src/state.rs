@@ -207,12 +207,6 @@ pub struct ExecutionCertificate {
     /// NodeIds written during execution (from first vote — all identical within shard).
     pub write_nodes: Vec<NodeId>,
 
-    /// Substate data that was WRITTEN during execution.
-    ///
-    /// **Temporary**: Kept for the block commit path (`extract_writes_per_cert`).
-    /// Will be removed in Phase 5 when the commit path switches to execution cache.
-    pub state_writes: Vec<SubstateWrite>,
-
     /// Hash of the ConsensusReceipt (outcome + event_root).
     pub receipt_hash: Hash,
 
@@ -274,7 +268,6 @@ impl ExecutionCertificate {
             shard_group_id,
             read_nodes: vec![],
             write_nodes: vec![],
-            state_writes: vec![],
             receipt_hash,
             success,
             aggregated_signature: zero_bls_signature(),

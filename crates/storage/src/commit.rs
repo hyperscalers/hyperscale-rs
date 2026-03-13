@@ -4,9 +4,8 @@
 //! `prepare_block_commit` returns an opaque `PreparedCommit` handle that
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
-use hyperscale_types::{
-    BlockHeight, Hash, QuorumCertificate, ShardGroupId, TransactionCertificate,
-};
+use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, TransactionCertificate};
+use radix_substate_store_interface::interface::DatabaseUpdates;
 use std::sync::Arc;
 
 /// Consensus metadata to be committed atomically with JMT + substate writes.
@@ -37,24 +36,22 @@ pub trait CommitStore: Send + Sync {
     /// Opaque handle carrying precomputed commit work.
     ///
     /// For RocksDB this contains a `WriteBatch` + `JmtSnapshot`.
-    /// For SimStorage this contains a `JmtSnapshot` + certificate data.
+    /// For SimStorage this contains a `JmtSnapshot` + pre-applied state.
     type PreparedCommit: Send + 'static;
 
     /// Compute speculative state root and return precomputed commit work.
     ///
-    /// Extracts `writes_per_cert` from certificates' shard proofs for `local_shard`,
-    /// computes the speculative JMT root, and bundles all work into a
-    /// `PreparedCommit` handle for efficient commit later.
+    /// Receives pre-merged `DatabaseUpdates` (already filtered to local shard)
+    /// and computes the speculative JMT root. The caller is responsible for
+    /// sourcing the writes (from execution cache or receipt storage) and merging.
     ///
-    /// `block_height` is the height of the block being prepared (used as JMT version
-    /// after certificate merging).
+    /// `block_height` is the height of the block being prepared (used as JMT version).
     ///
     /// Returns `(computed_state_root, prepared_commit_handle)`.
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
-        certificates: &[Arc<TransactionCertificate>],
-        local_shard: ShardGroupId,
+        merged_updates: &DatabaseUpdates,
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit);
 
@@ -64,11 +61,14 @@ pub trait CommitStore: Send + Sync {
     /// directly. Falls back to per-certificate recompute if the prepared
     /// data is stale (base root/version mismatch).
     ///
+    /// `certificates` are stored to the certificate column family for querying.
+    ///
     /// When `consensus` is provided, the consensus metadata is written
     /// atomically in the same batch as the JMT + substate data.
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
+        certificates: &[Arc<TransactionCertificate>],
         consensus: Option<ConsensusCommitData>,
     ) -> Hash;
 
@@ -83,8 +83,8 @@ pub trait CommitStore: Send + Sync {
     /// atomically in the same batch as the JMT + substate data.
     fn commit_block(
         &self,
+        merged_updates: &DatabaseUpdates,
         certificates: &[Arc<TransactionCertificate>],
-        local_shard: ShardGroupId,
         block_height: u64,
         consensus: Option<ConsensusCommitData>,
     ) -> Hash;

@@ -4,7 +4,7 @@
 //! algorithms, separated from dispatch (thread pool vs inline) and result
 //! delivery (channel vs event queue) concerns.
 
-use hyperscale_storage::{CommitStore, SubstateStore};
+use hyperscale_storage::{CommitStore, DatabaseUpdates, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_transaction_root, verify_bls12381_v1, Block,
     BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
@@ -261,12 +261,11 @@ pub fn verify_state_root<S: CommitStore>(
     storage: &S,
     parent_state_root: Hash,
     expected_root: Hash,
-    certificates: &[Arc<TransactionCertificate>],
-    local_shard: ShardGroupId,
+    merged_updates: &DatabaseUpdates,
     block_height: u64,
 ) -> StateRootResult<S::PreparedCommit> {
     let (computed_root, prepared) =
-        storage.prepare_block_commit(parent_state_root, certificates, local_shard, block_height);
+        storage.prepare_block_commit(parent_state_root, merged_updates, block_height);
 
     let valid = computed_root == expected_root;
 
@@ -316,6 +315,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     priority_transactions: Vec<Arc<RoutableTransaction>>,
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<TransactionCertificate>>,
+    merged_updates: DatabaseUpdates,
     commitment_proofs: HashMap<Hash, CommitmentProof>,
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
@@ -332,7 +332,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     let (state_root, certs_to_include, prepared) = if include_certs {
         // JMT ready - compute speculative root and get prepared commit handle
         let (root, prepared) =
-            storage.prepare_block_commit(parent_state_root, &certificates, local_shard, height.0);
+            storage.prepare_block_commit(parent_state_root, &merged_updates, height.0);
         (root, certificates, Some(prepared))
     } else {
         // Either no certificates, or JMT not ready - inherit parent state

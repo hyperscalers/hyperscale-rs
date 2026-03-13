@@ -337,9 +337,11 @@ where
                     hash: block_hash,
                     qc: qc.clone(),
                 };
+                // Empty blocks have no certificate writes — pass empty DatabaseUpdates.
+                let empty_updates = hyperscale_types::DatabaseUpdates::default();
                 let result = self.storage.commit_block(
+                    &empty_updates,
                     &block.certificates,
-                    self.local_shard,
                     height.0,
                     Some(consensus),
                 );
@@ -373,7 +375,6 @@ where
 
         let storage = Arc::clone(&self.storage);
         let event_tx = self.event_sender.clone();
-        let local_shard = self.local_shard;
 
         self.dispatch.spawn_execution(move || {
             for (i, (block, qc)) in commits.into_iter().enumerate() {
@@ -391,11 +392,15 @@ where
                 // Consensus metadata is folded into the same atomic write.
                 let prepared = prepared_map[i].take();
                 let result = if let Some(prepared) = prepared {
-                    storage.commit_prepared_block(prepared, Some(consensus))
+                    storage.commit_prepared_block(prepared, &block.certificates, Some(consensus))
                 } else {
+                    // No prepared commit — fallback with empty updates.
+                    // The prepared path is the normal case; this only hits for
+                    // empty blocks or when the prepared commit was stale.
+                    let empty_updates = hyperscale_types::DatabaseUpdates::default();
                     storage.commit_block(
+                        &empty_updates,
                         &block.certificates,
-                        local_shard,
                         height.0,
                         Some(consensus),
                     )

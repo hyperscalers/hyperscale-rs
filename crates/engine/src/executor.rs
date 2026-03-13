@@ -11,8 +11,8 @@
 //! and executor, calling the executor methods to handle these actions.
 //!
 //! **IMPORTANT**: The executor is READ-ONLY. It does NOT commit state changes
-//! to storage. Writes are collected in the execution result and committed later
-//! by the runner when a `TransactionCertificate` is included in a committed block.
+//! to storage. `DatabaseUpdates` from execution are cached by the state machine
+//! and applied when a `TransactionCertificate` is included in a committed block.
 //! This ensures all validators agree on the state before it's persisted.
 //!
 //! ```text
@@ -31,8 +31,8 @@
 
 use crate::error::ExecutionError;
 use crate::execution::{
-    build_ledger_receipt, build_local_execution, extract_database_updates, extract_substate_writes,
-    is_commit_success, ProvisionedSnapshot,
+    build_ledger_receipt, build_local_execution, extract_database_updates, is_commit_success,
+    ProvisionedSnapshot,
 };
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
@@ -265,17 +265,10 @@ impl RadixExecutor {
                 &self.caches.exec_config,
             );
 
-            // Use cross-shard result which filters writes to declared_writes
-            // so all shards compute the same merkle root
-            let result = self.receipt_to_cross_shard_result(
-                tx.hash(),
-                &receipt,
-                &tx.declared_writes,
-                &provisioned,
-            );
+            let result = self.receipt_to_cross_shard_result(tx.hash(), &receipt, &provisioned);
 
-            // NO COMMIT HERE - writes are returned in result.state_writes
-            // They will be committed later when TransactionCertificate is included in a block
+            // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
+            // and applied when the TransactionCertificate is included in a block.
 
             results.push(result);
         }
@@ -313,8 +306,8 @@ impl RadixExecutor {
 
         let result = self.receipt_to_result(tx.hash(), &receipt, &snapshot);
 
-        // NO COMMIT HERE - writes are returned in result.state_writes
-        // They will be committed later when TransactionCertificate is included in a block
+        // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
+        // and applied when the TransactionCertificate is included in a block.
 
         Ok(result)
     }
@@ -332,14 +325,12 @@ impl RadixExecutor {
         let success = is_commit_success(receipt);
 
         if success {
-            let state_writes = extract_substate_writes(receipt);
             let ledger_receipt = build_ledger_receipt(receipt, execution_snapshot);
             let local_execution = build_local_execution(receipt);
             let receipt_hash = ledger_receipt.receipt_hash();
             let database_updates = extract_database_updates(receipt);
             SingleTxResult::success(
                 tx_hash,
-                state_writes,
                 receipt_hash,
                 ledger_receipt,
                 local_execution,
@@ -353,43 +344,25 @@ impl RadixExecutor {
 
     /// Convert a receipt to a result for cross-shard transactions.
     ///
-    /// For cross-shard transactions, each shard only sees its local writes,
-    /// but the merkle root must be computed over the DECLARED writes so all
-    /// shards agree on the same root. We filter the actual writes to only
-    /// include those in declared_writes.
+    /// Convert a receipt to a result for cross-shard transactions.
+    ///
+    /// State writes are no longer embedded in the result — the execution cache
+    /// holds the raw `DatabaseUpdates`, and block commit reads from there.
     fn receipt_to_cross_shard_result(
         &self,
         tx_hash: Hash,
         receipt: &TransactionReceipt,
-        declared_writes: &[NodeId],
         execution_snapshot: &impl SubstateDatabase,
     ) -> SingleTxResult {
         let success = is_commit_success(receipt);
 
         if success {
-            let all_writes = extract_substate_writes(receipt);
-            // Filter writes to only include nodes in declared_writes
-            // This ensures all shards compute the same merkle root by excluding
-            // writes to system components (faucet, etc.) that may differ between shards
-            //
-            // NOTE: Currently this filters out most writes because declared_writes contains
-            // account component NodeIds but actual writes go to vault NodeIds inside those
-            // accounts. This results in an empty merkle root (Hash::ZERO) which still
-            // achieves agreement across shards. A future improvement would be to include
-            // writes to child nodes of declared_writes.
-            let declared_set: std::collections::HashSet<_> = declared_writes.iter().collect();
-            let filtered_writes: Vec<_> = all_writes
-                .iter()
-                .filter(|w| declared_set.contains(&w.node_id))
-                .cloned()
-                .collect();
             let ledger_receipt = build_ledger_receipt(receipt, execution_snapshot);
             let local_execution = build_local_execution(receipt);
             let receipt_hash = ledger_receipt.receipt_hash();
             let database_updates = extract_database_updates(receipt);
             SingleTxResult::success(
                 tx_hash,
-                filtered_writes,
                 receipt_hash,
                 ledger_receipt,
                 local_execution,

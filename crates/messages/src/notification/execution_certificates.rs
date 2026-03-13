@@ -118,7 +118,6 @@ mod tests {
             shard_group_id: ShardGroupId(0),
             read_nodes: vec![],
             write_nodes: vec![],
-            state_writes: vec![],
             receipt_hash: Hash::from_bytes(b"commitment"),
             success: true,
             aggregated_signature: zero_bls_signature(),

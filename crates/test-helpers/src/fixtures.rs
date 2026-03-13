@@ -188,7 +188,6 @@ pub fn make_signed_execution_certificate(
         shard_group_id: shard,
         read_nodes: vec![],
         write_nodes: vec![],
-        state_writes: vec![],
         receipt_hash,
         success,
         aggregated_signature,

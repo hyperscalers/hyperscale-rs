@@ -401,7 +401,6 @@ mod tests {
             transaction_hash: Hash::from_bytes(b"tx1"),
             shard_group_id: ShardGroupId(1),
             read_nodes: vec![],
-            state_writes: vec![],
             write_nodes: vec![],
             receipt_hash: Hash::from_bytes(b"commit"),
             success: true,
