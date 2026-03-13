@@ -24,6 +24,7 @@ mod signing;
 mod block;
 mod epoch;
 mod quorum_certificate;
+mod receipt;
 mod signer_bitfield;
 mod state;
 mod topology;
@@ -75,6 +76,11 @@ pub use block::{
     CommittedBlockHeader,
 };
 pub use quorum_certificate::QuorumCertificate;
+pub use receipt::{
+    ApplicationEvent, ConsensusReceipt, FeeSummary, LedgerReceiptEntry, LedgerTransactionOutcome,
+    LedgerTransactionReceipt, LocalTransactionExecution, LogLevel, ReceiptBundle, SubstateChange,
+    SubstateChangeAction, SubstateRef,
+};
 pub use signer_bitfield::SignerBitfield;
 pub use state::{
     ExecutionCertificate, ExecutionResult, ExecutionVote, StateEntry, StateProvision, SubstateWrite,
