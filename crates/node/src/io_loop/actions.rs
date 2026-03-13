@@ -120,7 +120,8 @@ where
             | Action::VerifyStateProvisions { .. }
             | Action::ExecuteTransactions { .. }
             | Action::SpeculativeExecute { .. }
-            | Action::FetchAndBroadcastProvisions { .. } => {
+            | Action::FetchAndBroadcastProvisions { .. }
+            | Action::StoreReceiptBundles { .. } => {
                 self.dispatch_delegated_action(action);
             }
 
@@ -204,8 +205,7 @@ where
             | Action::InitiateShardMerge { .. }
             | Action::CompleteShardMerge { .. }
             | Action::PersistEpochConfig { .. }
-            | Action::FetchEpochConfig { .. }
-            | Action::StoreReceiptBundles { .. } => {}
+            | Action::FetchEpochConfig { .. } => {}
         }
     }
 

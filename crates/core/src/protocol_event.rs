@@ -187,6 +187,9 @@ pub enum ProtocolEvent {
     ExecutionBatchCompleted {
         votes: Vec<ExecutionVote>,
         results: Vec<hyperscale_types::ExecutionResult>,
+        /// True when this batch came from speculative execution.
+        /// Receipt bundles are only persisted for canonical (non-speculative) execution.
+        speculative: bool,
     },
 
     /// Received an execution certificate for cross-shard execution.

@@ -9,8 +9,9 @@ use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommitmentProof,
-    CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
+    CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate,
+    TransactionDefer,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -962,16 +963,40 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ExecutionVoteReceived { vote } => {
                 self.execution.on_vote(self.topology.snapshot(), vote)
             }
-            ProtocolEvent::ExecutionBatchCompleted { votes, results } => {
-                // 1. Populate execution cache (in-memory, for block commit fast path)
+            ProtocolEvent::ExecutionBatchCompleted {
+                votes,
+                results,
+                speculative,
+            } => {
+                // 1. Build receipt bundles before consuming results
+                //    (only for canonical execution — speculative results are ephemeral)
+                let bundles: Vec<ReceiptBundle> = if !speculative {
+                    results
+                        .iter()
+                        .map(|r| ReceiptBundle {
+                            tx_hash: r.tx_hash,
+                            ledger_receipt: Arc::new(r.ledger_receipt.clone()),
+                            local_execution: Some(r.local_execution.clone()),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                // 2. Populate execution cache (in-memory, for block commit fast path)
                 for result in results {
                     self.execution
                         .execution_cache_mut()
                         .insert(result.tx_hash, result.database_updates);
                 }
 
-                // 2. Process votes through VoteTracker
-                let mut actions = Vec::new();
+                // 3. Dispatch receipt storage (fire-and-forget, off main thread)
+                let mut actions: Vec<Action> = Vec::new();
+                if !bundles.is_empty() {
+                    actions.push(Action::StoreReceiptBundles { bundles });
+                }
+
+                // 4. Process votes through VoteTracker
                 for vote in votes {
                     actions.extend(self.execution.on_vote(self.topology.snapshot(), vote));
                 }

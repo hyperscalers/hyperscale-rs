@@ -12,14 +12,14 @@ use hyperscale_core::{Action, NodeInput, ProtocolEvent, ProvisionVerificationRes
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_metrics as metrics;
-use hyperscale_storage::{CommitStore, SubstateStore};
+use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
     Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ShardGroupId, ValidatorId,
 };
 use std::sync::Arc;
 
 /// Context for executing delegated actions.
-pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore, D: Dispatch> {
+pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore + ConsensusStore, D: Dispatch> {
     pub storage: &'a S,
     pub executor: &'a RadixExecutor,
     pub signing_key: &'a Bls12381G1PrivateKey,
@@ -68,6 +68,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
         Action::SpeculativeExecute { .. } => Some(DispatchPool::Execution),
         Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Execution),
+        Action::StoreReceiptBundles { .. } => Some(DispatchPool::Execution),
         _ => None,
     }
 }
@@ -82,7 +83,10 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// The runner is responsible for additionally broadcasting votes to shard
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
-pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
+pub(crate) fn handle_delegated_action<
+    S: CommitStore + SubstateStore + ConsensusStore,
+    D: Dispatch,
+>(
     action: Action,
     ctx: &ActionContext<'_, S, D>,
 ) -> Option<DelegatedResult<S::PreparedCommit>> {
@@ -406,7 +410,11 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
 
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
-                    ProtocolEvent::ExecutionBatchCompleted { votes, results },
+                    ProtocolEvent::ExecutionBatchCompleted {
+                        votes,
+                        results,
+                        speculative: false,
+                    },
                 )],
                 prepared_commit: None,
             })
@@ -433,7 +441,11 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
 
             Some(DelegatedResult {
                 events: vec![
-                    NodeInput::Protocol(ProtocolEvent::ExecutionBatchCompleted { votes, results }),
+                    NodeInput::Protocol(ProtocolEvent::ExecutionBatchCompleted {
+                        votes,
+                        results,
+                        speculative: true,
+                    }),
                     NodeInput::Protocol(ProtocolEvent::SpeculativeExecutionComplete {
                         block_hash,
                         tx_hashes,
@@ -518,6 +530,15 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 .collect();
             Some(DelegatedResult {
                 events: vec![NodeInput::ProvisionsReady { batches }],
+                prepared_commit: None,
+            })
+        }
+
+        // --- Receipt persistence (fire-and-forget) ---
+        Action::StoreReceiptBundles { bundles } => {
+            ctx.storage.store_receipt_bundles(&bundles);
+            Some(DelegatedResult {
+                events: vec![],
                 prepared_commit: None,
             })
         }
