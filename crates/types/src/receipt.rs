@@ -163,6 +163,15 @@ impl LedgerTransactionReceipt {
     pub fn receipt_hash(&self) -> Hash {
         self.consensus_receipt().receipt_hash()
     }
+
+    /// Create a failure receipt with no state changes or events.
+    pub fn failure() -> Self {
+        Self {
+            outcome: LedgerTransactionOutcome::Failure,
+            state_changes: vec![],
+            application_events: vec![],
+        }
+    }
 }
 
 // ─── Local Execution (Tier 3) ────────────────────────────────────────────────

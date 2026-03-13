@@ -1,6 +1,7 @@
 //! Execution result types.
 
-use hyperscale_types::{Hash, SubstateWrite};
+use hyperscale_types::{Hash, LedgerTransactionReceipt, LocalTransactionExecution, SubstateWrite};
+use radix_substate_store_interface::interface::DatabaseUpdates;
 
 /// Output from executing a batch of transactions.
 #[derive(Debug, Clone)]
@@ -61,6 +62,23 @@ pub struct SingleTxResult {
     /// Only populated for successful executions.
     pub state_writes: Vec<SubstateWrite>,
 
+    // ─── New receipt fields ─────────────────────────────────────────────
+    /// Hash of ConsensusReceipt (outcome + event_root).
+    pub receipt_hash: Hash,
+
+    /// Full ledger receipt with all state changes.
+    pub ledger_receipt: LedgerTransactionReceipt,
+
+    /// Local execution metadata (fees, logs, errors).
+    pub local_execution: LocalTransactionExecution,
+
+    /// Raw DatabaseUpdates for the execution cache.
+    ///
+    /// Kept separate from the receipt because the receipt has SubstateChange
+    /// format (with Create/Update/Delete + previous values), while
+    /// DatabaseUpdates is the raw format needed for JMT application.
+    pub database_updates: DatabaseUpdates,
+
     /// Error message if execution failed.
     pub error: Option<String>,
 }
@@ -71,12 +89,20 @@ impl SingleTxResult {
         tx_hash: Hash,
         writes_commitment: Hash,
         state_writes: Vec<SubstateWrite>,
+        receipt_hash: Hash,
+        ledger_receipt: LedgerTransactionReceipt,
+        local_execution: LocalTransactionExecution,
+        database_updates: DatabaseUpdates,
     ) -> Self {
         Self {
             tx_hash,
             success: true,
             writes_commitment,
             state_writes,
+            receipt_hash,
+            ledger_receipt,
+            local_execution,
+            database_updates,
             error: None,
         }
     }
@@ -88,6 +114,10 @@ impl SingleTxResult {
             success: false,
             writes_commitment: Hash::ZERO,
             state_writes: vec![],
+            receipt_hash: LedgerTransactionReceipt::failure().receipt_hash(),
+            ledger_receipt: LedgerTransactionReceipt::failure(),
+            local_execution: LocalTransactionExecution::failure(None),
+            database_updates: DatabaseUpdates::default(),
             error: Some(error.into()),
         }
     }
@@ -101,4 +131,22 @@ impl SingleTxResult {
     pub fn is_failure(&self) -> bool {
         !self.success
     }
+}
+
+/// Execution output that travels alongside an ExecutionVote through the
+/// ProtocolEvent boundary from the thread pool to the state machine.
+///
+/// The state machine uses this to:
+/// 1. Populate the ExecutionCache (in-memory, for block commit fast path)
+/// 2. Dispatch receipt storage to disk (via StoreReceiptBundles action)
+#[derive(Debug, Clone)]
+pub struct ExecutionResult {
+    /// Hash of the executed transaction.
+    pub tx_hash: Hash,
+    /// Raw DatabaseUpdates for the execution cache.
+    pub database_updates: DatabaseUpdates,
+    /// Full ledger receipt with all state changes.
+    pub ledger_receipt: LedgerTransactionReceipt,
+    /// Local execution metadata (fees, logs, errors).
+    pub local_execution: LocalTransactionExecution,
 }

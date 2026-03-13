@@ -8,10 +8,12 @@
 //! - State provisioning
 //! - Vote aggregation and certificate formation
 
+pub mod execution_cache;
 pub mod handlers;
 
 mod pending;
 mod state;
 mod trackers;
 
+pub use execution_cache::ExecutionCache;
 pub use state::{ExecutionState, DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};

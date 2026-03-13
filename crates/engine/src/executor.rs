@@ -31,7 +31,8 @@
 
 use crate::error::ExecutionError;
 use crate::execution::{
-    compute_writes_commitment, extract_substate_writes, is_commit_success, ProvisionedSnapshot,
+    build_ledger_receipt, build_local_execution, compute_writes_commitment,
+    extract_database_updates, extract_substate_writes, is_commit_success, ProvisionedSnapshot,
 };
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
@@ -268,8 +269,12 @@ impl RadixExecutor {
 
             // Use cross-shard result which filters writes to declared_writes
             // so all shards compute the same merkle root
-            let result =
-                self.receipt_to_cross_shard_result(tx.hash(), &receipt, &tx.declared_writes);
+            let result = self.receipt_to_cross_shard_result(
+                tx.hash(),
+                &receipt,
+                &tx.declared_writes,
+                &provisioned,
+            );
 
             // NO COMMIT HERE - writes are returned in result.state_writes
             // They will be committed later when TransactionCertificate is included in a block
@@ -308,7 +313,7 @@ impl RadixExecutor {
             &executable,
         );
 
-        let result = self.receipt_to_result(tx.hash(), &receipt);
+        let result = self.receipt_to_result(tx.hash(), &receipt, &snapshot);
 
         // NO COMMIT HERE - writes are returned in result.state_writes
         // They will be committed later when TransactionCertificate is included in a block
@@ -317,13 +322,33 @@ impl RadixExecutor {
     }
 
     /// Convert a receipt to a result.
-    fn receipt_to_result(&self, tx_hash: Hash, receipt: &TransactionReceipt) -> SingleTxResult {
+    ///
+    /// The `execution_snapshot` must be the same snapshot used for execution,
+    /// so that previous values read for state change classification are correct.
+    fn receipt_to_result(
+        &self,
+        tx_hash: Hash,
+        receipt: &TransactionReceipt,
+        execution_snapshot: &impl SubstateDatabase,
+    ) -> SingleTxResult {
         let success = is_commit_success(receipt);
 
         if success {
             let state_writes = extract_substate_writes(receipt);
             let writes_commitment = compute_writes_commitment(&state_writes);
-            SingleTxResult::success(tx_hash, writes_commitment, state_writes)
+            let ledger_receipt = build_ledger_receipt(receipt, execution_snapshot);
+            let local_execution = build_local_execution(receipt);
+            let receipt_hash = ledger_receipt.receipt_hash();
+            let database_updates = extract_database_updates(receipt);
+            SingleTxResult::success(
+                tx_hash,
+                writes_commitment,
+                state_writes,
+                receipt_hash,
+                ledger_receipt,
+                local_execution,
+                database_updates,
+            )
         } else {
             let error = format!("{:?}", receipt.result);
             SingleTxResult::failure(tx_hash, error)
@@ -341,6 +366,7 @@ impl RadixExecutor {
         tx_hash: Hash,
         receipt: &TransactionReceipt,
         declared_writes: &[NodeId],
+        execution_snapshot: &impl SubstateDatabase,
     ) -> SingleTxResult {
         let success = is_commit_success(receipt);
 
@@ -362,7 +388,19 @@ impl RadixExecutor {
                 .cloned()
                 .collect();
             let writes_commitment = compute_writes_commitment(&filtered_writes);
-            SingleTxResult::success(tx_hash, writes_commitment, filtered_writes)
+            let ledger_receipt = build_ledger_receipt(receipt, execution_snapshot);
+            let local_execution = build_local_execution(receipt);
+            let receipt_hash = ledger_receipt.receipt_hash();
+            let database_updates = extract_database_updates(receipt);
+            SingleTxResult::success(
+                tx_hash,
+                writes_commitment,
+                filtered_writes,
+                receipt_hash,
+                ledger_receipt,
+                local_execution,
+                database_updates,
+            )
         } else {
             let error = format!("{:?}", receipt.result);
             SingleTxResult::failure(tx_hash, error)

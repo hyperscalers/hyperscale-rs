@@ -37,6 +37,7 @@ mod validation;
 pub use execution::ProvisionedSnapshot;
 pub use executor::{fetch_state_entries, RadixExecutor};
 pub use genesis::GenesisConfig;
+pub use result::ExecutionResult;
 pub use validation::TransactionValidation;
 
 // Re-export Radix types needed by engine callers (not storage-related)
