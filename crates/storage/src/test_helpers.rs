@@ -114,6 +114,7 @@ pub fn make_test_block(height: u64) -> Block {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         },
         retry_transactions: vec![],

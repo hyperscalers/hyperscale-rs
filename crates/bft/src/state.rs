@@ -1026,6 +1026,7 @@ impl BftState {
             is_fallback: true,
             state_root: parent_state_root,
             transaction_root: Hash::ZERO, // Fallback blocks have no transactions
+            receipt_root: Hash::ZERO,     // No certificates
             provision_targets: vec![],    // Empty - fallback blocks have no transactions
         };
 
@@ -1149,6 +1150,7 @@ impl BftState {
             is_fallback: false, // Not a fallback - just empty due to sync
             state_root: parent_state_root,
             transaction_root: Hash::ZERO, // Sync blocks have no transactions
+            receipt_root: Hash::ZERO,     // No certificates
             provision_targets: vec![],    // Empty - sync blocks have no transactions
         };
 
@@ -1916,6 +1918,14 @@ impl BftState {
                     verification_actions.extend(
                         self.verification
                             .initiate_transaction_root_verification(block_hash, &block),
+                    );
+                }
+
+                // Verify receipt root if block has certificates.
+                if self.verification.needs_receipt_root_verification(&block) {
+                    verification_actions.extend(
+                        self.verification
+                            .initiate_receipt_root_verification(block_hash, &block),
                     );
                 }
 
@@ -2753,6 +2763,59 @@ impl BftState {
             debug!(
                 block_hash = ?block_hash,
                 "Transaction root done, waiting for other verifications"
+            );
+            return vec![];
+        }
+
+        let height = pending_block.header().height.0;
+        let round = pending_block.header().round;
+
+        // All verifications complete - vote
+        self.create_vote(topology, block_hash, height, round)
+    }
+
+    /// Handle receipt root verification result.
+    ///
+    /// Called when the runner completes `Action::VerifyReceiptRoot`. If the
+    /// receipt root is invalid, the block is rejected. If valid, proceeds to
+    /// vote for the block (assuming other verifications are also complete).
+    #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
+    pub fn on_receipt_root_verified(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        valid: bool,
+    ) -> Vec<Action> {
+        if !self
+            .verification
+            .on_receipt_root_verified(block_hash, valid)
+        {
+            warn!(
+                block_hash = ?block_hash,
+                "Receipt root verification FAILED - proposer included incorrect receipt_root!"
+            );
+            self.pending_blocks.remove(&block_hash);
+            return vec![];
+        }
+
+        let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
+            warn!(
+                block_hash = ?block_hash,
+                "Receipt root verification complete but pending block not found"
+            );
+            return vec![];
+        };
+
+        let block = match pending_block.block() {
+            Some(b) => b,
+            None => return vec![],
+        };
+
+        // Check if all verifications are complete (state root, tx root, etc. may still be pending)
+        if !self.verification.is_block_verified(&block) {
+            debug!(
+                block_hash = ?block_hash,
+                "Receipt root done, waiting for other verifications"
             );
             return vec![];
         }
@@ -4757,6 +4820,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         }
     }
@@ -4778,6 +4842,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -4873,6 +4938,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -4894,6 +4960,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         assert!(
@@ -4971,6 +5038,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -5054,6 +5122,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -5141,6 +5210,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -5215,6 +5285,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -5746,6 +5817,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_a_hash = block_a.hash();
@@ -5761,6 +5833,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_b_hash = block_b.hash();
@@ -5805,6 +5878,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_hash = block.hash();
@@ -5843,6 +5917,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             };
             state.try_vote_on_block(&topology, block.hash(), height, 0);
@@ -6140,6 +6215,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let original_block_hash = original_header.hash();
@@ -6216,6 +6292,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -6251,6 +6328,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -6581,6 +6659,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let original_block_hash = original_header.hash();
@@ -6829,6 +6908,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_hash_r1 = header_round1.hash();
@@ -6844,6 +6924,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_hash_r2 = header_round2.hash();
@@ -6859,6 +6940,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_hash_r3 = header_round3.hash();
@@ -6875,6 +6957,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_hash_h6 = header_height6.hash();
@@ -7153,6 +7236,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -7187,6 +7271,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -7896,6 +7981,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             },
             retry_transactions: vec![],
@@ -8449,6 +8535,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             },
             retry_transactions: vec![],

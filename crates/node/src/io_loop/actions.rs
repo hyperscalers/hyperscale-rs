@@ -115,6 +115,7 @@ where
             | Action::VerifyCommitmentProof { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyTransactionRoot { .. }
+            | Action::VerifyReceiptRoot { .. }
             | Action::BuildProposal { .. }
             | Action::AggregateExecutionCertificate { .. }
             | Action::VerifyStateProvisions { .. }

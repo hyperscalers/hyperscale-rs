@@ -1,8 +1,8 @@
 //! Async verification pipeline for block voting.
 //!
-//! Tracks QC signature, CommitmentProof, state root, and transaction root
-//! verifications. BftState delegates verification bookkeeping here while
-//! retaining control-flow decisions (voting, block rejection).
+//! Tracks QC signature, CommitmentProof, state root, transaction root, and
+//! receipt root verifications. BftState delegates verification bookkeeping
+//! here while retaining control-flow decisions (voting, block rejection).
 
 use hyperscale_types::{
     Block, BlockHeader, Bls12381G1PublicKey, CommitmentProof, Hash, TopologySnapshot,
@@ -135,6 +135,13 @@ pub(crate) struct VerificationPipeline {
 
     /// Blocks with verified transaction roots.
     verified_transaction_roots: HashSet<Hash>,
+
+    // === Receipt root verification ===
+    /// Blocks where receipt root verification is currently in-flight.
+    receipt_root_verifications_in_flight: HashSet<Hash>,
+
+    /// Blocks with verified receipt roots.
+    verified_receipt_roots: HashSet<Hash>,
 }
 
 impl VerificationPipeline {
@@ -152,6 +159,8 @@ impl VerificationPipeline {
             ready_state_root_verifications: Vec::new(),
             transaction_root_verifications_in_flight: HashSet::new(),
             verified_transaction_roots: HashSet::new(),
+            receipt_root_verifications_in_flight: HashSet::new(),
+            verified_receipt_roots: HashSet::new(),
         }
     }
 
@@ -225,7 +234,13 @@ impl VerificationPipeline {
             self.verified_transaction_roots.contains(&block_hash)
         };
 
-        commitment_proof_ok && state_root_ok && transaction_root_ok
+        let receipt_root_ok = if block.certificates.is_empty() {
+            true
+        } else {
+            self.verified_receipt_roots.contains(&block_hash)
+        };
+
+        commitment_proof_ok && state_root_ok && transaction_root_ok && receipt_root_ok
     }
 
     // ─── CommitmentProof ─────────────────────────────────────────────────
@@ -571,6 +586,65 @@ impl VerificationPipeline {
             debug!(
                 block_hash = ?block_hash,
                 "Transaction root verified successfully"
+            );
+        }
+
+        valid
+    }
+
+    // ─── Receipt root ─────────────────────────────────────────────────────
+
+    /// Check if a block needs receipt root verification before voting.
+    pub fn needs_receipt_root_verification(&self, block: &Block) -> bool {
+        if block.certificates.is_empty() {
+            return false;
+        }
+
+        let block_hash = block.hash();
+
+        if self.verified_receipt_roots.contains(&block_hash)
+            || self
+                .receipt_root_verifications_in_flight
+                .contains(&block_hash)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    /// Initiate receipt root verification for a block.
+    pub fn initiate_receipt_root_verification(
+        &mut self,
+        block_hash: Hash,
+        block: &Block,
+    ) -> Vec<Action> {
+        debug!(
+            block_hash = ?block_hash,
+            cert_count = block.certificates.len(),
+            expected_root = ?block.header.receipt_root,
+            "Initiating receipt root verification"
+        );
+
+        self.receipt_root_verifications_in_flight.insert(block_hash);
+
+        vec![Action::VerifyReceiptRoot {
+            block_hash,
+            expected_root: block.header.receipt_root,
+            certificates: block.certificates.clone(),
+        }]
+    }
+
+    /// Record a receipt root verification result. Returns whether the verification passed.
+    pub fn on_receipt_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
+        self.receipt_root_verifications_in_flight
+            .remove(&block_hash);
+
+        if valid {
+            self.verified_receipt_roots.insert(block_hash);
+            debug!(
+                block_hash = ?block_hash,
+                "Receipt root verified successfully"
             );
         }
 

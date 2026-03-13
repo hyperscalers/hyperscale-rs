@@ -345,6 +345,21 @@ pub enum Action {
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 
+    /// Verify a block's receipt root.
+    ///
+    /// Computes the merkle root from the certificates' `receipt_hash` values
+    /// and compares against the block header's claimed `receipt_root`.
+    /// Returns `ProtocolEvent::ReceiptRootVerified`.
+    ///
+    /// Pure CPU operation — verified in parallel with state root and transaction root.
+    VerifyReceiptRoot {
+        block_hash: Hash,
+        /// Expected receipt root from block header.
+        expected_root: Hash,
+        /// Certificates whose receipt_hash values form the merkle leaves.
+        certificates: Vec<Arc<TransactionCertificate>>,
+    },
+
     /// Build a complete block proposal.
     ///
     /// Computes the new state root from certificates, builds the complete block,
@@ -753,6 +768,7 @@ impl Action {
                 | Action::VerifyCommitmentProof { .. }
                 | Action::VerifyStateRoot { .. }
                 | Action::VerifyTransactionRoot { .. }
+                | Action::VerifyReceiptRoot { .. }
                 | Action::BuildProposal { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
@@ -804,6 +820,7 @@ impl Action {
             Action::VerifyCommitmentProof { .. } => "VerifyCommitmentProof",
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
             Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
+            Action::VerifyReceiptRoot { .. } => "VerifyReceiptRoot",
             Action::BuildProposal { .. } => "BuildProposal",
 
             // Delegated Work - Execution

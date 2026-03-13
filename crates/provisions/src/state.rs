@@ -859,6 +859,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::from_bytes(format!("root_{shard}_{height}").as_bytes()),
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let header_hash = header.hash();
@@ -977,6 +978,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::from_bytes(b"root"),
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let mut qc = QuorumCertificate::genesis();
@@ -1006,6 +1008,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::from_bytes(b"root"),
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let header_hash = header.hash();
@@ -1517,6 +1520,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::from_bytes(format!("root_{shard}_{height}").as_bytes()),
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets,
         };
         let header_hash = header.hash();

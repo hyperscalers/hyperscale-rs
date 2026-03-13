@@ -6,10 +6,11 @@
 
 use hyperscale_storage::{CommitStore, DatabaseUpdates, SubstateStore};
 use hyperscale_types::{
-    batch_verify_bls_same_message, compute_transaction_root, verify_bls12381_v1, Block,
-    BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
-    Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield, TransactionAbort,
-    TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
+    batch_verify_bls_same_message, compute_receipt_root, compute_transaction_root,
+    verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
+    Bls12381G2Signature, CommitmentProof, Hash, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, SignerBitfield, TransactionAbort, TransactionCertificate, TransactionDefer,
+    ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -246,6 +247,28 @@ pub fn verify_transaction_root(
     valid
 }
 
+/// Verify a block's receipt root against its certificates.
+///
+/// Pure computation over the certificates' `receipt_hash` values.
+pub fn verify_receipt_root(
+    expected_root: Hash,
+    certificates: &[Arc<TransactionCertificate>],
+) -> bool {
+    let computed_root = compute_receipt_root(certificates);
+    let valid = computed_root == expected_root;
+
+    if !valid {
+        tracing::warn!(
+            ?expected_root,
+            ?computed_root,
+            cert_count = certificates.len(),
+            "Receipt root verification FAILED"
+        );
+    }
+
+    valid
+}
+
 /// Result of state root verification.
 pub struct StateRootResult<P: Send> {
     pub valid: bool,
@@ -353,6 +376,9 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     let transaction_root =
         compute_transaction_root(&retry_transactions, &priority_transactions, &transactions);
 
+    // Compute receipt root from certificate receipt hashes
+    let receipt_root = compute_receipt_root(&certs_to_include);
+
     // Build the block
     let header = BlockHeader {
         shard_group_id: local_shard,
@@ -365,6 +391,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         is_fallback,
         state_root,
         transaction_root,
+        receipt_root,
         provision_targets,
     };
 

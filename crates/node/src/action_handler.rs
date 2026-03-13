@@ -58,6 +58,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::VerifyCommitmentProof { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::VerifyReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
 
         // General crypto
@@ -196,6 +197,26 @@ pub(crate) fn handle_delegated_action<
                 events: vec![NodeInput::Protocol(
                     ProtocolEvent::TransactionRootVerified { block_hash, valid },
                 )],
+                prepared_commit: None,
+            })
+        }
+
+        Action::VerifyReceiptRoot {
+            block_hash,
+            expected_root,
+            certificates,
+        } => {
+            let start = std::time::Instant::now();
+            let valid = hyperscale_bft::handlers::verify_receipt_root(expected_root, &certificates);
+            metrics::record_signature_verification_latency(
+                "receipt_root",
+                start.elapsed().as_secs_f64(),
+            );
+            Some(DelegatedResult {
+                events: vec![NodeInput::Protocol(ProtocolEvent::ReceiptRootVerified {
+                    block_hash,
+                    valid,
+                })],
                 prepared_commit: None,
             })
         }

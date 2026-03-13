@@ -1158,6 +1158,24 @@ impl TransactionCertificate {
             .map(|cert| cert.read_nodes.len())
             .sum()
     }
+
+    /// Combined receipt hash across all shards.
+    ///
+    /// For single-shard transactions, returns the shard's `receipt_hash` directly.
+    /// For cross-shard transactions, computes a merkle root over each shard's
+    /// `receipt_hash` in shard ID order (deterministic via BTreeMap).
+    pub fn receipt_hash(&self) -> Hash {
+        let hashes: Vec<Hash> = self
+            .shard_proofs
+            .values()
+            .map(|cert| cert.receipt_hash)
+            .collect();
+        match hashes.len() {
+            0 => Hash::ZERO,
+            1 => hashes[0],
+            _ => crate::compute_merkle_root(&hashes),
+        }
+    }
 }
 
 // ============================================================================
