@@ -4,14 +4,19 @@
 //! `TransactionCertificate`, `Block`, and `QuorumCertificate` so that
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
-use crate::{DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates};
+use crate::{
+    ConsensusStore, DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
+};
 use hyperscale_types::{
-    zero_bls_signature, Block, BlockHeader, BlockHeight, ExecutionCertificate, Hash, NodeId,
-    PartitionNumber, QuorumCertificate, ShardGroupId, SignerBitfield, SubstateWrite,
+    zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, ExecutionCertificate,
+    FeeSummary, Hash, LedgerTransactionOutcome, LedgerTransactionReceipt,
+    LocalTransactionExecution, LogLevel, NodeId, PartitionNumber, QuorumCertificate, ReceiptBundle,
+    ShardGroupId, SignerBitfield, SubstateChange, SubstateChangeAction, SubstateRef, SubstateWrite,
     TransactionCertificate, TransactionDecision, ValidatorId,
 };
 use radix_common::prelude::DatabaseUpdate;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Build a `DatabaseUpdates` containing a single `Set` operation.
 pub fn make_database_update(
@@ -150,4 +155,109 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
         signers: SignerBitfield::new(4),
         weighted_timestamp_ms: block.header.timestamp,
     }
+}
+
+/// Build a `ReceiptBundle` with both ledger receipt and local execution.
+pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
+    let tx_hash = Hash::from_bytes(&[seed; 32]);
+    let ledger_receipt = Arc::new(LedgerTransactionReceipt {
+        outcome: LedgerTransactionOutcome::Success,
+        state_changes: vec![SubstateChange {
+            substate_ref: SubstateRef {
+                node_id: NodeId([seed; 30]),
+                partition: PartitionNumber(0),
+                sort_key: vec![seed],
+            },
+            action: SubstateChangeAction::Create {
+                new_value: vec![seed, seed + 1],
+            },
+        }],
+        application_events: vec![ApplicationEvent {
+            type_id: vec![seed],
+            data: vec![seed, seed + 1],
+        }],
+    });
+    let local_execution = Some(LocalTransactionExecution {
+        fee_summary: FeeSummary {
+            total_execution_cost: vec![seed],
+            total_royalty_cost: vec![],
+            total_storage_cost: vec![],
+            total_tipping_cost: vec![],
+        },
+        log_messages: vec![(LogLevel::Info, format!("tx {seed}"))],
+        error_message: None,
+    });
+    ReceiptBundle {
+        tx_hash,
+        ledger_receipt,
+        local_execution,
+    }
+}
+
+/// Build a `ReceiptBundle` without local execution (simulates synced receipt).
+pub fn make_synced_receipt_bundle(seed: u8) -> ReceiptBundle {
+    let mut bundle = make_test_receipt_bundle(seed);
+    bundle.local_execution = None;
+    bundle
+}
+
+/// Shared receipt storage roundtrip test. Call from each backend's test suite.
+pub fn test_receipt_storage_roundtrip(storage: &impl ConsensusStore) {
+    let bundle = make_test_receipt_bundle(42);
+    let tx_hash = bundle.tx_hash;
+
+    // Initially no receipt
+    assert!(!storage.has_receipt(&tx_hash));
+    assert!(storage.get_ledger_receipt(&tx_hash).is_none());
+    assert!(storage.get_local_execution(&tx_hash).is_none());
+
+    // Store and verify
+    storage.store_receipt_bundle(&bundle);
+    assert!(storage.has_receipt(&tx_hash));
+
+    let retrieved = storage.get_ledger_receipt(&tx_hash).unwrap();
+    assert_eq!(*retrieved, *bundle.ledger_receipt);
+
+    let local = storage.get_local_execution(&tx_hash).unwrap();
+    assert_eq!(local, bundle.local_execution.unwrap());
+}
+
+/// Shared test for synced receipt (no local execution).
+pub fn test_receipt_storage_synced(storage: &impl ConsensusStore) {
+    let bundle = make_synced_receipt_bundle(43);
+    let tx_hash = bundle.tx_hash;
+
+    storage.store_receipt_bundle(&bundle);
+    assert!(storage.has_receipt(&tx_hash));
+
+    let retrieved = storage.get_ledger_receipt(&tx_hash).unwrap();
+    assert_eq!(*retrieved, *bundle.ledger_receipt);
+
+    // Local execution should be None for synced receipts
+    assert!(storage.get_local_execution(&tx_hash).is_none());
+}
+
+/// Shared test for batch receipt storage.
+pub fn test_receipt_batch_storage(storage: &impl ConsensusStore) {
+    let bundles: Vec<ReceiptBundle> = (10..13).map(make_test_receipt_bundle).collect();
+
+    storage.store_receipt_bundles(&bundles);
+
+    for bundle in &bundles {
+        assert!(storage.has_receipt(&bundle.tx_hash));
+        let retrieved = storage.get_ledger_receipt(&bundle.tx_hash).unwrap();
+        assert_eq!(*retrieved, *bundle.ledger_receipt);
+    }
+}
+
+/// Shared test for idempotent receipt overwrite.
+pub fn test_receipt_idempotent_overwrite(storage: &impl ConsensusStore) {
+    let bundle = make_test_receipt_bundle(44);
+    let tx_hash = bundle.tx_hash;
+
+    storage.store_receipt_bundle(&bundle);
+    storage.store_receipt_bundle(&bundle); // overwrite with same data
+
+    let retrieved = storage.get_ledger_receipt(&tx_hash).unwrap();
+    assert_eq!(*retrieved, *bundle.ledger_receipt);
 }

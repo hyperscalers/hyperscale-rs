@@ -4,9 +4,11 @@
 //! All methods take `&self` — implementations use interior mutability.
 
 use hyperscale_types::{
-    Block, BlockHeight, Hash, QuorumCertificate, RoutableTransaction, TransactionCertificate,
+    Block, BlockHeight, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
+    QuorumCertificate, ReceiptBundle, RoutableTransaction, TransactionCertificate,
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Abstracts consensus-related storage for both simulation and production.
 ///
@@ -73,4 +75,35 @@ pub trait ConsensusStore: Send + Sync {
     ///
     /// Returns only certificates that were found (missing hashes are skipped).
     fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate>;
+
+    // ─── Receipt Storage ──────────────────────────────────────────────────
+
+    /// Store a receipt bundle (ledger receipt + optional local execution) for a transaction.
+    ///
+    /// If `bundle.local_execution` is `None` (e.g., receipt fetched during sync),
+    /// only the ledger receipt is persisted.
+    fn store_receipt_bundle(&self, bundle: &ReceiptBundle);
+
+    /// Store multiple receipt bundles atomically.
+    ///
+    /// Default implementation loops, but RocksDB overrides for atomic batch write.
+    fn store_receipt_bundles(&self, bundles: &[ReceiptBundle]) {
+        for bundle in bundles {
+            self.store_receipt_bundle(bundle);
+        }
+    }
+
+    /// Retrieve the ledger receipt for a transaction.
+    fn get_ledger_receipt(&self, tx_hash: &Hash) -> Option<Arc<LedgerTransactionReceipt>>;
+
+    /// Retrieve local execution details for a transaction.
+    ///
+    /// Returns `None` both when the tx doesn't exist AND when it was synced
+    /// (not executed locally). Use `has_receipt()` to distinguish.
+    fn get_local_execution(&self, tx_hash: &Hash) -> Option<LocalTransactionExecution>;
+
+    /// Check if a ledger receipt exists for a transaction.
+    fn has_receipt(&self, tx_hash: &Hash) -> bool {
+        self.get_ledger_receipt(tx_hash).is_some()
+    }
 }

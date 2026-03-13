@@ -20,8 +20,8 @@ use hyperscale_storage::{
     SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{
-    Block, BlockHeight, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TransactionCertificate,
+    Block, BlockHeight, Hash, LedgerTransactionReceipt, LocalTransactionExecution, NodeId,
+    QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId, TransactionCertificate,
 };
 use im::OrdMap;
 use std::collections::{BTreeMap, HashMap};
@@ -86,6 +86,10 @@ struct ConsensusState {
     /// Our own votes indexed by height.
     /// **BFT Safety Critical**: Used to prevent equivocation after restart.
     own_votes: HashMap<u64, (Hash, u64)>,
+    /// Ledger receipts keyed by transaction hash.
+    ledger_receipts: HashMap<Hash, Arc<LedgerTransactionReceipt>>,
+    /// Local execution details keyed by transaction hash.
+    local_executions: HashMap<Hash, LocalTransactionExecution>,
 }
 
 impl ConsensusState {
@@ -98,6 +102,8 @@ impl ConsensusState {
             transactions: HashMap::new(),
             certificates: HashMap::new(),
             own_votes: HashMap::new(),
+            ledger_receipts: HashMap::new(),
+            local_executions: HashMap::new(),
         }
     }
 }
@@ -867,6 +873,33 @@ impl<D: Dispatch + 'static> ConsensusStore for SimStorage<D> {
             .filter_map(|h| c.certificates.get(h).cloned())
             .collect()
     }
+
+    fn store_receipt_bundle(&self, bundle: &ReceiptBundle) {
+        let mut c = self.consensus.write().unwrap();
+        c.ledger_receipts
+            .insert(bundle.tx_hash, Arc::clone(&bundle.ledger_receipt));
+        if let Some(ref local) = bundle.local_execution {
+            c.local_executions.insert(bundle.tx_hash, local.clone());
+        }
+    }
+
+    fn get_ledger_receipt(&self, tx_hash: &Hash) -> Option<Arc<LedgerTransactionReceipt>> {
+        self.consensus
+            .read()
+            .unwrap()
+            .ledger_receipts
+            .get(tx_hash)
+            .cloned()
+    }
+
+    fn get_local_execution(&self, tx_hash: &Hash) -> Option<LocalTransactionExecution> {
+        self.consensus
+            .read()
+            .unwrap()
+            .local_executions
+            .get(tx_hash)
+            .cloned()
+    }
 }
 
 /// Snapshot of in-memory storage.
@@ -1616,5 +1649,33 @@ mod tests {
                 .is_none(),
             "future version should return None"
         );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Receipt storage
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_receipt_storage_roundtrip() {
+        let storage = SimStorage::new(SyncDispatch::new());
+        hyperscale_storage::test_helpers::test_receipt_storage_roundtrip(&storage);
+    }
+
+    #[test]
+    fn test_receipt_storage_synced() {
+        let storage = SimStorage::new(SyncDispatch::new());
+        hyperscale_storage::test_helpers::test_receipt_storage_synced(&storage);
+    }
+
+    #[test]
+    fn test_receipt_batch_storage() {
+        let storage = SimStorage::new(SyncDispatch::new());
+        hyperscale_storage::test_helpers::test_receipt_batch_storage(&storage);
+    }
+
+    #[test]
+    fn test_receipt_idempotent_overwrite() {
+        let storage = SimStorage::new(SyncDispatch::new());
+        hyperscale_storage::test_helpers::test_receipt_idempotent_overwrite(&storage);
     }
 }

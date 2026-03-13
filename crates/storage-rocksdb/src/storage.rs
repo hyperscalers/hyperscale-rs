@@ -1792,6 +1792,86 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
+    // Receipt storage
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Store a receipt bundle (ledger receipt + optional local execution).
+    pub fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
+        let mut batch = WriteBatch::default();
+        self.add_receipt_bundle_to_batch(&mut batch, bundle);
+        self.db
+            .write(batch)
+            .expect("failed to persist receipt bundle");
+    }
+
+    /// Store multiple receipt bundles in a single atomic WriteBatch.
+    pub fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
+        if bundles.is_empty() {
+            return;
+        }
+        let mut batch = WriteBatch::default();
+        for bundle in bundles {
+            self.add_receipt_bundle_to_batch(&mut batch, bundle);
+        }
+        self.db
+            .write(batch)
+            .expect("failed to persist receipt bundles");
+    }
+
+    /// Add a single receipt bundle's writes to an existing WriteBatch.
+    fn add_receipt_bundle_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        bundle: &hyperscale_types::ReceiptBundle,
+    ) {
+        let receipts_cf = self
+            .db
+            .cf_handle("ledger_receipts")
+            .expect("ledger_receipts column family must exist");
+        let receipt_bytes = sbor::basic_encode(bundle.ledger_receipt.as_ref())
+            .expect("ledger receipt encoding must succeed");
+        batch.put_cf(receipts_cf, bundle.tx_hash.as_bytes(), receipt_bytes);
+
+        if let Some(ref local) = bundle.local_execution {
+            let local_cf = self
+                .db
+                .cf_handle("local_executions")
+                .expect("local_executions column family must exist");
+            let local_bytes =
+                sbor::basic_encode(local).expect("local execution encoding must succeed");
+            batch.put_cf(local_cf, bundle.tx_hash.as_bytes(), local_bytes);
+        }
+    }
+
+    /// Retrieve the ledger receipt for a transaction.
+    pub fn get_ledger_receipt(
+        &self,
+        tx_hash: &Hash,
+    ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
+        let cf = self.db.cf_handle("ledger_receipts")?;
+        match self.db.get_cf(cf, tx_hash.as_bytes()) {
+            Ok(Some(value)) => {
+                let receipt: hyperscale_types::LedgerTransactionReceipt =
+                    sbor::basic_decode(&value).ok()?;
+                Some(Arc::new(receipt))
+            }
+            _ => None,
+        }
+    }
+
+    /// Retrieve local execution details for a transaction.
+    pub fn get_local_execution(
+        &self,
+        tx_hash: &Hash,
+    ) -> Option<hyperscale_types::LocalTransactionExecution> {
+        let cf = self.db.cf_handle("local_executions")?;
+        match self.db.get_cf(cf, tx_hash.as_bytes()) {
+            Ok(Some(value)) => sbor::basic_decode(&value).ok(),
+            _ => None,
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
     // Vote storage (BFT Safety Critical)
     // ═══════════════════════════════════════════════════════════════════════
 
@@ -2232,6 +2312,8 @@ impl Default for RocksDbConfig {
                 "jmt_nodes".to_string(), // JMT tree nodes for state commitment
                 "associated_state_tree_values".to_string(), // Historical substate values (leaf key -> value)
                 "stale_state_hash_tree_parts".to_string(),  // Deferred GC queue for stale JMT nodes
+                "ledger_receipts".to_string(),              // Ledger receipts keyed by tx hash
+                "local_executions".to_string(), // Local execution details keyed by tx hash
             ],
             jmt_history_length: 60_000, // Match Babylon's default
         }
@@ -2473,6 +2555,28 @@ impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for RocksDbStorag
     fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate> {
         RocksDbStorage::get_certificates_batch(self, hashes)
     }
+
+    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
+        RocksDbStorage::store_receipt_bundle(self, bundle)
+    }
+
+    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
+        RocksDbStorage::store_receipt_bundles(self, bundles)
+    }
+
+    fn get_ledger_receipt(
+        &self,
+        tx_hash: &Hash,
+    ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
+        RocksDbStorage::get_ledger_receipt(self, tx_hash)
+    }
+
+    fn get_local_execution(
+        &self,
+        tx_hash: &Hash,
+    ) -> Option<hyperscale_types::LocalTransactionExecution> {
+        RocksDbStorage::get_local_execution(self, tx_hash)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2687,6 +2791,28 @@ impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for SharedStorage
 
     fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate> {
         self.0.get_certificates_batch(hashes)
+    }
+
+    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
+        self.0.store_receipt_bundle(bundle)
+    }
+
+    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
+        self.0.store_receipt_bundles(bundles)
+    }
+
+    fn get_ledger_receipt(
+        &self,
+        tx_hash: &Hash,
+    ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
+        self.0.get_ledger_receipt(tx_hash)
+    }
+
+    fn get_local_execution(
+        &self,
+        tx_hash: &Hash,
+    ) -> Option<hyperscale_types::LocalTransactionExecution> {
+        self.0.get_local_execution(tx_hash)
     }
 }
 
@@ -3432,6 +3558,59 @@ mod tests {
 
             let vote = storage.get_own_vote(10);
             assert_eq!(vote, Some((vote_hash, 3)), "vote should survive reopen");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Receipt storage
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_receipt_storage_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
+        hyperscale_storage::test_helpers::test_receipt_storage_roundtrip(&storage);
+    }
+
+    #[test]
+    fn test_receipt_storage_synced() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
+        hyperscale_storage::test_helpers::test_receipt_storage_synced(&storage);
+    }
+
+    #[test]
+    fn test_receipt_batch_storage() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
+        hyperscale_storage::test_helpers::test_receipt_batch_storage(&storage);
+    }
+
+    #[test]
+    fn test_receipt_idempotent_overwrite() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
+        hyperscale_storage::test_helpers::test_receipt_idempotent_overwrite(&storage);
+    }
+
+    #[test]
+    fn test_receipt_survives_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let bundle = hyperscale_storage::test_helpers::make_test_receipt_bundle(55);
+        let tx_hash = bundle.tx_hash;
+
+        {
+            let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
+            storage.store_receipt_bundle(&bundle);
+        }
+
+        {
+            let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
+            assert!(storage.has_receipt(&tx_hash));
+            let retrieved = storage.get_ledger_receipt(&tx_hash).unwrap();
+            assert_eq!(*retrieved, *bundle.ledger_receipt);
+            let local = storage.get_local_execution(&tx_hash).unwrap();
+            assert_eq!(local, bundle.local_execution.unwrap());
         }
     }
 }
