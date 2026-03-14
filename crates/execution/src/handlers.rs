@@ -19,7 +19,7 @@ use hyperscale_types::{
     Bls12381G2Signature, ExecutionCertificate, ExecutionVote, Hash, NodeId, RoutableTransaction,
     ShardGroupId, SignerBitfield, StateProvision, ValidatorId,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// An execution vote with its signer's public key and voting power, awaiting verification.
@@ -326,6 +326,11 @@ pub fn execute_and_sign_single_shard<S: SubstateStore>(
         }
     };
 
+    // Filter out undeclared system state writes
+    let mut result = result;
+    result.database_updates =
+        filter_to_declared_writes(&result.database_updates, &tx.declared_writes);
+
     let write_nodes = extract_write_nodes(&result.database_updates);
 
     // Sign immediately after execution
@@ -394,6 +399,11 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
         }
     };
 
+    // Filter out undeclared system state writes
+    let mut result = result;
+    result.database_updates =
+        filter_to_declared_writes(&result.database_updates, &transaction.declared_writes);
+
     let write_nodes = extract_write_nodes(&result.database_updates);
 
     // Sign immediately after execution
@@ -416,6 +426,34 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
     };
 
     (vote, result)
+}
+
+/// Remove writes to NodeIds not in the transaction's declared write set.
+///
+/// Radix Engine may touch system state (fee vaults, royalty accumulators,
+/// transaction tracker) that is not part of the transaction's declared
+/// writes. These undeclared writes must be stripped before the result
+/// enters the execution cache / JMT.
+fn filter_to_declared_writes(
+    updates: &radix_substate_store_interface::interface::DatabaseUpdates,
+    declared_writes: &[NodeId],
+) -> radix_substate_store_interface::interface::DatabaseUpdates {
+    if declared_writes.is_empty() {
+        return updates.clone();
+    }
+    let allowed: HashSet<NodeId> = declared_writes.iter().copied().collect();
+    let mut filtered = radix_substate_store_interface::interface::DatabaseUpdates::default();
+    for (db_node_key, node_updates) in &updates.node_updates {
+        let Some(node_id) = hyperscale_storage::keys::db_node_key_to_node_id(db_node_key) else {
+            continue;
+        };
+        if allowed.contains(&node_id) {
+            filtered
+                .node_updates
+                .insert(db_node_key.clone(), node_updates.clone());
+        }
+    }
+    filtered
 }
 
 /// Extract deduplicated, deterministically-ordered NodeIds from DatabaseUpdates.
