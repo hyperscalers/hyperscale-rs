@@ -5,6 +5,7 @@ use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::{
     DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
 };
+use std::sync::Arc;
 
 /// Merge a slice of per-certificate `DatabaseUpdates` into a single combined update.
 ///
@@ -16,6 +17,23 @@ pub fn merge_database_updates(updates_list: &[DatabaseUpdates]) -> DatabaseUpdat
     }
     if updates_list.len() == 1 {
         return updates_list[0].clone();
+    }
+    let mut merged = DatabaseUpdates::default();
+    for updates in updates_list {
+        merge_into(&mut merged, updates);
+    }
+    merged
+}
+
+/// Merge a slice of Arc-wrapped per-certificate `DatabaseUpdates` into a single combined update.
+///
+/// Same semantics as [`merge_database_updates`] but dereferences through `Arc`.
+pub fn merge_database_updates_from_arcs(updates_list: &[Arc<DatabaseUpdates>]) -> DatabaseUpdates {
+    if updates_list.is_empty() {
+        return DatabaseUpdates::default();
+    }
+    if updates_list.len() == 1 {
+        return (*updates_list[0]).clone();
     }
     let mut merged = DatabaseUpdates::default();
     for updates in updates_list {

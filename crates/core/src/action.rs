@@ -309,9 +309,9 @@ pub enum Action {
         parent_state_root: Hash,
         /// Expected state root after applying writes.
         expected_root: Hash,
-        /// Pre-merged DatabaseUpdates (filtered to local shard, from execution cache).
-        /// Wrapped in Arc to avoid expensive clones through the action dispatch pipeline.
-        merged_updates: Arc<DatabaseUpdates>,
+        /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
+        /// Merged on the thread pool before verification.
+        per_cert_updates: Vec<Arc<DatabaseUpdates>>,
         /// Block height (used as JMT version).
         block_height: u64,
     },
@@ -375,8 +375,9 @@ pub enum Action {
         priority_transactions: Vec<Arc<RoutableTransaction>>,
         transactions: Vec<Arc<RoutableTransaction>>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        /// Pre-merged DatabaseUpdates for certificates (filtered to local shard).
-        merged_updates: DatabaseUpdates,
+        /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
+        /// Merged on the thread pool before proposal building.
+        per_cert_updates: Vec<Arc<DatabaseUpdates>>,
         commitment_proofs: HashMap<Hash, CommitmentProof>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
@@ -740,7 +741,6 @@ impl Action {
                 | Action::PersistBlock { .. }
                 | Action::PersistAndBroadcastVote { .. }
                 | Action::PersistTransactionCertificate { .. }
-                | Action::StoreReceiptBundles { .. }
                 | Action::RequestMissingProvisions { .. }
         )
     }
@@ -764,7 +764,6 @@ impl Action {
                 | Action::SpeculativeExecute { .. }
                 | Action::ExecuteCrossShardTransaction { .. }
                 | Action::FetchAndBroadcastProvisions { .. }
-                | Action::StoreReceiptBundles { .. }
                 | Action::FetchBlock { .. }
                 | Action::FetchChainMetadata
         )

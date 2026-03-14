@@ -330,32 +330,18 @@ impl NodeStateMachine {
         actions
     }
 
-    /// Compute pre-merged `DatabaseUpdates` for a set of certificate tx_hashes.
+    /// Collect per-certificate `Arc<DatabaseUpdates>` for a set of tx_hashes.
     ///
-    /// Same as `compute_merged_updates_for_certs` but works from tx_hashes
-    /// (used by the state root verification drain path).
-    fn compute_merged_updates_for_tx_hashes(
+    /// Returns cheap Arc clones — merging is deferred to the thread pool.
+    fn collect_updates_for_tx_hashes(
         &self,
         tx_hashes: &[Hash],
-    ) -> hyperscale_types::DatabaseUpdates {
-        let topology = self.topology.snapshot();
-        let local_shard = topology.local_shard();
-        let num_shards = topology.num_shards();
+    ) -> Vec<Arc<hyperscale_types::DatabaseUpdates>> {
         let cache = self.execution.execution_cache();
-
-        let per_cert: Vec<hyperscale_types::DatabaseUpdates> = tx_hashes
+        tx_hashes
             .iter()
-            .filter_map(|tx_hash| {
-                let raw = cache.get(tx_hash)?;
-                Some(hyperscale_storage::filter_updates_to_shard(
-                    raw,
-                    local_shard,
-                    num_shards,
-                ))
-            })
-            .collect();
-
-        hyperscale_storage::merge_database_updates(&per_cert)
+            .filter_map(|tx_hash| cache.get(tx_hash).cloned())
+            .collect()
     }
 
     /// Handle proposal timer — propose a block or advance the round on timeout.
@@ -396,26 +382,17 @@ impl NodeStateMachine {
             MAX_RETRIES,
         );
 
-        // Compute merged DatabaseUpdates from execution cache.
-        // The closure captures the execution cache and topology; BftState calls
-        // it with the final filtered certificate list after dedup.
+        // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
+        // The closure captures the cache; BftState calls it with the final
+        // filtered certificate list after dedup. Returns cheap Arc clones —
+        // merging is deferred to the thread pool.
         let topology = self.topology.snapshot();
-        let local_shard = topology.local_shard();
-        let num_shards = topology.num_shards();
         let cache = self.execution.execution_cache();
-        let compute_writes = |certs: &[Arc<TransactionCertificate>]| {
-            let per_cert: Vec<hyperscale_types::DatabaseUpdates> = certs
+        let collect_updates = |certs: &[Arc<TransactionCertificate>]| {
+            certs
                 .iter()
-                .filter_map(|cert| {
-                    let raw = cache.get(&cert.transaction_hash)?;
-                    Some(hyperscale_storage::filter_updates_to_shard(
-                        raw,
-                        local_shard,
-                        num_shards,
-                    ))
-                })
-                .collect();
-            hyperscale_storage::merge_database_updates(&per_cert)
+                .filter_map(|cert| cache.get(&cert.transaction_hash).cloned())
+                .collect::<Vec<Arc<hyperscale_types::DatabaseUpdates>>>()
         };
 
         self.bft.on_proposal_timer(
@@ -425,7 +402,7 @@ impl NodeStateMachine {
             aborted,
             certificates,
             commitment_proofs,
-            compute_writes,
+            collect_updates,
         )
     }
 
@@ -535,24 +512,15 @@ impl NodeStateMachine {
 
         let inputs = self.gather_proposal_inputs(pending_tx_count, pending_cert_count);
 
-        // Build the closure for computing merged DatabaseUpdates from execution cache.
+        // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
+        // Returns cheap Arc clones — merging is deferred to the thread pool.
         let topology = self.topology.snapshot();
-        let local_shard = topology.local_shard();
-        let num_shards = topology.num_shards();
         let cache = self.execution.execution_cache();
-        let compute_writes = |certs: &[Arc<TransactionCertificate>]| {
-            let per_cert: Vec<hyperscale_types::DatabaseUpdates> = certs
+        let collect_updates = |certs: &[Arc<TransactionCertificate>]| {
+            certs
                 .iter()
-                .filter_map(|cert| {
-                    let raw = cache.get(&cert.transaction_hash)?;
-                    Some(hyperscale_storage::filter_updates_to_shard(
-                        raw,
-                        local_shard,
-                        num_shards,
-                    ))
-                })
-                .collect();
-            hyperscale_storage::merge_database_updates(&per_cert)
+                .filter_map(|cert| cache.get(&cert.transaction_hash).cloned())
+                .collect::<Vec<Arc<hyperscale_types::DatabaseUpdates>>>()
         };
 
         self.bft.on_qc_formed(
@@ -564,7 +532,7 @@ impl NodeStateMachine {
             inputs.aborted,
             inputs.certificates,
             inputs.commitment_proofs,
-            compute_writes,
+            collect_updates,
         )
     }
 
@@ -991,7 +959,7 @@ impl StateMachine for NodeStateMachine {
 
                     self.execution.execution_cache_mut().insert(
                         tx_hash,
-                        result.database_updates,
+                        Arc::new(result.database_updates),
                         receipt_hash,
                     );
                 }
@@ -1106,12 +1074,12 @@ impl StateMachine for NodeStateMachine {
         // The BFT verification pipeline queues these; we compute merged_updates
         // from the execution cache and emit VerifyStateRoot actions.
         for ready in self.bft.drain_ready_state_root_verifications() {
-            let merged = self.compute_merged_updates_for_tx_hashes(&ready.cert_tx_hashes);
+            let per_cert_updates = self.collect_updates_for_tx_hashes(&ready.cert_tx_hashes);
             actions.push(Action::VerifyStateRoot {
                 block_hash: ready.block_hash,
                 parent_state_root: ready.parent_state_root,
                 expected_root: ready.expected_root,
-                merged_updates: Arc::new(merged),
+                per_cert_updates,
                 block_height: ready.block_height,
             });
         }

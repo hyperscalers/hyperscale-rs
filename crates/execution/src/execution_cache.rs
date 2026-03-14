@@ -13,14 +13,15 @@
 use hyperscale_storage::DatabaseUpdates;
 use hyperscale_types::Hash;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 /// Default maximum number of cached entries before LRU eviction.
 pub const DEFAULT_MAX_ENTRIES: usize = 10_000;
 
 /// Cached execution output for a single transaction.
 struct CachedExecution {
-    /// Raw write set from execution.
-    database_updates: DatabaseUpdates,
+    /// Raw write set from execution (Arc-wrapped for cheap clones across threads).
+    database_updates: Arc<DatabaseUpdates>,
     /// Hash of the ConsensusReceipt (outcome + event_root).
     /// Used for debug_assert cross-checks at block commit time.
     receipt_hash: Hash,
@@ -54,7 +55,7 @@ impl ExecutionCache {
     }
 
     /// Insert execution results. If the cache is full, evict oldest entries.
-    pub fn insert(&mut self, tx_hash: Hash, updates: DatabaseUpdates, receipt_hash: Hash) {
+    pub fn insert(&mut self, tx_hash: Hash, updates: Arc<DatabaseUpdates>, receipt_hash: Hash) {
         let entry = CachedExecution {
             database_updates: updates,
             receipt_hash,
@@ -80,7 +81,7 @@ impl ExecutionCache {
     }
 
     /// Look up cached writes for a transaction. Returns `None` if not cached.
-    pub fn get(&self, tx_hash: &Hash) -> Option<&DatabaseUpdates> {
+    pub fn get(&self, tx_hash: &Hash) -> Option<&Arc<DatabaseUpdates>> {
         self.entries.get(tx_hash).map(|e| &e.database_updates)
     }
 
@@ -90,7 +91,7 @@ impl ExecutionCache {
     }
 
     /// Remove an entry (called after block commit or transaction rejection).
-    pub fn remove(&mut self, tx_hash: &Hash) -> Option<DatabaseUpdates> {
+    pub fn remove(&mut self, tx_hash: &Hash) -> Option<Arc<DatabaseUpdates>> {
         if let Some(entry) = self.entries.remove(tx_hash) {
             self.insertion_order.retain(|h| h != tx_hash);
             Some(entry.database_updates)
@@ -137,11 +138,11 @@ impl ExecutionCache {
 mod tests {
     use super::*;
 
-    fn make_updates(seed: u8) -> DatabaseUpdates {
+    fn make_updates(seed: u8) -> Arc<DatabaseUpdates> {
         // Empty updates are sufficient for cache tests — we're testing
         // the cache mechanics, not the content of the updates.
         let _ = seed;
-        DatabaseUpdates::default()
+        Arc::new(DatabaseUpdates::default())
     }
 
     fn hash(seed: u8) -> Hash {

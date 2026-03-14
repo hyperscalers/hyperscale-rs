@@ -24,6 +24,7 @@ pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore + ConsensusSt
     pub executor: &'a RadixExecutor,
     pub signing_key: &'a Bls12381G1PrivateKey,
     pub local_shard: ShardGroupId,
+    pub num_shards: u64,
     pub validator_id: ValidatorId,
     pub dispatch: &'a D,
 }
@@ -69,7 +70,6 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
         Action::SpeculativeExecute { .. } => Some(DispatchPool::Execution),
         Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Execution),
-        Action::StoreReceiptBundles { .. } => Some(DispatchPool::Execution),
         _ => None,
     }
 }
@@ -226,15 +226,16 @@ pub(crate) fn handle_delegated_action<
             block_hash,
             parent_state_root,
             expected_root,
-            merged_updates,
+            per_cert_updates,
             block_height,
         } => {
             let start = std::time::Instant::now();
+            let merged = hyperscale_storage::merge_database_updates_from_arcs(&per_cert_updates);
             let result = hyperscale_bft::handlers::verify_state_root(
                 ctx.storage,
                 parent_state_root,
                 expected_root,
-                &merged_updates,
+                &merged,
                 block_height,
             );
             metrics::record_signature_verification_latency(
@@ -265,12 +266,14 @@ pub(crate) fn handle_delegated_action<
             priority_transactions,
             transactions,
             certificates,
-            merged_updates,
+            per_cert_updates,
             commitment_proofs,
             deferred,
             aborted,
             provision_targets,
         } => {
+            let merged_updates =
+                hyperscale_storage::merge_database_updates_from_arcs(&per_cert_updates);
             let result = hyperscale_bft::handlers::build_proposal(
                 ctx.storage,
                 proposer,
@@ -415,6 +418,8 @@ pub(crate) fn handle_delegated_action<
             transactions,
             state_root: _,
         } => {
+            let local_shard = ctx.local_shard;
+            let num_shards = ctx.num_shards;
             let pairs = ctx.dispatch.map_local(&transactions, |tx| {
                 hyperscale_execution::handlers::execute_and_sign_single_shard(
                     ctx.executor,
@@ -427,7 +432,18 @@ pub(crate) fn handle_delegated_action<
             });
 
             let (votes, results): (Vec<ExecutionVote>, Vec<_>) = pairs.into_iter().unzip();
-            let results = results.into_iter().map(ExecutionResult::from).collect();
+            let results = results
+                .into_iter()
+                .map(|r| {
+                    let mut result = ExecutionResult::from(r);
+                    result.database_updates = hyperscale_storage::filter_updates_to_shard(
+                        &result.database_updates,
+                        local_shard,
+                        num_shards,
+                    );
+                    result
+                })
+                .collect();
 
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
@@ -445,6 +461,8 @@ pub(crate) fn handle_delegated_action<
             block_hash,
             transactions,
         } => {
+            let local_shard = ctx.local_shard;
+            let num_shards = ctx.num_shards;
             let pairs = ctx.dispatch.map_local(&transactions, |tx| {
                 hyperscale_execution::handlers::execute_and_sign_single_shard(
                     ctx.executor,
@@ -457,7 +475,18 @@ pub(crate) fn handle_delegated_action<
             });
 
             let (votes, results): (Vec<ExecutionVote>, Vec<_>) = pairs.into_iter().unzip();
-            let results = results.into_iter().map(ExecutionResult::from).collect();
+            let results = results
+                .into_iter()
+                .map(|r| {
+                    let mut result = ExecutionResult::from(r);
+                    result.database_updates = hyperscale_storage::filter_updates_to_shard(
+                        &result.database_updates,
+                        local_shard,
+                        num_shards,
+                    );
+                    result
+                })
+                .collect();
             let tx_hashes: Vec<Hash> = votes.iter().map(|v| v.transaction_hash).collect();
 
             Some(DelegatedResult {
@@ -551,15 +580,6 @@ pub(crate) fn handle_delegated_action<
                 .collect();
             Some(DelegatedResult {
                 events: vec![NodeInput::ProvisionsReady { batches }],
-                prepared_commit: None,
-            })
-        }
-
-        // --- Receipt persistence (fire-and-forget) ---
-        Action::StoreReceiptBundles { bundles } => {
-            ctx.storage.store_receipt_bundles(&bundles);
-            Some(DelegatedResult {
-                events: vec![],
                 prepared_commit: None,
             })
         }

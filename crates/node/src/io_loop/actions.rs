@@ -117,8 +117,7 @@ where
             | Action::VerifyStateProvisions { .. }
             | Action::ExecuteTransactions { .. }
             | Action::SpeculativeExecute { .. }
-            | Action::FetchAndBroadcastProvisions { .. }
-            | Action::StoreReceiptBundles { .. } => {
+            | Action::FetchAndBroadcastProvisions { .. } => {
                 self.dispatch_delegated_action(action);
             }
 
@@ -128,6 +127,7 @@ where
             Action::PersistBlock { .. }
             | Action::PersistTransactionCertificate { .. }
             | Action::PersistAndBroadcastVote { .. }
+            | Action::StoreReceiptBundles { .. }
             | Action::FetchBlock { .. }
             | Action::FetchChainMetadata => {
                 self.process_storage_action(action);
@@ -239,6 +239,9 @@ where
                     "Persisted own vote"
                 );
                 self.network.notify(&recipients, &vote);
+            }
+            Action::StoreReceiptBundles { bundles } => {
+                self.storage.store_receipt_bundles(&bundles);
             }
             Action::FetchBlock { height } => {
                 let block = self.storage.get_block(height);
@@ -537,6 +540,7 @@ where
         let signing_key = Arc::clone(&self.signing_key);
         let dispatch = self.dispatch.clone();
         let local_shard = self.local_shard;
+        let num_shards = self.num_shards;
         let validator_id = self.validator_id;
         let prepared_commits = Arc::clone(&self.prepared_commits);
         let event_tx = self.event_sender.clone();
@@ -548,6 +552,7 @@ where
                 executor: &executor,
                 signing_key: &signing_key,
                 local_shard,
+                num_shards,
                 validator_id,
                 dispatch: &dispatch,
             };
