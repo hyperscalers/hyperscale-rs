@@ -121,7 +121,7 @@ pub(super) async fn run(
                             }
                         } else {
                             // No known address, try to find via Kademlia
-                            debug!(peer = %peer, "No known address for peer, relying on Kademlia discovery");
+                            warn!(peer = %peer, "No known address for peer, relying on Kademlia discovery");
                         }
                     }
                 }
@@ -131,7 +131,7 @@ pub(super) async fn run(
                 if !kademlia_bootstrapped && !bootstrap_peers.is_empty() {
                     for addr in &bootstrap_peers {
                         if let Err(e) = swarm.dial(addr.clone()) {
-                            debug!(
+                            warn!(
                                 addr = %addr,
                                 error = ?e,
                                 "Failed to re-dial bootstrap peer"
@@ -258,7 +258,7 @@ pub(super) async fn run(
                                 "Peer version incompatible, disconnecting"
                             );
                             if swarm.disconnect_peer_id(*peer_id).is_err() {
-                                debug!(peer = %peer_id, "Failed to disconnect incompatible peer");
+                                warn!(peer = %peer_id, "Failed to disconnect incompatible peer");
                             }
                         } else {
                             // Version OK — trigger the validator-bind protocol.
@@ -274,7 +274,7 @@ pub(super) async fn run(
                             "Peer has unrecognised agent version format, disconnecting"
                         );
                         if swarm.disconnect_peer_id(*peer_id).is_err() {
-                            debug!(peer = %peer_id, "Failed to disconnect non-hyperscale peer");
+                            warn!(peer = %peer_id, "Failed to disconnect non-hyperscale peer");
                         }
                     }
                 }

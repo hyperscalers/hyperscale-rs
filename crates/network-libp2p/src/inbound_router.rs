@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Timeout for reading requests and writing responses on streams.
 const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -99,7 +99,7 @@ impl InboundRouter {
                             let result = router_clone.handle_request_stream(peer_id, stream).await;
                             router_clone.decrement_peer_count(&peer_id);
                             if let Err(e) = result {
-                                debug!(peer = %peer_id, error = ?e, "Request stream handling failed");
+                                warn!(peer = %peer_id, error = ?e, "Request stream handling failed");
                             }
                         });
                     } else {
@@ -136,7 +136,7 @@ impl InboundRouter {
                                 .await;
                             router_clone.decrement_peer_count(&peer_id);
                             if let Err(e) = result {
-                                debug!(peer = %peer_id, error = ?e, "Notification stream handling failed");
+                                warn!(peer = %peer_id, error = ?e, "Notification stream handling failed");
                             }
                         });
                     } else {
@@ -166,7 +166,7 @@ impl InboundRouter {
         drop(peer_counter);
         if prev >= MAX_INBOUND_PER_PEER {
             self.decrement_peer_count(peer_id);
-            debug!(
+            warn!(
                 peer = %peer_id,
                 active = prev,
                 limit = MAX_INBOUND_PER_PEER,
@@ -179,7 +179,7 @@ impl InboundRouter {
             Ok(permit) => Some(permit),
             Err(_) => {
                 self.decrement_peer_count(peer_id);
-                debug!(
+                warn!(
                     peer = %peer_id,
                     limit = MAX_INBOUND_CONCURRENT,
                     "Dropping inbound stream: global concurrency limit reached"
@@ -278,7 +278,7 @@ impl InboundRouter {
             if let Some(handler) = self.registry.get_notification(&type_id) {
                 tokio::spawn(async move { handler(sbor_payload) });
             } else {
-                debug!(
+                warn!(
                     peer = %peer,
                     type_id = %type_id,
                     "Unknown notification type on persistent stream"

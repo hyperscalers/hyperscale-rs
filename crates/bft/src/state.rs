@@ -418,7 +418,7 @@ impl BftState {
         // Don't restart sync if we're already syncing
         // The runner's SyncManager handles target updates internally
         if self.sync.is_syncing() {
-            debug!(
+            warn!(
                 validator = ?topology.local_validator_id(),
                 target_height,
                 "Already syncing, skipping duplicate start_sync"
@@ -458,7 +458,7 @@ impl BftState {
         // Ignore stale blocks that have already been committed.
         // Late-arriving sync blocks can arrive after sync completes.
         if block_height <= self.committed_height {
-            debug!(
+            warn!(
                 validator = ?topology.local_validator_id(),
                 block_height,
                 committed_height = self.committed_height,
@@ -1831,14 +1831,14 @@ impl BftState {
                 // This is expected during view changes: we voted in round N, then round N+1
                 // proposes a different block, but we're locked to our original vote.
                 // This is BFT safety working correctly, not a violation.
-                debug!(
+                warn!(
                     validator = ?topology.local_validator_id(),
                     existing = ?existing_hash,
                     existing_round = existing_round,
                     new = ?block_hash,
                     new_round = round,
                     height = height,
-                    "Vote locking: already voted for different block at this height"
+                    "Vote locking: already voted for different block at this height (view change)"
                 );
                 return vec![];
             }
@@ -3105,7 +3105,7 @@ impl BftState {
         } else {
             // Block not yet complete - this can happen if we're still fetching
             // transactions/certificates. The block will be persisted when it commits.
-            debug!(
+            warn!(
                 validator = ?topology.local_validator_id(),
                 height = height,
                 block_hash = ?block_hash,
@@ -3289,7 +3289,7 @@ impl BftState {
         // This handles the case where signature verification completes out of order,
         // causing BlockReadyToCommit events to arrive non-sequentially.
         if height != self.committed_height + 1 {
-            debug!(
+            warn!(
                 "Buffering out-of-order commit: expected height {}, got {}",
                 self.committed_height + 1,
                 height
@@ -3520,7 +3520,7 @@ impl BftState {
 
         // height < next_needed but > committed_height - this shouldn't happen
         // if the checks above are correct, but handle gracefully
-        debug!(
+        warn!(
             height,
             next_needed,
             committed = self.committed_height,
@@ -3965,7 +3965,7 @@ impl BftState {
         // First phase: add transactions and check state
         let (added, still_missing, is_complete, needs_construct) = {
             let Some(pending) = self.pending_blocks.get_mut(&block_hash) else {
-                debug!(
+                warn!(
                     block_hash = ?block_hash,
                     "Received fetched transactions for unknown/completed block"
                 );
@@ -4008,7 +4008,7 @@ impl BftState {
             // Request still-missing transactions
             let missing_txs = pending.missing_transactions();
             if !missing_txs.is_empty() {
-                debug!(
+                warn!(
                     validator = ?validator_id,
                     block_hash = ?block_hash,
                     still_missing = missing_txs.len(),
@@ -4024,7 +4024,7 @@ impl BftState {
             // Request still-missing certificates
             let missing_certs = pending.missing_certificates();
             if !missing_certs.is_empty() {
-                debug!(
+                warn!(
                     validator = ?validator_id,
                     block_hash = ?block_hash,
                     still_missing = missing_certs.len(),
@@ -4088,7 +4088,7 @@ impl BftState {
         // First phase: add certificates and check state
         let (added, still_missing, is_complete, needs_construct) = {
             let Some(pending) = self.pending_blocks.get_mut(&block_hash) else {
-                debug!(
+                warn!(
                     block_hash = ?block_hash,
                     "Received fetched certificates for unknown/completed block"
                 );
@@ -4131,7 +4131,7 @@ impl BftState {
             // Request still-missing transactions
             let missing_txs = pending.missing_transactions();
             if !missing_txs.is_empty() {
-                debug!(
+                warn!(
                     validator = ?validator_id,
                     block_hash = ?block_hash,
                     still_missing = missing_txs.len(),
@@ -4147,7 +4147,7 @@ impl BftState {
             // Request still-missing certificates
             let missing_certs = pending.missing_certificates();
             if !missing_certs.is_empty() {
-                debug!(
+                warn!(
                     validator = ?validator_id,
                     block_hash = ?block_hash,
                     still_missing = missing_certs.len(),
@@ -4447,7 +4447,7 @@ impl BftState {
             // Check if we should fetch missing transactions
             let missing_txs = pending.missing_transactions();
             if !missing_txs.is_empty() && age >= tx_timeout {
-                debug!(
+                warn!(
                     validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
                     missing_tx_count = missing_txs.len(),
@@ -4465,7 +4465,7 @@ impl BftState {
             // Check if we should fetch missing certificates
             let missing_certs = pending.missing_certificates();
             if !missing_certs.is_empty() && age >= cert_timeout {
-                debug!(
+                warn!(
                     validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
                     missing_cert_count = missing_certs.len(),
@@ -4530,7 +4530,7 @@ impl BftState {
         if gap > 5 {
             let pending_commit_count = self.pending_commits.len();
             let pending_data_count = self.pending_commits_awaiting_data.len();
-            debug!(
+            warn!(
                 validator = ?topology.local_validator_id(),
                 committed_height = self.committed_height,
                 next_needed_height = next_needed_height,

@@ -15,7 +15,7 @@ use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, Vali
 use libp2p::PeerId;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Libp2pNetwork
@@ -89,7 +89,7 @@ impl Network for Libp2pNetwork {
         let topic = Topic::shard(M::message_type_id(), shard);
         let data = compression::compress(&sbor::basic_encode(message).expect("SBOR encode failed"));
         if let Err(e) = self.adapter.publish(&topic, data, M::priority()) {
-            debug!(error = ?e, "Libp2pNetwork: broadcast_to_shard failed");
+            warn!(error = ?e, "Libp2pNetwork: broadcast_to_shard failed");
         }
     }
 
@@ -97,7 +97,7 @@ impl Network for Libp2pNetwork {
         let topic = Topic::global(M::message_type_id());
         let data = compression::compress(&sbor::basic_encode(message).expect("SBOR encode failed"));
         if let Err(e) = self.adapter.publish(&topic, data, M::priority()) {
-            debug!(error = ?e, "Libp2pNetwork: broadcast_global failed");
+            warn!(error = ?e, "Libp2pNetwork: broadcast_global failed");
         }
     }
 
@@ -131,7 +131,7 @@ impl Network for Libp2pNetwork {
         let type_id = M::message_type_id();
         for &validator in recipients {
             let Some(peer_id) = self.validator_peer_id(validator) else {
-                debug!(
+                warn!(
                     validator = validator.0,
                     "No peer ID for notify target, skipping"
                 );
@@ -176,7 +176,7 @@ impl Network for Libp2pNetwork {
                      (expected during cold start, protocol-level retries will resolve)"
                 );
             } else if count.is_multiple_of(100) {
-                debug!(
+                warn!(
                     request_type = R::message_type_id(),
                     total_unreachable = count,
                     "PeerUnreachable errors continue (validator-bind still in progress)"

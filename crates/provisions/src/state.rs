@@ -477,7 +477,7 @@ impl ProvisionCoordinator {
         if let Some(&tip) = self.remote_header_tips.get(&source_shard) {
             let cutoff = tip.0.saturating_sub(REMOTE_HEADER_RETENTION_BLOCKS);
             if block_height.0 < cutoff {
-                debug!(
+                warn!(
                     source_shard = source_shard.0,
                     block_height = block_height.0,
                     tip = tip.0,

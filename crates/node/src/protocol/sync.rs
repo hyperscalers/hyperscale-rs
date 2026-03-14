@@ -21,7 +21,7 @@ use hyperscale_types::{Block, Hash, QuorumCertificate};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
-use tracing::{debug, info, trace, warn};
+use tracing::{info, trace, warn};
 
 /// Configuration for the sync protocol.
 #[derive(Debug, Clone)]
@@ -268,7 +268,7 @@ impl SyncProtocol {
                 outputs
             }
             None => {
-                debug!(height, "Empty sync response, re-queuing");
+                warn!(height, "Empty sync response, re-queuing");
                 metrics::record_sync_response_error("empty_response");
                 self.queue_height(height);
                 self.emit_fetch_outputs()

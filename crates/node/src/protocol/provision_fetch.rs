@@ -17,7 +17,7 @@ use hyperscale_storage::{ConsensusStore, SubstateStore};
 use hyperscale_types::{BlockHeight, ShardGroupId, StateProvision, ValidatorId};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 /// Configuration for the provision fetch protocol.
 #[derive(Debug, Clone)]
@@ -219,7 +219,7 @@ impl ProvisionFetchProtocol {
         let key = (source_shard, block_height);
         if let Some(state) = self.pending.get_mut(&key) {
             state.in_flight = false;
-            debug!(
+            warn!(
                 source_shard = source_shard.0,
                 block_height = block_height.0,
                 tried = state.tried.len(),
@@ -281,7 +281,7 @@ impl ProvisionFetchProtocol {
                 None => {
                     state.rounds += 1;
                     if state.rounds >= self.config.max_rounds {
-                        debug!(
+                        warn!(
                             source_shard = source_shard.0,
                             block_height = block_height.0,
                             rounds = state.rounds,
@@ -289,7 +289,7 @@ impl ProvisionFetchProtocol {
                         );
                         to_remove.push((source_shard, block_height));
                     } else {
-                        debug!(
+                        warn!(
                             source_shard = source_shard.0,
                             block_height = block_height.0,
                             round = state.rounds,
@@ -336,7 +336,7 @@ pub fn serve_provision_request(
     let (block, _qc) = match storage.get_block(req.block_height) {
         Some(pair) => pair,
         None => {
-            debug!(
+            warn!(
                 block_height = req.block_height.0,
                 "Provision request: block not found"
             );
@@ -384,7 +384,7 @@ pub fn serve_provision_request(
             match hyperscale_engine::fetch_state_entries(storage, &owned_nodes, jmt_version) {
                 Some(entries) => entries,
                 None => {
-                    debug!(
+                    warn!(
                         block_height = req.block_height.0,
                         jmt_version, "Provision request: historical JMT version unavailable"
                     );
