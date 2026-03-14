@@ -1774,8 +1774,14 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             .db
             .cf_handle("ledger_receipts")
             .expect("ledger_receipts column family must exist");
-        let receipt_bytes = sbor::basic_encode(bundle.ledger_receipt.as_ref())
-            .expect("ledger receipt encoding must succeed");
+        let receipt_bytes = if let Some(ref updates) = bundle.database_updates {
+            let mut receipt = (*bundle.ledger_receipt).clone();
+            receipt.state_changes = hyperscale_storage::extract_state_changes(updates);
+            sbor::basic_encode(&receipt).expect("ledger receipt encoding must succeed")
+        } else {
+            sbor::basic_encode(bundle.ledger_receipt.as_ref())
+                .expect("ledger receipt encoding must succeed")
+        };
         batch.put_cf(receipts_cf, bundle.tx_hash.as_bytes(), receipt_bytes);
 
         if let Some(ref local) = bundle.local_execution {

@@ -515,12 +515,14 @@ where
             } => {
                 // Store receipts from sync peer BEFORE processing the block.
                 // Syncing nodes didn't execute locally, so local_execution is None.
+                // state_changes already populated by remote peer.
                 let bundles: Vec<hyperscale_types::ReceiptBundle> = ledger_receipts
                     .iter()
                     .map(|entry| hyperscale_types::ReceiptBundle {
                         tx_hash: entry.tx_hash,
                         ledger_receipt: std::sync::Arc::new(entry.receipt.clone()),
                         local_execution: None,
+                        database_updates: None,
                     })
                     .collect();
                 self.pending_receipt_bundles.extend(bundles);
@@ -559,12 +561,14 @@ where
             } => {
                 // Store receipts from fetch peer. Syncing nodes didn't execute
                 // locally, so local_execution is None.
+                // state_changes already populated by remote peer.
                 let bundles: Vec<hyperscale_types::ReceiptBundle> = ledger_receipts
                     .iter()
                     .map(|entry| hyperscale_types::ReceiptBundle {
                         tx_hash: entry.tx_hash,
                         ledger_receipt: std::sync::Arc::new(entry.receipt.clone()),
                         local_execution: None,
+                        database_updates: None,
                     })
                     .collect();
                 self.pending_receipt_bundles.extend(bundles);

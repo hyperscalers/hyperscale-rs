@@ -519,6 +519,9 @@ pub enum Action {
     ///
     /// Dispatched by the state machine after populating the execution cache.
     /// Only for canonical execution (not speculative).
+    ///
+    /// Bundles with `database_updates: Some(...)` have deferred state_changes —
+    /// the storage layer computes them at persist time.
     StoreReceiptBundles {
         bundles: Vec<hyperscale_types::ReceiptBundle>,
     },

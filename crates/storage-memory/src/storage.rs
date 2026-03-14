@@ -820,8 +820,14 @@ impl<D: Dispatch + 'static> ConsensusStore for SimStorage<D> {
 
     fn store_receipt_bundle(&self, bundle: &ReceiptBundle) {
         let mut c = self.consensus.write().unwrap();
-        c.ledger_receipts
-            .insert(bundle.tx_hash, Arc::clone(&bundle.ledger_receipt));
+        let receipt = if let Some(ref updates) = bundle.database_updates {
+            let mut r = (*bundle.ledger_receipt).clone();
+            r.state_changes = hyperscale_storage::extract_state_changes(updates);
+            Arc::new(r)
+        } else {
+            Arc::clone(&bundle.ledger_receipt)
+        };
+        c.ledger_receipts.insert(bundle.tx_hash, receipt);
         if let Some(ref local) = bundle.local_execution {
             c.local_executions.insert(bundle.tx_hash, local.clone());
         }

@@ -587,6 +587,8 @@ where
     /// Flush accumulated receipt bundles to storage on the execution pool.
     ///
     /// Moves SBOR-encoding + RocksDB writes off the pinned IoLoop thread.
+    /// Deferred `state_changes` computation (for bundles with `database_updates`)
+    /// is handled by the storage layer during persistence.
     /// With `SyncDispatch` (simulation), `spawn_execution` runs inline.
     pub(super) fn flush_receipt_storage(&mut self) {
         let bundles = std::mem::take(&mut self.pending_receipt_bundles);

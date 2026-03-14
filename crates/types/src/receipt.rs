@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use crate::{compute_merkle_root, Hash, NodeId, PartitionNumber};
+use crate::{compute_merkle_root, DatabaseUpdates, Hash, NodeId, PartitionNumber};
 
 // ─── Outcome ─────────────────────────────────────────────────────────────────
 
@@ -223,6 +223,12 @@ pub struct ReceiptBundle {
     /// `None` when receipt was fetched from a peer (sync/catch-up).
     /// Only populated when this node executed the transaction locally.
     pub local_execution: Option<LocalTransactionExecution>,
+    /// Deferred `DatabaseUpdates` for lazy `state_changes` computation.
+    ///
+    /// `Some` for locally-executed transactions (state_changes computed at storage time).
+    /// `None` for synced/fetched receipts (state_changes already populated by remote peer).
+    /// Transient — not serialized (SBOR impl excludes this field).
+    pub database_updates: Option<Arc<DatabaseUpdates>>,
 }
 
 // Manual PartialEq (compare Arc contents, not pointer identity)
@@ -278,6 +284,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             tx_hash,
             ledger_receipt: Arc::new(ledger_receipt),
             local_execution,
+            database_updates: None,
         })
     }
 }
@@ -446,6 +453,7 @@ mod tests {
             tx_hash: Hash::from_bytes(b"synced_tx"),
             ledger_receipt: Arc::clone(&receipt),
             local_execution: None,
+            database_updates: None,
         };
         assert!(synced.local_execution.is_none());
 
@@ -456,6 +464,7 @@ mod tests {
             local_execution: Some(LocalTransactionExecution::failure(Some(
                 "test error".to_string(),
             ))),
+            database_updates: None,
         };
         assert!(local.local_execution.is_some());
     }

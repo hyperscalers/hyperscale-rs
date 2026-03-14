@@ -202,6 +202,7 @@ pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
         tx_hash,
         ledger_receipt,
         local_execution,
+        database_updates: None,
     }
 }
 

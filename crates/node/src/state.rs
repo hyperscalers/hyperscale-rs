@@ -948,20 +948,20 @@ impl StateMachine for NodeStateMachine {
                 for result in results {
                     let tx_hash = result.tx_hash;
                     let receipt_hash = result.receipt_hash;
+                    let db_updates = Arc::new(result.database_updates);
 
                     if !speculative {
                         bundles.push(ReceiptBundle {
                             tx_hash,
                             ledger_receipt: Arc::new(result.ledger_receipt),
                             local_execution: Some(result.local_execution),
+                            database_updates: Some(Arc::clone(&db_updates)),
                         });
                     }
 
-                    self.execution.execution_cache_mut().insert(
-                        tx_hash,
-                        Arc::new(result.database_updates),
-                        receipt_hash,
-                    );
+                    self.execution
+                        .execution_cache_mut()
+                        .insert(tx_hash, db_updates, receipt_hash);
                 }
 
                 // Dispatch receipt storage (fire-and-forget, off main thread)

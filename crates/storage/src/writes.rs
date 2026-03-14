@@ -1,6 +1,9 @@
 //! Utilities for merging, filtering, and reconstructing `DatabaseUpdates`.
 
-use hyperscale_types::{LedgerTransactionReceipt, ShardGroupId, SubstateChangeAction};
+use hyperscale_types::{
+    LedgerTransactionReceipt, PartitionNumber, ShardGroupId, SubstateChange, SubstateChangeAction,
+    SubstateRef,
+};
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::interface::{
     DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
@@ -107,6 +110,76 @@ fn merge_partition_updates(
             }
         }
     }
+}
+
+/// Extract state changes from `DatabaseUpdates` without reading previous values.
+///
+/// Inverse of [`receipt_to_database_updates`]. All `Set` operations are
+/// classified as `Create` (no previous_value lookup). `Delete` operations use
+/// an empty previous_value. This is safe because `state_changes` are NOT part
+/// of the consensus receipt hash — the distinction between Create/Update is
+/// purely informational for clients/indexers.
+///
+/// The round-trip through `receipt_to_database_updates` is unaffected: both
+/// Create and Update map to `DatabaseUpdate::Set(new_value)`.
+pub fn extract_state_changes(db_updates: &DatabaseUpdates) -> Vec<SubstateChange> {
+    use crate::keys::db_node_key_to_node_id;
+
+    let mut changes = Vec::new();
+
+    for (db_node_key, node_updates) in &db_updates.node_updates {
+        let Some(node_id) = db_node_key_to_node_id(db_node_key) else {
+            continue;
+        };
+
+        for (partition_num, partition_updates) in &node_updates.partition_updates {
+            let partition = PartitionNumber(*partition_num);
+
+            match partition_updates {
+                PartitionDatabaseUpdates::Delta { substate_updates } => {
+                    for (db_sort_key, update) in substate_updates {
+                        let substate_ref = SubstateRef {
+                            node_id,
+                            partition,
+                            sort_key: db_sort_key.0.clone(),
+                        };
+
+                        let action = match update {
+                            DatabaseUpdate::Set(new_value) => SubstateChangeAction::Create {
+                                new_value: new_value.clone(),
+                            },
+                            DatabaseUpdate::Delete => SubstateChangeAction::Delete {
+                                previous_value: vec![],
+                            },
+                        };
+
+                        changes.push(SubstateChange {
+                            substate_ref,
+                            action,
+                        });
+                    }
+                }
+                PartitionDatabaseUpdates::Reset {
+                    new_substate_values,
+                } => {
+                    for (sort_key, new_value) in new_substate_values {
+                        changes.push(SubstateChange {
+                            substate_ref: SubstateRef {
+                                node_id,
+                                partition,
+                                sort_key: sort_key.0.clone(),
+                            },
+                            action: SubstateChangeAction::Create {
+                                new_value: new_value.clone(),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    changes
 }
 
 /// Reconstruct `DatabaseUpdates` from a ledger receipt's state changes.
@@ -395,6 +468,212 @@ mod tests {
             matches!(get_delta_value(&merged, b"node1", 0, &[1]), Some(DatabaseUpdate::Set(v)) if v == vec![10]),
             "single-element merge should be identity"
         );
+    }
+
+    // ── extract_state_changes tests ──────────────────────────────────────
+
+    mod extract_state_changes_tests {
+        use super::super::extract_state_changes;
+        use hyperscale_types::{NodeId, PartitionNumber, SubstateChangeAction};
+        use indexmap::indexmap;
+        use radix_common::prelude::DatabaseUpdate;
+        use radix_substate_store_interface::db_key_mapper::{
+            DatabaseKeyMapper, SpreadPrefixKeyMapper,
+        };
+        use radix_substate_store_interface::interface::{
+            DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
+        };
+
+        fn make_db_node_key(node_id: &[u8; 30]) -> Vec<u8> {
+            let radix_id = radix_common::types::NodeId(*node_id);
+            SpreadPrefixKeyMapper::to_db_node_key(&radix_id)
+        }
+
+        fn make_set_updates(
+            node_id: [u8; 30],
+            partition: u8,
+            sort_key: Vec<u8>,
+            value: Vec<u8>,
+        ) -> DatabaseUpdates {
+            let db_node_key = make_db_node_key(&node_id);
+            DatabaseUpdates {
+                node_updates: indexmap! {
+                    db_node_key => NodeDatabaseUpdates {
+                        partition_updates: indexmap! {
+                            partition => PartitionDatabaseUpdates::Delta {
+                                substate_updates: indexmap! {
+                                    DbSortKey(sort_key) => DatabaseUpdate::Set(value),
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        fn make_delete_updates(
+            node_id: [u8; 30],
+            partition: u8,
+            sort_key: Vec<u8>,
+        ) -> DatabaseUpdates {
+            let db_node_key = make_db_node_key(&node_id);
+            DatabaseUpdates {
+                node_updates: indexmap! {
+                    db_node_key => NodeDatabaseUpdates {
+                        partition_updates: indexmap! {
+                            partition => PartitionDatabaseUpdates::Delta {
+                                substate_updates: indexmap! {
+                                    DbSortKey(sort_key) => DatabaseUpdate::Delete,
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        fn make_reset_updates(
+            node_id: [u8; 30],
+            partition: u8,
+            new_values: Vec<(Vec<u8>, Vec<u8>)>,
+        ) -> DatabaseUpdates {
+            let db_node_key = make_db_node_key(&node_id);
+            let new_substate_values = new_values
+                .into_iter()
+                .map(|(k, v)| (DbSortKey(k), v))
+                .collect();
+            DatabaseUpdates {
+                node_updates: indexmap! {
+                    db_node_key => NodeDatabaseUpdates {
+                        partition_updates: indexmap! {
+                            partition => PartitionDatabaseUpdates::Reset {
+                                new_substate_values,
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        #[test]
+        fn test_set_classifies_as_create() {
+            let node_id = [1u8; 30];
+            let db_updates = make_set_updates(node_id, 0, vec![42], b"new_value".to_vec());
+
+            let changes = extract_state_changes(&db_updates);
+
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].substate_ref.node_id, NodeId(node_id));
+            assert_eq!(changes[0].substate_ref.partition, PartitionNumber(0));
+            assert_eq!(changes[0].substate_ref.sort_key, vec![42]);
+            match &changes[0].action {
+                SubstateChangeAction::Create { new_value } => {
+                    assert_eq!(new_value, b"new_value");
+                }
+                other => panic!("Expected Create, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delete() {
+            let node_id = [3u8; 30];
+            let db_updates = make_delete_updates(node_id, 1, vec![5]);
+
+            let changes = extract_state_changes(&db_updates);
+
+            assert_eq!(changes.len(), 1);
+            match &changes[0].action {
+                SubstateChangeAction::Delete { previous_value } => {
+                    assert!(previous_value.is_empty());
+                }
+                other => panic!("Expected Delete, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_multiple_nodes_and_partitions() {
+            let node_a = [10u8; 30];
+            let node_b = [20u8; 30];
+            let db_node_key_a = make_db_node_key(&node_a);
+            let db_node_key_b = make_db_node_key(&node_b);
+
+            let db_updates = DatabaseUpdates {
+                node_updates: indexmap! {
+                    db_node_key_a => NodeDatabaseUpdates {
+                        partition_updates: indexmap! {
+                            0 => PartitionDatabaseUpdates::Delta {
+                                substate_updates: indexmap! {
+                                    DbSortKey(vec![1]) => DatabaseUpdate::Set(b"a1".to_vec()),
+                                }
+                            },
+                            5 => PartitionDatabaseUpdates::Delta {
+                                substate_updates: indexmap! {
+                                    DbSortKey(vec![2]) => DatabaseUpdate::Set(b"a2".to_vec()),
+                                }
+                            }
+                        }
+                    },
+                    db_node_key_b => NodeDatabaseUpdates {
+                        partition_updates: indexmap! {
+                            0 => PartitionDatabaseUpdates::Delta {
+                                substate_updates: indexmap! {
+                                    DbSortKey(vec![3]) => DatabaseUpdate::Delete,
+                                }
+                            }
+                        }
+                    }
+                },
+            };
+
+            let changes = extract_state_changes(&db_updates);
+
+            assert_eq!(changes.len(), 3);
+            let node_ids: Vec<_> = changes.iter().map(|c| c.substate_ref.node_id).collect();
+            assert!(node_ids.contains(&NodeId(node_a)));
+            assert!(node_ids.contains(&NodeId(node_b)));
+        }
+
+        #[test]
+        fn test_reset_partition() {
+            let node_id = [5u8; 30];
+            let db_updates = make_reset_updates(node_id, 2, vec![(vec![1], b"reset_val".to_vec())]);
+
+            let changes = extract_state_changes(&db_updates);
+
+            assert_eq!(changes.len(), 1);
+            match &changes[0].action {
+                SubstateChangeAction::Create { new_value } => {
+                    assert_eq!(new_value, b"reset_val");
+                }
+                other => panic!("Expected Create for Reset partition, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_empty_updates() {
+            let db_updates = DatabaseUpdates::default();
+            let changes = extract_state_changes(&db_updates);
+            assert!(changes.is_empty());
+        }
+
+        #[test]
+        fn test_invalid_node_key_skipped() {
+            let db_updates = DatabaseUpdates {
+                node_updates: indexmap! {
+                    vec![0u8; 10] => NodeDatabaseUpdates {
+                        partition_updates: indexmap! {
+                            0 => PartitionDatabaseUpdates::Delta {
+                                substate_updates: indexmap! {
+                                    DbSortKey(vec![1]) => DatabaseUpdate::Set(b"val".to_vec()),
+                                }
+                            }
+                        }
+                    }
+                },
+            };
+            let changes = extract_state_changes(&db_updates);
+            assert!(changes.is_empty(), "Malformed node key should be skipped");
+        }
     }
 
     // ── receipt_to_database_updates tests ────────────────────────────────
