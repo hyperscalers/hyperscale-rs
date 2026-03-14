@@ -921,13 +921,12 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             return false;
         }
         if current_version != jmt_snapshot.base_version {
-            tracing::warn!(
+            tracing::debug!(
                 expected_version = jmt_snapshot.base_version,
                 actual_version = current_version,
-                "JMT snapshot base VERSION mismatch - falling back to slow path. \
-                 This can happen with empty commits or concurrent block processing."
+                "JMT snapshot base VERSION mismatch (root matches) - proceeding with fast path. \
+                 This is expected when empty commits advance the version counter."
             );
-            return false;
         }
 
         let nodes_count = jmt_snapshot.nodes.len();
@@ -2289,6 +2288,7 @@ impl Default for RocksDbConfig {
 pub struct RocksDbPreparedCommit {
     write_batch: WriteBatch,
     jmt_snapshot: JmtSnapshot,
+    merged_updates: DatabaseUpdates,
 }
 
 impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D> {
@@ -2312,6 +2312,7 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
         let prepared = RocksDbPreparedCommit {
             write_batch,
             jmt_snapshot,
+            merged_updates: merged_updates.clone(),
         };
 
         (computed_root, prepared)
@@ -2344,12 +2345,15 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
         if used_fast_path {
             result_root
         } else {
-            // Stale cache: fall back to recompute with empty updates.
-            // The prepared data had the writes baked in, but the JMT base has
-            // moved on. In practice this is very rare. Certificate storage will
-            // be handled by the fallback commit.
-            let empty = DatabaseUpdates::default();
-            self.commit_block(&empty, certificates, block_height, consensus)
+            // Stale cache: fall back to recompute from scratch.
+            // The JMT base root changed, so the prepared snapshot is invalid.
+            // Use the stored merged_updates to ensure substate writes aren't lost.
+            self.commit_block(
+                &prepared.merged_updates,
+                certificates,
+                block_height,
+                consensus,
+            )
         }
     }
 

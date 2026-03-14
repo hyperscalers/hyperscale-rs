@@ -452,9 +452,11 @@ impl<D: Dispatch + 'static> SimStorage<D> {
             );
         }
         if s.current_block_height != snapshot.base_version {
-            panic!(
-                "JMT snapshot base VERSION mismatch: expected {}, got {}.",
-                snapshot.base_version, s.current_block_height
+            tracing::debug!(
+                expected_version = snapshot.base_version,
+                actual_version = s.current_block_height,
+                "JMT snapshot base VERSION mismatch (root matches) - proceeding. \
+                 This is expected when empty commits advance the version counter."
             );
         }
 
@@ -539,6 +541,7 @@ pub struct SimPreparedCommit {
     /// Pre-built OrdMap with all certificate substate writes already applied.
     /// O(1) clone from base at prepare time; O(1) swap at commit time.
     resulting_data: OrdMap<Vec<u8>, Vec<u8>>,
+    merged_updates: DatabaseUpdates,
 }
 
 impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
@@ -595,6 +598,7 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
         let prepared = SimPreparedCommit {
             snapshot,
             resulting_data,
+            merged_updates: merged_updates.clone(),
         };
 
         (result_root, prepared)
@@ -611,8 +615,7 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
 
         {
             let mut s = self.state.write().unwrap();
-            let use_fast_path = s.current_root_hash == prepared.snapshot.base_root
-                && s.current_block_height == prepared.snapshot.base_version;
+            let use_fast_path = s.current_root_hash == prepared.snapshot.base_root;
 
             if use_fast_path {
                 // Fast path: apply precomputed JMT snapshot + swap OrdMap
@@ -637,11 +640,13 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
         }
 
         // Stale cache: fall back to full block commit which recomputes JMT.
-        // We don't have the merged_updates here, so use empty (certificates
-        // are stored but JMT gets an empty update — this is the degenerate case).
-        // In practice, stale prepared commits are rare.
-        let empty = DatabaseUpdates::default();
-        self.commit_block(&empty, certificates, block_height, consensus)
+        // Use the stored merged_updates to ensure substate writes aren't lost.
+        self.commit_block(
+            &prepared.merged_updates,
+            certificates,
+            block_height,
+            consensus,
+        )
     }
 
     fn commit_block(
