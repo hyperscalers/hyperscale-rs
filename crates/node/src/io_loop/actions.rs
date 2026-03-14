@@ -122,12 +122,18 @@ where
             }
 
             // ═══════════════════════════════════════════════════════════
+            // Receipt storage — accumulated and flushed async
+            // ═══════════════════════════════════════════════════════════
+            Action::StoreReceiptBundles { bundles } => {
+                self.pending_receipt_bundles.extend(bundles);
+            }
+
+            // ═══════════════════════════════════════════════════════════
             // Storage
             // ═══════════════════════════════════════════════════════════
             Action::PersistBlock { .. }
             | Action::PersistTransactionCertificate { .. }
             | Action::PersistAndBroadcastVote { .. }
-            | Action::StoreReceiptBundles { .. }
             | Action::FetchBlock { .. }
             | Action::FetchChainMetadata => {
                 self.process_storage_action(action);
@@ -239,9 +245,6 @@ where
                     "Persisted own vote"
                 );
                 self.network.notify(&recipients, &vote);
-            }
-            Action::StoreReceiptBundles { bundles } => {
-                self.storage.store_receipt_bundles(&bundles);
             }
             Action::FetchBlock { height } => {
                 let block = self.storage.get_block(height);
@@ -579,6 +582,21 @@ where
             DispatchPool::Crypto => self.dispatch.spawn_crypto(spawn_fn),
             DispatchPool::Execution => self.dispatch.spawn_execution(spawn_fn),
         }
+    }
+
+    /// Flush accumulated receipt bundles to storage on the execution pool.
+    ///
+    /// Moves SBOR-encoding + RocksDB writes off the pinned IoLoop thread.
+    /// With `SyncDispatch` (simulation), `spawn_execution` runs inline.
+    pub(super) fn flush_receipt_storage(&mut self) {
+        let bundles = std::mem::take(&mut self.pending_receipt_bundles);
+        if bundles.is_empty() {
+            return;
+        }
+        let storage = Arc::clone(&self.storage);
+        self.dispatch.spawn_execution(move || {
+            storage.store_receipt_bundles(&bundles);
+        });
     }
 
     /// Local shard committee excluding self, for use as the `peers` argument

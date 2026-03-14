@@ -199,6 +199,11 @@ where
     // off the pinned IoLoop thread while preserving commit ordering.
     pending_block_commits: Vec<(Block, QuorumCertificate)>,
 
+    // Receipt bundle accumulator — collects StoreReceiptBundles within an
+    // event cycle, then spawns storage writes on the execution pool so
+    // SBOR-encoding + RocksDB writes don't block the IoLoop thread.
+    pending_receipt_bundles: Vec<hyperscale_types::ReceiptBundle>,
+
     // Transaction status cache — retains the latest status for every transaction
     // that has emitted a status notification. Bounded LRU cache shared (via Arc)
     // with external consumers (e.g. RPC handlers in production).
@@ -291,6 +296,7 @@ where
                 b.committed_header_window,
             ),
             pending_block_commits: Vec::new(),
+            pending_receipt_bundles: Vec::new(),
             cached_local_peers,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             emitted_statuses: Vec::new(),
@@ -517,7 +523,8 @@ where
                         local_execution: None,
                     })
                     .collect();
-                self.storage.store_receipt_bundles(&bundles);
+                self.pending_receipt_bundles.extend(bundles);
+                self.flush_receipt_storage();
                 let outputs = self
                     .sync_protocol
                     .handle(SyncInput::BlockResponseReceived { height, block });
@@ -560,7 +567,8 @@ where
                         local_execution: None,
                     })
                     .collect();
-                self.storage.store_receipt_bundles(&bundles);
+                self.pending_receipt_bundles.extend(bundles);
+                self.flush_receipt_storage();
                 let outputs = self
                     .fetch_protocol
                     .handle(FetchInput::CertificatesReceived {
@@ -741,6 +749,7 @@ where
             self.process_action(action);
         }
         self.flush_block_commits();
+        self.flush_receipt_storage();
     }
 
     /// Flush any batch accumulators whose deadlines have expired.
@@ -875,6 +884,7 @@ where
     /// Called during shutdown or when immediate delivery is needed.
     pub fn flush_all_batches(&mut self) {
         self.flush_block_commits();
+        self.flush_receipt_storage();
         self.flush_validation_batch();
         self.flush_cross_shard_executions();
         self.flush_execution_vote_verifications();

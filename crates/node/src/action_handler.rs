@@ -436,11 +436,13 @@ pub(crate) fn handle_delegated_action<
                 .into_iter()
                 .map(|r| {
                     let mut result = ExecutionResult::from(r);
-                    result.database_updates = hyperscale_storage::filter_updates_to_shard(
-                        &result.database_updates,
-                        local_shard,
-                        num_shards,
-                    );
+                    if num_shards > 1 {
+                        result.database_updates = hyperscale_storage::filter_updates_to_shard(
+                            &result.database_updates,
+                            local_shard,
+                            num_shards,
+                        );
+                    }
                     result
                 })
                 .collect();
@@ -479,11 +481,13 @@ pub(crate) fn handle_delegated_action<
                 .into_iter()
                 .map(|r| {
                     let mut result = ExecutionResult::from(r);
-                    result.database_updates = hyperscale_storage::filter_updates_to_shard(
-                        &result.database_updates,
-                        local_shard,
-                        num_shards,
-                    );
+                    if num_shards > 1 {
+                        result.database_updates = hyperscale_storage::filter_updates_to_shard(
+                            &result.database_updates,
+                            local_shard,
+                            num_shards,
+                        );
+                    }
                     result
                 })
                 .collect();
