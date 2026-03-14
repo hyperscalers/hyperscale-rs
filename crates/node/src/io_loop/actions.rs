@@ -304,36 +304,45 @@ where
         self.pending_block_commits.push((block, qc));
     }
 
-    /// Flush accumulated block commits. If all blocks are empty (no
-    /// certificates), commits synchronously. Otherwise spawns a single
-    /// closure on the execution pool that commits all blocks sequentially,
-    /// sending `StateCommitComplete` and `BlockCommitted` events after each.
+    /// Flush accumulated block commits and any pending receipt bundles.
     ///
-    /// If a previous async commit closure is still in flight, blocks remain
-    /// in `pending_block_commits` to avoid spawning a second closure — Rayon
-    /// does not guarantee FIFO ordering across separate `spawn()` calls, so
-    /// two independent closures can execute out of order. The in-flight
-    /// closure clears the flag before sending its final events, so the
-    /// resulting `feed_event` → `flush_block_commits` picks up the backlog.
+    /// If all blocks are empty (no certificates), commits synchronously.
+    /// Otherwise spawns a single closure on the execution pool that persists
+    /// receipt bundles first, then commits all blocks sequentially, sending
+    /// `StateCommitComplete` and `BlockCommitted` events after each.
+    ///
+    /// Receipt bundles are drained into the same closure because the sync
+    /// path reconstructs `DatabaseUpdates` by reading receipts back from
+    /// storage. Writing receipts and committing in a single closure
+    /// guarantees ordering — Rayon does not guarantee FIFO ordering across
+    /// separate `spawn()` calls.
+    ///
+    /// If a previous async commit closure is still in flight, blocks and
+    /// receipt bundles remain pending to avoid spawning a second closure.
+    /// The in-flight closure clears the flag before sending its final
+    /// events, so the resulting `feed_event` → `flush_block_commits` picks
+    /// up the backlog.
     pub(super) fn flush_block_commits(&mut self) {
         if self.pending_block_commits.is_empty() {
             return;
         }
 
         // Defer if a previous async commit is still running on the exec pool.
-        // The pending blocks will be drained on the next flush once the
-        // in-flight closure completes and its events trigger feed_event.
         if self.commit_in_flight.load(Ordering::Acquire) {
             return;
         }
 
         let commits = std::mem::take(&mut self.pending_block_commits);
+        let pending_receipts = std::mem::take(&mut self.pending_receipt_bundles);
 
         let has_non_empty = commits.iter().any(|(b, _)| !b.certificates.is_empty());
 
         if !has_non_empty {
             // All empty blocks — synchronous fast path.
             // Still advance JMT version so it matches block height.
+            if !pending_receipts.is_empty() {
+                self.storage.store_receipt_bundles(&pending_receipts);
+            }
             for (block, qc) in commits {
                 let height = block.header.height;
                 let block_hash = block.hash();
@@ -387,6 +396,12 @@ where
         self.commit_in_flight.store(true, Ordering::Release);
 
         self.dispatch.spawn_execution(move || {
+            // Persist receipt bundles before committing — the sync path
+            // reconstructs DatabaseUpdates by reading these back.
+            if !pending_receipts.is_empty() {
+                storage.store_receipt_bundles(&pending_receipts);
+            }
+
             for (i, (block, qc)) in commits.into_iter().enumerate() {
                 let block_hash = block.hash();
                 let height = block.header.height;

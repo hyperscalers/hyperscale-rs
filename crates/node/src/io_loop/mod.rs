@@ -536,7 +536,6 @@ where
                     })
                     .collect();
                 self.pending_receipt_bundles.extend(bundles);
-                self.flush_receipt_storage();
                 let outputs = self
                     .sync_protocol
                     .handle(SyncInput::BlockResponseReceived { height, block });
@@ -582,7 +581,6 @@ where
                     })
                     .collect();
                 self.pending_receipt_bundles.extend(bundles);
-                self.flush_receipt_storage();
                 let outputs = self
                     .fetch_protocol
                     .handle(FetchInput::CertificatesReceived {
