@@ -43,10 +43,10 @@ pub fn next_prefix(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// Build a storage key directly from SubstateWrite fields.
+/// Build a storage key directly from node/partition/sort_key fields.
 ///
-/// This is equivalent to converting through `substate_writes_to_database_updates` +
-/// `to_storage_key`, but avoids the intermediate `DatabaseUpdates` allocation.
+/// Uses SpreadPrefixKeyMapper to compute the db_node_key and db_partition_num,
+/// then builds the composite storage key.
 pub fn storage_key_from_write(
     node_id: &NodeId,
     partition: &hyperscale_types::PartitionNumber,
@@ -108,6 +108,21 @@ pub fn node_prefix(node_id: &NodeId) -> Vec<u8> {
     prefix.extend_from_slice(RADIX_PREFIX);
     prefix.extend_from_slice(&db_node_key);
     prefix
+}
+
+/// Extract the NodeId from a SpreadPrefixKeyMapper db_node_key.
+///
+/// DbNodeKey format: 20-byte hash prefix + 30-byte NodeId.
+/// Returns None if the key is too short (should not happen with valid keys).
+pub fn db_node_key_to_node_id(db_node_key: &[u8]) -> Option<NodeId> {
+    const HASH_PREFIX_LEN: usize = 20;
+    const NODE_ID_LEN: usize = 30;
+    if db_node_key.len() < HASH_PREFIX_LEN + NODE_ID_LEN {
+        return None;
+    }
+    let mut id = [0u8; NODE_ID_LEN];
+    id.copy_from_slice(&db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN]);
+    Some(NodeId(id))
 }
 
 #[cfg(test)]

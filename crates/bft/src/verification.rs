@@ -1,16 +1,16 @@
 //! Async verification pipeline for block voting.
 //!
-//! Tracks QC signature, CommitmentProof, state root, and transaction root
-//! verifications. BftState delegates verification bookkeeping here while
-//! retaining control-flow decisions (voting, block rejection).
+//! Tracks QC signature, CommitmentProof, state root, transaction root, and
+//! receipt root verifications. BftState delegates verification bookkeeping
+//! here while retaining control-flow decisions (voting, block rejection).
 
-use hyperscale_core::Action;
 use hyperscale_types::{
     Block, BlockHeader, Bls12381G1PublicKey, CommitmentProof, Hash, TopologySnapshot,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use tracing::{debug, trace, warn};
+
+use hyperscale_core::Action;
 
 /// Block header pending QC signature verification.
 ///
@@ -50,12 +50,24 @@ struct PendingStateRootVerification {
     required_root: Hash,
     /// The state root claimed by the proposer (to verify against).
     expected_root: Hash,
-    /// The certificates to commit. State writes are extracted from these.
-    /// Also used to pre-build the RocksDB WriteBatch during verification
-    /// for efficient single-fsync commit later.
-    certificates: Vec<Arc<hyperscale_types::TransactionCertificate>>,
-    /// Block height (used as JMT version for certificate merging).
+    /// Transaction hashes of the certificates in the block. Used to look up
+    /// DatabaseUpdates from the execution cache when the JMT catches up.
+    cert_tx_hashes: Vec<Hash>,
+    /// Block height (used as JMT version).
     block_height: u64,
+}
+
+/// State root verification that is ready to dispatch (JMT is at the correct root).
+///
+/// The `NodeStateMachine` drains these after each BFT call, computes the
+/// `merged_updates` from the execution cache, and emits `VerifyStateRoot` actions.
+#[derive(Debug)]
+pub struct ReadyStateRootVerification {
+    pub block_hash: Hash,
+    pub parent_state_root: Hash,
+    pub expected_root: Hash,
+    pub cert_tx_hashes: Vec<Hash>,
+    pub block_height: u64,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -113,12 +125,23 @@ pub(crate) struct VerificationPipeline {
     /// Blocks with verified state roots.
     verified_state_roots: HashSet<Hash>,
 
+    /// State root verifications ready to dispatch (JMT root matches).
+    /// Drained by NodeStateMachine which computes merged_updates from execution cache.
+    ready_state_root_verifications: Vec<ReadyStateRootVerification>,
+
     // === Transaction root verification ===
     /// Blocks where transaction root verification is currently in-flight.
     transaction_root_verifications_in_flight: HashSet<Hash>,
 
     /// Blocks with verified transaction roots.
     verified_transaction_roots: HashSet<Hash>,
+
+    // === Receipt root verification ===
+    /// Blocks where receipt root verification is currently in-flight.
+    receipt_root_verifications_in_flight: HashSet<Hash>,
+
+    /// Blocks with verified receipt roots.
+    verified_receipt_roots: HashSet<Hash>,
 }
 
 impl VerificationPipeline {
@@ -133,8 +156,11 @@ impl VerificationPipeline {
             pending_state_root_verifications: HashMap::new(),
             last_committed_jmt_root: jmt_root,
             verified_state_roots: HashSet::new(),
+            ready_state_root_verifications: Vec::new(),
             transaction_root_verifications_in_flight: HashSet::new(),
             verified_transaction_roots: HashSet::new(),
+            receipt_root_verifications_in_flight: HashSet::new(),
+            verified_receipt_roots: HashSet::new(),
         }
     }
 
@@ -208,7 +234,13 @@ impl VerificationPipeline {
             self.verified_transaction_roots.contains(&block_hash)
         };
 
-        commitment_proof_ok && state_root_ok && transaction_root_ok
+        let receipt_root_ok = if block.certificates.is_empty() {
+            true
+        } else {
+            self.verified_receipt_roots.contains(&block_hash)
+        };
+
+        commitment_proof_ok && state_root_ok && transaction_root_ok && receipt_root_ok
     }
 
     // ─── CommitmentProof ─────────────────────────────────────────────────
@@ -419,36 +451,45 @@ impl VerificationPipeline {
     /// Initiate state root verification for a block.
     ///
     /// `parent_state_root` is the state root of the parent block (base state).
-    /// If JMT is ready, emits a VerifyStateRoot action immediately.
+    /// If JMT is ready, pushes to the ready queue for immediate dispatch.
     /// Otherwise, queues for later when JMT catches up.
+    ///
+    /// In both cases, the `NodeStateMachine` is responsible for draining
+    /// `ready_state_root_verifications` and computing `merged_updates` from
+    /// the execution cache before emitting the actual `VerifyStateRoot` action.
     pub fn initiate_state_root_verification(
         &mut self,
         block_hash: Hash,
         block: &Block,
         parent_state_root: Hash,
-    ) -> Vec<Action> {
+    ) {
         let current_root = self.last_committed_jmt_root;
+        let cert_tx_hashes: Vec<Hash> = block
+            .certificates
+            .iter()
+            .map(|c| c.transaction_hash)
+            .collect();
 
         if current_root == parent_state_root {
-            // JMT is ready - verify immediately
+            // JMT is ready - mark as ready for dispatch
             debug!(
                 block_hash = ?block_hash,
                 certificate_count = block.certificates.len(),
                 expected_root = ?block.header.state_root,
                 parent_state_root = ?parent_state_root,
                 current_jmt_root = ?current_root,
-                "JMT ready - initiating state root verification"
+                "JMT ready - state root verification ready for dispatch"
             );
 
             self.state_root_verifications_in_flight.insert(block_hash);
-
-            vec![Action::VerifyStateRoot {
-                block_hash,
-                parent_state_root,
-                expected_root: block.header.state_root,
-                certificates: block.certificates.clone(),
-                block_height: block.header.height.0,
-            }]
+            self.ready_state_root_verifications
+                .push(ReadyStateRootVerification {
+                    block_hash,
+                    parent_state_root,
+                    expected_root: block.header.state_root,
+                    cert_tx_hashes,
+                    block_height: block.header.height.0,
+                });
         } else {
             // JMT not ready - queue for later
             debug!(
@@ -465,12 +506,10 @@ impl VerificationPipeline {
                 PendingStateRootVerification {
                     required_root: parent_state_root,
                     expected_root: block.header.state_root,
-                    certificates: block.certificates.clone(),
+                    cert_tx_hashes,
                     block_height: block.header.height.0,
                 },
             );
-
-            vec![] // No action yet - will be triggered by StateCommitComplete
         }
     }
 
@@ -553,6 +592,65 @@ impl VerificationPipeline {
         valid
     }
 
+    // ─── Receipt root ─────────────────────────────────────────────────────
+
+    /// Check if a block needs receipt root verification before voting.
+    pub fn needs_receipt_root_verification(&self, block: &Block) -> bool {
+        if block.certificates.is_empty() {
+            return false;
+        }
+
+        let block_hash = block.hash();
+
+        if self.verified_receipt_roots.contains(&block_hash)
+            || self
+                .receipt_root_verifications_in_flight
+                .contains(&block_hash)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    /// Initiate receipt root verification for a block.
+    pub fn initiate_receipt_root_verification(
+        &mut self,
+        block_hash: Hash,
+        block: &Block,
+    ) -> Vec<Action> {
+        debug!(
+            block_hash = ?block_hash,
+            cert_count = block.certificates.len(),
+            expected_root = ?block.header.receipt_root,
+            "Initiating receipt root verification"
+        );
+
+        self.receipt_root_verifications_in_flight.insert(block_hash);
+
+        vec![Action::VerifyReceiptRoot {
+            block_hash,
+            expected_root: block.header.receipt_root,
+            certificates: block.certificates.clone(),
+        }]
+    }
+
+    /// Record a receipt root verification result. Returns whether the verification passed.
+    pub fn on_receipt_root_verified(&mut self, block_hash: Hash, valid: bool) -> bool {
+        self.receipt_root_verifications_in_flight
+            .remove(&block_hash);
+
+        if valid {
+            self.verified_receipt_roots.insert(block_hash);
+            debug!(
+                block_hash = ?block_hash,
+                "Receipt root verified successfully"
+            );
+        }
+
+        valid
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // JMT state tracking
     // ═══════════════════════════════════════════════════════════════════════
@@ -564,8 +662,9 @@ impl VerificationPipeline {
 
     /// JMT advanced — update root and unblock any waiting state root verifications.
     ///
-    /// Returns actions for verifications that can now proceed.
-    pub fn on_jmt_advanced(&mut self, block_height: u64, new_root: Hash) -> Vec<Action> {
+    /// Unblocked verifications are pushed to the ready queue for
+    /// `NodeStateMachine` to drain and enrich with `merged_updates`.
+    pub fn on_jmt_advanced(&mut self, block_height: u64, new_root: Hash) {
         self.last_committed_jmt_root = new_root;
 
         // Find all pending verifications where the JMT now has the required base root.
@@ -577,7 +676,7 @@ impl VerificationPipeline {
             .collect();
 
         if unblocked.is_empty() {
-            return vec![];
+            return;
         }
 
         debug!(
@@ -585,21 +684,27 @@ impl VerificationPipeline {
             block_height, "Unblocking pending state root verifications"
         );
 
-        let mut actions = Vec::new();
         for block_hash in unblocked {
             if let Some(pv) = self.pending_state_root_verifications.remove(&block_hash) {
                 self.state_root_verifications_in_flight.insert(block_hash);
-                actions.push(Action::VerifyStateRoot {
-                    block_hash,
-                    parent_state_root: pv.required_root,
-                    expected_root: pv.expected_root,
-                    certificates: pv.certificates,
-                    block_height: pv.block_height,
-                });
+                self.ready_state_root_verifications
+                    .push(ReadyStateRootVerification {
+                        block_hash,
+                        parent_state_root: pv.required_root,
+                        expected_root: pv.expected_root,
+                        cert_tx_hashes: pv.cert_tx_hashes,
+                        block_height: pv.block_height,
+                    });
             }
         }
+    }
 
-        actions
+    /// Drain state root verifications that are ready to dispatch.
+    ///
+    /// The caller (`NodeStateMachine`) computes `merged_updates` from the
+    /// execution cache for each verification and emits the `VerifyStateRoot` action.
+    pub fn drain_ready_state_root_verifications(&mut self) -> Vec<ReadyStateRootVerification> {
+        std::mem::take(&mut self.ready_state_root_verifications)
     }
 
     /// Number of pending state root verifications (for logging).
@@ -645,6 +750,9 @@ impl VerificationPipeline {
 
         self.verified_state_roots
             .retain(|hash| pending_blocks.contains_key(hash));
+
+        self.ready_state_root_verifications
+            .retain(|r| pending_blocks.contains_key(&r.block_hash));
 
         self.transaction_root_verifications_in_flight
             .retain(|hash| pending_blocks.contains_key(hash));

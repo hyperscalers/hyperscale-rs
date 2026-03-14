@@ -19,11 +19,11 @@
 //!
 //! ## Phase 3: Deterministic Execution
 //! With provisioned state, validators execute the transaction and create
-//! an ExecutionVote with merkle root of execution results.
+//! an ExecutionVote with the receipt hash of execution results.
 //!
 //! ## Phase 4: Vote Aggregation
 //! Validators broadcast votes to their local shard. When 2f+1 voting power agrees
-//! on the same merkle root, an ExecutionCertificate is created and broadcast to
+//! on the same receipt hash, an ExecutionCertificate is created and broadcast to
 //! remote participating shards (local peers form it independently).
 //!
 //! ## Phase 5: Finalization
@@ -41,6 +41,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
 
+use crate::execution_cache::ExecutionCache;
 use crate::pending::{
     PendingCertificateAggregation, PendingCertificateVerification,
     PendingFetchedCertificateVerification,
@@ -95,6 +96,10 @@ pub struct SpeculativeResult {
 pub struct ExecutionState {
     /// Current time.
     now: Duration,
+
+    /// In-memory cache of execution write sets (DatabaseUpdates), keyed by tx hash.
+    /// Populated when execution completes, read during block commit, evicted after commit.
+    execution_cache: ExecutionCache,
 
     /// Transactions that have been executed (deduplication).
     /// Maps tx_hash -> block_height when executed, enabling height-based cleanup.
@@ -269,6 +274,7 @@ impl ExecutionState {
     ) -> Self {
         Self {
             now: Duration::ZERO,
+            execution_cache: ExecutionCache::new(crate::execution_cache::DEFAULT_MAX_ENTRIES),
             executed_txs: HashMap::new(),
             finalized_certificates: BTreeMap::new(),
             committed_height: 0,
@@ -307,6 +313,20 @@ impl ExecutionState {
     /// Set the current time.
     pub fn set_time(&mut self, now: Duration) {
         self.now = now;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Execution Cache
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Read access to the execution cache (for block commit / state root verification).
+    pub fn execution_cache(&self) -> &ExecutionCache {
+        &self.execution_cache
+    }
+
+    /// Mutable access to the execution cache (for inserting results / evicting after commit).
+    pub fn execution_cache_mut(&mut self) -> &mut ExecutionCache {
+        &mut self.execution_cache
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -367,7 +387,7 @@ impl ExecutionState {
             .into_iter()
             .partition(|tx| topology.is_single_shard_transaction(tx));
 
-        // Handle single-shard transactions (now use voting like cross-shard)
+        // Handle single-shard transactions (voting, same as cross-shard)
         // All WRITE operations need BLS signature aggregation
         //
         // With inline signing, speculative execution has already signed and sent votes.
@@ -726,7 +746,6 @@ impl ExecutionState {
     // Phase 3: Vote Aggregation
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle execution vote received.
     /// Handle an execution vote received from another validator.
     ///
     /// Uses deferred verification: votes are buffered until we have enough
@@ -923,9 +942,7 @@ impl ExecutionState {
         // Mark as seen to prevent re-buffering if vote arrives again
         let validator_id = vote.validator;
         if !tracker.has_seen_validator(validator_id) {
-            // We need to mark it as seen even though we're adding it directly
-            // Use a dummy public key since we won't actually verify
-            // Actually, we should track this differently - let's just add to verified_execution_votes
+            // Record in verified_execution_votes to prevent re-buffering on duplicate arrival
             self.verified_execution_votes
                 .insert((tx_hash, validator_id), 0);
             self.verified_votes_by_tx
@@ -950,19 +967,26 @@ impl ExecutionState {
         };
 
         // Check for quorum
-        let Some((writes_commitment, total_power)) = tracker.check_quorum() else {
+        let Some((receipt_hash, total_power)) = tracker.check_quorum() else {
             return vec![];
         };
 
-        // Extract data from tracker - use take_votes_for_root to avoid cloning
-        let votes = tracker.take_votes_for_commitment(&writes_commitment);
+        // Extract data from tracker - use take_votes_for_receipt_hash to avoid cloning
+        let votes = tracker.take_votes_for_receipt_hash(&receipt_hash);
         let read_nodes = tracker.read_nodes().to_vec();
         let participating_shards = tracker.participating_shards().to_vec();
+
+        // Take write_nodes from the first vote — all votes within a shard have
+        // identical write_nodes (deterministic execution), so any vote suffices.
+        let write_nodes = votes
+            .first()
+            .map(|v| v.write_nodes.clone())
+            .unwrap_or_default();
 
         tracing::debug!(
             tx_hash = ?tx_hash,
             shard = local_shard.0,
-            writes_commitment = ?writes_commitment,
+            receipt_hash = ?receipt_hash,
             votes = votes.len(),
             power = total_power,
             "Vote quorum reached - delegating BLS aggregation"
@@ -985,9 +1009,10 @@ impl ExecutionState {
         vec![Action::AggregateExecutionCertificate {
             tx_hash,
             shard: local_shard,
-            writes_commitment,
+            receipt_hash,
             votes,
             read_nodes,
+            write_nodes,
             committee,
         }]
     }
@@ -1058,13 +1083,12 @@ impl ExecutionState {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Phase 4: Finalization
+    // Phase 5: Finalization
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle execution certificate received.
+    /// Handle an execution certificate received from another validator.
     ///
     /// Delegates signature verification to the runner before processing.
-    /// Handle an execution certificate received from another validator.
     #[instrument(skip(self, cert), fields(
         tx_hash = ?cert.transaction_hash,
         shard = cert.shard_group_id.0,
@@ -1711,33 +1735,6 @@ impl ExecutionState {
         }
     }
 
-    /// Add a verified certificate received from gossip or fetch.
-    ///
-    /// Called after a TransactionCertificate from another validator has been verified.
-    /// This adds it to finalized_certificates so it's available for block inclusion,
-    /// without going through the normal vote aggregation and certificate tracking flow.
-    pub fn add_verified_certificate(&mut self, certificate: Arc<TransactionCertificate>) {
-        let tx_hash = certificate.transaction_hash;
-
-        // Check if already finalized
-        if self.finalized_certificates.contains_key(&tx_hash) {
-            tracing::debug!(
-                tx_hash = ?tx_hash,
-                "Certificate already finalized, skipping add"
-            );
-            return;
-        }
-
-        tracing::debug!(
-            tx_hash = ?tx_hash,
-            decision = ?certificate.decision,
-            shards = certificate.shard_proofs.len(),
-            "Adding verified certificate from gossip"
-        );
-
-        self.finalized_certificates.insert(tx_hash, certificate);
-    }
-
     // ═══════════════════════════════════════════════════════════════════════════
     // Speculative Execution
     // ═══════════════════════════════════════════════════════════════════════════
@@ -1926,7 +1923,7 @@ impl ExecutionState {
         let written_nodes: HashSet<NodeId> = certificate
             .shard_proofs
             .values()
-            .flat_map(|cert| cert.state_writes.iter().map(|w| w.node_id))
+            .flat_map(|cert| cert.write_nodes.iter().copied())
             .collect();
 
         if written_nodes.is_empty() {
@@ -2186,7 +2183,7 @@ mod tests {
 
         // In production, the runner executes + signs + sends ExecutionVoteReceived.
         // Simulate that by creating a vote and calling on_vote.
-        let writes_commitment = Hash::ZERO;
+        let receipt_hash = Hash::ZERO;
         let success = true;
         let local_shard = topology.local_shard();
         let validator_id = topology.local_validator_id();
@@ -2194,15 +2191,15 @@ mod tests {
         // Create a signed vote (simulating what the runner does)
         let signing_key = generate_bls_keypair();
         let message =
-            hyperscale_types::exec_vote_message(&tx_hash, &writes_commitment, local_shard, success);
+            hyperscale_types::exec_vote_message(&tx_hash, &receipt_hash, local_shard, success);
         let signature = signing_key.sign_v1(&message);
 
         let vote = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: local_shard,
-            writes_commitment,
+            receipt_hash,
             success,
-            state_writes: vec![],
+            write_nodes: vec![],
             validator: validator_id,
             signature,
         };
@@ -2381,7 +2378,7 @@ mod tests {
 
         let committee = TestCommittee::new(4, 42);
         let tx_hash = Hash::from_bytes(b"test_tx");
-        let writes_commitment = Hash::from_bytes(b"state_root");
+        let receipt_hash = Hash::from_bytes(b"state_root");
         let shard = ShardGroupId(0);
 
         // Create a properly signed execution vote
@@ -2389,7 +2386,7 @@ mod tests {
             &committee,
             0, // voter index
             tx_hash,
-            writes_commitment,
+            receipt_hash,
             shard,
             true,
         );
@@ -2410,7 +2407,7 @@ mod tests {
 
         let committee = TestCommittee::new(4, 42);
         let tx_hash = Hash::from_bytes(b"test_tx");
-        let writes_commitment = Hash::from_bytes(b"commitment");
+        let receipt_hash = Hash::from_bytes(b"commitment");
         let shard = ShardGroupId(0);
 
         // Create an execution certificate with real aggregated signatures
@@ -2418,7 +2415,7 @@ mod tests {
             &committee,
             &[0, 1, 2], // 3 voters
             tx_hash,
-            writes_commitment,
+            receipt_hash,
             shard,
             true,
         );

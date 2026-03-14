@@ -1,6 +1,9 @@
 //! Execution result types.
 
-use hyperscale_types::{Hash, SubstateWrite};
+use hyperscale_types::{
+    ExecutionResult, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
+};
+use radix_substate_store_interface::interface::DatabaseUpdates;
 
 /// Output from executing a batch of transactions.
 #[derive(Debug, Clone)]
@@ -50,16 +53,22 @@ pub struct SingleTxResult {
     /// Whether execution succeeded (committed).
     pub success: bool,
 
-    /// Deterministic hash-chain commitment over execution output writes.
-    ///
-    /// Used in the voting protocol to ensure all shards agree on results.
-    /// For failed transactions, this is a zero hash.
-    pub writes_commitment: Hash,
+    // ─── Receipt fields ──────────────────────────────────────────────────
+    /// Hash of ConsensusReceipt (outcome + event_root).
+    pub receipt_hash: Hash,
 
-    /// State writes from execution (for certificate creation).
+    /// Full ledger receipt with all state changes.
+    pub ledger_receipt: LedgerTransactionReceipt,
+
+    /// Local execution metadata (fees, logs, errors).
+    pub local_execution: LocalTransactionExecution,
+
+    /// Raw DatabaseUpdates for the execution cache.
     ///
-    /// Only populated for successful executions.
-    pub state_writes: Vec<SubstateWrite>,
+    /// Kept separate from the receipt because the receipt has SubstateChange
+    /// format (with Create/Update/Delete + previous values), while
+    /// DatabaseUpdates is the raw format needed for JMT application.
+    pub database_updates: DatabaseUpdates,
 
     /// Error message if execution failed.
     pub error: Option<String>,
@@ -69,14 +78,18 @@ impl SingleTxResult {
     /// Create a successful result.
     pub fn success(
         tx_hash: Hash,
-        writes_commitment: Hash,
-        state_writes: Vec<SubstateWrite>,
+        receipt_hash: Hash,
+        ledger_receipt: LedgerTransactionReceipt,
+        local_execution: LocalTransactionExecution,
+        database_updates: DatabaseUpdates,
     ) -> Self {
         Self {
             tx_hash,
             success: true,
-            writes_commitment,
-            state_writes,
+            receipt_hash,
+            ledger_receipt,
+            local_execution,
+            database_updates,
             error: None,
         }
     }
@@ -86,8 +99,10 @@ impl SingleTxResult {
         Self {
             tx_hash,
             success: false,
-            writes_commitment: Hash::ZERO,
-            state_writes: vec![],
+            receipt_hash: LedgerTransactionReceipt::failure().receipt_hash(),
+            ledger_receipt: LedgerTransactionReceipt::failure(),
+            local_execution: LocalTransactionExecution::failure(None),
+            database_updates: DatabaseUpdates::default(),
             error: Some(error.into()),
         }
     }
@@ -100,5 +115,20 @@ impl SingleTxResult {
     /// Check if this is a failed execution.
     pub fn is_failure(&self) -> bool {
         !self.success
+    }
+}
+
+// ExecutionResult is defined in hyperscale_types::receipt and re-exported
+// from hyperscale_types. The engine crate re-exports it from lib.rs.
+
+impl From<SingleTxResult> for ExecutionResult {
+    fn from(r: SingleTxResult) -> Self {
+        Self {
+            tx_hash: r.tx_hash,
+            receipt_hash: r.receipt_hash,
+            database_updates: r.database_updates,
+            ledger_receipt: r.ledger_receipt,
+            local_execution: r.local_execution,
+        }
     }
 }

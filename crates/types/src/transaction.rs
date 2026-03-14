@@ -1,8 +1,6 @@
 //! Transaction types for consensus.
 
-use crate::{
-    BlockHeight, CommitmentProof, ExecutionCertificate, Hash, NodeId, ShardGroupId, SubstateWrite,
-};
+use crate::{BlockHeight, CommitmentProof, ExecutionCertificate, Hash, NodeId, ShardGroupId};
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
 use radix_transactions::validation::TransactionValidator;
@@ -1100,7 +1098,7 @@ pub struct TransactionCertificate {
     pub decision: TransactionDecision,
 
     /// Execution certificates from all participating shards, keyed by shard ID.
-    /// Each certificate contains read_nodes, state_writes, signatures, etc.
+    /// Each certificate contains read_nodes, write_nodes, signatures, etc.
     pub shard_proofs: BTreeMap<ShardGroupId, ExecutionCertificate>,
 }
 
@@ -1148,25 +1146,9 @@ impl TransactionCertificate {
             .collect()
     }
 
-    /// Get all state writes across all shards.
-    pub fn all_state_writes(&self) -> Vec<SubstateWrite> {
-        self.shard_proofs
-            .values()
-            .flat_map(|cert| cert.state_writes.iter().cloned())
-            .collect()
-    }
-
     /// Check if all shards succeeded.
     pub fn all_shards_succeeded(&self) -> bool {
         self.shard_proofs.values().all(|cert| cert.success)
-    }
-
-    /// Get total number of state writes across all shards.
-    pub fn total_write_count(&self) -> usize {
-        self.shard_proofs
-            .values()
-            .map(|cert| cert.state_writes.len())
-            .sum()
     }
 
     /// Get total number of read nodes across all shards.
@@ -1175,6 +1157,24 @@ impl TransactionCertificate {
             .values()
             .map(|cert| cert.read_nodes.len())
             .sum()
+    }
+
+    /// Combined receipt hash across all shards.
+    ///
+    /// For single-shard transactions, returns the shard's `receipt_hash` directly.
+    /// For cross-shard transactions, computes a merkle root over each shard's
+    /// `receipt_hash` in shard ID order (deterministic via BTreeMap).
+    pub fn receipt_hash(&self) -> Hash {
+        let hashes: Vec<Hash> = self
+            .shard_proofs
+            .values()
+            .map(|cert| cert.receipt_hash)
+            .collect();
+        match hashes.len() {
+            0 => Hash::ZERO,
+            1 => hashes[0],
+            _ => crate::compute_merkle_root(&hashes),
+        }
     }
 }
 

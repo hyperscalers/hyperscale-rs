@@ -888,58 +888,6 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         (root, snapshot)
     }
 
-    /// Build a WriteBatch for all certificates in a block.
-    ///
-    /// This pre-builds all the writes that will be committed when the block commits,
-    /// allowing them to be applied with a single fsync instead of N fsyncs.
-    ///
-    /// # Arguments
-    ///
-    /// * `certificates` - The certificates to include in the batch
-    /// * `local_shard` - The local shard to extract writes from
-    ///
-    /// # Returns
-    ///
-    /// A WriteBatch containing all certificate and state writes.
-    pub(crate) fn build_write_batch(
-        &self,
-        certificates: &[std::sync::Arc<hyperscale_types::TransactionCertificate>],
-        local_shard: hyperscale_types::ShardGroupId,
-    ) -> WriteBatch {
-        let mut batch = WriteBatch::default();
-
-        let cert_cf = self
-            .db
-            .cf_handle("certificates")
-            .expect("certificates column family must exist");
-        let state_cf = self
-            .db
-            .cf_handle(STATE_CF)
-            .expect("state column family must exist");
-
-        for cert in certificates {
-            // Serialize and add certificate
-            let cert_bytes =
-                sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
-            batch.put_cf(cert_cf, cert.transaction_hash.as_bytes(), cert_bytes);
-
-            // Add state writes for local shard (iterate SubstateWrite directly,
-            // avoiding intermediate DatabaseUpdates allocation)
-            if let Some(shard_proof) = cert.shard_proofs.get(&local_shard) {
-                for write in &shard_proof.state_writes {
-                    let storage_key = hyperscale_storage::keys::storage_key_from_write(
-                        &write.node_id,
-                        &write.partition,
-                        &write.sort_key,
-                    );
-                    batch.put_cf(state_cf, &storage_key, &write.value);
-                }
-            }
-        }
-
-        batch
-    }
-
     /// Try to apply a prepared block commit with a single fsync.
     ///
     /// This is the fast path for block commit. Applies the pre-built WriteBatch
@@ -973,13 +921,12 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             return false;
         }
         if current_version != jmt_snapshot.base_version {
-            tracing::warn!(
+            tracing::debug!(
                 expected_version = jmt_snapshot.base_version,
                 actual_version = current_version,
-                "JMT snapshot base VERSION mismatch - falling back to slow path. \
-                 This can happen with empty commits or concurrent block processing."
+                "JMT snapshot base VERSION mismatch (root matches) - proceeding with fast path. \
+                 This is expected when empty commits advance the version counter."
             );
-            return false;
         }
 
         let nodes_count = jmt_snapshot.nodes.len();
@@ -1705,18 +1652,17 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     /// # Arguments
     ///
     /// * `certificate` - The transaction certificate to store
-    /// * `writes` - The state writes from the certificate's shard_proofs for the local shard
+    /// * `updates` - The database updates to apply alongside the certificate
     #[cfg(test)]
     #[instrument(level = Level::DEBUG, skip_all, fields(
         tx_hash = %certificate.transaction_hash,
-        write_count = writes.len(),
         latency_us = tracing::field::Empty,
         otel.kind = "INTERNAL",
     ))]
     pub fn commit_certificate_with_writes(
         &self,
         certificate: &TransactionCertificate,
-        writes: &[hyperscale_types::SubstateWrite],
+        updates: &hyperscale_storage::DatabaseUpdates,
     ) {
         let start = Instant::now();
         let mut batch = rocksdb::WriteBatch::default();
@@ -1737,7 +1683,6 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             .db
             .cf_handle(STATE_CF)
             .expect("state column family must exist");
-        let updates = hyperscale_storage::substate_writes_to_database_updates(writes);
         for (db_node_key, node_updates) in &updates.node_updates {
             for (partition_num, partition_updates) in &node_updates.partition_updates {
                 if let hyperscale_storage::PartitionDatabaseUpdates::Delta { substate_updates } =
@@ -1777,7 +1722,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
 
         tracing::debug!(
             tx_hash = %certificate.transaction_hash,
-            write_count = writes.len(),
+            write_count,
             "Certificate state writes committed (JMT deferred to block commit)"
         );
 
@@ -1789,6 +1734,92 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
 
         // Record span fields
         tracing::Span::current().record("latency_us", elapsed.as_micros() as u64);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Receipt storage
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Store a receipt bundle (ledger receipt + optional local execution).
+    pub fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
+        let mut batch = WriteBatch::default();
+        self.add_receipt_bundle_to_batch(&mut batch, bundle);
+        self.db
+            .write(batch)
+            .expect("failed to persist receipt bundle");
+    }
+
+    /// Store multiple receipt bundles in a single atomic WriteBatch.
+    pub fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
+        if bundles.is_empty() {
+            return;
+        }
+        let mut batch = WriteBatch::default();
+        for bundle in bundles {
+            self.add_receipt_bundle_to_batch(&mut batch, bundle);
+        }
+        self.db
+            .write(batch)
+            .expect("failed to persist receipt bundles");
+    }
+
+    /// Add a single receipt bundle's writes to an existing WriteBatch.
+    fn add_receipt_bundle_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        bundle: &hyperscale_types::ReceiptBundle,
+    ) {
+        let receipts_cf = self
+            .db
+            .cf_handle("ledger_receipts")
+            .expect("ledger_receipts column family must exist");
+        let receipt_bytes = if let Some(ref updates) = bundle.database_updates {
+            let mut receipt = (*bundle.ledger_receipt).clone();
+            receipt.state_changes = hyperscale_storage::extract_state_changes(updates);
+            sbor::basic_encode(&receipt).expect("ledger receipt encoding must succeed")
+        } else {
+            sbor::basic_encode(bundle.ledger_receipt.as_ref())
+                .expect("ledger receipt encoding must succeed")
+        };
+        batch.put_cf(receipts_cf, bundle.tx_hash.as_bytes(), receipt_bytes);
+
+        if let Some(ref local) = bundle.local_execution {
+            let local_cf = self
+                .db
+                .cf_handle("local_executions")
+                .expect("local_executions column family must exist");
+            let local_bytes =
+                sbor::basic_encode(local).expect("local execution encoding must succeed");
+            batch.put_cf(local_cf, bundle.tx_hash.as_bytes(), local_bytes);
+        }
+    }
+
+    /// Retrieve the ledger receipt for a transaction.
+    pub fn get_ledger_receipt(
+        &self,
+        tx_hash: &Hash,
+    ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
+        let cf = self.db.cf_handle("ledger_receipts")?;
+        match self.db.get_cf(cf, tx_hash.as_bytes()) {
+            Ok(Some(value)) => {
+                let receipt: hyperscale_types::LedgerTransactionReceipt =
+                    sbor::basic_decode(&value).ok()?;
+                Some(Arc::new(receipt))
+            }
+            _ => None,
+        }
+    }
+
+    /// Retrieve local execution details for a transaction.
+    pub fn get_local_execution(
+        &self,
+        tx_hash: &Hash,
+    ) -> Option<hyperscale_types::LocalTransactionExecution> {
+        let cf = self.db.cf_handle("local_executions")?;
+        match self.db.get_cf(cf, tx_hash.as_bytes()) {
+            Ok(Some(value)) => sbor::basic_decode(&value).ok(),
+            _ => None,
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -2232,6 +2263,8 @@ impl Default for RocksDbConfig {
                 "jmt_nodes".to_string(), // JMT tree nodes for state commitment
                 "associated_state_tree_values".to_string(), // Historical substate values (leaf key -> value)
                 "stale_state_hash_tree_parts".to_string(),  // Deferred GC queue for stale JMT nodes
+                "ledger_receipts".to_string(),              // Ledger receipts keyed by tx hash
+                "local_executions".to_string(), // Local execution details keyed by tx hash
             ],
             jmt_history_length: 60_000, // Match Babylon's default
         }
@@ -2241,8 +2274,6 @@ impl Default for RocksDbConfig {
 // ═══════════════════════════════════════════════════════════════════════
 // CommitStore implementation
 // ═══════════════════════════════════════════════════════════════════════
-
-use hyperscale_storage::extract_writes_per_cert;
 
 /// Precomputed commit work for a RocksDB block commit.
 ///
@@ -2257,8 +2288,7 @@ use hyperscale_storage::extract_writes_per_cert;
 pub struct RocksDbPreparedCommit {
     write_batch: WriteBatch,
     jmt_snapshot: JmtSnapshot,
-    certificates: Vec<Arc<TransactionCertificate>>,
-    local_shard: hyperscale_types::ShardGroupId,
+    merged_updates: DatabaseUpdates,
 }
 
 impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D> {
@@ -2267,31 +2297,22 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
     fn prepare_block_commit(
         &self,
         parent_state_root: hyperscale_types::Hash,
-        certificates: &[Arc<TransactionCertificate>],
-        local_shard: hyperscale_types::ShardGroupId,
+        merged_updates: &DatabaseUpdates,
         block_height: u64,
     ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
-        let writes_per_cert = extract_writes_per_cert(certificates, local_shard);
-
-        // Convert SubstateWrites → DatabaseUpdates once upfront, reuse for JMT.
-        let updates_per_cert: Vec<DatabaseUpdates> = writes_per_cert
-            .iter()
-            .map(|writes| hyperscale_storage::substate_writes_to_database_updates(writes))
-            .collect();
-
         let (computed_root, jmt_snapshot) = self.compute_speculative_root_from_base(
             parent_state_root,
-            &updates_per_cert,
+            std::slice::from_ref(merged_updates),
             block_height,
         );
 
-        let write_batch = self.build_write_batch(certificates, local_shard);
+        // Pre-build substate writes into a WriteBatch for efficient commit.
+        let write_batch = self.build_substate_write_batch(merged_updates);
 
         let prepared = RocksDbPreparedCommit {
             write_batch,
             jmt_snapshot,
-            certificates: certificates.to_vec(),
-            local_shard,
+            merged_updates: merged_updates.clone(),
         };
 
         (computed_root, prepared)
@@ -2300,26 +2321,36 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
+        certificates: &[Arc<TransactionCertificate>],
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
     ) -> hyperscale_types::Hash {
         let block_height = prepared.jmt_snapshot.new_version;
         let result_root = prepared.jmt_snapshot.result_root;
-        let used_fast_path = self.try_apply_prepared_commit(
-            prepared.write_batch,
-            prepared.jmt_snapshot,
-            consensus.as_ref(),
-        );
+
+        // Append certificate storage to the write batch.
+        let mut write_batch = prepared.write_batch;
+        let cert_cf = self
+            .db
+            .cf_handle("certificates")
+            .expect("certificates column family must exist");
+        for cert in certificates {
+            let cert_bytes =
+                sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
+            write_batch.put_cf(cert_cf, cert.transaction_hash.as_bytes(), cert_bytes);
+        }
+
+        let used_fast_path =
+            self.try_apply_prepared_commit(write_batch, prepared.jmt_snapshot, consensus.as_ref());
 
         if used_fast_path {
-            // Return the known values from the snapshot rather than re-reading
-            // from the store, avoiding a TOCTOU window with concurrent commits.
             result_root
         } else {
-            // Stale cache: fall back to full block commit which recomputes JMT.
-            // Pass consensus through so it's still written atomically.
+            // Stale cache: fall back to recompute from scratch.
+            // The JMT base root changed, so the prepared snapshot is invalid.
+            // Use the stored merged_updates to ensure substate writes aren't lost.
             self.commit_block(
-                &prepared.certificates,
-                prepared.local_shard,
+                &prepared.merged_updates,
+                certificates,
                 block_height,
                 consensus,
             )
@@ -2328,8 +2359,8 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
 
     fn commit_block(
         &self,
+        merged_updates: &DatabaseUpdates,
         certificates: &[Arc<TransactionCertificate>],
-        local_shard: hyperscale_types::ShardGroupId,
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
     ) -> hyperscale_types::Hash {
@@ -2347,32 +2378,29 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
             base_version
         );
 
-        // Build a single WriteBatch for all certificates' metadata + substate writes.
-        let mut batch = if certificates.is_empty() {
-            rocksdb::WriteBatch::default()
-        } else {
-            self.build_write_batch(certificates, local_shard)
-        };
+        // Build a WriteBatch for certificates + substate writes.
+        let mut batch = self.build_substate_write_batch(merged_updates);
 
-        // Compute merged JMT update. Empty blocks still need proper tree nodes
-        // at the new version so that subsequent reads from `base_version` find
-        // a valid root node.
-        let merged = if certificates.is_empty() {
-            DatabaseUpdates::default()
-        } else {
-            let writes_per_cert = extract_writes_per_cert(certificates, local_shard);
-            let updates_per_cert: Vec<DatabaseUpdates> = writes_per_cert
-                .iter()
-                .map(|w| hyperscale_storage::substate_writes_to_database_updates(w))
-                .collect();
-            hyperscale_storage::merge_database_updates(&updates_per_cert)
-        };
+        // Store certificates to the certificate CF.
+        if !certificates.is_empty() {
+            let cert_cf = self
+                .db
+                .cf_handle("certificates")
+                .expect("certificates column family must exist");
+            for cert in certificates {
+                let cert_bytes =
+                    sbor::basic_encode(cert.as_ref()).expect("certificate encoding must succeed");
+                batch.put_cf(cert_cf, cert.transaction_hash.as_bytes(), cert_bytes);
+            }
+        }
+
+        // Compute JMT update.
         let parent_version = hyperscale_storage::jmt_parent_height(base_version, base_root);
         let (new_root, collected) = hyperscale_storage::jmt::put_at_version(
             &snapshot_store,
             parent_version,
             block_height,
-            &merged,
+            merged_updates,
             &self.dispatch,
         );
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
@@ -2472,6 +2500,28 @@ impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for RocksDbStorag
 
     fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate> {
         RocksDbStorage::get_certificates_batch(self, hashes)
+    }
+
+    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
+        RocksDbStorage::store_receipt_bundle(self, bundle)
+    }
+
+    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
+        RocksDbStorage::store_receipt_bundles(self, bundles)
+    }
+
+    fn get_ledger_receipt(
+        &self,
+        tx_hash: &Hash,
+    ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
+        RocksDbStorage::get_ledger_receipt(self, tx_hash)
+    }
+
+    fn get_local_execution(
+        &self,
+        tx_hash: &Hash,
+    ) -> Option<hyperscale_types::LocalTransactionExecution> {
+        RocksDbStorage::get_local_execution(self, tx_hash)
     }
 }
 
@@ -2596,31 +2646,32 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for SharedStorage<D>
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
-        certificates: &[std::sync::Arc<TransactionCertificate>],
-        local_shard: hyperscale_types::ShardGroupId,
+        merged_updates: &DatabaseUpdates,
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit) {
         self.0
-            .prepare_block_commit(parent_state_root, certificates, local_shard, block_height)
+            .prepare_block_commit(parent_state_root, merged_updates, block_height)
     }
 
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
+        certificates: &[std::sync::Arc<TransactionCertificate>],
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
     ) -> hyperscale_types::Hash {
-        self.0.commit_prepared_block(prepared, consensus)
+        self.0
+            .commit_prepared_block(prepared, certificates, consensus)
     }
 
     fn commit_block(
         &self,
+        merged_updates: &DatabaseUpdates,
         certificates: &[std::sync::Arc<TransactionCertificate>],
-        local_shard: hyperscale_types::ShardGroupId,
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
     ) -> hyperscale_types::Hash {
         self.0
-            .commit_block(certificates, local_shard, block_height, consensus)
+            .commit_block(merged_updates, certificates, block_height, consensus)
     }
 }
 
@@ -2688,6 +2739,28 @@ impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for SharedStorage
     fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate> {
         self.0.get_certificates_batch(hashes)
     }
+
+    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
+        self.0.store_receipt_bundle(bundle)
+    }
+
+    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
+        self.0.store_receipt_bundles(bundles)
+    }
+
+    fn get_ledger_receipt(
+        &self,
+        tx_hash: &Hash,
+    ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
+        self.0.get_ledger_receipt(tx_hash)
+    }
+
+    fn get_local_execution(
+        &self,
+        tx_hash: &Hash,
+    ) -> Option<hyperscale_types::LocalTransactionExecution> {
+        self.0.get_local_execution(tx_hash)
+    }
 }
 
 #[cfg(test)]
@@ -2695,7 +2768,7 @@ mod tests {
     use super::*;
     use hyperscale_dispatch_sync::SyncDispatch;
     use hyperscale_storage::test_helpers::{
-        make_database_update, make_substate_write, make_test_block, make_test_certificate,
+        make_database_update, make_mapped_database_update, make_test_block, make_test_certificate,
         make_test_qc,
     };
     use hyperscale_storage::{CommitStore, ConsensusStore, NodeDatabaseUpdates, SubstateStore};
@@ -2903,11 +2976,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
-        let writes = vec![make_substate_write(1, 0, vec![10, 20], vec![99, 88, 77])];
-        let cert = make_test_certificate(42, ShardGroupId(0), writes.clone());
+        let updates = make_mapped_database_update(1, 0, vec![10, 20], vec![99, 88, 77]);
+        let cert = make_test_certificate(42, ShardGroupId(0));
         let tx_hash = cert.transaction_hash;
 
-        storage.commit_certificate_with_writes(&cert, &writes);
+        storage.commit_certificate_with_writes(&cert, &updates);
 
         // Verify certificate is stored
         let stored_cert = storage.get_certificate(&tx_hash);
@@ -3025,13 +3098,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
-        let writes = vec![make_substate_write(1, 0, vec![10, 20], vec![99, 88, 77])];
-        let cert = make_test_certificate(42, ShardGroupId(0), writes.clone());
+        let updates = make_mapped_database_update(1, 0, vec![10, 20], vec![99, 88, 77]);
+        let cert = make_test_certificate(42, ShardGroupId(0));
         let tx_hash = cert.transaction_hash;
 
         // Commit twice (simulating replay after crash)
-        storage.commit_certificate_with_writes(&cert, &writes);
-        storage.commit_certificate_with_writes(&cert, &writes);
+        storage.commit_certificate_with_writes(&cert, &updates);
+        storage.commit_certificate_with_writes(&cert, &updates);
 
         let stored = storage.get_certificate(&tx_hash);
         assert!(stored.is_some());
@@ -3126,13 +3199,10 @@ mod tests {
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
         let shard = ShardGroupId(0);
-        let cert = Arc::new(make_test_certificate(
-            1,
-            shard,
-            vec![make_substate_write(1, 0, vec![10], vec![42])],
-        ));
+        let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
+        let cert = Arc::new(make_test_certificate(1, shard));
 
-        let result = storage.commit_block(&[cert], shard, 1, None);
+        let result = storage.commit_block(&updates, &[cert], 1, None);
         assert_ne!(result, Hash::ZERO);
     }
 
@@ -3142,18 +3212,13 @@ mod tests {
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
         let shard = ShardGroupId(0);
-        let cert1 = Arc::new(make_test_certificate(
-            1,
-            shard,
-            vec![make_substate_write(1, 0, vec![10], vec![1])],
-        ));
-        let cert2 = Arc::new(make_test_certificate(
-            2,
-            shard,
-            vec![make_substate_write(2, 0, vec![20], vec![2])],
-        ));
+        let updates1 = make_mapped_database_update(1, 0, vec![10], vec![1]);
+        let updates2 = make_mapped_database_update(2, 0, vec![20], vec![2]);
+        let merged = hyperscale_storage::merge_database_updates(&[updates1, updates2]);
+        let cert1 = Arc::new(make_test_certificate(1, shard));
+        let cert2 = Arc::new(make_test_certificate(2, shard));
 
-        let result = storage.commit_block(&[cert1, cert2], shard, 1, None);
+        let result = storage.commit_block(&merged, &[cert1, cert2], 1, None);
         // Certificate merging: all certs applied as single JMT version = block_height
         assert_ne!(result, Hash::ZERO);
     }
@@ -3163,7 +3228,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
-        storage.commit_block(&[], ShardGroupId(0), 1, None);
+        storage.commit_block(&DatabaseUpdates::default(), &[], 1, None);
         // Empty block: JMT version still advances to block_height
         assert_eq!(storage.jmt_version(), 1);
     }
@@ -3171,24 +3236,26 @@ mod tests {
     #[test]
     fn test_prepare_then_commit_matches_direct() {
         let shard = ShardGroupId(0);
-        let cert = Arc::new(make_test_certificate(
-            1,
-            shard,
-            vec![make_substate_write(1, 0, vec![10], vec![42])],
-        ));
+        let cert = Arc::new(make_test_certificate(1, shard));
 
         // Prepare path
         let temp_dir1 = TempDir::new().unwrap();
         let s_prepared = RocksDbStorage::open(temp_dir1.path(), SyncDispatch::new()).unwrap();
         let parent_root = s_prepared.state_root_hash();
         let (spec_root, prepared) =
-            s_prepared.prepare_block_commit(parent_root, std::slice::from_ref(&cert), shard, 1);
-        let result_prepared = s_prepared.commit_prepared_block(prepared, None);
+            s_prepared.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
+        let certs = std::slice::from_ref(&cert);
+        let result_prepared = s_prepared.commit_prepared_block(prepared, certs, None);
 
         // Direct path
         let temp_dir2 = TempDir::new().unwrap();
         let s_direct = RocksDbStorage::open(temp_dir2.path(), SyncDispatch::new()).unwrap();
-        let result_direct = s_direct.commit_block(&[cert], shard, 1, None);
+        let result_direct = s_direct.commit_block(
+            &DatabaseUpdates::default(),
+            std::slice::from_ref(&cert),
+            1,
+            None,
+        );
 
         assert_eq!(result_prepared, result_direct);
         assert_eq!(spec_root, result_prepared);
@@ -3200,14 +3267,10 @@ mod tests {
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
         let shard = ShardGroupId(0);
-        let cert = Arc::new(make_test_certificate(
-            1,
-            shard,
-            vec![make_substate_write(1, 0, vec![10], vec![42])],
-        ));
+        let cert = Arc::new(make_test_certificate(1, shard));
         let tx_hash = cert.transaction_hash;
 
-        let _ = storage.commit_block(&[cert], shard, 1, None);
+        let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None);
 
         assert!(storage.get_certificate(&tx_hash).is_some());
     }
@@ -3230,8 +3293,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
-        let cert1 = make_test_certificate(1, ShardGroupId(0), vec![]);
-        let cert2 = make_test_certificate(2, ShardGroupId(0), vec![]);
+        let cert1 = make_test_certificate(1, ShardGroupId(0));
+        let cert2 = make_test_certificate(2, ShardGroupId(0));
         let hash1 = cert1.transaction_hash;
         let hash2 = cert2.transaction_hash;
 
@@ -3302,7 +3365,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
-        let cert = make_test_certificate(1, ShardGroupId(0), vec![]);
+        let cert = make_test_certificate(1, ShardGroupId(0));
         let tx_hash = cert.transaction_hash;
 
         storage.store_certificate(&cert);
@@ -3341,10 +3404,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
-        let writes = vec![make_substate_write(1, 0, vec![10], vec![42])];
-        let cert = make_test_certificate(1, ShardGroupId(0), writes.clone());
+        let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
+        let cert = make_test_certificate(1, ShardGroupId(0));
 
-        storage.commit_certificate_with_writes(&cert, &writes);
+        storage.commit_certificate_with_writes(&cert, &updates);
 
         // Individual cert commits persist substate data + certificate metadata,
         // but JMT is deferred to block commit.
@@ -3378,10 +3441,10 @@ mod tests {
         let cert_hash;
         {
             let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
-            let writes = vec![make_substate_write(1, 0, vec![10], vec![42])];
-            let cert = make_test_certificate(1, ShardGroupId(0), writes.clone());
+            let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
+            let cert = make_test_certificate(1, ShardGroupId(0));
             cert_hash = cert.transaction_hash;
-            storage.commit_certificate_with_writes(&cert, &writes);
+            storage.commit_certificate_with_writes(&cert, &updates);
             root_after_write = storage.state_root_hash();
             version_after_write = storage.jmt_version();
         }
@@ -3432,6 +3495,59 @@ mod tests {
 
             let vote = storage.get_own_vote(10);
             assert_eq!(vote, Some((vote_hash, 3)), "vote should survive reopen");
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Receipt storage
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_receipt_storage_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
+        hyperscale_storage::test_helpers::test_receipt_storage_roundtrip(&storage);
+    }
+
+    #[test]
+    fn test_receipt_storage_synced() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
+        hyperscale_storage::test_helpers::test_receipt_storage_synced(&storage);
+    }
+
+    #[test]
+    fn test_receipt_batch_storage() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
+        hyperscale_storage::test_helpers::test_receipt_batch_storage(&storage);
+    }
+
+    #[test]
+    fn test_receipt_idempotent_overwrite() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
+        hyperscale_storage::test_helpers::test_receipt_idempotent_overwrite(&storage);
+    }
+
+    #[test]
+    fn test_receipt_survives_reopen() {
+        let temp_dir = TempDir::new().unwrap();
+        let bundle = hyperscale_storage::test_helpers::make_test_receipt_bundle(55);
+        let tx_hash = bundle.tx_hash;
+
+        {
+            let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
+            storage.store_receipt_bundle(&bundle);
+        }
+
+        {
+            let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
+            assert!(storage.has_receipt(&tx_hash));
+            let retrieved = storage.get_ledger_receipt(&tx_hash).unwrap();
+            assert_eq!(*retrieved, *bundle.ledger_receipt);
+            let local = storage.get_local_execution(&tx_hash).unwrap();
+            assert_eq!(local, bundle.local_execution.unwrap());
         }
     }
 }

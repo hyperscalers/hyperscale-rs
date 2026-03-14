@@ -11,7 +11,7 @@
 //! verify accumulated signatures across multiple transactions in ~2 pairing
 //! operations. These are called from the I/O loop's time-windowed batch flush.
 
-use hyperscale_engine::RadixExecutor;
+use hyperscale_engine::{RadixExecutor, SingleTxResult};
 use hyperscale_storage::SubstateStore;
 use hyperscale_types::{
     batch_verify_bls_different_messages, batch_verify_bls_same_message, exec_vote_message,
@@ -19,7 +19,7 @@ use hyperscale_types::{
     Bls12381G2Signature, ExecutionCertificate, ExecutionVote, Hash, NodeId, RoutableTransaction,
     ShardGroupId, SignerBitfield, StateProvision, ValidatorId,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// An execution vote with its signer's public key and voting power, awaiting verification.
@@ -27,15 +27,20 @@ pub type UnverifiedExecutionVote = (ExecutionVote, Bls12381G1PublicKey, u64);
 
 /// Aggregate verified execution votes into an `ExecutionCertificate`.
 ///
-/// Deduplicates votes by validator, aggregates BLS signatures, builds a signer
-/// bitfield using the committee's indices, and extracts state_writes
-/// from the first vote.
+/// Deduplicates votes by validator, aggregates BLS signatures, and builds a
+/// signer bitfield using the committee's indices.
+///
+/// The caller provides `read_nodes` and `write_nodes` directly (from the
+/// local execution result) rather than extracting them from votes, since votes
+/// are lightweight (receipt_hash + write_nodes only).
+#[allow(clippy::too_many_arguments)]
 pub fn aggregate_execution_certificate(
     tx_hash: Hash,
     shard: ShardGroupId,
-    writes_commitment: Hash,
+    receipt_hash: Hash,
     votes: &[ExecutionVote],
     read_nodes: Vec<NodeId>,
+    write_nodes: Vec<NodeId>,
     committee: &[ValidatorId],
 ) -> ExecutionCertificate {
     // Deduplicate votes by validator to avoid aggregating the same signature multiple times
@@ -65,18 +70,13 @@ pub fn aggregate_execution_certificate(
     }
 
     let success = votes.first().map(|v| v.success).unwrap_or(false);
-    // All votes for the same tx should have identical state_writes
-    let state_writes = votes
-        .first()
-        .map(|v| v.state_writes.clone())
-        .unwrap_or_default();
 
     ExecutionCertificate {
         transaction_hash: tx_hash,
         shard_group_id: shard,
         read_nodes,
-        state_writes,
-        writes_commitment,
+        write_nodes,
+        receipt_hash,
         success,
         aggregated_signature,
         signers,
@@ -85,7 +85,7 @@ pub fn aggregate_execution_certificate(
 
 /// Verify and aggregate execution votes for a single transaction.
 ///
-/// Groups votes by signing message (same `(tx_hash, writes_commitment, shard, success)`
+/// Groups votes by signing message (same `(tx_hash, receipt_hash, shard, success)`
 /// sign the same message), then uses BLS same-message batch verification for
 /// each group. Falls back to individual verification on batch failure.
 ///
@@ -178,7 +178,7 @@ pub fn verify_execution_certificate_signature(
 ///
 /// For a single tx_hash, delegates to [`verify_and_aggregate_execution_votes`]
 /// which applies same-message grouping (cheaper when many votes share a
-/// merkle root).
+/// receipt hash).
 pub fn batch_verify_and_aggregate_execution_votes(
     items: Vec<(Hash, Vec<UnverifiedExecutionVote>)>,
 ) -> Vec<(Hash, Vec<(ExecutionVote, u64)>)> {
@@ -301,7 +301,9 @@ pub fn batch_verify_execution_certificate_signatures(
 /// Calls `executor.execute_single_shard()` with the given transaction,
 /// then signs the execution result with the validator's private key.
 ///
-/// Returns an `ExecutionVote` containing the execution result and signature.
+/// Returns an `(ExecutionVote, SingleTxResult)` tuple. The vote contains only
+/// receipt_hash + write_nodes; the full execution result travels alongside
+/// for the state machine to populate the execution cache and store receipts.
 pub fn execute_and_sign_single_shard<S: SubstateStore>(
     executor: &RadixExecutor,
     storage: &S,
@@ -309,49 +311,58 @@ pub fn execute_and_sign_single_shard<S: SubstateStore>(
     signing_key: &Bls12381G1PrivateKey,
     local_shard: ShardGroupId,
     validator_id: ValidatorId,
-) -> ExecutionVote {
-    let (tx_hash, success, writes_commitment, state_writes) =
-        match executor.execute_single_shard(storage, std::slice::from_ref(tx)) {
-            Ok(output) => {
-                if let Some(r) = output.results().first() {
-                    (
-                        r.tx_hash,
-                        r.success,
-                        r.writes_commitment,
-                        r.state_writes.clone(),
-                    )
-                } else {
-                    (tx.hash(), false, Hash::ZERO, vec![])
-                }
+) -> (ExecutionVote, SingleTxResult) {
+    let result = match executor.execute_single_shard(storage, std::slice::from_ref(tx)) {
+        Ok(output) => {
+            if let Some(r) = output.results().first() {
+                r.clone()
+            } else {
+                SingleTxResult::failure(tx.hash(), "No execution result returned")
             }
-            Err(e) => {
-                tracing::warn!(tx_hash = ?tx.hash(), error = %e, "Transaction execution failed");
-                (tx.hash(), false, Hash::ZERO, vec![])
-            }
-        };
+        }
+        Err(e) => {
+            tracing::warn!(tx_hash = ?tx.hash(), error = %e, "Transaction execution failed");
+            SingleTxResult::failure(tx.hash(), e.to_string())
+        }
+    };
+
+    // Filter out undeclared system state writes
+    let mut result = result;
+    result.database_updates =
+        filter_to_declared_writes(&result.database_updates, &tx.declared_writes);
+
+    let write_nodes = extract_write_nodes(&result.database_updates);
 
     // Sign immediately after execution
-    let message = exec_vote_message(&tx_hash, &writes_commitment, local_shard, success);
+    let message = exec_vote_message(
+        &result.tx_hash,
+        &result.receipt_hash,
+        local_shard,
+        result.success,
+    );
     let signature = signing_key.sign_v1(&message);
 
-    ExecutionVote {
-        transaction_hash: tx_hash,
+    let vote = ExecutionVote {
+        transaction_hash: result.tx_hash,
         shard_group_id: local_shard,
-        writes_commitment,
-        success,
-        state_writes,
+        receipt_hash: result.receipt_hash,
+        success: result.success,
+        write_nodes,
         validator: validator_id,
         signature,
-    }
+    };
+
+    (vote, result)
 }
 
 /// Execute a cross-shard transaction with provisions and sign the vote.
 ///
-/// Calls `executor.execute_cross_shard()` with the transaction and provisions,
-/// using the topology to determine which nodes are local to this shard.
+/// Calls `executor.execute_cross_shard()` with the transaction and provisions.
 /// Signs the execution result with the validator's private key.
 ///
-/// Returns an `ExecutionVote` containing the execution result and signature.
+/// Returns an `(ExecutionVote, SingleTxResult)` tuple. The vote contains only
+/// receipt_hash + write_nodes; the full execution result travels alongside
+/// for the state machine to populate the execution cache and store receipts.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_and_sign_cross_shard<S: SubstateStore>(
     executor: &RadixExecutor,
@@ -362,48 +373,92 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
     signing_key: &Bls12381G1PrivateKey,
     local_shard: ShardGroupId,
     validator_id: ValidatorId,
-    num_shards: u64,
-) -> ExecutionVote {
-    let is_local_node = |node_id: &hyperscale_types::NodeId| -> bool {
-        hyperscale_types::shard_for_node(node_id, num_shards) == local_shard
-    };
-
-    let (result_hash, success, writes_commitment, state_writes) = match executor
-        .execute_cross_shard(
-            storage,
-            std::slice::from_ref(transaction),
-            provisions,
-            is_local_node,
-        ) {
+) -> (ExecutionVote, SingleTxResult) {
+    let result = match executor.execute_cross_shard(
+        storage,
+        std::slice::from_ref(transaction),
+        provisions,
+    ) {
         Ok(output) => {
             if let Some(r) = output.results().first() {
-                (
-                    r.tx_hash,
-                    r.success,
-                    r.writes_commitment,
-                    r.state_writes.clone(),
-                )
+                r.clone()
             } else {
-                (tx_hash, false, Hash::ZERO, vec![])
+                SingleTxResult::failure(tx_hash, "No cross-shard execution result returned")
             }
         }
         Err(e) => {
             tracing::warn!(?tx_hash, error = %e, "Cross-shard execution failed");
-            (tx_hash, false, Hash::ZERO, vec![])
+            SingleTxResult::failure(tx_hash, e.to_string())
         }
     };
 
+    // Filter out undeclared system state writes
+    let mut result = result;
+    result.database_updates =
+        filter_to_declared_writes(&result.database_updates, &transaction.declared_writes);
+
+    let write_nodes = extract_write_nodes(&result.database_updates);
+
     // Sign immediately after execution
-    let message = exec_vote_message(&result_hash, &writes_commitment, local_shard, success);
+    let message = exec_vote_message(
+        &result.tx_hash,
+        &result.receipt_hash,
+        local_shard,
+        result.success,
+    );
     let signature = signing_key.sign_v1(&message);
 
-    ExecutionVote {
-        transaction_hash: result_hash,
+    let vote = ExecutionVote {
+        transaction_hash: result.tx_hash,
         shard_group_id: local_shard,
-        writes_commitment,
-        success,
-        state_writes,
+        receipt_hash: result.receipt_hash,
+        success: result.success,
+        write_nodes,
         validator: validator_id,
         signature,
+    };
+
+    (vote, result)
+}
+
+/// Remove writes to NodeIds not in the transaction's declared write set.
+///
+/// Radix Engine may touch system state (fee vaults, royalty accumulators,
+/// transaction tracker) that is not part of the transaction's declared
+/// writes. These undeclared writes must be stripped before the result
+/// enters the execution cache / JMT.
+fn filter_to_declared_writes(
+    updates: &hyperscale_storage::DatabaseUpdates,
+    declared_writes: &[NodeId],
+) -> hyperscale_storage::DatabaseUpdates {
+    if declared_writes.is_empty() {
+        return updates.clone();
     }
+    let allowed: HashSet<NodeId> = declared_writes.iter().copied().collect();
+    let mut filtered = hyperscale_storage::DatabaseUpdates::default();
+    for (db_node_key, node_updates) in &updates.node_updates {
+        let Some(node_id) = hyperscale_storage::keys::db_node_key_to_node_id(db_node_key) else {
+            continue;
+        };
+        if allowed.contains(&node_id) {
+            filtered
+                .node_updates
+                .insert(db_node_key.clone(), node_updates.clone());
+        }
+    }
+    filtered
+}
+
+/// Extract deduplicated, deterministically-ordered NodeIds from DatabaseUpdates.
+///
+/// Uses BTreeSet to ensure all validators within a shard produce identical
+/// write_nodes vectors (deterministic ordering from identical execution).
+pub fn extract_write_nodes(updates: &hyperscale_storage::DatabaseUpdates) -> Vec<NodeId> {
+    updates
+        .node_updates
+        .keys()
+        .filter_map(|db_node_key| hyperscale_storage::keys::db_node_key_to_node_id(db_node_key))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }

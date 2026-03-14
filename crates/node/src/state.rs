@@ -9,8 +9,9 @@ use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommitmentProof,
-    CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
+    CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, ReceiptBundle,
+    RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate,
+    TransactionDefer,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -329,6 +330,20 @@ impl NodeStateMachine {
         actions
     }
 
+    /// Collect per-certificate `Arc<DatabaseUpdates>` for a set of tx_hashes.
+    ///
+    /// Returns cheap Arc clones — merging is deferred to the thread pool.
+    fn collect_updates_for_tx_hashes(
+        &self,
+        tx_hashes: &[Hash],
+    ) -> Vec<Arc<hyperscale_types::DatabaseUpdates>> {
+        let cache = self.execution.execution_cache();
+        tx_hashes
+            .iter()
+            .filter_map(|tx_hash| cache.get(tx_hash).cloned())
+            .collect()
+    }
+
     /// Handle proposal timer — propose a block or advance the round on timeout.
     fn on_proposal_timer(&mut self) -> Vec<Action> {
         // Check if we should advance the round due to timeout.
@@ -367,14 +382,27 @@ impl NodeStateMachine {
             MAX_RETRIES,
         );
 
-        // BftState handles state_root computation internally after filtering certificates
+        // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
+        // The closure captures the cache; BftState calls it with the final
+        // filtered certificate list after dedup. Returns cheap Arc clones —
+        // merging is deferred to the thread pool.
+        let topology = self.topology.snapshot();
+        let cache = self.execution.execution_cache();
+        let collect_updates = |certs: &[Arc<TransactionCertificate>]| {
+            certs
+                .iter()
+                .filter_map(|cert| cache.get(&cert.transaction_hash).cloned())
+                .collect::<Vec<Arc<hyperscale_types::DatabaseUpdates>>>()
+        };
+
         self.bft.on_proposal_timer(
-            self.topology.snapshot(),
+            topology,
             &ready_txs,
             deferred,
             aborted,
             certificates,
             commitment_proofs,
+            collect_updates,
         )
     }
 
@@ -484,9 +512,19 @@ impl NodeStateMachine {
 
         let inputs = self.gather_proposal_inputs(pending_tx_count, pending_cert_count);
 
-        // BftState handles state_root computation internally after filtering certificates
+        // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
+        // Returns cheap Arc clones — merging is deferred to the thread pool.
+        let topology = self.topology.snapshot();
+        let cache = self.execution.execution_cache();
+        let collect_updates = |certs: &[Arc<TransactionCertificate>]| {
+            certs
+                .iter()
+                .filter_map(|cert| cache.get(&cert.transaction_hash).cloned())
+                .collect::<Vec<Arc<hyperscale_types::DatabaseUpdates>>>()
+        };
+
         self.bft.on_qc_formed(
-            self.topology.snapshot(),
+            topology,
             block_hash,
             qc,
             &inputs.ready_txs,
@@ -494,6 +532,7 @@ impl NodeStateMachine {
             inputs.aborted,
             inputs.certificates,
             inputs.commitment_proofs,
+            collect_updates,
         )
     }
 
@@ -519,8 +558,11 @@ impl NodeStateMachine {
         // Notify BFT so it can update its committed state tracking.
         // BFT uses this as the source of truth for block height in block headers,
         // preventing speculative version propagation that causes deadlocks.
+        // Unblocked state root verifications are pushed to the ready queue
+        // and drained by handle() via drain_ready_state_root_verifications().
         self.bft
-            .on_state_commit_complete(self.topology.snapshot(), height, state_root)
+            .on_state_commit_complete(self.topology.snapshot(), height, state_root);
+        vec![]
     }
 
     /// Handle block committed — notify all subsystems in the correct order.
@@ -575,6 +617,25 @@ impl NodeStateMachine {
         // They've been included in this block, so don't need to be proposed again.
         // Also invalidate any speculative results that conflict with these writes.
         for cert in &block.certificates {
+            // Debug cross-check: verify our local execution produced the same
+            // receipt_hash as the quorum-signed certificate. A mismatch indicates
+            // an engine determinism bug (different outcome/events for same input).
+            if let Some(local_receipt_hash) = self
+                .execution
+                .execution_cache()
+                .get_receipt_hash(&cert.transaction_hash)
+            {
+                if let Some(ec) = cert.shard_proofs.values().next() {
+                    debug_assert_eq!(
+                        local_receipt_hash,
+                        ec.receipt_hash,
+                        "receipt_hash mismatch for tx {}: local engine produced different \
+                         outcome/events than certificate. This indicates an engine determinism bug.",
+                        cert.transaction_hash,
+                    );
+                }
+            }
+
             self.execution
                 .remove_finalized_certificate(&cert.transaction_hash);
             // Invalidate speculative results that read from nodes being written
@@ -740,27 +801,6 @@ impl NodeStateMachine {
         }
         actions
     }
-
-    /// Handle a received certificate that has been fully verified.
-    fn on_transaction_certificate_verified(
-        &mut self,
-        certificate: Arc<TransactionCertificate>,
-    ) -> Vec<Action> {
-        let tx_hash = certificate.transaction_hash;
-        let accepted = certificate.is_accepted();
-
-        // Cancel any ongoing local certificate building
-        self.execution.cancel_certificate_building(&tx_hash);
-
-        // Add to finalized certificates if not already present
-        self.execution.add_verified_certificate(certificate);
-
-        // Notify mempool that transaction is finalized
-        vec![Action::Continuation(ProtocolEvent::TransactionExecuted {
-            tx_hash,
-            accepted,
-        })]
-    }
 }
 
 impl StateMachine for NodeStateMachine {
@@ -771,7 +811,7 @@ impl StateMachine for NodeStateMachine {
         height = self.bft.committed_height(),
     ))]
     fn handle(&mut self, event: ProtocolEvent) -> Vec<Action> {
-        match event {
+        let mut actions = match event {
             // ── Timers ───────────────────────────────────────────────────
             ProtocolEvent::CleanupTimer => self.on_cleanup_timer(),
             ProtocolEvent::ProposalTimer => self.on_proposal_timer(),
@@ -823,6 +863,9 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::TransactionRootVerified { block_hash, valid } => self
                 .bft
                 .on_transaction_root_verified(self.topology.snapshot(), block_hash, valid),
+            ProtocolEvent::ReceiptRootVerified { block_hash, valid } => self
+                .bft
+                .on_receipt_root_verified(self.topology.snapshot(), block_hash, valid),
             ProtocolEvent::ProposalBuilt {
                 height,
                 round,
@@ -889,8 +932,45 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ExecutionVoteReceived { vote } => {
                 self.execution.on_vote(self.topology.snapshot(), vote)
             }
-            ProtocolEvent::ExecutionVoteBatchReceived { votes } => {
-                let mut actions = Vec::new();
+            ProtocolEvent::ExecutionBatchCompleted {
+                votes,
+                results,
+                speculative,
+            } => {
+                // Single pass: populate execution cache and build receipt bundles.
+                // Consumes results by value — no clones needed.
+                let mut bundles: Vec<ReceiptBundle> = if !speculative {
+                    Vec::with_capacity(results.len())
+                } else {
+                    Vec::new()
+                };
+
+                for result in results {
+                    let tx_hash = result.tx_hash;
+                    let receipt_hash = result.receipt_hash;
+                    let db_updates = Arc::new(result.database_updates);
+
+                    if !speculative {
+                        bundles.push(ReceiptBundle {
+                            tx_hash,
+                            ledger_receipt: Arc::new(result.ledger_receipt),
+                            local_execution: Some(result.local_execution),
+                            database_updates: Some(Arc::clone(&db_updates)),
+                        });
+                    }
+
+                    self.execution
+                        .execution_cache_mut()
+                        .insert(tx_hash, db_updates, receipt_hash);
+                }
+
+                // Dispatch receipt storage (fire-and-forget, off main thread)
+                let mut actions: Vec<Action> = Vec::new();
+                if !bundles.is_empty() {
+                    actions.push(Action::StoreReceiptBundles { bundles });
+                }
+
+                // Process votes through VoteTracker
                 for vote in votes {
                     actions.extend(self.execution.on_vote(self.topology.snapshot(), vote));
                 }
@@ -958,10 +1038,6 @@ impl StateMachine for NodeStateMachine {
                     vec![Arc::new(certificate)],
                 )
             }
-            ProtocolEvent::TransactionCertificateVerified { certificate } => {
-                self.on_transaction_certificate_verified(certificate)
-            }
-
             // ── Storage / Sync ───────────────────────────────────────────
             ProtocolEvent::BlockFetched { .. } => vec![],
             ProtocolEvent::SyncBlockReadyToApply { block, qc } => self
@@ -992,7 +1068,23 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::ShardSplitComplete { .. }
             | ProtocolEvent::ShardMergeInitiated { .. }
             | ProtocolEvent::ShardMergeComplete { .. } => vec![],
+        };
+
+        // Drain any state root verifications that became ready during this event.
+        // The BFT verification pipeline queues these; we compute merged_updates
+        // from the execution cache and emit VerifyStateRoot actions.
+        for ready in self.bft.drain_ready_state_root_verifications() {
+            let per_cert_updates = self.collect_updates_for_tx_hashes(&ready.cert_tx_hashes);
+            actions.push(Action::VerifyStateRoot {
+                block_hash: ready.block_hash,
+                parent_state_root: ready.parent_state_root,
+                expected_root: ready.expected_root,
+                per_cert_updates,
+                block_height: ready.block_height,
+            });
         }
+
+        actions
     }
 
     fn set_time(&mut self, now: Duration) {

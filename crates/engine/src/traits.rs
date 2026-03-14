@@ -9,7 +9,7 @@
 //! Both use the real Radix Engine - the difference is the calling convention.
 
 use crate::result::ExecutionOutput;
-use hyperscale_types::{StateEntry, Hash, NodeId, RoutableTransaction, StateProvision};
+use hyperscale_types::{StateEntry, NodeId, RoutableTransaction, StateProvision};
 
 /// Trait for transaction execution backends.
 ///
@@ -25,7 +25,7 @@ use hyperscale_types::{StateEntry, Hash, NodeId, RoutableTransaction, StateProvi
 /// This trait is synchronous. The deterministic runner handles async concerns:
 /// 1. Receives `Action::ExecuteTransactions` from state machine
 /// 2. Calls this backend (inline for sim, spawns for prod)
-/// 3. Sends `ProtocolEvent::ExecutionVoteBatchReceived` when complete
+/// 3. Sends `ProtocolEvent::ExecutionBatchCompleted` when complete
 ///
 /// For simulation, steps 2-3 happen synchronously.
 /// For production, step 2 spawns a rayon task, step 3 uses a callback.
@@ -70,10 +70,4 @@ pub trait ExecutionBackend: Clone + Send + Sync + 'static {
     /// Returns `Some(entries)` with pre-computed storage keys on success.
     fn fetch_state_entries(&self, nodes: &[NodeId], block_height: u64) -> Option<Vec<StateEntry>>;
 
-    /// Compute writes commitment from state writes.
-    ///
-    /// Computes a deterministic hash of state modifications for the voting protocol.
-    /// This is used for transaction certificates - validators vote on this hash
-    /// to agree on execution results.
-    fn compute_writes_commitment(&self, writes: &[(NodeId, Vec<u8>)]) -> Hash;
 }

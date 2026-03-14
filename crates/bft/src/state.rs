@@ -418,7 +418,7 @@ impl BftState {
         // Don't restart sync if we're already syncing
         // The runner's SyncManager handles target updates internally
         if self.sync.is_syncing() {
-            debug!(
+            warn!(
                 validator = ?topology.local_validator_id(),
                 target_height,
                 "Already syncing, skipping duplicate start_sync"
@@ -458,7 +458,7 @@ impl BftState {
         // Ignore stale blocks that have already been committed.
         // Late-arriving sync blocks can arrive after sync completes.
         if block_height <= self.committed_height {
-            debug!(
+            warn!(
                 validator = ?topology.local_validator_id(),
                 block_height,
                 committed_height = self.committed_height,
@@ -722,14 +722,15 @@ impl BftState {
     ///
     /// Takes ready transactions from mempool (already sectioned and hash-sorted),
     /// plus deferrals, aborts, and certificates from execution.
-    #[instrument(skip(self, ready_txs, deferred, aborted, certificates, commitment_proofs), fields(
+    #[instrument(skip(self, ready_txs, deferred, aborted, certificates, commitment_proofs, collect_updates), fields(
         tx_count = ready_txs.len(),
         deferred_count = deferred.len(),
         aborted_count = aborted.len(),
         cert_count = certificates.len(),
         proof_count = commitment_proofs.len()
     ))]
-    pub fn on_proposal_timer(
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_proposal_timer<F>(
         &mut self,
         topology: &TopologySnapshot,
         ready_txs: &ReadyTransactions,
@@ -737,7 +738,11 @@ impl BftState {
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
         commitment_proofs: std::collections::HashMap<Hash, CommitmentProof>,
-    ) -> Vec<Action> {
+        collect_updates: F,
+    ) -> Vec<Action>
+    where
+        F: FnOnce(&[Arc<TransactionCertificate>]) -> Vec<Arc<hyperscale_types::DatabaseUpdates>>,
+    {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This allows the chain to grow
         // while waiting for the two-chain commit rule to be satisfied.
@@ -932,6 +937,10 @@ impl BftState {
         }
         let provision_targets: Vec<ShardGroupId> = provision_target_set.into_iter().collect();
 
+        // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
+        // Merging is deferred to the thread pool.
+        let per_cert_updates = collect_updates(&certificates_to_propose);
+
         // Always use BuildProposal - the runner handles JMT readiness and timeout.
         // This ensures transactions are always included regardless of certificate state.
         // Include SetTimer to reschedule the proposal timer.
@@ -954,6 +963,7 @@ impl BftState {
                 priority_transactions,
                 transactions: other_transactions,
                 certificates: certificates_to_propose,
+                per_cert_updates,
                 commitment_proofs,
                 deferred: deferred_filtered,
                 aborted: aborted_with_height,
@@ -1017,6 +1027,7 @@ impl BftState {
             is_fallback: true,
             state_root: parent_state_root,
             transaction_root: Hash::ZERO, // Fallback blocks have no transactions
+            receipt_root: Hash::ZERO,     // No certificates
             provision_targets: vec![],    // Empty - fallback blocks have no transactions
         };
 
@@ -1140,6 +1151,7 @@ impl BftState {
             is_fallback: false, // Not a fallback - just empty due to sync
             state_root: parent_state_root,
             transaction_root: Hash::ZERO, // Sync blocks have no transactions
+            receipt_root: Hash::ZERO,     // No certificates
             provision_targets: vec![],    // Empty - sync blocks have no transactions
         };
 
@@ -1820,14 +1832,14 @@ impl BftState {
                 // This is expected during view changes: we voted in round N, then round N+1
                 // proposes a different block, but we're locked to our original vote.
                 // This is BFT safety working correctly, not a violation.
-                debug!(
+                warn!(
                     validator = ?topology.local_validator_id(),
                     existing = ?existing_hash,
                     existing_round = existing_round,
                     new = ?block_hash,
                     new_round = round,
                     height = height,
-                    "Vote locking: already voted for different block at this height"
+                    "Vote locking: already voted for different block at this height (view change)"
                 );
                 return vec![];
             }
@@ -1885,17 +1897,17 @@ impl BftState {
                 }
 
                 // Verify state root if block has committed certificates.
+                // The verification pipeline queues the request; NodeStateMachine
+                // will drain and enrich with merged_updates from the execution cache.
                 if self.verification.needs_state_root_verification(&block) {
                     let parent_state_root = self
                         .get_block_by_hash(block.header.parent_hash)
                         .map(|parent| parent.header.state_root)
                         .unwrap_or_else(|| self.get_local_jmt_root());
-                    verification_actions.extend(
-                        self.verification.initiate_state_root_verification(
-                            block_hash,
-                            &block,
-                            parent_state_root,
-                        ),
+                    self.verification.initiate_state_root_verification(
+                        block_hash,
+                        &block,
+                        parent_state_root,
                     );
                 }
 
@@ -1907,6 +1919,14 @@ impl BftState {
                     verification_actions.extend(
                         self.verification
                             .initiate_transaction_root_verification(block_hash, &block),
+                    );
+                }
+
+                // Verify receipt root if block has certificates.
+                if self.verification.needs_receipt_root_verification(&block) {
+                    verification_actions.extend(
+                        self.verification
+                            .initiate_receipt_root_verification(block_hash, &block),
                     );
                 }
 
@@ -2755,6 +2775,59 @@ impl BftState {
         self.create_vote(topology, block_hash, height, round)
     }
 
+    /// Handle receipt root verification result.
+    ///
+    /// Called when the runner completes `Action::VerifyReceiptRoot`. If the
+    /// receipt root is invalid, the block is rejected. If valid, proceeds to
+    /// vote for the block (assuming other verifications are also complete).
+    #[instrument(skip(self), fields(block_hash = ?block_hash, valid = valid))]
+    pub fn on_receipt_root_verified(
+        &mut self,
+        topology: &TopologySnapshot,
+        block_hash: Hash,
+        valid: bool,
+    ) -> Vec<Action> {
+        if !self
+            .verification
+            .on_receipt_root_verified(block_hash, valid)
+        {
+            warn!(
+                block_hash = ?block_hash,
+                "Receipt root verification FAILED - proposer included incorrect receipt_root!"
+            );
+            self.pending_blocks.remove(&block_hash);
+            return vec![];
+        }
+
+        let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
+            warn!(
+                block_hash = ?block_hash,
+                "Receipt root verification complete but pending block not found"
+            );
+            return vec![];
+        };
+
+        let block = match pending_block.block() {
+            Some(b) => b,
+            None => return vec![],
+        };
+
+        // Check if all verifications are complete (state root, tx root, etc. may still be pending)
+        if !self.verification.is_block_verified(&block) {
+            debug!(
+                block_hash = ?block_hash,
+                "Receipt root done, waiting for other verifications"
+            );
+            return vec![];
+        }
+
+        let height = pending_block.header().height.0;
+        let round = pending_block.header().round;
+
+        // All verifications complete - vote
+        self.create_vote(topology, block_hash, height, round)
+    }
+
     /// Handle proposal built by the runner.
     ///
     /// Called when the runner completes `Action::BuildProposal`. The runner has
@@ -2843,26 +2916,26 @@ impl BftState {
     /// This updates our tracked local JMT root (last_committed_jmt_root) and
     /// checks if any pending state root verifications can now proceed.
     ///
+    /// Unblocked verifications are pushed to the ready queue; the caller
+    /// (`NodeStateMachine`) drains them and computes `merged_updates`.
+    ///
     /// # Arguments
     /// * `block_height` - The block height (= JMT version) after the commit
     /// * `state_root` - The JMT root hash after the commit
-    ///
-    /// # Returns
-    /// Actions to verify any state roots that were waiting for this commit.
     #[instrument(skip(self, _topology), fields(block_height, state_root = ?state_root))]
     pub fn on_state_commit_complete(
         &mut self,
         _topology: &TopologySnapshot,
         block_height: u64,
         state_root: Hash,
-    ) -> Vec<Action> {
+    ) {
         // Only advance forward (avoid out-of-order updates).
         // Use strict `<` so that same-height updates are accepted: the BFT state
         // machine advances `committed_height` in `commit_block_and_buffered`
         // *before* the IO loop commits the JMT and sends `StateCommitComplete`.
         // With `<=` the root update would be silently dropped.
         if block_height < self.committed_height {
-            return vec![];
+            return;
         }
 
         debug!(
@@ -2873,7 +2946,7 @@ impl BftState {
             "JMT state commit complete, checking for unblocked verifications"
         );
 
-        self.verification.on_jmt_advanced(block_height, state_root)
+        self.verification.on_jmt_advanced(block_height, state_root);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2960,12 +3033,12 @@ impl BftState {
     ///
     /// `state_root` is the computed JMT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
-    #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, commitment_proofs), fields(
+    #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, commitment_proofs, collect_updates), fields(
         height = qc.height.0,
         block_hash = ?block_hash
     ))]
     #[allow(clippy::too_many_arguments)]
-    pub fn on_qc_formed(
+    pub fn on_qc_formed<F>(
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
@@ -2975,7 +3048,11 @@ impl BftState {
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
         commitment_proofs: HashMap<Hash, CommitmentProof>,
-    ) -> Vec<Action> {
+        collect_updates: F,
+    ) -> Vec<Action>
+    where
+        F: FnOnce(&[Arc<TransactionCertificate>]) -> Vec<Arc<hyperscale_types::DatabaseUpdates>>,
+    {
         let height = qc.height.0;
 
         info!(
@@ -3029,7 +3106,7 @@ impl BftState {
         } else {
             // Block not yet complete - this can happen if we're still fetching
             // transactions/certificates. The block will be persisted when it commits.
-            debug!(
+            warn!(
                 validator = ?topology.local_validator_id(),
                 height = height,
                 block_hash = ?block_hash,
@@ -3081,6 +3158,7 @@ impl BftState {
                 aborted,
                 certificates,
                 commitment_proofs,
+                collect_updates,
             ));
         } else if should_try_proposal && rate_limited {
             trace!(
@@ -3212,7 +3290,7 @@ impl BftState {
         // This handles the case where signature verification completes out of order,
         // causing BlockReadyToCommit events to arrive non-sequentially.
         if height != self.committed_height + 1 {
-            debug!(
+            warn!(
                 "Buffering out-of-order commit: expected height {}, got {}",
                 self.committed_height + 1,
                 height
@@ -3443,7 +3521,7 @@ impl BftState {
 
         // height < next_needed but > committed_height - this shouldn't happen
         // if the checks above are correct, but handle gracefully
-        debug!(
+        warn!(
             height,
             next_needed,
             committed = self.committed_height,
@@ -3888,7 +3966,7 @@ impl BftState {
         // First phase: add transactions and check state
         let (added, still_missing, is_complete, needs_construct) = {
             let Some(pending) = self.pending_blocks.get_mut(&block_hash) else {
-                debug!(
+                warn!(
                     block_hash = ?block_hash,
                     "Received fetched transactions for unknown/completed block"
                 );
@@ -3931,7 +4009,7 @@ impl BftState {
             // Request still-missing transactions
             let missing_txs = pending.missing_transactions();
             if !missing_txs.is_empty() {
-                debug!(
+                warn!(
                     validator = ?validator_id,
                     block_hash = ?block_hash,
                     still_missing = missing_txs.len(),
@@ -3947,7 +4025,7 @@ impl BftState {
             // Request still-missing certificates
             let missing_certs = pending.missing_certificates();
             if !missing_certs.is_empty() {
-                debug!(
+                warn!(
                     validator = ?validator_id,
                     block_hash = ?block_hash,
                     still_missing = missing_certs.len(),
@@ -4011,7 +4089,7 @@ impl BftState {
         // First phase: add certificates and check state
         let (added, still_missing, is_complete, needs_construct) = {
             let Some(pending) = self.pending_blocks.get_mut(&block_hash) else {
-                debug!(
+                warn!(
                     block_hash = ?block_hash,
                     "Received fetched certificates for unknown/completed block"
                 );
@@ -4054,7 +4132,7 @@ impl BftState {
             // Request still-missing transactions
             let missing_txs = pending.missing_transactions();
             if !missing_txs.is_empty() {
-                debug!(
+                warn!(
                     validator = ?validator_id,
                     block_hash = ?block_hash,
                     still_missing = missing_txs.len(),
@@ -4070,7 +4148,7 @@ impl BftState {
             // Request still-missing certificates
             let missing_certs = pending.missing_certificates();
             if !missing_certs.is_empty() {
-                debug!(
+                warn!(
                     validator = ?validator_id,
                     block_hash = ?block_hash,
                     still_missing = missing_certs.len(),
@@ -4370,7 +4448,7 @@ impl BftState {
             // Check if we should fetch missing transactions
             let missing_txs = pending.missing_transactions();
             if !missing_txs.is_empty() && age >= tx_timeout {
-                debug!(
+                warn!(
                     validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
                     missing_tx_count = missing_txs.len(),
@@ -4388,7 +4466,7 @@ impl BftState {
             // Check if we should fetch missing certificates
             let missing_certs = pending.missing_certificates();
             if !missing_certs.is_empty() && age >= cert_timeout {
-                debug!(
+                warn!(
                     validator = ?topology.local_validator_id(),
                     block_hash = ?block_hash,
                     missing_cert_count = missing_certs.len(),
@@ -4453,7 +4531,7 @@ impl BftState {
         if gap > 5 {
             let pending_commit_count = self.pending_commits.len();
             let pending_data_count = self.pending_commits_awaiting_data.len();
-            debug!(
+            warn!(
                 validator = ?topology.local_validator_id(),
                 committed_height = self.committed_height,
                 next_needed_height = next_needed_height,
@@ -4529,6 +4607,17 @@ impl BftState {
     // ═══════════════════════════════════════════════════════════════════════════
     // Accessors
     // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Drain state root verifications that are ready to dispatch.
+    ///
+    /// Called by `NodeStateMachine` after each BFT method call. The caller
+    /// computes `merged_updates` from the execution cache for each entry
+    /// and emits `VerifyStateRoot` actions.
+    pub fn drain_ready_state_root_verifications(
+        &mut self,
+    ) -> Vec<crate::verification::ReadyStateRootVerification> {
+        self.verification.drain_ready_state_root_verifications()
+    }
 
     /// Get the current committed height.
     pub fn committed_height(&self) -> u64 {
@@ -4732,6 +4821,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         }
     }
@@ -4753,6 +4843,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -4848,6 +4939,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -4869,6 +4961,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         assert!(
@@ -4946,6 +5039,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -5029,6 +5123,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -5116,6 +5211,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -5190,6 +5286,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -5721,6 +5818,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_a_hash = block_a.hash();
@@ -5736,6 +5834,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_b_hash = block_b.hash();
@@ -5780,6 +5879,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_hash = block.hash();
@@ -5818,6 +5918,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             };
             state.try_vote_on_block(&topology, block.hash(), height, 0);
@@ -6115,6 +6216,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let original_block_hash = original_header.hash();
@@ -6191,6 +6293,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -6226,6 +6329,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -6556,6 +6660,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let original_block_hash = original_header.hash();
@@ -6804,6 +6909,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_hash_r1 = header_round1.hash();
@@ -6819,6 +6925,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_hash_r2 = header_round2.hash();
@@ -6834,6 +6941,7 @@ mod tests {
             is_fallback: true,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_hash_r3 = header_round3.hash();
@@ -6850,6 +6958,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
         let block_hash_h6 = header_height6.hash();
@@ -6996,6 +7105,7 @@ mod tests {
             vec![],                        // no aborts
             vec![],                        // no certificates
             HashMap::new(),                // no commitment proofs
+            |_certs| vec![],
         );
 
         // Should NOT contain a BlockHeader broadcast (no proposal)
@@ -7044,6 +7154,7 @@ mod tests {
             vec![],                        // no aborts
             vec![],                        // no certificates
             HashMap::new(),                // no commitment proofs
+            |_certs| vec![],
         );
 
         // Should contain a BuildProposal action (proposal triggered)
@@ -7126,6 +7237,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -7160,6 +7272,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -7578,6 +7691,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| vec![],
         );
 
         // Should NOT contain a BlockHeader broadcast (rate limited)
@@ -7631,6 +7745,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| vec![],
         );
 
         // Should contain a BuildProposal action (enough time passed)
@@ -7711,6 +7826,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| vec![],
         );
 
         let has_block_header = actions
@@ -7786,6 +7902,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| vec![],
         );
 
         // Should contain a BuildProposal action (rate limiting disabled)
@@ -7836,6 +7953,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| vec![],
         );
 
         // Check that a BuildProposal action was emitted (async proposal)
@@ -7864,6 +7982,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             },
             retry_transactions: vec![],
@@ -8115,6 +8234,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| vec![],
         );
 
         // Should have broadcast a block header
@@ -8190,6 +8310,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| vec![],
         );
 
         // Extract the block header
@@ -8415,6 +8536,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             },
             retry_transactions: vec![],
@@ -8478,6 +8600,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| vec![],
         );
 
         // Leader activity should be updated
@@ -8597,6 +8720,7 @@ mod tests {
             vec![],
             vec![],
             HashMap::new(),
+            |_certs| vec![],
         );
 
         // Verify we got a proposal (not skipped due to syncing)

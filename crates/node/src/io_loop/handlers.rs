@@ -6,7 +6,7 @@ use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_messages::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
-    ExecutionVotesNotification, TransactionCertificateNotification, TransactionGossip,
+    ExecutionVotesNotification, TransactionGossip,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
@@ -172,35 +172,6 @@ where
                         header,
                         manifest,
                     }));
-                },
-            );
-
-        // ── transaction.certificate → verify sender sig, then NodeInput::TransactionCertificateReceived ─
-
-        let tx = self.event_sender.clone();
-        let topology = self.topology.clone();
-        self.network
-            .register_notification_handler::<TransactionCertificateNotification>(
-                move |gossip: TransactionCertificateNotification| {
-                    let topo = topology.load();
-                    let local_shard = topo.local_shard();
-                    let sender = gossip.sender;
-                    let msg = gossip.signing_message(local_shard);
-                    if !verify_sender_signature(
-                        &topo,
-                        sender,
-                        local_shard,
-                        &msg,
-                        &gossip.sender_signature,
-                        "tx_cert_gossip",
-                        "transaction certificate",
-                    ) {
-                        return;
-                    }
-
-                    let _ = tx.send(NodeInput::TransactionCertificateReceived {
-                        certificate: gossip.into_certificate(),
-                    });
                 },
             );
 

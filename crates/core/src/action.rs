@@ -1,16 +1,13 @@
 //! Action types for the deterministic state machine.
 
 use crate::{ProtocolEvent, TimerId};
-use hyperscale_messages::{
-    BlockHeaderNotification, BlockVoteNotification, TransactionCertificateNotification,
-    TransactionGossip,
-};
+use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
-    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision,
-    TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId,
-    VotePower,
+    CommittedBlockHeader, DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate,
+    ExecutionVote, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    SignerBitfield, StateProvision, TopologySnapshot, TransactionAbort, TransactionCertificate,
+    TransactionDefer, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -68,12 +65,6 @@ pub enum Action {
     BroadcastTransaction {
         shard: ShardGroupId,
         gossip: Box<TransactionGossip>,
-    },
-
-    /// Broadcast a transaction certificate gossip to the local shard.
-    BroadcastTransactionCertificate {
-        shard: ShardGroupId,
-        gossip: TransactionCertificateNotification,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -215,12 +206,14 @@ pub enum Action {
         tx_hash: Hash,
         /// Shard group that executed.
         shard: ShardGroupId,
-        /// Deterministic hash-chain commitment over execution output writes.
-        writes_commitment: Hash,
+        /// Hash of the ConsensusReceipt (outcome + event_root).
+        receipt_hash: Hash,
         /// Votes to aggregate (with quorum).
         votes: Vec<ExecutionVote>,
         /// Read nodes (for certificate).
         read_nodes: Vec<NodeId>,
+        /// Write nodes touched by this transaction's execution.
+        write_nodes: Vec<NodeId>,
         /// Ordered committee for the shard (for SignerBitfield index mapping).
         committee: Vec<ValidatorId>,
     },
@@ -299,28 +292,28 @@ pub enum Action {
 
     /// Verify a block's state root against the JMT.
     ///
-    /// Computes the speculative state root from certificates and compares
-    /// against the block header's claimed state_root. Returns `ProtocolEvent::StateRootVerified`.
-    ///
-    /// Each inner Vec represents one certificate's writes. They must be applied
-    /// incrementally (one JMT version per certificate) to match commit-time behavior.
+    /// Applies the block's shard-local state changes to the JMT and compares the
+    /// resulting root against the header's `state_root`.
+    /// Returns `ProtocolEvent::StateRootVerified`.
     ///
     /// The verification flow:
     /// 1. Runner checks if local JMT root matches `parent_state_root`
-    /// 2. If match, extracts writes from certificates and computes new root
+    /// 2. Applies per-certificate updates to compute new JMT root
     /// 3. Compares computed root against `expected_root`
     /// 4. If valid, builds and caches a WriteBatch for efficient commit later
     ///
-    /// This ensures proposer and verifier compute from the same base state.
+    /// The caller (state machine) is responsible for sourcing writes from the
+    /// execution cache, filtering to local shard, and merging.
     VerifyStateRoot {
         block_hash: Hash,
         /// Base state root to verify from (must match local JMT before computing).
         parent_state_root: Hash,
-        /// Expected state root after applying certificate writes.
+        /// Expected state root after applying writes.
         expected_root: Hash,
-        /// Certificates whose writes will be applied to compute the new root.
-        certificates: Vec<Arc<TransactionCertificate>>,
-        /// Block height (used as JMT version for certificate merging).
+        /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
+        /// Merged on the thread pool before verification.
+        per_cert_updates: Vec<Arc<DatabaseUpdates>>,
+        /// Block height (used as JMT version).
         block_height: u64,
     },
 
@@ -342,6 +335,21 @@ pub enum Action {
         priority_transactions: Vec<Arc<RoutableTransaction>>,
         /// Normal transactions.
         transactions: Vec<Arc<RoutableTransaction>>,
+    },
+
+    /// Verify a block's receipt root.
+    ///
+    /// Computes the merkle root from the certificates' `receipt_hash` values
+    /// and compares against the block header's claimed `receipt_root`.
+    /// Returns `ProtocolEvent::ReceiptRootVerified`.
+    ///
+    /// Pure CPU operation — verified in parallel with state root and transaction root.
+    VerifyReceiptRoot {
+        block_hash: Hash,
+        /// Expected receipt root from block header.
+        expected_root: Hash,
+        /// Certificates whose receipt_hash values form the merkle leaves.
+        certificates: Vec<Arc<TransactionCertificate>>,
     },
 
     /// Build a complete block proposal.
@@ -368,6 +376,9 @@ pub enum Action {
         priority_transactions: Vec<Arc<RoutableTransaction>>,
         transactions: Vec<Arc<RoutableTransaction>>,
         certificates: Vec<Arc<TransactionCertificate>>,
+        /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
+        /// Merged on the thread pool before proposal building.
+        per_cert_updates: Vec<Arc<DatabaseUpdates>>,
         commitment_proofs: HashMap<Hash, CommitmentProof>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
@@ -378,7 +389,7 @@ pub enum Action {
     /// Execute a batch of single-shard transactions.
     ///
     /// Delegated to the engine thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::ExecutionVoteBatchReceived` with all votes when complete.
+    /// Returns `ProtocolEvent::ExecutionBatchCompleted` with all votes when complete.
     ExecuteTransactions {
         block_hash: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
@@ -504,6 +515,17 @@ pub enum Action {
     ///
     /// Stored so we don't re-execute if we crash and recover.
     PersistTransactionCertificate { certificate: TransactionCertificate },
+
+    /// Persist receipt bundles to disk. Fire-and-forget — no ProtocolEvent response.
+    ///
+    /// Dispatched by the state machine after populating the execution cache.
+    /// Only for canonical execution (not speculative).
+    ///
+    /// Bundles with `database_updates: Some(...)` have deferred state_changes —
+    /// the storage layer computes them at persist time.
+    StoreReceiptBundles {
+        bundles: Vec<hyperscale_types::ReceiptBundle>,
+    },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Global Consensus / Epoch Management
@@ -717,7 +739,6 @@ impl Action {
             Action::BroadcastBlockHeader { .. }
                 | Action::BroadcastBlockVote { .. }
                 | Action::BroadcastTransaction { .. }
-                | Action::BroadcastTransactionCertificate { .. }
                 | Action::BroadcastExecutionVote { .. }
                 | Action::BroadcastExecutionCertificate { .. }
                 | Action::BroadcastCommittedBlockHeader { .. }
@@ -741,6 +762,7 @@ impl Action {
                 | Action::VerifyCommitmentProof { .. }
                 | Action::VerifyStateRoot { .. }
                 | Action::VerifyTransactionRoot { .. }
+                | Action::VerifyReceiptRoot { .. }
                 | Action::BuildProposal { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
@@ -763,9 +785,8 @@ impl Action {
             Action::BroadcastBlockHeader { .. } => "BroadcastBlockHeader",
             Action::BroadcastBlockVote { .. } => "BroadcastBlockVote",
 
-            // Network - Mempool & Certificates
+            // Network - Mempool
             Action::BroadcastTransaction { .. } => "BroadcastTransaction",
-            Action::BroadcastTransactionCertificate { .. } => "BroadcastTransactionCertificate",
 
             // Network - Execution Layer (batchable)
             Action::BroadcastExecutionVote { .. } => "BroadcastExecutionVote",
@@ -791,6 +812,7 @@ impl Action {
             Action::VerifyCommitmentProof { .. } => "VerifyCommitmentProof",
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
             Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
+            Action::VerifyReceiptRoot { .. } => "VerifyReceiptRoot",
             Action::BuildProposal { .. } => "BuildProposal",
 
             // Delegated Work - Execution
@@ -809,6 +831,7 @@ impl Action {
 
             // Storage - Execution
             Action::PersistTransactionCertificate { .. } => "PersistTransactionCertificate",
+            Action::StoreReceiptBundles { .. } => "StoreReceiptBundles",
 
             // Storage - Read Requests
             Action::FetchBlock { .. } => "FetchBlock",

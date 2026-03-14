@@ -16,6 +16,19 @@ const RETRY_TAG: &[u8] = b"RETRY";
 const PRIORITY_TAG: &[u8] = b"PRIORITY";
 const NORMAL_TAG: &[u8] = b"NORMAL";
 
+/// Compute the receipt merkle root for a block's certificates.
+///
+/// Each certificate's `receipt_hash` (hash of outcome + event_root) becomes a leaf.
+/// Returns `Hash::ZERO` if there are no certificates.
+pub fn compute_receipt_root(certificates: &[Arc<TransactionCertificate>]) -> Hash {
+    if certificates.is_empty() {
+        return Hash::ZERO;
+    }
+
+    let leaves: Vec<Hash> = certificates.iter().map(|c| c.receipt_hash()).collect();
+    compute_merkle_root(&leaves)
+}
+
 /// Compute the transaction merkle root for a block.
 ///
 /// Transactions are organized into three sections with tagged leaf hashes:
@@ -109,6 +122,15 @@ pub struct BlockHeader {
     /// For empty blocks (fallback, sync), this is `Hash::ZERO`.
     pub transaction_root: Hash,
 
+    /// Merkle root of all certificate receipt hashes in this block.
+    ///
+    /// Each certificate's `receipt_hash` (hash of outcome + event_root) is a leaf
+    /// in a binary merkle tree. This enables light-client proof of "did transaction
+    /// X succeed/fail in block N?" without replaying the block.
+    ///
+    /// For empty blocks (genesis, fallback, no certificates), this is `Hash::ZERO`.
+    pub receipt_root: Hash,
+
     /// Shard groups that need provisions from this block's transactions.
     ///
     /// Computed from the block's cross-shard transactions: for each transaction
@@ -138,6 +160,7 @@ impl BlockHeader {
             is_fallback: false,
             state_root,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         }
     }
@@ -752,6 +775,7 @@ mod tests {
             is_fallback: false,
             state_root: Hash::ZERO,
             transaction_root: Hash::ZERO,
+            receipt_root: Hash::ZERO,
             provision_targets: vec![],
         };
 
@@ -815,5 +839,87 @@ mod tests {
         assert_ne!(root_retry, root_priority);
         assert_ne!(root_priority, root_normal);
         assert_ne!(root_retry, root_normal);
+    }
+
+    #[test]
+    fn test_compute_receipt_root_empty() {
+        let root = compute_receipt_root(&[]);
+        assert_eq!(root, Hash::ZERO);
+    }
+
+    #[test]
+    fn test_compute_receipt_root_deterministic() {
+        use crate::{
+            zero_bls_signature, ExecutionCertificate, ShardGroupId, SignerBitfield,
+            TransactionCertificate, TransactionDecision,
+        };
+        use std::collections::BTreeMap;
+
+        let make_cert = |seed: u8| -> Arc<TransactionCertificate> {
+            let mut shard_proofs = BTreeMap::new();
+            shard_proofs.insert(
+                ShardGroupId(0),
+                ExecutionCertificate {
+                    transaction_hash: Hash::from_bytes(&[seed; 32]),
+                    shard_group_id: ShardGroupId(0),
+                    read_nodes: vec![],
+                    write_nodes: vec![],
+                    receipt_hash: Hash::from_bytes(&[seed + 100; 32]),
+                    success: true,
+                    aggregated_signature: zero_bls_signature(),
+                    signers: SignerBitfield::empty(),
+                },
+            );
+            Arc::new(TransactionCertificate {
+                transaction_hash: Hash::from_bytes(&[seed; 32]),
+                decision: TransactionDecision::Accept,
+                shard_proofs,
+            })
+        };
+
+        let certs = vec![make_cert(1), make_cert(2)];
+        let root1 = compute_receipt_root(&certs);
+        let root2 = compute_receipt_root(&certs);
+        assert_eq!(root1, root2);
+        assert_ne!(root1, Hash::ZERO);
+    }
+
+    #[test]
+    fn test_compute_receipt_root_single_cert() {
+        use crate::{
+            zero_bls_signature, ExecutionCertificate, ShardGroupId, SignerBitfield,
+            TransactionCertificate, TransactionDecision,
+        };
+        use std::collections::BTreeMap;
+
+        let mut shard_proofs = BTreeMap::new();
+        shard_proofs.insert(
+            ShardGroupId(0),
+            ExecutionCertificate {
+                transaction_hash: Hash::from_bytes(&[1; 32]),
+                shard_group_id: ShardGroupId(0),
+                read_nodes: vec![],
+                write_nodes: vec![],
+                receipt_hash: Hash::from_bytes(b"receipt_hash_value"),
+                success: true,
+                aggregated_signature: zero_bls_signature(),
+                signers: SignerBitfield::empty(),
+            },
+        );
+        let cert = Arc::new(TransactionCertificate {
+            transaction_hash: Hash::from_bytes(&[1; 32]),
+            decision: TransactionDecision::Accept,
+            shard_proofs,
+        });
+
+        let root = compute_receipt_root(&[cert.clone()]);
+        // Single cert: receipt_root should equal the cert's receipt_hash
+        assert_eq!(root, cert.receipt_hash());
+    }
+
+    #[test]
+    fn test_genesis_receipt_root_is_zero() {
+        let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
+        assert_eq!(genesis.header.receipt_root, Hash::ZERO);
     }
 }

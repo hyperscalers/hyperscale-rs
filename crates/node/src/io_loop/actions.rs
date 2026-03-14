@@ -7,11 +7,11 @@ use crate::protocol::provision_fetch::ProvisionFetchInput;
 use crate::protocol::sync::SyncInput;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_messages::TransactionCertificateNotification;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::ValidatorId;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
@@ -54,9 +54,6 @@ where
             }
             Action::BroadcastTransaction { shard, gossip } => {
                 self.network.broadcast_to_shard(shard, &*gossip);
-            }
-            Action::BroadcastTransactionCertificate { shard: _, gossip } => {
-                self.network.notify(&self.cached_local_peers, &gossip);
             }
             Action::BroadcastCommittedBlockHeader { gossip } => {
                 self.network.broadcast_global(&gossip);
@@ -115,6 +112,7 @@ where
             | Action::VerifyCommitmentProof { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyTransactionRoot { .. }
+            | Action::VerifyReceiptRoot { .. }
             | Action::BuildProposal { .. }
             | Action::AggregateExecutionCertificate { .. }
             | Action::VerifyStateProvisions { .. }
@@ -122,6 +120,13 @@ where
             | Action::SpeculativeExecute { .. }
             | Action::FetchAndBroadcastProvisions { .. } => {
                 self.dispatch_delegated_action(action);
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            // Receipt storage — accumulated and flushed async
+            // ═══════════════════════════════════════════════════════════
+            Action::StoreReceiptBundles { bundles } => {
+                self.pending_receipt_bundles.extend(bundles);
             }
 
             // ═══════════════════════════════════════════════════════════
@@ -223,20 +228,6 @@ where
                 self.cert_cache
                     .insert(certificate.transaction_hash, Arc::new(certificate.clone()));
                 self.storage.store_certificate(&certificate);
-                // Notify local shard peers about cross-shard certificates.
-                if certificate.shard_proofs.len() > 1 {
-                    let msg = hyperscale_types::tx_cert_gossip_message(
-                        self.local_shard,
-                        &certificate.transaction_hash,
-                    );
-                    let sig = self.signing_key.sign_v1(&msg);
-                    let gossip = TransactionCertificateNotification::new(
-                        certificate,
-                        self.validator_id,
-                        sig,
-                    );
-                    self.network.notify(&self.cached_local_peers, &gossip);
-                }
             }
             Action::PersistAndBroadcastVote {
                 height,
@@ -317,11 +308,26 @@ where
     /// certificates), commits synchronously. Otherwise spawns a single
     /// closure on the execution pool that commits all blocks sequentially,
     /// sending `StateCommitComplete` and `BlockCommitted` events after each.
+    ///
+    /// If a previous async commit closure is still in flight, blocks remain
+    /// in `pending_block_commits` to avoid spawning a second closure — Rayon
+    /// does not guarantee FIFO ordering across separate `spawn()` calls, so
+    /// two independent closures can execute out of order. The in-flight
+    /// closure clears the flag before sending its final events, so the
+    /// resulting `feed_event` → `flush_block_commits` picks up the backlog.
     pub(super) fn flush_block_commits(&mut self) {
-        let commits = std::mem::take(&mut self.pending_block_commits);
-        if commits.is_empty() {
+        if self.pending_block_commits.is_empty() {
             return;
         }
+
+        // Defer if a previous async commit is still running on the exec pool.
+        // The pending blocks will be drained on the next flush once the
+        // in-flight closure completes and its events trigger feed_event.
+        if self.commit_in_flight.load(Ordering::Acquire) {
+            return;
+        }
+
+        let commits = std::mem::take(&mut self.pending_block_commits);
 
         let has_non_empty = commits.iter().any(|(b, _)| !b.certificates.is_empty());
 
@@ -336,9 +342,11 @@ where
                     hash: block_hash,
                     qc: qc.clone(),
                 };
+                // Empty blocks have no certificate writes — pass empty DatabaseUpdates.
+                let empty_updates = hyperscale_types::DatabaseUpdates::default();
                 let result = self.storage.commit_block(
+                    &empty_updates,
                     &block.certificates,
-                    self.local_shard,
                     height.0,
                     Some(consensus),
                 );
@@ -373,6 +381,10 @@ where
         let storage = Arc::clone(&self.storage);
         let event_tx = self.event_sender.clone();
         let local_shard = self.local_shard;
+        let num_shards = self.num_shards;
+        let in_flight = self.commit_in_flight.clone();
+
+        self.commit_in_flight.store(true, Ordering::Release);
 
         self.dispatch.spawn_execution(move || {
             for (i, (block, qc)) in commits.into_iter().enumerate() {
@@ -390,17 +402,54 @@ where
                 // Consensus metadata is folded into the same atomic write.
                 let prepared = prepared_map[i].take();
                 let result = if let Some(prepared) = prepared {
-                    storage.commit_prepared_block(prepared, Some(consensus))
+                    // Normal path: prepared commit from VerifyStateRoot.
+                    storage.commit_prepared_block(prepared, &block.certificates, Some(consensus))
+                } else if !block.certificates.is_empty() {
+                    // Sync path: no execution cache, reconstruct DatabaseUpdates
+                    // from receipts stored during sync.
+                    let per_cert: Vec<hyperscale_types::DatabaseUpdates> = block
+                        .certificates
+                        .iter()
+                        .map(|cert| {
+                            let receipt = storage
+                                .get_ledger_receipt(&cert.transaction_hash)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "Missing receipt for certificate {} at height {} — \
+                                         sync response was incomplete and pre-storage failed",
+                                        cert.transaction_hash, height.0,
+                                    )
+                                });
+                            let updates = hyperscale_storage::receipt_to_database_updates(&receipt);
+                            hyperscale_storage::filter_updates_to_shard(
+                                &updates,
+                                local_shard,
+                                num_shards,
+                            )
+                        })
+                        .collect();
+                    let merged = hyperscale_storage::merge_database_updates(&per_cert);
+                    storage.commit_block(&merged, &block.certificates, height.0, Some(consensus))
                 } else {
+                    // Empty block: no updates needed.
+                    let empty_updates = hyperscale_types::DatabaseUpdates::default();
                     storage.commit_block(
+                        &empty_updates,
                         &block.certificates,
-                        local_shard,
                         height.0,
                         Some(consensus),
                     )
                 };
 
                 ConsensusStore::prune_own_votes(&*storage, height.0);
+
+                // Clear the in-flight flag before sending events for the last
+                // block. The channel send synchronizes-with recv on the main
+                // thread, so the flag is guaranteed visible when the resulting
+                // feed_event calls flush_block_commits to drain any backlog.
+                if i == prepared_map.len() - 1 {
+                    in_flight.store(false, Ordering::Release);
+                }
 
                 let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
                     height: height.0,
@@ -521,6 +570,7 @@ where
         let signing_key = Arc::clone(&self.signing_key);
         let dispatch = self.dispatch.clone();
         let local_shard = self.local_shard;
+        let num_shards = self.num_shards;
         let validator_id = self.validator_id;
         let prepared_commits = Arc::clone(&self.prepared_commits);
         let event_tx = self.event_sender.clone();
@@ -532,6 +582,7 @@ where
                 executor: &executor,
                 signing_key: &signing_key,
                 local_shard,
+                num_shards,
                 validator_id,
                 dispatch: &dispatch,
             };
@@ -558,6 +609,23 @@ where
             DispatchPool::Crypto => self.dispatch.spawn_crypto(spawn_fn),
             DispatchPool::Execution => self.dispatch.spawn_execution(spawn_fn),
         }
+    }
+
+    /// Flush accumulated receipt bundles to storage on the execution pool.
+    ///
+    /// Moves SBOR-encoding + RocksDB writes off the pinned IoLoop thread.
+    /// Deferred `state_changes` computation (for bundles with `database_updates`)
+    /// is handled by the storage layer during persistence.
+    /// With `SyncDispatch` (simulation), `spawn_execution` runs inline.
+    pub(super) fn flush_receipt_storage(&mut self) {
+        let bundles = std::mem::take(&mut self.pending_receipt_bundles);
+        if bundles.is_empty() {
+            return;
+        }
+        let storage = Arc::clone(&self.storage);
+        self.dispatch.spawn_execution(move || {
+            storage.store_receipt_bundles(&bundles);
+        });
     }
 
     /// Local shard committee excluding self, for use as the `peers` argument

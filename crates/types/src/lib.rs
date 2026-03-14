@@ -24,6 +24,7 @@ mod signing;
 mod block;
 mod epoch;
 mod quorum_certificate;
+mod receipt;
 mod signer_bitfield;
 mod state;
 mod topology;
@@ -64,21 +65,23 @@ pub use proofs::{CommitmentProof, MerkleInclusionProof, SubstateInclusionProof};
 pub use signing::{
     block_header_message, block_vote_message, committed_block_header_message,
     exec_cert_batch_message, exec_vote_batch_message, exec_vote_message,
-    state_provision_batch_message, tx_cert_gossip_message, validator_bind_message,
-    DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH,
-    DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_TX_CERT_GOSSIP,
-    DOMAIN_VALIDATOR_BIND,
+    state_provision_batch_message, validator_bind_message, DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE,
+    DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH, DOMAIN_EXEC_VOTE,
+    DOMAIN_EXEC_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND,
 };
 
 pub use block::{
-    compute_transaction_root, Block, BlockHeader, BlockManifest, BlockMetadata,
-    CommittedBlockHeader,
+    compute_receipt_root, compute_transaction_root, Block, BlockHeader, BlockManifest,
+    BlockMetadata, CommittedBlockHeader,
 };
 pub use quorum_certificate::QuorumCertificate;
-pub use signer_bitfield::SignerBitfield;
-pub use state::{
-    ExecutionCertificate, ExecutionResult, ExecutionVote, StateEntry, StateProvision, SubstateWrite,
+pub use receipt::{
+    ApplicationEvent, ConsensusReceipt, ExecutionResult, FeeSummary, LedgerReceiptEntry,
+    LedgerTransactionOutcome, LedgerTransactionReceipt, LocalTransactionExecution, LogLevel,
+    ReceiptBundle, SubstateChange, SubstateChangeAction, SubstateRef,
 };
+pub use signer_bitfield::SignerBitfield;
+pub use state::{ExecutionCertificate, ExecutionVote, StateEntry, StateProvision};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
     sign_and_notarize, sign_and_notarize_with_options, AbortReason, DeferReason, ReadyTransactions,
@@ -87,6 +90,9 @@ pub use transaction::{
     TransactionStatusParseError,
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
+
+// Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)
+pub use radix_substate_store_interface::interface::DatabaseUpdates;
 
 /// Block vote for BFT consensus.
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]

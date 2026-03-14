@@ -1,6 +1,8 @@
 //! Block fetch response.
 
-use hyperscale_types::{Block, MessagePriority, NetworkMessage, QuorumCertificate};
+use hyperscale_types::{
+    Block, LedgerReceiptEntry, MessagePriority, NetworkMessage, QuorumCertificate,
+};
 use sbor::prelude::BasicSbor;
 
 /// Response to a block fetch request containing the full Block and its QC.
@@ -10,14 +12,21 @@ pub struct GetBlockResponse {
     pub block: Option<Block>,
     /// The QC that certifies this block (None if block not found or at tip).
     pub qc: Option<QuorumCertificate>,
+    /// Ledger receipts for the block's certificates. Empty if block not found.
+    pub ledger_receipts: Vec<LedgerReceiptEntry>,
 }
 
 impl GetBlockResponse {
     /// Create a response with a found block and its certifying QC.
-    pub fn found(block: Block, qc: QuorumCertificate) -> Self {
+    pub fn found(
+        block: Block,
+        qc: QuorumCertificate,
+        ledger_receipts: Vec<LedgerReceiptEntry>,
+    ) -> Self {
         Self {
             block: Some(block),
             qc: Some(qc),
+            ledger_receipts,
         }
     }
 
@@ -26,6 +35,7 @@ impl GetBlockResponse {
         Self {
             block: None,
             qc: None,
+            ledger_receipts: vec![],
         }
     }
 
@@ -44,9 +54,15 @@ impl GetBlockResponse {
         self.qc.as_ref()
     }
 
-    /// Consume and return the block and QC if present.
-    pub fn into_parts(self) -> (Option<Block>, Option<QuorumCertificate>) {
-        (self.block, self.qc)
+    /// Consume and return the block, QC, and receipts.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Option<Block>,
+        Option<QuorumCertificate>,
+        Vec<LedgerReceiptEntry>,
+    ) {
+        (self.block, self.qc, self.ledger_receipts)
     }
 }
 
@@ -84,6 +100,7 @@ mod tests {
                 is_fallback: false,
                 state_root: Hash::ZERO,
                 transaction_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             },
             retry_transactions: vec![],
@@ -113,11 +130,12 @@ mod tests {
     fn test_block_response_found() {
         let block = create_test_block();
         let qc = create_test_qc(&block);
-        let response = GetBlockResponse::found(block.clone(), qc.clone());
+        let response = GetBlockResponse::found(block.clone(), qc.clone(), vec![]);
 
         assert!(response.has_block());
         assert_eq!(response.block(), Some(&block));
         assert_eq!(response.qc(), Some(&qc));
+        assert!(response.ledger_receipts.is_empty());
     }
 
     #[test]
@@ -127,16 +145,18 @@ mod tests {
         assert!(!response.has_block());
         assert_eq!(response.block(), None);
         assert_eq!(response.qc(), None);
+        assert!(response.ledger_receipts.is_empty());
     }
 
     #[test]
     fn test_block_response_into_parts() {
         let block = create_test_block();
         let qc = create_test_qc(&block);
-        let response = GetBlockResponse::found(block.clone(), qc.clone());
+        let response = GetBlockResponse::found(block.clone(), qc.clone(), vec![]);
 
-        let (extracted_block, extracted_qc) = response.into_parts();
+        let (extracted_block, extracted_qc, extracted_receipts) = response.into_parts();
         assert_eq!(extracted_block, Some(block));
         assert_eq!(extracted_qc, Some(qc));
+        assert!(extracted_receipts.is_empty());
     }
 }

@@ -91,6 +91,7 @@ fn test_recovered_votes_prevent_equivocation() {
         is_fallback: false,
         state_root: Hash::ZERO,
         transaction_root: Hash::ZERO,
+        receipt_root: Hash::ZERO,
         provision_targets: vec![],
     };
 

@@ -12,16 +12,19 @@ use hyperscale_core::{Action, NodeInput, ProtocolEvent, ProvisionVerificationRes
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_metrics as metrics;
-use hyperscale_storage::{CommitStore, SubstateStore};
-use hyperscale_types::{Bls12381G1PrivateKey, ExecutionVote, Hash, ShardGroupId, ValidatorId};
+use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
+use hyperscale_types::{
+    Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ShardGroupId, ValidatorId,
+};
 use std::sync::Arc;
 
 /// Context for executing delegated actions.
-pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore, D: Dispatch> {
+pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore + ConsensusStore, D: Dispatch> {
     pub storage: &'a S,
     pub executor: &'a RadixExecutor,
     pub signing_key: &'a Bls12381G1PrivateKey,
     pub local_shard: ShardGroupId,
+    pub num_shards: u64,
     pub validator_id: ValidatorId,
     pub dispatch: &'a D,
 }
@@ -56,6 +59,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::VerifyCommitmentProof { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::VerifyReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
 
         // General crypto
@@ -80,7 +84,10 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// The runner is responsible for additionally broadcasting votes to shard
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
-pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatch>(
+pub(crate) fn handle_delegated_action<
+    S: CommitStore + SubstateStore + ConsensusStore,
+    D: Dispatch,
+>(
     action: Action,
     ctx: &ActionContext<'_, S, D>,
 ) -> Option<DelegatedResult<S::PreparedCommit>> {
@@ -194,21 +201,41 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             })
         }
 
+        Action::VerifyReceiptRoot {
+            block_hash,
+            expected_root,
+            certificates,
+        } => {
+            let start = std::time::Instant::now();
+            let valid = hyperscale_bft::handlers::verify_receipt_root(expected_root, &certificates);
+            metrics::record_signature_verification_latency(
+                "receipt_root",
+                start.elapsed().as_secs_f64(),
+            );
+            Some(DelegatedResult {
+                events: vec![NodeInput::Protocol(ProtocolEvent::ReceiptRootVerified {
+                    block_hash,
+                    valid,
+                })],
+                prepared_commit: None,
+            })
+        }
+
         // --- BFT state root and proposal ---
         Action::VerifyStateRoot {
             block_hash,
             parent_state_root,
             expected_root,
-            certificates,
+            per_cert_updates,
             block_height,
         } => {
             let start = std::time::Instant::now();
+            let merged = hyperscale_storage::merge_database_updates_from_arcs(&per_cert_updates);
             let result = hyperscale_bft::handlers::verify_state_root(
                 ctx.storage,
                 parent_state_root,
                 expected_root,
-                &certificates,
-                ctx.local_shard,
+                &merged,
                 block_height,
             );
             metrics::record_signature_verification_latency(
@@ -239,11 +266,14 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             priority_transactions,
             transactions,
             certificates,
+            per_cert_updates,
             commitment_proofs,
             deferred,
             aborted,
             provision_targets,
         } => {
+            let merged_updates =
+                hyperscale_storage::merge_database_updates_from_arcs(&per_cert_updates);
             let result = hyperscale_bft::handlers::build_proposal(
                 ctx.storage,
                 proposer,
@@ -258,6 +288,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 priority_transactions,
                 transactions,
                 certificates,
+                merged_updates,
                 commitment_proofs,
                 deferred,
                 aborted,
@@ -280,17 +311,19 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
         Action::AggregateExecutionCertificate {
             tx_hash,
             shard,
-            writes_commitment,
+            receipt_hash,
             votes,
             read_nodes,
+            write_nodes,
             committee,
         } => {
             let certificate = hyperscale_execution::handlers::aggregate_execution_certificate(
                 tx_hash,
                 shard,
-                writes_commitment,
+                receipt_hash,
                 &votes,
                 read_nodes,
+                write_nodes,
                 &committee,
             );
             Some(DelegatedResult {
@@ -385,7 +418,9 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             transactions,
             state_root: _,
         } => {
-            let votes: Vec<ExecutionVote> = ctx.dispatch.map_local(&transactions, |tx| {
+            let local_shard = ctx.local_shard;
+            let num_shards = ctx.num_shards;
+            let pairs = ctx.dispatch.map_local(&transactions, |tx| {
                 hyperscale_execution::handlers::execute_and_sign_single_shard(
                     ctx.executor,
                     ctx.storage,
@@ -396,9 +431,29 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 )
             });
 
+            let (votes, results): (Vec<ExecutionVote>, Vec<_>) = pairs.into_iter().unzip();
+            let results = results
+                .into_iter()
+                .map(|r| {
+                    let mut result = ExecutionResult::from(r);
+                    if num_shards > 1 {
+                        result.database_updates = hyperscale_storage::filter_updates_to_shard(
+                            &result.database_updates,
+                            local_shard,
+                            num_shards,
+                        );
+                    }
+                    result
+                })
+                .collect();
+
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
-                    ProtocolEvent::ExecutionVoteBatchReceived { votes },
+                    ProtocolEvent::ExecutionBatchCompleted {
+                        votes,
+                        results,
+                        speculative: false,
+                    },
                 )],
                 prepared_commit: None,
             })
@@ -408,7 +463,9 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
             block_hash,
             transactions,
         } => {
-            let votes: Vec<ExecutionVote> = ctx.dispatch.map_local(&transactions, |tx| {
+            let local_shard = ctx.local_shard;
+            let num_shards = ctx.num_shards;
+            let pairs = ctx.dispatch.map_local(&transactions, |tx| {
                 hyperscale_execution::handlers::execute_and_sign_single_shard(
                     ctx.executor,
                     ctx.storage,
@@ -419,11 +476,30 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore, D: Dispatc
                 )
             });
 
+            let (votes, results): (Vec<ExecutionVote>, Vec<_>) = pairs.into_iter().unzip();
+            let results = results
+                .into_iter()
+                .map(|r| {
+                    let mut result = ExecutionResult::from(r);
+                    if num_shards > 1 {
+                        result.database_updates = hyperscale_storage::filter_updates_to_shard(
+                            &result.database_updates,
+                            local_shard,
+                            num_shards,
+                        );
+                    }
+                    result
+                })
+                .collect();
             let tx_hashes: Vec<Hash> = votes.iter().map(|v| v.transaction_hash).collect();
 
             Some(DelegatedResult {
                 events: vec![
-                    NodeInput::Protocol(ProtocolEvent::ExecutionVoteBatchReceived { votes }),
+                    NodeInput::Protocol(ProtocolEvent::ExecutionBatchCompleted {
+                        votes,
+                        results,
+                        speculative: true,
+                    }),
                     NodeInput::Protocol(ProtocolEvent::SpeculativeExecutionComplete {
                         block_hash,
                         tx_hashes,

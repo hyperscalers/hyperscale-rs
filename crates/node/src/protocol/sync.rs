@@ -21,7 +21,7 @@ use hyperscale_types::{Block, Hash, QuorumCertificate};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
-use tracing::{debug, info, trace, warn};
+use tracing::{info, trace, warn};
 
 /// Configuration for the sync protocol.
 #[derive(Debug, Clone)]
@@ -268,7 +268,7 @@ impl SyncProtocol {
                 outputs
             }
             None => {
-                debug!(height, "Empty sync response, re-queuing");
+                warn!(height, "Empty sync response, re-queuing");
                 metrics::record_sync_response_error("empty_response");
                 self.queue_height(height);
                 self.emit_fetch_outputs()
@@ -372,13 +372,41 @@ impl SyncProtocol {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Serve an inbound block sync request.
+///
+/// Includes ledger receipts for each certificate in the block so the
+/// syncing peer can apply state changes without re-executing.
 pub fn serve_block_request(
     storage: &impl ConsensusStore,
     req: GetBlockRequest,
 ) -> GetBlockResponse {
     trace!(height = req.height.0, "Handling block sync request");
     match storage.get_block_for_sync(req.height) {
-        Some((block, qc)) => GetBlockResponse::found(block, qc),
+        Some((block, qc)) => {
+            // Collect receipts for each certificate in the block.
+            let mut ledger_receipts = Vec::with_capacity(block.certificates.len());
+            for cert in &block.certificates {
+                let tx_hash = cert.transaction_hash;
+                if let Some(receipt) = storage.get_ledger_receipt(&tx_hash) {
+                    ledger_receipts.push(hyperscale_types::LedgerReceiptEntry {
+                        tx_hash,
+                        receipt: (*receipt).clone(),
+                    });
+                }
+            }
+
+            if ledger_receipts.len() != block.certificates.len() {
+                warn!(
+                    height = req.height.0,
+                    expected = block.certificates.len(),
+                    found = ledger_receipts.len(),
+                    "Missing receipts for block certificates — \
+                     returning not_found so requester tries another peer"
+                );
+                return GetBlockResponse::not_found();
+            }
+
+            GetBlockResponse::found(block, qc, ledger_receipts)
+        }
         None => GetBlockResponse::not_found(),
     }
 }

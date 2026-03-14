@@ -21,7 +21,7 @@ use libp2p::PeerId;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// Initial reconnection backoff after a stream failure.
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
@@ -125,7 +125,7 @@ impl NotifyStreamPool {
         // Check backoff before creating a new stream.
         if let Some(state) = self.backoff.get(&peer_id) {
             if Instant::now() < state.next_attempt {
-                debug!(peer = %peer_id, "Skipping notify: in backoff period");
+                warn!(peer = %peer_id, "Skipping notify: in backoff period");
                 return;
             }
         }
@@ -160,7 +160,7 @@ impl NotifyStreamPool {
         let mut stream = match adapter.open_notify_stream(peer_id).await {
             Ok(s) => s,
             Err(e) => {
-                debug!(peer = %peer_id, error = ?e, "Failed to open persistent notify stream");
+                warn!(peer = %peer_id, error = ?e, "Failed to open persistent notify stream");
                 Self::apply_backoff(&backoff_map, &peer_id);
                 peers.remove(&peer_id);
                 return;
@@ -183,7 +183,7 @@ impl NotifyStreamPool {
                     metrics::record_libp2p_bandwidth(0, wire_bytes as u64);
                 }
                 Err(e) => {
-                    debug!(
+                    warn!(
                         peer = %peer_id,
                         error = ?e,
                         "Persistent notify stream write failed"

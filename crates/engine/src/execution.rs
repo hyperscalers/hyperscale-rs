@@ -7,15 +7,16 @@
 //! receiving shard can use them directly without expensive hash computations.
 
 use hyperscale_storage::keys;
-use hyperscale_types::{Hash, NodeId, PartitionNumber, StateEntry, SubstateWrite};
-use radix_common::prelude::DatabaseUpdate;
+use hyperscale_types::{
+    ApplicationEvent, FeeSummary, LedgerTransactionOutcome, LedgerTransactionReceipt,
+    LocalTransactionExecution, LogLevel, StateEntry,
+};
 use radix_engine::transaction::{
     execute_transaction, ExecutionConfig, TransactionReceipt, TransactionResult,
 };
 use radix_engine::vm::DefaultVmModules;
 use radix_substate_store_interface::interface::{
-    CreateDatabaseUpdates, DatabaseUpdates, DbPartitionKey, DbSortKey, PartitionDatabaseUpdates,
-    SubstateDatabase,
+    CreateDatabaseUpdates, DatabaseUpdates, DbPartitionKey, DbSortKey, SubstateDatabase,
 };
 use radix_transactions::prelude::ExecutableTransaction;
 use std::collections::BTreeMap;
@@ -28,81 +29,142 @@ pub fn extract_state_updates(receipt: &TransactionReceipt) -> Option<DatabaseUpd
     }
 }
 
-/// Check if a transaction receipt represents a successful commit.
-pub fn is_commit_success(receipt: &TransactionReceipt) -> bool {
+/// Check if a transaction receipt committed (state changes applied).
+///
+/// In Radix Engine, `Commit` means the transaction's state changes were applied
+/// (including fee payment). The transaction's own logic may still have failed
+/// (`Commit(Failure)`) — use `commit.outcome` to distinguish success from failure.
+pub fn is_committed(receipt: &TransactionReceipt) -> bool {
     matches!(&receipt.result, TransactionResult::Commit(_))
 }
 
-/// Extract SubstateWrites from a receipt.
-pub fn extract_substate_writes(receipt: &TransactionReceipt) -> Vec<SubstateWrite> {
-    let Some(updates) = extract_state_updates(receipt) else {
-        return Vec::new();
-    };
+// ============================================================================
+// Receipt building
+// ============================================================================
 
-    let mut writes = Vec::new();
-
-    for (db_node_key, node_updates) in &updates.node_updates {
-        // Convert DbNodeKey back to NodeId (extract 30-byte suffix after 20-byte hash prefix)
-        let node_id = if db_node_key.len() >= 50 {
-            let mut id = [0u8; 30];
-            id.copy_from_slice(&db_node_key[20..50]);
-            NodeId(id)
-        } else {
-            continue;
-        };
-
-        for (partition_num, partition_updates) in &node_updates.partition_updates {
-            let partition = PartitionNumber(*partition_num);
-
-            if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
-                for (db_sort_key, update) in substate_updates {
-                    if let DatabaseUpdate::Set(value) = update {
-                        writes.push(SubstateWrite::new(
-                            node_id,
-                            partition,
-                            db_sort_key.0.clone(),
-                            value.clone(),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-
-    writes
+/// Extract `DatabaseUpdates` from a transaction receipt.
+///
+/// Returns `DatabaseUpdates::default()` for rejected/aborted transactions.
+pub fn extract_database_updates(receipt: &TransactionReceipt) -> DatabaseUpdates {
+    extract_state_updates(receipt).unwrap_or_default()
 }
 
-/// Compute a deterministic commitment hash for a set of substate writes.
+/// Build a `LedgerTransactionReceipt` from a Radix Engine receipt.
 ///
-/// This is used for transaction certificates - validators vote on this hash
-/// to agree on execution results before the writes are applied to storage.
-///
-/// Note: This is distinct from `storage.state_root_hash()` which is the JMT
-/// root of the entire state tree. This function only hashes the writes from
-/// a single transaction for voting purposes.
-///
-/// Uses a simple hash chain over sorted writes for determinism.
-pub fn compute_writes_commitment(writes: &[SubstateWrite]) -> Hash {
-    if writes.is_empty() {
-        return Hash::ZERO;
+/// State changes are derived purely from `DatabaseUpdates` without reading
+/// previous values from storage. The Create/Update/Delete classification is
+/// approximate (all Sets are classified as Create) — this is safe because
+/// `state_changes` are NOT part of the consensus receipt hash.
+pub fn build_ledger_receipt(receipt: &TransactionReceipt) -> LedgerTransactionReceipt {
+    match &receipt.result {
+        TransactionResult::Commit(commit) => {
+            let application_events = extract_application_events(commit);
+            let outcome = match &commit.outcome {
+                radix_engine::transaction::TransactionOutcome::Success(_) => {
+                    LedgerTransactionOutcome::Success
+                }
+                radix_engine::transaction::TransactionOutcome::Failure(_) => {
+                    LedgerTransactionOutcome::Failure
+                }
+            };
+            // state_changes deferred to storage time (flush_receipt_storage).
+            // Safe because receipt_hash() only depends on outcome + event_root.
+            LedgerTransactionReceipt {
+                outcome,
+                state_changes: vec![],
+                application_events,
+            }
+        }
+        TransactionResult::Reject(_) | TransactionResult::Abort(_) => {
+            LedgerTransactionReceipt::failure()
+        }
     }
+}
 
-    // Sort writes for determinism
-    let mut sorted: Vec<_> = writes.iter().collect();
-    sorted.sort_by(|a, b| {
-        (&a.node_id.0, a.partition.0, &a.sort_key).cmp(&(&b.node_id.0, b.partition.0, &b.sort_key))
-    });
+/// Build `LocalTransactionExecution` from a Radix Engine receipt.
+pub fn build_local_execution(receipt: &TransactionReceipt) -> LocalTransactionExecution {
+    let fee_summary = build_fee_summary(receipt);
 
-    // Hash chain
-    let mut data = Vec::new();
-    for write in sorted {
-        data.extend_from_slice(&write.node_id.0);
-        data.push(write.partition.0);
-        data.extend_from_slice(&write.sort_key);
-        data.extend_from_slice(&write.value);
+    let (log_messages, error_message) = match &receipt.result {
+        TransactionResult::Commit(commit) => {
+            let logs = commit
+                .application_logs
+                .iter()
+                .map(|(level, msg)| (convert_log_level(level), msg.clone()))
+                .collect();
+            let error = match &commit.outcome {
+                radix_engine::transaction::TransactionOutcome::Failure(err) => {
+                    Some(format!("{err:?}"))
+                }
+                _ => None,
+            };
+            (logs, error)
+        }
+        TransactionResult::Reject(reject) => (vec![], Some(format!("{:?}", reject.reason))),
+        TransactionResult::Abort(abort) => (vec![], Some(format!("{:?}", abort.reason))),
+    };
+
+    LocalTransactionExecution {
+        fee_summary,
+        log_messages,
+        error_message,
     }
+}
 
-    Hash::from_bytes(&data)
+/// Extract application events from a committed receipt.
+fn extract_application_events(
+    commit: &radix_engine::transaction::CommitResult,
+) -> Vec<ApplicationEvent> {
+    commit
+        .application_events
+        .iter()
+        .map(|(type_id, data)| {
+            // SBOR-encode the EventTypeIdentifier for type_id bytes.
+            let type_id_bytes = radix_common::data::scrypto::scrypto_encode(type_id)
+                .unwrap_or_else(|_| format!("{type_id:?}").into_bytes());
+            ApplicationEvent {
+                type_id: type_id_bytes,
+                data: data.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Build a `FeeSummary` from a Radix Engine receipt.
+///
+/// Fee costs are SBOR-encoded as raw bytes to avoid a direct dependency on
+/// the Decimal type in the types crate.
+fn build_fee_summary(receipt: &TransactionReceipt) -> FeeSummary {
+    let fees = &receipt.fee_summary;
+    FeeSummary {
+        total_execution_cost: radix_common::data::scrypto::scrypto_encode(
+            &fees.total_execution_cost_in_xrd,
+        )
+        .unwrap_or_default(),
+        total_royalty_cost: radix_common::data::scrypto::scrypto_encode(
+            &fees.total_royalty_cost_in_xrd,
+        )
+        .unwrap_or_default(),
+        total_storage_cost: radix_common::data::scrypto::scrypto_encode(
+            &fees.total_storage_cost_in_xrd,
+        )
+        .unwrap_or_default(),
+        total_tipping_cost: radix_common::data::scrypto::scrypto_encode(
+            &fees.total_tipping_cost_in_xrd,
+        )
+        .unwrap_or_default(),
+    }
+}
+
+/// Convert Radix Engine log level to our LogLevel.
+fn convert_log_level(level: &radix_engine_interface::types::Level) -> LogLevel {
+    match level {
+        radix_engine_interface::types::Level::Error => LogLevel::Error,
+        radix_engine_interface::types::Level::Warn => LogLevel::Warn,
+        radix_engine_interface::types::Level::Info => LogLevel::Info,
+        radix_engine_interface::types::Level::Debug => LogLevel::Debug,
+        radix_engine_interface::types::Level::Trace => LogLevel::Trace,
+    }
 }
 
 // ============================================================================
@@ -146,7 +208,6 @@ impl<'a, S: SubstateDatabase> ProvisionedSnapshot<'a, S> {
 
     /// Create from multiple provisions (from different source shards).
     pub fn from_provisions(base: &'a S, provisions_list: &[&[StateEntry]]) -> Self {
-        let total_entries: usize = provisions_list.iter().map(|p| p.len()).sum();
         let mut provisions = BTreeMap::new();
 
         for entries in provisions_list {
@@ -154,9 +215,6 @@ impl<'a, S: SubstateDatabase> ProvisionedSnapshot<'a, S> {
                 provisions.insert(entry.storage_key.clone(), entry.value.clone());
             }
         }
-
-        // Shrink if we over-allocated (unlikely with BTreeMap but good practice)
-        let _ = total_entries; // suppress unused warning
 
         Self { base, provisions }
     }
@@ -313,5 +371,216 @@ impl Iterator for MergedPartitionIterator<'_> {
                 (None, None) => return None,
             }
         }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperscale_types::{LedgerTransactionOutcome, LogLevel};
+    use radix_engine::transaction::{
+        AbortResult, CommitResult, RejectResult, TransactionOutcome, TransactionReceipt,
+        TransactionResult,
+    };
+
+    // ─── Helpers ────────────────────────────────────────────────────────
+
+    fn make_success_receipt_with_logs(
+        logs: Vec<(radix_engine_interface::types::Level, String)>,
+    ) -> TransactionReceipt {
+        let mut commit = CommitResult::empty_with_outcome(TransactionOutcome::Success(vec![]));
+        commit.application_logs = logs;
+        TransactionReceipt::empty_with_commit(commit)
+    }
+
+    fn make_success_receipt_with_events(
+        events: Vec<(radix_engine_interface::types::EventTypeIdentifier, Vec<u8>)>,
+    ) -> TransactionReceipt {
+        let mut commit = CommitResult::empty_with_outcome(TransactionOutcome::Success(vec![]));
+        commit.application_events = events;
+        TransactionReceipt::empty_with_commit(commit)
+    }
+
+    fn make_reject_receipt() -> TransactionReceipt {
+        TransactionReceipt {
+            result: TransactionResult::Reject(RejectResult {
+                reason: radix_engine::errors::RejectionReason::SuccessButFeeLoanNotRepaid,
+            }),
+            ..TransactionReceipt::empty_commit_success()
+        }
+    }
+
+    fn make_abort_receipt() -> TransactionReceipt {
+        TransactionReceipt {
+            result: TransactionResult::Abort(AbortResult {
+                reason: radix_engine::transaction::AbortReason::ConfiguredAbortTriggeredOnFeeLoanRepayment,
+            }),
+            ..TransactionReceipt::empty_commit_success()
+        }
+    }
+
+    // ─── Tests: build_ledger_receipt ────────────────────────────────────
+
+    #[test]
+    fn test_build_ledger_receipt_commit_success() {
+        let receipt = TransactionReceipt::empty_commit_success();
+        let ledger = build_ledger_receipt(&receipt);
+
+        assert_eq!(ledger.outcome, LedgerTransactionOutcome::Success);
+        assert!(ledger.state_changes.is_empty());
+        assert!(ledger.application_events.is_empty());
+    }
+
+    #[test]
+    fn test_build_ledger_receipt_with_events() {
+        use radix_engine_interface::types::{Emitter, EventTypeIdentifier};
+        let radix_node_id = radix_common::types::NodeId([1u8; 30]);
+        let event_id = EventTypeIdentifier(
+            Emitter::Method(
+                radix_node_id,
+                radix_engine_interface::prelude::ModuleId::Main,
+            ),
+            "TestEvent".to_string(),
+        );
+        let receipt = make_success_receipt_with_events(vec![
+            (event_id.clone(), b"event_data_1".to_vec()),
+            (event_id, b"event_data_2".to_vec()),
+        ]);
+        let ledger = build_ledger_receipt(&receipt);
+
+        assert_eq!(ledger.outcome, LedgerTransactionOutcome::Success);
+        assert_eq!(ledger.application_events.len(), 2);
+        assert_eq!(ledger.application_events[0].data, b"event_data_1");
+        assert_eq!(ledger.application_events[1].data, b"event_data_2");
+        // type_id should be SBOR-encoded EventTypeIdentifier (non-empty)
+        assert!(!ledger.application_events[0].type_id.is_empty());
+    }
+
+    #[test]
+    fn test_build_ledger_receipt_reject() {
+        let receipt = make_reject_receipt();
+        let ledger = build_ledger_receipt(&receipt);
+
+        assert_eq!(ledger, LedgerTransactionReceipt::failure());
+        assert_eq!(ledger.outcome, LedgerTransactionOutcome::Failure);
+        assert!(ledger.state_changes.is_empty());
+        assert!(ledger.application_events.is_empty());
+    }
+
+    #[test]
+    fn test_build_ledger_receipt_abort() {
+        let receipt = make_abort_receipt();
+        let ledger = build_ledger_receipt(&receipt);
+
+        assert_eq!(ledger, LedgerTransactionReceipt::failure());
+    }
+
+    #[test]
+    fn test_build_ledger_receipt_receipt_hash_deterministic() {
+        let receipt = TransactionReceipt::empty_commit_success();
+        let ledger_a = build_ledger_receipt(&receipt);
+        let ledger_b = build_ledger_receipt(&receipt);
+
+        assert_eq!(ledger_a.receipt_hash(), ledger_b.receipt_hash());
+    }
+
+    // ─── Tests: build_local_execution ───────────────────────────────────
+
+    #[test]
+    fn test_build_local_execution_success_no_error() {
+        let receipt = TransactionReceipt::empty_commit_success();
+        let local = build_local_execution(&receipt);
+
+        assert!(local.error_message.is_none());
+        assert!(local.log_messages.is_empty());
+    }
+
+    #[test]
+    fn test_build_local_execution_with_logs() {
+        use radix_engine_interface::types::Level;
+        let receipt = make_success_receipt_with_logs(vec![
+            (Level::Info, "hello world".to_string()),
+            (Level::Error, "something broke".to_string()),
+            (Level::Debug, "debug info".to_string()),
+        ]);
+        let local = build_local_execution(&receipt);
+
+        assert_eq!(local.log_messages.len(), 3);
+        assert_eq!(
+            local.log_messages[0],
+            (LogLevel::Info, "hello world".to_string())
+        );
+        assert_eq!(
+            local.log_messages[1],
+            (LogLevel::Error, "something broke".to_string())
+        );
+        assert_eq!(
+            local.log_messages[2],
+            (LogLevel::Debug, "debug info".to_string())
+        );
+        assert!(local.error_message.is_none());
+    }
+
+    #[test]
+    fn test_build_local_execution_reject_has_error() {
+        let receipt = make_reject_receipt();
+        let local = build_local_execution(&receipt);
+
+        assert!(local.error_message.is_some());
+        assert!(local.log_messages.is_empty());
+    }
+
+    #[test]
+    fn test_build_local_execution_abort_has_error() {
+        let receipt = make_abort_receipt();
+        let local = build_local_execution(&receipt);
+
+        assert!(local.error_message.is_some());
+        assert!(local.log_messages.is_empty());
+    }
+
+    #[test]
+    fn test_build_local_execution_fees_are_encoded() {
+        let receipt = TransactionReceipt::empty_commit_success();
+        let local = build_local_execution(&receipt);
+
+        // Default fee summary has zero Decimals, which still SBOR-encode to non-empty bytes.
+        assert!(
+            !local.fee_summary.total_execution_cost.is_empty(),
+            "SBOR-encoded zero Decimal should be non-empty"
+        );
+        assert!(!local.fee_summary.total_royalty_cost.is_empty());
+        assert!(!local.fee_summary.total_storage_cost.is_empty());
+        assert!(!local.fee_summary.total_tipping_cost.is_empty());
+    }
+
+    // ─── Tests: extract_database_updates ────────────────────────────────
+
+    #[test]
+    fn test_extract_database_updates_commit_empty() {
+        let receipt = TransactionReceipt::empty_commit_success();
+        let updates = extract_database_updates(&receipt);
+
+        assert!(updates.node_updates.is_empty());
+    }
+
+    #[test]
+    fn test_extract_database_updates_reject_returns_default() {
+        let receipt = make_reject_receipt();
+        let updates = extract_database_updates(&receipt);
+
+        assert!(updates.node_updates.is_empty());
+    }
+
+    #[test]
+    fn test_extract_database_updates_abort_returns_default() {
+        let receipt = make_abort_receipt();
+        let updates = extract_database_updates(&receipt);
+
+        assert!(updates.node_updates.is_empty());
     }
 }

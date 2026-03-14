@@ -21,11 +21,11 @@ use tracing::instrument;
 /// Tracks votes for a cross-shard transaction.
 ///
 /// After executing a transaction with provisioned state, validators create
-/// votes on the execution result (writes commitment). This tracker collects votes
+/// votes on the execution result (receipt hash). This tracker collects votes
 /// and determines when quorum is reached.
 ///
-/// The tracker now supports deferred verification: unverified votes are buffered
-/// until we have enough voting power to possibly reach quorum, then batch-verified.
+/// Supports deferred verification: unverified votes are buffered until we have
+/// enough voting power to possibly reach quorum, then batch-verified.
 #[derive(Debug)]
 pub struct VoteTracker {
     /// Transaction hash.
@@ -40,10 +40,10 @@ pub struct VoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
     // Verified votes (passed signature verification)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Verified votes grouped by writes commitment.
-    votes_by_commitment: BTreeMap<Hash, Vec<ExecutionVote>>,
-    /// Voting power per writes commitment (verified votes only).
-    power_by_commitment: BTreeMap<Hash, u64>,
+    /// Verified votes grouped by receipt hash.
+    votes_by_receipt_hash: BTreeMap<Hash, Vec<ExecutionVote>>,
+    /// Voting power per receipt hash (verified votes only).
+    power_by_receipt_hash: BTreeMap<Hash, u64>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Unverified votes (buffered until quorum possible)
@@ -79,8 +79,8 @@ impl VoteTracker {
             participating_shards,
             read_nodes,
             quorum,
-            votes_by_commitment: BTreeMap::new(),
-            power_by_commitment: BTreeMap::new(),
+            votes_by_receipt_hash: BTreeMap::new(),
+            power_by_receipt_hash: BTreeMap::new(),
             unverified_votes: Vec::new(),
             unverified_power: 0,
             seen_validators: HashSet::new(),
@@ -140,9 +140,9 @@ impl VoteTracker {
             return false;
         }
 
-        // Get the best verified power (highest power for any writes commitment)
+        // Get the best verified power (highest power for any receipt hash)
         let best_verified_power = self
-            .power_by_commitment
+            .power_by_receipt_hash
             .values()
             .max()
             .copied()
@@ -188,40 +188,40 @@ impl VoteTracker {
         quorum = self.quorum,
     ))]
     pub fn add_verified_vote(&mut self, vote: ExecutionVote, power: u64) {
-        let commitment = vote.writes_commitment;
-        self.votes_by_commitment
-            .entry(commitment)
+        let receipt_hash = vote.receipt_hash;
+        self.votes_by_receipt_hash
+            .entry(receipt_hash)
             .or_default()
             .push(vote);
-        *self.power_by_commitment.entry(commitment).or_insert(0) += power;
+        *self.power_by_receipt_hash.entry(receipt_hash).or_insert(0) += power;
     }
 
-    /// Check if quorum is reached for any writes commitment (verified votes only).
+    /// Check if quorum is reached for any receipt hash (verified votes only).
     ///
-    /// Returns `Some((writes_commitment, total_power))` if quorum is reached, `None` otherwise.
-    /// Use `votes_for_commitment()` to get the actual votes after checking quorum.
+    /// Returns `Some((receipt_hash, total_power))` if quorum is reached, `None` otherwise.
+    /// Use `votes_for_receipt_hash()` to get the actual votes after checking quorum.
     pub fn check_quorum(&self) -> Option<(Hash, u64)> {
-        for (commitment, power) in &self.power_by_commitment {
+        for (receipt_hash, power) in &self.power_by_receipt_hash {
             if *power >= self.quorum {
-                return Some((*commitment, *power));
+                return Some((*receipt_hash, *power));
             }
         }
         None
     }
 
-    /// Get votes for a specific writes commitment (reference).
+    /// Get votes for a specific receipt hash (reference).
     #[cfg(test)]
-    pub fn votes_for_commitment(&self, commitment: &Hash) -> &[ExecutionVote] {
-        self.votes_by_commitment
-            .get(commitment)
+    pub fn votes_for_receipt_hash(&self, receipt_hash: &Hash) -> &[ExecutionVote] {
+        self.votes_by_receipt_hash
+            .get(receipt_hash)
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
 
-    /// Take votes for a specific writes commitment (ownership transfer, avoids clone).
-    pub fn take_votes_for_commitment(&mut self, commitment: &Hash) -> Vec<ExecutionVote> {
-        self.votes_by_commitment
-            .remove(commitment)
+    /// Take votes for a specific receipt hash (ownership transfer, avoids clone).
+    pub fn take_votes_for_receipt_hash(&mut self, receipt_hash: &Hash) -> Vec<ExecutionVote> {
+        self.votes_by_receipt_hash
+            .remove(receipt_hash)
             .unwrap_or_default()
     }
 }
@@ -250,9 +250,9 @@ mod tests {
         let vote = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            writes_commitment: commitment,
+            receipt_hash: commitment,
             success: true,
-            state_writes: vec![],
+            write_nodes: vec![],
             validator: ValidatorId(0),
             signature: zero_bls_signature(),
         };
@@ -271,7 +271,7 @@ mod tests {
         assert!(result.is_some());
         let (root, power) = result.unwrap();
         assert_eq!(root, commitment);
-        assert_eq!(tracker.votes_for_commitment(&root).len(), 3);
+        assert_eq!(tracker.votes_for_receipt_hash(&root).len(), 3);
         assert_eq!(power, 3);
     }
 
@@ -286,9 +286,9 @@ mod tests {
         let vote_a = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            writes_commitment: root_a,
+            receipt_hash: root_a,
             success: true,
-            state_writes: vec![],
+            write_nodes: vec![],
             validator: ValidatorId(0),
             signature: zero_bls_signature(),
         };
@@ -296,9 +296,9 @@ mod tests {
         let vote_b = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            writes_commitment: root_b,
+            receipt_hash: root_b,
             success: true,
-            state_writes: vec![],
+            write_nodes: vec![],
             validator: ValidatorId(1),
             signature: zero_bls_signature(),
         };
@@ -332,9 +332,9 @@ mod tests {
         let vote = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            writes_commitment: commitment,
+            receipt_hash: commitment,
             success: true,
-            state_writes: vec![],
+            write_nodes: vec![],
             validator: ValidatorId(0),
             signature: zero_bls_signature(),
         };
@@ -364,9 +364,9 @@ mod tests {
         let vote = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            writes_commitment: commitment,
+            receipt_hash: commitment,
             success: true,
-            state_writes: vec![],
+            write_nodes: vec![],
             validator: ValidatorId(0),
             signature: zero_bls_signature(),
         };
@@ -389,9 +389,9 @@ mod tests {
             let vote = ExecutionVote {
                 transaction_hash: tx_hash,
                 shard_group_id: ShardGroupId(0),
-                writes_commitment: commitment,
+                receipt_hash: commitment,
                 success: true,
-                state_writes: vec![],
+                write_nodes: vec![],
                 validator: ValidatorId(i),
                 signature: zero_bls_signature(),
             };
@@ -414,9 +414,9 @@ mod tests {
             let vote = ExecutionVote {
                 transaction_hash: tx_hash,
                 shard_group_id: ShardGroupId(0),
-                writes_commitment: commitment,
+                receipt_hash: commitment,
                 success: true,
-                state_writes: vec![],
+                write_nodes: vec![],
                 validator: ValidatorId(i),
                 signature: zero_bls_signature(),
             };
@@ -448,9 +448,9 @@ mod tests {
         let vote1 = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            writes_commitment: commitment,
+            receipt_hash: commitment,
             success: true,
-            state_writes: vec![],
+            write_nodes: vec![],
             validator: ValidatorId(0),
             signature: zero_bls_signature(),
         };
@@ -459,7 +459,7 @@ mod tests {
         // 1 verified + 1 unverified = 2, not enough for quorum 3
         let vote2 = ExecutionVote {
             validator: ValidatorId(1),
-            ..tracker.votes_by_commitment.values().next().unwrap()[0].clone()
+            ..tracker.votes_by_receipt_hash.values().next().unwrap()[0].clone()
         };
         tracker.buffer_unverified_vote(vote2, pk, 1);
         assert!(!tracker.should_trigger_verification());
@@ -468,9 +468,9 @@ mod tests {
         let vote3 = ExecutionVote {
             transaction_hash: tx_hash,
             shard_group_id: ShardGroupId(0),
-            writes_commitment: commitment,
+            receipt_hash: commitment,
             success: true,
-            state_writes: vec![],
+            write_nodes: vec![],
             validator: ValidatorId(2),
             signature: zero_bls_signature(),
         };

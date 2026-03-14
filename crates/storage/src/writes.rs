@@ -1,59 +1,14 @@
-//! Conversion from SubstateWrites to DatabaseUpdates.
+//! Utilities for merging, filtering, and reconstructing `DatabaseUpdates`.
 
-use hyperscale_types::{ShardGroupId, SubstateWrite, TransactionCertificate};
+use hyperscale_types::{
+    LedgerTransactionReceipt, PartitionNumber, ShardGroupId, SubstateChange, SubstateChangeAction,
+    SubstateRef,
+};
 use radix_common::prelude::DatabaseUpdate;
-use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 use radix_substate_store_interface::interface::{
     DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
 };
 use std::sync::Arc;
-
-/// Convert SubstateWrites back to DatabaseUpdates for committing to storage.
-///
-/// This is the inverse of `extract_substate_writes()`. Used when applying
-/// certificate state writes during `PersistTransactionCertificate`.
-///
-/// # Arguments
-///
-/// * `writes` - The substate writes to convert (typically from a certificate's shard_proofs)
-///
-/// # Returns
-///
-/// A `DatabaseUpdates` structure suitable for JMT and substate storage operations
-pub fn substate_writes_to_database_updates(writes: &[SubstateWrite]) -> DatabaseUpdates {
-    let mut updates = DatabaseUpdates::default();
-
-    for write in writes {
-        let radix_node_id = radix_common::types::NodeId(write.node_id.0);
-        let radix_partition = radix_common::types::PartitionNumber(write.partition.0);
-
-        let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
-        let db_partition_num = SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
-        let db_sort_key = DbSortKey(write.sort_key.clone());
-
-        let node_updates =
-            updates
-                .node_updates
-                .entry(db_node_key)
-                .or_insert_with(|| NodeDatabaseUpdates {
-                    partition_updates: indexmap::IndexMap::new(),
-                });
-
-        let partition_updates = node_updates
-            .partition_updates
-            .entry(db_partition_num)
-            .or_insert_with(|| PartitionDatabaseUpdates::Delta {
-                substate_updates: indexmap::IndexMap::new(),
-            });
-
-        let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates else {
-            unreachable!("writes conversion always creates Delta partitions");
-        };
-        substate_updates.insert(db_sort_key, DatabaseUpdate::Set(write.value.clone()));
-    }
-
-    updates
-}
 
 /// Merge a slice of per-certificate `DatabaseUpdates` into a single combined update.
 ///
@@ -65,6 +20,23 @@ pub fn merge_database_updates(updates_list: &[DatabaseUpdates]) -> DatabaseUpdat
     }
     if updates_list.len() == 1 {
         return updates_list[0].clone();
+    }
+    let mut merged = DatabaseUpdates::default();
+    for updates in updates_list {
+        merge_into(&mut merged, updates);
+    }
+    merged
+}
+
+/// Merge a slice of Arc-wrapped per-certificate `DatabaseUpdates` into a single combined update.
+///
+/// Same semantics as [`merge_database_updates`] but dereferences through `Arc`.
+pub fn merge_database_updates_from_arcs(updates_list: &[Arc<DatabaseUpdates>]) -> DatabaseUpdates {
+    if updates_list.is_empty() {
+        return DatabaseUpdates::default();
+    }
+    if updates_list.len() == 1 {
+        return (*updates_list[0]).clone();
     }
     let mut merged = DatabaseUpdates::default();
     for updates in updates_list {
@@ -140,224 +112,153 @@ fn merge_partition_updates(
     }
 }
 
-/// Extract per-certificate state writes for a given local shard.
+/// Extract state changes from `DatabaseUpdates` without reading previous values.
 ///
-/// For each certificate, extracts the `state_writes` from the shard proof
-/// matching `local_shard`. Certificates without a proof for the local shard
-/// produce an empty `Vec`.
-pub fn extract_writes_per_cert(
-    certificates: &[Arc<TransactionCertificate>],
+/// Inverse of [`receipt_to_database_updates`]. All `Set` operations are
+/// classified as `Create` (no previous_value lookup). `Delete` operations use
+/// an empty previous_value. This is safe because `state_changes` are NOT part
+/// of the consensus receipt hash — the distinction between Create/Update is
+/// purely informational for clients/indexers.
+///
+/// The round-trip through `receipt_to_database_updates` is unaffected: both
+/// Create and Update map to `DatabaseUpdate::Set(new_value)`.
+pub fn extract_state_changes(db_updates: &DatabaseUpdates) -> Vec<SubstateChange> {
+    use crate::keys::db_node_key_to_node_id;
+
+    let mut changes = Vec::new();
+
+    for (db_node_key, node_updates) in &db_updates.node_updates {
+        let Some(node_id) = db_node_key_to_node_id(db_node_key) else {
+            continue;
+        };
+
+        for (partition_num, partition_updates) in &node_updates.partition_updates {
+            let partition = PartitionNumber(*partition_num);
+
+            match partition_updates {
+                PartitionDatabaseUpdates::Delta { substate_updates } => {
+                    for (db_sort_key, update) in substate_updates {
+                        let substate_ref = SubstateRef {
+                            node_id,
+                            partition,
+                            sort_key: db_sort_key.0.clone(),
+                        };
+
+                        let action = match update {
+                            DatabaseUpdate::Set(new_value) => SubstateChangeAction::Create {
+                                new_value: new_value.clone(),
+                            },
+                            DatabaseUpdate::Delete => SubstateChangeAction::Delete {
+                                previous_value: vec![],
+                            },
+                        };
+
+                        changes.push(SubstateChange {
+                            substate_ref,
+                            action,
+                        });
+                    }
+                }
+                PartitionDatabaseUpdates::Reset {
+                    new_substate_values,
+                } => {
+                    for (sort_key, new_value) in new_substate_values {
+                        changes.push(SubstateChange {
+                            substate_ref: SubstateRef {
+                                node_id,
+                                partition,
+                                sort_key: sort_key.0.clone(),
+                            },
+                            action: SubstateChangeAction::Create {
+                                new_value: new_value.clone(),
+                            },
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    changes
+}
+
+/// Reconstruct `DatabaseUpdates` from a ledger receipt's state changes.
+///
+/// This converts the receipt's `SubstateChange` entries into the `DatabaseUpdates`
+/// format used by the JMT commit path. Used by syncing nodes that receive receipts
+/// from peers instead of executing transactions locally.
+///
+/// The resulting `DatabaseUpdates` contain ALL nodes (not filtered to any shard).
+/// Call `filter_updates_to_shard` afterward to restrict to the local shard.
+pub fn receipt_to_database_updates(receipt: &LedgerTransactionReceipt) -> DatabaseUpdates {
+    use crate::keys::node_entity_key;
+    use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
+
+    let mut updates = DatabaseUpdates::default();
+
+    for change in &receipt.state_changes {
+        let db_node_key = node_entity_key(&change.substate_ref.node_id);
+        let radix_partition = radix_common::types::PartitionNumber(change.substate_ref.partition.0);
+        let db_partition_num = SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
+        let db_sort_key = DbSortKey(change.substate_ref.sort_key.clone());
+
+        let db_update = match &change.action {
+            SubstateChangeAction::Create { new_value } => DatabaseUpdate::Set(new_value.clone()),
+            SubstateChangeAction::Update { new_value, .. } => {
+                DatabaseUpdate::Set(new_value.clone())
+            }
+            SubstateChangeAction::Delete { .. } => DatabaseUpdate::Delete,
+        };
+
+        let node_updates = updates.node_updates.entry(db_node_key).or_default();
+        let partition_updates = node_updates
+            .partition_updates
+            .entry(db_partition_num)
+            .or_insert_with(|| PartitionDatabaseUpdates::Delta {
+                substate_updates: indexmap::IndexMap::new(),
+            });
+
+        if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
+            substate_updates.insert(db_sort_key, db_update);
+        }
+    }
+
+    updates
+}
+
+/// Filter DatabaseUpdates to only include writes for the local shard.
+///
+/// Uses `db_node_key_to_node_id` to extract the NodeId from each db_node_key,
+/// then `shard_for_node` to determine ownership. Only updates for nodes
+/// owned by `local_shard` are included in the output.
+pub fn filter_updates_to_shard(
+    updates: &DatabaseUpdates,
     local_shard: ShardGroupId,
-) -> Vec<Vec<SubstateWrite>> {
-    certificates
-        .iter()
-        .map(|cert| {
-            cert.shard_proofs
-                .get(&local_shard)
-                .map(|proof| proof.state_writes.clone())
-                .unwrap_or_default()
-        })
-        .collect()
+    num_shards: u64,
+) -> DatabaseUpdates {
+    use crate::keys::db_node_key_to_node_id;
+    use hyperscale_types::shard_for_node;
+
+    let mut filtered = DatabaseUpdates::default();
+    for (db_node_key, node_updates) in &updates.node_updates {
+        let Some(node_id) = db_node_key_to_node_id(db_node_key) else {
+            continue;
+        };
+        if shard_for_node(&node_id, num_shards) != local_shard {
+            continue;
+        }
+        filtered
+            .node_updates
+            .insert(db_node_key.clone(), node_updates.clone());
+    }
+    filtered
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_helpers::{
-        make_multi_shard_certificate, make_substate_write, make_test_certificate,
-    };
-    use hyperscale_types::ShardGroupId;
     use radix_common::prelude::DatabaseUpdate;
-
-    #[test]
-    fn test_substate_writes_to_database_updates_single() {
-        let writes = vec![make_substate_write(1, 0, vec![10, 20], vec![99, 88])];
-        let updates = substate_writes_to_database_updates(&writes);
-
-        assert_eq!(updates.node_updates.len(), 1);
-        let (_, node_updates) = updates.node_updates.iter().next().unwrap();
-        assert_eq!(node_updates.partition_updates.len(), 1);
-        let (_, partition_updates) = node_updates.partition_updates.iter().next().unwrap();
-        match partition_updates {
-            PartitionDatabaseUpdates::Delta { substate_updates } => {
-                assert_eq!(substate_updates.len(), 1);
-                let (sort_key, update) = substate_updates.iter().next().unwrap();
-                assert_eq!(sort_key.0, vec![10, 20]);
-                assert!(matches!(update, DatabaseUpdate::Set(v) if v == &vec![99, 88]));
-            }
-            _ => panic!("expected Delta partition updates"),
-        }
-    }
-
-    #[test]
-    fn test_substate_writes_to_database_updates_multiple_nodes() {
-        let writes = vec![
-            make_substate_write(1, 0, vec![10], vec![1]),
-            make_substate_write(2, 0, vec![20], vec![2]),
-        ];
-        let updates = substate_writes_to_database_updates(&writes);
-        assert_eq!(updates.node_updates.len(), 2);
-    }
-
-    #[test]
-    fn test_substate_writes_to_database_updates_same_partition() {
-        let writes = vec![
-            make_substate_write(1, 0, vec![10], vec![1]),
-            make_substate_write(1, 0, vec![20], vec![2]),
-        ];
-        let updates = substate_writes_to_database_updates(&writes);
-
-        assert_eq!(updates.node_updates.len(), 1);
-        let (_, node_updates) = updates.node_updates.iter().next().unwrap();
-        assert_eq!(node_updates.partition_updates.len(), 1);
-        let (_, partition_updates) = node_updates.partition_updates.iter().next().unwrap();
-        match partition_updates {
-            PartitionDatabaseUpdates::Delta { substate_updates } => {
-                assert_eq!(substate_updates.len(), 2);
-            }
-            _ => panic!("expected Delta partition updates"),
-        }
-    }
-
-    #[test]
-    fn test_substate_writes_to_database_updates_empty() {
-        let updates = substate_writes_to_database_updates(&[]);
-        assert!(updates.node_updates.is_empty());
-    }
-
-    #[test]
-    fn test_substate_writes_to_database_updates_multiple_partitions() {
-        let writes = vec![
-            make_substate_write(1, 0, vec![10], vec![1]),
-            make_substate_write(1, 3, vec![20], vec![2]),
-        ];
-        let updates = substate_writes_to_database_updates(&writes);
-
-        assert_eq!(updates.node_updates.len(), 1);
-        let (_, node_updates) = updates.node_updates.iter().next().unwrap();
-        assert_eq!(node_updates.partition_updates.len(), 2);
-    }
-
-    #[test]
-    fn test_substate_writes_last_write_wins() {
-        let writes = vec![
-            make_substate_write(1, 0, vec![10], vec![1]),
-            make_substate_write(1, 0, vec![10], vec![99]),
-        ];
-        let updates = substate_writes_to_database_updates(&writes);
-
-        let (_, node_updates) = updates.node_updates.iter().next().unwrap();
-        let (_, partition_updates) = node_updates.partition_updates.iter().next().unwrap();
-        match partition_updates {
-            PartitionDatabaseUpdates::Delta { substate_updates } => {
-                assert_eq!(substate_updates.len(), 1);
-                let (_, update) = substate_updates.iter().next().unwrap();
-                assert!(
-                    matches!(update, DatabaseUpdate::Set(v) if v == &vec![99]),
-                    "last write should win for duplicate sort keys"
-                );
-            }
-            _ => panic!("expected Delta partition updates"),
-        }
-    }
-
-    #[test]
-    fn test_extract_writes_per_cert_matching_shard() {
-        let shard = ShardGroupId(0);
-        let writes = vec![make_substate_write(1, 0, vec![10], vec![1])];
-        let cert = Arc::new(make_test_certificate(42, shard, writes.clone()));
-
-        let result = extract_writes_per_cert(&[cert], shard);
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], writes);
-    }
-
-    #[test]
-    fn test_extract_writes_per_cert_missing_shard() {
-        let cert = Arc::new(make_test_certificate(42, ShardGroupId(0), vec![]));
-        let result = extract_writes_per_cert(&[cert], ShardGroupId(99));
-        assert_eq!(result.len(), 1);
-        assert!(result[0].is_empty());
-    }
-
-    #[test]
-    fn test_extract_writes_per_cert_mixed() {
-        let shard = ShardGroupId(0);
-        let other_shard = ShardGroupId(1);
-        let writes = vec![make_substate_write(1, 0, vec![10], vec![1])];
-
-        let cert_match = Arc::new(make_test_certificate(1, shard, writes.clone()));
-        let cert_miss = Arc::new(make_test_certificate(
-            2,
-            other_shard,
-            vec![make_substate_write(2, 0, vec![20], vec![2])],
-        ));
-
-        let result = extract_writes_per_cert(&[cert_match, cert_miss], shard);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], writes);
-        assert!(result[1].is_empty());
-    }
-
-    #[test]
-    fn test_extract_writes_per_cert_empty_certs() {
-        let result = extract_writes_per_cert(&[], ShardGroupId(0));
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_extract_writes_per_cert_preserves_order() {
-        let shard = ShardGroupId(0);
-        let cert1 = Arc::new(make_test_certificate(
-            1,
-            shard,
-            vec![make_substate_write(1, 0, vec![10], vec![1])],
-        ));
-        let cert2 = Arc::new(make_test_certificate(
-            2,
-            shard,
-            vec![make_substate_write(2, 0, vec![20], vec![2])],
-        ));
-        let cert3 = Arc::new(make_test_certificate(
-            3,
-            shard,
-            vec![make_substate_write(3, 0, vec![30], vec![3])],
-        ));
-
-        let result = extract_writes_per_cert(&[cert1, cert2, cert3], shard);
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0][0].value, vec![1]);
-        assert_eq!(result[1][0].value, vec![2]);
-        assert_eq!(result[2][0].value, vec![3]);
-    }
-
-    #[test]
-    fn test_extract_writes_per_cert_multi_shard_certificate() {
-        // A certificate with proofs for shard 0 AND shard 1.
-        // Extracting for shard 0 should return only shard 0's writes.
-        let shard0_writes = vec![make_substate_write(1, 0, vec![10], vec![1])];
-        let shard1_writes = vec![make_substate_write(2, 0, vec![20], vec![2])];
-        let cert = Arc::new(make_multi_shard_certificate(
-            1,
-            vec![
-                (ShardGroupId(0), shard0_writes.clone()),
-                (ShardGroupId(1), shard1_writes.clone()),
-            ],
-        ));
-
-        let result_shard0 = extract_writes_per_cert(std::slice::from_ref(&cert), ShardGroupId(0));
-        assert_eq!(result_shard0.len(), 1);
-        assert_eq!(result_shard0[0], shard0_writes);
-
-        let result_shard1 = extract_writes_per_cert(std::slice::from_ref(&cert), ShardGroupId(1));
-        assert_eq!(result_shard1.len(), 1);
-        assert_eq!(result_shard1[0], shard1_writes);
-
-        // Shard 2 has no proof — should return empty writes
-        let result_shard2 = extract_writes_per_cert(&[cert], ShardGroupId(2));
-        assert_eq!(result_shard2.len(), 1);
-        assert!(result_shard2[0].is_empty());
-    }
+    use radix_substate_store_interface::interface::DbSortKey;
 
     // Helper to create a Delta DatabaseUpdates with a single node/partition/substate.
     fn make_delta_updates(
@@ -567,5 +468,364 @@ mod tests {
             matches!(get_delta_value(&merged, b"node1", 0, &[1]), Some(DatabaseUpdate::Set(v)) if v == vec![10]),
             "single-element merge should be identity"
         );
+    }
+
+    // ── extract_state_changes tests ──────────────────────────────────────
+
+    mod extract_state_changes_tests {
+        use super::super::extract_state_changes;
+        use hyperscale_types::{NodeId, PartitionNumber, SubstateChangeAction};
+        use indexmap::indexmap;
+        use radix_common::prelude::DatabaseUpdate;
+        use radix_substate_store_interface::db_key_mapper::{
+            DatabaseKeyMapper, SpreadPrefixKeyMapper,
+        };
+        use radix_substate_store_interface::interface::{
+            DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
+        };
+
+        fn make_db_node_key(node_id: &[u8; 30]) -> Vec<u8> {
+            let radix_id = radix_common::types::NodeId(*node_id);
+            SpreadPrefixKeyMapper::to_db_node_key(&radix_id)
+        }
+
+        fn make_set_updates(
+            node_id: [u8; 30],
+            partition: u8,
+            sort_key: Vec<u8>,
+            value: Vec<u8>,
+        ) -> DatabaseUpdates {
+            let db_node_key = make_db_node_key(&node_id);
+            DatabaseUpdates {
+                node_updates: indexmap! {
+                    db_node_key => NodeDatabaseUpdates {
+                        partition_updates: indexmap! {
+                            partition => PartitionDatabaseUpdates::Delta {
+                                substate_updates: indexmap! {
+                                    DbSortKey(sort_key) => DatabaseUpdate::Set(value),
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        fn make_delete_updates(
+            node_id: [u8; 30],
+            partition: u8,
+            sort_key: Vec<u8>,
+        ) -> DatabaseUpdates {
+            let db_node_key = make_db_node_key(&node_id);
+            DatabaseUpdates {
+                node_updates: indexmap! {
+                    db_node_key => NodeDatabaseUpdates {
+                        partition_updates: indexmap! {
+                            partition => PartitionDatabaseUpdates::Delta {
+                                substate_updates: indexmap! {
+                                    DbSortKey(sort_key) => DatabaseUpdate::Delete,
+                                }
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        fn make_reset_updates(
+            node_id: [u8; 30],
+            partition: u8,
+            new_values: Vec<(Vec<u8>, Vec<u8>)>,
+        ) -> DatabaseUpdates {
+            let db_node_key = make_db_node_key(&node_id);
+            let new_substate_values = new_values
+                .into_iter()
+                .map(|(k, v)| (DbSortKey(k), v))
+                .collect();
+            DatabaseUpdates {
+                node_updates: indexmap! {
+                    db_node_key => NodeDatabaseUpdates {
+                        partition_updates: indexmap! {
+                            partition => PartitionDatabaseUpdates::Reset {
+                                new_substate_values,
+                            }
+                        }
+                    }
+                },
+            }
+        }
+
+        #[test]
+        fn test_set_classifies_as_create() {
+            let node_id = [1u8; 30];
+            let db_updates = make_set_updates(node_id, 0, vec![42], b"new_value".to_vec());
+
+            let changes = extract_state_changes(&db_updates);
+
+            assert_eq!(changes.len(), 1);
+            assert_eq!(changes[0].substate_ref.node_id, NodeId(node_id));
+            assert_eq!(changes[0].substate_ref.partition, PartitionNumber(0));
+            assert_eq!(changes[0].substate_ref.sort_key, vec![42]);
+            match &changes[0].action {
+                SubstateChangeAction::Create { new_value } => {
+                    assert_eq!(new_value, b"new_value");
+                }
+                other => panic!("Expected Create, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_delete() {
+            let node_id = [3u8; 30];
+            let db_updates = make_delete_updates(node_id, 1, vec![5]);
+
+            let changes = extract_state_changes(&db_updates);
+
+            assert_eq!(changes.len(), 1);
+            match &changes[0].action {
+                SubstateChangeAction::Delete { previous_value } => {
+                    assert!(previous_value.is_empty());
+                }
+                other => panic!("Expected Delete, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_multiple_nodes_and_partitions() {
+            let node_a = [10u8; 30];
+            let node_b = [20u8; 30];
+            let db_node_key_a = make_db_node_key(&node_a);
+            let db_node_key_b = make_db_node_key(&node_b);
+
+            let db_updates = DatabaseUpdates {
+                node_updates: indexmap! {
+                    db_node_key_a => NodeDatabaseUpdates {
+                        partition_updates: indexmap! {
+                            0 => PartitionDatabaseUpdates::Delta {
+                                substate_updates: indexmap! {
+                                    DbSortKey(vec![1]) => DatabaseUpdate::Set(b"a1".to_vec()),
+                                }
+                            },
+                            5 => PartitionDatabaseUpdates::Delta {
+                                substate_updates: indexmap! {
+                                    DbSortKey(vec![2]) => DatabaseUpdate::Set(b"a2".to_vec()),
+                                }
+                            }
+                        }
+                    },
+                    db_node_key_b => NodeDatabaseUpdates {
+                        partition_updates: indexmap! {
+                            0 => PartitionDatabaseUpdates::Delta {
+                                substate_updates: indexmap! {
+                                    DbSortKey(vec![3]) => DatabaseUpdate::Delete,
+                                }
+                            }
+                        }
+                    }
+                },
+            };
+
+            let changes = extract_state_changes(&db_updates);
+
+            assert_eq!(changes.len(), 3);
+            let node_ids: Vec<_> = changes.iter().map(|c| c.substate_ref.node_id).collect();
+            assert!(node_ids.contains(&NodeId(node_a)));
+            assert!(node_ids.contains(&NodeId(node_b)));
+        }
+
+        #[test]
+        fn test_reset_partition() {
+            let node_id = [5u8; 30];
+            let db_updates = make_reset_updates(node_id, 2, vec![(vec![1], b"reset_val".to_vec())]);
+
+            let changes = extract_state_changes(&db_updates);
+
+            assert_eq!(changes.len(), 1);
+            match &changes[0].action {
+                SubstateChangeAction::Create { new_value } => {
+                    assert_eq!(new_value, b"reset_val");
+                }
+                other => panic!("Expected Create for Reset partition, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn test_empty_updates() {
+            let db_updates = DatabaseUpdates::default();
+            let changes = extract_state_changes(&db_updates);
+            assert!(changes.is_empty());
+        }
+
+        #[test]
+        fn test_invalid_node_key_skipped() {
+            let db_updates = DatabaseUpdates {
+                node_updates: indexmap! {
+                    vec![0u8; 10] => NodeDatabaseUpdates {
+                        partition_updates: indexmap! {
+                            0 => PartitionDatabaseUpdates::Delta {
+                                substate_updates: indexmap! {
+                                    DbSortKey(vec![1]) => DatabaseUpdate::Set(b"val".to_vec()),
+                                }
+                            }
+                        }
+                    }
+                },
+            };
+            let changes = extract_state_changes(&db_updates);
+            assert!(changes.is_empty(), "Malformed node key should be skipped");
+        }
+    }
+
+    // ── receipt_to_database_updates tests ────────────────────────────────
+
+    mod receipt_conversion {
+        use super::super::receipt_to_database_updates;
+        use hyperscale_types::{
+            LedgerTransactionOutcome, LedgerTransactionReceipt, NodeId, PartitionNumber,
+            SubstateChange, SubstateChangeAction, SubstateRef,
+        };
+        use radix_common::prelude::DatabaseUpdate;
+        use radix_substate_store_interface::interface::PartitionDatabaseUpdates;
+
+        #[test]
+        fn test_empty_receipt_produces_empty_updates() {
+            let receipt = LedgerTransactionReceipt {
+                outcome: LedgerTransactionOutcome::Success,
+                state_changes: vec![],
+                application_events: vec![],
+            };
+            let updates = receipt_to_database_updates(&receipt);
+            assert!(updates.node_updates.is_empty());
+        }
+
+        #[test]
+        fn test_create_produces_set() {
+            let receipt = LedgerTransactionReceipt {
+                outcome: LedgerTransactionOutcome::Success,
+                state_changes: vec![SubstateChange {
+                    substate_ref: SubstateRef {
+                        node_id: NodeId([1; 30]),
+                        partition: PartitionNumber(0),
+                        sort_key: vec![10],
+                    },
+                    action: SubstateChangeAction::Create {
+                        new_value: vec![42],
+                    },
+                }],
+                application_events: vec![],
+            };
+            let updates = receipt_to_database_updates(&receipt);
+            assert_eq!(updates.node_updates.len(), 1);
+
+            let node = updates.node_updates.values().next().unwrap();
+            let part = node.partition_updates.values().next().unwrap();
+            match part {
+                PartitionDatabaseUpdates::Delta { substate_updates } => {
+                    assert_eq!(substate_updates.len(), 1);
+                    let val = substate_updates.values().next().unwrap();
+                    assert!(matches!(val, DatabaseUpdate::Set(v) if v == &vec![42]));
+                }
+                _ => panic!("expected Delta"),
+            }
+        }
+
+        #[test]
+        fn test_delete_produces_delete() {
+            let receipt = LedgerTransactionReceipt {
+                outcome: LedgerTransactionOutcome::Failure,
+                state_changes: vec![SubstateChange {
+                    substate_ref: SubstateRef {
+                        node_id: NodeId([2; 30]),
+                        partition: PartitionNumber(1),
+                        sort_key: vec![20],
+                    },
+                    action: SubstateChangeAction::Delete {
+                        previous_value: vec![99],
+                    },
+                }],
+                application_events: vec![],
+            };
+            let updates = receipt_to_database_updates(&receipt);
+            assert_eq!(updates.node_updates.len(), 1);
+
+            let node = updates.node_updates.values().next().unwrap();
+            let part = node.partition_updates.values().next().unwrap();
+            match part {
+                PartitionDatabaseUpdates::Delta { substate_updates } => {
+                    assert_eq!(substate_updates.len(), 1);
+                    let val = substate_updates.values().next().unwrap();
+                    assert!(matches!(val, DatabaseUpdate::Delete));
+                }
+                _ => panic!("expected Delta"),
+            }
+        }
+
+        #[test]
+        fn test_update_uses_new_value() {
+            let receipt = LedgerTransactionReceipt {
+                outcome: LedgerTransactionOutcome::Success,
+                state_changes: vec![SubstateChange {
+                    substate_ref: SubstateRef {
+                        node_id: NodeId([3; 30]),
+                        partition: PartitionNumber(2),
+                        sort_key: vec![30],
+                    },
+                    action: SubstateChangeAction::Update {
+                        previous_value: vec![10],
+                        new_value: vec![20],
+                    },
+                }],
+                application_events: vec![],
+            };
+            let updates = receipt_to_database_updates(&receipt);
+
+            let node = updates.node_updates.values().next().unwrap();
+            let part = node.partition_updates.values().next().unwrap();
+            match part {
+                PartitionDatabaseUpdates::Delta { substate_updates } => {
+                    let val = substate_updates.values().next().unwrap();
+                    assert!(
+                        matches!(val, DatabaseUpdate::Set(v) if v == &vec![20]),
+                        "should use new_value, not previous_value"
+                    );
+                }
+                _ => panic!("expected Delta"),
+            }
+        }
+
+        #[test]
+        fn test_multiple_changes_same_node_different_partitions() {
+            let receipt = LedgerTransactionReceipt {
+                outcome: LedgerTransactionOutcome::Success,
+                state_changes: vec![
+                    SubstateChange {
+                        substate_ref: SubstateRef {
+                            node_id: NodeId([4; 30]),
+                            partition: PartitionNumber(0),
+                            sort_key: vec![1],
+                        },
+                        action: SubstateChangeAction::Create {
+                            new_value: vec![10],
+                        },
+                    },
+                    SubstateChange {
+                        substate_ref: SubstateRef {
+                            node_id: NodeId([4; 30]),
+                            partition: PartitionNumber(5),
+                            sort_key: vec![2],
+                        },
+                        action: SubstateChangeAction::Create {
+                            new_value: vec![20],
+                        },
+                    },
+                ],
+                application_events: vec![],
+            };
+            let updates = receipt_to_database_updates(&receipt);
+            // Same node_id → same db_node_key → one entry
+            assert_eq!(updates.node_updates.len(), 1);
+            let node = updates.node_updates.values().next().unwrap();
+            assert_eq!(node.partition_updates.len(), 2);
+        }
     }
 }

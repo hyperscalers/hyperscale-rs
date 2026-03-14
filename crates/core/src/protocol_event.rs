@@ -114,6 +114,9 @@ pub enum ProtocolEvent {
     /// Transaction root verification completed.
     TransactionRootVerified { block_hash: Hash, valid: bool },
 
+    /// Receipt root verification completed.
+    ReceiptRootVerified { block_hash: Hash, valid: bool },
+
     /// Proposal block built by the runner.
     ProposalBuilt {
         height: BlockHeight,
@@ -176,12 +179,21 @@ pub enum ProtocolEvent {
     /// Received an execution vote for cross-shard execution.
     ExecutionVoteReceived { vote: ExecutionVote },
 
-    /// Batch of execution votes from a single dispatch (ExecuteTransactions / SpeculativeExecute).
+    /// Batch of execution results from a single ExecuteTransactions or SpeculativeExecute dispatch.
     ///
-    /// Replaces N individual `ExecutionVoteReceived` callback events with one batch,
-    /// reducing channel sends and state-machine `handle()` calls proportionally to
-    /// the number of transactions in a block.
-    ExecutionVoteBatchReceived { votes: Vec<ExecutionVote> },
+    /// Votes are lightweight (receipt_hash + write_nodes) — suitable for network gossip.
+    /// Results carry the full execution output (DatabaseUpdates, receipts) — stays local.
+    ///
+    /// The state machine uses results to:
+    /// 1. Populate ExecutionCache (in-memory, for block commit fast path)
+    /// 2. Dispatch StoreReceiptBundles action (for canonical execution only)
+    ExecutionBatchCompleted {
+        votes: Vec<ExecutionVote>,
+        results: Vec<hyperscale_types::ExecutionResult>,
+        /// True when this batch came from speculative execution.
+        /// Receipt bundles are only persisted for canonical (non-speculative) execution.
+        speculative: bool,
+    },
 
     /// Received an execution certificate for cross-shard execution.
     ExecutionCertificateReceived { cert: ExecutionCertificate },
@@ -219,11 +231,7 @@ pub enum ProtocolEvent {
         submitted_locally: bool,
     },
 
-    /// A transaction certificate has been verified and the execution outcome resolved.
-    ///
-    /// Emitted as a continuation after `TransactionCertificateVerified`, not after
-    /// speculative or normal execution. The `accepted` field comes from
-    /// `certificate.is_accepted()`.
+    /// A transaction's execution outcome has been resolved and certificate finalized.
     TransactionExecuted { tx_hash: Hash, accepted: bool },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -245,14 +253,6 @@ pub enum ProtocolEvent {
     FetchedCertificateVerified {
         block_hash: Hash,
         certificate: TransactionCertificate,
-    },
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Transaction Certificate (verified by IoLoop)
-    // ═══════════════════════════════════════════════════════════════════════
-    /// A received TransactionCertificate has been fully verified.
-    TransactionCertificateVerified {
-        certificate: Arc<TransactionCertificate>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -372,6 +372,7 @@ impl ProtocolEvent {
             ProtocolEvent::CommitmentProofVerified { .. } => "CommitmentProofVerified",
             ProtocolEvent::StateRootVerified { .. } => "StateRootVerified",
             ProtocolEvent::TransactionRootVerified { .. } => "TransactionRootVerified",
+            ProtocolEvent::ReceiptRootVerified { .. } => "ReceiptRootVerified",
             ProtocolEvent::ProposalBuilt { .. } => "ProposalBuilt",
 
             // State Commit
@@ -386,7 +387,7 @@ impl ProtocolEvent {
 
             // Execution
             ProtocolEvent::ExecutionVoteReceived { .. } => "ExecutionVoteReceived",
-            ProtocolEvent::ExecutionVoteBatchReceived { .. } => "ExecutionVoteBatchReceived",
+            ProtocolEvent::ExecutionBatchCompleted { .. } => "ExecutionBatchCompleted",
             ProtocolEvent::ExecutionCertificateReceived { .. } => "ExecutionCertificateReceived",
             ProtocolEvent::ExecutionVotesVerifiedAndAggregated { .. } => {
                 "ExecutionVotesVerifiedAndAggregated"
@@ -407,11 +408,6 @@ impl ProtocolEvent {
             ProtocolEvent::TransactionFetchDelivered { .. } => "TransactionFetchDelivered",
             ProtocolEvent::CertificateFetchDelivered { .. } => "CertificateFetchDelivered",
             ProtocolEvent::FetchedCertificateVerified { .. } => "FetchedCertificateVerified",
-
-            // Transaction Certificate
-            ProtocolEvent::TransactionCertificateVerified { .. } => {
-                "TransactionCertificateVerified"
-            }
 
             // Storage Callbacks
             ProtocolEvent::BlockFetched { .. } => "BlockFetched",

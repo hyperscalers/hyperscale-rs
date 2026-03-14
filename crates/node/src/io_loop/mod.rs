@@ -20,7 +20,6 @@
 
 mod actions;
 mod batches;
-mod cert_verification;
 mod handlers;
 mod protocols;
 mod verify;
@@ -48,9 +47,9 @@ use hyperscale_types::{
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::warn;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///
@@ -64,25 +63,6 @@ const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
 const DEFAULT_TX_CACHE_SIZE: usize = 50_000;
 /// Default transaction status cache capacity.
 const DEFAULT_TX_STATUS_CACHE_SIZE: usize = 100_000;
-/// Maximum age for pending certificate verifications before cleanup.
-const PENDING_CERT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Pending verification of a received TransactionCertificate.
-///
-/// When we receive a TransactionCertificate, we verify each embedded
-/// ExecutionCertificate's BLS signature before persisting. This tracks the verification
-/// progress for a single certificate.
-struct PendingCertificateVerification {
-    /// The certificate being verified.
-    certificate: Arc<TransactionCertificate>,
-    /// Shards still awaiting verification callback.
-    pending_shards: HashSet<ShardGroupId>,
-    /// Whether any verification has failed.
-    failed: bool,
-    /// When this verification started (logical time from state.now()).
-    created_at: Duration,
-}
-
 use hyperscale_execution::handlers::UnverifiedExecutionVote;
 
 /// A single execution-vote verification item: tx_hash with its unverified votes.
@@ -189,9 +169,6 @@ where
     cert_cache: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
     tx_cache: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
 
-    // Certificate verification tracking
-    pending_cert_verifications: HashMap<Hash, PendingCertificateVerification>,
-
     // Sync protocol
     sync_protocol: SyncProtocol,
 
@@ -222,6 +199,19 @@ where
     // the execution pool to commit them sequentially. This keeps JMT writes
     // off the pinned IoLoop thread while preserving commit ordering.
     pending_block_commits: Vec<(Block, QuorumCertificate)>,
+
+    // Guard against out-of-order block commits across separate flushes.
+    // When an async commit closure is in flight on the execution pool, new
+    // blocks accumulate in `pending_block_commits` instead of spawning a
+    // second closure (Rayon doesn't guarantee FIFO ordering of spawned tasks).
+    // The closure clears this flag before sending its final event, so the
+    // subsequent `feed_event` → `flush_block_commits` drains the backlog.
+    commit_in_flight: Arc<AtomicBool>,
+
+    // Receipt bundle accumulator — collects StoreReceiptBundles within an
+    // event cycle, then spawns storage writes on the execution pool so
+    // SBOR-encoding + RocksDB writes don't block the IoLoop thread.
+    pending_receipt_bundles: Vec<hyperscale_types::ReceiptBundle>,
 
     // Transaction status cache — retains the latest status for every transaction
     // that has emitted a status notification. Bounded LRU cache shared (via Arc)
@@ -285,7 +275,6 @@ where
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             cert_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
-            pending_cert_verifications: HashMap::new(),
             tx_validator,
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
@@ -316,6 +305,8 @@ where
                 b.committed_header_window,
             ),
             pending_block_commits: Vec::new(),
+            commit_in_flight: Arc::new(AtomicBool::new(false)),
+            pending_receipt_bundles: Vec::new(),
             cached_local_peers,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),
             emitted_statuses: Vec::new(),
@@ -526,20 +517,26 @@ where
                 }
             }
 
-            NodeInput::TransactionCertificateReceived { certificate } => {
-                self.handle_received_certificate(certificate);
-            }
-
-            NodeInput::CertificateSignatureVerified {
-                tx_hash,
-                shard,
-                valid,
-            } => {
-                self.handle_cert_verification_result(tx_hash, shard, valid);
-            }
-
             // ── Sync protocol ──────────────────────────────────────────
-            NodeInput::SyncBlockResponseReceived { height, block } => {
+            NodeInput::SyncBlockResponseReceived {
+                height,
+                block,
+                ledger_receipts,
+            } => {
+                // Store receipts from sync peer BEFORE processing the block.
+                // Syncing nodes didn't execute locally, so local_execution is None.
+                // state_changes already populated by remote peer.
+                let bundles: Vec<hyperscale_types::ReceiptBundle> = ledger_receipts
+                    .iter()
+                    .map(|entry| hyperscale_types::ReceiptBundle {
+                        tx_hash: entry.tx_hash,
+                        ledger_receipt: std::sync::Arc::new(entry.receipt.clone()),
+                        local_execution: None,
+                        database_updates: None,
+                    })
+                    .collect();
+                self.pending_receipt_bundles.extend(bundles);
+                self.flush_receipt_storage();
                 let outputs = self
                     .sync_protocol
                     .handle(SyncInput::BlockResponseReceived { height, block });
@@ -570,7 +567,22 @@ where
             NodeInput::CertificateReceived {
                 block_hash,
                 certificates,
+                ledger_receipts,
             } => {
+                // Store receipts from fetch peer. Syncing nodes didn't execute
+                // locally, so local_execution is None.
+                // state_changes already populated by remote peer.
+                let bundles: Vec<hyperscale_types::ReceiptBundle> = ledger_receipts
+                    .iter()
+                    .map(|entry| hyperscale_types::ReceiptBundle {
+                        tx_hash: entry.tx_hash,
+                        ledger_receipt: std::sync::Arc::new(entry.receipt.clone()),
+                        local_execution: None,
+                        database_updates: None,
+                    })
+                    .collect();
+                self.pending_receipt_bundles.extend(bundles);
+                self.flush_receipt_storage();
                 let outputs = self
                     .fetch_protocol
                     .handle(FetchInput::CertificatesReceived {
@@ -712,7 +724,7 @@ where
                             self.accumulate_broadcast_vote(self.local_shard, vote.clone());
                         }
                     }
-                    ProtocolEvent::ExecutionVoteBatchReceived { ref votes } => {
+                    ProtocolEvent::ExecutionBatchCompleted { ref votes, .. } => {
                         for vote in votes {
                             if vote.validator == self.validator_id {
                                 self.accumulate_broadcast_vote(self.local_shard, vote.clone());
@@ -751,6 +763,7 @@ where
             self.process_action(action);
         }
         self.flush_block_commits();
+        self.flush_receipt_storage();
     }
 
     /// Flush any batch accumulators whose deadlines have expired.
@@ -779,20 +792,6 @@ where
         }
         if self.committed_header_batch.is_expired(now) {
             self.flush_committed_header_verifications();
-        }
-
-        // Clean up stale pending certificate verifications.
-        let before = self.pending_cert_verifications.len();
-        self.pending_cert_verifications.retain(|_, pending| {
-            now.saturating_sub(pending.created_at) < PENDING_CERT_VERIFICATION_TIMEOUT
-        });
-        let cleaned = before - self.pending_cert_verifications.len();
-        if cleaned > 0 {
-            warn!(
-                cleaned,
-                remaining = self.pending_cert_verifications.len(),
-                "Cleaned up stale pending certificate verifications"
-            );
         }
     }
 
@@ -871,9 +870,6 @@ where
 
         // ── Livelock ──
         metrics::set_livelock_deferred_count(self.state.livelock().stats().pending_deferrals);
-
-        // ── Certificate verification tracking ──
-        metrics::set_pending_cert_verification_count(self.pending_cert_verifications.len());
     }
 
     /// Capture a snapshot of node state for external status APIs.
@@ -902,6 +898,7 @@ where
     /// Called during shutdown or when immediate delivery is needed.
     pub fn flush_all_batches(&mut self) {
         self.flush_block_commits();
+        self.flush_receipt_storage();
         self.flush_validation_batch();
         self.flush_cross_shard_executions();
         self.flush_execution_vote_verifications();

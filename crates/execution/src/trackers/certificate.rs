@@ -103,7 +103,7 @@ impl CertificateTracker {
     ///
     /// Returns `None` if:
     /// - Not all certificates have been collected
-    /// - Certificates have mismatched writes commitments (Byzantine behavior)
+    /// - Certificates have mismatched receipt hashes (Byzantine behavior)
     #[instrument(level = "debug", skip(self), fields(
         tx_hash = %self.tx_hash,
         shard_count = self.certificates.len(),
@@ -119,13 +119,13 @@ impl CertificateTracker {
             return None;
         }
 
-        // Verify all shards agree on writes commitment (zero-allocation iterator approach)
-        let mut commitments = self.certificates.values().map(|c| c.writes_commitment);
-        let first = commitments.next()?; // Safe: is_complete() guarantees at least one
-        if !commitments.all(|c| c == first) {
+        // Verify all shards agree on receipt hash (zero-allocation iterator approach)
+        let mut receipt_hashes = self.certificates.values().map(|c| c.receipt_hash);
+        let first = receipt_hashes.next()?; // Safe: is_complete() guarantees at least one
+        if !receipt_hashes.all(|h| h == first) {
             tracing::warn!(
                 tx_hash = ?self.tx_hash,
-                "Writes commitment mismatch across shards - cannot create TX certificate"
+                "Receipt hash mismatch across shards - cannot create TX certificate"
             );
             return None;
         }
@@ -133,7 +133,7 @@ impl CertificateTracker {
         tracing::debug!(
             tx_hash = ?self.tx_hash,
             shards = ?self.certificates.keys().collect::<Vec<_>>(),
-            "Creating TX certificate - all certificates collected and writes commitments match"
+            "Creating TX certificate - all certificates collected and receipt hashes match"
         );
 
         // Determine decision first (before moving certificates)
@@ -163,14 +163,14 @@ mod tests {
     fn make_certificate(
         tx_hash: Hash,
         shard: ShardGroupId,
-        writes_commitment: Hash,
+        receipt_hash: Hash,
     ) -> ExecutionCertificate {
         ExecutionCertificate {
             transaction_hash: tx_hash,
             shard_group_id: shard,
             read_nodes: vec![],
-            state_writes: vec![],
-            writes_commitment,
+            write_nodes: vec![],
+            receipt_hash,
             success: true,
             aggregated_signature: zero_bls_signature(),
             signers: SignerBitfield::new(4),

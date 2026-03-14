@@ -31,7 +31,7 @@ use libp2p_stream as stream;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{info, warn};
 
 /// Shared validator key map, updated atomically on epoch transitions.
 type SharedValidatorKeys = Arc<ArcSwap<ValidatorKeyMap>>;
@@ -206,7 +206,7 @@ async fn run_service(
                 tokio::spawn(async move {
                     let keys_guard = keys.load();
                     if let Err(e) = handle_inbound(peer_id, stream, &vp, local_vid, &sig, &keys_guard).await {
-                        debug!(peer = %peer_id, error = %e, "Inbound validator-bind failed");
+                        warn!(peer = %peer_id, error = %e, "Inbound validator-bind failed");
                     }
                 });
             }
@@ -229,7 +229,7 @@ async fn run_service(
                 tokio::spawn(async move {
                     let keys_guard = keys.load();
                     if let Err(e) = handle_outbound(peer_id, ctrl, &vp, local_vid, &sig, &keys_guard).await {
-                        debug!(peer = %peer_id, error = %e, "Outbound validator-bind failed");
+                        warn!(peer = %peer_id, error = %e, "Outbound validator-bind failed");
                     }
                 });
             }

@@ -1,6 +1,8 @@
 //! Certificate fetch response.
 
-use hyperscale_types::{MessagePriority, NetworkMessage, TransactionCertificate};
+use hyperscale_types::{
+    LedgerReceiptEntry, MessagePriority, NetworkMessage, TransactionCertificate,
+};
 use sbor::prelude::BasicSbor;
 
 /// Response to a certificate fetch request.
@@ -11,18 +13,27 @@ use sbor::prelude::BasicSbor;
 pub struct GetCertificatesResponse {
     /// The requested certificates that were found.
     pub certificates: Vec<TransactionCertificate>,
+    /// Ledger receipts for the found certificates.
+    pub ledger_receipts: Vec<LedgerReceiptEntry>,
 }
 
 impl GetCertificatesResponse {
-    /// Create a response with found certificates.
-    pub fn new(certificates: Vec<TransactionCertificate>) -> Self {
-        Self { certificates }
+    /// Create a response with found certificates and their receipts.
+    pub fn new(
+        certificates: Vec<TransactionCertificate>,
+        ledger_receipts: Vec<LedgerReceiptEntry>,
+    ) -> Self {
+        Self {
+            certificates,
+            ledger_receipts,
+        }
     }
 
     /// Create an empty response (no certificates found).
     pub fn empty() -> Self {
         Self {
             certificates: vec![],
+            ledger_receipts: vec![],
         }
     }
 
@@ -36,7 +47,12 @@ impl GetCertificatesResponse {
         self.certificates.is_empty()
     }
 
-    /// Consume and return the certificates.
+    /// Consume and return the certificates and receipts.
+    pub fn into_parts(self) -> (Vec<TransactionCertificate>, Vec<LedgerReceiptEntry>) {
+        (self.certificates, self.ledger_receipts)
+    }
+
+    /// Consume and return the certificates only.
     pub fn into_certificates(self) -> Vec<TransactionCertificate> {
         self.certificates
     }
@@ -73,7 +89,7 @@ mod tests {
         let cert1 = make_test_certificate(Hash::from_bytes(b"tx1"));
         let cert2 = make_test_certificate(Hash::from_bytes(b"tx2"));
 
-        let response = GetCertificatesResponse::new(vec![cert1.clone(), cert2.clone()]);
+        let response = GetCertificatesResponse::new(vec![cert1.clone(), cert2.clone()], vec![]);
         assert_eq!(response.count(), 2);
         assert!(!response.is_empty());
     }
@@ -90,7 +106,7 @@ mod tests {
         let cert1 = make_test_certificate(Hash::from_bytes(b"tx1"));
         let cert2 = make_test_certificate(Hash::from_bytes(b"tx2"));
 
-        let response = GetCertificatesResponse::new(vec![cert1, cert2]);
+        let response = GetCertificatesResponse::new(vec![cert1, cert2], vec![]);
 
         let encoded = basic_encode(&response).expect("encode");
         let decoded: GetCertificatesResponse = basic_decode(&encoded).expect("decode");

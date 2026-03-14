@@ -73,7 +73,6 @@ where
         let dispatch = self.dispatch.clone();
         let local_shard = self.local_shard;
         let validator_id = self.validator_id;
-        let num_shards = self.num_shards;
         let event_tx = self.event_sender.clone();
 
         self.dispatch.spawn_execution(move || {
@@ -88,11 +87,13 @@ where
                     &signing_key,
                     local_shard,
                     validator_id,
-                    num_shards,
                 )
             });
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
-            for vote in votes {
+            // Cross-shard results are intentionally discarded here — they are partial
+            // (only valid after all shards commit). The execution cache and receipt storage
+            // are populated by the state machine after local single-shard execution instead.
+            for (vote, _result) in votes {
                 let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived {
                     vote,
                 }));

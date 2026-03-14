@@ -91,7 +91,7 @@ impl RequestManager {
 
                     if current_peer_attempts >= self.config.retries_before_rotation {
                         // Rotate to next peer
-                        debug!(
+                        warn!(
                             peer = ?current_peer,
                             current_peer_attempts,
                             request = %request_desc,
@@ -106,7 +106,7 @@ impl RequestManager {
                         // If no other peer available, continue with current
                         current_peer_attempts = 0;
                     } else {
-                        debug!(
+                        warn!(
                             peer = ?current_peer,
                             current_peer_attempts,
                             retries_before_rotation = self.config.retries_before_rotation,
