@@ -186,12 +186,13 @@ pub enum ProtocolEvent {
     ///
     /// The state machine uses results to:
     /// 1. Populate ExecutionCache (in-memory, for block commit fast path)
-    /// 2. Dispatch StoreReceiptBundles action (for canonical execution only)
+    /// 2. Dispatch StoreReceiptBundles action (for both speculative and canonical)
     ExecutionBatchCompleted {
         votes: Vec<ExecutionVote>,
         results: Vec<hyperscale_types::ExecutionResult>,
         /// True when this batch came from speculative execution.
-        /// Receipt bundles are only persisted for canonical (non-speculative) execution.
+        /// Receipt bundles are persisted for both speculative and canonical execution
+        /// so that the sync protocol can always serve complete blocks.
         speculative: bool,
     },
 

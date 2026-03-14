@@ -939,18 +939,30 @@ impl StateMachine for NodeStateMachine {
             } => {
                 // Single pass: populate execution cache and build receipt bundles.
                 // Consumes results by value — no clones needed.
-                let mut bundles: Vec<ReceiptBundle> = if !speculative {
-                    Vec::with_capacity(results.len())
-                } else {
-                    Vec::new()
-                };
+                //
+                // Receipts are stored for BOTH speculative and canonical executions.
+                // The sync protocol requires ledger receipts to serve blocks; without
+                // them `serve_block_request` returns not_found, permanently blocking
+                // any peer that needs to sync past the affected height.
+                //
+                // For speculative batches, we only store receipts for transactions
+                // still tracked in `speculative_in_flight_txs`. After a view change,
+                // that set is cleared — so a slow speculative execution completing
+                // post-view-change won't overwrite a canonical receipt produced by
+                // the re-execution that the view-change path dispatches.
+                let mut bundles: Vec<ReceiptBundle> = Vec::with_capacity(results.len());
 
                 for result in results {
                     let tx_hash = result.tx_hash;
                     let receipt_hash = result.receipt_hash;
                     let db_updates = Arc::new(result.database_updates);
 
-                    if !speculative {
+                    // For speculative batches, skip receipts for transactions that
+                    // are no longer tracked (cleared by view change). Canonical
+                    // execution will produce the correct receipt.
+                    let dominated =
+                        speculative && !self.execution.is_speculative_in_flight_for_tx(&tx_hash);
+                    if !dominated {
                         bundles.push(ReceiptBundle {
                             tx_hash,
                             ledger_receipt: Arc::new(result.ledger_receipt),
