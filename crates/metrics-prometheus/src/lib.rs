@@ -133,7 +133,6 @@ pub struct Metrics {
     pub network_request_retries: CounterVec,
     pub early_arrival_evictions: Counter,
     pub backpressure_events: CounterVec,
-    pub pending_cert_verification_count: Gauge,
 }
 
 impl Metrics {
@@ -683,12 +682,6 @@ impl Metrics {
                 &["source"]
             )
             .unwrap(),
-
-            pending_cert_verification_count: register_gauge!(
-                "hyperscale_pending_cert_verification_count",
-                "Number of certificates waiting for signature verification"
-            )
-            .unwrap(),
         }
     }
 }
@@ -965,12 +958,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .backpressure_events
             .with_label_values(&[source])
             .inc();
-    }
-
-    fn set_pending_cert_verification_count(&self, size: usize) {
-        self.metrics
-            .pending_cert_verification_count
-            .set(size as f64);
     }
 
     fn record_early_arrival_eviction(&self) {

@@ -20,7 +20,6 @@
 
 mod actions;
 mod batches;
-mod cert_verification;
 mod handlers;
 mod protocols;
 mod verify;
@@ -50,7 +49,6 @@ use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tracing::warn;
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
 ///
@@ -64,25 +62,6 @@ const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
 const DEFAULT_TX_CACHE_SIZE: usize = 50_000;
 /// Default transaction status cache capacity.
 const DEFAULT_TX_STATUS_CACHE_SIZE: usize = 100_000;
-/// Maximum age for pending certificate verifications before cleanup.
-const PENDING_CERT_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Pending verification of a received TransactionCertificate.
-///
-/// When we receive a TransactionCertificate, we verify each embedded
-/// ExecutionCertificate's BLS signature before persisting. This tracks the verification
-/// progress for a single certificate.
-struct PendingCertificateVerification {
-    /// The certificate being verified.
-    certificate: Arc<TransactionCertificate>,
-    /// Shards still awaiting verification callback.
-    pending_shards: HashSet<ShardGroupId>,
-    /// Whether any verification has failed.
-    failed: bool,
-    /// When this verification started (logical time from state.now()).
-    created_at: Duration,
-}
-
 use hyperscale_execution::handlers::UnverifiedExecutionVote;
 
 /// A single execution-vote verification item: tx_hash with its unverified votes.
@@ -189,9 +168,6 @@ where
     cert_cache: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
     tx_cache: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
 
-    // Certificate verification tracking
-    pending_cert_verifications: HashMap<Hash, PendingCertificateVerification>,
-
     // Sync protocol
     sync_protocol: SyncProtocol,
 
@@ -285,7 +261,6 @@ where
             prepared_commits: Arc::new(Mutex::new(HashMap::new())),
             cert_cache: Arc::new(QuickCache::new(DEFAULT_CERT_CACHE_SIZE)),
             tx_cache: Arc::new(QuickCache::new(DEFAULT_TX_CACHE_SIZE)),
-            pending_cert_verifications: HashMap::new(),
             tx_validator,
             pending_validation: HashSet::new(),
             locally_submitted: HashSet::new(),
@@ -524,18 +499,6 @@ where
                     self.pending_validation.insert(tx_hash);
                     self.queue_validation(tx);
                 }
-            }
-
-            NodeInput::TransactionCertificateReceived { certificate } => {
-                self.handle_received_certificate(certificate);
-            }
-
-            NodeInput::CertificateSignatureVerified {
-                tx_hash,
-                shard,
-                valid,
-            } => {
-                self.handle_cert_verification_result(tx_hash, shard, valid);
             }
 
             // ── Sync protocol ──────────────────────────────────────────
@@ -805,20 +768,6 @@ where
         if self.committed_header_batch.is_expired(now) {
             self.flush_committed_header_verifications();
         }
-
-        // Clean up stale pending certificate verifications.
-        let before = self.pending_cert_verifications.len();
-        self.pending_cert_verifications.retain(|_, pending| {
-            now.saturating_sub(pending.created_at) < PENDING_CERT_VERIFICATION_TIMEOUT
-        });
-        let cleaned = before - self.pending_cert_verifications.len();
-        if cleaned > 0 {
-            warn!(
-                cleaned,
-                remaining = self.pending_cert_verifications.len(),
-                "Cleaned up stale pending certificate verifications"
-            );
-        }
     }
 
     /// Get the nearest batch deadline, if any.
@@ -896,9 +845,6 @@ where
 
         // ── Livelock ──
         metrics::set_livelock_deferred_count(self.state.livelock().stats().pending_deferrals);
-
-        // ── Certificate verification tracking ──
-        metrics::set_pending_cert_verification_count(self.pending_cert_verifications.len());
     }
 
     /// Capture a snapshot of node state for external status APIs.

@@ -1739,33 +1739,6 @@ impl ExecutionState {
         }
     }
 
-    /// Add a verified certificate received from gossip or fetch.
-    ///
-    /// Called after a TransactionCertificate from another validator has been verified.
-    /// This adds it to finalized_certificates so it's available for block inclusion,
-    /// without going through the normal vote aggregation and certificate tracking flow.
-    pub fn add_verified_certificate(&mut self, certificate: Arc<TransactionCertificate>) {
-        let tx_hash = certificate.transaction_hash;
-
-        // Check if already finalized
-        if self.finalized_certificates.contains_key(&tx_hash) {
-            tracing::debug!(
-                tx_hash = ?tx_hash,
-                "Certificate already finalized, skipping add"
-            );
-            return;
-        }
-
-        tracing::debug!(
-            tx_hash = ?tx_hash,
-            decision = ?certificate.decision,
-            shards = certificate.shard_proofs.len(),
-            "Adding verified certificate from gossip"
-        );
-
-        self.finalized_certificates.insert(tx_hash, certificate);
-    }
-
     // ═══════════════════════════════════════════════════════════════════════════
     // Speculative Execution
     // ═══════════════════════════════════════════════════════════════════════════

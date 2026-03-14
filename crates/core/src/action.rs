@@ -1,10 +1,7 @@
 //! Action types for the deterministic state machine.
 
 use crate::{ProtocolEvent, TimerId};
-use hyperscale_messages::{
-    BlockHeaderNotification, BlockVoteNotification, TransactionCertificateNotification,
-    TransactionGossip,
-};
+use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
     CommittedBlockHeader, DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate,
@@ -68,12 +65,6 @@ pub enum Action {
     BroadcastTransaction {
         shard: ShardGroupId,
         gossip: Box<TransactionGossip>,
-    },
-
-    /// Broadcast a transaction certificate gossip to the local shard.
-    BroadcastTransactionCertificate {
-        shard: ShardGroupId,
-        gossip: TransactionCertificateNotification,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -743,7 +734,6 @@ impl Action {
             Action::BroadcastBlockHeader { .. }
                 | Action::BroadcastBlockVote { .. }
                 | Action::BroadcastTransaction { .. }
-                | Action::BroadcastTransactionCertificate { .. }
                 | Action::BroadcastExecutionVote { .. }
                 | Action::BroadcastExecutionCertificate { .. }
                 | Action::BroadcastCommittedBlockHeader { .. }
@@ -792,9 +782,8 @@ impl Action {
             Action::BroadcastBlockHeader { .. } => "BroadcastBlockHeader",
             Action::BroadcastBlockVote { .. } => "BroadcastBlockVote",
 
-            // Network - Mempool & Certificates
+            // Network - Mempool
             Action::BroadcastTransaction { .. } => "BroadcastTransaction",
-            Action::BroadcastTransactionCertificate { .. } => "BroadcastTransactionCertificate",
 
             // Network - Execution Layer (batchable)
             Action::BroadcastExecutionVote { .. } => "BroadcastExecutionVote",

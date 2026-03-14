@@ -833,27 +833,6 @@ impl NodeStateMachine {
         }
         actions
     }
-
-    /// Handle a received certificate that has been fully verified.
-    fn on_transaction_certificate_verified(
-        &mut self,
-        certificate: Arc<TransactionCertificate>,
-    ) -> Vec<Action> {
-        let tx_hash = certificate.transaction_hash;
-        let accepted = certificate.is_accepted();
-
-        // Cancel any ongoing local certificate building
-        self.execution.cancel_certificate_building(&tx_hash);
-
-        // Add to finalized certificates if not already present
-        self.execution.add_verified_certificate(certificate);
-
-        // Notify mempool that transaction is finalized
-        vec![Action::Continuation(ProtocolEvent::TransactionExecuted {
-            tx_hash,
-            accepted,
-        })]
-    }
 }
 
 impl StateMachine for NodeStateMachine {
@@ -1089,10 +1068,6 @@ impl StateMachine for NodeStateMachine {
                     vec![Arc::new(certificate)],
                 )
             }
-            ProtocolEvent::TransactionCertificateVerified { certificate } => {
-                self.on_transaction_certificate_verified(certificate)
-            }
-
             // ── Storage / Sync ───────────────────────────────────────────
             ProtocolEvent::BlockFetched { .. } => vec![],
             ProtocolEvent::SyncBlockReadyToApply { block, qc } => self

@@ -7,7 +7,6 @@ use crate::protocol::provision_fetch::ProvisionFetchInput;
 use crate::protocol::sync::SyncInput;
 use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_messages::TransactionCertificateNotification;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
@@ -54,9 +53,6 @@ where
             }
             Action::BroadcastTransaction { shard, gossip } => {
                 self.network.broadcast_to_shard(shard, &*gossip);
-            }
-            Action::BroadcastTransactionCertificate { shard: _, gossip } => {
-                self.network.notify(&self.cached_local_peers, &gossip);
             }
             Action::BroadcastCommittedBlockHeader { gossip } => {
                 self.network.broadcast_global(&gossip);
@@ -225,20 +221,6 @@ where
                 self.cert_cache
                     .insert(certificate.transaction_hash, Arc::new(certificate.clone()));
                 self.storage.store_certificate(&certificate);
-                // Notify local shard peers about cross-shard certificates.
-                if certificate.shard_proofs.len() > 1 {
-                    let msg = hyperscale_types::tx_cert_gossip_message(
-                        self.local_shard,
-                        &certificate.transaction_hash,
-                    );
-                    let sig = self.signing_key.sign_v1(&msg);
-                    let gossip = TransactionCertificateNotification::new(
-                        certificate,
-                        self.validator_id,
-                        sig,
-                    );
-                    self.network.notify(&self.cached_local_peers, &gossip);
-                }
             }
             Action::PersistAndBroadcastVote {
                 height,

@@ -231,11 +231,7 @@ pub enum ProtocolEvent {
         submitted_locally: bool,
     },
 
-    /// A transaction certificate has been verified and the execution outcome resolved.
-    ///
-    /// Emitted as a continuation after `TransactionCertificateVerified`, not after
-    /// speculative or normal execution. The `accepted` field comes from
-    /// `certificate.is_accepted()`.
+    /// A transaction's execution outcome has been resolved and certificate finalized.
     TransactionExecuted { tx_hash: Hash, accepted: bool },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -257,14 +253,6 @@ pub enum ProtocolEvent {
     FetchedCertificateVerified {
         block_hash: Hash,
         certificate: TransactionCertificate,
-    },
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Transaction Certificate (verified by IoLoop)
-    // ═══════════════════════════════════════════════════════════════════════
-    /// A received TransactionCertificate has been fully verified.
-    TransactionCertificateVerified {
-        certificate: Arc<TransactionCertificate>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -420,11 +408,6 @@ impl ProtocolEvent {
             ProtocolEvent::TransactionFetchDelivered { .. } => "TransactionFetchDelivered",
             ProtocolEvent::CertificateFetchDelivered { .. } => "CertificateFetchDelivered",
             ProtocolEvent::FetchedCertificateVerified { .. } => "FetchedCertificateVerified",
-
-            // Transaction Certificate
-            ProtocolEvent::TransactionCertificateVerified { .. } => {
-                "TransactionCertificateVerified"
-            }
 
             // Storage Callbacks
             ProtocolEvent::BlockFetched { .. } => "BlockFetched",

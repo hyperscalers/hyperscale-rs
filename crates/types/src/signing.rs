@@ -212,26 +212,6 @@ pub fn exec_cert_batch_message(
 }
 
 /// Domain tag for transaction certificate gossip.
-///
-/// Format: `TX_CERT_GOSSIP` || shard_group_id || tx_hash
-///
-/// Signed by the sender when gossiping finalized transaction certificates.
-/// Verified by receivers to reject unauthenticated certificate spam.
-pub const DOMAIN_TX_CERT_GOSSIP: &[u8] = b"TX_CERT_GOSSIP";
-
-/// Build the signing message for a transaction certificate gossip.
-///
-/// The message covers the shard and the transaction hash. Cheap to
-/// reconstruct at verification while binding the signature to the
-/// specific certificate.
-pub fn tx_cert_gossip_message(shard_group: ShardGroupId, tx_hash: &Hash) -> Vec<u8> {
-    let mut message = Vec::with_capacity(64);
-    message.extend_from_slice(DOMAIN_TX_CERT_GOSSIP);
-    message.extend_from_slice(&shard_group.0.to_le_bytes());
-    message.extend_from_slice(tx_hash.as_bytes());
-    message
-}
-
 /// Domain tag for validator-bind protocol.
 ///
 /// Format: `VALIDATOR_BIND` || peer_id_bytes
@@ -413,17 +393,6 @@ mod tests {
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_EXEC_CERT_BATCH));
-    }
-
-    #[test]
-    fn test_tx_cert_gossip_message_deterministic() {
-        let tx_hash = Hash::from_bytes(b"tx1");
-
-        let msg1 = tx_cert_gossip_message(ShardGroupId(1), &tx_hash);
-        let msg2 = tx_cert_gossip_message(ShardGroupId(1), &tx_hash);
-
-        assert_eq!(msg1, msg2);
-        assert!(msg1.starts_with(DOMAIN_TX_CERT_GOSSIP));
     }
 
     #[test]

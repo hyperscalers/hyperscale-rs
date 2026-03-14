@@ -50,16 +50,6 @@ pub enum NodeInput {
     /// Client submitted a transaction.
     SubmitTransaction { tx: Arc<RoutableTransaction> },
 
-    /// Received a finalized transaction certificate via notification.
-    TransactionCertificateReceived { certificate: TransactionCertificate },
-
-    /// A shard's signature in a received certificate has been verified.
-    CertificateSignatureVerified {
-        tx_hash: Hash,
-        shard: ShardGroupId,
-        valid: bool,
-    },
-
     /// Sync block response received from network callback.
     SyncBlockResponseReceived {
         height: u64,
@@ -172,8 +162,6 @@ impl NodeInput {
                 _ => EventPriority::Internal,
             },
             NodeInput::SubmitTransaction { .. } => EventPriority::Client,
-            NodeInput::TransactionCertificateReceived { .. } => EventPriority::Network,
-            NodeInput::CertificateSignatureVerified { .. } => EventPriority::Internal,
             NodeInput::SyncBlockResponseReceived { .. } => EventPriority::Internal,
             NodeInput::SyncBlockFetchFailed { .. } => EventPriority::Internal,
             NodeInput::FetchTick => EventPriority::Timer,
@@ -210,8 +198,6 @@ impl NodeInput {
         match self {
             NodeInput::Protocol(pe) => pe.type_name(),
             NodeInput::SubmitTransaction { .. } => "SubmitTransaction",
-            NodeInput::TransactionCertificateReceived { .. } => "TransactionCertificateReceived",
-            NodeInput::CertificateSignatureVerified { .. } => "CertificateSignatureVerified",
             NodeInput::SyncBlockResponseReceived { .. } => "SyncBlockResponseReceived",
             NodeInput::SyncBlockFetchFailed { .. } => "SyncBlockFetchFailed",
             NodeInput::FetchTick => "FetchTick",
