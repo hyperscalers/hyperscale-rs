@@ -24,8 +24,8 @@ use tracing::instrument;
 /// votes on the execution result (receipt hash). This tracker collects votes
 /// and determines when quorum is reached.
 ///
-/// The tracker now supports deferred verification: unverified votes are buffered
-/// until we have enough voting power to possibly reach quorum, then batch-verified.
+/// Supports deferred verification: unverified votes are buffered until we have
+/// enough voting power to possibly reach quorum, then batch-verified.
 #[derive(Debug)]
 pub struct VoteTracker {
     /// Transaction hash.

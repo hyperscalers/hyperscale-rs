@@ -29,8 +29,12 @@ pub fn extract_state_updates(receipt: &TransactionReceipt) -> Option<DatabaseUpd
     }
 }
 
-/// Check if a transaction receipt represents a successful commit.
-pub fn is_commit_success(receipt: &TransactionReceipt) -> bool {
+/// Check if a transaction receipt committed (state changes applied).
+///
+/// In Radix Engine, `Commit` means the transaction's state changes were applied
+/// (including fee payment). The transaction's own logic may still have failed
+/// (`Commit(Failure)`) — use `commit.outcome` to distinguish success from failure.
+pub fn is_committed(receipt: &TransactionReceipt) -> bool {
     matches!(&receipt.result, TransactionResult::Commit(_))
 }
 
@@ -47,17 +51,11 @@ pub fn extract_database_updates(receipt: &TransactionReceipt) -> DatabaseUpdates
 
 /// Build a `LedgerTransactionReceipt` from a Radix Engine receipt.
 ///
-/// The caller must pass the pre-computed `DatabaseUpdates` for this transaction
-/// (from `extract_database_updates`) so that we don't recompute it internally.
-///
 /// State changes are derived purely from `DatabaseUpdates` without reading
 /// previous values from storage. The Create/Update/Delete classification is
 /// approximate (all Sets are classified as Create) — this is safe because
 /// `state_changes` are NOT part of the consensus receipt hash.
-pub fn build_ledger_receipt(
-    receipt: &TransactionReceipt,
-    _db_updates: &DatabaseUpdates,
-) -> LedgerTransactionReceipt {
+pub fn build_ledger_receipt(receipt: &TransactionReceipt) -> LedgerTransactionReceipt {
     match &receipt.result {
         TransactionResult::Commit(commit) => {
             let application_events = extract_application_events(commit);
@@ -392,7 +390,6 @@ mod tests {
         AbortResult, CommitResult, RejectResult, TransactionOutcome, TransactionReceipt,
         TransactionResult,
     };
-    use radix_substate_store_interface::interface::DatabaseUpdates;
 
     // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -435,7 +432,7 @@ mod tests {
     #[test]
     fn test_build_ledger_receipt_commit_success() {
         let receipt = TransactionReceipt::empty_commit_success();
-        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default());
+        let ledger = build_ledger_receipt(&receipt);
 
         assert_eq!(ledger.outcome, LedgerTransactionOutcome::Success);
         assert!(ledger.state_changes.is_empty());
@@ -457,7 +454,7 @@ mod tests {
             (event_id.clone(), b"event_data_1".to_vec()),
             (event_id, b"event_data_2".to_vec()),
         ]);
-        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default());
+        let ledger = build_ledger_receipt(&receipt);
 
         assert_eq!(ledger.outcome, LedgerTransactionOutcome::Success);
         assert_eq!(ledger.application_events.len(), 2);
@@ -470,7 +467,7 @@ mod tests {
     #[test]
     fn test_build_ledger_receipt_reject() {
         let receipt = make_reject_receipt();
-        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default());
+        let ledger = build_ledger_receipt(&receipt);
 
         assert_eq!(ledger, LedgerTransactionReceipt::failure());
         assert_eq!(ledger.outcome, LedgerTransactionOutcome::Failure);
@@ -481,7 +478,7 @@ mod tests {
     #[test]
     fn test_build_ledger_receipt_abort() {
         let receipt = make_abort_receipt();
-        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default());
+        let ledger = build_ledger_receipt(&receipt);
 
         assert_eq!(ledger, LedgerTransactionReceipt::failure());
     }
@@ -489,8 +486,8 @@ mod tests {
     #[test]
     fn test_build_ledger_receipt_receipt_hash_deterministic() {
         let receipt = TransactionReceipt::empty_commit_success();
-        let ledger_a = build_ledger_receipt(&receipt, &DatabaseUpdates::default());
-        let ledger_b = build_ledger_receipt(&receipt, &DatabaseUpdates::default());
+        let ledger_a = build_ledger_receipt(&receipt);
+        let ledger_b = build_ledger_receipt(&receipt);
 
         assert_eq!(ledger_a.receipt_hash(), ledger_b.receipt_hash());
     }

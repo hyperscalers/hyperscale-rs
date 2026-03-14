@@ -119,8 +119,7 @@ impl SingleTxResult {
 }
 
 // ExecutionResult is defined in hyperscale_types::receipt and re-exported
-// from hyperscale_types. The engine crate re-exports it from lib.rs for
-// backward compatibility.
+// from hyperscale_types. The engine crate re-exports it from lib.rs.
 
 impl From<SingleTxResult> for ExecutionResult {
     fn from(r: SingleTxResult) -> Self {

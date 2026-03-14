@@ -12,7 +12,6 @@ hyperscale-mempool.workspace = true
 hyperscale-messages.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
-radix-substate-store-interface.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 serde.workspace = true

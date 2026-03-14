@@ -302,11 +302,10 @@ mod tests {
     fn test_signed_execution_vote() {
         let committee = TestCommittee::new(4, 42);
         let tx_hash = Hash::from_bytes(b"tx");
-        let writes_commitment = Hash::from_bytes(b"state");
+        let receipt_hash = Hash::from_bytes(b"state");
         let shard = ShardGroupId(0);
 
-        let vote =
-            make_signed_execution_vote(&committee, 0, tx_hash, writes_commitment, shard, true);
+        let vote = make_signed_execution_vote(&committee, 0, tx_hash, receipt_hash, shard, true);
 
         // Should verify with correct key
         assert!(verify_execution_vote(&vote, committee.public_key(0)));
@@ -319,14 +318,14 @@ mod tests {
     fn test_signed_execution_certificate() {
         let committee = TestCommittee::new(4, 42);
         let tx_hash = Hash::from_bytes(b"tx");
-        let writes_commitment = Hash::from_bytes(b"commitment");
+        let receipt_hash = Hash::from_bytes(b"commitment");
         let shard = ShardGroupId(0);
 
         let cert = make_signed_execution_certificate(
             &committee,
             &[0, 1, 2],
             tx_hash,
-            writes_commitment,
+            receipt_hash,
             shard,
             true,
         );

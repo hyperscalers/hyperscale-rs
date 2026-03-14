@@ -120,9 +120,9 @@ impl CertificateTracker {
         }
 
         // Verify all shards agree on receipt hash (zero-allocation iterator approach)
-        let mut commitments = self.certificates.values().map(|c| c.receipt_hash);
-        let first = commitments.next()?; // Safe: is_complete() guarantees at least one
-        if !commitments.all(|c| c == first) {
+        let mut receipt_hashes = self.certificates.values().map(|c| c.receipt_hash);
+        let first = receipt_hashes.next()?; // Safe: is_complete() guarantees at least one
+        if !receipt_hashes.all(|h| h == first) {
             tracing::warn!(
                 tx_hash = ?self.tx_hash,
                 "Receipt hash mismatch across shards - cannot create TX certificate"

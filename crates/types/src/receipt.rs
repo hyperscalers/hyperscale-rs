@@ -319,7 +319,7 @@ pub struct ExecutionResult {
     /// Computed on the execution thread pool to avoid recomputation on the state machine.
     pub receipt_hash: Hash,
     /// Raw DatabaseUpdates for the execution cache.
-    pub database_updates: radix_substate_store_interface::interface::DatabaseUpdates,
+    pub database_updates: DatabaseUpdates,
     /// Full ledger receipt with all state changes.
     pub ledger_receipt: LedgerTransactionReceipt,
     /// Local execution metadata (fees, logs, errors).

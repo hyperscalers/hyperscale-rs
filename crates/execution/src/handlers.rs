@@ -32,7 +32,7 @@ pub type UnverifiedExecutionVote = (ExecutionVote, Bls12381G1PublicKey, u64);
 ///
 /// The caller provides `read_nodes` and `write_nodes` directly (from the
 /// local execution result) rather than extracting them from votes, since votes
-/// are now lightweight (receipt_hash + write_nodes only).
+/// are lightweight (receipt_hash + write_nodes only).
 #[allow(clippy::too_many_arguments)]
 pub fn aggregate_execution_certificate(
     tx_hash: Hash,
@@ -178,7 +178,7 @@ pub fn verify_execution_certificate_signature(
 ///
 /// For a single tx_hash, delegates to [`verify_and_aggregate_execution_votes`]
 /// which applies same-message grouping (cheaper when many votes share a
-/// merkle root).
+/// receipt hash).
 pub fn batch_verify_and_aggregate_execution_votes(
     items: Vec<(Hash, Vec<UnverifiedExecutionVote>)>,
 ) -> Vec<(Hash, Vec<(ExecutionVote, u64)>)> {
@@ -301,8 +301,8 @@ pub fn batch_verify_execution_certificate_signatures(
 /// Calls `executor.execute_single_shard()` with the given transaction,
 /// then signs the execution result with the validator's private key.
 ///
-/// Returns an `(ExecutionVote, SingleTxResult)` tuple. The vote is lightweight
-/// (receipt_hash + write_nodes); the full execution result travels alongside
+/// Returns an `(ExecutionVote, SingleTxResult)` tuple. The vote contains only
+/// receipt_hash + write_nodes; the full execution result travels alongside
 /// for the state machine to populate the execution cache and store receipts.
 pub fn execute_and_sign_single_shard<S: SubstateStore>(
     executor: &RadixExecutor,
@@ -361,8 +361,8 @@ pub fn execute_and_sign_single_shard<S: SubstateStore>(
 /// using the topology to determine which nodes are local to this shard.
 /// Signs the execution result with the validator's private key.
 ///
-/// Returns an `(ExecutionVote, SingleTxResult)` tuple. The vote is lightweight
-/// (receipt_hash + write_nodes); the full execution result travels alongside
+/// Returns an `(ExecutionVote, SingleTxResult)` tuple. The vote contains only
+/// receipt_hash + write_nodes; the full execution result travels alongside
 /// for the state machine to populate the execution cache and store receipts.
 #[allow(clippy::too_many_arguments)]
 pub fn execute_and_sign_cross_shard<S: SubstateStore>(
@@ -435,14 +435,14 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
 /// writes. These undeclared writes must be stripped before the result
 /// enters the execution cache / JMT.
 fn filter_to_declared_writes(
-    updates: &radix_substate_store_interface::interface::DatabaseUpdates,
+    updates: &hyperscale_storage::DatabaseUpdates,
     declared_writes: &[NodeId],
-) -> radix_substate_store_interface::interface::DatabaseUpdates {
+) -> hyperscale_storage::DatabaseUpdates {
     if declared_writes.is_empty() {
         return updates.clone();
     }
     let allowed: HashSet<NodeId> = declared_writes.iter().copied().collect();
-    let mut filtered = radix_substate_store_interface::interface::DatabaseUpdates::default();
+    let mut filtered = hyperscale_storage::DatabaseUpdates::default();
     for (db_node_key, node_updates) in &updates.node_updates {
         let Some(node_id) = hyperscale_storage::keys::db_node_key_to_node_id(db_node_key) else {
             continue;
@@ -460,9 +460,7 @@ fn filter_to_declared_writes(
 ///
 /// Uses BTreeSet to ensure all validators within a shard produce identical
 /// write_nodes vectors (deterministic ordering from identical execution).
-pub fn extract_write_nodes(
-    updates: &radix_substate_store_interface::interface::DatabaseUpdates,
-) -> Vec<NodeId> {
+pub fn extract_write_nodes(updates: &hyperscale_storage::DatabaseUpdates) -> Vec<NodeId> {
     updates
         .node_updates
         .keys()

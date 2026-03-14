@@ -31,7 +31,7 @@
 
 use crate::error::ExecutionError;
 use crate::execution::{
-    build_ledger_receipt, build_local_execution, extract_database_updates, is_commit_success,
+    build_ledger_receipt, build_local_execution, extract_database_updates, is_committed,
     ProvisionedSnapshot,
 };
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
@@ -265,7 +265,7 @@ impl RadixExecutor {
                 &self.caches.exec_config,
             );
 
-            let result = self.receipt_to_cross_shard_result(tx.hash(), &receipt);
+            let result = self.receipt_to_result(tx.hash(), &receipt);
 
             // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
             // and applied when the TransactionCertificate is included in a block.
@@ -314,40 +314,11 @@ impl RadixExecutor {
 
     /// Convert a receipt to a result.
     fn receipt_to_result(&self, tx_hash: Hash, receipt: &TransactionReceipt) -> SingleTxResult {
-        let success = is_commit_success(receipt);
+        let success = is_committed(receipt);
 
         if success {
             let database_updates = extract_database_updates(receipt);
-            let ledger_receipt = build_ledger_receipt(receipt, &database_updates);
-            let local_execution = build_local_execution(receipt);
-            let receipt_hash = ledger_receipt.receipt_hash();
-            SingleTxResult::success(
-                tx_hash,
-                receipt_hash,
-                ledger_receipt,
-                local_execution,
-                database_updates,
-            )
-        } else {
-            let error = format!("{:?}", receipt.result);
-            SingleTxResult::failure(tx_hash, error)
-        }
-    }
-
-    /// Convert a receipt to a result for cross-shard transactions.
-    ///
-    /// State writes are no longer embedded in the result — the execution cache
-    /// holds the raw `DatabaseUpdates`, and block commit reads from there.
-    fn receipt_to_cross_shard_result(
-        &self,
-        tx_hash: Hash,
-        receipt: &TransactionReceipt,
-    ) -> SingleTxResult {
-        let success = is_commit_success(receipt);
-
-        if success {
-            let database_updates = extract_database_updates(receipt);
-            let ledger_receipt = build_ledger_receipt(receipt, &database_updates);
+            let ledger_receipt = build_ledger_receipt(receipt);
             let local_execution = build_local_execution(receipt);
             let receipt_hash = ledger_receipt.receipt_hash();
             SingleTxResult::success(

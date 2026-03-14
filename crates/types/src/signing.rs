@@ -211,7 +211,6 @@ pub fn exec_cert_batch_message(
     message
 }
 
-/// Domain tag for transaction certificate gossip.
 /// Domain tag for validator-bind protocol.
 ///
 /// Format: `VALIDATOR_BIND` || peer_id_bytes

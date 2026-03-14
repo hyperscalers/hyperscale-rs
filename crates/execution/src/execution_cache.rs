@@ -138,10 +138,9 @@ impl ExecutionCache {
 mod tests {
     use super::*;
 
-    fn make_updates(seed: u8) -> Arc<DatabaseUpdates> {
+    fn make_updates() -> Arc<DatabaseUpdates> {
         // Empty updates are sufficient for cache tests — we're testing
         // the cache mechanics, not the content of the updates.
-        let _ = seed;
         Arc::new(DatabaseUpdates::default())
     }
 
@@ -153,7 +152,7 @@ mod tests {
     fn test_insert_and_get() {
         let mut cache = ExecutionCache::new(100);
         let h = hash(1);
-        let updates = make_updates(1);
+        let updates = make_updates();
 
         assert!(cache.get(&h).is_none());
         cache.insert(h, updates, Hash::ZERO);
@@ -165,7 +164,7 @@ mod tests {
     fn test_remove() {
         let mut cache = ExecutionCache::new(100);
         let h = hash(1);
-        cache.insert(h, make_updates(1), Hash::ZERO);
+        cache.insert(h, make_updates(), Hash::ZERO);
 
         let removed = cache.remove(&h);
         assert!(removed.is_some());
@@ -183,7 +182,7 @@ mod tests {
     fn test_remove_batch() {
         let mut cache = ExecutionCache::new(100);
         for i in 0..5 {
-            cache.insert(hash(i), make_updates(i), Hash::ZERO);
+            cache.insert(hash(i), make_updates(), Hash::ZERO);
         }
         assert_eq!(cache.len(), 5);
 
@@ -199,13 +198,13 @@ mod tests {
     #[test]
     fn test_lru_eviction() {
         let mut cache = ExecutionCache::new(3);
-        cache.insert(hash(1), make_updates(1), Hash::ZERO);
-        cache.insert(hash(2), make_updates(2), Hash::ZERO);
-        cache.insert(hash(3), make_updates(3), Hash::ZERO);
+        cache.insert(hash(1), make_updates(), Hash::ZERO);
+        cache.insert(hash(2), make_updates(), Hash::ZERO);
+        cache.insert(hash(3), make_updates(), Hash::ZERO);
         assert_eq!(cache.len(), 3);
 
         // Inserting a 4th should evict hash(1) (oldest)
-        cache.insert(hash(4), make_updates(4), Hash::ZERO);
+        cache.insert(hash(4), make_updates(), Hash::ZERO);
         assert_eq!(cache.len(), 3);
         assert!(cache.get(&hash(1)).is_none(), "oldest should be evicted");
         assert!(cache.get(&hash(2)).is_some());
@@ -216,12 +215,12 @@ mod tests {
     #[test]
     fn test_insert_duplicate_does_not_evict() {
         let mut cache = ExecutionCache::new(3);
-        cache.insert(hash(1), make_updates(1), Hash::ZERO);
-        cache.insert(hash(2), make_updates(2), Hash::ZERO);
-        cache.insert(hash(3), make_updates(3), Hash::ZERO);
+        cache.insert(hash(1), make_updates(), Hash::ZERO);
+        cache.insert(hash(2), make_updates(), Hash::ZERO);
+        cache.insert(hash(3), make_updates(), Hash::ZERO);
 
         // Re-inserting hash(1) should NOT evict anything
-        cache.insert(hash(1), make_updates(1), Hash::ZERO);
+        cache.insert(hash(1), make_updates(), Hash::ZERO);
         assert_eq!(cache.len(), 3);
         assert!(cache.get(&hash(1)).is_some());
         assert!(cache.get(&hash(2)).is_some());
@@ -231,8 +230,8 @@ mod tests {
     #[test]
     fn test_has_all() {
         let mut cache = ExecutionCache::new(100);
-        cache.insert(hash(1), make_updates(1), Hash::ZERO);
-        cache.insert(hash(2), make_updates(2), Hash::ZERO);
+        cache.insert(hash(1), make_updates(), Hash::ZERO);
+        cache.insert(hash(2), make_updates(), Hash::ZERO);
 
         assert!(cache.has_all(&[hash(1), hash(2)]));
         assert!(!cache.has_all(&[hash(1), hash(3)]));
@@ -242,8 +241,8 @@ mod tests {
     #[test]
     fn test_missing() {
         let mut cache = ExecutionCache::new(100);
-        cache.insert(hash(1), make_updates(1), Hash::ZERO);
-        cache.insert(hash(2), make_updates(2), Hash::ZERO);
+        cache.insert(hash(1), make_updates(), Hash::ZERO);
+        cache.insert(hash(2), make_updates(), Hash::ZERO);
 
         let missing = cache.missing(&[hash(1), hash(2), hash(3)]);
         assert_eq!(missing, vec![hash(3)]);

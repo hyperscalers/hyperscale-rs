@@ -92,6 +92,9 @@ where
                 )
             });
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
+            // Cross-shard results are intentionally discarded here — they are partial
+            // (only valid after all shards commit). The execution cache and receipt storage
+            // are populated by the state machine after local single-shard execution instead.
             for (vote, _result) in votes {
                 let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived {
                     vote,

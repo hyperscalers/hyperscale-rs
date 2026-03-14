@@ -19,11 +19,11 @@
 //!
 //! ## Phase 3: Deterministic Execution
 //! With provisioned state, validators execute the transaction and create
-//! an ExecutionVote with merkle root of execution results.
+//! an ExecutionVote with the receipt hash of execution results.
 //!
 //! ## Phase 4: Vote Aggregation
 //! Validators broadcast votes to their local shard. When 2f+1 voting power agrees
-//! on the same merkle root, an ExecutionCertificate is created and broadcast to
+//! on the same receipt hash, an ExecutionCertificate is created and broadcast to
 //! remote participating shards (local peers form it independently).
 //!
 //! ## Phase 5: Finalization
@@ -387,7 +387,7 @@ impl ExecutionState {
             .into_iter()
             .partition(|tx| topology.is_single_shard_transaction(tx));
 
-        // Handle single-shard transactions (now use voting like cross-shard)
+        // Handle single-shard transactions (voting, same as cross-shard)
         // All WRITE operations need BLS signature aggregation
         //
         // With inline signing, speculative execution has already signed and sent votes.
@@ -746,7 +746,6 @@ impl ExecutionState {
     // Phase 3: Vote Aggregation
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle execution vote received.
     /// Handle an execution vote received from another validator.
     ///
     /// Uses deferred verification: votes are buffered until we have enough
@@ -943,9 +942,7 @@ impl ExecutionState {
         // Mark as seen to prevent re-buffering if vote arrives again
         let validator_id = vote.validator;
         if !tracker.has_seen_validator(validator_id) {
-            // We need to mark it as seen even though we're adding it directly
-            // Use a dummy public key since we won't actually verify
-            // Actually, we should track this differently - let's just add to verified_execution_votes
+            // Record in verified_execution_votes to prevent re-buffering on duplicate arrival
             self.verified_execution_votes
                 .insert((tx_hash, validator_id), 0);
             self.verified_votes_by_tx
@@ -1086,13 +1083,12 @@ impl ExecutionState {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Phase 4: Finalization
+    // Phase 5: Finalization
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle execution certificate received.
+    /// Handle an execution certificate received from another validator.
     ///
     /// Delegates signature verification to the runner before processing.
-    /// Handle an execution certificate received from another validator.
     #[instrument(skip(self, cert), fields(
         tx_hash = ?cert.transaction_hash,
         shard = cert.shard_group_id.0,
