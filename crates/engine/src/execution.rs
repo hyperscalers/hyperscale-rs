@@ -50,17 +50,20 @@ pub fn extract_database_updates(receipt: &TransactionReceipt) -> DatabaseUpdates
 
 /// Build a `LedgerTransactionReceipt` from a Radix Engine receipt.
 ///
+/// The caller must pass the pre-computed `DatabaseUpdates` for this transaction
+/// (from `extract_database_updates`) so that we don't recompute it internally.
+///
 /// The `execution_snapshot` parameter must be the **same snapshot** used for
 /// execution. This guarantees previous values are read from the correct
 /// state version — no drift possible.
 pub fn build_ledger_receipt(
     receipt: &TransactionReceipt,
+    db_updates: &DatabaseUpdates,
     execution_snapshot: &impl SubstateDatabase,
 ) -> LedgerTransactionReceipt {
     match &receipt.result {
         TransactionResult::Commit(commit) => {
-            let db_updates = commit.state_updates.create_database_updates();
-            let state_changes = extract_state_changes(&db_updates, execution_snapshot);
+            let state_changes = extract_state_changes(db_updates, execution_snapshot);
             let application_events = extract_application_events(commit);
             let outcome = match &commit.outcome {
                 radix_engine::transaction::TransactionOutcome::Success(_) => {
@@ -855,7 +858,7 @@ mod tests {
     fn test_build_ledger_receipt_commit_success() {
         let receipt = TransactionReceipt::empty_commit_success();
         let snapshot = MockSnapshot::new();
-        let ledger = build_ledger_receipt(&receipt, &snapshot);
+        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default(), &snapshot);
 
         assert_eq!(ledger.outcome, LedgerTransactionOutcome::Success);
         assert!(ledger.state_changes.is_empty());
@@ -878,7 +881,7 @@ mod tests {
             (event_id, b"event_data_2".to_vec()),
         ]);
         let snapshot = MockSnapshot::new();
-        let ledger = build_ledger_receipt(&receipt, &snapshot);
+        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default(), &snapshot);
 
         assert_eq!(ledger.outcome, LedgerTransactionOutcome::Success);
         assert_eq!(ledger.application_events.len(), 2);
@@ -892,7 +895,7 @@ mod tests {
     fn test_build_ledger_receipt_reject() {
         let receipt = make_reject_receipt();
         let snapshot = MockSnapshot::new();
-        let ledger = build_ledger_receipt(&receipt, &snapshot);
+        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default(), &snapshot);
 
         assert_eq!(ledger, LedgerTransactionReceipt::failure());
         assert_eq!(ledger.outcome, LedgerTransactionOutcome::Failure);
@@ -904,7 +907,7 @@ mod tests {
     fn test_build_ledger_receipt_abort() {
         let receipt = make_abort_receipt();
         let snapshot = MockSnapshot::new();
-        let ledger = build_ledger_receipt(&receipt, &snapshot);
+        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default(), &snapshot);
 
         assert_eq!(ledger, LedgerTransactionReceipt::failure());
     }
@@ -913,8 +916,8 @@ mod tests {
     fn test_build_ledger_receipt_receipt_hash_deterministic() {
         let receipt = TransactionReceipt::empty_commit_success();
         let snapshot = MockSnapshot::new();
-        let ledger_a = build_ledger_receipt(&receipt, &snapshot);
-        let ledger_b = build_ledger_receipt(&receipt, &snapshot);
+        let ledger_a = build_ledger_receipt(&receipt, &DatabaseUpdates::default(), &snapshot);
+        let ledger_b = build_ledger_receipt(&receipt, &DatabaseUpdates::default(), &snapshot);
 
         assert_eq!(ledger_a.receipt_hash(), ledger_b.receipt_hash());
     }

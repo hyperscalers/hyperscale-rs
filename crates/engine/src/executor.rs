@@ -325,10 +325,11 @@ impl RadixExecutor {
         let success = is_commit_success(receipt);
 
         if success {
-            let ledger_receipt = build_ledger_receipt(receipt, execution_snapshot);
+            let database_updates = extract_database_updates(receipt);
+            let ledger_receipt =
+                build_ledger_receipt(receipt, &database_updates, execution_snapshot);
             let local_execution = build_local_execution(receipt);
             let receipt_hash = ledger_receipt.receipt_hash();
-            let database_updates = extract_database_updates(receipt);
             SingleTxResult::success(
                 tx_hash,
                 receipt_hash,
@@ -344,8 +345,6 @@ impl RadixExecutor {
 
     /// Convert a receipt to a result for cross-shard transactions.
     ///
-    /// Convert a receipt to a result for cross-shard transactions.
-    ///
     /// State writes are no longer embedded in the result — the execution cache
     /// holds the raw `DatabaseUpdates`, and block commit reads from there.
     fn receipt_to_cross_shard_result(
@@ -357,10 +356,11 @@ impl RadixExecutor {
         let success = is_commit_success(receipt);
 
         if success {
-            let ledger_receipt = build_ledger_receipt(receipt, execution_snapshot);
+            let database_updates = extract_database_updates(receipt);
+            let ledger_receipt =
+                build_ledger_receipt(receipt, &database_updates, execution_snapshot);
             let local_execution = build_local_execution(receipt);
             let receipt_hash = ledger_receipt.receipt_hash();
-            let database_updates = extract_database_updates(receipt);
             SingleTxResult::success(
                 tx_hash,
                 receipt_hash,
