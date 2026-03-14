@@ -12,7 +12,7 @@
 
 use hyperscale_storage::DatabaseUpdates;
 use hyperscale_types::Hash;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// Default maximum number of cached entries before LRU eviction.
 pub const DEFAULT_MAX_ENTRIES: usize = 10_000;
@@ -37,8 +37,8 @@ struct CachedExecution {
 /// syncs (fetches receipts from peers) to rebuild state.
 pub struct ExecutionCache {
     entries: HashMap<Hash, CachedExecution>,
-    /// Insertion-order tracking for LRU eviction.
-    insertion_order: Vec<Hash>,
+    /// Insertion-order tracking for LRU eviction (VecDeque for O(1) pop_front).
+    insertion_order: VecDeque<Hash>,
     /// Maximum number of entries before LRU eviction.
     max_entries: usize,
 }
@@ -48,7 +48,7 @@ impl ExecutionCache {
     pub fn new(max_entries: usize) -> Self {
         Self {
             entries: HashMap::with_capacity(max_entries.min(1024)),
-            insertion_order: Vec::with_capacity(max_entries.min(1024)),
+            insertion_order: VecDeque::with_capacity(max_entries.min(1024)),
             max_entries,
         }
     }
@@ -68,8 +68,7 @@ impl ExecutionCache {
 
         // Evict oldest entries if at capacity
         while self.entries.len() >= self.max_entries {
-            if let Some(oldest) = self.insertion_order.first().copied() {
-                self.insertion_order.remove(0);
+            if let Some(oldest) = self.insertion_order.pop_front() {
                 self.entries.remove(&oldest);
             } else {
                 break;
@@ -77,7 +76,7 @@ impl ExecutionCache {
         }
 
         self.entries.insert(tx_hash, entry);
-        self.insertion_order.push(tx_hash);
+        self.insertion_order.push_back(tx_hash);
     }
 
     /// Look up cached writes for a transaction. Returns `None` if not cached.

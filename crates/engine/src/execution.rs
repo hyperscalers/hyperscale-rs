@@ -53,17 +53,17 @@ pub fn extract_database_updates(receipt: &TransactionReceipt) -> DatabaseUpdates
 /// The caller must pass the pre-computed `DatabaseUpdates` for this transaction
 /// (from `extract_database_updates`) so that we don't recompute it internally.
 ///
-/// The `execution_snapshot` parameter must be the **same snapshot** used for
-/// execution. This guarantees previous values are read from the correct
-/// state version — no drift possible.
+/// State changes are derived purely from `DatabaseUpdates` without reading
+/// previous values from storage. The Create/Update/Delete classification is
+/// approximate (all Sets are classified as Create) — this is safe because
+/// `state_changes` are NOT part of the consensus receipt hash.
 pub fn build_ledger_receipt(
     receipt: &TransactionReceipt,
     db_updates: &DatabaseUpdates,
-    execution_snapshot: &impl SubstateDatabase,
 ) -> LedgerTransactionReceipt {
     match &receipt.result {
         TransactionResult::Commit(commit) => {
-            let state_changes = extract_state_changes(db_updates, execution_snapshot);
+            let state_changes = extract_state_changes(db_updates);
             let application_events = extract_application_events(commit);
             let outcome = match &commit.outcome {
                 radix_engine::transaction::TransactionOutcome::Success(_) => {
@@ -115,12 +115,16 @@ pub fn build_local_execution(receipt: &TransactionReceipt) -> LocalTransactionEx
     }
 }
 
-/// Extract state changes from DatabaseUpdates, reading previous values from the
-/// execution snapshot.
-pub(crate) fn extract_state_changes(
-    db_updates: &DatabaseUpdates,
-    snapshot: &impl SubstateDatabase,
-) -> Vec<SubstateChange> {
+/// Extract state changes from DatabaseUpdates without reading previous values.
+///
+/// All `Set` operations are classified as `Create` (no previous_value lookup).
+/// `Delete` operations use an empty previous_value. This is safe because
+/// `state_changes` are NOT part of the consensus receipt hash — the distinction
+/// between Create/Update is purely informational for clients/indexers.
+///
+/// The round-trip through `receipt_to_database_updates` is unaffected: both
+/// Create and Update map to `DatabaseUpdate::Set(new_value)`.
+pub(crate) fn extract_state_changes(db_updates: &DatabaseUpdates) -> Vec<SubstateChange> {
     let mut changes = Vec::new();
 
     for (db_node_key, node_updates) in &db_updates.node_updates {
@@ -130,10 +134,6 @@ pub(crate) fn extract_state_changes(
 
         for (partition_num, partition_updates) in &node_updates.partition_updates {
             let partition = PartitionNumber(*partition_num);
-            let partition_key = DbPartitionKey {
-                node_key: db_node_key.clone(),
-                partition_num: *partition_num,
-            };
 
             match partition_updates {
                 PartitionDatabaseUpdates::Delta { substate_updates } => {
@@ -143,21 +143,13 @@ pub(crate) fn extract_state_changes(
                             partition,
                             sort_key: db_sort_key.0.clone(),
                         };
-                        let previous =
-                            snapshot.get_raw_substate_by_db_key(&partition_key, db_sort_key);
 
                         let action = match update {
-                            DatabaseUpdate::Set(new_value) => match previous {
-                                Some(prev) => SubstateChangeAction::Update {
-                                    previous_value: prev,
-                                    new_value: new_value.clone(),
-                                },
-                                None => SubstateChangeAction::Create {
-                                    new_value: new_value.clone(),
-                                },
+                            DatabaseUpdate::Set(new_value) => SubstateChangeAction::Create {
+                                new_value: new_value.clone(),
                             },
                             DatabaseUpdate::Delete => SubstateChangeAction::Delete {
-                                previous_value: previous.unwrap_or_default(),
+                                previous_value: vec![],
                             },
                         };
 
@@ -170,46 +162,20 @@ pub(crate) fn extract_state_changes(
                 PartitionDatabaseUpdates::Reset {
                     new_substate_values,
                 } => {
-                    // For Reset: all existing values in the partition are deleted,
-                    // then new values are set. We emit Delete for old and Create for new.
-                    // Reading all old values from the snapshot:
-                    let old_values: Vec<_> = snapshot
-                        .list_raw_values_from_db_key(&partition_key, None)
-                        .collect();
-                    for (old_sort_key, old_value) in old_values {
-                        // Only emit Delete if the key is NOT in the new set
-                        if !new_substate_values.contains_key(&old_sort_key) {
-                            changes.push(SubstateChange {
-                                substate_ref: SubstateRef {
-                                    node_id,
-                                    partition,
-                                    sort_key: old_sort_key.0,
-                                },
-                                action: SubstateChangeAction::Delete {
-                                    previous_value: old_value,
-                                },
-                            });
-                        }
-                    }
+                    // For Reset: emit Create for all new values.
+                    // We cannot emit Delete for removed keys without reading
+                    // the snapshot, but deletes are captured in the
+                    // DatabaseUpdates structure itself for JMT application.
                     for (sort_key, new_value) in new_substate_values {
-                        let previous =
-                            snapshot.get_raw_substate_by_db_key(&partition_key, sort_key);
-                        let action = match previous {
-                            Some(prev) => SubstateChangeAction::Update {
-                                previous_value: prev,
-                                new_value: new_value.clone(),
-                            },
-                            None => SubstateChangeAction::Create {
-                                new_value: new_value.clone(),
-                            },
-                        };
                         changes.push(SubstateChange {
                             substate_ref: SubstateRef {
                                 node_id,
                                 partition,
                                 sort_key: sort_key.0.clone(),
                             },
-                            action,
+                            action: SubstateChangeAction::Create {
+                                new_value: new_value.clone(),
+                            },
                         });
                     }
                 }
@@ -506,61 +472,8 @@ mod tests {
     };
     use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
     use radix_substate_store_interface::interface::{
-        DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
+        DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
     };
-
-    // ─── Mock SubstateDatabase ──────────────────────────────────────────
-
-    /// Minimal SubstateDatabase backed by a BTreeMap keyed on (node_key, partition, sort_key).
-    struct MockSnapshot {
-        substates: std::collections::BTreeMap<(Vec<u8>, u8, Vec<u8>), Vec<u8>>,
-    }
-
-    impl MockSnapshot {
-        fn new() -> Self {
-            Self {
-                substates: std::collections::BTreeMap::new(),
-            }
-        }
-
-        /// Insert a substate using a hyperscale NodeId, converting to db_node_key internally.
-        fn with_substate(
-            mut self,
-            node_id: [u8; 30],
-            partition: u8,
-            sort_key: Vec<u8>,
-            value: Vec<u8>,
-        ) -> Self {
-            let db_node_key = make_db_node_key(&node_id);
-            self.substates
-                .insert((db_node_key, partition, sort_key), value);
-            self
-        }
-    }
-
-    impl SubstateDatabase for MockSnapshot {
-        fn get_raw_substate_by_db_key(
-            &self,
-            partition_key: &DbPartitionKey,
-            sort_key: &DbSortKey,
-        ) -> Option<Vec<u8>> {
-            self.substates
-                .get(&(
-                    partition_key.node_key.clone(),
-                    partition_key.partition_num,
-                    sort_key.0.clone(),
-                ))
-                .cloned()
-        }
-
-        fn list_raw_values_from_db_key(
-            &self,
-            _partition_key: &DbPartitionKey,
-            _from_sort_key: Option<&DbSortKey>,
-        ) -> Box<dyn Iterator<Item = (DbSortKey, Vec<u8>)> + '_> {
-            Box::new(std::iter::empty())
-        }
-    }
 
     // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -671,13 +584,11 @@ mod tests {
     // ─── Tests: extract_state_changes ───────────────────────────────────
 
     #[test]
-    fn test_extract_state_changes_create() {
+    fn test_extract_state_changes_set_classifies_as_create() {
         let node_id = [1u8; 30];
         let db_updates = make_set_updates(node_id, 0, vec![42], b"new_value".to_vec());
-        // No previous value in snapshot => should classify as Create
-        let snapshot = MockSnapshot::new();
 
-        let changes = extract_state_changes(&db_updates, &snapshot);
+        let changes = extract_state_changes(&db_updates);
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].substate_ref.node_id, NodeId(node_id));
@@ -692,56 +603,11 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_state_changes_update() {
-        let node_id = [2u8; 30];
-        let db_updates = make_set_updates(node_id, 3, vec![10], b"new_value".to_vec());
-        // Previous value exists => should classify as Update
-        let snapshot =
-            MockSnapshot::new().with_substate(node_id, 3, vec![10], b"old_value".to_vec());
-
-        let changes = extract_state_changes(&db_updates, &snapshot);
-
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].substate_ref.node_id, NodeId(node_id));
-        assert_eq!(changes[0].substate_ref.partition, HsPartitionNumber(3));
-        match &changes[0].action {
-            SubstateChangeAction::Update {
-                previous_value,
-                new_value,
-            } => {
-                assert_eq!(previous_value, b"old_value");
-                assert_eq!(new_value, b"new_value");
-            }
-            other => panic!("Expected Update, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn test_extract_state_changes_delete() {
         let node_id = [3u8; 30];
         let db_updates = make_delete_updates(node_id, 1, vec![5]);
-        let snapshot =
-            MockSnapshot::new().with_substate(node_id, 1, vec![5], b"doomed_value".to_vec());
 
-        let changes = extract_state_changes(&db_updates, &snapshot);
-
-        assert_eq!(changes.len(), 1);
-        match &changes[0].action {
-            SubstateChangeAction::Delete { previous_value } => {
-                assert_eq!(previous_value, b"doomed_value");
-            }
-            other => panic!("Expected Delete, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_extract_state_changes_delete_missing_previous() {
-        let node_id = [4u8; 30];
-        let db_updates = make_delete_updates(node_id, 0, vec![7]);
-        // No previous value — Delete should produce empty previous_value
-        let snapshot = MockSnapshot::new();
-
-        let changes = extract_state_changes(&db_updates, &snapshot);
+        let changes = extract_state_changes(&db_updates);
 
         assert_eq!(changes.len(), 1);
         match &changes[0].action {
@@ -786,12 +652,10 @@ mod tests {
                 }
             },
         };
-        let snapshot = MockSnapshot::new().with_substate(node_b, 0, vec![3], b"bye".to_vec());
 
-        let changes = extract_state_changes(&db_updates, &snapshot);
+        let changes = extract_state_changes(&db_updates);
 
         assert_eq!(changes.len(), 3);
-        // Verify we got changes for both nodes
         let node_ids: Vec<_> = changes.iter().map(|c| c.substate_ref.node_id).collect();
         assert!(node_ids.contains(&NodeId(node_a)));
         assert!(node_ids.contains(&NodeId(node_b)));
@@ -800,40 +664,28 @@ mod tests {
     #[test]
     fn test_extract_state_changes_reset_partition() {
         let node_id = [5u8; 30];
-        // Reset partition with one new value, one existing value in snapshot
         let db_updates = make_reset_updates(node_id, 2, vec![(vec![1], b"reset_val".to_vec())]);
-        // Existing key [1] in snapshot => Update; old key [99] not in new set => Delete
-        // (note: Delete for old keys requires list_raw_values_from_db_key, which our mock
-        //  returns empty, so we only get the new values classified as Create/Update)
-        let snapshot = MockSnapshot::new().with_substate(node_id, 2, vec![1], b"prev_val".to_vec());
 
-        let changes = extract_state_changes(&db_updates, &snapshot);
+        let changes = extract_state_changes(&db_updates);
 
-        // With empty list_raw_values, we should get 1 change (the new value)
         assert_eq!(changes.len(), 1);
         match &changes[0].action {
-            SubstateChangeAction::Update {
-                previous_value,
-                new_value,
-            } => {
-                assert_eq!(previous_value, b"prev_val");
+            SubstateChangeAction::Create { new_value } => {
                 assert_eq!(new_value, b"reset_val");
             }
-            other => panic!("Expected Update for existing key in Reset, got {other:?}"),
+            other => panic!("Expected Create for Reset partition, got {other:?}"),
         }
     }
 
     #[test]
     fn test_extract_state_changes_empty_updates() {
         let db_updates = DatabaseUpdates::default();
-        let snapshot = MockSnapshot::new();
-        let changes = extract_state_changes(&db_updates, &snapshot);
+        let changes = extract_state_changes(&db_updates);
         assert!(changes.is_empty());
     }
 
     #[test]
     fn test_extract_state_changes_invalid_node_key_skipped() {
-        // db_node_key shorter than 50 bytes should be skipped (db_node_key_to_node_id returns None)
         let db_updates = DatabaseUpdates {
             node_updates: indexmap! {
                 vec![0u8; 10] => NodeDatabaseUpdates {
@@ -847,8 +699,7 @@ mod tests {
                 }
             },
         };
-        let snapshot = MockSnapshot::new();
-        let changes = extract_state_changes(&db_updates, &snapshot);
+        let changes = extract_state_changes(&db_updates);
         assert!(changes.is_empty(), "Malformed node key should be skipped");
     }
 
@@ -857,8 +708,7 @@ mod tests {
     #[test]
     fn test_build_ledger_receipt_commit_success() {
         let receipt = TransactionReceipt::empty_commit_success();
-        let snapshot = MockSnapshot::new();
-        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default(), &snapshot);
+        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default());
 
         assert_eq!(ledger.outcome, LedgerTransactionOutcome::Success);
         assert!(ledger.state_changes.is_empty());
@@ -880,8 +730,7 @@ mod tests {
             (event_id.clone(), b"event_data_1".to_vec()),
             (event_id, b"event_data_2".to_vec()),
         ]);
-        let snapshot = MockSnapshot::new();
-        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default(), &snapshot);
+        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default());
 
         assert_eq!(ledger.outcome, LedgerTransactionOutcome::Success);
         assert_eq!(ledger.application_events.len(), 2);
@@ -894,8 +743,7 @@ mod tests {
     #[test]
     fn test_build_ledger_receipt_reject() {
         let receipt = make_reject_receipt();
-        let snapshot = MockSnapshot::new();
-        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default(), &snapshot);
+        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default());
 
         assert_eq!(ledger, LedgerTransactionReceipt::failure());
         assert_eq!(ledger.outcome, LedgerTransactionOutcome::Failure);
@@ -906,8 +754,7 @@ mod tests {
     #[test]
     fn test_build_ledger_receipt_abort() {
         let receipt = make_abort_receipt();
-        let snapshot = MockSnapshot::new();
-        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default(), &snapshot);
+        let ledger = build_ledger_receipt(&receipt, &DatabaseUpdates::default());
 
         assert_eq!(ledger, LedgerTransactionReceipt::failure());
     }
@@ -915,9 +762,8 @@ mod tests {
     #[test]
     fn test_build_ledger_receipt_receipt_hash_deterministic() {
         let receipt = TransactionReceipt::empty_commit_success();
-        let snapshot = MockSnapshot::new();
-        let ledger_a = build_ledger_receipt(&receipt, &DatabaseUpdates::default(), &snapshot);
-        let ledger_b = build_ledger_receipt(&receipt, &DatabaseUpdates::default(), &snapshot);
+        let ledger_a = build_ledger_receipt(&receipt, &DatabaseUpdates::default());
+        let ledger_b = build_ledger_receipt(&receipt, &DatabaseUpdates::default());
 
         assert_eq!(ledger_a.receipt_hash(), ledger_b.receipt_hash());
     }

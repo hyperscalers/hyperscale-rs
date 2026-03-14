@@ -308,6 +308,9 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle {
 pub struct ExecutionResult {
     /// Hash of the executed transaction.
     pub tx_hash: Hash,
+    /// Pre-computed consensus receipt hash (outcome + event_root).
+    /// Computed on the execution thread pool to avoid recomputation on the state machine.
+    pub receipt_hash: Hash,
     /// Raw DatabaseUpdates for the execution cache.
     pub database_updates: radix_substate_store_interface::interface::DatabaseUpdates,
     /// Full ledger receipt with all state changes.

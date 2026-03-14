@@ -126,6 +126,7 @@ impl From<SingleTxResult> for ExecutionResult {
     fn from(r: SingleTxResult) -> Self {
         Self {
             tx_hash: r.tx_hash,
+            receipt_hash: r.receipt_hash,
             database_updates: r.database_updates,
             ledger_receipt: r.ledger_receipt,
             local_execution: r.local_execution,

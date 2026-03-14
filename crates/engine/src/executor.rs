@@ -265,7 +265,7 @@ impl RadixExecutor {
                 &self.caches.exec_config,
             );
 
-            let result = self.receipt_to_cross_shard_result(tx.hash(), &receipt, &provisioned);
+            let result = self.receipt_to_cross_shard_result(tx.hash(), &receipt);
 
             // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
             // and applied when the TransactionCertificate is included in a block.
@@ -304,7 +304,7 @@ impl RadixExecutor {
             &executable,
         );
 
-        let result = self.receipt_to_result(tx.hash(), &receipt, &snapshot);
+        let result = self.receipt_to_result(tx.hash(), &receipt);
 
         // NO COMMIT HERE - DatabaseUpdates are cached by the state machine
         // and applied when the TransactionCertificate is included in a block.
@@ -313,21 +313,12 @@ impl RadixExecutor {
     }
 
     /// Convert a receipt to a result.
-    ///
-    /// The `execution_snapshot` must be the same snapshot used for execution,
-    /// so that previous values read for state change classification are correct.
-    fn receipt_to_result(
-        &self,
-        tx_hash: Hash,
-        receipt: &TransactionReceipt,
-        execution_snapshot: &impl SubstateDatabase,
-    ) -> SingleTxResult {
+    fn receipt_to_result(&self, tx_hash: Hash, receipt: &TransactionReceipt) -> SingleTxResult {
         let success = is_commit_success(receipt);
 
         if success {
             let database_updates = extract_database_updates(receipt);
-            let ledger_receipt =
-                build_ledger_receipt(receipt, &database_updates, execution_snapshot);
+            let ledger_receipt = build_ledger_receipt(receipt, &database_updates);
             let local_execution = build_local_execution(receipt);
             let receipt_hash = ledger_receipt.receipt_hash();
             SingleTxResult::success(
@@ -351,14 +342,12 @@ impl RadixExecutor {
         &self,
         tx_hash: Hash,
         receipt: &TransactionReceipt,
-        execution_snapshot: &impl SubstateDatabase,
     ) -> SingleTxResult {
         let success = is_commit_success(receipt);
 
         if success {
             let database_updates = extract_database_updates(receipt);
-            let ledger_receipt =
-                build_ledger_receipt(receipt, &database_updates, execution_snapshot);
+            let ledger_receipt = build_ledger_receipt(receipt, &database_updates);
             let local_execution = build_local_execution(receipt);
             let receipt_hash = ledger_receipt.receipt_hash();
             SingleTxResult::success(

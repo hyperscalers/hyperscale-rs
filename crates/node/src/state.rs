@@ -969,38 +969,40 @@ impl StateMachine for NodeStateMachine {
                 results,
                 speculative,
             } => {
-                // 1. Build receipt bundles before consuming results
-                //    (only for canonical execution — speculative results are ephemeral)
-                let bundles: Vec<ReceiptBundle> = if !speculative {
-                    results
-                        .iter()
-                        .map(|r| ReceiptBundle {
-                            tx_hash: r.tx_hash,
-                            ledger_receipt: Arc::new(r.ledger_receipt.clone()),
-                            local_execution: Some(r.local_execution.clone()),
-                        })
-                        .collect()
+                // Single pass: populate execution cache and build receipt bundles.
+                // Consumes results by value — no clones needed.
+                let mut bundles: Vec<ReceiptBundle> = if !speculative {
+                    Vec::with_capacity(results.len())
                 } else {
                     Vec::new()
                 };
 
-                // 2. Populate execution cache (in-memory, for block commit fast path)
                 for result in results {
-                    let receipt_hash = result.ledger_receipt.receipt_hash();
+                    let tx_hash = result.tx_hash;
+                    let receipt_hash = result.receipt_hash;
+
+                    if !speculative {
+                        bundles.push(ReceiptBundle {
+                            tx_hash,
+                            ledger_receipt: Arc::new(result.ledger_receipt),
+                            local_execution: Some(result.local_execution),
+                        });
+                    }
+
                     self.execution.execution_cache_mut().insert(
-                        result.tx_hash,
+                        tx_hash,
                         result.database_updates,
                         receipt_hash,
                     );
                 }
 
-                // 3. Dispatch receipt storage (fire-and-forget, off main thread)
+                // Dispatch receipt storage (fire-and-forget, off main thread)
                 let mut actions: Vec<Action> = Vec::new();
                 if !bundles.is_empty() {
                     actions.push(Action::StoreReceiptBundles { bundles });
                 }
 
-                // 4. Process votes through VoteTracker
+                // Process votes through VoteTracker
                 for vote in votes {
                     actions.extend(self.execution.on_vote(self.topology.snapshot(), vote));
                 }
