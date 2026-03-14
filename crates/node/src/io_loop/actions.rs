@@ -324,6 +324,9 @@ where
     /// up the backlog.
     pub(super) fn flush_block_commits(&mut self) {
         if self.pending_block_commits.is_empty() {
+            // Also flush any receipt bundles that arrived after their
+            // block was already committed.
+            self.flush_pending_receipts();
             return;
         }
 
@@ -480,6 +483,25 @@ where
         });
     }
 
+    /// Flush receipt bundles that are not associated with a pending block
+    /// commit. These arise when async execution (`ExecuteTransactions` /
+    /// `SpeculativeExecute`) completes *after* the block that references
+    /// those certificates was already committed and flushed. Storing them
+    /// promptly ensures the sync protocol can serve those blocks; without
+    /// this the sync protocol cannot reconstruct `DatabaseUpdates` for
+    /// those blocks, stalling recovery and preventing new commits that
+    /// would otherwise have drained the receipts.
+    pub(super) fn flush_pending_receipts(&mut self) {
+        if self.pending_receipt_bundles.is_empty() {
+            return;
+        }
+        let bundles = std::mem::take(&mut self.pending_receipt_bundles);
+        let storage = Arc::clone(&self.storage);
+        self.dispatch.spawn_execution(move || {
+            storage.store_receipt_bundles(&bundles);
+        });
+    }
+
     /// Process sync, fetch, and provision recovery actions.
     fn process_sync_fetch_action(&mut self, action: Action) {
         match action {
@@ -624,23 +646,6 @@ where
             DispatchPool::Crypto => self.dispatch.spawn_crypto(spawn_fn),
             DispatchPool::Execution => self.dispatch.spawn_execution(spawn_fn),
         }
-    }
-
-    /// Flush accumulated receipt bundles to storage on the execution pool.
-    ///
-    /// Moves SBOR-encoding + RocksDB writes off the pinned IoLoop thread.
-    /// Deferred `state_changes` computation (for bundles with `database_updates`)
-    /// is handled by the storage layer during persistence.
-    /// With `SyncDispatch` (simulation), `spawn_execution` runs inline.
-    pub(super) fn flush_receipt_storage(&mut self) {
-        let bundles = std::mem::take(&mut self.pending_receipt_bundles);
-        if bundles.is_empty() {
-            return;
-        }
-        let storage = Arc::clone(&self.storage);
-        self.dispatch.spawn_execution(move || {
-            storage.store_receipt_bundles(&bundles);
-        });
     }
 
     /// Local shard committee excluding self, for use as the `peers` argument

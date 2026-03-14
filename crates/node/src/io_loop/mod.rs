@@ -761,7 +761,6 @@ where
             self.process_action(action);
         }
         self.flush_block_commits();
-        self.flush_receipt_storage();
     }
 
     /// Flush any batch accumulators whose deadlines have expired.
@@ -896,7 +895,11 @@ where
     /// Called during shutdown or when immediate delivery is needed.
     pub fn flush_all_batches(&mut self) {
         self.flush_block_commits();
-        self.flush_receipt_storage();
+
+        // When commit_in_flight is true, flush_block_commits returns
+        // without draining receipts — flush them independently here.
+        self.flush_pending_receipts();
+
         self.flush_validation_batch();
         self.flush_cross_shard_executions();
         self.flush_execution_vote_verifications();
