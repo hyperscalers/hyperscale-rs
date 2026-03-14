@@ -37,7 +37,7 @@ struct ValidatorInfoEntry {
 ///
 /// Subsystem crates depend on this (via `hyperscale-types`) instead of the
 /// full `hyperscale-topology` crate.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TopologySnapshot {
     local_validator_id: ValidatorId,
     local_shard: ShardGroupId,
@@ -473,6 +473,21 @@ impl TopologySnapshot {
     pub fn is_node_in_splitting_shard(&self, node_id: &NodeId) -> bool {
         let shard = self.shard_for_node_id(node_id);
         self.is_shard_splitting(shard)
+    }
+}
+
+impl std::fmt::Debug for TopologySnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TopologySnapshot")
+            .field("validator", &self.local_validator_id)
+            .field("shard", &self.local_shard)
+            .field("num_shards", &self.num_shards)
+            .field("epoch", &self.current_epoch)
+            .field(
+                "committee_size",
+                &self.committee_for_shard(self.local_shard).len(),
+            )
+            .finish()
     }
 }
 
