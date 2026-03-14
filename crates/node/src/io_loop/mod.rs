@@ -47,6 +47,7 @@ use hyperscale_types::{
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -199,6 +200,14 @@ where
     // off the pinned IoLoop thread while preserving commit ordering.
     pending_block_commits: Vec<(Block, QuorumCertificate)>,
 
+    // Guard against out-of-order block commits across separate flushes.
+    // When an async commit closure is in flight on the execution pool, new
+    // blocks accumulate in `pending_block_commits` instead of spawning a
+    // second closure (Rayon doesn't guarantee FIFO ordering of spawned tasks).
+    // The closure clears this flag before sending its final event, so the
+    // subsequent `feed_event` → `flush_block_commits` drains the backlog.
+    commit_in_flight: Arc<AtomicBool>,
+
     // Receipt bundle accumulator — collects StoreReceiptBundles within an
     // event cycle, then spawns storage writes on the execution pool so
     // SBOR-encoding + RocksDB writes don't block the IoLoop thread.
@@ -296,6 +305,7 @@ where
                 b.committed_header_window,
             ),
             pending_block_commits: Vec::new(),
+            commit_in_flight: Arc::new(AtomicBool::new(false)),
             pending_receipt_bundles: Vec::new(),
             cached_local_peers,
             tx_status_cache: Arc::new(QuickCache::new(DEFAULT_TX_STATUS_CACHE_SIZE)),

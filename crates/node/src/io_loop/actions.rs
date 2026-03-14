@@ -11,6 +11,7 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::ValidatorId;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
@@ -307,11 +308,26 @@ where
     /// certificates), commits synchronously. Otherwise spawns a single
     /// closure on the execution pool that commits all blocks sequentially,
     /// sending `StateCommitComplete` and `BlockCommitted` events after each.
+    ///
+    /// If a previous async commit closure is still in flight, blocks remain
+    /// in `pending_block_commits` to avoid spawning a second closure — Rayon
+    /// does not guarantee FIFO ordering across separate `spawn()` calls, so
+    /// two independent closures can execute out of order. The in-flight
+    /// closure clears the flag before sending its final events, so the
+    /// resulting `feed_event` → `flush_block_commits` picks up the backlog.
     pub(super) fn flush_block_commits(&mut self) {
-        let commits = std::mem::take(&mut self.pending_block_commits);
-        if commits.is_empty() {
+        if self.pending_block_commits.is_empty() {
             return;
         }
+
+        // Defer if a previous async commit is still running on the exec pool.
+        // The pending blocks will be drained on the next flush once the
+        // in-flight closure completes and its events trigger feed_event.
+        if self.commit_in_flight.load(Ordering::Acquire) {
+            return;
+        }
+
+        let commits = std::mem::take(&mut self.pending_block_commits);
 
         let has_non_empty = commits.iter().any(|(b, _)| !b.certificates.is_empty());
 
@@ -366,6 +382,9 @@ where
         let event_tx = self.event_sender.clone();
         let local_shard = self.local_shard;
         let num_shards = self.num_shards;
+        let in_flight = self.commit_in_flight.clone();
+
+        self.commit_in_flight.store(true, Ordering::Release);
 
         self.dispatch.spawn_execution(move || {
             for (i, (block, qc)) in commits.into_iter().enumerate() {
@@ -423,6 +442,14 @@ where
                 };
 
                 ConsensusStore::prune_own_votes(&*storage, height.0);
+
+                // Clear the in-flight flag before sending events for the last
+                // block. The channel send synchronizes-with recv on the main
+                // thread, so the flag is guaranteed visible when the resulting
+                // feed_event calls flush_block_commits to drain any backlog.
+                if i == prepared_map.len() - 1 {
+                    in_flight.store(false, Ordering::Release);
+                }
 
                 let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
                     height: height.0,
