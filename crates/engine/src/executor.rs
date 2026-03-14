@@ -234,7 +234,6 @@ impl RadixExecutor {
         storage: &S,
         transactions: &[Arc<RoutableTransaction>],
         provisions: &[StateProvision],
-        _is_local_node: impl Fn(&NodeId) -> bool,
     ) -> Result<ExecutionOutput, ExecutionError> {
         let start = Instant::now();
 

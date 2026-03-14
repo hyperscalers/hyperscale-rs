@@ -357,8 +357,7 @@ pub fn execute_and_sign_single_shard<S: SubstateStore>(
 
 /// Execute a cross-shard transaction with provisions and sign the vote.
 ///
-/// Calls `executor.execute_cross_shard()` with the transaction and provisions,
-/// using the topology to determine which nodes are local to this shard.
+/// Calls `executor.execute_cross_shard()` with the transaction and provisions.
 /// Signs the execution result with the validator's private key.
 ///
 /// Returns an `(ExecutionVote, SingleTxResult)` tuple. The vote contains only
@@ -374,17 +373,11 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
     signing_key: &Bls12381G1PrivateKey,
     local_shard: ShardGroupId,
     validator_id: ValidatorId,
-    num_shards: u64,
 ) -> (ExecutionVote, SingleTxResult) {
-    let is_local_node = |node_id: &hyperscale_types::NodeId| -> bool {
-        hyperscale_types::shard_for_node(node_id, num_shards) == local_shard
-    };
-
     let result = match executor.execute_cross_shard(
         storage,
         std::slice::from_ref(transaction),
         provisions,
-        is_local_node,
     ) {
         Ok(output) => {
             if let Some(r) = output.results().first() {

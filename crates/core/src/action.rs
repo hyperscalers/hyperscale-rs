@@ -292,12 +292,13 @@ pub enum Action {
 
     /// Verify a block's state root against the JMT.
     ///
-    /// Computes the speculative state root from pre-merged DatabaseUpdates and compares
-    /// against the block header's claimed state_root. Returns `ProtocolEvent::StateRootVerified`.
+    /// Applies the block's shard-local state changes to the JMT and compares the
+    /// resulting root against the header's `state_root`.
+    /// Returns `ProtocolEvent::StateRootVerified`.
     ///
     /// The verification flow:
     /// 1. Runner checks if local JMT root matches `parent_state_root`
-    /// 2. Applies merged_updates to compute new JMT root
+    /// 2. Applies per-certificate updates to compute new JMT root
     /// 3. Compares computed root against `expected_root`
     /// 4. If valid, builds and caches a WriteBatch for efficient commit later
     ///

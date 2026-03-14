@@ -208,7 +208,6 @@ impl<'a, S: SubstateDatabase> ProvisionedSnapshot<'a, S> {
 
     /// Create from multiple provisions (from different source shards).
     pub fn from_provisions(base: &'a S, provisions_list: &[&[StateEntry]]) -> Self {
-        let total_entries: usize = provisions_list.iter().map(|p| p.len()).sum();
         let mut provisions = BTreeMap::new();
 
         for entries in provisions_list {
@@ -216,9 +215,6 @@ impl<'a, S: SubstateDatabase> ProvisionedSnapshot<'a, S> {
                 provisions.insert(entry.storage_key.clone(), entry.value.clone());
             }
         }
-
-        // Shrink if we over-allocated (unlikely with BTreeMap but good practice)
-        let _ = total_entries; // suppress unused warning
 
         Self { base, provisions }
     }

@@ -214,13 +214,12 @@ pub struct LedgerReceiptEntry {
 
 /// A receipt bundle for storage — ledger receipt + optional local execution.
 ///
-/// `local_execution` is `None` when the receipt was fetched from a peer
-/// (sync/catch-up). Only populated when this node executed the transaction locally.
+/// `local_execution` and `database_updates` are `None` when the receipt was
+/// fetched from a peer (sync/catch-up).
 #[derive(Debug, Clone)]
 pub struct ReceiptBundle {
     pub tx_hash: Hash,
     pub ledger_receipt: Arc<LedgerTransactionReceipt>,
-    /// `None` when receipt was fetched from a peer (sync/catch-up).
     /// Only populated when this node executed the transaction locally.
     pub local_execution: Option<LocalTransactionExecution>,
     /// Deferred `DatabaseUpdates` for lazy `state_changes` computation.
@@ -231,7 +230,8 @@ pub struct ReceiptBundle {
     pub database_updates: Option<Arc<DatabaseUpdates>>,
 }
 
-// Manual PartialEq (compare Arc contents, not pointer identity)
+// Manual PartialEq: compares Arc contents (not pointer identity) and
+// intentionally excludes `database_updates` (transient, not serialized).
 impl PartialEq for ReceiptBundle {
     fn eq(&self, other: &Self) -> bool {
         self.tx_hash == other.tx_hash
@@ -307,6 +307,10 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle {
 
 /// Execution output that travels alongside an ExecutionVote through the
 /// ProtocolEvent boundary from the thread pool to the state machine.
+///
+/// Separate from `SingleTxResult` (engine-internal) because `success` and
+/// `error` are not needed past the vote-signing boundary — the state machine
+/// determines outcome from the receipt's `outcome` field instead.
 ///
 /// The state machine uses this to:
 /// 1. Populate the ExecutionCache (in-memory, for block commit fast path)
