@@ -979,7 +979,18 @@ impl StateMachine for NodeStateMachine {
                 // Dispatch receipt storage (fire-and-forget, off main thread)
                 let mut actions: Vec<Action> = Vec::new();
                 if !bundles.is_empty() {
+                    tracing::debug!(
+                        speculative,
+                        bundle_count = bundles.len(),
+                        "Emitting StoreReceiptBundles"
+                    );
                     actions.push(Action::StoreReceiptBundles { bundles });
+                } else {
+                    tracing::warn!(
+                        speculative,
+                        results_count = 0, // results already consumed
+                        "ExecutionBatchCompleted produced ZERO receipt bundles"
+                    );
                 }
 
                 // Process votes through VoteTracker

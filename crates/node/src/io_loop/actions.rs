@@ -126,6 +126,11 @@ where
             // Receipt storage — accumulated and flushed async
             // ═══════════════════════════════════════════════════════════
             Action::StoreReceiptBundles { bundles } => {
+                debug!(
+                    count = bundles.len(),
+                    tx_hashes = ?bundles.iter().map(|b| b.tx_hash).collect::<Vec<_>>(),
+                    "Receipt bundles queued for storage"
+                );
                 self.pending_receipt_bundles.extend(bundles);
             }
 

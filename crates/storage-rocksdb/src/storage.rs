@@ -1758,6 +1758,11 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         for bundle in bundles {
             self.add_receipt_bundle_to_batch(&mut batch, bundle);
         }
+        tracing::debug!(
+            count = bundles.len(),
+            tx_hashes = ?bundles.iter().map(|b| b.tx_hash).collect::<Vec<_>>(),
+            "Persisting receipt bundles to RocksDB"
+        );
         self.db
             .write(batch)
             .expect("failed to persist receipt bundles");
@@ -1802,9 +1807,18 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         let cf = self.db.cf_handle("ledger_receipts")?;
         match self.db.get_cf(cf, tx_hash.as_bytes()) {
             Ok(Some(value)) => {
-                let receipt: hyperscale_types::LedgerTransactionReceipt =
-                    sbor::basic_decode(&value).ok()?;
-                Some(Arc::new(receipt))
+                match sbor::basic_decode::<hyperscale_types::LedgerTransactionReceipt>(&value) {
+                    Ok(receipt) => Some(Arc::new(receipt)),
+                    Err(e) => {
+                        tracing::error!(
+                            ?tx_hash,
+                            bytes_len = value.len(),
+                            error = ?e,
+                            "Ledger receipt exists in storage but SBOR decode failed"
+                        );
+                        None
+                    }
+                }
             }
             _ => None,
         }
