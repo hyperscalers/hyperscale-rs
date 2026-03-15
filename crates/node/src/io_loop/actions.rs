@@ -496,15 +496,19 @@ where
     /// this the sync protocol cannot reconstruct `DatabaseUpdates` for
     /// those blocks, stalling recovery and preventing new commits that
     /// would otherwise have drained the receipts.
+    ///
+    /// This is synchronous (not spawned on the execution pool) to avoid a
+    /// race with `flush_block_commits`: if receipts are written async and
+    /// a subsequent block commit runs before the write completes, the
+    /// commit closure panics on `get_ledger_receipt` returning `None`.
+    /// Receipt storage is a small RocksDB `WriteBatch`, so the main-thread
+    /// cost is negligible.
     pub(super) fn flush_pending_receipts(&mut self) {
         if self.pending_receipt_bundles.is_empty() {
             return;
         }
         let bundles = std::mem::take(&mut self.pending_receipt_bundles);
-        let storage = Arc::clone(&self.storage);
-        self.dispatch.spawn_execution(move || {
-            storage.store_receipt_bundles(&bundles);
-        });
+        self.storage.store_receipt_bundles(&bundles);
     }
 
     /// Process sync, fetch, and provision recovery actions.
