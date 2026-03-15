@@ -9,8 +9,8 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
-    Bls12381G1PublicKey, ExecutionCertificate, ExecutionVote, Hash, RoutableTransaction,
-    ShardGroupId,
+    Bls12381G1PublicKey, ExecutionCertificate, ExecutionResult, ExecutionVote, Hash,
+    RoutableTransaction, ShardGroupId,
 };
 use std::sync::Arc;
 
@@ -72,12 +72,13 @@ where
         let signing_key = Arc::clone(&self.signing_key);
         let dispatch = self.dispatch.clone();
         let local_shard = self.local_shard;
+        let num_shards = self.num_shards;
         let validator_id = self.validator_id;
         let event_tx = self.event_sender.clone();
 
         self.dispatch.spawn_execution(move || {
             let start = std::time::Instant::now();
-            let votes: Vec<_> = dispatch.map_local(&requests, |req| {
+            let pairs: Vec<_> = dispatch.map_local(&requests, |req| {
                 hyperscale_execution::handlers::execute_and_sign_cross_shard(
                     &executor,
                     &*storage,
@@ -90,14 +91,36 @@ where
                 )
             });
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
-            // Cross-shard results are intentionally discarded here — they are partial
-            // (only valid after all shards commit). The execution cache and receipt storage
-            // are populated by the state machine after local single-shard execution instead.
-            for (vote, _result) in votes {
-                let _ = event_tx.send(NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived {
-                    vote,
-                }));
-            }
+
+            // Separate votes and results, converting SingleTxResult → ExecutionResult
+            // and filtering database_updates to the local shard (matching the single-shard
+            // path in action_handler.rs).
+            let (votes, results): (Vec<ExecutionVote>, Vec<_>) = pairs.into_iter().unzip();
+            let results = results
+                .into_iter()
+                .map(|r| {
+                    let mut result = ExecutionResult::from(r);
+                    if num_shards > 1 {
+                        result.database_updates = hyperscale_storage::filter_updates_to_shard(
+                            &result.database_updates,
+                            local_shard,
+                            num_shards,
+                        );
+                    }
+                    result
+                })
+                .collect();
+
+            // Send results back to the state machine via the same event that single-shard
+            // execution uses. This populates the execution cache (enabling VerifyStateRoot)
+            // and stores receipts (enabling serve_block_request for sync).
+            let _ = event_tx.send(NodeInput::Protocol(
+                ProtocolEvent::ExecutionBatchCompleted {
+                    votes,
+                    results,
+                    speculative: false,
+                },
+            ));
         });
     }
 
