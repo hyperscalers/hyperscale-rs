@@ -1448,6 +1448,9 @@ impl ExecutionState {
         // Remove from finalized certificates
         self.finalized_certificates.remove(tx_hash);
 
+        // Evict from execution cache — writes have been applied to JMT at this point.
+        self.execution_cache.remove(tx_hash);
+
         // Clean up all transaction tracking state now that it's finalized.
         // This is the same cleanup done by cleanup_transaction() for aborts/deferrals,
         // but we need to do it here for successful completions too.
@@ -1637,6 +1640,9 @@ impl ExecutionState {
 
         // Remove from executed set so retry can be processed
         self.executed_txs.remove(tx_hash);
+
+        // Evict from execution cache — transaction is being retried or abandoned.
+        self.execution_cache.remove(tx_hash);
 
         // Phase 1-2: Provisioning cleanup
         // Note: Provision tracking is handled by ProvisionCoordinator

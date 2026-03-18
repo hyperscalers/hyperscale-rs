@@ -760,6 +760,12 @@ impl VerificationPipeline {
         self.verified_transaction_roots
             .retain(|hash| pending_blocks.contains_key(hash));
 
+        self.receipt_root_verifications_in_flight
+            .retain(|hash| pending_blocks.contains_key(hash));
+
+        self.verified_receipt_roots
+            .retain(|hash| pending_blocks.contains_key(hash));
+
         // verified_qcs uses height-based retention (not pending_blocks membership)
         // because QC cache entries are keyed by the certified block's hash, which
         // differs from the proposing block's hash. A 2-block buffer below

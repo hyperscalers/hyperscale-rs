@@ -90,7 +90,12 @@ struct ConsensusState {
     ledger_receipts: HashMap<Hash, Arc<LedgerTransactionReceipt>>,
     /// Local execution details keyed by transaction hash.
     local_executions: HashMap<Hash, LocalTransactionExecution>,
+    /// Insertion height for each receipt, enabling height-based pruning.
+    receipt_heights: HashMap<Hash, u64>,
 }
+
+/// Maximum number of blocks worth of receipts to retain in simulation storage.
+const SIM_RECEIPT_RETENTION_BLOCKS: u64 = 1_000;
 
 impl ConsensusState {
     fn new() -> Self {
@@ -104,7 +109,25 @@ impl ConsensusState {
             own_votes: HashMap::new(),
             ledger_receipts: HashMap::new(),
             local_executions: HashMap::new(),
+            receipt_heights: HashMap::new(),
         }
+    }
+
+    /// Prune receipts older than the retention window.
+    fn prune_receipts(&mut self, committed_height: u64) {
+        let cutoff = committed_height.saturating_sub(SIM_RECEIPT_RETENTION_BLOCKS);
+        if cutoff == 0 {
+            return;
+        }
+        self.receipt_heights.retain(|tx_hash, height| {
+            if *height <= cutoff {
+                self.ledger_receipts.remove(tx_hash);
+                self.local_executions.remove(tx_hash);
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -633,6 +656,7 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
                     c.committed_height = consensus.height;
                     c.committed_hash = Some(consensus.hash);
                     c.committed_qc = Some(consensus.qc);
+                    c.prune_receipts(consensus.height.0);
                 }
 
                 return result_root;
@@ -704,6 +728,7 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
                 c.committed_height = consensus.height;
                 c.committed_hash = Some(consensus.hash);
                 c.committed_qc = Some(consensus.qc);
+                c.prune_receipts(consensus.height.0);
             }
         }
 
@@ -832,7 +857,9 @@ impl<D: Dispatch + 'static> ConsensusStore for SimStorage<D> {
         } else {
             Arc::clone(&bundle.ledger_receipt)
         };
+        let height = c.committed_height.0;
         c.ledger_receipts.insert(bundle.tx_hash, receipt);
+        c.receipt_heights.insert(bundle.tx_hash, height);
         if let Some(ref local) = bundle.local_execution {
             c.local_executions.insert(bundle.tx_hash, local.clone());
         }
