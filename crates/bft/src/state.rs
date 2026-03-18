@@ -4400,6 +4400,12 @@ impl BftState {
         self.pending_commits_awaiting_data
             .retain(|_, (height, _)| *height > committed_height);
 
+        // Remove buffered out-of-order commits at or below committed height.
+        // These are commits that arrived before their predecessors; once we've
+        // committed past their height they are stale.
+        self.pending_commits
+            .retain(|height, _| *height > committed_height);
+
         // Delegate sync state cleanup to the SyncManager
         self.sync.cleanup(committed_height);
 
