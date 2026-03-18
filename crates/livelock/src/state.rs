@@ -15,7 +15,7 @@ use tracing::{debug, trace, warn};
 /// Configuration for livelock prevention.
 #[derive(Debug, Clone)]
 pub struct LivelockConfig {
-    /// How long to keep tombstones for deferred transactions.
+    /// How long to keep tombstones for completed transactions.
     pub tombstone_ttl: Duration,
     /// Number of blocks before a stuck transaction times out.
     pub execution_timeout_blocks: u64,
@@ -52,10 +52,10 @@ pub struct LivelockState {
     /// Used for both early detection and deduplication.
     provision_tracker: ProvisionTracker,
 
-    /// Tombstones for deferred transactions to discard late-arriving provisions.
+    /// Tombstones for completed transactions to discard late-arriving provisions.
     /// Maps tx_hash -> tombstone expiry time.
-    /// Added when deferral COMMITS (not when cycle detected).
-    deferred_tombstones: HashMap<Hash, Duration>,
+    /// Added when any terminal state COMMITS (certificate, abort, or deferral).
+    tombstones: HashMap<Hash, Duration>,
 
     /// Commitment proofs from remote transactions.
     /// Attached to deferrals when a livelock cycle is detected.
@@ -81,7 +81,7 @@ impl std::fmt::Debug for LivelockState {
         f.debug_struct("LivelockState")
             .field("committed_tracker_len", &self.committed_tracker.len())
             .field("provision_tracker_len", &self.provision_tracker.len())
-            .field("deferred_tombstones_len", &self.deferred_tombstones.len())
+            .field("tombstones_len", &self.tombstones.len())
             .field("pending_deferrals_len", &self.pending_deferrals.len())
             .finish()
     }
@@ -104,7 +104,7 @@ impl LivelockState {
         Self {
             committed_tracker: CommittedCrossShardTracker::new(),
             provision_tracker: ProvisionTracker::new(),
-            deferred_tombstones: HashMap::new(),
+            tombstones: HashMap::new(),
             commitment_proofs: HashMap::new(),
             pending_deferrals: Vec::new(),
             pending_deferral_hashes: HashSet::new(),
@@ -208,10 +208,10 @@ impl LivelockState {
         );
 
         // Check tombstone - discard late provisions for deferred TXs
-        if self.deferred_tombstones.contains_key(&remote_tx_hash) {
+        if self.tombstones.contains_key(&remote_tx_hash) {
             trace!(
                 remote_tx = %remote_tx_hash,
-                "Discarding quorum - TX has tombstone (was deferred)"
+                "Discarding quorum - TX has tombstone (already completed)"
             );
             return;
         }
@@ -414,7 +414,7 @@ impl LivelockState {
     fn on_deferral_committed(&mut self, tx_hash: &Hash) {
         // Add tombstone with TTL
         let expiry = self.now + self.config.tombstone_ttl;
-        self.deferred_tombstones.insert(*tx_hash, expiry);
+        self.tombstones.insert(*tx_hash, expiry);
 
         // Remove from tracking
         self.committed_tracker.remove(tx_hash);
@@ -430,22 +430,30 @@ impl LivelockState {
 
     /// Called when an abort commits.
     fn on_abort_committed(&mut self, tx_hash: &Hash) {
-        // Remove from tracking (no tombstone needed - abort is terminal)
-        self.committed_tracker.remove(tx_hash);
-        self.provision_tracker.remove_tx(tx_hash);
-        self.commitment_proofs.remove(tx_hash);
+        // Add tombstone to prevent late provisions from re-populating state
+        let expiry = self.now + self.config.tombstone_ttl;
+        self.tombstones.insert(*tx_hash, expiry);
 
-        debug!(tx = %tx_hash, "Abort committed - removed from tracking");
-    }
-
-    /// Called when a certificate commits.
-    fn on_certificate_committed(&mut self, tx_hash: &Hash) {
         // Remove from tracking
         self.committed_tracker.remove(tx_hash);
         self.provision_tracker.remove_tx(tx_hash);
         self.commitment_proofs.remove(tx_hash);
 
-        trace!(tx = %tx_hash, "Certificate committed - removed from tracking");
+        debug!(tx = %tx_hash, "Abort committed - added tombstone");
+    }
+
+    /// Called when a certificate commits.
+    fn on_certificate_committed(&mut self, tx_hash: &Hash) {
+        // Add tombstone to prevent late provisions from re-populating state
+        let expiry = self.now + self.config.tombstone_ttl;
+        self.tombstones.insert(*tx_hash, expiry);
+
+        // Remove from tracking
+        self.committed_tracker.remove(tx_hash);
+        self.provision_tracker.remove_tx(tx_hash);
+        self.commitment_proofs.remove(tx_hash);
+
+        trace!(tx = %tx_hash, "Certificate committed - added tombstone");
     }
 
     /// Cleanup expired tombstones.
@@ -453,15 +461,15 @@ impl LivelockState {
     /// Called periodically by the cleanup timer.
     pub fn cleanup(&mut self) {
         let now = self.now;
-        let before = self.deferred_tombstones.len();
+        let before = self.tombstones.len();
 
-        self.deferred_tombstones.retain(|_, expiry| *expiry > now);
+        self.tombstones.retain(|_, expiry| *expiry > now);
 
-        let removed = before - self.deferred_tombstones.len();
+        let removed = before - self.tombstones.len();
         if removed > 0 {
             debug!(
                 removed,
-                remaining = self.deferred_tombstones.len(),
+                remaining = self.tombstones.len(),
                 "Cleaned up expired tombstones"
             );
         }
@@ -479,7 +487,7 @@ impl LivelockState {
     pub fn stats(&self) -> LivelockStats {
         LivelockStats {
             pending_deferrals: self.pending_deferrals.len(),
-            active_tombstones: self.deferred_tombstones.len(),
+            active_tombstones: self.tombstones.len(),
             tracked_transactions: self.committed_tracker.len(),
         }
     }
@@ -490,7 +498,7 @@ impl LivelockState {
 pub struct LivelockStats {
     /// Number of deferrals queued for next block.
     pub pending_deferrals: usize,
-    /// Number of active tombstones (recently deferred transactions).
+    /// Number of active tombstones (recently completed transactions).
     pub active_tombstones: usize,
     /// Number of transactions being tracked for cycle detection.
     pub tracked_transactions: usize,
@@ -719,9 +727,7 @@ mod tests {
         let tx = Hash::from_bytes(b"deferred_tx");
 
         // Add tombstone for a deferred TX
-        state
-            .deferred_tombstones
-            .insert(tx, Duration::from_secs(100));
+        state.tombstones.insert(tx, Duration::from_secs(100));
 
         // Receive quorum of provisions for the deferred TX
         let proof = make_commitment_proof(tx, ShardGroupId(1));
@@ -739,20 +745,16 @@ mod tests {
         let tx2 = Hash::from_bytes(b"tx2");
 
         // Add tombstones with different expiry times
-        state
-            .deferred_tombstones
-            .insert(tx1, Duration::from_secs(10));
-        state
-            .deferred_tombstones
-            .insert(tx2, Duration::from_secs(100));
+        state.tombstones.insert(tx1, Duration::from_secs(10));
+        state.tombstones.insert(tx2, Duration::from_secs(100));
 
         // Set current time past first expiry
         state.now = Duration::from_secs(50);
         state.cleanup();
 
         // tx1 should be cleaned up, tx2 should remain
-        assert!(!state.deferred_tombstones.contains_key(&tx1));
-        assert!(state.deferred_tombstones.contains_key(&tx2));
+        assert!(!state.tombstones.contains_key(&tx1));
+        assert!(state.tombstones.contains_key(&tx2));
     }
 
     #[test]
@@ -859,7 +861,7 @@ mod tests {
 
         // Tombstone should be added
         assert!(
-            state.deferred_tombstones.contains_key(&tx),
+            state.tombstones.contains_key(&tx),
             "Tombstone should be added for deferred TX"
         );
     }
@@ -945,6 +947,132 @@ mod tests {
         assert!(
             state.get_pending_deferrals().is_empty(),
             "Unidirectional dependency should not cause deferral"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Tombstone Tests (Fix 2: cover completed and aborted txs)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_certificate_commit_adds_tombstone() {
+        let mut state = LivelockState::new();
+
+        let tx = hash_with_prefix(0xAA);
+        let node = make_test_node_id(1);
+
+        // Register TX as committed
+        let needs =
+            make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
+        state.committed_tracker.add(tx, needs);
+
+        // Commit certificate
+        let cert = hyperscale_types::TransactionCertificate {
+            transaction_hash: tx,
+            decision: hyperscale_types::TransactionDecision::Accept,
+            shard_proofs: std::collections::BTreeMap::new(),
+        };
+
+        let block = hyperscale_types::Block {
+            header: hyperscale_types::BlockHeader {
+                shard_group_id: ShardGroupId(0),
+                height: BlockHeight(5),
+                parent_hash: Hash::from_bytes(b"parent"),
+                parent_qc: hyperscale_types::QuorumCertificate::genesis(),
+                proposer: ValidatorId(0),
+                timestamp: 1234567890,
+                round: 0,
+                is_fallback: false,
+                state_root: Hash::ZERO,
+                transaction_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
+                provision_targets: vec![],
+            },
+            retry_transactions: vec![],
+            priority_transactions: vec![],
+            transactions: vec![],
+            certificates: vec![std::sync::Arc::new(cert)],
+            deferred: vec![],
+            aborted: vec![],
+            commitment_proofs: std::collections::HashMap::new(),
+        };
+
+        state.on_block_committed(&block);
+
+        // Tombstone should be added for certificate commit
+        assert!(
+            state.tombstones.contains_key(&tx),
+            "Certificate commit should add tombstone"
+        );
+
+        // Late provision should be rejected
+        let proof = make_commitment_proof(tx, ShardGroupId(1));
+        state.on_provision_accepted(tx, ShardGroupId(1), &proof);
+        assert!(
+            state.commitment_proofs.is_empty(),
+            "Late provision after certificate should be rejected by tombstone"
+        );
+    }
+
+    #[test]
+    fn test_abort_commit_adds_tombstone() {
+        let mut state = LivelockState::new();
+
+        let tx = hash_with_prefix(0xBB);
+        let node = make_test_node_id(1);
+
+        // Register TX as committed
+        let needs =
+            make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
+        state.committed_tracker.add(tx, needs);
+
+        // Commit abort
+        let abort = hyperscale_types::TransactionAbort {
+            tx_hash: tx,
+            reason: hyperscale_types::AbortReason::ExecutionTimeout {
+                committed_at: BlockHeight(1),
+            },
+            block_height: BlockHeight(5),
+        };
+
+        let block = hyperscale_types::Block {
+            header: hyperscale_types::BlockHeader {
+                shard_group_id: ShardGroupId(0),
+                height: BlockHeight(5),
+                parent_hash: Hash::from_bytes(b"parent"),
+                parent_qc: hyperscale_types::QuorumCertificate::genesis(),
+                proposer: ValidatorId(0),
+                timestamp: 1234567890,
+                round: 0,
+                is_fallback: false,
+                state_root: Hash::ZERO,
+                transaction_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
+                provision_targets: vec![],
+            },
+            retry_transactions: vec![],
+            priority_transactions: vec![],
+            transactions: vec![],
+            certificates: vec![],
+            deferred: vec![],
+            aborted: vec![abort],
+            commitment_proofs: std::collections::HashMap::new(),
+        };
+
+        state.on_block_committed(&block);
+
+        // Tombstone should be added for abort commit
+        assert!(
+            state.tombstones.contains_key(&tx),
+            "Abort commit should add tombstone"
+        );
+
+        // Late provision should be rejected
+        let proof = make_commitment_proof(tx, ShardGroupId(1));
+        state.on_provision_accepted(tx, ShardGroupId(1), &proof);
+        assert!(
+            state.commitment_proofs.is_empty(),
+            "Late provision after abort should be rejected by tombstone"
         );
     }
 }

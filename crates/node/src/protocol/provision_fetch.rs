@@ -59,6 +59,11 @@ pub enum ProvisionFetchInput {
         source_shard: ShardGroupId,
         block_height: BlockHeight,
     },
+    /// Cancel a pending provision fetch (proactive provisions verified before fallback).
+    Cancel {
+        source_shard: ShardGroupId,
+        block_height: BlockHeight,
+    },
     /// Periodic tick — spawn pending fetch operations.
     Tick,
 }
@@ -129,6 +134,10 @@ impl ProvisionFetchProtocol {
                 source_shard,
                 block_height,
             } => self.handle_failed(source_shard, block_height),
+            ProvisionFetchInput::Cancel {
+                source_shard,
+                block_height,
+            } => self.handle_cancel(source_shard, block_height),
             ProvisionFetchInput::Tick => self.spawn_pending_fetches(),
         }
     }
@@ -209,6 +218,22 @@ impl ProvisionFetchProtocol {
             );
             vec![]
         }
+    }
+
+    fn handle_cancel(
+        &mut self,
+        source_shard: ShardGroupId,
+        block_height: BlockHeight,
+    ) -> Vec<ProvisionFetchOutput> {
+        let key = (source_shard, block_height);
+        if self.pending.remove(&key).is_some() {
+            debug!(
+                source_shard = source_shard.0,
+                block_height = block_height.0,
+                "Provision fetch cancelled (proactive provisions verified)"
+            );
+        }
+        vec![]
     }
 
     fn handle_failed(
@@ -712,5 +737,75 @@ mod tests {
         // Second tick while still in-flight: no new dispatch.
         let outputs = protocol.handle(ProvisionFetchInput::Tick);
         assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn test_cancel_removes_pending_fetch() {
+        let mut protocol = ProvisionFetchProtocol::new(default_config());
+
+        // Submit a request.
+        protocol.handle(ProvisionFetchInput::Request {
+            source_shard: shard(1),
+            block_height: height(10),
+            target_shard: shard(0),
+            peers: vec![vid(1), vid(2)],
+            preferred_peer: vid(1),
+        });
+        assert!(protocol.has_pending());
+
+        // Cancel the request.
+        let outputs = protocol.handle(ProvisionFetchInput::Cancel {
+            source_shard: shard(1),
+            block_height: height(10),
+        });
+        assert!(outputs.is_empty());
+        assert!(
+            !protocol.has_pending(),
+            "Cancel should remove the pending fetch"
+        );
+
+        // Tick should have nothing to dispatch.
+        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn test_cancel_unknown_fetch_is_noop() {
+        let mut protocol = ProvisionFetchProtocol::new(default_config());
+
+        // Cancel for non-existent fetch — should not panic.
+        let outputs = protocol.handle(ProvisionFetchInput::Cancel {
+            source_shard: shard(99),
+            block_height: height(999),
+        });
+        assert!(outputs.is_empty());
+    }
+
+    #[test]
+    fn test_cancel_in_flight_fetch() {
+        let mut protocol = ProvisionFetchProtocol::new(default_config());
+
+        protocol.handle(ProvisionFetchInput::Request {
+            source_shard: shard(1),
+            block_height: height(10),
+            target_shard: shard(0),
+            peers: vec![vid(1)],
+            preferred_peer: vid(1),
+        });
+
+        // Tick dispatches the fetch (in-flight).
+        let outputs = protocol.handle(ProvisionFetchInput::Tick);
+        assert_eq!(outputs.len(), 1);
+        assert!(protocol.has_pending());
+
+        // Cancel while in-flight — should still remove the pending entry.
+        protocol.handle(ProvisionFetchInput::Cancel {
+            source_shard: shard(1),
+            block_height: height(10),
+        });
+        assert!(
+            !protocol.has_pending(),
+            "Cancel should remove even in-flight fetches"
+        );
     }
 }

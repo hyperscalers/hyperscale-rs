@@ -710,6 +710,18 @@ pub enum Action {
         block_hash: Hash,
     },
 
+    /// Cancel a pending provision fetch request.
+    ///
+    /// Emitted by `ProvisionCoordinator` when proactive provisions are verified
+    /// before the fallback fetch completes. This prevents the fallback response
+    /// from delivering duplicate provisions that would leak memory.
+    CancelProvisionFetch {
+        /// The shard whose provisions were fetched.
+        source_shard: ShardGroupId,
+        /// The block height of the provisions.
+        block_height: BlockHeight,
+    },
+
     /// Request missing provisions from a source shard via cross-shard request.
     ///
     /// Emitted by `ProvisionCoordinator` when a remote block's `provision_targets`
@@ -746,6 +758,7 @@ impl Action {
                 | Action::PersistAndBroadcastVote { .. }
                 | Action::PersistTransactionCertificate { .. }
                 | Action::RequestMissingProvisions { .. }
+                | Action::CancelProvisionFetch { .. }
         )
     }
 
@@ -856,6 +869,7 @@ impl Action {
             Action::FetchCertificates { .. } => "FetchCertificates",
             Action::CancelFetch { .. } => "CancelFetch",
             Action::RequestMissingProvisions { .. } => "RequestMissingProvisions",
+            Action::CancelProvisionFetch { .. } => "CancelProvisionFetch",
         }
     }
 }

@@ -175,7 +175,8 @@ where
             | Action::FetchTransactions { .. }
             | Action::FetchCertificates { .. }
             | Action::CancelFetch { .. }
-            | Action::RequestMissingProvisions { .. } => {
+            | Action::RequestMissingProvisions { .. }
+            | Action::CancelProvisionFetch { .. } => {
                 self.process_sync_fetch_action(action);
             }
 
@@ -620,6 +621,16 @@ where
                     .handle(ProvisionFetchInput::Tick);
                 self.process_provision_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
+            }
+            Action::CancelProvisionFetch {
+                source_shard,
+                block_height,
+            } => {
+                self.provision_fetch_protocol
+                    .handle(ProvisionFetchInput::Cancel {
+                        source_shard,
+                        block_height,
+                    });
             }
             _ => unreachable!(),
         }

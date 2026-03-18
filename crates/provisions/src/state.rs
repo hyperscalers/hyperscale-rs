@@ -133,6 +133,15 @@ pub struct ProvisionCoordinator {
     expected_provisions: HashMap<(ShardGroupId, BlockHeight), ExpectedProvision>,
 
     // ═══════════════════════════════════════════════════════════════════
+    // Completed Transaction Tombstones
+    // ═══════════════════════════════════════════════════════════════════
+    /// Tombstones for transactions that have reached terminal state
+    /// (certificate committed, aborted, or deferred). Prevents late-arriving
+    /// provisions from re-populating cleaned-up state.
+    /// Maps tx_hash -> local_committed_height when cleanup occurred.
+    completed_tombstones: HashMap<Hash, BlockHeight>,
+
+    // ═══════════════════════════════════════════════════════════════════
     // Time
     // ═══════════════════════════════════════════════════════════════════
     /// Current time.
@@ -174,6 +183,7 @@ impl ProvisionCoordinator {
             verified_provisions: HashMap::new(),
             local_committed_height: BlockHeight(0),
             expected_provisions: HashMap::new(),
+            completed_tombstones: HashMap::new(),
             now: Duration::ZERO,
         }
     }
@@ -222,6 +232,14 @@ impl ProvisionCoordinator {
 
         // Update local committed height
         self.local_committed_height = block.header.height;
+
+        // Prune expired tombstones — provisions for blocks older than the
+        // header retention window are already discarded by the pruned-header
+        // check, so tombstones beyond that window are unnecessary.
+        let current_height = self.local_committed_height.0;
+        self.completed_tombstones.retain(|_, tombstone_height| {
+            current_height.saturating_sub(tombstone_height.0) < REMOTE_HEADER_RETENTION_BLOCKS
+        });
 
         // Check for timed-out expected provisions and emit fallback requests
         let mut actions = vec![];
@@ -427,6 +445,16 @@ impl ProvisionCoordinator {
         for provision in provisions {
             let tx_hash = provision.transaction_hash;
 
+            // Skip provisions for transactions that have already completed
+            if self.completed_tombstones.contains_key(&tx_hash) {
+                trace!(
+                    tx_hash = %tx_hash,
+                    source_shard = source_shard.0,
+                    "Ignoring provision (transaction already completed — tombstone present)"
+                );
+                continue;
+            }
+
             // Auto-register if not already registered (for remote TXs / cycle detection)
             self.registered_txs.entry(tx_hash).or_insert_with(|| {
                 let mut required_shards = BTreeSet::new();
@@ -573,8 +601,14 @@ impl ProvisionCoordinator {
                 self.unverified_remote_headers.remove(&key);
             }
 
-            // Clear expected provision tracking — provisions arrived and verified
-            self.expected_provisions.remove(&key);
+            // Clear expected provision tracking — provisions arrived and verified.
+            // Cancel any in-flight fallback fetch to prevent duplicate delivery.
+            if self.expected_provisions.remove(&key).is_some() {
+                actions.push(Action::CancelProvisionFetch {
+                    source_shard: shard,
+                    block_height: height,
+                });
+            }
         }
 
         for result in results {
@@ -765,6 +799,10 @@ impl ProvisionCoordinator {
 
     /// Clean up all state for a transaction.
     fn cleanup_tx(&mut self, tx_hash: &Hash) {
+        // Add tombstone to prevent late provisions from re-populating state
+        self.completed_tombstones
+            .insert(*tx_hash, self.local_committed_height);
+
         // Remove registration
         self.registered_txs.remove(tx_hash);
 
@@ -773,6 +811,9 @@ impl ProvisionCoordinator {
             for shard in by_shard.keys() {
                 if let Some(txs) = self.txs_by_source_shard.get_mut(shard) {
                     txs.remove(tx_hash);
+                    if txs.is_empty() {
+                        self.txs_by_source_shard.remove(shard);
+                    }
                 }
             }
         }
@@ -1726,6 +1767,171 @@ mod tests {
             coordinator.pending_provisions.len(),
             0,
             "Old pending provisions should be pruned"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Tombstone Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_tombstone_blocks_late_provision_after_cleanup() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new();
+
+        let tx_hash = Hash::from_bytes(b"tx1");
+        let source_shard = ShardGroupId(1);
+
+        // Setup: header + provision + verification
+        let header = make_committed_header(source_shard, 10);
+        coordinator.on_remote_block_committed(&topology, header.clone(), ValidatorId(3));
+        let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
+        coordinator.on_state_provisions_received(&topology, vec![provision.clone()]);
+        let result = make_verified_result(provision.clone(), true);
+        coordinator.on_state_provisions_verified(&topology, vec![result], Some(header.clone()));
+
+        // Verify tx is registered and has provisions
+        assert!(coordinator.is_registered(&tx_hash));
+        assert!(coordinator.has_any_verified_provisions(&tx_hash));
+
+        // Cleanup via block commit (simulates certificate committed)
+        let mut block = make_block(1);
+        block.certificates.push(std::sync::Arc::new(
+            hyperscale_types::TransactionCertificate {
+                transaction_hash: tx_hash,
+                decision: hyperscale_types::TransactionDecision::Accept,
+                shard_proofs: std::collections::BTreeMap::new(),
+            },
+        ));
+        coordinator.on_block_committed(&topology, &block);
+
+        // Tx should be cleaned up
+        assert!(!coordinator.is_registered(&tx_hash));
+        assert!(!coordinator.has_any_verified_provisions(&tx_hash));
+
+        // Late provision arrives — should be blocked by tombstone
+        let late_provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
+        let actions = coordinator.on_state_provisions_received(&topology, vec![late_provision]);
+        assert!(actions.is_empty());
+
+        // Tx should NOT be re-registered
+        assert!(
+            !coordinator.is_registered(&tx_hash),
+            "Tombstone should prevent re-registration of completed tx"
+        );
+        assert!(
+            !coordinator.has_any_verified_provisions(&tx_hash),
+            "Tombstone should prevent re-population of verified provisions"
+        );
+    }
+
+    #[test]
+    fn test_tombstones_pruned_after_retention_window() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new();
+
+        let tx_hash = Hash::from_bytes(b"tx1");
+
+        // Register and cleanup at height 5
+        coordinator.on_tx_registered(tx_hash, make_registration(vec![ShardGroupId(1)]));
+        let mut block = make_block(5);
+        block.certificates.push(std::sync::Arc::new(
+            hyperscale_types::TransactionCertificate {
+                transaction_hash: tx_hash,
+                decision: hyperscale_types::TransactionDecision::Accept,
+                shard_proofs: std::collections::BTreeMap::new(),
+            },
+        ));
+        coordinator.on_block_committed(&topology, &block);
+
+        // Tombstone should exist
+        assert!(coordinator.completed_tombstones.contains_key(&tx_hash));
+
+        // Advance past retention window (100 blocks)
+        let block = make_block(106);
+        coordinator.on_block_committed(&topology, &block);
+
+        // Tombstone should be pruned
+        assert!(
+            !coordinator.completed_tombstones.contains_key(&tx_hash),
+            "Tombstone should be pruned after retention window"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // CancelProvisionFetch Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_verified_provisions_emit_cancel_fetch() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new();
+
+        let source_shard = ShardGroupId(1);
+
+        // Remote header targeting our shard — creates expected_provision entry
+        let header = make_committed_header_with_targets(source_shard, 10, vec![ShardGroupId(0)]);
+        coordinator.on_remote_block_committed(&topology, header.clone(), ValidatorId(3));
+        assert_eq!(coordinator.expected_provisions.len(), 1);
+
+        // Provision arrives and is verified
+        let provision = make_provision(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
+        coordinator.on_state_provisions_received(&topology, vec![provision.clone()]);
+        let result = make_verified_result(provision, true);
+        let actions =
+            coordinator.on_state_provisions_verified(&topology, vec![result], Some(header));
+
+        // Should emit CancelProvisionFetch action
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::CancelProvisionFetch {
+                    source_shard: s,
+                    block_height: h,
+                } if *s == source_shard && *h == BlockHeight(10)
+            )),
+            "Should emit CancelProvisionFetch when expected provision is verified"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Empty txs_by_source_shard Cleanup Tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_cleanup_removes_empty_txs_by_source_shard_entries() {
+        let topology = make_test_topology(ShardGroupId(0));
+        let mut coordinator = ProvisionCoordinator::new();
+
+        let tx_hash = Hash::from_bytes(b"tx1");
+        let source_shard = ShardGroupId(1);
+
+        // Setup: header + provision + verification
+        let header = make_committed_header(source_shard, 10);
+        coordinator.on_remote_block_committed(&topology, header.clone(), ValidatorId(3));
+        let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
+        coordinator.on_state_provisions_received(&topology, vec![provision.clone()]);
+        let result = make_verified_result(provision, true);
+        coordinator.on_state_provisions_verified(&topology, vec![result], Some(header));
+
+        // Reverse index should have an entry
+        assert!(coordinator.txs_with_provisions_from(source_shard).is_some());
+
+        // Cleanup via block commit
+        let mut block = make_block(1);
+        block.certificates.push(std::sync::Arc::new(
+            hyperscale_types::TransactionCertificate {
+                transaction_hash: tx_hash,
+                decision: hyperscale_types::TransactionDecision::Accept,
+                shard_proofs: std::collections::BTreeMap::new(),
+            },
+        ));
+        coordinator.on_block_committed(&topology, &block);
+
+        // Empty shard entry should be removed entirely
+        assert!(
+            coordinator.txs_with_provisions_from(source_shard).is_none(),
+            "Empty txs_by_source_shard entry should be removed after cleanup"
         );
     }
 
