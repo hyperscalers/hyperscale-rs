@@ -39,7 +39,7 @@ NODE_HOSTNAME="${NODE_HOSTNAME:-localhost}"     # Hostname for spammer endpoints
 TCP_FALLBACK_ENABLED="${TCP_FALLBACK_ENABLED:-false}" # Enable TCP fallback transport (default: false)
 NETWORK_LATENCY_MS=""                           # Network latency in milliseconds (empty = disabled)
 PACKET_LOSS_PERCENT=""                          # Packet loss percentage (empty = disabled)
-JMT_HISTORY_LENGTH=60000                        # Number of block heights of JMT history to retain (default: 60000)
+JMT_HISTORY_LENGTH=256                          # Number of block heights of JMT history to retain (default: 256)
 
 # Mempool configuration
 MEMPOOL_MAX_IN_FLIGHT=512                       # Soft limit on in-flight transactions

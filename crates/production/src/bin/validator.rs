@@ -449,7 +449,7 @@ impl Default for StorageConfig {
 }
 
 fn default_jmt_history_length() -> u64 {
-    60_000 // Match Babylon's default
+    256
 }
 
 fn default_max_background_jobs() -> i32 {

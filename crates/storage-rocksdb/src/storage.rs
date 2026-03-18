@@ -2252,7 +2252,7 @@ pub struct RocksDbConfig {
     /// this window.
     ///
     /// Set to 0 for immediate deletion (no history retention).
-    /// Defaults to 60,000 (matching Babylon's default).
+    /// Defaults to 256.
     pub jmt_history_length: u64,
 }
 
@@ -2280,7 +2280,7 @@ impl Default for RocksDbConfig {
                 "ledger_receipts".to_string(),              // Ledger receipts keyed by tx hash
                 "local_executions".to_string(), // Local execution details keyed by tx hash
             ],
-            jmt_history_length: 60_000, // Match Babylon's default
+            jmt_history_length: 256,
         }
     }
 }

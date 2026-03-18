@@ -55,7 +55,7 @@ impl SharedState {
             data: OrdMap::new(),
             // Pruning disabled: historical substate reads traverse the JMT at
             // past heights and need old nodes to still exist. In production,
-            // RocksDB GC respects `jmt_history_length` (default 60k).
+            // RocksDB GC respects `jmt_history_length` (default 256).
             // In simulation, tests are short-lived so retaining all nodes is fine.
             tree_store: TypedInMemoryTreeStore::new(),
             current_block_height: 0,
