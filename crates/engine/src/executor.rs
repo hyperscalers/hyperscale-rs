@@ -242,15 +242,10 @@ impl RadixExecutor {
         // Take a snapshot for isolated execution
         let snapshot = storage.snapshot();
 
-        // Collect all DbStateEntries from provisions
-        // Provisions now contain pre-computed storage keys (StateEntry)
-        let all_entries: Vec<&StateEntry> =
-            provisions.iter().flat_map(|p| p.entries.iter()).collect();
-
-        // Create provisioned snapshot with pre-computed storage keys
-        // This is O(n log n) to build the BTreeMap, then O(log n) per lookup
-        let entries_slice: Vec<StateEntry> = all_entries.iter().map(|e| (*e).clone()).collect();
-        let provisioned = ProvisionedSnapshot::new(&snapshot, &entries_slice);
+        // Create provisioned snapshot from pre-computed storage keys.
+        let entry_slices: Vec<&[StateEntry]> =
+            provisions.iter().map(|p| p.entries.as_slice()).collect();
+        let provisioned = ProvisionedSnapshot::from_provisions(&snapshot, &entry_slices);
 
         for tx in transactions {
             // Execute using cached VM modules and config
