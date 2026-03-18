@@ -2129,8 +2129,8 @@ mod tests {
             1000,
             Hash::ZERO,
             QuorumCertificate::genesis(),
-            vec![],
-            vec![],
+            Arc::new(vec![]),
+            Arc::new(vec![]),
         );
 
         TransactionDefer {

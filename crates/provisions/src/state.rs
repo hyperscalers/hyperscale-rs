@@ -17,6 +17,7 @@ use hyperscale_types::{
     TopologySnapshot, ValidatorId,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, trace, warn};
 
@@ -616,8 +617,8 @@ impl ProvisionCoordinator {
                 provision.block_timestamp,
                 header.state_root(),
                 header.qc.clone(),
-                (*provision.entries).clone(),
-                (*provision.merkle_proofs).clone(),
+                Arc::clone(&provision.entries),
+                Arc::clone(&provision.merkle_proofs),
             );
 
             // Store provision and proof together

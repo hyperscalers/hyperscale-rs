@@ -502,6 +502,7 @@ mod tests {
     use hyperscale_types::{
         zero_bls_signature, SignerBitfield, StateEntry, SubstateInclusionProof, ValidatorId,
     };
+    use std::sync::Arc;
 
     fn make_test_node_id(id: u8) -> NodeId {
         // Create a simple NodeId from bytes
@@ -529,8 +530,8 @@ mod tests {
                 aggregated_signature: zero_bls_signature(),
                 weighted_timestamp_ms: 0,
             },
-            vec![],
-            vec![],
+            Arc::new(vec![]),
+            Arc::new(vec![]),
         )
     }
 
@@ -565,8 +566,8 @@ mod tests {
                 aggregated_signature: zero_bls_signature(),
                 weighted_timestamp_ms: 0,
             },
-            entries,
-            merkle_proofs,
+            Arc::new(entries),
+            Arc::new(merkle_proofs),
         )
     }
 
@@ -615,8 +616,8 @@ mod tests {
                 aggregated_signature: Bls12381G2Signature([0u8; 96]),
                 weighted_timestamp_ms: 0,
             },
-            vec![],
-            vec![],
+            Arc::new(vec![]),
+            Arc::new(vec![]),
         )
     }
 

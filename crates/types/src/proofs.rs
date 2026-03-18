@@ -367,8 +367,8 @@ impl CommitmentProof {
         block_timestamp: u64,
         state_root: Hash,
         qc: QuorumCertificate,
-        entries: Vec<StateEntry>,
-        merkle_proofs: Vec<SubstateInclusionProof>,
+        entries: Arc<Vec<StateEntry>>,
+        merkle_proofs: Arc<Vec<SubstateInclusionProof>>,
     ) -> Self {
         assert_eq!(
             entries.len(),
@@ -383,8 +383,8 @@ impl CommitmentProof {
             block_timestamp,
             state_root,
             qc,
-            entries: Arc::new(entries),
-            merkle_proofs: Arc::new(merkle_proofs),
+            entries,
+            merkle_proofs,
         }
     }
 
@@ -442,8 +442,8 @@ mod tests {
             1000,
             Hash::from_bytes(b"state_root"),
             test_qc(),
-            entries,
-            proofs,
+            Arc::new(entries),
+            Arc::new(proofs),
         );
 
         let nodes = proof.nodes();
@@ -482,8 +482,8 @@ mod tests {
             1000,
             Hash::from_bytes(b"state_root"),
             test_qc(),
-            entries,
-            vec![substate_proof.clone(), substate_proof],
+            Arc::new(entries),
+            Arc::new(vec![substate_proof.clone(), substate_proof]),
         );
 
         let bytes = sbor::basic_encode(&original).expect("encoding should succeed");
@@ -506,8 +506,8 @@ mod tests {
             1000,
             Hash::from_bytes(b"root"),
             test_qc(),
-            entries,
-            proofs,
+            Arc::new(entries),
+            Arc::new(proofs),
         );
 
         let hash1 = proof.entries_hash();

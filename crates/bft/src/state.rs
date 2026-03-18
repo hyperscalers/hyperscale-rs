@@ -7392,8 +7392,8 @@ mod tests {
                 1000, // block_timestamp
                 Hash::ZERO,
                 QuorumCertificate::genesis(),
-                vec![StateEntry::test_entry(node, 0, vec![], None)],
-                vec![SubstateInclusionProof::dummy()],
+                Arc::new(vec![StateEntry::test_entry(node, 0, vec![], None)]),
+                Arc::new(vec![SubstateInclusionProof::dummy()]),
             ))
         } else {
             None
