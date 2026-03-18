@@ -274,7 +274,7 @@ impl ExecutionState {
     ) -> Self {
         Self {
             now: Duration::ZERO,
-            execution_cache: ExecutionCache::new(crate::execution_cache::DEFAULT_MAX_ENTRIES),
+            execution_cache: ExecutionCache::new(),
             executed_txs: HashMap::new(),
             finalized_certificates: BTreeMap::new(),
             committed_height: 0,
