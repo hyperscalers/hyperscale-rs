@@ -482,6 +482,14 @@ where
                 });
             }
 
+            // Clean up tracking sets for transactions that failed validation.
+            NodeInput::TransactionValidationsFailed { hashes } => {
+                for hash in &hashes {
+                    self.pending_validation.remove(hash);
+                    self.locally_submitted.remove(hash);
+                }
+            }
+
             // Intercept gossip-received transactions for validation.
             NodeInput::Protocol(ProtocolEvent::TransactionGossipReceived { tx, .. }) => {
                 let tx_hash = tx.hash();

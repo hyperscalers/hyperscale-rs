@@ -90,6 +90,10 @@ pub enum NodeInput {
         submitted_locally: bool,
     },
 
+    /// Transactions that failed validation — sent back so the IoLoop can
+    /// remove their hashes from `pending_validation` and `locally_submitted`.
+    TransactionValidationsFailed { hashes: Vec<Hash> },
+
     /// A committed block header from a remote shard whose sender signature
     /// has been verified by the IoLoop gossip gate.
     CommittedHeaderValidated {
@@ -170,6 +174,7 @@ impl NodeInput {
             NodeInput::TransactionReceived { .. } => EventPriority::Network,
             NodeInput::CertificateReceived { .. } => EventPriority::Network,
             NodeInput::TransactionValidated { .. } => EventPriority::Internal,
+            NodeInput::TransactionValidationsFailed { .. } => EventPriority::Internal,
             NodeInput::CommittedHeaderValidated { .. } => EventPriority::Internal,
             NodeInput::CommittedBlockGossipReceived { .. } => EventPriority::Network,
             NodeInput::ProvisionsReady { .. } => EventPriority::Internal,
@@ -206,6 +211,7 @@ impl NodeInput {
             NodeInput::TransactionReceived { .. } => "TransactionReceived",
             NodeInput::CertificateReceived { .. } => "CertificateReceived",
             NodeInput::TransactionValidated { .. } => "TransactionValidated",
+            NodeInput::TransactionValidationsFailed { .. } => "TransactionValidationsFailed",
             NodeInput::CommittedHeaderValidated { .. } => "CommittedHeaderValidated",
             NodeInput::CommittedBlockGossipReceived { .. } => "CommittedBlockGossipReceived",
             NodeInput::ProvisionsReady { .. } => "ProvisionsReady",

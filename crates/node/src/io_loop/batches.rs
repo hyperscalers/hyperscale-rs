@@ -49,13 +49,21 @@ where
             let results: Vec<bool> =
                 dispatch.map_local(&batch, |tx| validator.validate_transaction(tx).is_ok());
 
+            let mut failed_hashes = Vec::new();
             for (tx, valid) in batch.into_iter().zip(results) {
                 if valid {
                     let _ = event_tx.send(NodeInput::TransactionValidated {
                         tx,
                         submitted_locally: false, // IoLoop sets from locally_submitted
                     });
+                } else {
+                    failed_hashes.push(tx.hash());
                 }
+            }
+            if !failed_hashes.is_empty() {
+                let _ = event_tx.send(NodeInput::TransactionValidationsFailed {
+                    hashes: failed_hashes,
+                });
             }
         });
     }
