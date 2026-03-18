@@ -33,8 +33,9 @@ pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore + ConsensusSt
 pub(crate) struct DelegatedResult<P: Send> {
     /// Events to deliver to the state machine.
     pub events: Vec<NodeInput>,
-    /// Prepared commit handle to cache (block_hash -> handle).
-    pub prepared_commit: Option<(Hash, P)>,
+    /// Prepared commit handle to cache: (block_hash, block_height, handle).
+    /// Height is stored alongside the handle so stale entries can be pruned.
+    pub prepared_commit: Option<(Hash, u64, P)>,
 }
 
 /// Which dispatch pool an action should run on in production.
@@ -242,7 +243,9 @@ pub(crate) fn handle_delegated_action<
                 "state_root",
                 start.elapsed().as_secs_f64(),
             );
-            let prepared = result.prepared_commit.map(|p| (block_hash, p));
+            let prepared = result
+                .prepared_commit
+                .map(|p| (block_hash, block_height, p));
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(ProtocolEvent::StateRootVerified {
                     block_hash,
@@ -295,7 +298,9 @@ pub(crate) fn handle_delegated_action<
                 shard_group_id,
                 provision_targets,
             );
-            let prepared = result.prepared_commit.map(|p| (result.block_hash, p));
+            let prepared = result
+                .prepared_commit
+                .map(|p| (result.block_hash, height.0, p));
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(ProtocolEvent::ProposalBuilt {
                     height,

@@ -162,8 +162,11 @@ where
     validator_id: ValidatorId,
     num_shards: u64,
 
-    // Prepared commit cache (shared with dispatch closures)
-    prepared_commits: Arc<Mutex<HashMap<Hash, S::PreparedCommit>>>,
+    // Prepared commit cache (shared with dispatch closures).
+    // Stores (block_height, prepared_commit) so stale entries can be pruned
+    // when they outlive the block they were prepared for.
+    #[allow(clippy::type_complexity)]
+    prepared_commits: Arc<Mutex<HashMap<Hash, (u64, S::PreparedCommit)>>>,
 
     // In-memory caches (shared with inbound router in production)
     cert_cache: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,

@@ -351,6 +351,16 @@ where
             if !pending_receipts.is_empty() {
                 self.storage.store_receipt_bundles(&pending_receipts);
             }
+            // Prune stale prepared_commits that outlived their blocks.
+            let max_height = commits
+                .iter()
+                .map(|(b, _)| b.header.height.0)
+                .max()
+                .unwrap_or(0);
+            {
+                let mut cache = self.prepared_commits.lock().unwrap();
+                cache.retain(|_, (h, _)| *h > max_height);
+            }
             for (block, qc) in commits {
                 let height = block.header.height;
                 let block_hash = block.hash();
@@ -385,12 +395,31 @@ where
             return;
         }
 
-        // Extract prepared commit handles for each block in the batch.
+        // Extract prepared commit handles for each block in the batch,
+        // then prune any stale entries at or below the highest committed
+        // height. Stale entries accumulate when VerifyStateRoot /
+        // BuildProposal complete on the crypto pool *after* the block they
+        // prepared has already been committed via the sync/receipt-
+        // reconstruction path. Without this prune, one orphaned
+        // PreparedCommit (WriteBatch + JmtSnapshot + DatabaseUpdates) leaks
+        // per block whenever the crypto pool is slower than commit dispatch.
+        let max_committed_height = commits
+            .iter()
+            .map(|(b, _)| b.header.height.0)
+            .max()
+            .unwrap_or(0);
+
         let mut prepared_map = {
             let mut cache = self.prepared_commits.lock().unwrap();
             let mut map = Vec::with_capacity(commits.len());
             for (block, _) in &commits {
-                map.push(cache.remove(&block.hash()));
+                map.push(cache.remove(&block.hash()).map(|(_, p)| p));
+            }
+            let before = cache.len();
+            cache.retain(|_, (h, _)| *h > max_committed_height);
+            let pruned = before - cache.len();
+            if pruned > 0 {
+                tracing::debug!(pruned, "Pruned stale prepared_commits entries");
             }
             map
         };
@@ -641,8 +670,11 @@ where
                         metrics::record_execution_latency(elapsed);
                     }
                 }
-                if let Some((hash, prepared)) = result.prepared_commit {
-                    prepared_commits.lock().unwrap().insert(hash, prepared);
+                if let Some((hash, height, prepared)) = result.prepared_commit {
+                    prepared_commits
+                        .lock()
+                        .unwrap()
+                        .insert(hash, (height, prepared));
                 }
                 for event in result.events {
                     let _ = event_tx.send(event);
