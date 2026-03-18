@@ -102,7 +102,9 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         // Compression
         opts.set_compression_type(config.compression.to_rocksdb());
 
-        // Block cache and bloom filter
+        // Block cache and bloom filter — shared across ALL column families.
+        // SST index/filter blocks are pinned inside this cache to prevent
+        // unbounded heap growth as the database accumulates SST files.
         let mut block_opts = rocksdb::BlockBasedOptions::default();
         if let Some(cache_size) = config.block_cache_size {
             let cache = rocksdb::Cache::new_lru_cache(cache_size);
@@ -111,15 +113,24 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         if config.bloom_filter_bits > 0.0 {
             block_opts.set_bloom_filter(config.bloom_filter_bits, false);
         }
+        // Pin SST index/filter blocks inside the bounded block cache instead
+        // of letting them consume unbounded heap memory as the DB grows.
+        block_opts.set_cache_index_and_filter_blocks(true);
+        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
         opts.set_block_based_table_factory(&block_opts);
 
-        // Column families - use the same options as the DB for consistency
+        // Column families — apply the same block cache, bloom filter, write
+        // buffer, and compression settings so all CFs share the bounded
+        // block cache and have consistent memory behavior.
         let cf_descriptors: Vec<_> = config
             .column_families
             .into_iter()
             .map(|name| {
                 let mut cf_opts = Options::default();
                 cf_opts.set_compression_type(config.compression.to_rocksdb());
+                cf_opts.set_write_buffer_size(config.write_buffer_size);
+                cf_opts.set_max_write_buffer_number(config.max_write_buffer_number);
+                cf_opts.set_block_based_table_factory(&block_opts);
                 ColumnFamilyDescriptor::new(name, cf_opts)
             })
             .collect();
@@ -2262,7 +2273,7 @@ impl Default for RocksDbConfig {
             max_background_jobs: 4,
             write_buffer_size: 128 * 1024 * 1024, // 128MB
             max_write_buffer_number: 3,
-            block_cache_size: Some(512 * 1024 * 1024), // 512MB
+            block_cache_size: Some(1024 * 1024 * 1024), // 1GB
             compression: CompressionType::Lz4,
             bloom_filter_bits: 10.0,
             bytes_per_sync: 1024 * 1024, // 1MB
