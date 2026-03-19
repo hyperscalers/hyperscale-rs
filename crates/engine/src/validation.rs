@@ -22,39 +22,10 @@
 //! }
 //! ```
 
+use hyperscale_core::ValidationError;
 use hyperscale_types::RoutableTransaction;
 use radix_common::network::NetworkDefinition;
-use radix_transactions::errors::TransactionValidationError;
 use radix_transactions::validation::TransactionValidator;
-use thiserror::Error;
-
-/// Errors from transaction validation.
-#[derive(Debug, Error)]
-pub enum ValidationError {
-    /// Transaction failed signature validation.
-    #[error("Invalid signature: {0}")]
-    InvalidSignature(String),
-
-    /// Transaction failed structural validation.
-    #[error("Invalid transaction structure: {0}")]
-    InvalidStructure(String),
-
-    /// Transaction failed preparation (encoding/decoding issues).
-    #[error("Preparation failed: {0}")]
-    PreparationFailed(String),
-}
-
-impl From<TransactionValidationError> for ValidationError {
-    fn from(e: TransactionValidationError) -> Self {
-        // Categorize the error type for better error messages
-        let msg = format!("{:?}", e);
-        if msg.contains("Signature") || msg.contains("signature") {
-            ValidationError::InvalidSignature(msg)
-        } else {
-            ValidationError::InvalidStructure(msg)
-        }
-    }
-}
 
 /// Transaction validator for signature verification before mempool acceptance.
 ///
@@ -180,6 +151,19 @@ impl TransactionValidation {
                 result: self.validate_transaction(tx),
             })
             .collect()
+    }
+}
+
+// Implement the generic TransactionValidator trait for any TypeConfig whose
+// Transaction = RoutableTransaction. This covers both ConcreteConfig and RadixConfig
+// without creating a circular dependency on hyperscale-radix-config.
+impl<C> hyperscale_core::TransactionValidator<C> for TransactionValidation
+where
+    C: hyperscale_types::TypeConfig<Transaction = RoutableTransaction>,
+{
+    fn validate_transaction(&self, tx: &RoutableTransaction) -> Result<(), ValidationError> {
+        // Delegate to the inherent method (same signature)
+        TransactionValidation::validate_transaction(self, tx)
     }
 }
 

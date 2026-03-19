@@ -37,6 +37,7 @@ mod validation;
 pub use execution::ProvisionedSnapshot;
 pub use executor::{fetch_state_entries, RadixExecutor};
 pub use genesis::GenesisConfig;
+pub use hyperscale_core::ValidationError;
 pub use hyperscale_types::ExecutionResult;
 pub use result::{ExecutionOutput, SingleTxResult};
 pub use validation::TransactionValidation;
