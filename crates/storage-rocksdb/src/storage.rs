@@ -2317,7 +2317,9 @@ pub struct RocksDbPreparedCommit {
     merged_updates: DatabaseUpdates,
 }
 
-impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D> {
+impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch + 'static>
+    hyperscale_storage::CommitStore<C> for RocksDbStorage<D>
+{
     type PreparedCommit = RocksDbPreparedCommit;
 
     fn prepare_block_commit(
@@ -2374,7 +2376,8 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
             // Stale cache: fall back to recompute from scratch.
             // The JMT base root changed, so the prepared snapshot is invalid.
             // Use the stored merged_updates to ensure substate writes aren't lost.
-            self.commit_block(
+            <Self as hyperscale_storage::CommitStore<C>>::commit_block(
+                self,
                 &prepared.merged_updates,
                 certificates,
                 block_height,
@@ -2666,7 +2669,9 @@ impl<D: Dispatch + 'static> SubstateStore for SharedStorage<D> {
     }
 }
 
-impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for SharedStorage<D> {
+impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch + 'static>
+    hyperscale_storage::CommitStore<C> for SharedStorage<D>
+{
     type PreparedCommit = RocksDbPreparedCommit;
 
     fn prepare_block_commit(
@@ -2675,8 +2680,12 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for SharedStorage<D>
         merged_updates: &DatabaseUpdates,
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit) {
-        self.0
-            .prepare_block_commit(parent_state_root, merged_updates, block_height)
+        <RocksDbStorage<D> as hyperscale_storage::CommitStore<C>>::prepare_block_commit(
+            &self.0,
+            parent_state_root,
+            merged_updates,
+            block_height,
+        )
     }
 
     fn commit_prepared_block(
@@ -2685,8 +2694,12 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for SharedStorage<D>
         certificates: &[std::sync::Arc<TransactionCertificate>],
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
     ) -> hyperscale_types::Hash {
-        self.0
-            .commit_prepared_block(prepared, certificates, consensus)
+        <RocksDbStorage<D> as hyperscale_storage::CommitStore<C>>::commit_prepared_block(
+            &self.0,
+            prepared,
+            certificates,
+            consensus,
+        )
     }
 
     fn commit_block(
@@ -2696,8 +2709,13 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for SharedStorage<D>
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
     ) -> hyperscale_types::Hash {
-        self.0
-            .commit_block(merged_updates, certificates, block_height, consensus)
+        <RocksDbStorage<D> as hyperscale_storage::CommitStore<C>>::commit_block(
+            &self.0,
+            merged_updates,
+            certificates,
+            block_height,
+            consensus,
+        )
     }
 }
 
@@ -2798,7 +2816,7 @@ mod tests {
         make_test_qc,
     };
     use hyperscale_storage::{CommitStore, ConsensusStore, NodeDatabaseUpdates, SubstateStore};
-    use hyperscale_types::ShardGroupId;
+    use hyperscale_types::{ConcreteConfig, ShardGroupId};
     use tempfile::TempDir;
 
     #[test]
@@ -3228,7 +3246,8 @@ mod tests {
         let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
         let cert = Arc::new(make_test_certificate(1, shard));
 
-        let result = storage.commit_block(&updates, &[cert], 1, None);
+        let result =
+            CommitStore::<ConcreteConfig>::commit_block(&storage, &updates, &[cert], 1, None);
         assert_ne!(result, Hash::ZERO);
     }
 
@@ -3244,7 +3263,13 @@ mod tests {
         let cert1 = Arc::new(make_test_certificate(1, shard));
         let cert2 = Arc::new(make_test_certificate(2, shard));
 
-        let result = storage.commit_block(&merged, &[cert1, cert2], 1, None);
+        let result = CommitStore::<ConcreteConfig>::commit_block(
+            &storage,
+            &merged,
+            &[cert1, cert2],
+            1,
+            None,
+        );
         // Certificate merging: all certs applied as single JMT version = block_height
         assert_ne!(result, Hash::ZERO);
     }
@@ -3254,7 +3279,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
-        storage.commit_block(&DatabaseUpdates::default(), &[], 1, None);
+        CommitStore::<ConcreteConfig>::commit_block(
+            &storage,
+            &DatabaseUpdates::default(),
+            &[],
+            1,
+            None,
+        );
         // Empty block: JMT version still advances to block_height
         assert_eq!(storage.jmt_version(), 1);
     }
@@ -3268,15 +3299,25 @@ mod tests {
         let temp_dir1 = TempDir::new().unwrap();
         let s_prepared = RocksDbStorage::open(temp_dir1.path(), SyncDispatch::new()).unwrap();
         let parent_root = s_prepared.state_root_hash();
-        let (spec_root, prepared) =
-            s_prepared.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
+        let (spec_root, prepared) = CommitStore::<ConcreteConfig>::prepare_block_commit(
+            &s_prepared,
+            parent_root,
+            &DatabaseUpdates::default(),
+            1,
+        );
         let certs = std::slice::from_ref(&cert);
-        let result_prepared = s_prepared.commit_prepared_block(prepared, certs, None);
+        let result_prepared = CommitStore::<ConcreteConfig>::commit_prepared_block(
+            &s_prepared,
+            prepared,
+            certs,
+            None,
+        );
 
         // Direct path
         let temp_dir2 = TempDir::new().unwrap();
         let s_direct = RocksDbStorage::open(temp_dir2.path(), SyncDispatch::new()).unwrap();
-        let result_direct = s_direct.commit_block(
+        let result_direct = CommitStore::<ConcreteConfig>::commit_block(
+            &s_direct,
             &DatabaseUpdates::default(),
             std::slice::from_ref(&cert),
             1,
@@ -3296,7 +3337,13 @@ mod tests {
         let cert = Arc::new(make_test_certificate(1, shard));
         let tx_hash = cert.transaction_hash;
 
-        let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None);
+        let _ = CommitStore::<ConcreteConfig>::commit_block(
+            &storage,
+            &DatabaseUpdates::default(),
+            &[cert],
+            1,
+            None,
+        );
 
         assert!(storage.get_certificate(&tx_hash).is_some());
     }

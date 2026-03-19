@@ -477,14 +477,15 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                                 )
                             });
                             let updates = hyperscale_storage::receipt_to_database_updates(&receipt);
-                            hyperscale_storage::filter_updates_to_shard(
+                            <Cfg::C as hyperscale_types::TypeConfig>::filter_state_update_to_shard(
                                 &updates,
                                 local_shard,
                                 num_shards,
                             )
                         })
                         .collect();
-                    let merged = hyperscale_storage::merge_database_updates(&per_cert);
+                    let merged =
+                        <Cfg::C as hyperscale_types::TypeConfig>::merge_state_updates(&per_cert);
                     CommitStore::<Cfg::C>::commit_block(
                         &*storage,
                         &merged,

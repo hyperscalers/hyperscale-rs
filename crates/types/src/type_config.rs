@@ -176,22 +176,113 @@ impl TypeConfig for ConcreteConfig {
         receipt.outcome == LedgerTransactionOutcome::Success
     }
 
-    fn merge_state_updates(_updates: &[DatabaseUpdates]) -> DatabaseUpdates {
-        unimplemented!("ConcreteConfig::merge_state_updates — use RadixConfig")
+    fn merge_state_updates(updates: &[DatabaseUpdates]) -> DatabaseUpdates {
+        // Delegate to the merge logic in hyperscale_storage at runtime.
+        // ConcreteConfig is only used where the storage crate is also available,
+        // so this is always reachable. The implementation is provided by the
+        // storage crate's free function, called through the RadixConfig path
+        // (which has an identical impl). For ConcreteConfig we inline a simple
+        // version using DatabaseUpdates' IndexMap structure.
+        use radix_substate_store_interface::interface::NodeDatabaseUpdates;
+        if updates.is_empty() {
+            return DatabaseUpdates::default();
+        }
+        if updates.len() == 1 {
+            return updates[0].clone();
+        }
+        let mut merged = DatabaseUpdates::default();
+        for update in updates {
+            for (entity_key, node_updates) in &update.node_updates {
+                let target = merged
+                    .node_updates
+                    .entry(entity_key.clone())
+                    .or_insert_with(NodeDatabaseUpdates::default);
+                for (partition, part_updates) in &node_updates.partition_updates {
+                    target
+                        .partition_updates
+                        .entry(*partition)
+                        .and_modify(|existing| {
+                            // Merge: source overwrites target for overlapping keys
+                            match (existing, part_updates) {
+                                (
+                                    radix_substate_store_interface::interface::PartitionDatabaseUpdates::Delta { substate_updates: target_updates },
+                                    radix_substate_store_interface::interface::PartitionDatabaseUpdates::Delta { substate_updates: source_updates },
+                                ) => {
+                                    for (k, v) in source_updates {
+                                        target_updates.insert(k.clone(), v.clone());
+                                    }
+                                }
+                                (existing, source) => {
+                                    *existing = source.clone();
+                                }
+                            }
+                        })
+                        .or_insert_with(|| part_updates.clone());
+                }
+            }
+        }
+        merged
     }
 
     fn filter_state_update_to_shard(
-        _update: &DatabaseUpdates,
-        _local_shard: ShardGroupId,
-        _num_shards: u64,
+        update: &DatabaseUpdates,
+        local_shard: ShardGroupId,
+        num_shards: u64,
     ) -> DatabaseUpdates {
-        unimplemented!("ConcreteConfig::filter_state_update_to_shard — use RadixConfig")
+        if num_shards <= 1 {
+            return update.clone();
+        }
+        // Extract NodeId from db_node_key: 20-byte hash prefix + 30-byte NodeId.
+        const HASH_PREFIX_LEN: usize = 20;
+        const NODE_ID_LEN: usize = 30;
+        let mut filtered = DatabaseUpdates::default();
+        for (db_node_key, node_updates) in &update.node_updates {
+            if db_node_key.len() >= HASH_PREFIX_LEN + NODE_ID_LEN {
+                let mut bytes = [0u8; NODE_ID_LEN];
+                bytes.copy_from_slice(&db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN]);
+                let node_id = NodeId(bytes);
+                if crate::shard_for_node(&node_id, num_shards) == local_shard {
+                    filtered
+                        .node_updates
+                        .insert(db_node_key.clone(), node_updates.clone());
+                }
+            } else {
+                // Keep system/unknown entries
+                filtered
+                    .node_updates
+                    .insert(db_node_key.clone(), node_updates.clone());
+            }
+        }
+        filtered
     }
 
     fn filter_state_update_to_writes(
-        _update: &DatabaseUpdates,
-        _declared_writes: &[NodeId],
+        update: &DatabaseUpdates,
+        declared_writes: &[NodeId],
     ) -> DatabaseUpdates {
-        unimplemented!("ConcreteConfig::filter_state_update_to_writes — use RadixConfig")
+        if declared_writes.is_empty() {
+            return update.clone();
+        }
+        const HASH_PREFIX_LEN: usize = 20;
+        const NODE_ID_LEN: usize = 30;
+        let allowed: std::collections::HashSet<NodeId> = declared_writes.iter().copied().collect();
+        let mut filtered = DatabaseUpdates::default();
+        for (db_node_key, node_updates) in &update.node_updates {
+            if db_node_key.len() >= HASH_PREFIX_LEN + NODE_ID_LEN {
+                let mut bytes = [0u8; NODE_ID_LEN];
+                bytes.copy_from_slice(&db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN]);
+                let node_id = NodeId(bytes);
+                if allowed.contains(&node_id) {
+                    filtered
+                        .node_updates
+                        .insert(db_node_key.clone(), node_updates.clone());
+                }
+            } else {
+                filtered
+                    .node_updates
+                    .insert(db_node_key.clone(), node_updates.clone());
+            }
+        }
+        filtered
     }
 }

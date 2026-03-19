@@ -106,11 +106,12 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 .map(|r| {
                     let mut result = ExecutionResult::from(r);
                     if num_shards > 1 {
-                        result.database_updates = hyperscale_storage::filter_updates_to_shard(
-                            &result.database_updates,
-                            local_shard,
-                            num_shards,
-                        );
+                        result.database_updates =
+                            <Cfg::C as hyperscale_types::TypeConfig>::filter_state_update_to_shard(
+                                &result.database_updates,
+                                local_shard,
+                                num_shards,
+                            );
                     }
                     result
                 })

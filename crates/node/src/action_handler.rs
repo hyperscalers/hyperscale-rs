@@ -236,7 +236,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
             block_height,
         } => {
             let start = std::time::Instant::now();
-            let merged = hyperscale_storage::merge_database_updates_from_arcs(&per_cert_updates);
+            let merged = <Cfg::C as TypeConfig>::merge_state_updates_from_arcs(&per_cert_updates);
             let result = hyperscale_bft::handlers::verify_state_root::<Cfg::C, _>(
                 ctx.storage,
                 parent_state_root,
@@ -281,7 +281,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
             provision_targets,
         } => {
             let merged_updates =
-                hyperscale_storage::merge_database_updates_from_arcs(&per_cert_updates);
+                <Cfg::C as TypeConfig>::merge_state_updates_from_arcs(&per_cert_updates);
             let result = hyperscale_bft::handlers::build_proposal::<Cfg::C, _>(
                 ctx.storage,
                 proposer,
@@ -447,7 +447,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
                 .map(|r| {
                     let mut db_updates = r.state_update;
                     if num_shards > 1 {
-                        db_updates = hyperscale_storage::filter_updates_to_shard(
+                        db_updates = <Cfg::C as TypeConfig>::filter_state_update_to_shard(
                             &db_updates,
                             local_shard,
                             num_shards,
@@ -498,7 +498,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
                 .map(|r| {
                     let mut db_updates = r.state_update;
                     if num_shards > 1 {
-                        db_updates = hyperscale_storage::filter_updates_to_shard(
+                        db_updates = <Cfg::C as TypeConfig>::filter_state_update_to_shard(
                             &db_updates,
                             local_shard,
                             num_shards,

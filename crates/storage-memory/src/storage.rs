@@ -21,7 +21,7 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     Block, BlockHeight, Hash, LedgerTransactionReceipt, LocalTransactionExecution, NodeId,
-    QuorumCertificate, ReceiptBundle, RoutableTransaction, TransactionCertificate,
+    QuorumCertificate, ReceiptBundle, RoutableTransaction, TransactionCertificate, TypeConfig,
 };
 use im::OrdMap;
 use std::collections::{BTreeMap, HashMap};
@@ -567,7 +567,9 @@ pub struct SimPreparedCommit {
     merged_updates: DatabaseUpdates,
 }
 
-impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
+impl<C: TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch + 'static> CommitStore<C>
+    for SimStorage<D>
+{
     type PreparedCommit = SimPreparedCommit;
 
     fn prepare_block_commit(
@@ -665,7 +667,8 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
 
         // Stale cache: fall back to full block commit which recomputes JMT.
         // Use the stored merged_updates to ensure substate writes aren't lost.
-        self.commit_block(
+        <Self as CommitStore<C>>::commit_block(
+            self,
             &prepared.merged_updates,
             certificates,
             block_height,
@@ -953,7 +956,9 @@ mod tests {
         CommitStore, CommittableSubstateDatabase, ConsensusStore, NodeDatabaseUpdates,
         SubstateDatabase, SubstateStore,
     };
-    use hyperscale_types::{zero_bls_signature, Hash, NodeId, ShardGroupId, SignerBitfield};
+    use hyperscale_types::{
+        zero_bls_signature, ConcreteConfig, Hash, NodeId, ShardGroupId, SignerBitfield,
+    };
 
     #[test]
     fn test_basic_substate_operations() {
@@ -1409,7 +1414,8 @@ mod tests {
         let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
         let cert = Arc::new(make_test_certificate(1, shard));
 
-        let result = storage.commit_block(&updates, &[cert], 1, None);
+        let result =
+            CommitStore::<ConcreteConfig>::commit_block(&storage, &updates, &[cert], 1, None);
         assert_ne!(result, Hash::ZERO);
     }
 
@@ -1423,7 +1429,13 @@ mod tests {
         let cert1 = Arc::new(make_test_certificate(1, shard));
         let cert2 = Arc::new(make_test_certificate(2, shard));
 
-        let result = storage.commit_block(&merged, &[cert1, cert2], 1, None);
+        let result = CommitStore::<ConcreteConfig>::commit_block(
+            &storage,
+            &merged,
+            &[cert1, cert2],
+            1,
+            None,
+        );
         // Certificate merging: all certs applied as single JMT version = block_height
         assert_ne!(result, Hash::ZERO);
     }
@@ -1431,7 +1443,13 @@ mod tests {
     #[test]
     fn test_commit_block_empty_certs() {
         let storage = SimStorage::new(SyncDispatch::new());
-        storage.commit_block(&DatabaseUpdates::default(), &[], 1, None);
+        CommitStore::<ConcreteConfig>::commit_block(
+            &storage,
+            &DatabaseUpdates::default(),
+            &[],
+            1,
+            None,
+        );
         // Empty block: JMT version still advances to block_height
         assert_eq!(storage.jmt_version(), 1);
     }
@@ -1447,13 +1465,23 @@ mod tests {
 
         // Prepare path
         let parent_root = s_prepared.state_root_hash();
-        let (spec_root, prepared) =
-            s_prepared.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
+        let (spec_root, prepared) = CommitStore::<ConcreteConfig>::prepare_block_commit(
+            &s_prepared,
+            parent_root,
+            &DatabaseUpdates::default(),
+            1,
+        );
         let certs = std::slice::from_ref(&cert);
-        let result_prepared = s_prepared.commit_prepared_block(prepared, certs, None);
+        let result_prepared = CommitStore::<ConcreteConfig>::commit_prepared_block(
+            &s_prepared,
+            prepared,
+            certs,
+            None,
+        );
 
         // Direct path
-        let result_direct = s_direct.commit_block(
+        let result_direct = CommitStore::<ConcreteConfig>::commit_block(
+            &s_direct,
             &DatabaseUpdates::default(),
             std::slice::from_ref(&cert),
             1,
@@ -1471,9 +1499,14 @@ mod tests {
         let cert = Arc::new(make_test_certificate(1, shard));
 
         let parent_root = storage.state_root_hash();
-        let (spec_root, prepared) =
-            storage.prepare_block_commit(parent_root, &DatabaseUpdates::default(), 1);
-        let result = storage.commit_prepared_block(prepared, &[cert], None);
+        let (spec_root, prepared) = CommitStore::<ConcreteConfig>::prepare_block_commit(
+            &storage,
+            parent_root,
+            &DatabaseUpdates::default(),
+            1,
+        );
+        let result =
+            CommitStore::<ConcreteConfig>::commit_prepared_block(&storage, prepared, &[cert], None);
 
         assert_eq!(spec_root, result);
     }
@@ -1501,7 +1534,13 @@ mod tests {
         let cert = Arc::new(make_test_certificate(1, shard));
         let tx_hash = cert.transaction_hash;
 
-        let _ = storage.commit_block(&DatabaseUpdates::default(), &[cert], 1, None);
+        let _ = CommitStore::<ConcreteConfig>::commit_block(
+            &storage,
+            &DatabaseUpdates::default(),
+            &[cert],
+            1,
+            None,
+        );
 
         assert!(storage.get_certificate(&tx_hash).is_some());
     }
@@ -1581,13 +1620,15 @@ mod tests {
         // Block height 1: commit value [100] for node 1
         let updates1 = make_mapped_database_update(1, 0, vec![10], vec![100]);
         let cert1 = Arc::new(make_test_certificate(1, shard));
-        let result1 = storage.commit_block(&updates1, &[cert1], 1, None);
+        let result1 =
+            CommitStore::<ConcreteConfig>::commit_block(&storage, &updates1, &[cert1], 1, None);
         let root_v1 = result1;
 
         // Block height 2: overwrite with value [200]
         let updates2 = make_mapped_database_update(1, 0, vec![10], vec![200]);
         let cert2 = Arc::new(make_test_certificate(2, shard));
-        let result2 = storage.commit_block(&updates2, &[cert2], 2, None);
+        let result2 =
+            CommitStore::<ConcreteConfig>::commit_block(&storage, &updates2, &[cert2], 2, None);
         let root_v2 = result2;
         assert_ne!(root_v1, root_v2, "roots must differ after overwrite");
 

@@ -337,7 +337,8 @@ where
 
     // Filter out undeclared system state writes
     let mut result = result;
-    result.state_update = filter_to_declared_writes(&result.state_update, &tx.declared_writes);
+    let declared_writes = C::transaction_writes(tx);
+    result.state_update = C::filter_state_update_to_writes(&result.state_update, &declared_writes);
 
     let write_nodes = extract_write_nodes(&result.state_update);
 
@@ -411,8 +412,8 @@ where
 
     // Filter out undeclared system state writes
     let mut result = result;
-    result.state_update =
-        filter_to_declared_writes(&result.state_update, &transaction.declared_writes);
+    let declared_writes = C::transaction_writes(transaction);
+    result.state_update = C::filter_state_update_to_writes(&result.state_update, &declared_writes);
 
     let write_nodes = extract_write_nodes(&result.state_update);
 
