@@ -8,6 +8,8 @@ description = "Core types for Hyperscale consensus: Event, Action, and StateMach
 hyperscale-types.workspace = true
 hyperscale-messages.workspace = true
 hyperscale-storage.workspace = true
+hyperscale-dispatch.workspace = true
+hyperscale-network.workspace = true
 hyperscale-codec.workspace = true
 
 thiserror.workspace = true

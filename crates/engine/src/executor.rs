@@ -36,8 +36,12 @@ use crate::execution::{
 };
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
+use hyperscale_core::ExecutionBackend;
 use hyperscale_storage::{CommittableSubstateDatabase, SubstateDatabase, SubstateStore};
-use hyperscale_types::{Hash, NodeId, RoutableTransaction, StateEntry, StateProvision};
+use hyperscale_types::{
+    DatabaseUpdates, Hash, LedgerTransactionReceipt, NodeId, RoutableTransaction, StateEntry,
+    StateProvision, TypeConfig,
+};
 use radix_common::network::NetworkDefinition;
 use radix_engine::transaction::{execute_transaction, ExecutionConfig, TransactionReceipt};
 use radix_engine::vm::DefaultVmModules;
@@ -193,7 +197,7 @@ impl RadixExecutor {
         tx_count = transactions.len(),
         latency_us = tracing::field::Empty,
     ))]
-    pub fn execute_single_shard<S: SubstateStore>(
+    fn execute_single_shard_inner<S: SubstateStore>(
         &self,
         storage: &S,
         transactions: &[Arc<RoutableTransaction>],
@@ -229,7 +233,7 @@ impl RadixExecutor {
         provision_count = provisions.len(),
         latency_us = tracing::field::Empty,
     ))]
-    pub fn execute_cross_shard<S: SubstateStore>(
+    fn execute_cross_shard_inner<S: SubstateStore>(
         &self,
         storage: &S,
         transactions: &[Arc<RoutableTransaction>],
@@ -335,7 +339,7 @@ impl RadixExecutor {
     /// Reads substates at the given `block_height` using historical JMT traversal.
     /// Both data and proofs must come from the same version.
     /// Returns `None` if the version is unavailable (GC'd or not yet committed).
-    pub fn fetch_state_entries<S: SubstateStore>(
+    fn fetch_state_entries_inner<S: SubstateStore>(
         &self,
         storage: &S,
         nodes: &[NodeId],
@@ -344,10 +348,109 @@ impl RadixExecutor {
         fetch_state_entries(storage, nodes, block_height)
     }
 
+    /// Execute single-shard transactions (delegates to inner implementation).
+    pub fn execute_single_shard<S: SubstateStore>(
+        &self,
+        storage: &S,
+        transactions: &[Arc<RoutableTransaction>],
+    ) -> Result<ExecutionOutput, ExecutionError> {
+        self.execute_single_shard_inner(storage, transactions)
+    }
+
+    /// Execute cross-shard transactions with provisions (delegates to inner implementation).
+    pub fn execute_cross_shard<S: SubstateStore>(
+        &self,
+        storage: &S,
+        transactions: &[Arc<RoutableTransaction>],
+        provisions: &[StateProvision],
+    ) -> Result<ExecutionOutput, ExecutionError> {
+        self.execute_cross_shard_inner(storage, transactions, provisions)
+    }
+
+    /// Fetch state entries (delegates to inner implementation).
+    pub fn fetch_state_entries<S: SubstateStore>(
+        &self,
+        storage: &S,
+        nodes: &[NodeId],
+        block_height: u64,
+    ) -> Option<Vec<StateEntry>> {
+        self.fetch_state_entries_inner(storage, nodes, block_height)
+    }
+
     /// Get reference to the network definition.
     pub fn network(&self) -> &NetworkDefinition {
         &self.network
     }
+}
+
+impl<C> ExecutionBackend<C> for RadixExecutor
+where
+    C: TypeConfig<
+        Transaction = RoutableTransaction,
+        ExecutionReceipt = LedgerTransactionReceipt,
+        StateUpdate = DatabaseUpdates,
+    >,
+{
+    type Error = ExecutionError;
+
+    fn execute_single_shard<S: SubstateStore>(
+        &self,
+        storage: &S,
+        transactions: &[Arc<RoutableTransaction>],
+    ) -> Result<ExecutionOutput<C>, Self::Error> {
+        self.execute_single_shard_inner(storage, transactions)
+            .map(into_config_output)
+    }
+
+    fn execute_cross_shard<S: SubstateStore>(
+        &self,
+        storage: &S,
+        transactions: &[Arc<RoutableTransaction>],
+        provisions: &[StateProvision],
+    ) -> Result<ExecutionOutput<C>, Self::Error> {
+        self.execute_cross_shard_inner(storage, transactions, provisions)
+            .map(into_config_output)
+    }
+
+    fn fetch_state_entries<S: SubstateStore>(
+        &self,
+        storage: &S,
+        nodes: &[NodeId],
+        block_height: u64,
+    ) -> Option<Vec<StateEntry>> {
+        self.fetch_state_entries_inner(storage, nodes, block_height)
+    }
+}
+
+/// Convert `ExecutionOutput<ConcreteConfig>` to `ExecutionOutput<C>` for any
+/// config whose associated types match the concrete Radix types.
+///
+/// This is a field-by-field move with no actual data transformation — the
+/// associated types (`RoutableTransaction`, `LedgerTransactionReceipt`,
+/// `DatabaseUpdates`) are identical on both sides.
+fn into_config_output<C>(output: ExecutionOutput) -> ExecutionOutput<C>
+where
+    C: TypeConfig<
+        Transaction = RoutableTransaction,
+        ExecutionReceipt = LedgerTransactionReceipt,
+        StateUpdate = DatabaseUpdates,
+    >,
+{
+    ExecutionOutput::new(
+        output
+            .results
+            .into_iter()
+            .map(|r| SingleTxResult {
+                tx_hash: r.tx_hash,
+                success: r.success,
+                receipt_hash: r.receipt_hash,
+                receipt: r.receipt,
+                local_execution: r.local_execution,
+                state_update: r.state_update,
+                error: r.error,
+            })
+            .collect(),
+    )
 }
 
 impl Clone for RadixExecutor {

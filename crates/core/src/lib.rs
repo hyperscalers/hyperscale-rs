@@ -31,15 +31,19 @@
 mod action;
 mod execution_backend;
 mod input;
+mod node_config;
 mod protocol_event;
 pub mod result;
 mod timer;
 mod traits;
+mod validation;
 
 pub use action::{Action, CrossShardExecutionRequest, ProvisionRequest, TransactionStatus};
 pub use execution_backend::ExecutionBackend;
 pub use input::{EventPriority, NodeInput};
+pub use node_config::NodeConfig;
 pub use protocol_event::{ProtocolEvent, ProvisionVerificationResult};
 pub use result::{ExecutionOutput, SingleTxResult};
 pub use timer::{TimerId, TimerScheduler};
 pub use traits::StateMachine;
+pub use validation::{TransactionValidator, ValidationError};
