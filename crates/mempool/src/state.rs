@@ -3063,7 +3063,7 @@ mod tests {
             required_shards: std::iter::once(ShardGroupId(1)).collect(),
             registered_at: BlockHeight(1),
         };
-        coordinator.on_tx_registered(tx_hash, reg);
+        coordinator.on_tx_registered::<ConcreteConfig>(tx_hash, reg);
 
         // Simulate a verified provision being added (need to call internal method)
         // For this test, we'll just verify the logic by checking has_any_verified_provisions

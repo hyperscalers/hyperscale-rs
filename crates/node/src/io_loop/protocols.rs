@@ -18,7 +18,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     ///
     /// DeliverBlock and SyncComplete are fed directly to the state machine
     /// (no round-trip through the runner). FetchBlock uses the Network trait.
-    pub(super) fn process_sync_outputs(&mut self, outputs: Vec<SyncOutput>) {
+    pub(super) fn process_sync_outputs(&mut self, outputs: Vec<SyncOutput<Cfg::C>>) {
         for output in outputs {
             match output {
                 SyncOutput::FetchBlock { height } => {
@@ -53,6 +53,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                                 });
 
                                 if receipts_complete {
+                                    let block = block.map(|(b, q)| (b.reconfig::<Cfg::C>(), q));
                                     let _ = es.send(NodeInput::SyncBlockResponseReceived {
                                         height,
                                         block: Box::new(block),
@@ -174,7 +175,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 } => {
                     // Persist fetched certificates to storage so they survive restarts.
                     for cert in &certificates {
-                        self.storage.store_certificate(cert);
+                        ConsensusStore::<Cfg::C>::store_certificate(&*self.storage, cert);
                     }
                     self.feed_event(ProtocolEvent::CertificateFetchDelivered {
                         block_hash,

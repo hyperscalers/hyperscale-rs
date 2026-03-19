@@ -19,7 +19,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     // ─── Action Processing ──────────────────────────────────────────────
 
     /// Process a single action from the state machine.
-    pub(super) fn process_action(&mut self, action: Action) {
+    pub(super) fn process_action(&mut self, action: Action<Cfg::C>) {
         match action {
             // ═══════════════════════════════════════════════════════════
             // Timers
@@ -217,18 +217,18 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     // ─── Action Handler Groups ──────────────────────────────────────────
 
     /// Process storage read/write actions.
-    fn process_storage_action(&mut self, action: Action) {
+    fn process_storage_action(&mut self, action: Action<Cfg::C>) {
         match action {
             Action::PersistBlock { block, qc } => {
                 let height = block.header.height;
-                ConsensusStore::put_block(&*self.storage, height, &block, &qc);
+                ConsensusStore::<Cfg::C>::put_block(&*self.storage, height, &block, &qc);
             }
             Action::PersistTransactionCertificate { certificate } => {
                 // Populate cert cache before persisting — serves peer fetch requests
                 // from memory even if storage write hasn't completed.
                 self.cert_cache
                     .insert(certificate.transaction_hash, Arc::new(certificate.clone()));
-                self.storage.store_certificate(&certificate);
+                ConsensusStore::<Cfg::C>::store_certificate(&*self.storage, &certificate);
             }
             Action::PersistAndBroadcastVote {
                 height,
@@ -239,7 +239,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 recipients,
             } => {
                 // BFT Safety: persist vote BEFORE broadcasting.
-                self.storage.put_own_vote(height.0, round, block_hash);
+                ConsensusStore::<Cfg::C>::put_own_vote(&*self.storage, height.0, round, block_hash);
                 trace!(
                     height = height.0,
                     round,
@@ -249,7 +249,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 self.network.notify(&recipients, &vote);
             }
             Action::FetchBlock { height } => {
-                let block = self.storage.get_block(height);
+                let block = ConsensusStore::<Cfg::C>::get_block(&*self.storage, height);
                 let _ = self
                     .event_sender
                     .send(NodeInput::Protocol(ProtocolEvent::BlockFetched {
@@ -258,9 +258,9 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                     }));
             }
             Action::FetchChainMetadata => {
-                let height = self.storage.committed_height();
-                let hash = self.storage.committed_hash();
-                let qc = self.storage.latest_qc();
+                let height = ConsensusStore::<Cfg::C>::committed_height(&*self.storage);
+                let hash = ConsensusStore::<Cfg::C>::committed_hash(&*self.storage);
+                let qc = ConsensusStore::<Cfg::C>::latest_qc(&*self.storage);
                 let _ = self.event_sender.send(NodeInput::Protocol(
                     ProtocolEvent::ChainMetadataFetched { height, hash, qc },
                 ));
@@ -274,7 +274,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     /// defers the heavy JMT/metadata writes to [`flush_block_commits`].
     fn accumulate_block_commit(
         &mut self,
-        block: hyperscale_types::Block,
+        block: hyperscale_types::Block<Cfg::C>,
         qc: hyperscale_types::QuorumCertificate,
     ) {
         let block_hash = block.hash();
@@ -345,7 +345,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
             // All empty blocks — synchronous fast path.
             // Still advance JMT version so it matches block height.
             if !pending_receipts.is_empty() {
-                self.storage.store_receipt_bundles(&pending_receipts);
+                ConsensusStore::<Cfg::C>::store_receipt_bundles(&*self.storage, &pending_receipts);
             }
             // Prune stale prepared_commits that outlived their blocks.
             let max_height = commits
@@ -367,13 +367,14 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 };
                 // Empty blocks have no certificate writes — pass empty DatabaseUpdates.
                 let empty_updates = hyperscale_types::DatabaseUpdates::default();
-                let result = self.storage.commit_block(
+                let result = CommitStore::<Cfg::C>::commit_block(
+                    &*self.storage,
                     &empty_updates,
                     &block.certificates,
                     height.0,
                     Some(consensus),
                 );
-                ConsensusStore::prune_own_votes(&*self.storage, height.0);
+                ConsensusStore::<Cfg::C>::prune_own_votes(&*self.storage, height.0);
                 let _ = self.event_sender.send(NodeInput::Protocol(
                     ProtocolEvent::StateCommitComplete {
                         height: height.0,
@@ -432,7 +433,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
             // Persist receipt bundles before committing — the sync path
             // reconstructs DatabaseUpdates by reading these back.
             if !pending_receipts.is_empty() {
-                storage.store_receipt_bundles(&pending_receipts);
+                ConsensusStore::<Cfg::C>::store_receipt_bundles(&*storage, &pending_receipts);
             }
 
             for (i, (block, qc)) in commits.into_iter().enumerate() {
@@ -451,7 +452,12 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 let prepared = prepared_map[i].take();
                 let result = if let Some(prepared) = prepared {
                     // Normal path: prepared commit from VerifyStateRoot.
-                    storage.commit_prepared_block(prepared, &block.certificates, Some(consensus))
+                    CommitStore::<Cfg::C>::commit_prepared_block(
+                        &*storage,
+                        prepared,
+                        &block.certificates,
+                        Some(consensus),
+                    )
                 } else if !block.certificates.is_empty() {
                     // Sync path: no execution cache, reconstruct DatabaseUpdates
                     // from receipts stored during sync.
@@ -459,15 +465,17 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                         .certificates
                         .iter()
                         .map(|cert| {
-                            let receipt = storage
-                                .get_ledger_receipt(&cert.transaction_hash)
-                                .unwrap_or_else(|| {
-                                    panic!(
-                                        "Missing receipt for certificate {} at height {} — \
+                            let receipt = ConsensusStore::<Cfg::C>::get_ledger_receipt(
+                                &*storage,
+                                &cert.transaction_hash,
+                            )
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "Missing receipt for certificate {} at height {} — \
                                          sync response was incomplete and pre-storage failed",
-                                        cert.transaction_hash, height.0,
-                                    )
-                                });
+                                    cert.transaction_hash, height.0,
+                                )
+                            });
                             let updates = hyperscale_storage::receipt_to_database_updates(&receipt);
                             hyperscale_storage::filter_updates_to_shard(
                                 &updates,
@@ -477,11 +485,18 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                         })
                         .collect();
                     let merged = hyperscale_storage::merge_database_updates(&per_cert);
-                    storage.commit_block(&merged, &block.certificates, height.0, Some(consensus))
+                    CommitStore::<Cfg::C>::commit_block(
+                        &*storage,
+                        &merged,
+                        &block.certificates,
+                        height.0,
+                        Some(consensus),
+                    )
                 } else {
                     // Empty block: no updates needed.
                     let empty_updates = hyperscale_types::DatabaseUpdates::default();
-                    storage.commit_block(
+                    CommitStore::<Cfg::C>::commit_block(
+                        &*storage,
                         &empty_updates,
                         &block.certificates,
                         height.0,
@@ -489,7 +504,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                     )
                 };
 
-                ConsensusStore::prune_own_votes(&*storage, height.0);
+                ConsensusStore::<Cfg::C>::prune_own_votes(&*storage, height.0);
 
                 // Clear the in-flight flag before sending events for the last
                 // block. The channel send synchronizes-with recv on the main
@@ -533,11 +548,11 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
             return;
         }
         let bundles = std::mem::take(&mut self.pending_receipt_bundles);
-        self.storage.store_receipt_bundles(&bundles);
+        ConsensusStore::<Cfg::C>::store_receipt_bundles(&*self.storage, &bundles);
     }
 
     /// Process sync, fetch, and provision recovery actions.
-    fn process_sync_fetch_action(&mut self, action: Action) {
+    fn process_sync_fetch_action(&mut self, action: Action<Cfg::C>) {
         match action {
             Action::StartSync {
                 target_height,
@@ -639,10 +654,10 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     /// `event_sender` channel and are processed on a future `step()` call.
     /// With `SyncDispatch` (simulation), `spawn_*` runs inline so events
     /// enter the channel immediately and are drained by the harness.
-    fn dispatch_delegated_action(&mut self, action: Action) {
+    fn dispatch_delegated_action(&mut self, action: Action<Cfg::C>) {
         let is_speculative = matches!(action, Action::SpeculativeExecute { .. });
         let is_execution = is_speculative || matches!(action, Action::ExecuteTransactions { .. });
-        let pool = action_handler::dispatch_pool_for(&action)
+        let pool = action_handler::dispatch_pool_for::<Cfg::C>(&action)
             .expect("dispatch_delegated_action called for delegated actions only");
 
         // Clone cheap shared state for the 'static spawn closure.

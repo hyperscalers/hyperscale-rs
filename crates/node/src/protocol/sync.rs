@@ -17,7 +17,7 @@ use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ConsensusStore;
-use hyperscale_types::{Block, Hash, QuorumCertificate};
+use hyperscale_types::{Block, ConcreteConfig, Hash, QuorumCertificate, TypeConfig};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -95,7 +95,7 @@ impl Default for SyncStatus {
 
 /// Inputs to the sync protocol state machine.
 #[derive(Debug)]
-pub enum SyncInput {
+pub enum SyncInput<C: TypeConfig = ConcreteConfig> {
     /// Start or update sync target.
     StartSync {
         target_height: u64,
@@ -105,7 +105,7 @@ pub enum SyncInput {
     /// `None` means the peer did not have the block.
     BlockResponseReceived {
         height: u64,
-        block: Box<Option<(Block, QuorumCertificate)>>,
+        block: Box<Option<(Block<C>, QuorumCertificate)>>,
     },
     /// A block fetch failed after all retries.
     BlockFetchFailed { height: u64 },
@@ -115,12 +115,12 @@ pub enum SyncInput {
 
 /// Outputs from the sync protocol state machine.
 #[derive(Debug)]
-pub enum SyncOutput {
+pub enum SyncOutput<C: TypeConfig = ConcreteConfig> {
     /// Request the runner to fetch a block at this height.
     FetchBlock { height: u64 },
     /// A validated block is ready to deliver to BFT.
     DeliverBlock {
-        block: Box<Block>,
+        block: Box<Block<C>>,
         qc: Box<QuorumCertificate>,
     },
     /// Sync is complete (reached target).
@@ -155,7 +155,7 @@ impl SyncProtocol {
     }
 
     /// Process an input and return outputs.
-    pub fn handle(&mut self, input: SyncInput) -> Vec<SyncOutput> {
+    pub fn handle<C: TypeConfig>(&mut self, input: SyncInput<C>) -> Vec<SyncOutput<C>> {
         match input {
             SyncInput::StartSync {
                 target_height,
@@ -204,7 +204,11 @@ impl SyncProtocol {
     // Input Handlers
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn handle_start_sync(&mut self, target_height: u64, target_hash: Hash) -> Vec<SyncOutput> {
+    fn handle_start_sync<C: TypeConfig>(
+        &mut self,
+        target_height: u64,
+        target_hash: Hash,
+    ) -> Vec<SyncOutput<C>> {
         if self.sync_target.is_some_and(|(t, _)| t >= target_height) {
             return vec![];
         }
@@ -221,11 +225,11 @@ impl SyncProtocol {
         self.emit_fetch_outputs()
     }
 
-    fn handle_block_response(
+    fn handle_block_response<C: TypeConfig>(
         &mut self,
         height: u64,
-        block: Option<(Block, QuorumCertificate)>,
-    ) -> Vec<SyncOutput> {
+        block: Option<(Block<C>, QuorumCertificate)>,
+    ) -> Vec<SyncOutput<C>> {
         self.heights_in_flight.remove(&height);
 
         match block {
@@ -276,7 +280,7 @@ impl SyncProtocol {
         }
     }
 
-    fn handle_block_fetch_failed(&mut self, height: u64) -> Vec<SyncOutput> {
+    fn handle_block_fetch_failed<C: TypeConfig>(&mut self, height: u64) -> Vec<SyncOutput<C>> {
         self.heights_in_flight.remove(&height);
         warn!(height, "Sync fetch failed, re-queuing");
         metrics::record_sync_response_error("fetch_failed");
@@ -284,7 +288,7 @@ impl SyncProtocol {
         self.emit_fetch_outputs()
     }
 
-    fn handle_block_committed(&mut self, height: u64) -> Vec<SyncOutput> {
+    fn handle_block_committed<C: TypeConfig>(&mut self, height: u64) -> Vec<SyncOutput<C>> {
         self.committed_height = height;
         self.remove_heights_at_or_below(height);
 
@@ -353,7 +357,7 @@ impl SyncProtocol {
     }
 
     /// Emit FetchBlock outputs for pending heights up to concurrent limit.
-    fn emit_fetch_outputs(&mut self) -> Vec<SyncOutput> {
+    fn emit_fetch_outputs<C: TypeConfig>(&mut self) -> Vec<SyncOutput<C>> {
         let mut outputs = Vec::new();
         while self.heights_in_flight.len() < self.config.max_concurrent_fetches {
             if let Some(height) = self.pop_next_height() {
@@ -376,7 +380,7 @@ impl SyncProtocol {
 /// Includes ledger receipts for each certificate in the block so the
 /// syncing peer can apply state changes without re-executing.
 pub fn serve_block_request(
-    storage: &impl ConsensusStore,
+    storage: &(impl ConsensusStore + ?Sized),
     req: GetBlockRequest,
 ) -> GetBlockResponse {
     trace!(height = req.height.0, "Handling block sync request");
@@ -437,7 +441,7 @@ mod tests {
             sync_window_size: 10,
         });
 
-        let outputs = protocol.handle(SyncInput::StartSync {
+        let outputs = protocol.handle::<ConcreteConfig>(SyncInput::StartSync {
             target_height: 5,
             target_hash: Hash::ZERO,
         });
@@ -461,7 +465,7 @@ mod tests {
             sync_window_size: 64,
         });
 
-        protocol.handle(SyncInput::StartSync {
+        protocol.handle::<ConcreteConfig>(SyncInput::StartSync {
             target_height: 2,
             target_hash: Hash::ZERO,
         });
@@ -469,7 +473,7 @@ mod tests {
         assert!(protocol.is_syncing());
 
         // Commit up to target
-        let outputs = protocol.handle(SyncInput::BlockCommitted { height: 2 });
+        let outputs = protocol.handle::<ConcreteConfig>(SyncInput::BlockCommitted { height: 2 });
 
         assert!(!protocol.is_syncing());
         assert!(outputs
@@ -484,13 +488,13 @@ mod tests {
             sync_window_size: 10,
         });
 
-        protocol.handle(SyncInput::StartSync {
+        protocol.handle::<ConcreteConfig>(SyncInput::StartSync {
             target_height: 3,
             target_hash: Hash::ZERO,
         });
 
         // Fail the first fetch
-        let outputs = protocol.handle(SyncInput::BlockFetchFailed { height: 1 });
+        let outputs = protocol.handle::<ConcreteConfig>(SyncInput::BlockFetchFailed { height: 1 });
 
         // Should re-emit a FetchBlock for height 1
         assert!(outputs

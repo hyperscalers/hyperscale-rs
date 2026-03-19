@@ -254,6 +254,25 @@ pub struct Block<C: TypeConfig = ConcreteConfig> {
     pub commitment_proofs: HashMap<Hash, CommitmentProof>,
 }
 
+impl<C: TypeConfig> Block<C> {
+    /// Re-tag this block with a different [`TypeConfig`] that shares the
+    /// same `Transaction` associated type. This is a zero-cost, field-by-field
+    /// move used at generic/concrete boundaries (e.g. network deserialization
+    /// produces `Block<ConcreteConfig>` but `IoLoop<Cfg>` needs `Block<Cfg::C>`).
+    pub fn reconfig<C2: TypeConfig<Transaction = C::Transaction>>(self) -> Block<C2> {
+        Block {
+            header: self.header,
+            retry_transactions: self.retry_transactions,
+            priority_transactions: self.priority_transactions,
+            transactions: self.transactions,
+            certificates: self.certificates,
+            deferred: self.deferred,
+            aborted: self.aborted,
+            commitment_proofs: self.commitment_proofs,
+        }
+    }
+}
+
 impl<C: TypeConfig> std::fmt::Debug for Block<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Block")

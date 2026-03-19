@@ -15,7 +15,8 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{CommitStore, SubstateStore};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ShardGroupId, ValidatorId,
+    Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ShardGroupId, TypeConfig,
+    ValidatorId,
 };
 use std::sync::Arc;
 
@@ -31,13 +32,19 @@ pub(crate) struct ActionContext<'a, Cfg: NodeConfig> {
 }
 
 /// Result of handling a delegated action.
-pub(crate) struct DelegatedResult<P: Send> {
+pub(crate) struct DelegatedResult<C: TypeConfig, P: Send> {
     /// Events to deliver to the state machine.
-    pub events: Vec<NodeInput>,
+    pub events: Vec<NodeInput<C>>,
     /// Prepared commit handle to cache: (block_hash, block_height, handle).
     /// Height is stored alongside the handle so stale entries can be pruned.
     pub prepared_commit: Option<(Hash, u64, P)>,
 }
+
+/// Alias for `DelegatedResult` parameterized by a `NodeConfig`.
+pub(crate) type DelegatedActionResult<Cfg> = DelegatedResult<
+    <Cfg as NodeConfig>::C,
+    <<Cfg as NodeConfig>::S as CommitStore<<Cfg as NodeConfig>::C>>::PreparedCommit,
+>;
 
 /// Which dispatch pool an action should run on in production.
 pub(crate) enum DispatchPool {
@@ -53,7 +60,7 @@ pub(crate) enum DispatchPool {
 ///
 /// Returns `None` for actions that are not delegated (network, timers, etc.)
 /// and should be handled by the runner directly.
-pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
+pub(crate) fn dispatch_pool_for<C: TypeConfig>(action: &Action<C>) -> Option<DispatchPool> {
     match action {
         // Consensus-critical crypto
         Action::VerifyAndBuildQuorumCertificate { .. } => Some(DispatchPool::ConsensusCrypto),
@@ -87,9 +94,9 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
-    action: Action,
+    action: Action<Cfg::C>,
     ctx: &ActionContext<'_, Cfg>,
-) -> Option<DelegatedResult<<Cfg::S as CommitStore>::PreparedCommit>> {
+) -> Option<DelegatedActionResult<Cfg>> {
     match action {
         // --- BFT crypto verification ---
         Action::VerifyAndBuildQuorumCertificate {
@@ -182,7 +189,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
             transactions,
         } => {
             let start = std::time::Instant::now();
-            let valid = hyperscale_bft::handlers::verify_transaction_root(
+            let valid = hyperscale_bft::handlers::verify_transaction_root::<Cfg::C>(
                 expected_root,
                 &retry_transactions,
                 &priority_transactions,
@@ -230,7 +237,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
         } => {
             let start = std::time::Instant::now();
             let merged = hyperscale_storage::merge_database_updates_from_arcs(&per_cert_updates);
-            let result = hyperscale_bft::handlers::verify_state_root(
+            let result = hyperscale_bft::handlers::verify_state_root::<Cfg::C, _>(
                 ctx.storage,
                 parent_state_root,
                 expected_root,
@@ -275,7 +282,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
         } => {
             let merged_updates =
                 hyperscale_storage::merge_database_updates_from_arcs(&per_cert_updates);
-            let result = hyperscale_bft::handlers::build_proposal(
+            let result = hyperscale_bft::handlers::build_proposal::<Cfg::C, _>(
                 ctx.storage,
                 proposer,
                 height,

@@ -4,13 +4,13 @@
 //! algorithms, separated from dispatch (thread pool vs inline) and result
 //! delivery (channel vs event queue) concerns.
 
-use hyperscale_storage::{CommitStore, DatabaseUpdates, SubstateStore};
+use hyperscale_storage::{CommitStore, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_receipt_root, compute_transaction_root,
     verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
-    Bls12381G2Signature, CommitmentProof, ConcreteConfig, Hash, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, SignerBitfield, TransactionAbort, TransactionCertificate,
-    TransactionDefer, TypeConfig, ValidatorId, VotePower,
+    Bls12381G2Signature, CommitmentProof, ConcreteConfig, Hash, QuorumCertificate, ShardGroupId,
+    SignerBitfield, TransactionAbort, TransactionCertificate, TransactionDefer, TypeConfig,
+    ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -223,17 +223,14 @@ pub fn verify_commitment_proof(
 /// Verify that the computed transaction merkle root matches the expected root.
 ///
 /// Pure computation over the three transaction sections (retry, priority, normal).
-pub fn verify_transaction_root(
+pub fn verify_transaction_root<C: TypeConfig>(
     expected_root: Hash,
-    retry_transactions: &[Arc<RoutableTransaction>],
-    priority_transactions: &[Arc<RoutableTransaction>],
-    transactions: &[Arc<RoutableTransaction>],
+    retry_transactions: &[Arc<C::Transaction>],
+    priority_transactions: &[Arc<C::Transaction>],
+    transactions: &[Arc<C::Transaction>],
 ) -> bool {
-    let computed_root = compute_transaction_root::<ConcreteConfig>(
-        retry_transactions,
-        priority_transactions,
-        transactions,
-    );
+    let computed_root =
+        compute_transaction_root::<C>(retry_transactions, priority_transactions, transactions);
     let valid = computed_root == expected_root;
 
     if !valid {
@@ -283,11 +280,11 @@ pub struct StateRootResult<P: Send> {
 /// Calls `storage.prepare_block_commit()` to compute the speculative state root
 /// from the certificates, then compares against the expected root. Returns the
 /// prepared commit handle for caching on success.
-pub fn verify_state_root<S: CommitStore>(
+pub fn verify_state_root<C: TypeConfig, S: CommitStore<C>>(
     storage: &S,
     parent_state_root: Hash,
     expected_root: Hash,
-    merged_updates: &DatabaseUpdates,
+    merged_updates: &C::StateUpdate,
     block_height: u64,
 ) -> StateRootResult<S::PreparedCommit> {
     let (computed_root, prepared) =
@@ -327,7 +324,7 @@ pub struct ProposalResult<P: Send, C: TypeConfig = ConcreteConfig> {
 /// 5. Build BlockHeader + Block, hash it
 /// 6. Return block, hash, optional prepared commit handle
 #[allow(clippy::too_many_arguments)]
-pub fn build_proposal<S: CommitStore + SubstateStore>(
+pub fn build_proposal<C: TypeConfig, S: CommitStore<C> + SubstateStore>(
     storage: &S,
     proposer: ValidatorId,
     height: BlockHeight,
@@ -337,17 +334,17 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     timestamp: u64,
     is_fallback: bool,
     parent_state_root: Hash,
-    retry_transactions: Vec<Arc<RoutableTransaction>>,
-    priority_transactions: Vec<Arc<RoutableTransaction>>,
-    transactions: Vec<Arc<RoutableTransaction>>,
+    retry_transactions: Vec<Arc<C::Transaction>>,
+    priority_transactions: Vec<Arc<C::Transaction>>,
+    transactions: Vec<Arc<C::Transaction>>,
     certificates: Vec<Arc<TransactionCertificate>>,
-    merged_updates: DatabaseUpdates,
+    merged_updates: C::StateUpdate,
     commitment_proofs: HashMap<Hash, CommitmentProof>,
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
     local_shard: ShardGroupId,
     provision_targets: Vec<ShardGroupId>,
-) -> ProposalResult<S::PreparedCommit> {
+) -> ProposalResult<S::PreparedCommit, C> {
     // Check if JMT is at parent_state_root (no waiting - instant check)
     let current_root = storage.state_root_hash();
     let jmt_ready = current_root == parent_state_root;
@@ -376,11 +373,8 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     };
 
     // Compute transaction root from all transaction sections
-    let transaction_root = compute_transaction_root::<ConcreteConfig>(
-        &retry_transactions,
-        &priority_transactions,
-        &transactions,
-    );
+    let transaction_root =
+        compute_transaction_root::<C>(&retry_transactions, &priority_transactions, &transactions);
 
     // Compute receipt root from certificate receipt hashes
     let receipt_root = compute_receipt_root(&certs_to_include);

@@ -31,6 +31,7 @@ use tracing::{debug, info, warn};
 pub struct ProdConfig;
 
 impl hyperscale_node::NodeConfig for ProdConfig {
+    type C = hyperscale_types::ConcreteConfig;
     type S = SharedStorage<PooledDispatch>;
     type N = Libp2pNetwork;
     type D = PooledDispatch;

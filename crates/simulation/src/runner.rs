@@ -35,6 +35,7 @@ use tracing::{debug, info, trace, warn};
 pub struct SimConfig;
 
 impl NodeConfig for SimConfig {
+    type C = hyperscale_types::ConcreteConfig;
     type S = SimStorage<SyncDispatch>;
     type N = SimNetworkAdapter;
     type D = SyncDispatch;

@@ -10,8 +10,8 @@ use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommitmentProof,
     CommittedBlockHeader, ConcreteConfig, Hash, QuorumCertificate, ReadyTransactions,
-    ReceiptBundle, RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionAbort,
-    TransactionCertificate, TransactionDefer, TypeConfig,
+    ReceiptBundle, ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate,
+    TransactionDefer, TypeConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,13 +51,13 @@ pub struct NodeStateMachine<C: TypeConfig = ConcreteConfig> {
     topology: TopologyState,
 
     /// BFT consensus state (includes implicit round advancement).
-    bft: BftState,
+    bft: BftState<C>,
 
     /// Execution state.
-    execution: ExecutionState,
+    execution: ExecutionState<C>,
 
     /// Mempool state.
-    mempool: MempoolState,
+    mempool: MempoolState<C>,
 
     /// Provision coordination for cross-shard transactions.
     provisions: ProvisionCoordinator,
@@ -76,12 +76,9 @@ pub struct NodeStateMachine<C: TypeConfig = ConcreteConfig> {
 
     /// Current time.
     now: Duration,
-
-    /// Phantom data for the type config parameter.
-    _phantom: std::marker::PhantomData<C>,
 }
 
-impl std::fmt::Debug for NodeStateMachine {
+impl<C: TypeConfig> std::fmt::Debug for NodeStateMachine<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeStateMachine")
             .field("node_index", &self.node_index)
@@ -96,15 +93,15 @@ impl std::fmt::Debug for NodeStateMachine {
 ///
 /// Used by both `ProposalTimer` and `QuorumCertificateFormed` handlers
 /// to avoid duplicating the ready-transaction gathering logic.
-struct ProposalInputs {
-    ready_txs: ReadyTransactions,
+struct ProposalInputs<C: TypeConfig> {
+    ready_txs: ReadyTransactions<C>,
     commitment_proofs: HashMap<Hash, CommitmentProof>,
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
     certificates: Vec<Arc<TransactionCertificate>>,
 }
 
-impl NodeStateMachine {
+impl<C: TypeConfig> NodeStateMachine<C> {
     /// Create a new node state machine with default speculative execution settings.
     ///
     /// # Arguments
@@ -174,7 +171,6 @@ impl NodeStateMachine {
             // Use recovered JMT root - critical for correct state root computation
             last_committed_jmt_root: jmt_root,
             now: Duration::ZERO,
-            _phantom: std::marker::PhantomData,
         }
     }
 
@@ -196,22 +192,22 @@ impl NodeStateMachine {
     }
 
     /// Get a reference to the mempool state.
-    pub fn mempool(&self) -> &MempoolState {
+    pub fn mempool(&self) -> &MempoolState<C> {
         &self.mempool
     }
 
     /// Get a reference to the BFT state.
-    pub fn bft(&self) -> &BftState {
+    pub fn bft(&self) -> &BftState<C> {
         &self.bft
     }
 
     /// Get a reference to the execution state.
-    pub fn execution(&self) -> &ExecutionState {
+    pub fn execution(&self) -> &ExecutionState<C> {
         &self.execution
     }
 
     /// Get a mutable reference to the execution state.
-    pub(crate) fn execution_mut(&mut self) -> &mut ExecutionState {
+    pub(crate) fn execution_mut(&mut self) -> &mut ExecutionState<C> {
         &mut self.execution
     }
 
@@ -233,7 +229,7 @@ impl NodeStateMachine {
     /// Initialize the node with a genesis block.
     ///
     /// Returns actions to be processed (e.g., initial timers).
-    pub fn initialize_genesis(&mut self, genesis: Block) -> Vec<Action> {
+    pub fn initialize_genesis(&mut self, genesis: Block<C>) -> Vec<Action<C>> {
         self.bft
             .initialize_genesis(self.topology.snapshot(), genesis)
         // Note: No separate view change timer - round advancement is handled
@@ -252,13 +248,13 @@ impl NodeStateMachine {
     /// mempool as having verified provisions.
     fn build_commitment_proofs(
         &self,
-        ready_txs: &ReadyTransactions,
+        ready_txs: &ReadyTransactions<C>,
     ) -> HashMap<Hash, CommitmentProof> {
         let mut proofs = HashMap::new();
 
         // Only priority transactions have verified provisions
         for tx in &ready_txs.priority {
-            let tx_hash = tx.hash();
+            let tx_hash = C::transaction_hash(tx);
             if let Some(proof) = self.provisions.build_commitment_proof(&tx_hash) {
                 proofs.insert(tx_hash, proof);
             }
@@ -271,7 +267,11 @@ impl NodeStateMachine {
     ///
     /// Used by both `on_proposal_timer` and `on_qc_formed` to avoid duplicating
     /// the ready-transaction + deferred + aborted + certificates gathering logic.
-    fn gather_proposal_inputs(&self, pending_txs: usize, pending_certs: usize) -> ProposalInputs {
+    fn gather_proposal_inputs(
+        &self,
+        pending_txs: usize,
+        pending_certs: usize,
+    ) -> ProposalInputs<C> {
         let max_txs = self.bft.config().max_transactions_per_block;
         let ready_txs = self
             .mempool
@@ -299,7 +299,7 @@ impl NodeStateMachine {
 
     /// Handle cleanup timer.
     #[instrument(skip(self))]
-    fn on_cleanup_timer(&mut self) -> Vec<Action> {
+    fn on_cleanup_timer(&mut self) -> Vec<Action<C>> {
         // Reschedule the cleanup timer
         let mut actions = vec![Action::SetTimer {
             id: TimerId::Cleanup,
@@ -334,13 +334,10 @@ impl NodeStateMachine {
         actions
     }
 
-    /// Collect per-certificate `Arc<DatabaseUpdates>` for a set of tx_hashes.
+    /// Collect per-certificate `Arc<StateUpdate>` for a set of tx_hashes.
     ///
     /// Returns cheap Arc clones — merging is deferred to the thread pool.
-    fn collect_updates_for_tx_hashes(
-        &self,
-        tx_hashes: &[Hash],
-    ) -> Vec<Arc<hyperscale_types::DatabaseUpdates>> {
+    fn collect_updates_for_tx_hashes(&self, tx_hashes: &[Hash]) -> Vec<Arc<C::StateUpdate>> {
         let cache = self.execution.execution_cache();
         tx_hashes
             .iter()
@@ -349,7 +346,7 @@ impl NodeStateMachine {
     }
 
     /// Handle proposal timer — propose a block or advance the round on timeout.
-    fn on_proposal_timer(&mut self) -> Vec<Action> {
+    fn on_proposal_timer(&mut self) -> Vec<Action<C>> {
         // Check if we should advance the round due to timeout.
         // Delegated to BftState which owns timeout tracking.
         if let Some(actions) = self.bft.check_round_timeout(self.topology.snapshot()) {
@@ -386,7 +383,7 @@ impl NodeStateMachine {
             MAX_RETRIES,
         );
 
-        // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
+        // Collect per-certificate Arc<StateUpdate> from execution cache.
         // The closure captures the cache; BftState calls it with the final
         // filtered certificate list after dedup. Returns cheap Arc clones —
         // merging is deferred to the thread pool.
@@ -396,7 +393,7 @@ impl NodeStateMachine {
             certs
                 .iter()
                 .filter_map(|cert| cache.get(&cert.transaction_hash).cloned())
-                .collect::<Vec<Arc<hyperscale_types::DatabaseUpdates>>>()
+                .collect::<Vec<Arc<C::StateUpdate>>>()
         };
 
         self.bft.on_proposal_timer(
@@ -415,7 +412,7 @@ impl NodeStateMachine {
         &mut self,
         header: BlockHeader,
         manifest: BlockManifest,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         // Total transaction count across all sections
         let total_tx_count = manifest.transaction_count();
 
@@ -505,7 +502,7 @@ impl NodeStateMachine {
     }
 
     /// Handle QC formed — may trigger immediate next proposal.
-    fn on_qc_formed(&mut self, block_hash: Hash, qc: QuorumCertificate) -> Vec<Action> {
+    fn on_qc_formed(&mut self, block_hash: Hash, qc: QuorumCertificate) -> Vec<Action<C>> {
         // Count transactions and certificates in the block that will be committed.
         // This is critical for respecting in-flight limits: the BlockCommitted
         // event won't be processed until after we select transactions, so we
@@ -516,7 +513,7 @@ impl NodeStateMachine {
 
         let inputs = self.gather_proposal_inputs(pending_tx_count, pending_cert_count);
 
-        // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
+        // Collect per-certificate Arc<StateUpdate> from execution cache.
         // Returns cheap Arc clones — merging is deferred to the thread pool.
         let topology = self.topology.snapshot();
         let cache = self.execution.execution_cache();
@@ -524,7 +521,7 @@ impl NodeStateMachine {
             certs
                 .iter()
                 .filter_map(|cert| cache.get(&cert.transaction_hash).cloned())
-                .collect::<Vec<Arc<hyperscale_types::DatabaseUpdates>>>()
+                .collect::<Vec<Arc<C::StateUpdate>>>()
         };
 
         self.bft.on_qc_formed(
@@ -541,7 +538,7 @@ impl NodeStateMachine {
     }
 
     /// Handle JMT state commit completion — update tracked state and notify BFT.
-    fn on_state_commit_complete(&mut self, height: u64, state_root: Hash) -> Vec<Action> {
+    fn on_state_commit_complete(&mut self, height: u64, state_root: Hash) -> Vec<Action<C>> {
         let prev_height = self.bft.committed_height();
 
         // Update if this is the current or a newer height. Use `>=` because
@@ -575,16 +572,25 @@ impl NodeStateMachine {
     /// 1. Register cross-shard TXs with livelock BEFORE processing deferrals
     /// 2. Cleanup deferred/aborted/retried execution state BEFORE passing new TXs
     /// 3. Process CrossShardTxRegistered continuations BEFORE other exec actions
-    fn on_block_committed(&mut self, block_hash: Hash, height: u64, block: Block) -> Vec<Action> {
+    fn on_block_committed(
+        &mut self,
+        block_hash: Hash,
+        height: u64,
+        block: Block<C>,
+    ) -> Vec<Action<C>> {
         let mut actions = Vec::new();
         let block_height = BlockHeight(height);
+        let num_shards = self.topology.snapshot().num_shards();
 
         // Register newly committed cross-shard TXs with livelock for cycle detection.
         // Must happen BEFORE livelock.on_block_committed() processes deferrals.
         for tx in block.all_transactions() {
-            if self.livelock.is_cross_shard(self.topology.snapshot(), tx) {
-                self.livelock
-                    .on_cross_shard_committed(self.topology.snapshot(), tx, block_height);
+            if C::transaction_is_cross_shard(tx, num_shards) {
+                self.livelock.on_cross_shard_committed_generic::<C>(
+                    self.topology.snapshot(),
+                    tx,
+                    block_height,
+                );
             }
         }
 
@@ -608,11 +614,11 @@ impl NodeStateMachine {
         // cleaned up so T' can execute fresh. The mempool marks T as Retried and
         // releases its locks; here we clean up execution tracking.
         for retry_tx in &block.retry_transactions {
-            let original_hash = retry_tx.original_hash();
+            let original_hash = C::transaction_original_hash(retry_tx);
             // Only cleanup if the original is different from the retry
             // (original_hash returns self.hash() for non-retries, but retry_transactions
             // should only contain actual retries)
-            if original_hash != retry_tx.hash() {
+            if original_hash != C::transaction_hash(retry_tx) {
                 self.execution.cleanup_transaction(&original_hash);
             }
         }
@@ -713,7 +719,7 @@ impl NodeStateMachine {
         &mut self,
         results: Vec<ProvisionVerificationResult>,
         committed_header: Option<CommittedBlockHeader>,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         for result in &results {
             if result.valid {
                 self.mempool.on_provision_verified(result.tx_hash);
@@ -727,7 +733,7 @@ impl NodeStateMachine {
     }
 
     /// Handle transaction executed — notify mempool and check pending blocks.
-    fn on_transaction_executed(&mut self, tx_hash: Hash, accepted: bool) -> Vec<Action> {
+    fn on_transaction_executed(&mut self, tx_hash: Hash, accepted: bool) -> Vec<Action<C>> {
         // Notify mempool
         let mut actions =
             self.mempool
@@ -747,16 +753,20 @@ impl NodeStateMachine {
     /// Handle transaction gossip received — add to mempool and check pending blocks.
     fn on_transaction_gossip_received(
         &mut self,
-        tx: Arc<RoutableTransaction>,
+        tx: Arc<C::Transaction>,
         submitted_locally: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         // Only add to our mempool if this transaction involves our shard.
         // Cross-shard transactions that don't touch our shard should be ignored.
-        if !self.topology.snapshot().involves_local_shard(&tx) {
+        if !self
+            .topology
+            .snapshot()
+            .involves_local_shard_generic::<C>(&tx)
+        {
             return vec![];
         }
 
-        let tx_hash = tx.hash();
+        let tx_hash = C::transaction_hash(&tx);
         let mut actions =
             self.mempool
                 .on_transaction_gossip_arc(self.topology.snapshot(), tx, submitted_locally);
@@ -773,7 +783,7 @@ impl NodeStateMachine {
     }
 
     /// Handle sync complete — resume cleanup timer.
-    fn on_sync_complete(&mut self) -> Vec<Action> {
+    fn on_sync_complete(&mut self) -> Vec<Action<C>> {
         let mut actions = self.bft.on_sync_complete(self.topology.snapshot());
         // Reschedule the cleanup timer. During sync, the cleanup timer
         // fires StartSync actions which don't reschedule the timer.
@@ -791,7 +801,7 @@ impl NodeStateMachine {
         &mut self,
         block_hash: Hash,
         certificates: Vec<TransactionCertificate>,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         // Verify each fetched certificate's embedded ExecutionCertificates against
         // our current topology. This ensures we don't accept forged certificates
         // from Byzantine peers.
@@ -807,14 +817,14 @@ impl NodeStateMachine {
     }
 }
 
-impl StateMachine for NodeStateMachine {
+impl<C: TypeConfig> StateMachine<C> for NodeStateMachine<C> {
     #[instrument(skip(self), fields(
         node = self.node_index,
         shard = self.topology.snapshot().local_shard().0,
         event = %event.type_name(),
         height = self.bft.committed_height(),
     ))]
-    fn handle(&mut self, event: ProtocolEvent) -> Vec<Action> {
+    fn handle(&mut self, event: ProtocolEvent<C>) -> Vec<Action<C>> {
         let mut actions = match event {
             // ── Timers ───────────────────────────────────────────────────
             ProtocolEvent::CleanupTimer => self.on_cleanup_timer(),
@@ -954,7 +964,7 @@ impl StateMachine for NodeStateMachine {
                 // that set is cleared — so a slow speculative execution completing
                 // post-view-change won't overwrite a canonical receipt produced by
                 // the re-execution that the view-change path dispatches.
-                let mut bundles: Vec<ReceiptBundle> = Vec::with_capacity(results.len());
+                let mut bundles: Vec<ReceiptBundle<C>> = Vec::with_capacity(results.len());
 
                 for result in results {
                     let tx_hash = result.tx_hash;
@@ -981,7 +991,7 @@ impl StateMachine for NodeStateMachine {
                 }
 
                 // Dispatch receipt storage (fire-and-forget, off main thread)
-                let mut actions: Vec<Action> = Vec::new();
+                let mut actions: Vec<Action<C>> = Vec::new();
                 if !bundles.is_empty() {
                     tracing::debug!(
                         speculative,

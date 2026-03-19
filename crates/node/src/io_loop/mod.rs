@@ -40,8 +40,8 @@ use hyperscale_network::Network;
 use hyperscale_storage::CommitStore;
 use hyperscale_types::{
     Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
-    ExecutionVote, Hash, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, TransactionCertificate, ValidatorId,
+    ExecutionVote, Hash, QuorumCertificate, ReceiptBundle, ShardGroupId, TopologySnapshot,
+    TransactionCertificate, TypeConfig, ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -140,12 +140,12 @@ pub struct NodeStatusSnapshot {
 /// storage, network, dispatch, executor, validator, and TypeConfig.
 pub struct IoLoop<Cfg: NodeConfig> {
     // Core components
-    state: NodeStateMachine,
+    state: NodeStateMachine<Cfg::C>,
     storage: Arc<Cfg::S>,
     executor: Cfg::E,
     network: Cfg::N,
     dispatch: Cfg::D,
-    event_sender: crossbeam::channel::Sender<NodeInput>,
+    event_sender: crossbeam::channel::Sender<NodeInput<Cfg::C>>,
 
     // Identity
     signing_key: Arc<Bls12381G1PrivateKey>,
@@ -158,11 +158,12 @@ pub struct IoLoop<Cfg: NodeConfig> {
     // Stores (block_height, prepared_commit) so stale entries can be pruned
     // when they outlive the block they were prepared for.
     #[allow(clippy::type_complexity)]
-    prepared_commits: Arc<Mutex<HashMap<Hash, (u64, <Cfg::S as CommitStore>::PreparedCommit)>>>,
+    prepared_commits:
+        Arc<Mutex<HashMap<Hash, (u64, <Cfg::S as CommitStore<Cfg::C>>::PreparedCommit)>>>,
 
     // In-memory caches (shared with inbound router in production)
     cert_cache: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
-    tx_cache: Arc<QuickCache<Hash, Arc<RoutableTransaction>>>,
+    tx_cache: Arc<QuickCache<Hash, Arc<<Cfg::C as TypeConfig>::Transaction>>>,
 
     // Sync protocol
     sync_protocol: SyncProtocol,
@@ -179,8 +180,8 @@ pub struct IoLoop<Cfg: NodeConfig> {
     locally_submitted: HashSet<Hash>,
 
     // Batch accumulators
-    validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
-    cross_shard_batch: BatchAccumulator<CrossShardExecutionRequest>,
+    validation_batch: BatchAccumulator<Arc<<Cfg::C as TypeConfig>::Transaction>>,
+    cross_shard_batch: BatchAccumulator<CrossShardExecutionRequest<Cfg::C>>,
     execution_vote_batch: BatchAccumulator<ExecutionVoteVerificationItem>,
     execution_certificate_batch: BatchAccumulator<(ExecutionCertificate, Vec<Bls12381G1PublicKey>)>,
     broadcast_vote_batch: ShardedBatchAccumulator<ExecutionVote>,
@@ -193,13 +194,13 @@ pub struct IoLoop<Cfg: NodeConfig> {
     // single feed_event/handle_actions batch, then spawns a single closure on
     // the execution pool to commit them sequentially. This keeps JMT writes
     // off the pinned IoLoop thread while preserving commit ordering.
-    pending_block_commits: Vec<(Block, QuorumCertificate)>,
+    pending_block_commits: Vec<(Block<Cfg::C>, QuorumCertificate)>,
 
     // Guard against out-of-order block commits across separate flushes.
     commit_in_flight: Arc<AtomicBool>,
 
     // Receipt bundle accumulator
-    pending_receipt_bundles: Vec<ReceiptBundle>,
+    pending_receipt_bundles: Vec<ReceiptBundle<Cfg::C>>,
 
     // Transaction status cache
     tx_status_cache: Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>>,
@@ -217,12 +218,12 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     /// Create a new IoLoop.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        state: NodeStateMachine,
+        state: NodeStateMachine<Cfg::C>,
         storage: Cfg::S,
         executor: Cfg::E,
         network: Cfg::N,
         dispatch: Cfg::D,
-        event_sender: crossbeam::channel::Sender<NodeInput>,
+        event_sender: crossbeam::channel::Sender<NodeInput<Cfg::C>>,
         signing_key: Bls12381G1PrivateKey,
         topology: SharedTopologySnapshot,
         config: IoLoopConfig,
@@ -327,7 +328,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     ///
     /// `NodeStateMachine::initialize_genesis()` returns actions (timer sets)
     /// that must be processed through the IoLoop's action handler.
-    pub fn handle_actions(&mut self, actions: Vec<Action>) {
+    pub fn handle_actions(&mut self, actions: Vec<Action<Cfg::C>>) {
         for action in actions {
             self.process_action(action);
         }
@@ -371,12 +372,12 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     // ─── Accessors ──────────────────────────────────────────────────────
 
     /// Access the state machine.
-    pub fn state(&self) -> &NodeStateMachine {
+    pub fn state(&self) -> &NodeStateMachine<Cfg::C> {
         &self.state
     }
 
     /// Mutably access the state machine.
-    pub fn state_mut(&mut self) -> &mut NodeStateMachine {
+    pub fn state_mut(&mut self) -> &mut NodeStateMachine<Cfg::C> {
         &mut self.state
     }
 
@@ -430,7 +431,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     /// 3. Process `emitted_statuses` from the returned [`StepOutput`]
     /// 4. Drain any events produced through the event channel (simulation only —
     ///    production receives these via its crossbeam channel receivers)
-    pub fn step(&mut self, event: NodeInput) -> StepOutput {
+    pub fn step(&mut self, event: NodeInput<Cfg::C>) -> StepOutput {
         self.emitted_statuses.clear();
         self.actions_generated = 0;
         self.pending_timer_ops.clear();
@@ -512,7 +513,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 // Store receipts from sync peer BEFORE processing the block.
                 // Syncing nodes didn't execute locally, so local_execution is None.
                 // state_changes already populated by remote peer.
-                let bundles: Vec<ReceiptBundle> = ledger_receipts
+                let bundles: Vec<ReceiptBundle<Cfg::C>> = ledger_receipts
                     .iter()
                     .map(|entry| ReceiptBundle {
                         tx_hash: entry.tx_hash,
@@ -557,7 +558,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 // Store receipts from fetch peer. Syncing nodes didn't execute
                 // locally, so local_execution is None.
                 // state_changes already populated by remote peer.
-                let bundles: Vec<ReceiptBundle> = ledger_receipts
+                let bundles: Vec<ReceiptBundle<Cfg::C>> = ledger_receipts
                     .iter()
                     .map(|entry| ReceiptBundle {
                         tx_hash: entry.tx_hash,
@@ -740,7 +741,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     ///
     /// This is the common pattern used throughout IoLoop: route an event through
     /// the state machine, then dispatch each resulting action.
-    fn feed_event(&mut self, event: ProtocolEvent) {
+    fn feed_event(&mut self, event: ProtocolEvent<Cfg::C>) {
         let actions = self.state.handle(event);
         self.actions_generated += actions.len();
         for action in actions {

@@ -6,7 +6,7 @@
 use crate::tracker::{CommittedCrossShardTracker, ProvisionTracker, RemoteStateNeeds};
 use hyperscale_types::{
     BlockHeight, CommitmentProof, DeferReason, Hash, NodeId, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, TransactionDefer,
+    TopologySnapshot, TransactionDefer, TypeConfig,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -148,6 +148,38 @@ impl LivelockState {
         self.committed_tracker.add(tx_hash, needs);
     }
 
+    /// Generic version of `on_cross_shard_committed` using `TypeConfig` operations.
+    ///
+    /// Registers a cross-shard transaction for cycle detection using generic
+    /// transaction accessors instead of direct field access.
+    pub fn on_cross_shard_committed_generic<C: TypeConfig>(
+        &mut self,
+        topology: &TopologySnapshot,
+        tx: &C::Transaction,
+        height: BlockHeight,
+    ) {
+        let tx_hash = C::transaction_hash(tx);
+        let reads = C::transaction_reads(tx);
+        let writes = C::transaction_writes(tx);
+
+        // Determine which shards and nodes we need provisions from
+        let needs = self.compute_remote_state_needs_from_nodes(topology, &reads, &writes);
+
+        if needs.shards.is_empty() {
+            // Not actually cross-shard, nothing to track
+            return;
+        }
+
+        debug!(
+            tx_hash = %tx_hash,
+            height = height.0,
+            shards = ?needs.shards,
+            "Tracking committed cross-shard TX for cycle detection"
+        );
+
+        self.committed_tracker.add(tx_hash, needs);
+    }
+
     /// Compute which remote shards and nodes a transaction needs provisions from.
     fn compute_remote_state_needs(
         &self,
@@ -169,6 +201,39 @@ impl LivelockState {
 
         // Add write nodes from remote shards (for read-your-writes scenarios)
         for node_id in &tx.declared_writes {
+            let shard = topology.shard_for_node_id(node_id);
+            if shard != local_shard {
+                nodes_by_shard.entry(shard).or_default().insert(*node_id);
+            }
+        }
+
+        let shards = nodes_by_shard.keys().copied().collect();
+
+        RemoteStateNeeds {
+            shards,
+            nodes_by_shard,
+        }
+    }
+
+    /// Compute remote state needs from pre-extracted read/write node lists.
+    fn compute_remote_state_needs_from_nodes(
+        &self,
+        topology: &TopologySnapshot,
+        reads: &[NodeId],
+        writes: &[NodeId],
+    ) -> RemoteStateNeeds {
+        let local_shard = topology.local_shard();
+
+        let mut nodes_by_shard: HashMap<ShardGroupId, HashSet<NodeId>> = HashMap::new();
+
+        for node_id in reads {
+            let shard = topology.shard_for_node_id(node_id);
+            if shard != local_shard {
+                nodes_by_shard.entry(shard).or_default().insert(*node_id);
+            }
+        }
+
+        for node_id in writes {
             let shard = topology.shard_for_node_id(node_id);
             if shard != local_shard {
                 nodes_by_shard.entry(shard).or_default().insert(*node_id);
@@ -375,7 +440,7 @@ impl LivelockState {
     /// Called when a block is committed.
     ///
     /// Processes deferrals, aborts, and certificates to clean up tracking state.
-    pub fn on_block_committed(&mut self, block: &hyperscale_types::Block) {
+    pub fn on_block_committed<C: TypeConfig>(&mut self, block: &hyperscale_types::Block<C>) {
         let height = block.header.height;
 
         // Process committed deferrals
@@ -508,7 +573,8 @@ pub struct LivelockStats {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        zero_bls_signature, SignerBitfield, StateEntry, SubstateInclusionProof, ValidatorId,
+        zero_bls_signature, ConcreteConfig, SignerBitfield, StateEntry, SubstateInclusionProof,
+        ValidatorId,
     };
     use std::sync::Arc;
 
@@ -851,7 +917,7 @@ mod tests {
             commitment_proofs: std::collections::HashMap::new(),
         };
 
-        state.on_block_committed(&block);
+        state.on_block_committed::<ConcreteConfig>(&block);
 
         // TX should be removed from committed tracker
         assert!(
@@ -911,7 +977,7 @@ mod tests {
             commitment_proofs: std::collections::HashMap::new(),
         };
 
-        state.on_block_committed(&block);
+        state.on_block_committed::<ConcreteConfig>(&block);
 
         // TX should be removed from committed tracker (completed successfully)
         assert!(
@@ -997,7 +1063,7 @@ mod tests {
             commitment_proofs: std::collections::HashMap::new(),
         };
 
-        state.on_block_committed(&block);
+        state.on_block_committed::<ConcreteConfig>(&block);
 
         // Tombstone should be added for certificate commit
         assert!(
@@ -1059,7 +1125,7 @@ mod tests {
             commitment_proofs: std::collections::HashMap::new(),
         };
 
-        state.on_block_committed(&block);
+        state.on_block_committed::<ConcreteConfig>(&block);
 
         // Tombstone should be added for abort commit
         assert!(
