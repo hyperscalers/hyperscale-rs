@@ -427,7 +427,7 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
 /// transaction tracker) that is not part of the transaction's declared
 /// writes. These undeclared writes must be stripped before the result
 /// enters the execution cache / JMT.
-fn filter_to_declared_writes(
+pub fn filter_to_declared_writes(
     updates: &hyperscale_storage::DatabaseUpdates,
     declared_writes: &[NodeId],
 ) -> hyperscale_storage::DatabaseUpdates {

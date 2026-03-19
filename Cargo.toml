@@ -22,6 +22,7 @@ members = [
     "crates/node",
     "crates/production",
     "crates/provisions",
+    "crates/radix-config",
     "crates/simulation",
     "crates/simulator",
     "crates/spammer",
@@ -55,6 +56,7 @@ default-members = [
     "crates/node",
     "crates/production",
     "crates/provisions",
+    "crates/radix-config",
     "crates/simulation",
     "crates/simulator",
     "crates/spammer",
@@ -96,6 +98,7 @@ hyperscale-network-memory = { path = "crates/network-memory" }
 hyperscale-node = { path = "crates/node" }
 hyperscale-production = { path = "crates/production" }
 hyperscale-provisions = { path = "crates/provisions" }
+hyperscale-radix-config = { path = "crates/radix-config" }
 hyperscale-simulation = { path = "crates/simulation" }
 hyperscale-simulator = { path = "crates/simulator" }
 hyperscale-spammer = { path = "crates/spammer" }

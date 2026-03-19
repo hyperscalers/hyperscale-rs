@@ -20,6 +20,7 @@ mod identifiers;
 mod network;
 mod proofs;
 mod signing;
+mod type_config;
 
 // Consensus types
 mod block;
@@ -92,6 +93,7 @@ pub use transaction::{
     TransactionDecision, TransactionDefer, TransactionError, TransactionStatus,
     TransactionStatusParseError,
 };
+pub use type_config::TypeConfig;
 pub use validator::{ValidatorInfo, ValidatorSet};
 
 // Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)

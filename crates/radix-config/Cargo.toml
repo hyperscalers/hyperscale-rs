@@ -1,0 +1,10 @@
+[package]
+name = "hyperscale-radix-config"
+version.workspace = true
+edition.workspace = true
+description = "RadixConfig — concrete TypeConfig binding for the Radix implementation"
+
+[dependencies]
+hyperscale-types = { workspace = true }
+hyperscale-storage = { workspace = true }
+hyperscale-execution = { workspace = true }
