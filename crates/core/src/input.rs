@@ -2,10 +2,11 @@
 
 use crate::ProtocolEvent;
 use hyperscale_types::{
-    Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, Hash,
-    LedgerReceiptEntry, QuorumCertificate, RoutableTransaction, ShardGroupId, StateProvision,
-    TransactionCertificate, ValidatorId,
+    Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
+    ConcreteConfig, Hash, LedgerReceiptEntry, QuorumCertificate, ShardGroupId, StateProvision,
+    TransactionCertificate, TypeConfig, ValidatorId,
 };
+use std::fmt;
 use std::sync::Arc;
 
 /// Priority levels for event ordering within the same timestamp.
@@ -41,19 +42,18 @@ pub enum EventPriority {
 ///   (sync, fetch, validation pipeline) before potentially converting them
 ///   into `ProtocolEvent`s.
 #[allow(clippy::large_enum_variant)] // TODO: Box ProtocolEvent
-#[derive(Debug, Clone)]
-pub enum NodeInput {
+pub enum NodeInput<C: TypeConfig = ConcreteConfig> {
     /// Pass-through to state machine. IoLoop extracts the ProtocolEvent and
     /// passes it to state.handle() directly.
-    Protocol(ProtocolEvent),
+    Protocol(ProtocolEvent<C>),
 
     /// Client submitted a transaction.
-    SubmitTransaction { tx: Arc<RoutableTransaction> },
+    SubmitTransaction { tx: Arc<C::Transaction> },
 
     /// Sync block response received from network callback.
     SyncBlockResponseReceived {
         height: u64,
-        block: Box<Option<(Block, QuorumCertificate)>>,
+        block: Box<Option<(Block<C>, QuorumCertificate)>>,
         /// Ledger receipts for the block's certificates (from sync peer).
         ledger_receipts: Vec<LedgerReceiptEntry>,
     },
@@ -73,7 +73,7 @@ pub enum NodeInput {
     /// Received transactions from a fetch request (raw, before protocol processing).
     TransactionReceived {
         block_hash: Hash,
-        transactions: Vec<Arc<RoutableTransaction>>,
+        transactions: Vec<Arc<C::Transaction>>,
     },
 
     /// Received certificates from a fetch request (raw, before protocol processing).
@@ -86,7 +86,7 @@ pub enum NodeInput {
 
     /// Transaction validated by the validation pipeline.
     TransactionValidated {
-        tx: Arc<RoutableTransaction>,
+        tx: Arc<C::Transaction>,
         submitted_locally: bool,
     },
 
@@ -135,7 +135,112 @@ pub enum NodeInput {
     },
 }
 
-impl NodeInput {
+impl<C: TypeConfig> fmt::Debug for NodeInput<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "NodeInput::{}", self.type_name())
+    }
+}
+
+impl<C: TypeConfig> Clone for NodeInput<C> {
+    fn clone(&self) -> Self {
+        match self {
+            NodeInput::Protocol(pe) => NodeInput::Protocol(pe.clone()),
+            NodeInput::SubmitTransaction { tx } => NodeInput::SubmitTransaction { tx: tx.clone() },
+            NodeInput::SyncBlockResponseReceived {
+                height,
+                block,
+                ledger_receipts,
+            } => NodeInput::SyncBlockResponseReceived {
+                height: *height,
+                block: block.clone(),
+                ledger_receipts: ledger_receipts.clone(),
+            },
+            NodeInput::SyncBlockFetchFailed { height } => {
+                NodeInput::SyncBlockFetchFailed { height: *height }
+            }
+            NodeInput::FetchTick => NodeInput::FetchTick,
+            NodeInput::FetchTransactionsFailed { block_hash, hashes } => {
+                NodeInput::FetchTransactionsFailed {
+                    block_hash: *block_hash,
+                    hashes: hashes.clone(),
+                }
+            }
+            NodeInput::FetchCertificatesFailed { block_hash, hashes } => {
+                NodeInput::FetchCertificatesFailed {
+                    block_hash: *block_hash,
+                    hashes: hashes.clone(),
+                }
+            }
+            NodeInput::TransactionReceived {
+                block_hash,
+                transactions,
+            } => NodeInput::TransactionReceived {
+                block_hash: *block_hash,
+                transactions: transactions.clone(),
+            },
+            NodeInput::CertificateReceived {
+                block_hash,
+                certificates,
+                ledger_receipts,
+            } => NodeInput::CertificateReceived {
+                block_hash: *block_hash,
+                certificates: certificates.clone(),
+                ledger_receipts: ledger_receipts.clone(),
+            },
+            NodeInput::TransactionValidated {
+                tx,
+                submitted_locally,
+            } => NodeInput::TransactionValidated {
+                tx: tx.clone(),
+                submitted_locally: *submitted_locally,
+            },
+            NodeInput::TransactionValidationsFailed { hashes } => {
+                NodeInput::TransactionValidationsFailed {
+                    hashes: hashes.clone(),
+                }
+            }
+            NodeInput::CommittedHeaderValidated {
+                committed_header,
+                sender,
+            } => NodeInput::CommittedHeaderValidated {
+                committed_header: committed_header.clone(),
+                sender: *sender,
+            },
+            NodeInput::CommittedBlockGossipReceived {
+                committed_header,
+                sender,
+                public_key,
+                sender_signature,
+            } => NodeInput::CommittedBlockGossipReceived {
+                committed_header: committed_header.clone(),
+                sender: *sender,
+                public_key: *public_key,
+                sender_signature: *sender_signature,
+            },
+            NodeInput::ProvisionsReady { batches } => NodeInput::ProvisionsReady {
+                batches: batches.clone(),
+            },
+            NodeInput::ProvisionFetchReceived {
+                source_shard,
+                block_height,
+                provisions,
+            } => NodeInput::ProvisionFetchReceived {
+                source_shard: *source_shard,
+                block_height: *block_height,
+                provisions: provisions.clone(),
+            },
+            NodeInput::ProvisionFetchFailed {
+                source_shard,
+                block_height,
+            } => NodeInput::ProvisionFetchFailed {
+                source_shard: *source_shard,
+                block_height: *block_height,
+            },
+        }
+    }
+}
+
+impl<C: TypeConfig> NodeInput<C> {
     /// Get the priority for this input type.
     ///
     /// Events at the same timestamp are processed in priority order,
@@ -221,8 +326,8 @@ impl NodeInput {
     }
 }
 
-impl From<ProtocolEvent> for NodeInput {
-    fn from(event: ProtocolEvent) -> Self {
+impl<C: TypeConfig> From<ProtocolEvent<C>> for NodeInput<C> {
+    fn from(event: ProtocolEvent<C>) -> Self {
         NodeInput::Protocol(event)
     }
 }

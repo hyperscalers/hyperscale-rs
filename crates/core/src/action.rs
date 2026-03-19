@@ -4,24 +4,43 @@ use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
-    CommittedBlockHeader, DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate,
-    ExecutionVote, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    SignerBitfield, StateProvision, TopologySnapshot, TransactionAbort, TransactionCertificate,
-    TransactionDefer, ValidatorId, VotePower,
+    CommittedBlockHeader, ConcreteConfig, EpochConfig, EpochId, ExecutionCertificate,
+    ExecutionVote, Hash, NodeId, QuorumCertificate, ReceiptBundle, ShardGroupId, SignerBitfield,
+    StateProvision, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
+    TypeConfig, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// A request to execute a cross-shard transaction with its provisions.
-#[derive(Debug, Clone)]
-pub struct CrossShardExecutionRequest {
+pub struct CrossShardExecutionRequest<C: TypeConfig = ConcreteConfig> {
     /// Transaction hash (for correlation).
     pub tx_hash: Hash,
     /// The transaction to execute.
-    pub transaction: Arc<RoutableTransaction>,
+    pub transaction: Arc<C::Transaction>,
     /// State provisions from other shards.
     pub provisions: Vec<StateProvision>,
+}
+
+impl<C: TypeConfig> std::fmt::Debug for CrossShardExecutionRequest<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrossShardExecutionRequest")
+            .field("tx_hash", &self.tx_hash)
+            .field("transaction", &self.transaction)
+            .field("provisions", &self.provisions)
+            .finish()
+    }
+}
+
+impl<C: TypeConfig> Clone for CrossShardExecutionRequest<C> {
+    fn clone(&self) -> Self {
+        Self {
+            tx_hash: self.tx_hash,
+            transaction: Arc::clone(&self.transaction),
+            provisions: self.provisions.clone(),
+        }
+    }
 }
 
 /// A single cross-shard transaction's provisioning needs.
@@ -41,8 +60,7 @@ pub struct ProvisionRequest {
 ///
 /// Actions are **commands** - they describe something to do.
 /// The runner executes actions and may convert results back into events.
-#[derive(Debug, Clone)]
-pub enum Action {
+pub enum Action<C: TypeConfig = ConcreteConfig> {
     // ═══════════════════════════════════════════════════════════════════════
     // Network: BFT Consensus
     // ═══════════════════════════════════════════════════════════════════════
@@ -64,7 +82,7 @@ pub enum Action {
     /// Broadcast a transaction gossip to a shard.
     BroadcastTransaction {
         shard: ShardGroupId,
-        gossip: Box<TransactionGossip>,
+        gossip: Box<TransactionGossip<C>>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -133,7 +151,7 @@ pub enum Action {
     /// The state machine emits this when processing one event produces
     /// a follow-on protocol event that should be processed immediately
     /// (at the same timestamp with Internal priority).
-    Continuation(ProtocolEvent),
+    Continuation(ProtocolEvent<C>),
 
     // ═══════════════════════════════════════════════════════════════════════
     // Delegated Work (async, returns callback event)
@@ -312,7 +330,7 @@ pub enum Action {
         expected_root: Hash,
         /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
         /// Merged on the thread pool before verification.
-        per_cert_updates: Vec<Arc<DatabaseUpdates>>,
+        per_cert_updates: Vec<Arc<C::StateUpdate>>,
         /// Block height (used as JMT version).
         block_height: u64,
     },
@@ -330,11 +348,11 @@ pub enum Action {
         /// Expected transaction root from block header.
         expected_root: Hash,
         /// Retry transactions (highest priority section).
-        retry_transactions: Vec<Arc<RoutableTransaction>>,
+        retry_transactions: Vec<Arc<C::Transaction>>,
         /// Priority transactions (cross-shard with commitment proofs).
-        priority_transactions: Vec<Arc<RoutableTransaction>>,
+        priority_transactions: Vec<Arc<C::Transaction>>,
         /// Normal transactions.
-        transactions: Vec<Arc<RoutableTransaction>>,
+        transactions: Vec<Arc<C::Transaction>>,
     },
 
     /// Verify a block's receipt root.
@@ -372,13 +390,13 @@ pub enum Action {
         is_fallback: bool,
         /// Parent's state root. Certs included only if local JMT matches this.
         parent_state_root: Hash,
-        retry_transactions: Vec<Arc<RoutableTransaction>>,
-        priority_transactions: Vec<Arc<RoutableTransaction>>,
-        transactions: Vec<Arc<RoutableTransaction>>,
+        retry_transactions: Vec<Arc<C::Transaction>>,
+        priority_transactions: Vec<Arc<C::Transaction>>,
+        transactions: Vec<Arc<C::Transaction>>,
         certificates: Vec<Arc<TransactionCertificate>>,
         /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
         /// Merged on the thread pool before proposal building.
-        per_cert_updates: Vec<Arc<DatabaseUpdates>>,
+        per_cert_updates: Vec<Arc<C::StateUpdate>>,
         commitment_proofs: HashMap<Hash, CommitmentProof>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
@@ -392,7 +410,7 @@ pub enum Action {
     /// Returns `ProtocolEvent::ExecutionBatchCompleted` with all votes when complete.
     ExecuteTransactions {
         block_hash: Hash,
-        transactions: Vec<Arc<RoutableTransaction>>,
+        transactions: Vec<Arc<C::Transaction>>,
         state_root: Hash,
     },
 
@@ -410,7 +428,7 @@ pub enum Action {
         /// Block hash where these transactions appear.
         block_hash: Hash,
         /// Single-shard transactions to execute speculatively.
-        transactions: Vec<Arc<RoutableTransaction>>,
+        transactions: Vec<Arc<C::Transaction>>,
     },
 
     /// Execute a cross-shard transaction with provisioned state.
@@ -422,7 +440,7 @@ pub enum Action {
         /// Transaction hash (for correlation).
         tx_hash: Hash,
         /// The transaction to execute.
-        transaction: Arc<RoutableTransaction>,
+        transaction: Arc<C::Transaction>,
         /// State provisions from other shards.
         provisions: Vec<StateProvision>,
     },
@@ -436,7 +454,7 @@ pub enum Action {
     /// (`set_committed_state`) after JMT state has been applied, not at
     /// certification time.
     EmitCommittedBlock {
-        block: Block,
+        block: Block<C>,
         /// The QC that certified this block.
         qc: QuorumCertificate,
     },
@@ -479,7 +497,7 @@ pub enum Action {
     /// after JMT state has been applied, to prevent committed_height from
     /// getting ahead of actual JMT state on crash recovery.
     PersistBlock {
-        block: Block,
+        block: Block<C>,
         /// The QC that certified this block (stored alongside block data).
         qc: QuorumCertificate,
     },
@@ -523,9 +541,7 @@ pub enum Action {
     ///
     /// Bundles with `database_updates: Some(...)` have deferred state_changes —
     /// the storage layer computes them at persist time.
-    StoreReceiptBundles {
-        bundles: Vec<hyperscale_types::ReceiptBundle>,
-    },
+    StoreReceiptBundles { bundles: Vec<ReceiptBundle<C>> },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Global Consensus / Epoch Management
@@ -743,7 +759,441 @@ pub enum Action {
     },
 }
 
-impl Action {
+impl<C: TypeConfig> std::fmt::Debug for Action<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Action::{}", self.type_name())
+    }
+}
+
+impl<C: TypeConfig> Clone for Action<C> {
+    fn clone(&self) -> Self {
+        match self {
+            // Network - BFT Consensus
+            Action::BroadcastBlockHeader { shard, header } => Action::BroadcastBlockHeader {
+                shard: *shard,
+                header: header.clone(),
+            },
+            Action::BroadcastBlockVote { shard, vote } => Action::BroadcastBlockVote {
+                shard: *shard,
+                vote: vote.clone(),
+            },
+
+            // Network - Mempool
+            Action::BroadcastTransaction { shard, gossip } => Action::BroadcastTransaction {
+                shard: *shard,
+                gossip: gossip.clone(),
+            },
+
+            // Network - Execution Layer
+            Action::BroadcastExecutionVote { shard, vote } => Action::BroadcastExecutionVote {
+                shard: *shard,
+                vote: vote.clone(),
+            },
+            Action::BroadcastExecutionCertificate {
+                shard,
+                certificate,
+                recipients,
+            } => Action::BroadcastExecutionCertificate {
+                shard: *shard,
+                certificate: Arc::clone(certificate),
+                recipients: recipients.clone(),
+            },
+            Action::FetchAndBroadcastProvisions {
+                requests,
+                source_shard,
+                block_height,
+                block_timestamp,
+                shard_recipients,
+            } => Action::FetchAndBroadcastProvisions {
+                requests: requests.clone(),
+                source_shard: *source_shard,
+                block_height: *block_height,
+                block_timestamp: *block_timestamp,
+                shard_recipients: shard_recipients.clone(),
+            },
+            Action::BroadcastCommittedBlockHeader { gossip } => {
+                Action::BroadcastCommittedBlockHeader {
+                    gossip: gossip.clone(),
+                }
+            }
+
+            // Timers
+            Action::SetTimer { id, duration } => Action::SetTimer {
+                id: id.clone(),
+                duration: *duration,
+            },
+            Action::CancelTimer { id } => Action::CancelTimer { id: id.clone() },
+
+            // Continuation
+            Action::Continuation(event) => Action::Continuation(event.clone()),
+
+            // Delegated Work - Crypto Verification
+            Action::VerifyAndBuildQuorumCertificate {
+                block_hash,
+                shard_group_id,
+                height,
+                round,
+                parent_block_hash,
+                votes_to_verify,
+                verified_votes,
+                total_voting_power,
+            } => Action::VerifyAndBuildQuorumCertificate {
+                block_hash: *block_hash,
+                shard_group_id: *shard_group_id,
+                height: *height,
+                round: *round,
+                parent_block_hash: *parent_block_hash,
+                votes_to_verify: votes_to_verify.clone(),
+                verified_votes: verified_votes.clone(),
+                total_voting_power: *total_voting_power,
+            },
+            Action::VerifyStateProvisions {
+                provisions,
+                committed_headers,
+                committee_public_keys,
+                committee_voting_power,
+                quorum_threshold,
+            } => Action::VerifyStateProvisions {
+                provisions: provisions.clone(),
+                committed_headers: committed_headers.clone(),
+                committee_public_keys: committee_public_keys.clone(),
+                committee_voting_power: committee_voting_power.clone(),
+                quorum_threshold: *quorum_threshold,
+            },
+            Action::AggregateExecutionCertificate {
+                tx_hash,
+                shard,
+                receipt_hash,
+                votes,
+                read_nodes,
+                write_nodes,
+                committee,
+            } => Action::AggregateExecutionCertificate {
+                tx_hash: *tx_hash,
+                shard: *shard,
+                receipt_hash: *receipt_hash,
+                votes: votes.clone(),
+                read_nodes: read_nodes.clone(),
+                write_nodes: write_nodes.clone(),
+                committee: committee.clone(),
+            },
+            Action::VerifyAndAggregateExecutionVotes { tx_hash, votes } => {
+                Action::VerifyAndAggregateExecutionVotes {
+                    tx_hash: *tx_hash,
+                    votes: votes.clone(),
+                }
+            }
+            Action::VerifyExecutionCertificateSignature {
+                certificate,
+                public_keys,
+            } => Action::VerifyExecutionCertificateSignature {
+                certificate: certificate.clone(),
+                public_keys: public_keys.clone(),
+            },
+            Action::VerifyQcSignature {
+                qc,
+                public_keys,
+                block_hash,
+            } => Action::VerifyQcSignature {
+                qc: qc.clone(),
+                public_keys: public_keys.clone(),
+                block_hash: *block_hash,
+            },
+            Action::VerifyCommitmentProof {
+                block_hash,
+                deferral_index,
+                commitment_proof,
+                public_keys,
+                voting_power,
+                quorum_threshold,
+            } => Action::VerifyCommitmentProof {
+                block_hash: *block_hash,
+                deferral_index: *deferral_index,
+                commitment_proof: commitment_proof.clone(),
+                public_keys: public_keys.clone(),
+                voting_power: *voting_power,
+                quorum_threshold: *quorum_threshold,
+            },
+            Action::VerifyStateRoot {
+                block_hash,
+                parent_state_root,
+                expected_root,
+                per_cert_updates,
+                block_height,
+            } => Action::VerifyStateRoot {
+                block_hash: *block_hash,
+                parent_state_root: *parent_state_root,
+                expected_root: *expected_root,
+                per_cert_updates: per_cert_updates.clone(),
+                block_height: *block_height,
+            },
+            Action::VerifyTransactionRoot {
+                block_hash,
+                expected_root,
+                retry_transactions,
+                priority_transactions,
+                transactions,
+            } => Action::VerifyTransactionRoot {
+                block_hash: *block_hash,
+                expected_root: *expected_root,
+                retry_transactions: retry_transactions.clone(),
+                priority_transactions: priority_transactions.clone(),
+                transactions: transactions.clone(),
+            },
+            Action::VerifyReceiptRoot {
+                block_hash,
+                expected_root,
+                certificates,
+            } => Action::VerifyReceiptRoot {
+                block_hash: *block_hash,
+                expected_root: *expected_root,
+                certificates: certificates.clone(),
+            },
+            Action::BuildProposal {
+                shard_group_id,
+                proposer,
+                height,
+                round,
+                parent_hash,
+                parent_qc,
+                timestamp,
+                is_fallback,
+                parent_state_root,
+                retry_transactions,
+                priority_transactions,
+                transactions,
+                certificates,
+                per_cert_updates,
+                commitment_proofs,
+                deferred,
+                aborted,
+                provision_targets,
+            } => Action::BuildProposal {
+                shard_group_id: *shard_group_id,
+                proposer: *proposer,
+                height: *height,
+                round: *round,
+                parent_hash: *parent_hash,
+                parent_qc: parent_qc.clone(),
+                timestamp: *timestamp,
+                is_fallback: *is_fallback,
+                parent_state_root: *parent_state_root,
+                retry_transactions: retry_transactions.clone(),
+                priority_transactions: priority_transactions.clone(),
+                transactions: transactions.clone(),
+                certificates: certificates.clone(),
+                per_cert_updates: per_cert_updates.clone(),
+                commitment_proofs: commitment_proofs.clone(),
+                deferred: deferred.clone(),
+                aborted: aborted.clone(),
+                provision_targets: provision_targets.clone(),
+            },
+
+            // Delegated Work - Execution
+            Action::ExecuteTransactions {
+                block_hash,
+                transactions,
+                state_root,
+            } => Action::ExecuteTransactions {
+                block_hash: *block_hash,
+                transactions: transactions.clone(),
+                state_root: *state_root,
+            },
+            Action::SpeculativeExecute {
+                block_hash,
+                transactions,
+            } => Action::SpeculativeExecute {
+                block_hash: *block_hash,
+                transactions: transactions.clone(),
+            },
+            Action::ExecuteCrossShardTransaction {
+                tx_hash,
+                transaction,
+                provisions,
+            } => Action::ExecuteCrossShardTransaction {
+                tx_hash: *tx_hash,
+                transaction: Arc::clone(transaction),
+                provisions: provisions.clone(),
+            },
+
+            // External Notifications
+            Action::EmitCommittedBlock { block, qc } => Action::EmitCommittedBlock {
+                block: block.clone(),
+                qc: qc.clone(),
+            },
+            Action::EmitTransactionStatus {
+                tx_hash,
+                status,
+                added_at,
+                cross_shard,
+                submitted_locally,
+            } => Action::EmitTransactionStatus {
+                tx_hash: *tx_hash,
+                status: status.clone(),
+                added_at: *added_at,
+                cross_shard: *cross_shard,
+                submitted_locally: *submitted_locally,
+            },
+
+            // Storage - Consensus
+            Action::PersistBlock { block, qc } => Action::PersistBlock {
+                block: block.clone(),
+                qc: qc.clone(),
+            },
+            Action::PersistAndBroadcastVote {
+                height,
+                round,
+                block_hash,
+                shard,
+                vote,
+                recipients,
+            } => Action::PersistAndBroadcastVote {
+                height: *height,
+                round: *round,
+                block_hash: *block_hash,
+                shard: *shard,
+                vote: vote.clone(),
+                recipients: recipients.clone(),
+            },
+
+            // Storage - Execution
+            Action::PersistTransactionCertificate { certificate } => {
+                Action::PersistTransactionCertificate {
+                    certificate: certificate.clone(),
+                }
+            }
+            Action::StoreReceiptBundles { bundles } => Action::StoreReceiptBundles {
+                bundles: bundles.clone(),
+            },
+
+            // Global Consensus / Epoch Management
+            Action::ProposeGlobalBlock {
+                epoch,
+                height,
+                next_epoch_config,
+            } => Action::ProposeGlobalBlock {
+                epoch: *epoch,
+                height: *height,
+                next_epoch_config: next_epoch_config.clone(),
+            },
+            Action::BroadcastGlobalBlockVote {
+                block_hash,
+                shard,
+                shard_signature,
+                signers,
+                voting_power,
+            } => Action::BroadcastGlobalBlockVote {
+                block_hash: *block_hash,
+                shard: *shard,
+                shard_signature: *shard_signature,
+                signers: signers.clone(),
+                voting_power: *voting_power,
+            },
+            Action::TransitionEpoch {
+                from_epoch,
+                to_epoch,
+                next_config,
+            } => Action::TransitionEpoch {
+                from_epoch: *from_epoch,
+                to_epoch: *to_epoch,
+                next_config: next_config.clone(),
+            },
+            Action::TopologyChanged { topology } => Action::TopologyChanged {
+                topology: Arc::clone(topology),
+            },
+            Action::MarkValidatorReady { epoch, shard } => Action::MarkValidatorReady {
+                epoch: *epoch,
+                shard: *shard,
+            },
+            Action::InitiateShardSplit {
+                source_shard,
+                new_shard,
+                split_point,
+            } => Action::InitiateShardSplit {
+                source_shard: *source_shard,
+                new_shard: *new_shard,
+                split_point: *split_point,
+            },
+            Action::CompleteShardSplit {
+                source_shard,
+                new_shard,
+            } => Action::CompleteShardSplit {
+                source_shard: *source_shard,
+                new_shard: *new_shard,
+            },
+            Action::InitiateShardMerge {
+                shard_a,
+                shard_b,
+                merged_shard,
+            } => Action::InitiateShardMerge {
+                shard_a: *shard_a,
+                shard_b: *shard_b,
+                merged_shard: *merged_shard,
+            },
+            Action::CompleteShardMerge { merged_shard } => Action::CompleteShardMerge {
+                merged_shard: *merged_shard,
+            },
+            Action::PersistEpochConfig { config } => Action::PersistEpochConfig {
+                config: config.clone(),
+            },
+            Action::FetchEpochConfig { epoch } => Action::FetchEpochConfig { epoch: *epoch },
+
+            // Storage - Read Requests
+            Action::FetchBlock { height } => Action::FetchBlock { height: *height },
+            Action::FetchChainMetadata => Action::FetchChainMetadata,
+
+            // Runner I/O Requests
+            Action::StartSync {
+                target_height,
+                target_hash,
+            } => Action::StartSync {
+                target_height: *target_height,
+                target_hash: *target_hash,
+            },
+            Action::FetchTransactions {
+                block_hash,
+                proposer,
+                tx_hashes,
+            } => Action::FetchTransactions {
+                block_hash: *block_hash,
+                proposer: *proposer,
+                tx_hashes: tx_hashes.clone(),
+            },
+            Action::FetchCertificates {
+                block_hash,
+                proposer,
+                cert_hashes,
+            } => Action::FetchCertificates {
+                block_hash: *block_hash,
+                proposer: *proposer,
+                cert_hashes: cert_hashes.clone(),
+            },
+            Action::CancelFetch { block_hash } => Action::CancelFetch {
+                block_hash: *block_hash,
+            },
+            Action::CancelProvisionFetch {
+                source_shard,
+                block_height,
+            } => Action::CancelProvisionFetch {
+                source_shard: *source_shard,
+                block_height: *block_height,
+            },
+            Action::RequestMissingProvisions {
+                source_shard,
+                block_height,
+                proposer,
+                peers,
+            } => Action::RequestMissingProvisions {
+                source_shard: *source_shard,
+                block_height: *block_height,
+                proposer: *proposer,
+                peers: peers.clone(),
+            },
+        }
+    }
+}
+
+impl<C: TypeConfig> Action<C> {
     /// Check if this action requires async I/O (network or storage writes).
     pub fn is_async(&self) -> bool {
         matches!(

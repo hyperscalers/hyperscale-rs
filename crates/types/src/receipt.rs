@@ -218,7 +218,7 @@ pub struct LedgerReceiptEntry {
 ///
 /// `local_execution` and `database_updates` are `None` when the receipt was
 /// fetched from a peer (sync/catch-up).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ReceiptBundle<C: TypeConfig = ConcreteConfig> {
     pub tx_hash: Hash,
     pub ledger_receipt: Arc<C::ExecutionReceipt>,
@@ -230,6 +230,17 @@ pub struct ReceiptBundle<C: TypeConfig = ConcreteConfig> {
     /// `None` for synced/fetched receipts (state_changes already populated by remote peer).
     /// Transient — not serialized (SBOR impl excludes this field).
     pub database_updates: Option<Arc<C::StateUpdate>>,
+}
+
+impl<C: TypeConfig> Clone for ReceiptBundle<C> {
+    fn clone(&self) -> Self {
+        Self {
+            tx_hash: self.tx_hash,
+            ledger_receipt: Arc::clone(&self.ledger_receipt),
+            local_execution: self.local_execution.clone(),
+            database_updates: self.database_updates.as_ref().map(Arc::clone),
+        }
+    }
 }
 
 // Manual PartialEq: compares Arc contents (not pointer identity) and
@@ -324,7 +335,7 @@ impl<C: TypeConfig> sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle<C> 
 /// The state machine uses this to:
 /// 1. Populate the ExecutionCache (in-memory, for block commit fast path)
 /// 2. Dispatch receipt storage to disk (via StoreReceiptBundles action)
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ExecutionResult<C: TypeConfig = ConcreteConfig> {
     /// Hash of the executed transaction.
     pub tx_hash: Hash,
@@ -337,6 +348,18 @@ pub struct ExecutionResult<C: TypeConfig = ConcreteConfig> {
     pub ledger_receipt: C::ExecutionReceipt,
     /// Local execution metadata (fees, logs, errors).
     pub local_execution: LocalTransactionExecution,
+}
+
+impl<C: TypeConfig> Clone for ExecutionResult<C> {
+    fn clone(&self) -> Self {
+        Self {
+            tx_hash: self.tx_hash,
+            receipt_hash: self.receipt_hash,
+            database_updates: self.database_updates.clone(),
+            ledger_receipt: self.ledger_receipt.clone(),
+            local_execution: self.local_execution.clone(),
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

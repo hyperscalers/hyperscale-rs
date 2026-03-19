@@ -7,10 +7,11 @@
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommitmentProof,
-    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, StateProvision, TransactionCertificate,
-    ValidatorId,
+    CommittedBlockHeader, ConcreteConfig, EpochConfig, EpochId, ExecutionCertificate,
+    ExecutionVote, Hash, QuorumCertificate, ShardGroupId, StateProvision, TransactionCertificate,
+    TypeConfig, ValidatorId,
 };
+use std::fmt;
 use std::sync::Arc;
 
 /// Result of verifying a single provision within a batch.
@@ -33,8 +34,7 @@ pub struct ProvisionVerificationResult {
 ///
 /// [`IoLoop`] translates [`NodeInput`] into `ProtocolEvent` before passing
 /// to the state machine.
-#[derive(Debug, Clone)]
-pub enum ProtocolEvent {
+pub enum ProtocolEvent<C: TypeConfig = ConcreteConfig> {
     // ═══════════════════════════════════════════════════════════════════════
     // Timers
     // ═══════════════════════════════════════════════════════════════════════
@@ -88,7 +88,7 @@ pub enum ProtocolEvent {
     BlockCommitted {
         block_hash: Hash,
         height: u64,
-        block: Block,
+        block: Block<C>,
     },
 
     /// Quorum Certificate verification and building result.
@@ -121,7 +121,7 @@ pub enum ProtocolEvent {
     ProposalBuilt {
         height: BlockHeight,
         round: u64,
-        block: Arc<Block>,
+        block: Arc<Block<C>>,
         block_hash: Hash,
     },
 
@@ -189,7 +189,7 @@ pub enum ProtocolEvent {
     /// 2. Dispatch StoreReceiptBundles action (for both speculative and canonical)
     ExecutionBatchCompleted {
         votes: Vec<ExecutionVote>,
-        results: Vec<hyperscale_types::ExecutionResult>,
+        results: Vec<hyperscale_types::ExecutionResult<C>>,
         /// True when this batch came from speculative execution.
         /// Receipt bundles are persisted for both speculative and canonical execution
         /// so that the sync protocol can always serve complete blocks.
@@ -228,7 +228,7 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     /// Received a transaction via gossip (or validated RPC submission).
     TransactionGossipReceived {
-        tx: Arc<RoutableTransaction>,
+        tx: Arc<C::Transaction>,
         submitted_locally: bool,
     },
 
@@ -241,7 +241,7 @@ pub enum ProtocolEvent {
     /// Fetched transactions delivered to state machine.
     TransactionFetchDelivered {
         block_hash: Hash,
-        transactions: Vec<Arc<RoutableTransaction>>,
+        transactions: Vec<Arc<C::Transaction>>,
     },
 
     /// Fetched certificates delivered to state machine.
@@ -262,7 +262,7 @@ pub enum ProtocolEvent {
     /// Block fetched from storage.
     BlockFetched {
         height: BlockHeight,
-        block: Option<Block>,
+        block: Option<Block<C>>,
     },
 
     /// Chain metadata fetched from storage.
@@ -276,7 +276,10 @@ pub enum ProtocolEvent {
     // Sync Delivery (from IoLoop after sync protocol processing)
     // ═══════════════════════════════════════════════════════════════════════
     /// A synced block is ready to be applied to local state.
-    SyncBlockReadyToApply { block: Block, qc: QuorumCertificate },
+    SyncBlockReadyToApply {
+        block: Block<C>,
+        qc: QuorumCertificate,
+    },
 
     /// Sync completed successfully.
     SyncComplete { height: u64 },
@@ -352,7 +355,362 @@ pub enum ProtocolEvent {
     ShardMergeComplete { merged_shard: ShardGroupId },
 }
 
-impl ProtocolEvent {
+impl<C: TypeConfig> fmt::Debug for ProtocolEvent<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ProtocolEvent::{}", self.type_name())
+    }
+}
+
+impl<C: TypeConfig> Clone for ProtocolEvent<C> {
+    fn clone(&self) -> Self {
+        match self {
+            // Timers
+            ProtocolEvent::ProposalTimer => ProtocolEvent::ProposalTimer,
+            ProtocolEvent::CleanupTimer => ProtocolEvent::CleanupTimer,
+            ProtocolEvent::GlobalConsensusTimer => ProtocolEvent::GlobalConsensusTimer,
+
+            // BFT Consensus
+            ProtocolEvent::BlockHeaderReceived { header, manifest } => {
+                ProtocolEvent::BlockHeaderReceived {
+                    header: header.clone(),
+                    manifest: manifest.clone(),
+                }
+            }
+            ProtocolEvent::RemoteBlockCommitted {
+                committed_header,
+                sender,
+            } => ProtocolEvent::RemoteBlockCommitted {
+                committed_header: committed_header.clone(),
+                sender: *sender,
+            },
+            ProtocolEvent::BlockVoteReceived { vote } => {
+                ProtocolEvent::BlockVoteReceived { vote: vote.clone() }
+            }
+            ProtocolEvent::QuorumCertificateFormed { block_hash, qc } => {
+                ProtocolEvent::QuorumCertificateFormed {
+                    block_hash: *block_hash,
+                    qc: qc.clone(),
+                }
+            }
+            ProtocolEvent::BlockReadyToCommit { block_hash, qc } => {
+                ProtocolEvent::BlockReadyToCommit {
+                    block_hash: *block_hash,
+                    qc: qc.clone(),
+                }
+            }
+            ProtocolEvent::BlockCommitted {
+                block_hash,
+                height,
+                block,
+            } => ProtocolEvent::BlockCommitted {
+                block_hash: *block_hash,
+                height: *height,
+                block: block.clone(),
+            },
+            ProtocolEvent::QuorumCertificateResult {
+                block_hash,
+                qc,
+                verified_votes,
+            } => ProtocolEvent::QuorumCertificateResult {
+                block_hash: *block_hash,
+                qc: qc.clone(),
+                verified_votes: verified_votes.clone(),
+            },
+            ProtocolEvent::QcSignatureVerified { block_hash, valid } => {
+                ProtocolEvent::QcSignatureVerified {
+                    block_hash: *block_hash,
+                    valid: *valid,
+                }
+            }
+            ProtocolEvent::CommitmentProofVerified {
+                block_hash,
+                deferral_index,
+                valid,
+            } => ProtocolEvent::CommitmentProofVerified {
+                block_hash: *block_hash,
+                deferral_index: *deferral_index,
+                valid: *valid,
+            },
+            ProtocolEvent::StateRootVerified { block_hash, valid } => {
+                ProtocolEvent::StateRootVerified {
+                    block_hash: *block_hash,
+                    valid: *valid,
+                }
+            }
+            ProtocolEvent::TransactionRootVerified { block_hash, valid } => {
+                ProtocolEvent::TransactionRootVerified {
+                    block_hash: *block_hash,
+                    valid: *valid,
+                }
+            }
+            ProtocolEvent::ReceiptRootVerified { block_hash, valid } => {
+                ProtocolEvent::ReceiptRootVerified {
+                    block_hash: *block_hash,
+                    valid: *valid,
+                }
+            }
+            ProtocolEvent::ProposalBuilt {
+                height,
+                round,
+                block,
+                block_hash,
+            } => ProtocolEvent::ProposalBuilt {
+                height: *height,
+                round: *round,
+                block: block.clone(),
+                block_hash: *block_hash,
+            },
+
+            // State Commit
+            ProtocolEvent::StateCommitComplete { height, state_root } => {
+                ProtocolEvent::StateCommitComplete {
+                    height: *height,
+                    state_root: *state_root,
+                }
+            }
+
+            // Provisions
+            ProtocolEvent::CrossShardTxRegistered {
+                tx_hash,
+                required_shards,
+                committed_height,
+            } => ProtocolEvent::CrossShardTxRegistered {
+                tx_hash: *tx_hash,
+                required_shards: required_shards.clone(),
+                committed_height: *committed_height,
+            },
+            ProtocolEvent::ProvisionAccepted {
+                tx_hash,
+                source_shard,
+                commitment_proof,
+            } => ProtocolEvent::ProvisionAccepted {
+                tx_hash: *tx_hash,
+                source_shard: *source_shard,
+                commitment_proof: commitment_proof.clone(),
+            },
+            ProtocolEvent::ProvisioningComplete {
+                tx_hash,
+                provisions,
+            } => ProtocolEvent::ProvisioningComplete {
+                tx_hash: *tx_hash,
+                provisions: provisions.clone(),
+            },
+            ProtocolEvent::StateProvisionsReceived { provisions } => {
+                ProtocolEvent::StateProvisionsReceived {
+                    provisions: provisions.clone(),
+                }
+            }
+            ProtocolEvent::StateProvisionsVerified {
+                results,
+                committed_header,
+            } => ProtocolEvent::StateProvisionsVerified {
+                results: results.clone(),
+                committed_header: committed_header.clone(),
+            },
+
+            // Execution
+            ProtocolEvent::ExecutionVoteReceived { vote } => {
+                ProtocolEvent::ExecutionVoteReceived { vote: vote.clone() }
+            }
+            ProtocolEvent::ExecutionBatchCompleted {
+                votes,
+                results,
+                speculative,
+            } => ProtocolEvent::ExecutionBatchCompleted {
+                votes: votes.clone(),
+                results: results.clone(),
+                speculative: *speculative,
+            },
+            ProtocolEvent::ExecutionCertificateReceived { cert } => {
+                ProtocolEvent::ExecutionCertificateReceived { cert: cert.clone() }
+            }
+            ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
+                tx_hash,
+                verified_votes,
+            } => ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
+                tx_hash: *tx_hash,
+                verified_votes: verified_votes.clone(),
+            },
+            ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => {
+                ProtocolEvent::ExecutionCertificateSignatureVerified {
+                    certificate: certificate.clone(),
+                    valid: *valid,
+                }
+            }
+            ProtocolEvent::ExecutionCertificateAggregated {
+                tx_hash,
+                certificate,
+            } => ProtocolEvent::ExecutionCertificateAggregated {
+                tx_hash: *tx_hash,
+                certificate: certificate.clone(),
+            },
+            ProtocolEvent::SpeculativeExecutionComplete {
+                block_hash,
+                tx_hashes,
+            } => ProtocolEvent::SpeculativeExecutionComplete {
+                block_hash: *block_hash,
+                tx_hashes: tx_hashes.clone(),
+            },
+
+            // Mempool / Transactions
+            ProtocolEvent::TransactionGossipReceived {
+                tx,
+                submitted_locally,
+            } => ProtocolEvent::TransactionGossipReceived {
+                tx: tx.clone(),
+                submitted_locally: *submitted_locally,
+            },
+            ProtocolEvent::TransactionExecuted { tx_hash, accepted } => {
+                ProtocolEvent::TransactionExecuted {
+                    tx_hash: *tx_hash,
+                    accepted: *accepted,
+                }
+            }
+
+            // Fetch Delivery
+            ProtocolEvent::TransactionFetchDelivered {
+                block_hash,
+                transactions,
+            } => ProtocolEvent::TransactionFetchDelivered {
+                block_hash: *block_hash,
+                transactions: transactions.clone(),
+            },
+            ProtocolEvent::CertificateFetchDelivered {
+                block_hash,
+                certificates,
+            } => ProtocolEvent::CertificateFetchDelivered {
+                block_hash: *block_hash,
+                certificates: certificates.clone(),
+            },
+            ProtocolEvent::FetchedCertificateVerified {
+                block_hash,
+                certificate,
+            } => ProtocolEvent::FetchedCertificateVerified {
+                block_hash: *block_hash,
+                certificate: certificate.clone(),
+            },
+
+            // Storage Callbacks
+            ProtocolEvent::BlockFetched { height, block } => ProtocolEvent::BlockFetched {
+                height: *height,
+                block: block.clone(),
+            },
+            ProtocolEvent::ChainMetadataFetched { height, hash, qc } => {
+                ProtocolEvent::ChainMetadataFetched {
+                    height: *height,
+                    hash: *hash,
+                    qc: qc.clone(),
+                }
+            }
+
+            // Sync Delivery
+            ProtocolEvent::SyncBlockReadyToApply { block, qc } => {
+                ProtocolEvent::SyncBlockReadyToApply {
+                    block: block.clone(),
+                    qc: qc.clone(),
+                }
+            }
+            ProtocolEvent::SyncComplete { height } => {
+                ProtocolEvent::SyncComplete { height: *height }
+            }
+
+            // Global Consensus / Epoch
+            ProtocolEvent::GlobalBlockReceived {
+                epoch,
+                height,
+                proposer,
+                block_hash,
+                next_epoch_config,
+            } => ProtocolEvent::GlobalBlockReceived {
+                epoch: *epoch,
+                height: *height,
+                proposer: *proposer,
+                block_hash: *block_hash,
+                next_epoch_config: next_epoch_config.clone(),
+            },
+            ProtocolEvent::GlobalBlockVoteReceived {
+                block_hash,
+                shard,
+                shard_signature,
+                signers,
+                voting_power,
+            } => ProtocolEvent::GlobalBlockVoteReceived {
+                block_hash: *block_hash,
+                shard: *shard,
+                shard_signature: *shard_signature,
+                signers: signers.clone(),
+                voting_power: *voting_power,
+            },
+            ProtocolEvent::GlobalQcFormed { block_hash, epoch } => ProtocolEvent::GlobalQcFormed {
+                block_hash: *block_hash,
+                epoch: *epoch,
+            },
+            ProtocolEvent::EpochEndApproaching {
+                current_epoch,
+                end_height,
+            } => ProtocolEvent::EpochEndApproaching {
+                current_epoch: *current_epoch,
+                end_height: *end_height,
+            },
+            ProtocolEvent::EpochTransitionReady {
+                from_epoch,
+                to_epoch,
+                next_config,
+            } => ProtocolEvent::EpochTransitionReady {
+                from_epoch: *from_epoch,
+                to_epoch: *to_epoch,
+                next_config: next_config.clone(),
+            },
+            ProtocolEvent::EpochTransitionComplete {
+                new_epoch,
+                new_shard,
+                is_waiting,
+            } => ProtocolEvent::EpochTransitionComplete {
+                new_epoch: *new_epoch,
+                new_shard: *new_shard,
+                is_waiting: *is_waiting,
+            },
+            ProtocolEvent::ValidatorSyncComplete { epoch, shard } => {
+                ProtocolEvent::ValidatorSyncComplete {
+                    epoch: *epoch,
+                    shard: *shard,
+                }
+            }
+            ProtocolEvent::ShardSplitInitiated {
+                source_shard,
+                new_shard,
+                split_point,
+            } => ProtocolEvent::ShardSplitInitiated {
+                source_shard: *source_shard,
+                new_shard: *new_shard,
+                split_point: *split_point,
+            },
+            ProtocolEvent::ShardSplitComplete {
+                source_shard,
+                new_shard,
+            } => ProtocolEvent::ShardSplitComplete {
+                source_shard: *source_shard,
+                new_shard: *new_shard,
+            },
+            ProtocolEvent::ShardMergeInitiated {
+                shard_a,
+                shard_b,
+                merged_shard,
+            } => ProtocolEvent::ShardMergeInitiated {
+                shard_a: *shard_a,
+                shard_b: *shard_b,
+                merged_shard: *merged_shard,
+            },
+            ProtocolEvent::ShardMergeComplete { merged_shard } => {
+                ProtocolEvent::ShardMergeComplete {
+                    merged_shard: *merged_shard,
+                }
+            }
+        }
+    }
+}
+
+impl<C: TypeConfig> ProtocolEvent<C> {
     /// Get the event type name for telemetry.
     pub fn type_name(&self) -> &'static str {
         match self {
