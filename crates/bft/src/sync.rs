@@ -40,7 +40,7 @@ pub(crate) struct SyncManager<C: TypeConfig = ConcreteConfig> {
     pending_synced_block_verifications: HashMap<Hash, PendingSyncedBlockVerification<C>>,
 }
 
-impl SyncManager {
+impl<C: TypeConfig> SyncManager<C> {
     /// Create a new SyncManager.
     pub fn new() -> Self {
         Self {
@@ -87,7 +87,7 @@ impl SyncManager {
     }
 
     /// Buffer a future synced block for later processing.
-    pub fn buffer_block(&mut self, height: u64, block: Block, qc: QuorumCertificate) {
+    pub fn buffer_block(&mut self, height: u64, block: Block<C>, qc: QuorumCertificate) {
         debug!(height, "Buffering future synced block for later");
         self.buffered_synced_blocks.insert(height, (block, qc));
     }
@@ -103,7 +103,7 @@ impl SyncManager {
     pub fn track_pending_verification(
         &mut self,
         block_hash: Hash,
-        block: Block,
+        block: Block<C>,
         qc: QuorumCertificate,
     ) {
         let height = block.header.height.0;
@@ -183,7 +183,10 @@ impl SyncManager {
     ///
     /// Returns the block and QC if a verified block exists at `height`,
     /// otherwise None.
-    pub fn take_verified_at_height(&mut self, height: u64) -> Option<(Block, QuorumCertificate)> {
+    pub fn take_verified_at_height(
+        &mut self,
+        height: u64,
+    ) -> Option<(Block<C>, QuorumCertificate)> {
         let block_hash = self
             .pending_synced_block_verifications
             .iter()
@@ -233,7 +236,7 @@ impl SyncManager {
         &mut self,
         start_height: u64,
         max_count: usize,
-    ) -> Vec<(Block, QuorumCertificate)> {
+    ) -> Vec<(Block<C>, QuorumCertificate)> {
         let mut result = Vec::new();
         let mut height = start_height;
 

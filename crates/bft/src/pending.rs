@@ -3,8 +3,7 @@
 //! Tracks blocks being assembled from headers + gossiped transactions.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockManifest, ConcreteConfig, Hash, RoutableTransaction,
-    TransactionCertificate, TypeConfig,
+    Block, BlockHeader, BlockManifest, ConcreteConfig, Hash, TransactionCertificate, TypeConfig,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -50,7 +49,7 @@ pub struct PendingBlock<C: TypeConfig = ConcreteConfig> {
     constructed_block: Option<Arc<Block<C>>>,
 }
 
-impl PendingBlock {
+impl<C: TypeConfig> PendingBlock<C> {
     /// Create a pending block from a header and manifest.
     pub fn from_manifest(header: BlockHeader, manifest: BlockManifest) -> Self {
         let total_tx_count = manifest.transaction_count();
@@ -73,7 +72,7 @@ impl PendingBlock {
     ///
     /// Skips the hash-extraction → re-fill round-trip since we already have
     /// all transactions and certificates.
-    pub fn from_complete_block(block: &Block) -> Self {
+    pub fn from_complete_block(block: &Block<C>) -> Self {
         let manifest = BlockManifest::from_block(block);
         let mut pending = Self {
             header: block.header.clone(),
@@ -88,17 +87,17 @@ impl PendingBlock {
         for tx in &block.retry_transactions {
             pending
                 .received_transactions
-                .insert(tx.hash(), Arc::clone(tx));
+                .insert(C::transaction_hash(tx), Arc::clone(tx));
         }
         for tx in &block.priority_transactions {
             pending
                 .received_transactions
-                .insert(tx.hash(), Arc::clone(tx));
+                .insert(C::transaction_hash(tx), Arc::clone(tx));
         }
         for tx in &block.transactions {
             pending
                 .received_transactions
-                .insert(tx.hash(), Arc::clone(tx));
+                .insert(C::transaction_hash(tx), Arc::clone(tx));
         }
         for cert in &block.certificates {
             pending
@@ -111,8 +110,8 @@ impl PendingBlock {
     /// Add a received transaction.
     ///
     /// Returns true if this transaction was needed, false if duplicate or not in this block.
-    pub fn add_transaction_arc(&mut self, tx: Arc<RoutableTransaction>) -> bool {
-        let hash = tx.hash();
+    pub fn add_transaction_arc(&mut self, tx: Arc<C::Transaction>) -> bool {
+        let hash = C::transaction_hash(&tx);
         // O(1) lookup and removal with HashSet
         if self.missing_transaction_hashes.remove(&hash) {
             self.received_transactions.insert(hash, tx);
@@ -179,7 +178,7 @@ impl PendingBlock {
     /// # Errors
     ///
     /// Returns error if block is not yet complete.
-    pub fn construct_block(&mut self) -> Result<Arc<Block>, String> {
+    pub fn construct_block(&mut self) -> Result<Arc<Block<C>>, String> {
         if !self.is_complete() {
             return Err(format!(
                 "Cannot construct block: {} transactions and {} certificates still missing",
@@ -194,21 +193,21 @@ impl PendingBlock {
 
         // Build transactions in the ORIGINAL order from the gossip message.
         // Each section is built separately to maintain the correct Block structure.
-        let retry_transactions: Vec<Arc<RoutableTransaction>> = self
+        let retry_transactions: Vec<Arc<C::Transaction>> = self
             .manifest
             .retry_hashes
             .iter()
             .filter_map(|hash| self.received_transactions.remove(hash))
             .collect();
 
-        let priority_transactions: Vec<Arc<RoutableTransaction>> = self
+        let priority_transactions: Vec<Arc<C::Transaction>> = self
             .manifest
             .priority_hashes
             .iter()
             .filter_map(|hash| self.received_transactions.remove(hash))
             .collect();
 
-        let transactions: Vec<Arc<RoutableTransaction>> = self
+        let transactions: Vec<Arc<C::Transaction>> = self
             .manifest
             .tx_hashes
             .iter()
@@ -243,7 +242,7 @@ impl PendingBlock {
     }
 
     /// Get the constructed block, if available.
-    pub fn block(&self) -> Option<Arc<Block>> {
+    pub fn block(&self) -> Option<Arc<Block<C>>> {
         self.constructed_block.as_ref().map(Arc::clone)
     }
 
@@ -297,7 +296,7 @@ mod tests {
         let header = make_header(1);
 
         // Put tx1 in retry section, tx2 in other section
-        let pb = PendingBlock::from_manifest(
+        let pb: PendingBlock = PendingBlock::from_manifest(
             header.clone(),
             BlockManifest {
                 retry_hashes: vec![tx1],
@@ -316,7 +315,7 @@ mod tests {
     #[test]
     fn test_empty_block_is_complete() {
         let header = make_header(1);
-        let pb = PendingBlock::from_manifest(header, BlockManifest::default());
+        let pb: PendingBlock = PendingBlock::from_manifest(header, BlockManifest::default());
 
         assert!(pb.is_complete());
     }
@@ -328,7 +327,7 @@ mod tests {
         let cert2 = Hash::from_bytes(b"cert2");
         let header = make_header(1);
 
-        let pb = PendingBlock::from_manifest(
+        let pb: PendingBlock = PendingBlock::from_manifest(
             header,
             BlockManifest {
                 tx_hashes: vec![tx1],
@@ -350,7 +349,7 @@ mod tests {
         let cert_hash = Hash::from_bytes(b"cert1");
         let header = make_header(1);
 
-        let mut pb = PendingBlock::from_manifest(
+        let mut pb: PendingBlock = PendingBlock::from_manifest(
             header,
             BlockManifest {
                 cert_hashes: vec![cert_hash],
@@ -390,7 +389,7 @@ mod tests {
         let cert_hash = Hash::from_bytes(b"cert1");
         let header = make_header(1);
 
-        let mut pb = PendingBlock::from_manifest(
+        let mut pb: PendingBlock = PendingBlock::from_manifest(
             header,
             BlockManifest {
                 tx_hashes: vec![tx_hash],

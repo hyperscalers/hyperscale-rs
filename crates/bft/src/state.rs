@@ -31,9 +31,8 @@ pub type NodeIndex = u32;
 use hyperscale_types::{
     block_header_message, committed_block_header_message, Block, BlockHeader, BlockHeight,
     BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommitmentProof,
-    ConcreteConfig, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer, TypeConfig,
-    ValidatorId, VotePower,
+    ConcreteConfig, Hash, QuorumCertificate, ReadyTransactions, ShardGroupId, TopologySnapshot,
+    TransactionAbort, TransactionCertificate, TransactionDefer, TypeConfig, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -175,7 +174,7 @@ pub struct BftState<C: TypeConfig = ConcreteConfig> {
     verification: VerificationPipeline,
 
     /// Sync coordination (block buffering, verification tracking, sync flag).
-    sync: SyncManager,
+    sync: SyncManager<C>,
 
     /// Buffered commits waiting for earlier blocks to commit first.
     /// Maps height -> (block_hash, QC).
@@ -224,7 +223,7 @@ pub struct BftState<C: TypeConfig = ConcreteConfig> {
     view_changes: u64,
 }
 
-impl std::fmt::Debug for BftState {
+impl<C: TypeConfig> std::fmt::Debug for BftState<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BftState")
             .field("node_index", &self.node_index)
@@ -236,7 +235,7 @@ impl std::fmt::Debug for BftState {
     }
 }
 
-impl BftState {
+impl<C: TypeConfig> BftState<C> {
     /// Create a new BFT state machine.
     ///
     /// # Arguments
@@ -337,7 +336,7 @@ impl BftState {
     /// Get a block by its hash.
     ///
     /// Looks up the block in certified_blocks, pending_blocks, or genesis.
-    fn get_block_by_hash(&self, block_hash: Hash) -> Option<Block> {
+    fn get_block_by_hash(&self, block_hash: Hash) -> Option<Block<C>> {
         if let Some(block) = self.certified_blocks.get(&block_hash) {
             return Some(block.clone());
         }
@@ -415,7 +414,7 @@ impl BftState {
         topology: &TopologySnapshot,
         target_height: u64,
         target_hash: Hash,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         // Don't restart sync if we're already syncing
         // The runner's SyncManager handles target updates internally
         if self.sync.is_syncing() {
@@ -451,9 +450,9 @@ impl BftState {
     pub fn on_sync_block_ready_to_apply(
         &mut self,
         topology: &TopologySnapshot,
-        block: Block,
+        block: Block<C>,
         qc: QuorumCertificate,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let block_height = block.header.height.0;
 
         // Ignore stale blocks that have already been committed.
@@ -476,7 +475,7 @@ impl BftState {
     /// Re-enables normal block proposals and view changes.
     /// Also triggers fetch requests for any pending blocks that still need data,
     /// since fetching was suppressed during sync.
-    pub fn on_sync_complete(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    pub fn on_sync_complete(&mut self, topology: &TopologySnapshot) -> Vec<Action<C>> {
         info!(
             validator = ?topology.local_validator_id(),
             "Sync complete, resuming normal consensus"
@@ -587,7 +586,7 @@ impl BftState {
     ///
     /// If a view change occurs, the caller should NOT proceed to call
     /// `on_proposal_timer` in the same event handling cycle.
-    pub fn check_round_timeout(&mut self, topology: &TopologySnapshot) -> Option<Vec<Action>> {
+    pub fn check_round_timeout(&mut self, topology: &TopologySnapshot) -> Option<Vec<Action<C>>> {
         if !self.should_advance_round() {
             return None;
         }
@@ -615,8 +614,8 @@ impl BftState {
     pub fn initialize_genesis(
         &mut self,
         topology: &TopologySnapshot,
-        genesis: Block,
-    ) -> Vec<Action> {
+        genesis: Block<C>,
+    ) -> Vec<Action<C>> {
         let hash = genesis.hash();
 
         self.genesis_block = Some(genesis.clone());
@@ -645,7 +644,7 @@ impl BftState {
     ///
     /// Call this on startup to restore state from persistent storage.
     /// The runner will respond with `Event::ChainMetadataFetched`.
-    pub fn request_recovery(&self, topology: &TopologySnapshot) -> Vec<Action> {
+    pub fn request_recovery(&self, topology: &TopologySnapshot) -> Vec<Action<C>> {
         info!(
             validator = ?topology.local_validator_id(),
             "Requesting chain metadata for recovery"
@@ -663,7 +662,7 @@ impl BftState {
         height: BlockHeight,
         hash: Option<Hash>,
         qc: Option<QuorumCertificate>,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         if height.0 == 0 && hash.is_none() {
             // No committed blocks - this is a fresh start
             info!(
@@ -734,15 +733,15 @@ impl BftState {
     pub fn on_proposal_timer<F>(
         &mut self,
         topology: &TopologySnapshot,
-        ready_txs: &ReadyTransactions,
+        ready_txs: &ReadyTransactions<C>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
         commitment_proofs: std::collections::HashMap<Hash, CommitmentProof>,
         collect_updates: F,
-    ) -> Vec<Action>
+    ) -> Vec<Action<C>>
     where
-        F: FnOnce(&[Arc<TransactionCertificate>]) -> Vec<Arc<hyperscale_types::DatabaseUpdates>>,
+        F: FnOnce(&[Arc<TransactionCertificate>]) -> Vec<Arc<C::StateUpdate>>,
     {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This allows the chain to grow
@@ -805,9 +804,9 @@ impl BftState {
         };
 
         // Use sectioned transactions directly from mempool (already hash-sorted per section)
-        let retry_transactions: Vec<Arc<RoutableTransaction>> = ready_txs.retries.clone();
-        let priority_transactions: Vec<Arc<RoutableTransaction>> = ready_txs.priority.clone();
-        let other_transactions: Vec<Arc<RoutableTransaction>> = ready_txs.others.clone();
+        let retry_transactions = ready_txs.retries.clone();
+        let priority_transactions = ready_txs.priority.clone();
+        let other_transactions = ready_txs.others.clone();
 
         let timestamp = self.now.as_millis() as u64;
         let block_height = BlockHeight(next_height);
@@ -928,8 +927,8 @@ impl BftState {
             .chain(priority_transactions.iter())
             .chain(other_transactions.iter())
         {
-            if !topology.is_single_shard_transaction(tx) {
-                for shard in topology.all_shards_for_transaction(tx) {
+            if !topology.is_single_shard_transaction_generic::<C>(tx) {
+                for shard in topology.all_shards_for_transaction_generic::<C>(tx) {
                     if shard != local_shard {
                         provision_target_set.insert(shard);
                     }
@@ -938,7 +937,7 @@ impl BftState {
         }
         let provision_targets: Vec<ShardGroupId> = provision_target_set.into_iter().collect();
 
-        // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
+        // Collect per-certificate Arc<C::StateUpdate> from execution cache.
         // Merging is deferred to the thread pool.
         let per_cert_updates = collect_updates(&certificates_to_propose);
 
@@ -993,7 +992,7 @@ impl BftState {
         topology: &TopologySnapshot,
         height: u64,
         round: u64,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let mut actions = vec![];
 
         // Get parent info from latest QC
@@ -1032,7 +1031,7 @@ impl BftState {
             provision_targets: vec![],    // Empty - fallback blocks have no transactions
         };
 
-        let block: Block = Block {
+        let block: Block<C> = Block {
             header: header.clone(),
             retry_transactions: vec![], // Empty - fallback blocks have no transactions
             priority_transactions: vec![], // Empty
@@ -1116,7 +1115,7 @@ impl BftState {
         topology: &TopologySnapshot,
         height: u64,
         round: u64,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let mut actions = vec![];
 
         // Get parent info from latest QC
@@ -1156,7 +1155,7 @@ impl BftState {
             provision_targets: vec![],    // Empty - sync blocks have no transactions
         };
 
-        let block: Block = Block {
+        let block: Block<C> = Block {
             header: header.clone(),
             retry_transactions: vec![],
             priority_transactions: vec![],
@@ -1241,7 +1240,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         height: u64,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let mut actions = vec![];
 
         // Try to get the pending block we voted for
@@ -1334,9 +1333,9 @@ impl BftState {
         topology: &TopologySnapshot,
         header: BlockHeader,
         manifest: BlockManifest,
-        mempool: &HashMap<Hash, Arc<RoutableTransaction>>,
+        mempool: &HashMap<Hash, Arc<C::Transaction>>,
         certificates: &HashMap<Hash, Arc<TransactionCertificate>>,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let block_hash = header.hash();
         let height = header.height.0;
         let round = header.round;
@@ -1743,7 +1742,7 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let Some(pending) = self.pending_blocks.get(&block_hash) else {
             warn!(
                 "trigger_qc_verification_or_vote: no pending block for {}",
@@ -1811,7 +1810,7 @@ impl BftState {
         block_hash: Hash,
         height: u64,
         round: u64,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         // Check vote locking - have we already voted for a block at this height?
         // BFT Safety: A validator must not vote for conflicting blocks at the same height
         // in the same round. Across rounds, the vote lock may be released on timeout if
@@ -1961,7 +1960,7 @@ impl BftState {
     /// ## Aborts (TransactionAbort)
     /// - ExecutionTimeout: Structural rules only (timeout threshold is proposer's call)
     /// - TooManyRetries: Structural rules only (retry count is in the abort itself)
-    fn validate_deferrals_and_aborts(&self, block: &Block) -> Result<(), String> {
+    fn validate_deferrals_and_aborts(&self, block: &Block<C>) -> Result<(), String> {
         use hyperscale_types::{AbortReason, DeferReason};
         use std::collections::HashSet;
 
@@ -2069,7 +2068,7 @@ impl BftState {
     /// 2. retry_transactions must contain ONLY retry transactions
     /// 3. priority_transactions must contain ONLY non-retry TXs with commitment proofs
     /// 4. transactions must contain no retries and no TXs with commitment proofs
-    fn validate_transaction_ordering(&self, block: &Block) -> Result<(), String> {
+    fn validate_transaction_ordering(&self, block: &Block<C>) -> Result<(), String> {
         // 1. Verify each section is internally hash-sorted
         Self::verify_hash_sorted(&block.retry_transactions, "retry")?;
         Self::verify_hash_sorted(&block.priority_transactions, "priority")?;
@@ -2077,18 +2076,18 @@ impl BftState {
 
         // 2. Verify retry section contains only retry transactions
         for tx in &block.retry_transactions {
-            if !tx.is_retry() {
+            if !C::transaction_is_retry(tx) {
                 return Err(format!(
                     "Transaction {} in retry section but is_retry() = false",
-                    tx.hash()
+                    C::transaction_hash(tx)
                 ));
             }
         }
 
         // 3. Verify priority section contains only non-retry TXs with commitment proofs
         for tx in &block.priority_transactions {
-            let tx_hash = tx.hash();
-            if tx.is_retry() {
+            let tx_hash = C::transaction_hash(tx);
+            if C::transaction_is_retry(tx) {
                 return Err(format!(
                     "Retry transaction {} in priority section (should be in retry section)",
                     tx_hash
@@ -2104,8 +2103,8 @@ impl BftState {
 
         // 4. Verify other section contains no retries and no TXs with proofs
         for tx in &block.transactions {
-            let tx_hash = tx.hash();
-            if tx.is_retry() {
+            let tx_hash = C::transaction_hash(tx);
+            if C::transaction_is_retry(tx) {
                 return Err(format!(
                     "Retry transaction {} in other section (should be in retry section)",
                     tx_hash
@@ -2130,13 +2129,13 @@ impl BftState {
     fn validate_provision_targets(
         &self,
         topology: &TopologySnapshot,
-        block: &Block,
+        block: &Block<C>,
     ) -> Result<(), String> {
         let local_shard = topology.local_shard();
         let mut expected = std::collections::BTreeSet::new();
         for tx in block.all_transactions() {
-            if !topology.is_single_shard_transaction(tx) {
-                for shard in topology.all_shards_for_transaction(tx) {
+            if !topology.is_single_shard_transaction_generic::<C>(tx) {
+                for shard in topology.all_shards_for_transaction_generic::<C>(tx) {
                     if shard != local_shard {
                         expected.insert(shard);
                     }
@@ -2156,14 +2155,14 @@ impl BftState {
     }
 
     /// Verify that a list of transactions is sorted by hash in ascending order.
-    fn verify_hash_sorted(txs: &[Arc<RoutableTransaction>], section: &str) -> Result<(), String> {
+    fn verify_hash_sorted(txs: &[Arc<C::Transaction>], section: &str) -> Result<(), String> {
         for window in txs.windows(2) {
-            if window[0].hash() >= window[1].hash() {
+            if C::transaction_hash(&window[0]) >= C::transaction_hash(&window[1]) {
                 return Err(format!(
                     "{} section not in hash order: {} >= {}",
                     section,
-                    window[0].hash(),
-                    window[1].hash()
+                    C::transaction_hash(&window[0]),
+                    C::transaction_hash(&window[1])
                 ));
             }
         }
@@ -2182,7 +2181,7 @@ impl BftState {
         block_hash: Hash,
         height: u64,
         round: u64,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         // Record that we voted for this block at this height.
         // Core safety invariant: we will not vote for a different block at this height
         // unless the vote lock is released on timeout (see `advance_round`) or by
@@ -2252,7 +2251,11 @@ impl BftState {
         voter = ?vote.voter,
         block_hash = ?vote.block_hash
     ))]
-    pub fn on_block_vote(&mut self, topology: &TopologySnapshot, vote: BlockVote) -> Vec<Action> {
+    pub fn on_block_vote(
+        &mut self,
+        topology: &TopologySnapshot,
+        vote: BlockVote,
+    ) -> Vec<Action<C>> {
         trace!(
             validator = ?topology.local_validator_id(),
             voter = ?vote.voter,
@@ -2273,7 +2276,7 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         vote: BlockVote,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let block_hash = vote.block_hash;
         let height = vote.height.0;
         let is_own_vote = vote.voter == topology.local_validator_id();
@@ -2380,7 +2383,7 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let total_power = topology.local_voting_power();
 
         let Some(vote_set) = self.vote_sets.get_mut(&block_hash) else {
@@ -2445,7 +2448,7 @@ impl BftState {
         block_hash: Hash,
         qc: Option<QuorumCertificate>,
         verified_votes: Vec<(usize, BlockVote, u64)>,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         // If QC was built successfully, we're done
         if let Some(qc) = qc {
             info!(
@@ -2559,7 +2562,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         valid: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         // Check if this is a synced block verification
         info!(
             block_hash = ?block_hash,
@@ -2627,7 +2630,7 @@ impl BftState {
         block_hash: Hash,
         deferral_index: usize,
         valid: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         match self
             .verification
             .on_commitment_proof_verified(block_hash, deferral_index, valid)
@@ -2684,7 +2687,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         valid: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         if !self.verification.on_state_root_verified(block_hash, valid) {
             warn!(
                 block_hash = ?block_hash,
@@ -2734,7 +2737,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         valid: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         if !self
             .verification
             .on_transaction_root_verified(block_hash, valid)
@@ -2787,7 +2790,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         valid: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         if !self
             .verification
             .on_receipt_root_verified(block_hash, valid)
@@ -2840,9 +2843,9 @@ impl BftState {
         topology: &TopologySnapshot,
         height: BlockHeight,
         round: u64,
-        block: Arc<Block>,
+        block: Arc<Block<C>>,
         block_hash: Hash,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         // Take the pending proposal - if it doesn't match (height, round), something is wrong
         let Some(pending) = self.pending_proposal.take() else {
             warn!(
@@ -3044,15 +3047,15 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         qc: QuorumCertificate,
-        ready_txs: &ReadyTransactions,
+        ready_txs: &ReadyTransactions<C>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
         commitment_proofs: HashMap<Hash, CommitmentProof>,
         collect_updates: F,
-    ) -> Vec<Action>
+    ) -> Vec<Action<C>>
     where
-        F: FnOnce(&[Arc<TransactionCertificate>]) -> Vec<Arc<hyperscale_types::DatabaseUpdates>>,
+        F: FnOnce(&[Arc<TransactionCertificate>]) -> Vec<Arc<C::StateUpdate>>,
     {
         let height = qc.height.0;
 
@@ -3184,7 +3187,7 @@ impl BftState {
         &self,
         topology: &TopologySnapshot,
         qc: &QuorumCertificate,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         if !qc.has_committable_block() {
             return vec![];
         }
@@ -3233,7 +3236,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         qc: QuorumCertificate,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         // Get the block to commit
         let block = if let Some(pending) = self.pending_blocks.get(&block_hash) {
             pending.block().map(|b| (*b).clone())
@@ -3313,7 +3316,7 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         if let Some((height, qc)) = self.pending_commits_awaiting_data.remove(&block_hash) {
             info!(
                 validator = ?topology.local_validator_id(),
@@ -3337,7 +3340,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         certifying_qc: QuorumCertificate,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let mut actions = Vec::new();
         let mut current_hash = block_hash;
         let mut current_qc = certifying_qc;
@@ -3454,9 +3457,9 @@ impl BftState {
     fn on_synced_block_ready(
         &mut self,
         topology: &TopologySnapshot,
-        block: Block,
+        block: Block<C>,
         qc: QuorumCertificate,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let block_hash = block.hash();
         let height = block.header.height.0;
 
@@ -3537,9 +3540,9 @@ impl BftState {
     fn submit_synced_block_for_verification(
         &mut self,
         topology: &TopologySnapshot,
-        block: Block,
+        block: Block<C>,
         qc: QuorumCertificate,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let block_hash = block.hash();
         let height = block.header.height.0;
 
@@ -3582,7 +3585,7 @@ impl BftState {
     /// We submit up to `max_parallel_sync_verifications` blocks for parallel QC
     /// verification. This allows sync to make progress on multiple blocks at once
     /// instead of waiting for each block to verify sequentially.
-    fn try_drain_buffered_synced_blocks(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    fn try_drain_buffered_synced_blocks(&mut self, topology: &TopologySnapshot) -> Vec<Action<C>> {
         let mut actions = Vec::new();
 
         // How many blocks are already pending verification?
@@ -3616,9 +3619,9 @@ impl BftState {
     fn apply_synced_block(
         &mut self,
         topology: &TopologySnapshot,
-        block: Block,
+        block: Block<C>,
         qc: QuorumCertificate,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let block_hash = block.hash();
         let height = block.header.height.0;
 
@@ -3712,7 +3715,7 @@ impl BftState {
     ///
     /// Called after committing a block (via sync or normal consensus) to check
     /// if there are buffered commits at subsequent heights that can now proceed.
-    fn drain_pending_commits(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    fn drain_pending_commits(&mut self, topology: &TopologySnapshot) -> Vec<Action<C>> {
         let mut actions = Vec::new();
 
         loop {
@@ -3750,7 +3753,7 @@ impl BftState {
     /// Called after a synced block's QC is verified. Applies all verified blocks
     /// in height order starting from committed_height + 1, then drains any
     /// buffered out-of-order blocks that can now be submitted for verification.
-    fn try_apply_verified_synced_blocks(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    fn try_apply_verified_synced_blocks(&mut self, topology: &TopologySnapshot) -> Vec<Action<C>> {
         let mut actions = Vec::new();
 
         // First, apply all consecutive verified blocks
@@ -3790,7 +3793,7 @@ impl BftState {
     ///
     /// Returns actions to propose if we're the new proposer.
     #[instrument(skip(self), fields(new_round = self.view + 1))]
-    fn advance_round(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    fn advance_round(&mut self, topology: &TopologySnapshot) -> Vec<Action<C>> {
         // The next height to propose is one above the highest certified block,
         // NOT one above the committed block. This matches on_proposal_timer behavior.
         let height = self
@@ -3960,8 +3963,8 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
-        transactions: Vec<Arc<RoutableTransaction>>,
-    ) -> Vec<Action> {
+        transactions: Vec<Arc<C::Transaction>>,
+    ) -> Vec<Action<C>> {
         let validator_id = topology.local_validator_id();
 
         // First phase: add transactions and check state
@@ -4084,7 +4087,7 @@ impl BftState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         certificates: Vec<Arc<TransactionCertificate>>,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let validator_id = topology.local_validator_id();
 
         // First phase: add certificates and check state
@@ -4203,8 +4206,8 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         tx_hash: Hash,
-        mempool: &HashMap<Hash, Arc<RoutableTransaction>>,
-    ) -> Vec<Action> {
+        mempool: &HashMap<Hash, Arc<C::Transaction>>,
+    ) -> Vec<Action<C>> {
         let mut actions = Vec::new();
 
         // Find pending blocks that need this transaction
@@ -4263,7 +4266,7 @@ impl BftState {
         topology: &TopologySnapshot,
         cert_hash: Hash,
         certificates: &HashMap<Hash, Arc<TransactionCertificate>>,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let mut actions = Vec::new();
 
         // Find pending blocks that need this certificate
@@ -4426,7 +4429,7 @@ impl BftState {
     ///
     /// - `transaction_fetch_timeout`: How long to wait before fetching missing txs
     /// - `certificate_fetch_timeout`: How long to wait before fetching missing certs
-    pub fn check_pending_block_fetches(&self, topology: &TopologySnapshot) -> Vec<Action> {
+    pub fn check_pending_block_fetches(&self, topology: &TopologySnapshot) -> Vec<Action<C>> {
         // Don't fetch for gossip blocks while syncing.
         // Sync delivers complete blocks that will supersede these pending blocks.
         // This prevents FetchManager from consuming all request slots and starving sync.
@@ -4503,7 +4506,7 @@ impl BftState {
     /// - Block headers are dropped
     /// - Transaction/certificate fetches fail permanently
     /// - A block in the middle of the chain is incomplete while later blocks are ready
-    pub fn check_sync_health(&mut self, topology: &TopologySnapshot) -> Vec<Action> {
+    pub fn check_sync_health(&mut self, topology: &TopologySnapshot) -> Vec<Action<C>> {
         let Some(latest_qc) = &self.latest_qc else {
             return vec![];
         };
@@ -4780,7 +4783,7 @@ mod tests {
         let key_bytes = keys[0].to_bytes();
         let signing_key = Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
 
-        let state = BftState::new(
+        let state: BftState = BftState::new(
             0,
             signing_key,
             &topology,
@@ -4998,7 +5001,7 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
         let topology = TopologySnapshot::new(ValidatorId(1), 1, validator_set);
-        let mut state = BftState::new(
+        let mut state: BftState = BftState::new(
             1,
             {
                 let key_bytes = keys[1].to_bytes();
@@ -5083,7 +5086,7 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
         let topology = TopologySnapshot::new(ValidatorId(1), 1, validator_set);
-        let mut state = BftState::new(
+        let mut state: BftState = BftState::new(
             1,
             {
                 let key_bytes = keys[1].to_bytes();
@@ -5171,7 +5174,7 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
         let topology = TopologySnapshot::new(ValidatorId(1), 1, validator_set);
-        let mut state = BftState::new(
+        let mut state: BftState = BftState::new(
             1,
             {
                 let key_bytes = keys[1].to_bytes();
@@ -5268,7 +5271,7 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
         let topology = TopologySnapshot::new(ValidatorId(1), 1, validator_set);
-        let mut state = BftState::new(
+        let mut state: BftState = BftState::new(
             1,
             {
                 let key_bytes = keys[1].to_bytes();
@@ -5352,7 +5355,7 @@ mod tests {
 
         // Validator 2 - will be proposer at (height=1, round=1) since (1+1)%4 = 2
         let topology = TopologySnapshot::new(ValidatorId(2), 1, validator_set);
-        let mut state = BftState::new(
+        let mut state: BftState = BftState::new(
             2,
             {
                 let key_bytes = keys[2].to_bytes();
@@ -5791,7 +5794,7 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
         let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
-        let state = BftState::new(
+        let state: BftState = BftState::new(
             0,
             {
                 let key_bytes = keys[0].to_bytes();
@@ -6643,7 +6646,7 @@ mod tests {
 
         // Validator 0 will be proposer at (height=1, round=3): (1+3)%4 = 0
         let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
-        let mut state = BftState::new(
+        let mut state: BftState = BftState::new(
             0,
             {
                 let key_bytes = keys[0].to_bytes();
@@ -6750,7 +6753,7 @@ mod tests {
 
         // Validator 0 will be proposer at (height=1, round=3): (1+3)%4 = 0
         let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
-        let mut state = BftState::new(
+        let mut state: BftState = BftState::new(
             0,
             {
                 let key_bytes = keys[0].to_bytes();
@@ -7196,7 +7199,7 @@ mod tests {
             .collect();
         let validator_set = ValidatorSet::new(validators);
         let topology = TopologySnapshot::new(ValidatorId(0), 1, validator_set);
-        let mut state = BftState::new(
+        let mut state: BftState = BftState::new(
             1,
             {
                 let key_bytes = keys[0].to_bytes();
@@ -7791,7 +7794,7 @@ mod tests {
             ..BftConfig::default()
         };
 
-        let mut state = BftState::new(
+        let mut state: BftState = BftState::new(
             0,
             {
                 let key_bytes = keys[0].to_bytes();
@@ -7869,7 +7872,7 @@ mod tests {
             ..BftConfig::default()
         };
 
-        let mut state = BftState::new(
+        let mut state: BftState = BftState::new(
             0,
             {
                 let key_bytes = keys[0].to_bytes();
@@ -8846,7 +8849,7 @@ mod tests {
 
         let config = BftConfig::default().with_view_change_timeout_increment(Duration::ZERO);
 
-        let mut state = BftState::new(
+        let mut state: BftState = BftState::new(
             0,
             {
                 let key_bytes = keys[0].to_bytes();
@@ -8952,7 +8955,7 @@ mod tests {
         let config =
             BftConfig::default().with_view_change_timeout_max(Some(Duration::from_secs(10)));
 
-        let mut state = BftState::new(
+        let mut state: BftState = BftState::new(
             0,
             {
                 let key_bytes = keys[0].to_bytes();
@@ -9020,7 +9023,7 @@ mod tests {
         // Configure with no cap (Tendermint behavior)
         let config = BftConfig::default().with_view_change_timeout_max(None);
 
-        let mut state = BftState::new(
+        let mut state: BftState = BftState::new(
             0,
             {
                 let key_bytes = keys[0].to_bytes();

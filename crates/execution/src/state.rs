@@ -33,8 +33,8 @@
 use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, ConcreteConfig, ExecutionCertificate, ExecutionVote, Hash,
-    NodeId, RoutableTransaction, ShardGroupId, StateProvision, TopologySnapshot,
-    TransactionCertificate, TransactionDecision, TypeConfig, ValidatorId,
+    NodeId, ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate,
+    TransactionDecision, TypeConfig, ValidatorId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -242,7 +242,7 @@ pub struct ExecutionState<C: TypeConfig = ConcreteConfig> {
     speculative_invalidated_count: u64,
 }
 
-impl Default for ExecutionState {
+impl<C: TypeConfig> Default for ExecutionState<C> {
     fn default() -> Self {
         Self::new()
     }
@@ -254,7 +254,7 @@ pub const DEFAULT_SPECULATIVE_MAX_TXS: usize = 500;
 /// Default number of rounds to pause speculation after a view change.
 pub const DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS: u64 = 3;
 
-impl ExecutionState {
+impl<C: TypeConfig> ExecutionState<C> {
     /// Create a new execution state machine with default settings.
     pub fn new() -> Self {
         Self::with_speculative_config(
@@ -320,12 +320,12 @@ impl ExecutionState {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Read access to the execution cache (for block commit / state root verification).
-    pub fn execution_cache(&self) -> &ExecutionCache {
+    pub fn execution_cache(&self) -> &ExecutionCache<C> {
         &self.execution_cache
     }
 
     /// Mutable access to the execution cache (for inserting results / evicting after commit).
-    pub fn execution_cache_mut(&mut self) -> &mut ExecutionCache {
+    pub fn execution_cache_mut(&mut self) -> &mut ExecutionCache<C> {
         &mut self.execution_cache
     }
 
@@ -347,14 +347,14 @@ impl ExecutionState {
         height: u64,
         block_timestamp: u64,
         proposer: ValidatorId,
-        transactions: Vec<Arc<RoutableTransaction>>,
-    ) -> Vec<Action> {
+        transactions: Vec<Arc<C::Transaction>>,
+    ) -> Vec<Action<C>> {
         let mut actions = Vec::new();
 
         // Filter out already-executed transactions (dedup)
         let new_txs: Vec<_> = transactions
             .into_iter()
-            .filter(|tx| !self.executed_txs.contains_key(&tx.hash()))
+            .filter(|tx| !self.executed_txs.contains_key(&C::transaction_hash(tx)))
             .collect();
 
         if new_txs.is_empty() {
@@ -374,7 +374,7 @@ impl ExecutionState {
 
         // Mark all as executed (for dedup) with current height for later cleanup
         for tx in &new_txs {
-            self.executed_txs.insert(tx.hash(), height);
+            self.executed_txs.insert(C::transaction_hash(tx), height);
         }
 
         // Prune old entries to prevent unbounded growth
@@ -383,9 +383,10 @@ impl ExecutionState {
         self.prune_verified_votes();
 
         // Separate single-shard and cross-shard transactions
+        let num_shards = topology.num_shards();
         let (single_shard, cross_shard): (Vec<_>, Vec<_>) = new_txs
             .into_iter()
-            .partition(|tx| topology.is_single_shard_transaction(tx));
+            .partition(|tx| !C::transaction_is_cross_shard(tx, num_shards));
 
         // Handle single-shard transactions (voting, same as cross-shard)
         // All WRITE operations need BLS signature aggregation
@@ -398,7 +399,7 @@ impl ExecutionState {
         let mut txs_needing_execution = Vec::new();
 
         for tx in single_shard {
-            let tx_hash = tx.hash();
+            let tx_hash = C::transaction_hash(&tx);
 
             if self.take_speculative_result(&tx_hash).is_some() {
                 // Speculation completed - votes already signed and sent
@@ -454,10 +455,11 @@ impl ExecutionState {
         for tx in cross_shard {
             // Collect provision requests (proposer only)
             if is_proposer {
-                let mut owned_nodes: Vec<_> = tx
-                    .declared_reads
+                let reads = C::transaction_reads(&tx);
+                let writes = C::transaction_writes(&tx);
+                let mut owned_nodes: Vec<_> = reads
                     .iter()
-                    .chain(tx.declared_writes.iter())
+                    .chain(writes.iter())
                     .filter(|&node_id| topology.shard_for_node_id(node_id) == local_shard)
                     .copied()
                     .collect();
@@ -465,15 +467,19 @@ impl ExecutionState {
                 owned_nodes.dedup();
 
                 if !owned_nodes.is_empty() {
-                    let target_shards: Vec<_> = topology
-                        .all_shards_for_transaction(&tx)
+                    let all_nodes = C::transaction_all_nodes(&tx);
+                    let all_shards: BTreeSet<_> = all_nodes
+                        .iter()
+                        .map(|node_id| topology.shard_for_node_id(node_id))
+                        .collect();
+                    let target_shards: Vec<_> = all_shards
                         .into_iter()
                         .filter(|&s| s != local_shard)
                         .collect();
 
                     if !target_shards.is_empty() {
                         provision_requests.push(ProvisionRequest {
-                            tx_hash: tx.hash(),
+                            tx_hash: C::transaction_hash(&tx),
                             nodes: owned_nodes,
                             target_shards,
                         });
@@ -525,10 +531,10 @@ impl ExecutionState {
     fn start_single_shard_execution(
         &mut self,
         topology: &TopologySnapshot,
-        tx: Arc<RoutableTransaction>,
-    ) -> Vec<Action> {
+        tx: Arc<C::Transaction>,
+    ) -> Vec<Action<C>> {
         let mut actions = Vec::new();
-        let tx_hash = tx.hash();
+        let tx_hash = C::transaction_hash(&tx);
         let local_shard = topology.local_shard();
 
         tracing::debug!(
@@ -542,7 +548,7 @@ impl ExecutionState {
         let vote_tracker = VoteTracker::new(
             tx_hash,
             vec![local_shard], // Only our shard participates
-            tx.declared_reads.clone(),
+            C::transaction_reads(&tx),
             quorum,
         );
         self.vote_trackers.insert(tx_hash, vote_tracker);
@@ -592,17 +598,18 @@ impl ExecutionState {
     fn start_cross_shard_execution(
         &mut self,
         topology: &TopologySnapshot,
-        tx: Arc<RoutableTransaction>,
+        tx: Arc<C::Transaction>,
         height: u64,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let mut actions = Vec::new();
-        let tx_hash = tx.hash();
+        let tx_hash = C::transaction_hash(&tx);
         let local_shard = topology.local_shard();
 
         // Identify all participating shards
-        let participating_shards: BTreeSet<ShardGroupId> = topology
-            .all_shards_for_transaction(&tx)
-            .into_iter()
+        let all_nodes = C::transaction_all_nodes(&tx);
+        let participating_shards: BTreeSet<ShardGroupId> = all_nodes
+            .iter()
+            .map(|node_id| topology.shard_for_node_id(node_id))
             .collect();
 
         tracing::debug!(
@@ -657,7 +664,7 @@ impl ExecutionState {
         let vote_tracker = VoteTracker::new(
             tx_hash,
             participating_shards.iter().copied().collect(),
-            tx.declared_reads.clone(),
+            C::transaction_reads(&tx),
             quorum,
         );
         self.vote_trackers.insert(tx_hash, vote_tracker);
@@ -709,7 +716,7 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         tx_hash: Hash,
         provisions: Vec<StateProvision>,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let local_shard = topology.local_shard();
 
         // Get the transaction waiting for provisions
@@ -758,7 +765,7 @@ impl ExecutionState {
         validator = ?vote.validator,
         success = vote.success
     ))]
-    pub fn on_vote(&mut self, topology: &TopologySnapshot, vote: ExecutionVote) -> Vec<Action> {
+    pub fn on_vote(&mut self, topology: &TopologySnapshot, vote: ExecutionVote) -> Vec<Action<C>> {
         let tx_hash = vote.transaction_hash;
         let validator_id = vote.validator;
 
@@ -832,7 +839,7 @@ impl ExecutionState {
     }
 
     /// Check if we have enough buffered votes to trigger verification.
-    fn maybe_trigger_execution_vote_verification(&mut self, tx_hash: Hash) -> Vec<Action> {
+    fn maybe_trigger_execution_vote_verification(&mut self, tx_hash: Hash) -> Vec<Action<C>> {
         let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
             return vec![];
         };
@@ -869,7 +876,7 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         tx_hash: Hash,
         verified_votes: Vec<(ExecutionVote, u64)>,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
             tracing::debug!(
                 tx_hash = ?tx_hash,
@@ -931,7 +938,7 @@ impl ExecutionState {
         &mut self,
         topology: &TopologySnapshot,
         vote: ExecutionVote,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let tx_hash = vote.transaction_hash;
         let voting_power = topology.voting_power(vote.validator).unwrap_or(0);
 
@@ -959,7 +966,7 @@ impl ExecutionState {
     /// Check if quorum is reached for a transaction's votes.
     ///
     /// If quorum is reached, triggers BLS signature aggregation.
-    fn check_vote_quorum(&mut self, topology: &TopologySnapshot, tx_hash: Hash) -> Vec<Action> {
+    fn check_vote_quorum(&mut self, topology: &TopologySnapshot, tx_hash: Hash) -> Vec<Action<C>> {
         let local_shard = topology.local_shard();
 
         let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
@@ -1031,7 +1038,7 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         tx_hash: Hash,
         certificate: ExecutionCertificate,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let mut actions = Vec::new();
 
         // Get pending aggregation state
@@ -1098,7 +1105,7 @@ impl ExecutionState {
         &mut self,
         topology: &TopologySnapshot,
         cert: ExecutionCertificate,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let tx_hash = cert.transaction_hash;
         let shard = cert.shard_group_id;
 
@@ -1165,7 +1172,7 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         certificate: ExecutionCertificate,
         valid: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let tx_hash = certificate.transaction_hash;
         let shard = certificate.shard_group_id;
 
@@ -1202,7 +1209,7 @@ impl ExecutionState {
         tx_hash: Hash,
         shard: ShardGroupId,
         valid: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let Some(pending) = self.pending_fetched_cert_verifications.get_mut(&tx_hash) else {
             return vec![];
         };
@@ -1264,7 +1271,7 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         certificate: TransactionCertificate,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let tx_hash = certificate.transaction_hash;
         let mut actions = Vec::new();
 
@@ -1339,7 +1346,7 @@ impl ExecutionState {
         &mut self,
         topology: &TopologySnapshot,
         cert: Arc<ExecutionCertificate>,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let mut actions = Vec::new();
         let tx_hash = cert.transaction_hash;
         let cert_shard = cert.shard_group_id;
@@ -1790,8 +1797,8 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         block_hash: Hash,
         height: u64,
-        transactions: Vec<Arc<RoutableTransaction>>,
-    ) -> Vec<Action> {
+        transactions: Vec<Arc<C::Transaction>>,
+    ) -> Vec<Action<C>> {
         if !self.should_speculative_execute(height) {
             let in_cooldown =
                 height <= self.last_view_change_height + self.view_change_cooldown_rounds;
@@ -1807,13 +1814,22 @@ impl ExecutionState {
             return vec![];
         }
 
+        let num_shards = topology.num_shards();
         // Filter to single-shard transactions that haven't been executed, cached, or in-flight
         let single_shard_txs: Vec<_> = transactions
             .into_iter()
-            .filter(|tx| topology.is_single_shard_transaction(tx))
-            .filter(|tx| !self.speculative_results.contains_key(&tx.hash()))
-            .filter(|tx| !self.speculative_in_flight_txs.contains(&tx.hash()))
-            .filter(|tx| !self.executed_txs.contains_key(&tx.hash()))
+            .filter(|tx| !C::transaction_is_cross_shard(tx, num_shards))
+            .filter(|tx| {
+                !self
+                    .speculative_results
+                    .contains_key(&C::transaction_hash(tx))
+            })
+            .filter(|tx| {
+                !self
+                    .speculative_in_flight_txs
+                    .contains(&C::transaction_hash(tx))
+            })
+            .filter(|tx| !self.executed_txs.contains_key(&C::transaction_hash(tx)))
             .collect();
 
         if single_shard_txs.is_empty() {
@@ -1828,7 +1844,8 @@ impl ExecutionState {
 
         // Track in-flight txs (no block limit - only memory matters)
         for tx in &single_shard_txs {
-            self.speculative_in_flight_txs.insert(tx.hash());
+            self.speculative_in_flight_txs
+                .insert(C::transaction_hash(tx));
         }
 
         // Store transactions so we can get declared_reads when execution completes
@@ -1854,7 +1871,7 @@ impl ExecutionState {
         &mut self,
         block_hash: Hash,
         tx_hashes: Vec<Hash>,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         tracing::info!(
             block_hash = ?block_hash,
             tx_count = tx_hashes.len(),
@@ -1868,8 +1885,10 @@ impl ExecutionState {
             .unwrap_or_default();
 
         // Build a map from tx_hash to transaction for quick lookup
-        let tx_map: HashMap<Hash, &Arc<RoutableTransaction>> =
-            transactions.iter().map(|tx| (tx.hash(), tx)).collect();
+        let tx_map: HashMap<Hash, &Arc<C::Transaction>> = transactions
+            .iter()
+            .map(|tx| (C::transaction_hash(tx), tx))
+            .collect();
 
         // Mark each transaction as speculatively executed (votes already sent)
         for tx_hash in tx_hashes {
@@ -1888,7 +1907,7 @@ impl ExecutionState {
             // Get the read set from the transaction's declared_reads
             let read_set: HashSet<NodeId> = tx_map
                 .get(&tx_hash)
-                .map(|tx| tx.declared_reads.iter().copied().collect())
+                .map(|tx| C::transaction_reads(tx).into_iter().collect())
                 .unwrap_or_default();
 
             // Index for fast invalidation
@@ -2108,7 +2127,7 @@ impl ExecutionState {
     }
 }
 
-impl std::fmt::Debug for ExecutionState {
+impl<C: TypeConfig> std::fmt::Debug for ExecutionState<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutionState")
             .field("executed_txs", &self.executed_txs.len())

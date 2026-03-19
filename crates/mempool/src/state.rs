@@ -3,7 +3,7 @@
 use hyperscale_core::{Action, TransactionStatus};
 use hyperscale_types::{
     AbortReason, Block, BlockHeight, ConcreteConfig, DeferReason, Hash, NodeId, ReadyTransactions,
-    RoutableTransaction, TopologySnapshot, TransactionAbort, TransactionDecision, TypeConfig,
+    TopologySnapshot, TransactionAbort, TransactionDecision, TypeConfig,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -262,7 +262,7 @@ pub struct MempoolState<C: TypeConfig = ConcreteConfig> {
     config: MempoolConfig,
 }
 
-impl std::fmt::Debug for MempoolState {
+impl<C: TypeConfig> std::fmt::Debug for MempoolState<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MempoolState")
             .field("pool_size", &self.pool.len())
@@ -275,13 +275,13 @@ impl std::fmt::Debug for MempoolState {
     }
 }
 
-impl Default for MempoolState {
+impl<C: TypeConfig> Default for MempoolState<C> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl MempoolState {
+impl<C: TypeConfig> MempoolState<C> {
     /// Create a new mempool state machine with default config.
     pub fn new() -> Self {
         Self::with_config(MempoolConfig::default())
@@ -319,13 +319,13 @@ impl MempoolState {
     }
 
     /// Handle transaction submission from client.
-    #[instrument(skip(self, topology, tx), fields(tx_hash = ?tx.hash()))]
+    #[instrument(skip(self, topology, tx), fields(tx_hash = ?C::transaction_hash(&tx)))]
     pub fn on_submit_transaction_arc(
         &mut self,
         topology: &TopologySnapshot,
-        tx: Arc<RoutableTransaction>,
-    ) -> Vec<Action> {
-        let hash = tx.hash();
+        tx: Arc<C::Transaction>,
+    ) -> Vec<Action<C>> {
+        let hash = C::transaction_hash(&tx);
 
         // Check for duplicate
         if let Some(entry) = self.pool.get(&hash) {
@@ -344,7 +344,7 @@ impl MempoolState {
             return vec![];
         }
 
-        let cross_shard = tx.is_cross_shard(topology.num_shards());
+        let cross_shard = C::transaction_is_cross_shard(&tx, topology.num_shards());
         self.pool.insert(
             hash,
             PoolEntry {
@@ -373,12 +373,12 @@ impl MempoolState {
     }
 
     /// Handle transaction submission from client.
-    #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
+    #[instrument(skip(self, tx), fields(tx_hash = ?C::transaction_hash(&tx)))]
     pub fn on_submit_transaction(
         &mut self,
         topology: &TopologySnapshot,
-        tx: RoutableTransaction,
-    ) -> Vec<Action> {
+        tx: C::Transaction,
+    ) -> Vec<Action<C>> {
         self.on_submit_transaction_arc(topology, Arc::new(tx))
     }
 
@@ -388,21 +388,21 @@ impl MempoolState {
     /// node's RPC endpoint and was validated through the batcher.  The flag is
     /// propagated to `PoolEntry` so that finalization metrics are recorded only
     /// on the submitting node.
-    #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
+    #[instrument(skip(self, tx), fields(tx_hash = ?C::transaction_hash(&tx)))]
     pub fn on_transaction_gossip_arc(
         &mut self,
         topology: &TopologySnapshot,
-        tx: Arc<RoutableTransaction>,
+        tx: Arc<C::Transaction>,
         submitted_locally: bool,
-    ) -> Vec<Action> {
-        let hash = tx.hash();
+    ) -> Vec<Action<C>> {
+        let hash = C::transaction_hash(&tx);
 
         // Ignore if already have it or if tombstoned (completed/aborted/retried)
         if self.pool.contains_key(&hash) || self.is_tombstoned(&hash) {
             return vec![];
         }
 
-        let cross_shard = tx.is_cross_shard(topology.num_shards());
+        let cross_shard = C::transaction_is_cross_shard(&tx, topology.num_shards());
         self.pool.insert(
             hash,
             PoolEntry {
@@ -425,12 +425,12 @@ impl MempoolState {
     }
 
     /// Handle transaction received via gossip.
-    #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
+    #[instrument(skip(self, tx), fields(tx_hash = ?C::transaction_hash(&tx)))]
     pub fn on_transaction_gossip(
         &mut self,
         topology: &TopologySnapshot,
-        tx: RoutableTransaction,
-    ) -> Vec<Action> {
+        tx: C::Transaction,
+    ) -> Vec<Action<C>> {
         self.on_transaction_gossip_arc(topology, Arc::new(tx), false)
     }
 
@@ -441,9 +441,9 @@ impl MempoolState {
     fn broadcast_to_transaction_shards(
         &self,
         topology: &TopologySnapshot,
-        tx: &Arc<RoutableTransaction>,
-    ) -> Vec<Action> {
-        let shards = topology.all_shards_for_transaction(tx.as_ref());
+        tx: &Arc<C::Transaction>,
+    ) -> Vec<Action<C>> {
+        let shards = topology.all_shards_for_transaction_generic::<C>(tx);
         let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(tx));
 
         shards
@@ -528,8 +528,8 @@ impl MempoolState {
     pub fn on_block_committed_full(
         &mut self,
         topology: &TopologySnapshot,
-        block: &Block,
-    ) -> Vec<Action> {
+        block: &Block<C>,
+    ) -> Vec<Action<C>> {
         let height = block.header.height;
         let mut actions = Vec::new();
 
@@ -544,9 +544,9 @@ impl MempoolState {
         // but didn't receive them via gossip. We need them in the mempool for
         // status tracking (deferrals, retries, execution status updates).
         for tx in block.all_transactions() {
-            let hash = tx.hash();
+            let hash = C::transaction_hash(tx);
             if !self.pool.contains_key(&hash) {
-                let cross_shard = tx.is_cross_shard(topology.num_shards());
+                let cross_shard = C::transaction_is_cross_shard(tx, topology.num_shards());
                 self.pool.insert(
                     hash,
                     PoolEntry {
@@ -589,8 +589,8 @@ impl MempoolState {
         // Only iterate retry_transactions to avoid overhead in the common case.
         // Note: Execution state cleanup is handled by NodeStateMachine, similar to deferrals.
         for retry_tx in &block.retry_transactions {
-            let original_hash = retry_tx.original_hash();
-            let retry_hash = retry_tx.hash();
+            let original_hash = C::transaction_original_hash(retry_tx);
+            let retry_hash = C::transaction_hash(retry_tx);
 
             if let Some(entry) = self.pool.get(&original_hash) {
                 // Only process if original is in a non-terminal state
@@ -625,7 +625,7 @@ impl MempoolState {
         // This must happen synchronously to prevent the same transactions from being
         // re-proposed before the status update is processed.
         for tx in block.all_transactions() {
-            let hash = tx.hash();
+            let hash = C::transaction_hash(tx);
             if let Some(entry) = self.pool.get_mut(&hash) {
                 // Only update if still Pending (avoid overwriting later states during sync)
                 if matches!(entry.status, TransactionStatus::Pending) {
@@ -710,7 +710,7 @@ impl MempoolState {
         tx_hash: Hash,
         reason: &DeferReason,
         height: BlockHeight,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let DeferReason::LivelockCycle { winner_tx_hash } = reason;
 
         // Check if the winner has already completed - if so, create retry immediately.
@@ -834,7 +834,7 @@ impl MempoolState {
         tx_hash: Hash,
         decision: TransactionDecision,
         height: BlockHeight,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let mut actions = Vec::new();
 
         // Mark the certificate's TX as completed with the final decision and evict
@@ -868,14 +868,14 @@ impl MempoolState {
                 self.deferred_by.remove(&loser_hash)
             {
                 // Create retry transaction
-                let retry_tx = loser_tx.create_retry(winner_hash, height);
-                let retry_hash = retry_tx.hash();
+                let retry_tx = C::transaction_create_retry(&loser_tx, winner_hash, height);
+                let retry_hash = C::transaction_hash(&retry_tx);
 
                 tracing::info!(
                     original = %loser_hash,
                     retry = %retry_hash,
                     winner = %winner_hash,
-                    retry_count = retry_tx.retry_count(),
+                    retry_count = C::transaction_retry_count(&retry_tx),
                     "Creating retry for deferred transaction"
                 );
 
@@ -898,7 +898,8 @@ impl MempoolState {
                 // Add retry to mempool if not already present (dedup by hash)
                 if !self.pool.contains_key(&retry_hash) && !self.is_tombstoned(&retry_hash) {
                     let retry_tx = Arc::new(retry_tx);
-                    let cross_shard = retry_tx.is_cross_shard(topology.num_shards());
+                    let cross_shard =
+                        C::transaction_is_cross_shard(&retry_tx, topology.num_shards());
                     self.pool.insert(
                         retry_hash,
                         PoolEntry {
@@ -956,7 +957,7 @@ impl MempoolState {
         topology: &TopologySnapshot,
         winner_hash: Hash,
         height: BlockHeight,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let mut actions = Vec::new();
 
         // Get all losers deferred by this winner using reverse index
@@ -969,8 +970,8 @@ impl MempoolState {
             // Get the loser from deferred_by and create a retry
             if let Some((loser_tx, _winner, _deferred_at)) = self.deferred_by.remove(&loser_hash) {
                 // Create retry transaction for the deferred loser
-                let retry_tx = loser_tx.create_retry(winner_hash, height);
-                let retry_hash = retry_tx.hash();
+                let retry_tx = C::transaction_create_retry(&loser_tx, winner_hash, height);
+                let retry_hash = C::transaction_hash(&retry_tx);
 
                 tracing::info!(
                     loser = %loser_hash,
@@ -998,7 +999,8 @@ impl MempoolState {
                 // Add retry to mempool if not already present
                 if !self.pool.contains_key(&retry_hash) && !self.is_tombstoned(&retry_hash) {
                     let retry_tx = Arc::new(retry_tx);
-                    let cross_shard = retry_tx.is_cross_shard(topology.num_shards());
+                    let cross_shard =
+                        C::transaction_is_cross_shard(&retry_tx, topology.num_shards());
                     self.pool.insert(
                         retry_hash,
                         PoolEntry {
@@ -1039,22 +1041,22 @@ impl MempoolState {
     fn create_retry_for_transaction(
         &mut self,
         topology: &TopologySnapshot,
-        loser_tx: Arc<RoutableTransaction>,
+        loser_tx: Arc<C::Transaction>,
         loser_hash: Hash,
         winner_hash: Hash,
         height: BlockHeight,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let mut actions = Vec::new();
 
         // Create retry transaction
-        let retry_tx = loser_tx.create_retry(winner_hash, height);
-        let retry_hash = retry_tx.hash();
+        let retry_tx = C::transaction_create_retry(&loser_tx, winner_hash, height);
+        let retry_hash = C::transaction_hash(&retry_tx);
 
         tracing::info!(
             original = %loser_hash,
             retry = %retry_hash,
             winner = %winner_hash,
-            retry_count = retry_tx.retry_count(),
+            retry_count = C::transaction_retry_count(&retry_tx),
             "Creating retry for deferred transaction"
         );
 
@@ -1077,7 +1079,7 @@ impl MempoolState {
         // Add retry to mempool if not already present (dedup by hash)
         if !self.pool.contains_key(&retry_hash) && !self.is_tombstoned(&retry_hash) {
             let retry_tx = Arc::new(retry_tx);
-            let cross_shard = retry_tx.is_cross_shard(topology.num_shards());
+            let cross_shard = C::transaction_is_cross_shard(&retry_tx, topology.num_shards());
             self.pool.insert(
                 retry_hash,
                 PoolEntry {
@@ -1142,7 +1144,7 @@ impl MempoolState {
         topology: &TopologySnapshot,
         tx_hash: Hash,
         accepted: bool,
-    ) -> Vec<Action> {
+    ) -> Vec<Action<C>> {
         let mut actions = Vec::new();
 
         if let Some(entry) = self.pool.get_mut(&tx_hash) {
@@ -1203,14 +1205,14 @@ impl MempoolState {
                 continue;
             };
             // Create retry transaction
-            let retry_tx = loser_tx.create_retry(winner_hash, height);
-            let retry_hash = retry_tx.hash();
+            let retry_tx = C::transaction_create_retry(&loser_tx, winner_hash, height);
+            let retry_hash = C::transaction_hash(&retry_tx);
 
             tracing::info!(
                 original = %loser_hash,
                 retry = %retry_hash,
                 winner = %winner_hash,
-                retry_count = retry_tx.retry_count(),
+                retry_count = C::transaction_retry_count(&retry_tx),
                 "Creating retry for deferred transaction (winner finalized)"
             );
 
@@ -1233,7 +1235,7 @@ impl MempoolState {
             // Add retry to mempool if not already present (dedup by hash)
             if !self.pool.contains_key(&retry_hash) && !self.is_tombstoned(&retry_hash) {
                 let retry_tx = Arc::new(retry_tx);
-                let cross_shard = retry_tx.is_cross_shard(topology.num_shards());
+                let cross_shard = C::transaction_is_cross_shard(&retry_tx, topology.num_shards());
                 self.pool.insert(
                     retry_hash,
                     PoolEntry {
@@ -1268,7 +1270,11 @@ impl MempoolState {
     /// Mark a transaction as completed (certificate committed in block).
     ///
     /// This is a terminal state - the transaction is evicted from mempool.
-    pub fn mark_completed(&mut self, tx_hash: &Hash, decision: TransactionDecision) -> Vec<Action> {
+    pub fn mark_completed(
+        &mut self,
+        tx_hash: &Hash,
+        decision: TransactionDecision,
+    ) -> Vec<Action<C>> {
         if let Some(entry) = self.pool.get(tx_hash) {
             let added_at = entry.added_at;
             let cross_shard = entry.cross_shard;
@@ -1292,7 +1298,11 @@ impl MempoolState {
     /// the transaction lifecycle (Committed, Executed, etc.).
     ///
     /// Returns an action to emit the status update if the transition was valid.
-    pub fn update_status(&mut self, tx_hash: &Hash, new_status: TransactionStatus) -> Vec<Action> {
+    pub fn update_status(
+        &mut self,
+        tx_hash: &Hash,
+        new_status: TransactionStatus,
+    ) -> Vec<Action<C>> {
         if let Some(entry) = self.pool.get_mut(tx_hash) {
             // Case 1: Idempotent update - already in the target state
             if entry.status == new_status {
@@ -1402,12 +1412,12 @@ impl MempoolState {
     /// Called when a transaction transitions TO a lock-holding state (Committed/Executed).
     ///
     /// Also blocks any ready transactions that conflict with the newly locked nodes.
-    fn add_locked_nodes(&mut self, tx: &RoutableTransaction) {
-        for node in tx.all_declared_nodes() {
-            let is_new = self.locked_nodes_cache.insert(*node);
+    fn add_locked_nodes(&mut self, tx: &C::Transaction) {
+        for node in C::transaction_all_nodes(tx) {
+            let is_new = self.locked_nodes_cache.insert(node);
             if is_new {
                 // Block any ready transactions that conflict with this newly locked node
-                self.block_transactions_for_node(*node);
+                self.block_transactions_for_node(node);
             }
         }
     }
@@ -1416,11 +1426,11 @@ impl MempoolState {
     /// Called when a transaction transitions FROM a lock-holding state (evicted).
     ///
     /// Also promotes any deferred transactions that were waiting on these nodes.
-    fn remove_locked_nodes(&mut self, tx: &RoutableTransaction) {
-        for node in tx.all_declared_nodes() {
-            if self.locked_nodes_cache.remove(node) {
+    fn remove_locked_nodes(&mut self, tx: &C::Transaction) {
+        for node in C::transaction_all_nodes(tx) {
+            if self.locked_nodes_cache.remove(&node) {
                 // Promote any deferred transactions that were waiting on this node
-                self.promote_transactions_for_node(*node);
+                self.promote_transactions_for_node(node);
             }
         }
     }
@@ -1435,29 +1445,25 @@ impl MempoolState {
     /// Special case: Retry transactions are not blocked by locks held by their
     /// original transaction. When a retry T' arrives, it supersedes T, so T's
     /// locks should not prevent T' from being proposed.
-    fn add_to_ready_tracking(
-        &mut self,
-        hash: Hash,
-        tx: &Arc<RoutableTransaction>,
-        cross_shard: bool,
-    ) {
+    fn add_to_ready_tracking(&mut self, hash: Hash, tx: &Arc<C::Transaction>, cross_shard: bool) {
         // Find all locked nodes that block this transaction
-        let mut blocking_nodes: HashSet<NodeId> = tx
-            .all_declared_nodes()
+        let mut blocking_nodes: HashSet<NodeId> = C::transaction_all_nodes(tx)
+            .into_iter()
             .filter(|node| self.locked_nodes_cache.contains(node))
-            .copied()
             .collect();
 
         // Special case: retry transactions are not blocked by their original's locks.
         // When a retry T' arrives (e.g., via gossip from a shard that created the retry),
         // it should supersede T. The locks T holds should not block T'.
-        if !blocking_nodes.is_empty() && tx.is_retry() {
-            let original_hash = tx.original_hash();
+        if !blocking_nodes.is_empty() && C::transaction_is_retry(tx) {
+            let original_hash = C::transaction_original_hash(tx);
             if let Some(original_entry) = self.pool.get(&original_hash) {
                 if original_entry.status.holds_state_lock() {
                     // Remove the original's nodes from blocking_nodes - they don't block the retry
                     let original_nodes: HashSet<NodeId> =
-                        original_entry.tx.all_declared_nodes().copied().collect();
+                        C::transaction_all_nodes(&original_entry.tx)
+                            .into_iter()
+                            .collect();
                     blocking_nodes.retain(|node| !original_nodes.contains(node));
                 }
             }
@@ -1482,21 +1488,18 @@ impl MempoolState {
     /// Add a transaction to the appropriate ready set based on its properties.
     ///
     /// Precondition: transaction must not be deferred by any locked nodes.
-    fn add_to_ready_set(&mut self, hash: Hash, tx: &Arc<RoutableTransaction>, cross_shard: bool) {
+    fn add_to_ready_set(&mut self, hash: Hash, tx: &Arc<C::Transaction>, cross_shard: bool) {
         let ready_entry = ReadyEntry {
             tx: Arc::clone(tx),
             has_provisions: false, // Updated by on_provision_verified
         };
 
         // Add to reverse index for O(1) blocking when nodes become locked
-        for node in tx.all_declared_nodes() {
-            self.ready_txs_by_node
-                .entry(*node)
-                .or_default()
-                .insert(hash);
+        for node in C::transaction_all_nodes(tx) {
+            self.ready_txs_by_node.entry(node).or_default().insert(hash);
         }
 
-        if tx.is_retry() {
+        if C::transaction_is_retry(tx) {
             self.ready_retries.insert(hash, ready_entry);
         } else if cross_shard {
             // Cross-shard starts in others, promoted to priority when provisions verified
@@ -1533,12 +1536,12 @@ impl MempoolState {
     }
 
     /// Helper to remove a transaction from the ready_txs_by_node reverse index.
-    fn remove_from_ready_txs_by_node(&mut self, hash: &Hash, tx: &RoutableTransaction) {
-        for node in tx.all_declared_nodes() {
-            if let Some(txs) = self.ready_txs_by_node.get_mut(node) {
+    fn remove_from_ready_txs_by_node(&mut self, hash: &Hash, tx: &C::Transaction) {
+        for node in C::transaction_all_nodes(tx) {
+            if let Some(txs) = self.ready_txs_by_node.get_mut(&node) {
                 txs.remove(hash);
                 if txs.is_empty() {
-                    self.ready_txs_by_node.remove(node);
+                    self.ready_txs_by_node.remove(&node);
                 }
             }
         }
@@ -1568,12 +1571,12 @@ impl MempoolState {
 
             if let Some(entry) = removed_entry {
                 // Clean remaining nodes from ready_txs_by_node (except the one we already removed)
-                for other_node in entry.tx.all_declared_nodes() {
-                    if *other_node != node {
-                        if let Some(txs) = self.ready_txs_by_node.get_mut(other_node) {
+                for other_node in C::transaction_all_nodes(&entry.tx) {
+                    if other_node != node {
+                        if let Some(txs) = self.ready_txs_by_node.get_mut(&other_node) {
                             txs.remove(&hash);
                             if txs.is_empty() {
-                                self.ready_txs_by_node.remove(other_node);
+                                self.ready_txs_by_node.remove(&other_node);
                             }
                         }
                     }
@@ -1600,7 +1603,7 @@ impl MempoolState {
         };
 
         // Collect transactions to promote (to avoid borrow checker issues)
-        let mut to_promote: Vec<(Hash, Arc<RoutableTransaction>, bool)> = Vec::new();
+        let mut to_promote: Vec<(Hash, Arc<C::Transaction>, bool)> = Vec::new();
 
         for tx_hash in deferred_txs {
             if let Some(blocking_nodes) = self.deferred_by_nodes.get_mut(&tx_hash) {
@@ -1680,7 +1683,7 @@ impl MempoolState {
         max_count: usize,
         pending_commit_tx_count: usize,
         pending_commit_cert_count: usize,
-    ) -> ReadyTransactions {
+    ) -> ReadyTransactions<C> {
         // Certificates reduce in-flight (transactions complete), txs increase it
         let effective_in_flight = self
             .in_flight()
@@ -1831,7 +1834,7 @@ impl MempoolState {
     ///
     /// Checks both the active pool and the recently_evicted cache
     /// (for peer fetch requests of transactions that have completed).
-    pub fn get_transaction(&self, hash: &Hash) -> Option<Arc<RoutableTransaction>> {
+    pub fn get_transaction(&self, hash: &Hash) -> Option<Arc<C::Transaction>> {
         // First check active pool
         if let Some(entry) = self.pool.get(hash) {
             return Some(Arc::clone(&entry.tx));
@@ -1850,7 +1853,7 @@ impl MempoolState {
     /// Get all transactions as a HashMap (for block header validation).
     ///
     /// This allows BFT to look up transactions by hash when receiving block headers.
-    pub fn transactions_by_hash(&self) -> HashMap<Hash, Arc<RoutableTransaction>> {
+    pub fn transactions_by_hash(&self) -> HashMap<Hash, Arc<C::Transaction>> {
         self.pool
             .iter()
             .map(|(hash, entry)| (*hash, Arc::clone(&entry.tx)))
@@ -1863,7 +1866,7 @@ impl MempoolState {
     }
 
     /// Get the mempool as a hash map for BFT pending block completion.
-    pub fn as_hash_map(&self) -> std::collections::HashMap<Hash, Arc<RoutableTransaction>> {
+    pub fn as_hash_map(&self) -> std::collections::HashMap<Hash, Arc<C::Transaction>> {
         self.pool
             .iter()
             .map(|(hash, entry)| (*hash, Arc::clone(&entry.tx)))
@@ -1878,9 +1881,7 @@ impl MempoolState {
     /// Get all incomplete transactions (not yet finalized or completed).
     ///
     /// Returns tuples of (hash, status, transaction Arc) for analysis.
-    pub fn incomplete_transactions(
-        &self,
-    ) -> Vec<(Hash, TransactionStatus, Arc<RoutableTransaction>)> {
+    pub fn incomplete_transactions(&self) -> Vec<(Hash, TransactionStatus, Arc<C::Transaction>)> {
         self.pool
             .iter()
             .filter(|(_, entry)| {
@@ -1954,17 +1955,17 @@ impl MempoolState {
             }
 
             // Check for too many retries
-            if entry.tx.exceeds_max_retries(max_retries) {
+            if C::transaction_exceeds_max_retries(&entry.tx, max_retries) {
                 tracing::info!(
                     tx_hash = %hash,
-                    retry_count = entry.tx.retry_count(),
+                    retry_count = C::transaction_retry_count(&entry.tx),
                     max_retries = max_retries,
                     "Transaction exceeded maximum retry count"
                 );
                 aborts.push(TransactionAbort {
                     tx_hash: *hash,
                     reason: AbortReason::TooManyRetries {
-                        retry_count: entry.tx.retry_count(),
+                        retry_count: C::transaction_retry_count(&entry.tx),
                     },
                     block_height: BlockHeight(0), // Filled in by proposer
                 });
@@ -2060,10 +2061,13 @@ impl MempoolState {
 mod tests {
     use super::*;
     use hyperscale_types::{
-        generate_bls_keypair, test_utils::test_transaction, Block, BlockHeader, DeferReason,
-        QuorumCertificate, ShardGroupId, TransactionCertificate, TransactionDefer, ValidatorId,
-        ValidatorInfo, ValidatorSet,
+        generate_bls_keypair, test_utils::test_transaction, Block, BlockHeader, ConcreteConfig,
+        DeferReason, QuorumCertificate, RoutableTransaction, ShardGroupId, TransactionCertificate,
+        TransactionDefer, ValidatorId, ValidatorInfo, ValidatorSet,
     };
+
+    /// Concrete mempool type for tests.
+    type TestMempool = MempoolState<ConcreteConfig>;
     use std::collections::BTreeMap;
 
     fn make_test_topology() -> TopologySnapshot {
@@ -2146,7 +2150,7 @@ mod tests {
     #[test]
     fn test_deferral_updates_status_to_deferred() {
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         // Create and add a transaction
         let tx = test_transaction(1);
@@ -2192,7 +2196,7 @@ mod tests {
     #[test]
     fn test_winner_certificate_triggers_retry() {
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         // Create loser TX and submit
         let loser_tx = test_transaction(1);
@@ -2269,7 +2273,7 @@ mod tests {
     #[test]
     fn test_timeout_detection() {
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         // Create and commit a TX
         let tx = test_transaction(1);
@@ -2302,7 +2306,7 @@ mod tests {
         // This is critical for cross-shard transactions that get stuck when
         // certificate inclusion fails on another shard.
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         // Create and commit a TX
         let tx = test_transaction(1);
@@ -2352,7 +2356,7 @@ mod tests {
     #[test]
     fn test_too_many_retries_detection() {
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         // Create a TX that has already been retried multiple times
         let tx = test_transaction(1);
@@ -2380,7 +2384,7 @@ mod tests {
     #[test]
     fn test_abort_updates_status() {
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         // Create and commit a TX
         let tx = test_transaction(1);
@@ -2451,7 +2455,7 @@ mod tests {
         // The deferral should be stored and processed when the transaction arrives.
 
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         // Create transactions
         let loser_tx = test_transaction(1);
@@ -2511,7 +2515,7 @@ mod tests {
         // Retry should be created when loser tx arrives.
 
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         let loser_tx = test_transaction(1);
         let loser_hash = loser_tx.hash();
@@ -2576,7 +2580,7 @@ mod tests {
         // This is the normal case - should work as before.
 
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         let loser_tx = test_transaction(1);
         let loser_hash = loser_tx.hash();
@@ -2626,7 +2630,7 @@ mod tests {
         // - Block N+2: TX_B's certificate commits, retry created for TX_A
 
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         let tx_a = test_transaction(1);
         let tx_a_hash = tx_a.hash();
@@ -2680,7 +2684,7 @@ mod tests {
     #[test]
     fn test_completed_transaction_is_tombstoned() {
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
@@ -2703,7 +2707,7 @@ mod tests {
     #[test]
     fn test_tombstoned_transaction_rejected_on_gossip() {
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
@@ -2731,7 +2735,7 @@ mod tests {
     #[test]
     fn test_tombstoned_transaction_rejected_on_submit() {
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
@@ -2756,7 +2760,7 @@ mod tests {
     #[test]
     fn test_aborted_transaction_is_tombstoned() {
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
@@ -2786,7 +2790,7 @@ mod tests {
     #[test]
     fn test_retried_transaction_is_tombstoned() {
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         let loser = test_transaction(1);
         let loser_hash = loser.hash();
@@ -2828,7 +2832,7 @@ mod tests {
     #[test]
     fn test_tombstone_cleanup() {
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         // Create and complete several transactions at different heights
         for i in 1..=5 {
@@ -2863,7 +2867,7 @@ mod tests {
         // arrives afterwards trying to re-add it.
 
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
@@ -2892,7 +2896,7 @@ mod tests {
     #[test]
     fn test_mark_completed_creates_tombstone() {
         let topology = make_test_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
@@ -3013,7 +3017,7 @@ mod tests {
     fn test_backpressure_rejects_all_txns_at_soft_limit() {
         // Use a low limit for testing
         let config = make_mempool_config_with_limit(2);
-        let mut mempool = MempoolState::with_config(config);
+        let mut mempool = TestMempool::with_config(config);
         let topology = make_cross_shard_topology();
 
         // Put mempool at the backpressure limit
@@ -3039,7 +3043,7 @@ mod tests {
     fn test_backpressure_allows_cross_shard_with_provisions() {
         // Use a low limit for testing
         let config = make_mempool_config_with_limit(2);
-        let mut mempool = MempoolState::with_config(config);
+        let mut mempool = TestMempool::with_config(config);
         let topology = make_cross_shard_topology();
 
         // Create coordinator and add verified provisions for our TX
@@ -3076,7 +3080,7 @@ mod tests {
     #[test]
     fn test_backpressure_not_at_limit_allows_all_txns() {
         let topology = make_cross_shard_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         // Mempool is not at limit (nothing committed)
         assert!(!mempool.at_in_flight_limit());
@@ -3097,7 +3101,7 @@ mod tests {
     #[test]
     fn test_in_flight_counts_all_txns() {
         let topology = make_cross_shard_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         assert_eq!(mempool.in_flight(), 0);
 
@@ -3164,7 +3168,7 @@ mod tests {
     fn test_retry_transactions_have_highest_priority() {
         // Use a low limit for testing
         let config = make_mempool_config_with_limit(2);
-        let mut mempool = MempoolState::with_config(config);
+        let mut mempool = TestMempool::with_config(config);
         let topology = make_cross_shard_topology();
 
         // Put mempool at the backpressure limit
@@ -3209,7 +3213,7 @@ mod tests {
     #[test]
     fn test_retry_priority_ordering() {
         let topology = make_cross_shard_topology();
-        let mut mempool = MempoolState::new();
+        let mut mempool = TestMempool::new();
 
         // Add transactions in mixed order: normal, retry, normal
         let normal1 = test_transaction(1);
@@ -3222,7 +3226,7 @@ mod tests {
         mempool.on_submit_transaction(&topology, normal2.clone());
 
         // Request transactions - retry should be in retries section, others in others section
-        let ready = mempool.ready_transactions(10, 0, 0);
+        let ready: ReadyTransactions = mempool.ready_transactions(10, 0, 0);
 
         assert_eq!(ready.len(), 3, "All transactions should be returned");
 

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    DatabaseUpdates, Hash, LedgerTransactionOutcome, LedgerTransactionReceipt, NodeId,
+    BlockHeight, DatabaseUpdates, Hash, LedgerTransactionOutcome, LedgerTransactionReceipt, NodeId,
     RoutableTransaction, ShardGroupId, TypeConfig,
 };
 
@@ -28,12 +28,32 @@ impl TypeConfig for RadixConfig {
         tx.hash()
     }
 
+    fn transaction_is_retry(tx: &RoutableTransaction) -> bool {
+        tx.is_retry()
+    }
+
     fn transaction_reads(tx: &RoutableTransaction) -> Vec<NodeId> {
         tx.declared_reads.clone()
     }
 
     fn transaction_writes(tx: &RoutableTransaction) -> Vec<NodeId> {
         tx.declared_writes.clone()
+    }
+
+    fn transaction_original_hash(tx: &RoutableTransaction) -> Hash {
+        tx.original_hash()
+    }
+
+    fn transaction_retry_count(tx: &RoutableTransaction) -> u32 {
+        tx.retry_count()
+    }
+
+    fn transaction_create_retry(
+        tx: &RoutableTransaction,
+        deferred_by: Hash,
+        deferred_at: BlockHeight,
+    ) -> RoutableTransaction {
+        tx.create_retry(deferred_by, deferred_at)
     }
 
     fn receipt_hash(receipt: &LedgerTransactionReceipt) -> Hash {

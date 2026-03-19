@@ -5,7 +5,7 @@
 //! here while retaining control-flow decisions (voting, block rejection).
 
 use hyperscale_types::{
-    Block, BlockHeader, Bls12381G1PublicKey, CommitmentProof, Hash, TopologySnapshot,
+    Block, BlockHeader, Bls12381G1PublicKey, CommitmentProof, Hash, TopologySnapshot, TypeConfig,
 };
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, trace, warn};
@@ -213,7 +213,7 @@ impl VerificationPipeline {
     ///
     /// Returns true if CommitmentProof, state root, and transaction root
     /// verifications are all done (or not needed).
-    pub fn is_block_verified(&self, block: &Block) -> bool {
+    pub fn is_block_verified<C: TypeConfig>(&self, block: &Block<C>) -> bool {
         let block_hash = block.hash();
 
         let commitment_proof_ok = if block.deferred.is_empty() {
@@ -246,7 +246,7 @@ impl VerificationPipeline {
     // ─── CommitmentProof ─────────────────────────────────────────────────
 
     /// Check if a block needs CommitmentProof verification before voting.
-    pub fn needs_commitment_proof_verification(&self, block: &Block) -> bool {
+    pub fn needs_commitment_proof_verification<C: TypeConfig>(&self, block: &Block<C>) -> bool {
         if block.deferred.is_empty() {
             return false;
         }
@@ -268,12 +268,12 @@ impl VerificationPipeline {
     /// Begin tracking CommitmentProof verification for a block.
     ///
     /// Returns verification actions for each deferral's proof.
-    pub fn initiate_commitment_proof_verification(
+    pub fn initiate_commitment_proof_verification<C: TypeConfig>(
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
-        block: &Block,
-    ) -> Vec<Action> {
+        block: &Block<C>,
+    ) -> Vec<Action<C>> {
         if block.deferred.is_empty() {
             return vec![];
         }
@@ -427,7 +427,7 @@ impl VerificationPipeline {
     // ─── State root ──────────────────────────────────────────────────────
 
     /// Check if a block needs state root verification before voting.
-    pub fn needs_state_root_verification(&self, block: &Block) -> bool {
+    pub fn needs_state_root_verification<C: TypeConfig>(&self, block: &Block<C>) -> bool {
         if block.certificates.is_empty() {
             return false;
         }
@@ -457,10 +457,10 @@ impl VerificationPipeline {
     /// In both cases, the `NodeStateMachine` is responsible for draining
     /// `ready_state_root_verifications` and computing `merged_updates` from
     /// the execution cache before emitting the actual `VerifyStateRoot` action.
-    pub fn initiate_state_root_verification(
+    pub fn initiate_state_root_verification<C: TypeConfig>(
         &mut self,
         block_hash: Hash,
-        block: &Block,
+        block: &Block<C>,
         parent_state_root: Hash,
     ) {
         let current_root = self.last_committed_jmt_root;
@@ -531,7 +531,7 @@ impl VerificationPipeline {
     // ─── Transaction root ────────────────────────────────────────────────
 
     /// Check if a block needs transaction root verification before voting.
-    pub fn needs_transaction_root_verification(&self, block: &Block) -> bool {
+    pub fn needs_transaction_root_verification<C: TypeConfig>(&self, block: &Block<C>) -> bool {
         if block.transaction_count() == 0 {
             return false;
         }
@@ -550,11 +550,11 @@ impl VerificationPipeline {
     }
 
     /// Initiate transaction root verification for a block.
-    pub fn initiate_transaction_root_verification(
+    pub fn initiate_transaction_root_verification<C: TypeConfig>(
         &mut self,
         block_hash: Hash,
-        block: &Block,
-    ) -> Vec<Action> {
+        block: &Block<C>,
+    ) -> Vec<Action<C>> {
         debug!(
             block_hash = ?block_hash,
             retry_count = block.retry_transactions.len(),
@@ -595,7 +595,7 @@ impl VerificationPipeline {
     // ─── Receipt root ─────────────────────────────────────────────────────
 
     /// Check if a block needs receipt root verification before voting.
-    pub fn needs_receipt_root_verification(&self, block: &Block) -> bool {
+    pub fn needs_receipt_root_verification<C: TypeConfig>(&self, block: &Block<C>) -> bool {
         if block.certificates.is_empty() {
             return false;
         }
@@ -614,11 +614,11 @@ impl VerificationPipeline {
     }
 
     /// Initiate receipt root verification for a block.
-    pub fn initiate_receipt_root_verification(
+    pub fn initiate_receipt_root_verification<C: TypeConfig>(
         &mut self,
         block_hash: Hash,
-        block: &Block,
-    ) -> Vec<Action> {
+        block: &Block<C>,
+    ) -> Vec<Action<C>> {
         debug!(
             block_hash = ?block_hash,
             cert_count = block.certificates.len(),
@@ -728,11 +728,7 @@ impl VerificationPipeline {
     /// QC's certified block hash (not the proposing block), so it uses
     /// height-based retention with a 2-block buffer to support view-change
     /// scenarios where multiple proposals share the same parent QC.
-    pub fn cleanup(
-        &mut self,
-        pending_blocks: &HashMap<Hash, crate::pending::PendingBlock>,
-        committed_height: u64,
-    ) {
+    pub fn cleanup<V>(&mut self, pending_blocks: &HashMap<Hash, V>, committed_height: u64) {
         self.pending_qc_verifications
             .retain(|hash, _| pending_blocks.contains_key(hash));
 

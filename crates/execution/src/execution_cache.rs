@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_get() {
-        let mut cache = ExecutionCache::new();
+        let mut cache: ExecutionCache = ExecutionCache::new();
         let h = hash(1);
         let updates = make_updates();
 
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn test_remove() {
-        let mut cache = ExecutionCache::new();
+        let mut cache: ExecutionCache = ExecutionCache::new();
         let h = hash(1);
         cache.insert(h, make_updates(), Hash::ZERO);
 
@@ -145,13 +145,13 @@ mod tests {
 
     #[test]
     fn test_remove_nonexistent() {
-        let mut cache = ExecutionCache::new();
+        let mut cache: ExecutionCache = ExecutionCache::new();
         assert!(cache.remove(&hash(99)).is_none());
     }
 
     #[test]
     fn test_remove_batch() {
-        let mut cache = ExecutionCache::new();
+        let mut cache: ExecutionCache = ExecutionCache::new();
         for i in 0..5 {
             cache.insert(hash(i), make_updates(), Hash::ZERO);
         }
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn test_insert_duplicate_replaces() {
-        let mut cache = ExecutionCache::new();
+        let mut cache: ExecutionCache = ExecutionCache::new();
         cache.insert(hash(1), make_updates(), Hash::ZERO);
         cache.insert(hash(2), make_updates(), Hash::ZERO);
 
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_has_all() {
-        let mut cache = ExecutionCache::new();
+        let mut cache: ExecutionCache = ExecutionCache::new();
         cache.insert(hash(1), make_updates(), Hash::ZERO);
         cache.insert(hash(2), make_updates(), Hash::ZERO);
 
@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_missing() {
-        let mut cache = ExecutionCache::new();
+        let mut cache: ExecutionCache = ExecutionCache::new();
         cache.insert(hash(1), make_updates(), Hash::ZERO);
         cache.insert(hash(2), make_updates(), Hash::ZERO);
 

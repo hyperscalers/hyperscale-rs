@@ -7,7 +7,8 @@
 
 use crate::{
     BlockHeight, Bls12381G1PublicKey, EpochConfig, EpochId, NodeId, RoutableTransaction,
-    ShardCommitteeConfig, ShardGroupId, ValidatorId, ValidatorSet, ValidatorShardState, VotePower,
+    ShardCommitteeConfig, ShardGroupId, TypeConfig, ValidatorId, ValidatorSet, ValidatorShardState,
+    VotePower,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -434,6 +435,31 @@ impl TopologySnapshot {
         tx.declared_writes
             .iter()
             .any(|node_id| self.shard_for_node_id(node_id) == self.local_shard)
+    }
+
+    /// Generic: check if a transaction is single-shard using `TypeConfig` operations.
+    pub fn is_single_shard_transaction_generic<C: TypeConfig>(&self, tx: &C::Transaction) -> bool {
+        let writes = C::transaction_writes(tx);
+        let shards: std::collections::BTreeSet<_> = writes
+            .iter()
+            .map(|node_id| self.shard_for_node_id(node_id))
+            .collect();
+        shards.len() <= 1
+    }
+
+    /// Generic: get all shards involved in a transaction using `TypeConfig` operations.
+    pub fn all_shards_for_transaction_generic<C: TypeConfig>(
+        &self,
+        tx: &C::Transaction,
+    ) -> Vec<ShardGroupId> {
+        let reads = C::transaction_reads(tx);
+        let writes = C::transaction_writes(tx);
+        let all: std::collections::BTreeSet<_> = reads
+            .iter()
+            .chain(writes.iter())
+            .map(|node_id| self.shard_for_node_id(node_id))
+            .collect();
+        all.into_iter().collect()
     }
 
     /// Check if this shard is involved in a transaction at all.

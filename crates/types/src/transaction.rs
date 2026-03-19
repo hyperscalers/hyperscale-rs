@@ -1,6 +1,9 @@
 //! Transaction types for consensus.
 
-use crate::{BlockHeight, CommitmentProof, ExecutionCertificate, Hash, NodeId, ShardGroupId};
+use crate::{
+    BlockHeight, CommitmentProof, ConcreteConfig, ExecutionCertificate, Hash, NodeId, ShardGroupId,
+    TypeConfig,
+};
 use hyperscale_codec as sbor;
 use hyperscale_codec::prelude::*;
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
@@ -1682,17 +1685,17 @@ pub fn sign_and_notarize_with_options(
 ///
 /// Each section is sorted by transaction hash (from BTreeMap iteration order).
 /// This structure allows block building without reclassification.
-#[derive(Clone, Debug, Default)]
-pub struct ReadyTransactions {
+#[derive(Clone, Debug)]
+pub struct ReadyTransactions<C: TypeConfig = ConcreteConfig> {
     /// Retry transactions (highest priority, bypass soft limit).
-    pub retries: Vec<std::sync::Arc<RoutableTransaction>>,
+    pub retries: Vec<std::sync::Arc<C::Transaction>>,
     /// Priority transactions (cross-shard with verified provisions, bypass soft limit).
-    pub priority: Vec<std::sync::Arc<RoutableTransaction>>,
+    pub priority: Vec<std::sync::Arc<C::Transaction>>,
     /// Other transactions (subject to soft limit).
-    pub others: Vec<std::sync::Arc<RoutableTransaction>>,
+    pub others: Vec<std::sync::Arc<C::Transaction>>,
 }
 
-impl ReadyTransactions {
+impl<C: TypeConfig> ReadyTransactions<C> {
     /// Total number of transactions across all sections.
     pub fn len(&self) -> usize {
         self.retries.len() + self.priority.len() + self.others.len()
@@ -1704,11 +1707,21 @@ impl ReadyTransactions {
     }
 
     /// Iterate all transactions in priority order (retries, then priority, then others).
-    pub fn iter(&self) -> impl Iterator<Item = &std::sync::Arc<RoutableTransaction>> {
+    pub fn iter(&self) -> impl Iterator<Item = &std::sync::Arc<C::Transaction>> {
         self.retries
             .iter()
             .chain(self.priority.iter())
             .chain(self.others.iter())
+    }
+}
+
+impl<C: TypeConfig> Default for ReadyTransactions<C> {
+    fn default() -> Self {
+        Self {
+            retries: Vec::new(),
+            priority: Vec::new(),
+            others: Vec::new(),
+        }
     }
 }
 

@@ -7,6 +7,7 @@
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use crate::BlockHeight;
 use hyperscale_codec::prelude::{BasicDecode, BasicEncode};
 
 use crate::{
@@ -43,6 +44,45 @@ pub trait TypeConfig: Send + Sync + 'static {
 
     /// Get the write set (node addresses this tx writes to).
     fn transaction_writes(tx: &Self::Transaction) -> Vec<NodeId>;
+
+    /// Get all declared nodes (reads + writes combined).
+    fn transaction_all_nodes(tx: &Self::Transaction) -> Vec<NodeId> {
+        let mut nodes = Self::transaction_reads(tx);
+        nodes.extend(Self::transaction_writes(tx));
+        nodes
+    }
+
+    /// Check if a transaction is a retry (deferred and resubmitted).
+    fn transaction_is_retry(tx: &Self::Transaction) -> bool;
+
+    /// Get the original transaction hash (before retries).
+    fn transaction_original_hash(tx: &Self::Transaction) -> Hash;
+
+    /// Get the retry count for a transaction.
+    fn transaction_retry_count(tx: &Self::Transaction) -> u32;
+
+    /// Check if a transaction has exceeded the maximum retry count.
+    fn transaction_exceeds_max_retries(tx: &Self::Transaction, max_retries: u32) -> bool {
+        Self::transaction_retry_count(tx) >= max_retries
+    }
+
+    /// Create a retry transaction from a deferred transaction.
+    fn transaction_create_retry(
+        tx: &Self::Transaction,
+        deferred_by: Hash,
+        deferred_at: BlockHeight,
+    ) -> Self::Transaction;
+
+    /// Check if a transaction is cross-shard (touches multiple shards).
+    fn transaction_is_cross_shard(tx: &Self::Transaction, num_shards: u64) -> bool {
+        let reads = Self::transaction_reads(tx);
+        let writes = Self::transaction_writes(tx);
+        let mut shards = std::collections::BTreeSet::new();
+        for node in reads.iter().chain(writes.iter()) {
+            shards.insert(crate::shard_for_node(node, num_shards));
+        }
+        shards.len() > 1
+    }
 
     // ── Receipt operations ──
 
@@ -100,12 +140,32 @@ impl TypeConfig for ConcreteConfig {
         tx.hash()
     }
 
+    fn transaction_is_retry(tx: &RoutableTransaction) -> bool {
+        tx.is_retry()
+    }
+
     fn transaction_reads(tx: &RoutableTransaction) -> Vec<NodeId> {
         tx.declared_reads.clone()
     }
 
     fn transaction_writes(tx: &RoutableTransaction) -> Vec<NodeId> {
         tx.declared_writes.clone()
+    }
+
+    fn transaction_original_hash(tx: &RoutableTransaction) -> Hash {
+        tx.original_hash()
+    }
+
+    fn transaction_retry_count(tx: &RoutableTransaction) -> u32 {
+        tx.retry_count()
+    }
+
+    fn transaction_create_retry(
+        tx: &RoutableTransaction,
+        deferred_by: Hash,
+        deferred_at: BlockHeight,
+    ) -> RoutableTransaction {
+        tx.create_retry(deferred_by, deferred_at)
     }
 
     fn receipt_hash(receipt: &LedgerTransactionReceipt) -> Hash {

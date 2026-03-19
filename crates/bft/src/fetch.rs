@@ -37,7 +37,7 @@ impl FetchCoordinator {
     }
 
     /// Remove entries for blocks no longer in pending_blocks.
-    pub fn cleanup(&mut self, pending_blocks: &HashMap<Hash, crate::pending::PendingBlock>) {
+    pub fn cleanup<V>(&mut self, pending_blocks: &HashMap<Hash, V>) {
         self.pending_block_created_at
             .retain(|hash, _| pending_blocks.contains_key(hash));
     }
