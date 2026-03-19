@@ -27,6 +27,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+/// NodeConfig implementation for production.
+pub struct ProdConfig;
+
+impl hyperscale_node::NodeConfig for ProdConfig {
+    type S = SharedStorage<PooledDispatch>;
+    type N = Libp2pNetwork;
+    type D = PooledDispatch;
+    type E = hyperscale_engine::RadixExecutor;
+    type V = hyperscale_engine::TransactionValidation;
+}
+
 /// Concrete IoLoop type for the production runner.
 ///
 /// Storage is `SharedStorage<PooledDispatch>`, a newtype around
@@ -34,7 +45,7 @@ use tracing::{debug, info, warn};
 /// storage to be shared between the pinned IoLoop thread and async tasks
 /// (InboundRouter) via cheap Arc clones.
 /// Certificate and transaction caches live inside IoLoop itself.
-pub type ProdIoLoop = IoLoop<SharedStorage<PooledDispatch>, Libp2pNetwork, PooledDispatch>;
+pub type ProdIoLoop = IoLoop<ProdConfig>;
 
 /// Configuration for the pinned event loop.
 pub struct PinnedLoopConfig {

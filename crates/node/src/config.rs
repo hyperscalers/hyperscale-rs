@@ -9,7 +9,7 @@ use std::time::Duration;
 ///
 /// Bundles all sub-component configs so runners can pass a single value.
 #[derive(Debug, Default, Clone)]
-pub struct NodeConfig {
+pub struct IoLoopConfig {
     pub sync: SyncConfig,
     pub fetch: FetchConfig,
     pub provision_fetch: ProvisionFetchConfig,

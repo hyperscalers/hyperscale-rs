@@ -2,24 +2,21 @@
 
 use super::verify::verify_bls_with_metrics;
 use super::{ExecutionVoteVerificationItem, IoLoop};
-use hyperscale_core::{CrossShardExecutionRequest, NodeInput, ProtocolEvent, StateMachine};
+use hyperscale_core::{
+    CrossShardExecutionRequest, NodeConfig, NodeInput, ProtocolEvent, StateMachine,
+    TransactionValidator,
+};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_messages::{ExecutionCertificatesNotification, ExecutionVotesNotification};
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
-use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
     Bls12381G1PublicKey, ExecutionCertificate, ExecutionResult, ExecutionVote, Hash,
     RoutableTransaction, ShardGroupId,
 };
 use std::sync::Arc;
 
-impl<S, N, D> IoLoop<S, N, D>
-where
-    S: CommitStore + SubstateStore + ConsensusStore + Send + Sync + 'static,
-    N: Network,
-    D: Dispatch + 'static,
-{
+impl<Cfg: NodeConfig> IoLoop<Cfg> {
     // ─── Transaction Validation Batching ──────────────────────────────
 
     /// Queue a transaction for batch validation.

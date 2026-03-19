@@ -59,8 +59,8 @@ use quick_cache::sync::Cache as QuickCache;
 
 use hyperscale_core::NodeInput;
 use hyperscale_node::io_loop::{IoLoop, TimerOp};
+use hyperscale_node::NodeStateMachine;
 use hyperscale_node::SharedTopologySnapshot;
-use hyperscale_node::{NodeConfig, NodeStateMachine};
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{Block, Bls12381G1PrivateKey, Hash, ShardGroupId, ValidatorId};
 use std::sync::Arc;
@@ -453,7 +453,7 @@ impl ProductionRunnerBuilder {
             xb_callback_tx.clone(),
             io_loop_signing_key,
             topology.clone(),
-            NodeConfig::default(),
+            hyperscale_node::IoLoopConfig::default(),
             tx_validator.clone(),
         );
 

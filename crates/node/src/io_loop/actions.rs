@@ -5,22 +5,17 @@ use crate::action_handler::{self, ActionContext, DispatchPool};
 use crate::protocol::fetch::FetchInput;
 use crate::protocol::provision_fetch::ProvisionFetchInput;
 use crate::protocol::sync::SyncInput;
-use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine};
+use hyperscale_core::{Action, NodeConfig, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
-use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
+use hyperscale_storage::{CommitStore, ConsensusStore};
 use hyperscale_types::ValidatorId;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
-impl<S, N, D> IoLoop<S, N, D>
-where
-    S: CommitStore + SubstateStore + ConsensusStore + Send + Sync + 'static,
-    N: Network,
-    D: Dispatch + 'static,
-{
+impl<Cfg: NodeConfig> IoLoop<Cfg> {
     // ─── Action Processing ──────────────────────────────────────────────
 
     /// Process a single action from the state machine.
@@ -672,7 +667,7 @@ where
                 validator_id,
                 dispatch: &dispatch,
             };
-            if let Some(result) = action_handler::handle_delegated_action(action, &ctx) {
+            if let Some(result) = action_handler::handle_delegated_action::<Cfg>(action, &ctx) {
                 if is_execution {
                     let elapsed = start.elapsed().as_secs_f64();
                     if is_speculative {

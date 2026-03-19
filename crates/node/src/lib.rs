@@ -11,7 +11,8 @@ pub mod io_loop;
 mod protocol;
 mod state;
 
-pub use config::NodeConfig;
+pub use config::IoLoopConfig;
+pub use hyperscale_core::NodeConfig;
 pub use io_loop::{NodeStatusSnapshot, SharedTopologySnapshot, TimerOp};
 pub use protocol::sync::SyncStateKind;
 pub use state::NodeStateMachine;

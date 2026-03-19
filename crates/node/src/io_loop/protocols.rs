@@ -4,20 +4,13 @@ use super::{IoLoop, TimerOp};
 use crate::protocol::fetch::FetchOutput;
 use crate::protocol::provision_fetch::ProvisionFetchOutput;
 use crate::protocol::sync::SyncOutput;
-use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
-use hyperscale_dispatch::Dispatch;
+use hyperscale_core::{NodeConfig, NodeInput, ProtocolEvent, TimerId};
 use hyperscale_metrics as metrics;
-use hyperscale_network::Network;
-use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
+use hyperscale_storage::ConsensusStore;
 use hyperscale_types::BlockHeight;
 use std::time::Duration;
 
-impl<S, N, D> IoLoop<S, N, D>
-where
-    S: CommitStore + SubstateStore + ConsensusStore + Send + Sync + 'static,
-    N: Network,
-    D: Dispatch + 'static,
-{
+impl<Cfg: NodeConfig> IoLoop<Cfg> {
     /// Interval for the periodic fetch tick timer.
     const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -30,6 +23,7 @@ where
             match output {
                 SyncOutput::FetchBlock { height } => {
                     use hyperscale_messages::request::GetBlockRequest;
+                    use hyperscale_network::Network;
                     let es = self.event_sender.clone();
                     let peers = self.local_peers();
                     self.network.request(
@@ -107,6 +101,7 @@ where
                     tx_hashes,
                 } => {
                     use hyperscale_messages::request::GetTransactionsRequest;
+                    use hyperscale_network::Network;
                     let es = self.event_sender.clone();
                     let bh = block_hash;
                     let hs = tx_hashes.clone();
@@ -137,6 +132,7 @@ where
                     cert_hashes,
                 } => {
                     use hyperscale_messages::request::GetCertificatesRequest;
+                    use hyperscale_network::Network;
                     let es = self.event_sender.clone();
                     let bh = block_hash;
                     let hs = cert_hashes.clone();
@@ -203,6 +199,7 @@ where
                     peer,
                 } => {
                     use hyperscale_messages::request::GetProvisionsRequest;
+                    use hyperscale_network::Network;
                     let request = GetProvisionsRequest {
                         block_height,
                         target_shard,

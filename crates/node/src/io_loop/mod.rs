@@ -25,25 +25,23 @@ mod protocols;
 mod verify;
 
 use crate::batch_accumulator::{BatchAccumulator, ShardedBatchAccumulator};
-use crate::config::NodeConfig;
+use crate::config::IoLoopConfig;
 use crate::protocol::fetch::{FetchInput, FetchKind, FetchProtocol};
 use crate::protocol::provision_fetch::{ProvisionFetchInput, ProvisionFetchProtocol};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use crate::NodeStateMachine;
 use arc_swap::ArcSwap;
 use hyperscale_core::{
-    Action, CrossShardExecutionRequest, NodeInput, ProtocolEvent, StateMachine, TimerId,
+    Action, CrossShardExecutionRequest, NodeConfig, NodeInput, ProtocolEvent, StateMachine, TimerId,
 };
-use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::{RadixExecutor, TransactionValidation};
 use hyperscale_messages::TransactionGossip;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
-use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
+use hyperscale_storage::CommitStore;
 use hyperscale_types::{
-    Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ConcreteConfig,
-    ExecutionCertificate, ExecutionVote, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, TopologySnapshot, TransactionCertificate, TypeConfig, ValidatorId,
+    Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
+    ExecutionVote, Hash, QuorumCertificate, ReceiptBundle, RoutableTransaction, ShardGroupId,
+    TopologySnapshot, TransactionCertificate, ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -138,21 +136,15 @@ pub struct NodeStatusSnapshot {
 
 /// Unified I/O loop that processes all actions from the state machine.
 ///
-/// Generic over:
-/// - `S`: Storage (CommitStore + SubstateStore + ConsensusStore)
-/// - `N`: Network (message sending)
-/// - `D`: Dispatch (thread pool work scheduling)
-pub struct IoLoop<S, N, D, C: TypeConfig = ConcreteConfig>
-where
-    S: CommitStore + SubstateStore + ConsensusStore,
-    D: Dispatch,
-{
+/// Generic over `Cfg: NodeConfig`, which bundles all type parameters:
+/// storage, network, dispatch, executor, validator, and TypeConfig.
+pub struct IoLoop<Cfg: NodeConfig> {
     // Core components
-    state: NodeStateMachine<C>,
-    storage: Arc<S>,
-    executor: RadixExecutor,
-    network: N,
-    dispatch: D,
+    state: NodeStateMachine,
+    storage: Arc<Cfg::S>,
+    executor: Cfg::E,
+    network: Cfg::N,
+    dispatch: Cfg::D,
     event_sender: crossbeam::channel::Sender<NodeInput>,
 
     // Identity
@@ -166,7 +158,7 @@ where
     // Stores (block_height, prepared_commit) so stale entries can be pruned
     // when they outlive the block they were prepared for.
     #[allow(clippy::type_complexity)]
-    prepared_commits: Arc<Mutex<HashMap<Hash, (u64, S::PreparedCommit)>>>,
+    prepared_commits: Arc<Mutex<HashMap<Hash, (u64, <Cfg::S as CommitStore>::PreparedCommit)>>>,
 
     // In-memory caches (shared with inbound router in production)
     cert_cache: Arc<QuickCache<Hash, Arc<TransactionCertificate>>>,
@@ -182,7 +174,7 @@ where
     provision_fetch_protocol: ProvisionFetchProtocol,
 
     // Transaction validation
-    tx_validator: Arc<TransactionValidation>,
+    tx_validator: Arc<Cfg::V>,
     pending_validation: HashSet<Hash>,
     locally_submitted: HashSet<Hash>,
 
@@ -204,21 +196,12 @@ where
     pending_block_commits: Vec<(Block, QuorumCertificate)>,
 
     // Guard against out-of-order block commits across separate flushes.
-    // When an async commit closure is in flight on the execution pool, new
-    // blocks accumulate in `pending_block_commits` instead of spawning a
-    // second closure (Rayon doesn't guarantee FIFO ordering of spawned tasks).
-    // The closure clears this flag before sending its final event, so the
-    // subsequent `feed_event` → `flush_block_commits` drains the backlog.
     commit_in_flight: Arc<AtomicBool>,
 
-    // Receipt bundle accumulator — collects StoreReceiptBundles within an
-    // event cycle, then spawns storage writes on the execution pool so
-    // SBOR-encoding + RocksDB writes don't block the IoLoop thread.
-    pending_receipt_bundles: Vec<hyperscale_types::ReceiptBundle>,
+    // Receipt bundle accumulator
+    pending_receipt_bundles: Vec<ReceiptBundle>,
 
-    // Transaction status cache — retains the latest status for every transaction
-    // that has emitted a status notification. Bounded LRU cache shared (via Arc)
-    // with external consumers (e.g. RPC handlers in production).
+    // Transaction status cache
     tx_status_cache: Arc<QuickCache<Hash, hyperscale_types::TransactionStatus>>,
 
     // Cached local shard peers (committee excluding self) — avoids per-call allocation.
@@ -230,25 +213,20 @@ where
     pending_timer_ops: Vec<TimerOp>,
 }
 
-impl<S, N, D> IoLoop<S, N, D>
-where
-    S: CommitStore + SubstateStore + ConsensusStore + Send + Sync + 'static,
-    N: Network,
-    D: Dispatch + 'static,
-{
+impl<Cfg: NodeConfig> IoLoop<Cfg> {
     /// Create a new IoLoop.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: NodeStateMachine,
-        storage: S,
-        executor: RadixExecutor,
-        network: N,
-        dispatch: D,
+        storage: Cfg::S,
+        executor: Cfg::E,
+        network: Cfg::N,
+        dispatch: Cfg::D,
         event_sender: crossbeam::channel::Sender<NodeInput>,
         signing_key: Bls12381G1PrivateKey,
         topology: SharedTopologySnapshot,
-        config: NodeConfig,
-        tx_validator: Arc<TransactionValidation>,
+        config: IoLoopConfig,
+        tx_validator: Arc<Cfg::V>,
     ) -> Self {
         let topo = topology.load();
         let local_shard = topo.local_shard();
@@ -376,10 +354,7 @@ where
     ///
     /// Panics if the storage `Arc` has been cloned (e.g., by handler registration
     /// or dispatch closures), since `Arc::get_mut` requires sole ownership.
-    pub fn with_storage_and_executor<R>(
-        &mut self,
-        f: impl FnOnce(&mut S, &RadixExecutor) -> R,
-    ) -> R {
+    pub fn with_storage_and_executor<R>(&mut self, f: impl FnOnce(&mut Cfg::S, &Cfg::E) -> R) -> R {
         let storage = Arc::get_mut(&mut self.storage).expect(
             "with_storage_and_executor must be called before any spawned closures clone the Arc",
         );
@@ -406,18 +381,18 @@ where
     }
 
     /// Access the storage.
-    pub fn storage(&self) -> &S {
+    pub fn storage(&self) -> &Cfg::S {
         &self.storage
     }
 
     /// Mutably access the storage (for initialization/setup).
-    pub fn storage_mut(&mut self) -> &mut S {
+    pub fn storage_mut(&mut self) -> &mut Cfg::S {
         Arc::get_mut(&mut self.storage)
             .expect("storage_mut must be called before any spawned closures clone the Arc")
     }
 
     /// Access the network.
-    pub fn network(&self) -> &N {
+    pub fn network(&self) -> &Cfg::N {
         &self.network
     }
 
@@ -537,9 +512,9 @@ where
                 // Store receipts from sync peer BEFORE processing the block.
                 // Syncing nodes didn't execute locally, so local_execution is None.
                 // state_changes already populated by remote peer.
-                let bundles: Vec<hyperscale_types::ReceiptBundle> = ledger_receipts
+                let bundles: Vec<ReceiptBundle> = ledger_receipts
                     .iter()
-                    .map(|entry| hyperscale_types::ReceiptBundle {
+                    .map(|entry| ReceiptBundle {
                         tx_hash: entry.tx_hash,
                         ledger_receipt: std::sync::Arc::new(entry.receipt.clone()),
                         local_execution: None,
@@ -582,9 +557,9 @@ where
                 // Store receipts from fetch peer. Syncing nodes didn't execute
                 // locally, so local_execution is None.
                 // state_changes already populated by remote peer.
-                let bundles: Vec<hyperscale_types::ReceiptBundle> = ledger_receipts
+                let bundles: Vec<ReceiptBundle> = ledger_receipts
                     .iter()
-                    .map(|entry| hyperscale_types::ReceiptBundle {
+                    .map(|entry| ReceiptBundle {
                         tx_hash: entry.tx_hash,
                         ledger_receipt: std::sync::Arc::new(entry.receipt.clone()),
                         local_execution: None,

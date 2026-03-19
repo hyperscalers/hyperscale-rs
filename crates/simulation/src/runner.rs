@@ -8,7 +8,7 @@ use crate::NodeIndex;
 use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
-use hyperscale_engine::RadixExecutor;
+use hyperscale_engine::{RadixExecutor, TransactionValidation};
 use hyperscale_execution::{DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
@@ -31,8 +31,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
+/// NodeConfig implementation for simulation.
+pub struct SimConfig;
+
+impl NodeConfig for SimConfig {
+    type S = SimStorage<SyncDispatch>;
+    type N = SimNetworkAdapter;
+    type D = SyncDispatch;
+    type E = RadixExecutor;
+    type V = TransactionValidation;
+}
+
 /// Type alias for the simulation's concrete IoLoop.
-type SimIoLoop = IoLoop<SimStorage<SyncDispatch>, SimNetworkAdapter, SyncDispatch>;
+type SimIoLoop = IoLoop<SimConfig>;
 
 /// Type alias for the simulation's genesis wrapper.
 type SimGenesisWrapper<'a> = GenesisWrapper<'a, SimStorage<SyncDispatch>>;
@@ -224,7 +235,7 @@ impl SimulationRunner {
                     event_tx,
                     signing_key,
                     topology_arc,
-                    NodeConfig::default(),
+                    hyperscale_node::IoLoopConfig::default(),
                     tx_validator,
                 );
 

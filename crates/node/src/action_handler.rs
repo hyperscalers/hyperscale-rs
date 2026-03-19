@@ -8,25 +8,26 @@
 //! Batched work (execution votes, execution certs, cross-shard execution) and block
 //! commits are handled inline by the I/O loop's flush closures.
 
-use hyperscale_core::{Action, NodeInput, ProtocolEvent, ProvisionVerificationResult};
+use hyperscale_core::{
+    Action, ExecutionBackend, NodeConfig, NodeInput, ProtocolEvent, ProvisionVerificationResult,
+};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::RadixExecutor;
 use hyperscale_metrics as metrics;
-use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
+use hyperscale_storage::{CommitStore, SubstateStore};
 use hyperscale_types::{
     Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ShardGroupId, ValidatorId,
 };
 use std::sync::Arc;
 
 /// Context for executing delegated actions.
-pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore + ConsensusStore, D: Dispatch> {
-    pub storage: &'a S,
-    pub executor: &'a RadixExecutor,
+pub(crate) struct ActionContext<'a, Cfg: NodeConfig> {
+    pub storage: &'a Cfg::S,
+    pub executor: &'a Cfg::E,
     pub signing_key: &'a Bls12381G1PrivateKey,
     pub local_shard: ShardGroupId,
     pub num_shards: u64,
     pub validator_id: ValidatorId,
-    pub dispatch: &'a D,
+    pub dispatch: &'a Cfg::D,
 }
 
 /// Result of handling a delegated action.
@@ -85,13 +86,10 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// The runner is responsible for additionally broadcasting votes to shard
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
-pub(crate) fn handle_delegated_action<
-    S: CommitStore + SubstateStore + ConsensusStore,
-    D: Dispatch,
->(
+pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
     action: Action,
-    ctx: &ActionContext<'_, S, D>,
-) -> Option<DelegatedResult<S::PreparedCommit>> {
+    ctx: &ActionContext<'_, Cfg>,
+) -> Option<DelegatedResult<<Cfg::S as CommitStore>::PreparedCommit>> {
     match action {
         // --- BFT crypto verification ---
         Action::VerifyAndBuildQuorumCertificate {
@@ -440,15 +438,21 @@ pub(crate) fn handle_delegated_action<
             let results = results
                 .into_iter()
                 .map(|r| {
-                    let mut result = ExecutionResult::from(r);
+                    let mut db_updates = r.state_update;
                     if num_shards > 1 {
-                        result.database_updates = hyperscale_storage::filter_updates_to_shard(
-                            &result.database_updates,
+                        db_updates = hyperscale_storage::filter_updates_to_shard(
+                            &db_updates,
                             local_shard,
                             num_shards,
                         );
                     }
-                    result
+                    ExecutionResult {
+                        tx_hash: r.tx_hash,
+                        receipt_hash: r.receipt_hash,
+                        database_updates: db_updates,
+                        ledger_receipt: r.receipt,
+                        local_execution: r.local_execution,
+                    }
                 })
                 .collect();
 
@@ -485,15 +489,21 @@ pub(crate) fn handle_delegated_action<
             let results = results
                 .into_iter()
                 .map(|r| {
-                    let mut result = ExecutionResult::from(r);
+                    let mut db_updates = r.state_update;
                     if num_shards > 1 {
-                        result.database_updates = hyperscale_storage::filter_updates_to_shard(
-                            &result.database_updates,
+                        db_updates = hyperscale_storage::filter_updates_to_shard(
+                            &db_updates,
                             local_shard,
                             num_shards,
                         );
                     }
-                    result
+                    ExecutionResult {
+                        tx_hash: r.tx_hash,
+                        receipt_hash: r.receipt_hash,
+                        database_updates: db_updates,
+                        ledger_receipt: r.receipt,
+                        local_execution: r.local_execution,
+                    }
                 })
                 .collect();
             let tx_hashes: Vec<Hash> = votes.iter().map(|v| v.transaction_hash).collect();

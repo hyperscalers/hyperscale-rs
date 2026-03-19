@@ -2,22 +2,14 @@
 
 use super::verify::{resolve_sender_key, verify_bls_with_metrics, verify_sender_signature};
 use super::IoLoop;
-use hyperscale_core::{NodeInput, ProtocolEvent};
-use hyperscale_dispatch::Dispatch;
+use hyperscale_core::{NodeConfig, NodeInput, ProtocolEvent};
 use hyperscale_messages::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
     ExecutionVotesNotification, TransactionGossip,
 };
-use hyperscale_network::Network;
-use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use tracing::warn;
 
-impl<S, N, D> IoLoop<S, N, D>
-where
-    S: CommitStore + SubstateStore + ConsensusStore + Send + Sync + 'static,
-    N: Network,
-    D: Dispatch + 'static,
-{
+impl<Cfg: NodeConfig> IoLoop<Cfg> {
     /// Register per-type request handlers with the network.
     ///
     /// Each handler is a closure that captures shared state and delegates to
@@ -29,6 +21,7 @@ where
         use hyperscale_messages::request::{
             GetBlockRequest, GetCertificatesRequest, GetProvisionsRequest, GetTransactionsRequest,
         };
+        use hyperscale_network::Network;
         use std::sync::Arc;
 
         // ── block.request → sync protocol ────────────────────────────
@@ -71,7 +64,7 @@ where
     /// Register gossip handlers for broadcast message types (transactions
     /// and committed block headers).
     pub(super) fn register_gossip_handlers(&self) {
-        use hyperscale_network::{GossipVerdict, TopicScope};
+        use hyperscale_network::{GossipVerdict, Network, TopicScope};
 
         // ── transaction.gossip → ProtocolEvent::TransactionGossipReceived ─
         // The existing step() intercept handles dedup + validation queueing.
@@ -127,6 +120,8 @@ where
     /// Register notification handlers for protocol messages sent via unicast
     /// to known committee members.
     pub(super) fn register_notification_handlers(&self) {
+        use hyperscale_network::Network;
+
         // ── block.vote → ProtocolEvent::BlockVoteReceived ────────────
 
         let tx = self.event_sender.clone();

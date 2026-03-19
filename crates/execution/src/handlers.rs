@@ -11,7 +11,7 @@
 //! verify accumulated signatures across multiple transactions in ~2 pairing
 //! operations. These are called from the I/O loop's time-windowed batch flush.
 
-use hyperscale_engine::{RadixExecutor, SingleTxResult};
+use hyperscale_core::{ExecutionBackend, SingleTxResult};
 use hyperscale_storage::SubstateStore;
 use hyperscale_types::{
     batch_verify_bls_different_messages, batch_verify_bls_same_message, exec_vote_message,
@@ -304,14 +304,23 @@ pub fn batch_verify_execution_certificate_signatures(
 /// Returns an `(ExecutionVote, SingleTxResult)` tuple. The vote contains only
 /// receipt_hash + write_nodes; the full execution result travels alongside
 /// for the state machine to populate the execution cache and store receipts.
-pub fn execute_and_sign_single_shard<S: SubstateStore>(
-    executor: &RadixExecutor,
+pub fn execute_and_sign_single_shard<C, E, S>(
+    executor: &E,
     storage: &S,
     tx: &Arc<RoutableTransaction>,
     signing_key: &Bls12381G1PrivateKey,
     local_shard: ShardGroupId,
     validator_id: ValidatorId,
-) -> (ExecutionVote, SingleTxResult) {
+) -> (ExecutionVote, SingleTxResult<C>)
+where
+    C: hyperscale_types::TypeConfig<
+        Transaction = RoutableTransaction,
+        StateUpdate = hyperscale_storage::DatabaseUpdates,
+        ExecutionReceipt = hyperscale_types::LedgerTransactionReceipt,
+    >,
+    E: ExecutionBackend<C>,
+    S: SubstateStore,
+{
     let result = match executor.execute_single_shard(storage, std::slice::from_ref(tx)) {
         Ok(output) => {
             if let Some(r) = output.results.first() {
@@ -363,8 +372,8 @@ pub fn execute_and_sign_single_shard<S: SubstateStore>(
 /// receipt_hash + write_nodes; the full execution result travels alongside
 /// for the state machine to populate the execution cache and store receipts.
 #[allow(clippy::too_many_arguments)]
-pub fn execute_and_sign_cross_shard<S: SubstateStore>(
-    executor: &RadixExecutor,
+pub fn execute_and_sign_cross_shard<C, E, S>(
+    executor: &E,
     storage: &S,
     tx_hash: Hash,
     transaction: &Arc<RoutableTransaction>,
@@ -372,7 +381,16 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
     signing_key: &Bls12381G1PrivateKey,
     local_shard: ShardGroupId,
     validator_id: ValidatorId,
-) -> (ExecutionVote, SingleTxResult) {
+) -> (ExecutionVote, SingleTxResult<C>)
+where
+    C: hyperscale_types::TypeConfig<
+        Transaction = RoutableTransaction,
+        StateUpdate = hyperscale_storage::DatabaseUpdates,
+        ExecutionReceipt = hyperscale_types::LedgerTransactionReceipt,
+    >,
+    E: ExecutionBackend<C>,
+    S: SubstateStore,
+{
     let result = match executor.execute_cross_shard(
         storage,
         std::slice::from_ref(transaction),
