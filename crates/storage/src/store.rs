@@ -1,14 +1,17 @@
-//! Storage traits for Radix Engine execution.
+//! Storage traits for the consensus framework.
 //!
-//! This module defines the storage abstraction used by runners to persist Radix state.
+//! This module defines the storage abstraction used by runners to persist state.
+//! The traits are framework-level (no Radix-specific types in the trait boundary).
 
+use crate::SubstateReader;
 use hyperscale_types::{Hash, NodeId, SubstateInclusionProof};
-use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 
-/// Extension trait for substate storage with snapshots, node listing, and JMT state roots.
+/// A raw substate entry: `(partition_num, sort_key_bytes, value_bytes)`.
+pub type RawSubstateEntry = (u8, Vec<u8>, Vec<u8>);
+
+/// Storage trait for substate access, snapshots, provisioning, and JMT state roots.
 ///
-/// This trait extends Radix's `SubstateDatabase` with additional methods needed
-/// for deterministic simulation and state commitment:
+/// This is the framework's primary storage interface. It provides:
 /// - `snapshot()` - Create isolated views for parallel execution
 /// - `list_substates_for_node()` - Enumerate substates for cross-shard provisioning
 /// - `jmt_version()` / `state_root_hash()` - JMT state commitment
@@ -16,11 +19,11 @@ use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 /// All implementations use Jellyfish Merkle Tree (JMT) internally to maintain
 /// cryptographic state roots, updated on each `commit_block()`.
 ///
-/// Runner storage types (`SimStorage`, `RocksDbStorage`) implement this trait
-/// along with `SubstateDatabase`.
-pub trait SubstateStore: SubstateDatabase + Send + Sync {
+/// Storage backends also implement Radix's `SubstateDatabase` trait separately
+/// (not through this trait) for engine execution.
+pub trait SubstateStore: SubstateReader {
     /// The snapshot type returned by this storage.
-    type Snapshot<'a>: SubstateDatabase + Send + Sync
+    type Snapshot<'a>: SubstateReader
     where
         Self: 'a;
 
@@ -37,12 +40,12 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync {
 
     /// List all substates for a given NodeId.
     ///
-    /// Returns an iterator of (partition_num, sort_key, value) tuples.
+    /// Returns an iterator of (partition_num, sort_key_bytes, value) tuples.
     /// Used by cross-shard provisioning to collect state for other shards.
     fn list_substates_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Box<dyn Iterator<Item = (u8, DbSortKey, Vec<u8>)> + '_>;
+    ) -> Box<dyn Iterator<Item = RawSubstateEntry> + '_>;
 
     /// Returns the block height of the last committed JMT state.
     ///
@@ -74,7 +77,7 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync {
         &self,
         node_id: &NodeId,
         block_height: u64,
-    ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>>;
+    ) -> Option<Vec<RawSubstateEntry>>;
 
     /// Generate 3-tier JMT inclusion proofs for the given storage keys.
     fn generate_merkle_proofs(

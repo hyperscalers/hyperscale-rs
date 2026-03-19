@@ -6,7 +6,9 @@
 //! efficient execution. The sending shard computes storage keys once, so the
 //! receiving shard can use them directly without expensive hash computations.
 
+use crate::adapter::RadixStorageAdapter;
 use hyperscale_storage::keys;
+use hyperscale_storage::SubstateReader;
 use hyperscale_types::{
     ApplicationEvent, FeeSummary, LedgerTransactionOutcome, LedgerTransactionReceipt,
     LocalTransactionExecution, LogLevel, StateEntry,
@@ -192,7 +194,7 @@ pub struct ProvisionedSnapshot<'a, S> {
     provisions: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
-impl<'a, S: SubstateDatabase> ProvisionedSnapshot<'a, S> {
+impl<'a, S: SubstateReader> ProvisionedSnapshot<'a, S> {
     /// Create a new provisioned snapshot from pre-computed entries.
     ///
     /// Entries should have storage keys pre-computed by the sending shard.
@@ -230,7 +232,7 @@ impl<'a, S: SubstateDatabase> ProvisionedSnapshot<'a, S> {
     }
 }
 
-impl<S: SubstateDatabase> SubstateDatabase for ProvisionedSnapshot<'_, S> {
+impl<S: SubstateReader> SubstateDatabase for ProvisionedSnapshot<'_, S> {
     fn get_raw_substate_by_db_key(
         &self,
         partition_key: &DbPartitionKey,
@@ -245,9 +247,8 @@ impl<S: SubstateDatabase> SubstateDatabase for ProvisionedSnapshot<'_, S> {
             return value.clone();
         }
 
-        // Fall back to base storage
-        self.base
-            .get_raw_substate_by_db_key(partition_key, sort_key)
+        // Fall back to base storage via adapter
+        RadixStorageAdapter(self.base).get_raw_substate_by_db_key(partition_key, sort_key)
     }
 
     fn list_raw_values_from_db_key(
@@ -270,10 +271,17 @@ impl<S: SubstateDatabase> SubstateDatabase for ProvisionedSnapshot<'_, S> {
             None => prefix.clone(),
         };
 
-        // Get base iterator
-        let base_iter = self
-            .base
-            .list_raw_values_from_db_key(partition_key, from_sort_key);
+        // Get base iterator by calling SubstateReader directly and mapping to
+        // Radix types. We avoid creating a temporary RadixStorageAdapter here
+        // because the iterator borrows from the adapter, which would be dropped.
+        let base_iter: Box<dyn Iterator<Item = (DbSortKey, Vec<u8>)> + '_> = {
+            let raw = self.base.list_raw_substates(
+                &partition_key.node_key,
+                partition_key.partition_num,
+                from_sort_key.map(|k| k.0.as_slice()),
+            );
+            Box::new(raw.map(|(k, v)| (DbSortKey(k), v)))
+        };
 
         // Get provision entries in range (provisions are keyed by full storage key)
         let prov_entries: Vec<_> = self

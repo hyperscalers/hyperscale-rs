@@ -22,7 +22,7 @@ use hyperscale_storage::{
     },
     keys, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot,
     PartitionDatabaseUpdates, PartitionEntry, StateRootHash, SubstateDatabase, SubstateLookup,
-    SubstateStore,
+    SubstateReader, SubstateStore,
 };
 use hyperscale_types::NodeId;
 use rocksdb::{
@@ -360,6 +360,38 @@ impl<D: Dispatch + 'static> SubstateDatabase for RocksDbStorage<D> {
                 None
             }
         }))
+    }
+}
+
+impl<D: Dispatch + 'static> SubstateReader for RocksDbStorage<D> {
+    fn get_raw_substate(
+        &self,
+        node_key: &[u8],
+        partition_num: u8,
+        sort_key: &[u8],
+    ) -> Option<Vec<u8>> {
+        let pk = DbPartitionKey {
+            node_key: node_key.to_vec(),
+            partition_num,
+        };
+        self.get_raw_substate_by_db_key(&pk, &DbSortKey(sort_key.to_vec()))
+    }
+
+    fn list_raw_substates(
+        &self,
+        node_key: &[u8],
+        partition_num: u8,
+        from_sort_key: Option<&[u8]>,
+    ) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + '_> {
+        let pk = DbPartitionKey {
+            node_key: node_key.to_vec(),
+            partition_num,
+        };
+        let from = from_sort_key.map(|k| DbSortKey(k.to_vec()));
+        Box::new(
+            self.list_raw_values_from_db_key(&pk, from.as_ref())
+                .map(|(k, v)| (k.0, v)),
+        )
     }
 }
 
@@ -718,7 +750,7 @@ impl<D: Dispatch + 'static> SubstateStore for RocksDbStorage<D> {
     fn list_substates_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Box<dyn Iterator<Item = (u8, DbSortKey, Vec<u8>)> + '_> {
+    ) -> Box<dyn Iterator<Item = (u8, Vec<u8>, Vec<u8>)> + '_> {
         let prefix = keys::node_prefix(node_id);
         let prefix_len = prefix.len();
         let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
@@ -729,7 +761,7 @@ impl<D: Dispatch + 'static> SubstateStore for RocksDbStorage<D> {
             if full_key.len() > prefix_len {
                 let partition_num = full_key[prefix_len];
                 let sort_key_bytes = full_key[prefix_len + 1..].to_vec();
-                Some((partition_num, DbSortKey(sort_key_bytes), value.into_vec()))
+                Some((partition_num, sort_key_bytes, value.into_vec()))
             } else {
                 None
             }
@@ -749,7 +781,7 @@ impl<D: Dispatch + 'static> SubstateStore for RocksDbStorage<D> {
         &self,
         node_id: &NodeId,
         block_height: u64,
-    ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
+    ) -> Option<Vec<(u8, Vec<u8>, Vec<u8>)>> {
         // Take a RocksDB snapshot for all reads in this method. This protects
         // against concurrent JMT GC deleting nodes/associations mid-traversal.
         let snapshot_store = SnapshotTreeStore::new(&self.db);
@@ -769,14 +801,14 @@ impl<D: Dispatch + 'static> SubstateStore for RocksDbStorage<D> {
         // Uses the snapshot store so GC can't delete nodes mid-traversal.
         let entity_tier = EntityTier::new(&snapshot_store, Some(block_height));
         let partition_tier = entity_tier.get_entity_partition_tier(entity_key);
-        let mut entries: Vec<(u8, DbSortKey, Vec<u8>)> = Vec::new();
+        let mut entries: Vec<(u8, Vec<u8>, Vec<u8>)> = Vec::new();
 
         for substate_tier in partition_tier.into_iter_partition_substate_tiers_from(None) {
             let partition_num = substate_tier.partition_key().partition_num;
             for summary in substate_tier.into_iter_substate_summaries_from(None) {
                 entries.push((
                     partition_num,
-                    summary.sort_key,
+                    summary.sort_key.0,
                     encode_jmt_key(&summary.state_tree_leaf_key),
                 ));
             }
@@ -1061,6 +1093,38 @@ impl SubstateDatabase for RocksDbSnapshot<'_> {
                 None
             }
         }))
+    }
+}
+
+impl SubstateReader for RocksDbSnapshot<'_> {
+    fn get_raw_substate(
+        &self,
+        node_key: &[u8],
+        partition_num: u8,
+        sort_key: &[u8],
+    ) -> Option<Vec<u8>> {
+        let pk = DbPartitionKey {
+            node_key: node_key.to_vec(),
+            partition_num,
+        };
+        self.get_raw_substate_by_db_key(&pk, &DbSortKey(sort_key.to_vec()))
+    }
+
+    fn list_raw_substates(
+        &self,
+        node_key: &[u8],
+        partition_num: u8,
+        from_sort_key: Option<&[u8]>,
+    ) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + '_> {
+        let pk = DbPartitionKey {
+            node_key: node_key.to_vec(),
+            partition_num,
+        };
+        let from = from_sort_key.map(|k| DbSortKey(k.to_vec()));
+        Box::new(
+            self.list_raw_values_from_db_key(&pk, from.as_ref())
+                .map(|(k, v)| (k.0, v)),
+        )
     }
 }
 
@@ -2618,6 +2682,27 @@ impl<D: Dispatch + 'static> SubstateDatabase for SharedStorage<D> {
     }
 }
 
+impl<D: Dispatch + 'static> SubstateReader for SharedStorage<D> {
+    fn get_raw_substate(
+        &self,
+        node_key: &[u8],
+        partition_num: u8,
+        sort_key: &[u8],
+    ) -> Option<Vec<u8>> {
+        self.0.get_raw_substate(node_key, partition_num, sort_key)
+    }
+
+    fn list_raw_substates(
+        &self,
+        node_key: &[u8],
+        partition_num: u8,
+        from_sort_key: Option<&[u8]>,
+    ) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + '_> {
+        self.0
+            .list_raw_substates(node_key, partition_num, from_sort_key)
+    }
+}
+
 #[cfg(test)]
 impl<D: Dispatch + 'static> hyperscale_storage::CommittableSubstateDatabase for SharedStorage<D> {
     fn commit(&mut self, updates: &DatabaseUpdates) {
@@ -2639,7 +2724,7 @@ impl<D: Dispatch + 'static> SubstateStore for SharedStorage<D> {
     fn list_substates_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Box<dyn Iterator<Item = (u8, DbSortKey, Vec<u8>)> + '_> {
+    ) -> Box<dyn Iterator<Item = (u8, Vec<u8>, Vec<u8>)> + '_> {
         self.0.list_substates_for_node(node_id)
     }
 
@@ -2655,7 +2740,7 @@ impl<D: Dispatch + 'static> SubstateStore for SharedStorage<D> {
         &self,
         node_id: &NodeId,
         block_height: u64,
-    ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
+    ) -> Option<Vec<(u8, Vec<u8>, Vec<u8>)>> {
         self.0
             .list_substates_for_node_at_height(node_id, block_height)
     }

@@ -27,6 +27,7 @@
 
 #![warn(missing_docs)]
 
+mod adapter;
 mod error;
 mod execution;
 mod executor;

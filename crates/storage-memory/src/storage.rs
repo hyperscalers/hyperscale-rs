@@ -17,7 +17,7 @@ use hyperscale_storage::{
     jmt::{EntityTier, StoredTreeNodeKey, TypedInMemoryTreeStore, WriteableTreeStore},
     keys, CommitStore, ConsensusStore, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
     DbSubstateValue, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry, StateRootHash,
-    SubstateDatabase, SubstateStore,
+    SubstateDatabase, SubstateReader, SubstateStore,
 };
 use hyperscale_types::{
     Block, BlockHeight, Hash, LedgerTransactionReceipt, LocalTransactionExecution, NodeId,
@@ -374,6 +374,38 @@ impl<D: Dispatch + 'static> SubstateDatabase for SimStorage<D> {
     }
 }
 
+impl<D: Dispatch + 'static> SubstateReader for SimStorage<D> {
+    fn get_raw_substate(
+        &self,
+        node_key: &[u8],
+        partition_num: u8,
+        sort_key: &[u8],
+    ) -> Option<Vec<u8>> {
+        let pk = DbPartitionKey {
+            node_key: node_key.to_vec(),
+            partition_num,
+        };
+        self.get_raw_substate_by_db_key(&pk, &DbSortKey(sort_key.to_vec()))
+    }
+
+    fn list_raw_substates(
+        &self,
+        node_key: &[u8],
+        partition_num: u8,
+        from_sort_key: Option<&[u8]>,
+    ) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + '_> {
+        let pk = DbPartitionKey {
+            node_key: node_key.to_vec(),
+            partition_num,
+        };
+        let from = from_sort_key.map(|k| DbSortKey(k.to_vec()));
+        Box::new(
+            self.list_raw_values_from_db_key(&pk, from.as_ref())
+                .map(|(k, v)| (k.0, v)),
+        )
+    }
+}
+
 #[cfg(test)]
 impl<D: Dispatch + 'static> hyperscale_storage::CommittableSubstateDatabase for SimStorage<D> {
     fn commit(&mut self, updates: &DatabaseUpdates) {
@@ -393,7 +425,7 @@ impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
     fn list_substates_for_node(
         &self,
         node_id: &NodeId,
-    ) -> Box<dyn Iterator<Item = (u8, DbSortKey, Vec<u8>)> + '_> {
+    ) -> Box<dyn Iterator<Item = (u8, Vec<u8>, Vec<u8>)> + '_> {
         let prefix = keys::node_prefix(node_id);
         let prefix_len = prefix.len();
         let end = keys::next_prefix(&prefix).expect("storage key prefix overflow");
@@ -404,7 +436,7 @@ impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
             if full_key.len() > prefix_len {
                 let partition_num = full_key[prefix_len];
                 let sort_key_bytes = full_key[prefix_len + 1..].to_vec();
-                Some((partition_num, DbSortKey(sort_key_bytes), value))
+                Some((partition_num, sort_key_bytes, value))
             } else {
                 None
             }
@@ -423,7 +455,7 @@ impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
         &self,
         node_id: &NodeId,
         block_height: u64,
-    ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
+    ) -> Option<Vec<(u8, Vec<u8>, Vec<u8>)>> {
         let entity_key = keys::node_entity_key(node_id);
 
         let s = self.state.read().unwrap();
@@ -440,7 +472,7 @@ impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
             let partition_num = substate_tier.partition_key().partition_num;
             for summary in substate_tier.into_iter_substate_summaries_from(None) {
                 if let Some(value) = s.associations.get(&summary.state_tree_leaf_key) {
-                    results.push((partition_num, summary.sort_key, value.clone()));
+                    results.push((partition_num, summary.sort_key.0, value.clone()));
                 }
             }
         }
@@ -941,6 +973,38 @@ impl SubstateDatabase for SimSnapshot {
                 None
             }
         }))
+    }
+}
+
+impl SubstateReader for SimSnapshot {
+    fn get_raw_substate(
+        &self,
+        node_key: &[u8],
+        partition_num: u8,
+        sort_key: &[u8],
+    ) -> Option<Vec<u8>> {
+        let pk = DbPartitionKey {
+            node_key: node_key.to_vec(),
+            partition_num,
+        };
+        self.get_raw_substate_by_db_key(&pk, &DbSortKey(sort_key.to_vec()))
+    }
+
+    fn list_raw_substates(
+        &self,
+        node_key: &[u8],
+        partition_num: u8,
+        from_sort_key: Option<&[u8]>,
+    ) -> Box<dyn Iterator<Item = (Vec<u8>, Vec<u8>)> + '_> {
+        let pk = DbPartitionKey {
+            node_key: node_key.to_vec(),
+            partition_num,
+        };
+        let from = from_sort_key.map(|k| DbSortKey(k.to_vec()));
+        Box::new(
+            self.list_raw_values_from_db_key(&pk, from.as_ref())
+                .map(|(k, v)| (k.0, v)),
+        )
     }
 }
 

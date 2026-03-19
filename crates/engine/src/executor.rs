@@ -29,6 +29,7 @@
 //! Block commit applies DatabaseUpdates from execution cache
 //! ```
 
+use crate::adapter::RadixStorageAdapter;
 use crate::error::ExecutionError;
 use crate::execution::{
     build_ledger_receipt, build_local_execution, extract_database_updates, is_committed,
@@ -78,13 +79,12 @@ pub fn fetch_state_entries<S: SubstateStore>(
 
         for (partition_num, db_sort_key, value) in substates {
             // Build full storage key
-            let mut storage_key = Vec::with_capacity(
-                RADIX_PREFIX.len() + db_node_key.len() + 1 + db_sort_key.0.len(),
-            );
+            let mut storage_key =
+                Vec::with_capacity(RADIX_PREFIX.len() + db_node_key.len() + 1 + db_sort_key.len());
             storage_key.extend_from_slice(RADIX_PREFIX);
             storage_key.extend_from_slice(&db_node_key);
             storage_key.push(partition_num);
-            storage_key.extend_from_slice(&db_sort_key.0);
+            storage_key.extend_from_slice(&db_sort_key);
 
             entries.push(StateEntry::new(storage_key, Some(value)));
         }
@@ -286,6 +286,7 @@ impl RadixExecutor {
     ) -> Result<SingleTxResult, ExecutionError> {
         // Take a snapshot for isolated execution
         let snapshot = storage.snapshot();
+        let db = RadixStorageAdapter(&snapshot);
 
         // Get or create validated transaction (cached on RoutableTransaction)
         // This avoids re-validating signatures if already validated at RPC submission
@@ -296,7 +297,7 @@ impl RadixExecutor {
 
         // Use cached vm_modules and exec_config
         let receipt = execute_transaction(
-            &snapshot,
+            &db,
             &self.caches.vm_modules,
             &self.caches.exec_config,
             &executable,

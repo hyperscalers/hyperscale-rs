@@ -36,6 +36,7 @@ mod jmt_snapshot;
 pub mod keys;
 mod overlay;
 pub mod proofs;
+mod reader;
 mod store;
 mod writes;
 
@@ -47,7 +48,8 @@ pub use consensus::ConsensusStore;
 pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
 pub use jmt_snapshot::{JmtSnapshot, LeafSubstateKeyAssociation};
 pub use overlay::{SubstateDbLookup, SubstateLookup};
-pub use store::{SubstateStore, RADIX_PREFIX};
+pub use reader::SubstateReader;
+pub use store::{RawSubstateEntry, SubstateStore, RADIX_PREFIX};
 pub use writes::{
     extract_state_changes, filter_updates_to_shard, merge_database_updates,
     merge_database_updates_from_arcs, merge_into, receipt_to_database_updates,
