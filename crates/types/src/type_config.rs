@@ -9,7 +9,10 @@ use std::sync::Arc;
 
 use hyperscale_codec::prelude::{BasicDecode, BasicEncode};
 
-use crate::{Hash, NodeId, ShardGroupId};
+use crate::{
+    DatabaseUpdates, Hash, LedgerTransactionOutcome, LedgerTransactionReceipt, NodeId,
+    RoutableTransaction, ShardGroupId,
+};
 
 /// Core trait that parameterizes the consensus framework over
 /// application-specific types.
@@ -75,4 +78,60 @@ pub trait TypeConfig: Send + Sync + 'static {
         update: &Self::StateUpdate,
         declared_writes: &[NodeId],
     ) -> Self::StateUpdate;
+}
+
+/// Internal concrete config used as the default type parameter during migration.
+///
+/// This allows `Block`, `ReceiptBundle`, etc. to be used without angle brackets
+/// while downstream consumers are incrementally parameterized. It binds the
+/// same concrete types that were previously hardcoded.
+///
+/// **Not for external use.** Use `RadixConfig` from `hyperscale-radix-config`
+/// for production code.
+#[derive(Debug, Clone)]
+pub struct ConcreteConfig;
+
+impl TypeConfig for ConcreteConfig {
+    type Transaction = RoutableTransaction;
+    type ExecutionReceipt = LedgerTransactionReceipt;
+    type StateUpdate = DatabaseUpdates;
+
+    fn transaction_hash(tx: &RoutableTransaction) -> Hash {
+        tx.hash()
+    }
+
+    fn transaction_reads(tx: &RoutableTransaction) -> Vec<NodeId> {
+        tx.declared_reads.clone()
+    }
+
+    fn transaction_writes(tx: &RoutableTransaction) -> Vec<NodeId> {
+        tx.declared_writes.clone()
+    }
+
+    fn receipt_hash(receipt: &LedgerTransactionReceipt) -> Hash {
+        receipt.consensus_receipt().receipt_hash()
+    }
+
+    fn receipt_success(receipt: &LedgerTransactionReceipt) -> bool {
+        receipt.outcome == LedgerTransactionOutcome::Success
+    }
+
+    fn merge_state_updates(_updates: &[DatabaseUpdates]) -> DatabaseUpdates {
+        unimplemented!("ConcreteConfig::merge_state_updates — use RadixConfig")
+    }
+
+    fn filter_state_update_to_shard(
+        _update: &DatabaseUpdates,
+        _local_shard: ShardGroupId,
+        _num_shards: u64,
+    ) -> DatabaseUpdates {
+        unimplemented!("ConcreteConfig::filter_state_update_to_shard — use RadixConfig")
+    }
+
+    fn filter_state_update_to_writes(
+        _update: &DatabaseUpdates,
+        _declared_writes: &[NodeId],
+    ) -> DatabaseUpdates {
+        unimplemented!("ConcreteConfig::filter_state_update_to_writes — use RadixConfig")
+    }
 }

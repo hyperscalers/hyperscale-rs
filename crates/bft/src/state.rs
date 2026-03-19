@@ -1031,7 +1031,7 @@ impl BftState {
             provision_targets: vec![],    // Empty - fallback blocks have no transactions
         };
 
-        let block = Block {
+        let block: Block = Block {
             header: header.clone(),
             retry_transactions: vec![], // Empty - fallback blocks have no transactions
             priority_transactions: vec![], // Empty
@@ -1155,7 +1155,7 @@ impl BftState {
             provision_targets: vec![],    // Empty - sync blocks have no transactions
         };
 
-        let block = Block {
+        let block: Block = Block {
             header: header.clone(),
             retry_transactions: vec![],
             priority_transactions: vec![],

@@ -8,9 +8,9 @@ use hyperscale_storage::{CommitStore, DatabaseUpdates, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_receipt_root, compute_transaction_root,
     verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
-    Bls12381G2Signature, CommitmentProof, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, SignerBitfield, TransactionAbort, TransactionCertificate, TransactionDefer,
-    ValidatorId, VotePower,
+    Bls12381G2Signature, CommitmentProof, ConcreteConfig, Hash, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, SignerBitfield, TransactionAbort, TransactionCertificate,
+    TransactionDefer, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -229,8 +229,11 @@ pub fn verify_transaction_root(
     priority_transactions: &[Arc<RoutableTransaction>],
     transactions: &[Arc<RoutableTransaction>],
 ) -> bool {
-    let computed_root =
-        compute_transaction_root(retry_transactions, priority_transactions, transactions);
+    let computed_root = compute_transaction_root::<ConcreteConfig>(
+        retry_transactions,
+        priority_transactions,
+        transactions,
+    );
     let valid = computed_root == expected_root;
 
     if !valid {
@@ -373,8 +376,11 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     };
 
     // Compute transaction root from all transaction sections
-    let transaction_root =
-        compute_transaction_root(&retry_transactions, &priority_transactions, &transactions);
+    let transaction_root = compute_transaction_root::<ConcreteConfig>(
+        &retry_transactions,
+        &priority_transactions,
+        &transactions,
+    );
 
     // Compute receipt root from certificate receipt hashes
     let receipt_root = compute_receipt_root(&certs_to_include);

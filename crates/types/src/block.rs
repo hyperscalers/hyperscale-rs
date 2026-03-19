@@ -1,8 +1,8 @@
 //! Block and BlockHeader types for consensus.
 
 use crate::{
-    compute_merkle_root, BlockHeight, CommitmentProof, Hash, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, TransactionAbort, TransactionCertificate, TransactionDefer,
+    compute_merkle_root, BlockHeight, CommitmentProof, ConcreteConfig, Hash, QuorumCertificate,
+    ShardGroupId, TransactionAbort, TransactionCertificate, TransactionDefer, TypeConfig,
     ValidatorId,
 };
 use hyperscale_codec as sbor;
@@ -39,10 +39,10 @@ pub fn compute_receipt_root(certificates: &[Arc<TransactionCertificate>]) -> Has
 ///
 /// The root is computed over the concatenation of all tagged hashes in order.
 /// Returns `Hash::ZERO` if all sections are empty.
-pub fn compute_transaction_root(
-    retry_transactions: &[Arc<RoutableTransaction>],
-    priority_transactions: &[Arc<RoutableTransaction>],
-    transactions: &[Arc<RoutableTransaction>],
+pub fn compute_transaction_root<C: TypeConfig>(
+    retry_transactions: &[Arc<C::Transaction>],
+    priority_transactions: &[Arc<C::Transaction>],
+    transactions: &[Arc<C::Transaction>],
 ) -> Hash {
     let total_count = retry_transactions.len() + priority_transactions.len() + transactions.len();
 
@@ -54,17 +54,26 @@ pub fn compute_transaction_root(
 
     // Add retry transaction leaves
     for tx in retry_transactions {
-        leaves.push(Hash::from_parts(&[RETRY_TAG, tx.hash().as_bytes()]));
+        leaves.push(Hash::from_parts(&[
+            RETRY_TAG,
+            C::transaction_hash(tx).as_bytes(),
+        ]));
     }
 
     // Add priority transaction leaves
     for tx in priority_transactions {
-        leaves.push(Hash::from_parts(&[PRIORITY_TAG, tx.hash().as_bytes()]));
+        leaves.push(Hash::from_parts(&[
+            PRIORITY_TAG,
+            C::transaction_hash(tx).as_bytes(),
+        ]));
     }
 
     // Add normal transaction leaves
     for tx in transactions {
-        leaves.push(Hash::from_parts(&[NORMAL_TAG, tx.hash().as_bytes()]));
+        leaves.push(Hash::from_parts(&[
+            NORMAL_TAG,
+            C::transaction_hash(tx).as_bytes(),
+        ]));
     }
 
     compute_merkle_root(&leaves)
@@ -199,8 +208,7 @@ impl BlockHeader {
 /// Transactions and certificates are stored as `Arc` for efficient cloning
 /// and sharing across the system. When serialized (for storage or network),
 /// the underlying data is written directly.
-#[derive(Debug, Clone)]
-pub struct Block {
+pub struct Block<C: TypeConfig = ConcreteConfig> {
     /// Block header with consensus metadata.
     pub header: BlockHeader,
 
@@ -209,18 +217,18 @@ pub struct Block {
     /// These are transactions that were previously deferred due to cross-shard
     /// cycles and are being retried. They bypass backpressure limits because
     /// completing them is critical for liveness.
-    pub retry_transactions: Vec<Arc<RoutableTransaction>>,
+    pub retry_transactions: Vec<Arc<C::Transaction>>,
 
     /// Priority transactions (cross-shard with commitment proofs).
     ///
     /// These are cross-shard transactions where other shards have already
     /// committed and are waiting for us. They bypass soft backpressure limits.
-    pub priority_transactions: Vec<Arc<RoutableTransaction>>,
+    pub priority_transactions: Vec<Arc<C::Transaction>>,
 
     /// Other transactions (normal priority).
     ///
     /// Fresh transactions with no special priority. Subject to backpressure limits.
-    pub transactions: Vec<Arc<RoutableTransaction>>,
+    pub transactions: Vec<Arc<C::Transaction>>,
 
     /// Transaction certificates for finalized transactions.
     pub certificates: Vec<Arc<TransactionCertificate>>,
@@ -246,17 +254,53 @@ pub struct Block {
     pub commitment_proofs: HashMap<Hash, CommitmentProof>,
 }
 
+impl<C: TypeConfig> std::fmt::Debug for Block<C> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Block")
+            .field("header", &self.header)
+            .field("retry_transactions", &self.retry_transactions.len())
+            .field("priority_transactions", &self.priority_transactions.len())
+            .field("transactions", &self.transactions.len())
+            .field("certificates", &self.certificates.len())
+            .field("deferred", &self.deferred)
+            .field("aborted", &self.aborted)
+            .field("commitment_proofs", &self.commitment_proofs.len())
+            .finish()
+    }
+}
+
+impl<C: TypeConfig> Clone for Block<C> {
+    fn clone(&self) -> Self {
+        Self {
+            header: self.header.clone(),
+            retry_transactions: self.retry_transactions.clone(),
+            priority_transactions: self.priority_transactions.clone(),
+            transactions: self.transactions.clone(),
+            certificates: self.certificates.clone(),
+            deferred: self.deferred.clone(),
+            aborted: self.aborted.clone(),
+            commitment_proofs: self.commitment_proofs.clone(),
+        }
+    }
+}
+
 // Manual PartialEq - compare transaction/certificate content, not Arc pointers
-impl PartialEq for Block {
+impl<C: TypeConfig> PartialEq for Block<C> {
     fn eq(&self, other: &Self) -> bool {
-        fn tx_lists_equal(a: &[Arc<RoutableTransaction>], b: &[Arc<RoutableTransaction>]) -> bool {
-            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.hash() == y.hash())
+        fn tx_lists_equal<C: TypeConfig>(
+            a: &[Arc<C::Transaction>],
+            b: &[Arc<C::Transaction>],
+        ) -> bool {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| C::transaction_hash(x) == C::transaction_hash(y))
         }
 
         self.header == other.header
-            && tx_lists_equal(&self.retry_transactions, &other.retry_transactions)
-            && tx_lists_equal(&self.priority_transactions, &other.priority_transactions)
-            && tx_lists_equal(&self.transactions, &other.transactions)
+            && tx_lists_equal::<C>(&self.retry_transactions, &other.retry_transactions)
+            && tx_lists_equal::<C>(&self.priority_transactions, &other.priority_transactions)
+            && tx_lists_equal::<C>(&self.transactions, &other.transactions)
             && self.certificates.len() == other.certificates.len()
             && self
                 .certificates
@@ -269,17 +313,20 @@ impl PartialEq for Block {
     }
 }
 
-impl Eq for Block {}
+impl<C: TypeConfig> Eq for Block<C> {}
 
 // ============================================================================
 // Manual SBOR implementation (since Arc doesn't derive BasicSbor)
 // We serialize/deserialize the inner RoutableTransaction directly.
 // ============================================================================
 
-/// Helper to encode a Vec<Arc<RoutableTransaction>> as an SBOR array.
-fn encode_tx_vec<E: sbor::Encoder<sbor::NoCustomValueKind>>(
+/// Helper to encode a Vec<Arc<T>> as an SBOR array.
+fn encode_tx_vec<
+    T: sbor::Encode<sbor::NoCustomValueKind, E>,
+    E: sbor::Encoder<sbor::NoCustomValueKind>,
+>(
     encoder: &mut E,
-    txs: &[Arc<RoutableTransaction>],
+    txs: &[Arc<T>],
 ) -> Result<(), sbor::EncodeError> {
     encoder.write_value_kind(sbor::ValueKind::Array)?;
     encoder.write_value_kind(sbor::ValueKind::Tuple)?;
@@ -290,7 +337,11 @@ fn encode_tx_vec<E: sbor::Encoder<sbor::NoCustomValueKind>>(
     Ok(())
 }
 
-impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E> for Block {
+impl<C: TypeConfig, E: sbor::Encoder<sbor::NoCustomValueKind>>
+    sbor::Encode<sbor::NoCustomValueKind, E> for Block<C>
+where
+    C::Transaction: sbor::Encode<sbor::NoCustomValueKind, E>,
+{
     fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
         encoder.write_value_kind(sbor::ValueKind::Tuple)
     }
@@ -338,10 +389,13 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
 /// proof maps.
 const MAX_SBOR_COLLECTION_SIZE: usize = 10_000;
 
-/// Helper to decode a Vec<Arc<RoutableTransaction>> from an SBOR array.
-fn decode_tx_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
+/// Helper to decode a Vec<Arc<T>> from an SBOR array.
+fn decode_tx_vec<
+    T: sbor::Decode<sbor::NoCustomValueKind, D>,
+    D: sbor::Decoder<sbor::NoCustomValueKind>,
+>(
     decoder: &mut D,
-) -> Result<Vec<Arc<RoutableTransaction>>, sbor::DecodeError> {
+) -> Result<Vec<Arc<T>>, sbor::DecodeError> {
     decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
     decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
     let count = decoder.read_size()?;
@@ -353,14 +407,17 @@ fn decode_tx_vec<D: sbor::Decoder<sbor::NoCustomValueKind>>(
     }
     let mut txs = Vec::with_capacity(count);
     for _ in 0..count {
-        let tx: RoutableTransaction =
-            decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
+        let tx: T = decoder.decode_deeper_body_with_value_kind(sbor::ValueKind::Tuple)?;
         txs.push(Arc::new(tx));
     }
     Ok(txs)
 }
 
-impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D> for Block {
+impl<C: TypeConfig, D: sbor::Decoder<sbor::NoCustomValueKind>>
+    sbor::Decode<sbor::NoCustomValueKind, D> for Block<C>
+where
+    C::Transaction: sbor::Decode<sbor::NoCustomValueKind, D>,
+{
     fn decode_body_with_value_kind(
         decoder: &mut D,
         value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
@@ -378,9 +435,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let header: BlockHeader = decoder.decode()?;
 
         // Transaction sections
-        let retry_transactions = decode_tx_vec(decoder)?;
-        let priority_transactions = decode_tx_vec(decoder)?;
-        let transactions = decode_tx_vec(decoder)?;
+        let retry_transactions = decode_tx_vec::<C::Transaction, D>(decoder)?;
+        let priority_transactions = decode_tx_vec::<C::Transaction, D>(decoder)?;
+        let transactions = decode_tx_vec::<C::Transaction, D>(decoder)?;
 
         // Certificates (manual decoding to wrap in Arc)
         decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
@@ -432,13 +489,13 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
     }
 }
 
-impl sbor::Categorize<sbor::NoCustomValueKind> for Block {
+impl<C: TypeConfig> sbor::Categorize<sbor::NoCustomValueKind> for Block<C> {
     fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
         sbor::ValueKind::Tuple
     }
 }
 
-impl sbor::Describe<sbor::NoCustomTypeKind> for Block {
+impl<C: TypeConfig> sbor::Describe<sbor::NoCustomTypeKind> for Block<C> {
     const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("Block", &[], &[]);
 
     fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
@@ -446,7 +503,7 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for Block {
     }
 }
 
-impl Block {
+impl<C: TypeConfig> Block<C> {
     /// Create an empty genesis block with the given proposer and JMT state.
     pub fn genesis(shard_group_id: ShardGroupId, proposer: ValidatorId, state_root: Hash) -> Self {
         Self {
@@ -477,7 +534,7 @@ impl Block {
     }
 
     /// Iterate all transactions in priority order (retries, priority, others).
-    pub fn all_transactions(&self) -> impl Iterator<Item = &Arc<RoutableTransaction>> {
+    pub fn all_transactions(&self) -> impl Iterator<Item = &Arc<C::Transaction>> {
         self.retry_transactions
             .iter()
             .chain(self.priority_transactions.iter())
@@ -486,30 +543,39 @@ impl Block {
 
     /// Check if this block contains a specific transaction by hash.
     pub fn contains_transaction(&self, tx_hash: &Hash) -> bool {
-        self.all_transactions().any(|tx| tx.hash() == *tx_hash)
+        self.all_transactions()
+            .any(|tx| C::transaction_hash(tx) == *tx_hash)
     }
 
     /// Get all transaction hashes in priority order.
     pub fn all_transaction_hashes(&self) -> Vec<Hash> {
-        self.all_transactions().map(|tx| tx.hash()).collect()
+        self.all_transactions()
+            .map(|tx| C::transaction_hash(tx))
+            .collect()
     }
 
     /// Get retry transaction hashes.
     pub fn retry_hashes(&self) -> Vec<Hash> {
-        self.retry_transactions.iter().map(|tx| tx.hash()).collect()
+        self.retry_transactions
+            .iter()
+            .map(|tx| C::transaction_hash(tx))
+            .collect()
     }
 
     /// Get priority transaction hashes.
     pub fn priority_hashes(&self) -> Vec<Hash> {
         self.priority_transactions
             .iter()
-            .map(|tx| tx.hash())
+            .map(|tx| C::transaction_hash(tx))
             .collect()
     }
 
     /// Get other transaction hashes.
     pub fn transaction_hashes(&self) -> Vec<Hash> {
-        self.transactions.iter().map(|tx| tx.hash()).collect()
+        self.transactions
+            .iter()
+            .map(|tx| C::transaction_hash(tx))
+            .collect()
     }
 
     /// Check if this is the genesis block.
@@ -632,19 +698,23 @@ impl BlockManifest {
     }
 
     /// Build a manifest from a full block (extracting hashes).
-    pub fn from_block(block: &Block) -> Self {
+    pub fn from_block<C: TypeConfig>(block: &Block<C>) -> Self {
         Self {
             retry_hashes: block
                 .retry_transactions
                 .iter()
-                .map(|tx| tx.hash())
+                .map(|tx| C::transaction_hash(tx))
                 .collect(),
             priority_hashes: block
                 .priority_transactions
                 .iter()
-                .map(|tx| tx.hash())
+                .map(|tx| C::transaction_hash(tx))
                 .collect(),
-            tx_hashes: block.transactions.iter().map(|tx| tx.hash()).collect(),
+            tx_hashes: block
+                .transactions
+                .iter()
+                .map(|tx| C::transaction_hash(tx))
+                .collect(),
             cert_hashes: block
                 .certificates
                 .iter()
@@ -689,7 +759,7 @@ pub struct BlockMetadata {
 
 impl BlockMetadata {
     /// Create metadata from a full block and QC.
-    pub fn from_block(block: &Block, qc: QuorumCertificate) -> Self {
+    pub fn from_block<C: TypeConfig>(block: &Block<C>, qc: QuorumCertificate) -> Self {
         Self {
             header: block.header.clone(),
             manifest: BlockManifest::from_block(block),
@@ -762,6 +832,7 @@ impl CommittedBlockHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RoutableTransaction;
 
     #[test]
     fn test_block_header_hash_deterministic() {
@@ -787,7 +858,7 @@ mod tests {
 
     #[test]
     fn test_genesis_block() {
-        let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
+        let genesis: Block = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
 
         assert!(genesis.is_genesis());
         assert_eq!(genesis.height(), BlockHeight(0));
@@ -798,7 +869,7 @@ mod tests {
 
     #[test]
     fn test_compute_transaction_root_empty() {
-        let root = compute_transaction_root(&[], &[], &[]);
+        let root = compute_transaction_root::<ConcreteConfig>(&[], &[], &[]);
         assert_eq!(root, Hash::ZERO);
     }
 
@@ -814,8 +885,8 @@ mod tests {
         let notarized = crate::sign_and_notarize(manifest, &network, 1, &key).unwrap();
         let tx = Arc::new(RoutableTransaction::try_from(notarized).unwrap());
 
-        let root1 = compute_transaction_root(&[], &[], std::slice::from_ref(&tx));
-        let root2 = compute_transaction_root(&[], &[], std::slice::from_ref(&tx));
+        let root1 = compute_transaction_root::<ConcreteConfig>(&[], &[], std::slice::from_ref(&tx));
+        let root2 = compute_transaction_root::<ConcreteConfig>(&[], &[], std::slice::from_ref(&tx));
         assert_eq!(root1, root2);
         assert_ne!(root1, Hash::ZERO);
     }
@@ -833,9 +904,12 @@ mod tests {
         let tx = Arc::new(RoutableTransaction::try_from(notarized).unwrap());
 
         // Same tx in different slots should produce different roots
-        let root_retry = compute_transaction_root(std::slice::from_ref(&tx), &[], &[]);
-        let root_priority = compute_transaction_root(&[], std::slice::from_ref(&tx), &[]);
-        let root_normal = compute_transaction_root(&[], &[], std::slice::from_ref(&tx));
+        let root_retry =
+            compute_transaction_root::<ConcreteConfig>(std::slice::from_ref(&tx), &[], &[]);
+        let root_priority =
+            compute_transaction_root::<ConcreteConfig>(&[], std::slice::from_ref(&tx), &[]);
+        let root_normal =
+            compute_transaction_root::<ConcreteConfig>(&[], &[], std::slice::from_ref(&tx));
 
         assert_ne!(root_retry, root_priority);
         assert_ne!(root_priority, root_normal);
@@ -920,7 +994,7 @@ mod tests {
 
     #[test]
     fn test_genesis_receipt_root_is_zero() {
-        let genesis = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
+        let genesis: Block = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
         assert_eq!(genesis.header.receipt_root, Hash::ZERO);
     }
 }

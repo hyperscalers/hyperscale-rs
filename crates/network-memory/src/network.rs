@@ -1620,7 +1620,7 @@ mod tests {
         let adapter0 = network.create_adapter(0);
 
         // Node 0 broadcasts a transaction via its adapter
-        let gossip = TransactionGossip::new(test_transaction_with_nodes(
+        let gossip: TransactionGossip = TransactionGossip::new(test_transaction_with_nodes(
             &[1, 2, 3],
             vec![test_node(1)],
             vec![test_node(2)],

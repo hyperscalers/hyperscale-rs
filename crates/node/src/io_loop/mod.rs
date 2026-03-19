@@ -512,7 +512,7 @@ where
                     .map(|node_id| hyperscale_types::shard_for_node(node_id, self.num_shards))
                     .collect();
                 for shard in shards {
-                    let gossip = TransactionGossip::from_arc(Arc::clone(&tx));
+                    let gossip: TransactionGossip = TransactionGossip::from_arc(Arc::clone(&tx));
                     self.network.broadcast_to_shard(shard, &gossip);
                 }
 

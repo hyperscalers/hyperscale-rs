@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use hyperscale_codec as sbor;
 
-use crate::{compute_merkle_root, DatabaseUpdates, Hash, NodeId, PartitionNumber};
+use crate::{compute_merkle_root, ConcreteConfig, Hash, NodeId, PartitionNumber, TypeConfig};
 
 // ─── Outcome ─────────────────────────────────────────────────────────────────
 
@@ -219,9 +219,9 @@ pub struct LedgerReceiptEntry {
 /// `local_execution` and `database_updates` are `None` when the receipt was
 /// fetched from a peer (sync/catch-up).
 #[derive(Debug, Clone)]
-pub struct ReceiptBundle {
+pub struct ReceiptBundle<C: TypeConfig = ConcreteConfig> {
     pub tx_hash: Hash,
-    pub ledger_receipt: Arc<LedgerTransactionReceipt>,
+    pub ledger_receipt: Arc<C::ExecutionReceipt>,
     /// Only populated when this node executed the transaction locally.
     pub local_execution: Option<LocalTransactionExecution>,
     /// Deferred `DatabaseUpdates` for lazy `state_changes` computation.
@@ -229,12 +229,15 @@ pub struct ReceiptBundle {
     /// `Some` for locally-executed transactions (state_changes computed at storage time).
     /// `None` for synced/fetched receipts (state_changes already populated by remote peer).
     /// Transient — not serialized (SBOR impl excludes this field).
-    pub database_updates: Option<Arc<DatabaseUpdates>>,
+    pub database_updates: Option<Arc<C::StateUpdate>>,
 }
 
 // Manual PartialEq: compares Arc contents (not pointer identity) and
 // intentionally excludes `database_updates` (transient, not serialized).
-impl PartialEq for ReceiptBundle {
+impl<C: TypeConfig> PartialEq for ReceiptBundle<C>
+where
+    C::ExecutionReceipt: PartialEq,
+{
     fn eq(&self, other: &Self) -> bool {
         self.tx_hash == other.tx_hash
             && *self.ledger_receipt == *other.ledger_receipt
@@ -242,11 +245,13 @@ impl PartialEq for ReceiptBundle {
     }
 }
 
-impl Eq for ReceiptBundle {}
+impl<C: TypeConfig> Eq for ReceiptBundle<C> where C::ExecutionReceipt: PartialEq {}
 
 // Manual SBOR implementation (Arc doesn't derive BasicSbor)
-impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
-    for ReceiptBundle
+impl<C: TypeConfig, E: sbor::Encoder<sbor::NoCustomValueKind>>
+    sbor::Encode<sbor::NoCustomValueKind, E> for ReceiptBundle<C>
+where
+    C::ExecutionReceipt: sbor::Encode<sbor::NoCustomValueKind, E>,
 {
     fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
         encoder.write_value_kind(sbor::ValueKind::Tuple)
@@ -261,8 +266,10 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 }
 
-impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
-    for ReceiptBundle
+impl<C: TypeConfig, D: sbor::Decoder<sbor::NoCustomValueKind>>
+    sbor::Decode<sbor::NoCustomValueKind, D> for ReceiptBundle<C>
+where
+    C::ExecutionReceipt: sbor::Decode<sbor::NoCustomValueKind, D>,
 {
     fn decode_body_with_value_kind(
         decoder: &mut D,
@@ -279,7 +286,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         }
 
         let tx_hash: Hash = decoder.decode()?;
-        let ledger_receipt: LedgerTransactionReceipt = decoder.decode()?;
+        let ledger_receipt: C::ExecutionReceipt = decoder.decode()?;
         let local_execution: Option<LocalTransactionExecution> = decoder.decode()?;
 
         Ok(Self {
@@ -291,13 +298,13 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
     }
 }
 
-impl sbor::Categorize<sbor::NoCustomValueKind> for ReceiptBundle {
+impl<C: TypeConfig> sbor::Categorize<sbor::NoCustomValueKind> for ReceiptBundle<C> {
     fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
         sbor::ValueKind::Tuple
     }
 }
 
-impl sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle {
+impl<C: TypeConfig> sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle<C> {
     const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("ReceiptBundle", &[], &[]);
 
     fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
@@ -318,16 +325,16 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle {
 /// 1. Populate the ExecutionCache (in-memory, for block commit fast path)
 /// 2. Dispatch receipt storage to disk (via StoreReceiptBundles action)
 #[derive(Debug, Clone)]
-pub struct ExecutionResult {
+pub struct ExecutionResult<C: TypeConfig = ConcreteConfig> {
     /// Hash of the executed transaction.
     pub tx_hash: Hash,
     /// Pre-computed consensus receipt hash (outcome + event_root).
     /// Computed on the execution thread pool to avoid recomputation on the state machine.
     pub receipt_hash: Hash,
     /// Raw DatabaseUpdates for the execution cache.
-    pub database_updates: DatabaseUpdates,
+    pub database_updates: C::StateUpdate,
     /// Full ledger receipt with all state changes.
-    pub ledger_receipt: LedgerTransactionReceipt,
+    pub ledger_receipt: C::ExecutionReceipt,
     /// Local execution metadata (fees, logs, errors).
     pub local_execution: LocalTransactionExecution,
 }
@@ -455,7 +462,7 @@ mod tests {
         });
 
         // Bundle without local execution (synced from peer)
-        let synced = ReceiptBundle {
+        let synced: ReceiptBundle = ReceiptBundle {
             tx_hash: Hash::from_bytes(b"synced_tx"),
             ledger_receipt: Arc::clone(&receipt),
             local_execution: None,
@@ -464,7 +471,7 @@ mod tests {
         assert!(synced.local_execution.is_none());
 
         // Bundle with local execution (executed locally)
-        let local = ReceiptBundle {
+        let local: ReceiptBundle = ReceiptBundle {
             tx_hash: Hash::from_bytes(b"local_tx"),
             ledger_receipt: receipt,
             local_execution: Some(LocalTransactionExecution::failure(Some(
