@@ -4,7 +4,7 @@
 //! synced block QC verifications. BftState owns this as a field and
 //! delegates sync-specific bookkeeping here.
 
-use hyperscale_types::{Block, Hash, QuorumCertificate};
+use hyperscale_types::{Block, ConcreteConfig, Hash, QuorumCertificate, TypeConfig};
 use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, info, warn};
 
@@ -13,9 +13,9 @@ use tracing::{debug, info, warn};
 /// When we receive a synced block, we must verify its QC signature before
 /// applying it to our state.
 #[derive(Debug, Clone)]
-pub(crate) struct PendingSyncedBlockVerification {
+pub(crate) struct PendingSyncedBlockVerification<C: TypeConfig = ConcreteConfig> {
     /// The synced block awaiting QC verification.
-    pub block: Block,
+    pub block: Block<C>,
     /// The QC that certifies this block.
     pub qc: QuorumCertificate,
     /// Whether the QC signature has been verified.
@@ -27,17 +27,17 @@ pub(crate) struct PendingSyncedBlockVerification {
 /// BftState owns this as a field and delegates sync-specific bookkeeping
 /// to it. Core protocol state changes (committed_height, latest_qc) remain
 /// on BftState.
-pub(crate) struct SyncManager {
+pub(crate) struct SyncManager<C: TypeConfig = ConcreteConfig> {
     /// Whether we are currently syncing (catching up to the network).
     syncing: bool,
 
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
     /// Maps height -> (Block, QC).
-    buffered_synced_blocks: BTreeMap<u64, (Block, QuorumCertificate)>,
+    buffered_synced_blocks: BTreeMap<u64, (Block<C>, QuorumCertificate)>,
 
     /// Synced blocks pending QC signature verification.
     /// Maps block_hash -> pending synced block info.
-    pending_synced_block_verifications: HashMap<Hash, PendingSyncedBlockVerification>,
+    pending_synced_block_verifications: HashMap<Hash, PendingSyncedBlockVerification<C>>,
 }
 
 impl SyncManager {

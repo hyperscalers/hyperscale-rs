@@ -10,7 +10,7 @@ use hyperscale_types::{
     verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CommitmentProof, ConcreteConfig, Hash, QuorumCertificate,
     RoutableTransaction, ShardGroupId, SignerBitfield, TransactionAbort, TransactionCertificate,
-    TransactionDefer, ValidatorId, VotePower,
+    TransactionDefer, TypeConfig, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -311,8 +311,8 @@ pub fn verify_state_root<S: CommitStore>(
 }
 
 /// Result of building a proposal block.
-pub struct ProposalResult<P: Send> {
-    pub block: Block,
+pub struct ProposalResult<P: Send, C: TypeConfig = ConcreteConfig> {
+    pub block: Block<C>,
     pub block_hash: Hash,
     pub prepared_commit: Option<P>,
 }

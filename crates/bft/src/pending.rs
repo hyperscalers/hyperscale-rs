@@ -3,7 +3,8 @@
 //! Tracks blocks being assembled from headers + gossiped transactions.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockManifest, Hash, RoutableTransaction, TransactionCertificate,
+    Block, BlockHeader, BlockManifest, ConcreteConfig, Hash, RoutableTransaction,
+    TransactionCertificate, TypeConfig,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -26,15 +27,15 @@ use std::sync::Arc;
 /// - **Priority**: Cross-shard transactions with commitment proofs
 /// - **Other**: Fresh transactions with no special priority
 #[derive(Debug, Clone)]
-pub struct PendingBlock {
+pub struct PendingBlock<C: TypeConfig = ConcreteConfig> {
     /// Block header (received first).
     header: BlockHeader,
 
     /// Block contents manifest (transaction hashes, certificates, deferrals, etc.)
     manifest: BlockManifest,
 
-    /// Map of transaction hash -> Arc<RoutableTransaction> (for received transactions).
-    received_transactions: HashMap<Hash, Arc<RoutableTransaction>>,
+    /// Map of transaction hash -> Arc<Transaction> (for received transactions).
+    received_transactions: HashMap<Hash, Arc<C::Transaction>>,
 
     /// Set of transaction hashes we're still waiting for (HashSet for O(1) lookup).
     missing_transaction_hashes: HashSet<Hash>,
@@ -46,7 +47,7 @@ pub struct PendingBlock {
     missing_certificate_hashes: HashSet<Hash>,
 
     /// The fully constructed block (None until all transactions/certs received).
-    constructed_block: Option<Arc<Block>>,
+    constructed_block: Option<Arc<Block<C>>>,
 }
 
 impl PendingBlock {

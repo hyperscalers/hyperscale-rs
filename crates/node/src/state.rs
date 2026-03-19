@@ -9,9 +9,9 @@ use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommitmentProof,
-    CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate,
-    TransactionDefer,
+    CommittedBlockHeader, ConcreteConfig, Hash, QuorumCertificate, ReadyTransactions,
+    ReceiptBundle, RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionAbort,
+    TransactionCertificate, TransactionDefer, TypeConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ const SPECULATIVE_MAX_AGE: Duration = Duration::from_secs(30);
 ///
 /// Note: Sync is handled entirely by the runner (production: SyncManager, simulation: runner logic).
 /// The runner sends SyncBlockReadyToApply events directly to BFT when synced blocks are ready.
-pub struct NodeStateMachine {
+pub struct NodeStateMachine<C: TypeConfig = ConcreteConfig> {
     /// This node's index (simulation-only, for routing).
     node_index: NodeIndex,
 
@@ -76,6 +76,9 @@ pub struct NodeStateMachine {
 
     /// Current time.
     now: Duration,
+
+    /// Phantom data for the type config parameter.
+    _phantom: std::marker::PhantomData<C>,
 }
 
 impl std::fmt::Debug for NodeStateMachine {
@@ -171,6 +174,7 @@ impl NodeStateMachine {
             // Use recovered JMT root - critical for correct state root computation
             last_committed_jmt_root: jmt_root,
             now: Duration::ZERO,
+            _phantom: std::marker::PhantomData,
         }
     }
 

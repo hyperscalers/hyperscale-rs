@@ -10,15 +10,14 @@
 //! its thread (insert on execution completion, read on block commit, remove
 //! after commit).
 
-use hyperscale_storage::DatabaseUpdates;
-use hyperscale_types::Hash;
+use hyperscale_types::{ConcreteConfig, Hash, TypeConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Cached execution output for a single transaction.
-struct CachedExecution {
+struct CachedExecution<C: TypeConfig> {
     /// Raw write set from execution (Arc-wrapped for cheap clones across threads).
-    database_updates: Arc<DatabaseUpdates>,
+    database_updates: Arc<C::StateUpdate>,
     /// Hash of the ConsensusReceipt (outcome + event_root).
     /// Used for debug_assert cross-checks at block commit time.
     receipt_hash: Hash,
@@ -32,11 +31,11 @@ struct CachedExecution {
 ///
 /// This cache does NOT persist across restarts. After restart, the node
 /// syncs (fetches receipts from peers) to rebuild state.
-pub struct ExecutionCache {
-    entries: HashMap<Hash, CachedExecution>,
+pub struct ExecutionCache<C: TypeConfig = ConcreteConfig> {
+    entries: HashMap<Hash, CachedExecution<C>>,
 }
 
-impl ExecutionCache {
+impl<C: TypeConfig> ExecutionCache<C> {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
@@ -44,7 +43,7 @@ impl ExecutionCache {
     }
 
     /// Insert execution results.
-    pub fn insert(&mut self, tx_hash: Hash, updates: Arc<DatabaseUpdates>, receipt_hash: Hash) {
+    pub fn insert(&mut self, tx_hash: Hash, updates: Arc<C::StateUpdate>, receipt_hash: Hash) {
         self.entries.insert(
             tx_hash,
             CachedExecution {
@@ -55,7 +54,7 @@ impl ExecutionCache {
     }
 
     /// Look up cached writes for a transaction. Returns `None` if not cached.
-    pub fn get(&self, tx_hash: &Hash) -> Option<&Arc<DatabaseUpdates>> {
+    pub fn get(&self, tx_hash: &Hash) -> Option<&Arc<C::StateUpdate>> {
         self.entries.get(tx_hash).map(|e| &e.database_updates)
     }
 
@@ -65,7 +64,7 @@ impl ExecutionCache {
     }
 
     /// Remove an entry (called after block commit or transaction rejection).
-    pub fn remove(&mut self, tx_hash: &Hash) -> Option<Arc<DatabaseUpdates>> {
+    pub fn remove(&mut self, tx_hash: &Hash) -> Option<Arc<C::StateUpdate>> {
         self.entries.remove(tx_hash).map(|e| e.database_updates)
     }
 
@@ -101,7 +100,7 @@ impl ExecutionCache {
     }
 }
 
-impl Default for ExecutionCache {
+impl<C: TypeConfig> Default for ExecutionCache<C> {
     fn default() -> Self {
         Self::new()
     }
@@ -110,6 +109,7 @@ impl Default for ExecutionCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_storage::DatabaseUpdates;
 
     fn make_updates() -> Arc<DatabaseUpdates> {
         Arc::new(DatabaseUpdates::default())

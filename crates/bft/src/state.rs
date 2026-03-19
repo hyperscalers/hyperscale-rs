@@ -30,9 +30,10 @@ pub struct BftStats {
 pub type NodeIndex = u32;
 use hyperscale_types::{
     block_header_message, committed_block_header_message, Block, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommitmentProof, Hash,
-    QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot,
-    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
+    BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommitmentProof,
+    ConcreteConfig, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
+    TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer, TypeConfig,
+    ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -93,7 +94,7 @@ struct PendingProposal {
 /// 3. **Block Vote Received** → Collect votes, form QC when quorum reached
 /// 4. **QC Formed** → Update chain state, commit if ready (two-chain rule)
 /// 5. **View Change Timer** → Initiate view change if no progress
-pub struct BftState {
+pub struct BftState<C: TypeConfig = ConcreteConfig> {
     // ═══════════════════════════════════════════════════════════════════════════
     // Identity
     // ═══════════════════════════════════════════════════════════════════════════
@@ -129,13 +130,13 @@ pub struct BftState {
     latest_qc: Option<QuorumCertificate>,
 
     /// Genesis block (needed for bootstrapping).
-    genesis_block: Option<Block>,
+    genesis_block: Option<Block<C>>,
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Pending State
     // ═══════════════════════════════════════════════════════════════════════════
     /// Pending blocks being assembled (hash -> pending block).
-    pending_blocks: HashMap<Hash, PendingBlock>,
+    pending_blocks: HashMap<Hash, PendingBlock<C>>,
 
     /// Fetch timeout tracking for pending blocks.
     fetch: FetchCoordinator,
@@ -168,7 +169,7 @@ pub struct BftState {
 
     /// Blocks that have been certified (have QC) but not yet committed.
     /// Maps block_hash -> Block.
-    certified_blocks: HashMap<Hash, Block>,
+    certified_blocks: HashMap<Hash, Block<C>>,
 
     /// Async verification tracking (QC signatures, commitment proofs, state/tx roots).
     verification: VerificationPipeline,

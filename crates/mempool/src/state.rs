@@ -2,8 +2,8 @@
 
 use hyperscale_core::{Action, TransactionStatus};
 use hyperscale_types::{
-    AbortReason, Block, BlockHeight, DeferReason, Hash, NodeId, ReadyTransactions,
-    RoutableTransaction, TopologySnapshot, TransactionAbort, TransactionDecision,
+    AbortReason, Block, BlockHeight, ConcreteConfig, DeferReason, Hash, NodeId, ReadyTransactions,
+    RoutableTransaction, TopologySnapshot, TransactionAbort, TransactionDecision, TypeConfig,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -119,8 +119,8 @@ impl LockContentionStats {
 
 /// Entry in the transaction pool.
 #[derive(Debug)]
-struct PoolEntry {
-    tx: Arc<RoutableTransaction>,
+struct PoolEntry<C: TypeConfig = ConcreteConfig> {
+    tx: Arc<C::Transaction>,
     status: TransactionStatus,
     added_at: Duration,
     /// Whether this is a cross-shard transaction (cached at insertion time).
@@ -135,8 +135,8 @@ struct PoolEntry {
 /// Contains cached information needed for ready_transactions() to avoid
 /// re-computing properties on each call.
 #[derive(Debug, Clone)]
-struct ReadyEntry {
-    tx: Arc<RoutableTransaction>,
+struct ReadyEntry<C: TypeConfig = ConcreteConfig> {
+    tx: Arc<C::Transaction>,
     /// Whether this transaction has verified provisions (for cross-shard priority).
     has_provisions: bool,
 }
@@ -158,9 +158,9 @@ struct ReadyEntry {
 /// Transactions are added to these sets when they become ready (Pending status,
 /// no conflicts with locked nodes) and removed when they are no longer ready
 /// (status changes, conflicts arise, or evicted).
-pub struct MempoolState {
+pub struct MempoolState<C: TypeConfig = ConcreteConfig> {
     /// Transaction pool sorted by hash (BTreeMap for ordered iteration).
-    pool: BTreeMap<Hash, PoolEntry>,
+    pool: BTreeMap<Hash, PoolEntry<C>>,
 
     /// Deferred transactions waiting for their winner to complete.
     /// Maps: loser_tx_hash -> (loser_tx, winner_tx_hash, deferred_at_height)
@@ -168,7 +168,7 @@ pub struct MempoolState {
     /// When a deferral commits, the loser is added here with status Deferred.
     /// When the winner's certificate commits, we create a retry.
     /// The deferred_at_height enables cleanup of stale entries.
-    deferred_by: HashMap<Hash, (Arc<RoutableTransaction>, Hash, BlockHeight)>,
+    deferred_by: HashMap<Hash, (Arc<C::Transaction>, Hash, BlockHeight)>,
 
     /// Reverse index: winner_tx_hash -> Vec<loser_tx_hash>
     /// Allows O(1) lookup of all losers deferred by a winner.
@@ -203,7 +203,7 @@ pub struct MempoolState {
     /// Maps tx_hash -> (transaction, eviction_height).
     /// Transactions are moved here when evicted, then pruned after
     /// TRANSACTION_RETENTION_BLOCKS to allow slow peers to fetch them.
-    recently_evicted: HashMap<Hash, (Arc<RoutableTransaction>, BlockHeight)>,
+    recently_evicted: HashMap<Hash, (Arc<C::Transaction>, BlockHeight)>,
 
     /// Cached set of locked nodes (incrementally maintained).
     /// A node is locked if any transaction that declares it is in Committed or Executed status.
@@ -229,15 +229,15 @@ pub struct MempoolState {
     // 3. deferred_by_nodes contains Pending transactions deferred by locked nodes.
     /// Ready retry transactions (highest priority, bypass soft limit).
     /// BTreeMap maintains hash order for deterministic iteration.
-    ready_retries: BTreeMap<Hash, ReadyEntry>,
+    ready_retries: BTreeMap<Hash, ReadyEntry<C>>,
 
     /// Ready cross-shard transactions with verified provisions (high priority, bypass soft limit).
     /// BTreeMap maintains hash order for deterministic iteration.
-    ready_priority: BTreeMap<Hash, ReadyEntry>,
+    ready_priority: BTreeMap<Hash, ReadyEntry<C>>,
 
     /// Ready normal transactions (subject to soft limit).
     /// BTreeMap maintains hash order for deterministic iteration.
-    ready_others: BTreeMap<Hash, ReadyEntry>,
+    ready_others: BTreeMap<Hash, ReadyEntry<C>>,
 
     /// Pending transactions deferred by locked nodes.
     /// Maps tx_hash -> set of blocking node IDs.

@@ -41,9 +41,9 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
-    Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
-    ExecutionVote, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot,
-    TransactionCertificate, ValidatorId,
+    Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ConcreteConfig,
+    ExecutionCertificate, ExecutionVote, Hash, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, TopologySnapshot, TransactionCertificate, TypeConfig, ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -142,13 +142,13 @@ pub struct NodeStatusSnapshot {
 /// - `S`: Storage (CommitStore + SubstateStore + ConsensusStore)
 /// - `N`: Network (message sending)
 /// - `D`: Dispatch (thread pool work scheduling)
-pub struct IoLoop<S, N, D>
+pub struct IoLoop<S, N, D, C: TypeConfig = ConcreteConfig>
 where
     S: CommitStore + SubstateStore + ConsensusStore,
     D: Dispatch,
 {
     // Core components
-    state: NodeStateMachine,
+    state: NodeStateMachine<C>,
     storage: Arc<S>,
     executor: RadixExecutor,
     network: N,

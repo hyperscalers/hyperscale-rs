@@ -4,8 +4,9 @@
 //! `prepare_block_commit` returns an opaque `PreparedCommit` handle that
 //! carries precomputed work; `commit_prepared_block` applies it efficiently.
 
-use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, TransactionCertificate};
-use radix_substate_store_interface::interface::DatabaseUpdates;
+use hyperscale_types::{
+    BlockHeight, ConcreteConfig, Hash, QuorumCertificate, TransactionCertificate, TypeConfig,
+};
 use std::sync::Arc;
 
 /// Consensus metadata to be committed atomically with JMT + substate writes.
@@ -32,7 +33,7 @@ pub struct ConsensusCommitData {
 ///    If no handle is available, `commit_block` recomputes from scratch.
 ///
 /// All methods take `&self` — implementations use interior mutability.
-pub trait CommitStore: Send + Sync {
+pub trait CommitStore<C: TypeConfig = ConcreteConfig>: Send + Sync {
     /// Opaque handle carrying precomputed commit work.
     ///
     /// For RocksDB this contains a `WriteBatch` + `JmtSnapshot`.
@@ -51,7 +52,7 @@ pub trait CommitStore: Send + Sync {
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
-        merged_updates: &DatabaseUpdates,
+        merged_updates: &C::StateUpdate,
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit);
 
@@ -83,7 +84,7 @@ pub trait CommitStore: Send + Sync {
     /// atomically in the same batch as the JMT + substate data.
     fn commit_block(
         &self,
-        merged_updates: &DatabaseUpdates,
+        merged_updates: &C::StateUpdate,
         certificates: &[Arc<TransactionCertificate>],
         block_height: u64,
         consensus: Option<ConsensusCommitData>,

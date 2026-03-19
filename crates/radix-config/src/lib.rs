@@ -16,6 +16,7 @@ use hyperscale_types::{
 ///
 /// This is the reference (and currently only) implementation. It binds the
 /// framework's generic types to the concrete Radix ledger types.
+#[derive(Debug, Clone)]
 pub struct RadixConfig;
 
 impl TypeConfig for RadixConfig {

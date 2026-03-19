@@ -4,8 +4,8 @@
 //! All methods take `&self` — implementations use interior mutability.
 
 use hyperscale_types::{
-    Block, BlockHeight, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
-    QuorumCertificate, ReceiptBundle, RoutableTransaction, TransactionCertificate,
+    Block, BlockHeight, ConcreteConfig, Hash, LocalTransactionExecution, QuorumCertificate,
+    ReceiptBundle, TransactionCertificate, TypeConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,12 +14,12 @@ use std::sync::Arc;
 ///
 /// Provides a uniform interface for storing blocks, certificates, votes,
 /// and chain metadata across different storage backends.
-pub trait ConsensusStore: Send + Sync {
+pub trait ConsensusStore<C: TypeConfig = ConcreteConfig>: Send + Sync {
     /// Store a committed block with its quorum certificate.
-    fn put_block(&self, height: BlockHeight, block: &Block, qc: &QuorumCertificate);
+    fn put_block(&self, height: BlockHeight, block: &Block<C>, qc: &QuorumCertificate);
 
     /// Get a committed block by height.
-    fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)>;
+    fn get_block(&self, height: BlockHeight) -> Option<(Block<C>, QuorumCertificate)>;
 
     /// Set the highest committed block height.
     fn set_committed_height(&self, height: BlockHeight);
@@ -64,12 +64,12 @@ pub trait ConsensusStore: Send + Sync {
     ///
     /// Returns `Some((block, qc))` only if the full block is available with all
     /// transactions and certificates. Returns `None` if any data is missing.
-    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)>;
+    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block<C>, QuorumCertificate)>;
 
     /// Get multiple transactions by hash (batch read).
     ///
     /// Returns only transactions that were found (missing hashes are skipped).
-    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction>;
+    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<C::Transaction>;
 
     /// Get multiple certificates by hash (batch read).
     ///
@@ -82,19 +82,19 @@ pub trait ConsensusStore: Send + Sync {
     ///
     /// If `bundle.local_execution` is `None` (e.g., receipt fetched during sync),
     /// only the ledger receipt is persisted.
-    fn store_receipt_bundle(&self, bundle: &ReceiptBundle);
+    fn store_receipt_bundle(&self, bundle: &ReceiptBundle<C>);
 
     /// Store multiple receipt bundles atomically.
     ///
     /// Default implementation loops, but RocksDB overrides for atomic batch write.
-    fn store_receipt_bundles(&self, bundles: &[ReceiptBundle]) {
+    fn store_receipt_bundles(&self, bundles: &[ReceiptBundle<C>]) {
         for bundle in bundles {
             self.store_receipt_bundle(bundle);
         }
     }
 
     /// Retrieve the ledger receipt for a transaction.
-    fn get_ledger_receipt(&self, tx_hash: &Hash) -> Option<Arc<LedgerTransactionReceipt>>;
+    fn get_ledger_receipt(&self, tx_hash: &Hash) -> Option<Arc<C::ExecutionReceipt>>;
 
     /// Retrieve local execution details for a transaction.
     ///

@@ -32,9 +32,9 @@
 
 use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionVote, Hash, NodeId,
-    RoutableTransaction, ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate,
-    TransactionDecision, ValidatorId,
+    BlockHeight, Bls12381G1PublicKey, ConcreteConfig, ExecutionCertificate, ExecutionVote, Hash,
+    NodeId, RoutableTransaction, ShardGroupId, StateProvision, TopologySnapshot,
+    TransactionCertificate, TransactionDecision, TypeConfig, ValidatorId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -93,13 +93,13 @@ pub struct SpeculativeResult {
 /// Execution state machine.
 ///
 /// Handles transaction execution after blocks are committed.
-pub struct ExecutionState {
+pub struct ExecutionState<C: TypeConfig = ConcreteConfig> {
     /// Current time.
     now: Duration,
 
     /// In-memory cache of execution write sets (DatabaseUpdates), keyed by tx hash.
     /// Populated when execution completes, read during block commit, evicted after commit.
-    execution_cache: ExecutionCache,
+    execution_cache: ExecutionCache<C>,
 
     /// Transactions that have been executed (deduplication).
     /// Maps tx_hash -> block_height when executed, enabling height-based cleanup.
@@ -118,7 +118,7 @@ pub struct ExecutionState {
     /// Transactions waiting for provisioning to complete before execution.
     /// Maps tx_hash -> (transaction, block_height)
     /// Note: Provision tracking is handled by ProvisionCoordinator.
-    pending_provisioning: HashMap<Hash, (Arc<RoutableTransaction>, u64)>,
+    pending_provisioning: HashMap<Hash, (Arc<C::Transaction>, u64)>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Cross-shard state (Phase 3-4: Voting)
@@ -207,7 +207,7 @@ pub struct ExecutionState {
     /// Pending speculative executions waiting for callback.
     /// Maps block_hash -> list of transactions being speculatively executed.
     /// Used to retrieve declared_reads when speculative execution completes.
-    pending_speculative_executions: HashMap<Hash, Vec<Arc<RoutableTransaction>>>,
+    pending_speculative_executions: HashMap<Hash, Vec<Arc<C::Transaction>>>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Speculative Execution Config
