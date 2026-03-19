@@ -1,6 +1,7 @@
 //! Domain-specific identifier types.
 
-use sbor::prelude::*;
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
 use std::fmt;
 
 /// Validator identifier.

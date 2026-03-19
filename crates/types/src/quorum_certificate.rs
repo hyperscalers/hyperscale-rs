@@ -4,7 +4,8 @@ use crate::{
     block_vote_message, zero_bls_signature, BlockHeight, Bls12381G2Signature, Hash, ShardGroupId,
     SignerBitfield,
 };
-use sbor::prelude::*;
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
 
 /// A quorum certificate proving 2f+1 validators voted for a block.
 ///

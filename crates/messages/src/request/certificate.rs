@@ -1,8 +1,9 @@
 //! Certificate fetch request.
 
 use crate::response::GetCertificatesResponse;
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 use hyperscale_types::{Hash, MessagePriority, NetworkMessage, Request};
-use sbor::prelude::BasicSbor;
 
 /// Fetch type discriminator for request routing.
 /// This distinguishes certificate requests from transaction requests

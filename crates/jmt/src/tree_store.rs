@@ -4,8 +4,9 @@ use super::tier_framework::StoredNode;
 // Re-exports
 pub use super::types::{Nibble, NibblePath, TreeNodeKey, Version};
 use super::{Node, StorageError, TreeReader};
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
 use hyperscale_types::Hash;
-use sbor::prelude::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;
 

@@ -1,5 +1,6 @@
 //! Transaction fetch response.
 
+use hyperscale_codec as sbor;
 use hyperscale_types::{MessagePriority, NetworkMessage, RoutableTransaction};
 use std::sync::Arc;
 
@@ -151,8 +152,8 @@ impl NetworkMessage for GetTransactionsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_codec::{basic_decode, basic_encode};
     use hyperscale_types::test_utils::test_transaction;
-    use sbor::prelude::{basic_decode, basic_encode};
 
     #[test]
     fn test_get_transactions_response() {

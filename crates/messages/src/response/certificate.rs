@@ -1,9 +1,10 @@
 //! Certificate fetch response.
 
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 use hyperscale_types::{
     LedgerReceiptEntry, MessagePriority, NetworkMessage, TransactionCertificate,
 };
-use sbor::prelude::BasicSbor;
 
 /// Response to a certificate fetch request.
 ///
@@ -72,8 +73,8 @@ impl NetworkMessage for GetCertificatesResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_codec::{basic_decode, basic_encode};
     use hyperscale_types::{Hash, TransactionDecision};
-    use sbor::prelude::{basic_decode, basic_encode};
     use std::collections::BTreeMap;
 
     fn make_test_certificate(tx_hash: Hash) -> TransactionCertificate {

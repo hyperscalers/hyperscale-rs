@@ -24,7 +24,7 @@ futures.workspace = true
 bytes.workspace = true
 
 # Serialization
-sbor.workspace = true
+hyperscale-codec.workspace = true
 serde.workspace = true
 
 # CLI (for config enums)

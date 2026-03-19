@@ -13,6 +13,8 @@
 //! All registrations happen at init (before any messages arrive), so
 //! the read-heavy RwLock pattern is ideal.
 
+use hyperscale_codec as sbor;
+
 use crate::traits::{GossipHandler, GossipVerdict, NotificationHandler, RequestHandler};
 use hyperscale_types::{NetworkMessage, Request};
 use std::collections::HashMap;

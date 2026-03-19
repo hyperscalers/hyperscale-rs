@@ -3,11 +3,12 @@
 //! Only compiled when the `trace-propagation` feature is enabled.
 //! When disabled, `TraceContext` is a zero-size type that serializes to nothing.
 
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 #[cfg(feature = "trace-propagation")]
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 #[cfg(feature = "trace-propagation")]
 use opentelemetry_sdk::propagation::TraceContextPropagator;
-use sbor::prelude::BasicSbor;
 
 /// Trace context carrier for network messages.
 ///

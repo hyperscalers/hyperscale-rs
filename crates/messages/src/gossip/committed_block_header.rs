@@ -1,10 +1,11 @@
 //! CommittedBlockHeader gossip message for cross-shard header broadcast.
 
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 use hyperscale_types::{
     committed_block_header_message, Bls12381G2Signature, CommittedBlockHeader, MessagePriority,
     NetworkMessage, ValidatorId,
 };
-use sbor::prelude::BasicSbor;
 
 /// Gossips a committed block header globally to all shards.
 ///
@@ -60,6 +61,7 @@ mod tests {
 
     #[test]
     fn test_sbor_roundtrip() {
+        use hyperscale_codec::{basic_decode, basic_encode};
         use hyperscale_types::{
             zero_bls_signature, BlockHeader, BlockHeight, Hash, QuorumCertificate, ShardGroupId,
             ValidatorId,
@@ -87,8 +89,8 @@ mod tests {
             sender_signature: zero_bls_signature(),
         };
 
-        let encoded = sbor::basic_encode(&gossip).unwrap();
-        let decoded: CommittedBlockHeaderGossip = sbor::basic_decode(&encoded).unwrap();
+        let encoded = basic_encode(&gossip).unwrap();
+        let decoded: CommittedBlockHeaderGossip = basic_decode(&encoded).unwrap();
         assert_eq!(gossip, decoded);
     }
 }

@@ -1,8 +1,9 @@
 //! Block fetch request.
 
 use crate::response::GetBlockResponse;
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 use hyperscale_types::{BlockHeight, MessagePriority, NetworkMessage, Request};
-use sbor::prelude::BasicSbor;
 
 /// Request to fetch a full Block by height during sync or catch-up.
 ///

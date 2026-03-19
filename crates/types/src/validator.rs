@@ -1,7 +1,8 @@
 //! Validator set types.
 
 use crate::{Bls12381G1PublicKey, ValidatorId};
-use sbor::prelude::*;
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
 
 /// Information about a validator.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]

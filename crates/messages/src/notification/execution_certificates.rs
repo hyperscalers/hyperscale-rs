@@ -1,10 +1,11 @@
 //! ExecutionCertificatesNotification message.
 
 use crate::trace_context::TraceContext;
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 use hyperscale_types::{
     Bls12381G2Signature, ExecutionCertificate, MessagePriority, NetworkMessage, ValidatorId,
 };
-use sbor::prelude::BasicSbor;
 
 /// Batched certificates proving execution quorum.
 ///

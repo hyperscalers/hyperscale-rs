@@ -9,7 +9,7 @@ hyperscale-core.workspace = true
 hyperscale-network.workspace = true
 hyperscale-types.workspace = true
 
-sbor.workspace = true
+hyperscale-codec.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 tracing.workspace = true

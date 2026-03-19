@@ -1,10 +1,11 @@
 //! Transaction types for consensus.
 
 use crate::{BlockHeight, CommitmentProof, ExecutionCertificate, Hash, NodeId, ShardGroupId};
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
 use radix_transactions::validation::TransactionValidator;
-use sbor::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 

@@ -20,7 +20,8 @@
 //!
 //! 5. **Background** - Sync operations like block fetching. Fully deferrable.
 
-use sbor::prelude::{BasicDecode, BasicEncode, BasicSbor};
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::{BasicDecode, BasicEncode, BasicSbor};
 
 /// Network message priority levels.
 ///

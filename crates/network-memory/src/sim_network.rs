@@ -10,12 +10,13 @@
 //! encoding path. [`SimulatedNetwork::flush_gossip`](crate::SimulatedNetwork::flush_gossip)
 //! delivers due messages via each target's registered per-type gossip handler.
 
+use hyperscale_codec as sbor;
+use hyperscale_codec::basic_encode;
 use hyperscale_network::{
     compression, GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError,
     RequestHandler, TopicScope,
 };
 use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
-use sbor::basic_encode;
 use std::sync::{Arc, Mutex};
 
 /// Target for an outbound message.

@@ -1,7 +1,8 @@
 //! BlockVote notification message.
 
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 use hyperscale_types::{BlockVote, MessagePriority, NetworkMessage};
-use sbor::prelude::BasicSbor;
 
 /// Vote on a block proposal. 2f+1 matching votes create a QuorumCertificate.
 ///

@@ -1,0 +1,8 @@
+[package]
+name = "hyperscale-codec"
+version.workspace = true
+edition.workspace = true
+description = "Codec facade for Hyperscale — centralizes SBOR imports"
+
+[dependencies]
+sbor.workspace = true

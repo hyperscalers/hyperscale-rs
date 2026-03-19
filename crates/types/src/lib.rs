@@ -97,6 +97,8 @@ pub use validator::{ValidatorInfo, ValidatorSet};
 // Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)
 pub use radix_substate_store_interface::interface::DatabaseUpdates;
 
+use hyperscale_codec as sbor;
+
 /// Block vote for BFT consensus.
 #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
 pub struct BlockVote {

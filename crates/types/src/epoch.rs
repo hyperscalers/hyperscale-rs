@@ -4,7 +4,8 @@
 //! At epoch boundaries, validators may be shuffled between shards.
 
 use crate::{BlockHeight, Bls12381G1PublicKey, Hash, ShardGroupId, ValidatorId, ValidatorSet};
-use sbor::prelude::*;
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
 

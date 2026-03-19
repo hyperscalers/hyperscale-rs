@@ -203,6 +203,8 @@ pub trait Network: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_codec as sbor;
+
     use super::*;
 
     // Verify that closures satisfy GossipHandler<M> via blanket impl.

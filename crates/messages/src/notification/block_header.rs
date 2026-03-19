@@ -1,10 +1,11 @@
 //! BlockHeader notification message.
 
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 use hyperscale_types::{
     block_header_message, BlockHeader, BlockManifest, Bls12381G2Signature, MessagePriority,
     NetworkMessage,
 };
-use sbor::prelude::BasicSbor;
 
 /// Notifies committee members of a block proposal (header + manifest, not full block).
 /// Validators construct the full Block locally from header + mempool transactions.

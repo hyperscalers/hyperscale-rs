@@ -1,8 +1,9 @@
 //! StateProvisionsNotification message for cross-shard provisions.
 
 use crate::trace_context::TraceContext;
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 use hyperscale_types::{Bls12381G2Signature, MessagePriority, NetworkMessage, ValidatorId};
-use sbor::prelude::BasicSbor;
 
 /// Batched state provisions for cross-shard transactions.
 ///

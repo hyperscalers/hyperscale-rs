@@ -13,6 +13,8 @@
 
 use std::sync::Arc;
 
+use hyperscale_codec as sbor;
+
 use crate::{compute_merkle_root, DatabaseUpdates, Hash, NodeId, PartitionNumber};
 
 // ─── Outcome ─────────────────────────────────────────────────────────────────

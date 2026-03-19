@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/bft",
+    "crates/codec",
     "crates/core",
     "crates/dispatch",
     "crates/dispatch-pooled",
@@ -34,6 +35,7 @@ members = [
 
 default-members = [
     "crates/bft",
+    "crates/codec",
     "crates/core",
     "crates/dispatch",
     "crates/dispatch-pooled",
@@ -74,6 +76,7 @@ hyperscale-bft = { path = "crates/bft" }
 hyperscale-metrics = { path = "crates/metrics" }
 hyperscale-metrics-noop = { path = "crates/metrics-noop" }
 hyperscale-metrics-prometheus = { path = "crates/metrics-prometheus" }
+hyperscale-codec = { path = "crates/codec" }
 hyperscale-core = { path = "crates/core" }
 hyperscale-dispatch = { path = "crates/dispatch" }
 hyperscale-dispatch-pooled = { path = "crates/dispatch-pooled" }

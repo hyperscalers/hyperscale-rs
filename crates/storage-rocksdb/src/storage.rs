@@ -11,6 +11,8 @@
 //! JMT data is stored in dedicated column families (`jmt_nodes`, `jmt_meta`).
 //! On each commit, the JMT is updated and a new state root hash is computed.
 
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{
@@ -26,7 +28,6 @@ use hyperscale_types::NodeId;
 use rocksdb::{
     ColumnFamily, ColumnFamilyDescriptor, Options, Snapshot, WriteBatch, WriteOptions, DB,
 };
-use sbor::prelude::*;
 use std::path::Path;
 
 use std::sync::{Arc, Mutex};

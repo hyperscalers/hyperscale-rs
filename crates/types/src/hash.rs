@@ -1,6 +1,7 @@
 //! Cryptographic hash type using Blake3.
 
-use sbor::prelude::*;
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
 use std::fmt;
 
 /// A 32-byte cryptographic hash using Blake3.

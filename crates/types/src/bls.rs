@@ -7,6 +7,8 @@
 use std::fmt;
 use std::str::FromStr;
 
+use hyperscale_codec as sbor;
+
 use blst::min_pk;
 
 /// BLS12-381 ciphersuite for signatures (hash-to-curve DST).

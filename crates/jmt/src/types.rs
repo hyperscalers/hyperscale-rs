@@ -1,9 +1,10 @@
 // Forked from radixdlt-scrypto (originally from Aptos). Modified to use Blake3.
 
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
+use hyperscale_codec::{Decoder, Encoder};
 use hyperscale_types::Hash;
 use itertools::Itertools;
-use sbor::prelude::*;
-use sbor::{Decoder, Encoder};
 use std::collections::HashMap;
 use std::fmt;
 use std::iter::FromIterator;

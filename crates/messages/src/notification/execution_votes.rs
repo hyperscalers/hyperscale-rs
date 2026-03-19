@@ -1,9 +1,10 @@
 //! ExecutionVotesNotification message.
 
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 use hyperscale_types::{
     Bls12381G2Signature, ExecutionVote, MessagePriority, NetworkMessage, ValidatorId,
 };
-use sbor::prelude::BasicSbor;
 
 /// Batched votes on transaction execution results within a shard.
 ///

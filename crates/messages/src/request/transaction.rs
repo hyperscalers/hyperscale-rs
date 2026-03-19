@@ -1,8 +1,9 @@
 //! Transaction fetch request.
 
 use crate::response::GetTransactionsResponse;
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 use hyperscale_types::{Hash, MessagePriority, NetworkMessage, Request};
-use sbor::prelude::BasicSbor;
 
 /// Fetch type discriminator for request routing.
 /// This distinguishes transaction requests from certificate requests
@@ -62,7 +63,7 @@ impl Request for GetTransactionsRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sbor::prelude::basic_encode;
+    use hyperscale_codec::basic_encode;
 
     #[test]
     fn test_get_transactions_request() {

@@ -1,5 +1,7 @@
 //! RPC client for submitting transactions to Hyperscale nodes.
 
+use hyperscale_codec as sbor;
+
 mod types;
 
 pub use types::*;

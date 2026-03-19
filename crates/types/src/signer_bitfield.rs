@@ -1,6 +1,7 @@
 //! Bitfield for tracking which validators have signed.
 
-use sbor::prelude::*;
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
 
 /// A compact bitfield representing which validators have signed.
 ///

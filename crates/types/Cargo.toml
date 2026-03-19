@@ -13,7 +13,7 @@ blst = "0.3"
 rand.workspace = true
 
 # Serialization
-sbor.workspace = true
+hyperscale-codec.workspace = true
 
 # Error handling
 thiserror.workspace = true

@@ -1,6 +1,7 @@
 //! Transaction gossip message.
 
 use crate::trace_context::TraceContext;
+use hyperscale_codec as sbor;
 use hyperscale_types::{MessagePriority, NetworkMessage, RoutableTransaction, ShardMessage};
 use std::sync::Arc;
 

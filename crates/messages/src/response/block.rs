@@ -1,9 +1,10 @@
 //! Block fetch response.
 
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 use hyperscale_types::{
     Block, LedgerReceiptEntry, MessagePriority, NetworkMessage, QuorumCertificate,
 };
-use sbor::prelude::BasicSbor;
 
 /// Response to a block fetch request containing the full Block and its QC.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]

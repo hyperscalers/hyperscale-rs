@@ -18,7 +18,7 @@ hyperscale-types.workspace = true
 # Radix dependencies
 radix-common.workspace = true
 radix-transactions.workspace = true
-sbor.workspace = true
+hyperscale-codec.workspace = true
 
 # Async runtime
 tokio.workspace = true

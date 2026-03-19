@@ -4,7 +4,8 @@ use crate::{
     exec_vote_message, zero_bls_signature, BlockHeight, Bls12381G2Signature, Hash, NodeId,
     ShardGroupId, SignerBitfield, ValidatorId,
 };
-use sbor::prelude::*;
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
 use std::sync::Arc;
 
 // ============================================================================

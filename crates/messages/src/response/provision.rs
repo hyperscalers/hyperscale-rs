@@ -1,7 +1,8 @@
 //! Provision fetch response for fallback recovery.
 
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 use hyperscale_types::{MessagePriority, NetworkMessage, StateProvision};
-use sbor::prelude::BasicSbor;
 
 /// Response to a provision fetch request containing the state provisions.
 ///
@@ -34,6 +35,7 @@ impl NetworkMessage for GetProvisionsResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_codec::{basic_decode, basic_encode};
 
     #[test]
     fn test_sbor_roundtrip_empty() {
@@ -41,8 +43,8 @@ mod tests {
             provisions: Some(vec![]),
         };
 
-        let encoded = sbor::basic_encode(&response).unwrap();
-        let decoded: GetProvisionsResponse = sbor::basic_decode(&encoded).unwrap();
+        let encoded = basic_encode(&response).unwrap();
+        let decoded: GetProvisionsResponse = basic_decode(&encoded).unwrap();
         assert_eq!(response, decoded);
     }
 
@@ -50,8 +52,8 @@ mod tests {
     fn test_sbor_roundtrip_unavailable() {
         let response = GetProvisionsResponse { provisions: None };
 
-        let encoded = sbor::basic_encode(&response).unwrap();
-        let decoded: GetProvisionsResponse = sbor::basic_decode(&encoded).unwrap();
+        let encoded = basic_encode(&response).unwrap();
+        let decoded: GetProvisionsResponse = basic_decode(&encoded).unwrap();
         assert_eq!(response, decoded);
     }
 }

@@ -50,7 +50,7 @@ async-trait = "0.1"
 igd-next = { version = "0.14.3", features = ["aio_tokio"] }
 
 # Serialization
-sbor.workspace = true
+hyperscale-codec.workspace = true
 
 # Async runtime
 thiserror.workspace = true

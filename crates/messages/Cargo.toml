@@ -14,7 +14,7 @@ trace-propagation = ["opentelemetry", "opentelemetry_sdk"]
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 
 # Serialization
-sbor.workspace = true
+hyperscale-codec.workspace = true
 
 # OpenTelemetry for trace context propagation (optional)
 opentelemetry = { workspace = true, optional = true }

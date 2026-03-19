@@ -5,7 +5,8 @@ use crate::{
     RoutableTransaction, ShardGroupId, TransactionAbort, TransactionCertificate, TransactionDefer,
     ValidatorId,
 };
-use sbor::prelude::*;
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 

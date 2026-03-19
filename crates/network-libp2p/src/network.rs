@@ -3,6 +3,8 @@
 //! [`Libp2pNetwork`] wraps [`Libp2pAdapter`] and [`RequestManager`] to provide
 //! the [`Network`] interface used by `IoLoop` in the production runner.
 
+use hyperscale_codec as sbor;
+
 use crate::adapter::Libp2pAdapter;
 use crate::inbound_router::{spawn_inbound_router, InboundRouterHandle};
 use crate::notify_pool::NotifyStreamPool;

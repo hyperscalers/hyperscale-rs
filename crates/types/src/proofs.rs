@@ -19,7 +19,8 @@
 //! received provisions yet, causing expensive view changes.
 
 use crate::{BlockHeight, Hash, NodeId, QuorumCertificate, ShardGroupId, StateEntry};
-use sbor::prelude::*;
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 

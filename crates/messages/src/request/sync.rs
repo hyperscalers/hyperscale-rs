@@ -1,9 +1,10 @@
 //! Sync-related request messages.
 
+use hyperscale_codec as sbor;
+use hyperscale_codec::BasicSbor;
 use hyperscale_types::{
     BlockHeight, Bls12381G2Signature, MessagePriority, NetworkMessage, ShardMessage, ValidatorId,
 };
-use sbor::prelude::BasicSbor;
 
 /// Broadcast that validator has caught up to network head and is ready to participate.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
