@@ -38,7 +38,7 @@ pub use execution::ProvisionedSnapshot;
 pub use executor::{fetch_state_entries, RadixExecutor};
 pub use genesis::GenesisConfig;
 pub use hyperscale_types::ExecutionResult;
-pub use result::SingleTxResult;
+pub use result::{ExecutionOutput, SingleTxResult};
 pub use validation::TransactionValidation;
 
 // Re-export Radix types needed by engine callers (not storage-related)

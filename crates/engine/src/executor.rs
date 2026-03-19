@@ -315,13 +315,15 @@ impl RadixExecutor {
             let ledger_receipt = build_ledger_receipt(receipt);
             let local_execution = build_local_execution(receipt);
             let receipt_hash = ledger_receipt.receipt_hash();
-            SingleTxResult::success(
+            SingleTxResult {
                 tx_hash,
+                success: true,
                 receipt_hash,
-                ledger_receipt,
+                receipt: ledger_receipt,
                 local_execution,
-                database_updates,
-            )
+                state_update: database_updates,
+                error: None,
+            }
         } else {
             let error = format!("{:?}", receipt.result);
             SingleTxResult::failure(tx_hash, error)

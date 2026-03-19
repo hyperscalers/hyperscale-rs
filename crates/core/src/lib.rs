@@ -29,13 +29,17 @@
 //! 4. Converts action results back into NodeInputs
 
 mod action;
+mod execution_backend;
 mod input;
 mod protocol_event;
+pub mod result;
 mod timer;
 mod traits;
 
 pub use action::{Action, CrossShardExecutionRequest, ProvisionRequest, TransactionStatus};
+pub use execution_backend::ExecutionBackend;
 pub use input::{EventPriority, NodeInput};
 pub use protocol_event::{ProtocolEvent, ProvisionVerificationResult};
+pub use result::{ExecutionOutput, SingleTxResult};
 pub use timer::{TimerId, TimerScheduler};
 pub use traits::StateMachine;

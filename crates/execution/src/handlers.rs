@@ -314,7 +314,7 @@ pub fn execute_and_sign_single_shard<S: SubstateStore>(
 ) -> (ExecutionVote, SingleTxResult) {
     let result = match executor.execute_single_shard(storage, std::slice::from_ref(tx)) {
         Ok(output) => {
-            if let Some(r) = output.results().first() {
+            if let Some(r) = output.results.first() {
                 r.clone()
             } else {
                 SingleTxResult::failure(tx.hash(), "No execution result returned")
@@ -328,10 +328,9 @@ pub fn execute_and_sign_single_shard<S: SubstateStore>(
 
     // Filter out undeclared system state writes
     let mut result = result;
-    result.database_updates =
-        filter_to_declared_writes(&result.database_updates, &tx.declared_writes);
+    result.state_update = filter_to_declared_writes(&result.state_update, &tx.declared_writes);
 
-    let write_nodes = extract_write_nodes(&result.database_updates);
+    let write_nodes = extract_write_nodes(&result.state_update);
 
     // Sign immediately after execution
     let message = exec_vote_message(
@@ -380,7 +379,7 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
         provisions,
     ) {
         Ok(output) => {
-            if let Some(r) = output.results().first() {
+            if let Some(r) = output.results.first() {
                 r.clone()
             } else {
                 SingleTxResult::failure(tx_hash, "No cross-shard execution result returned")
@@ -394,10 +393,10 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
 
     // Filter out undeclared system state writes
     let mut result = result;
-    result.database_updates =
-        filter_to_declared_writes(&result.database_updates, &transaction.declared_writes);
+    result.state_update =
+        filter_to_declared_writes(&result.state_update, &transaction.declared_writes);
 
-    let write_nodes = extract_write_nodes(&result.database_updates);
+    let write_nodes = extract_write_nodes(&result.state_update);
 
     // Sign immediately after execution
     let message = exec_vote_message(
