@@ -11,16 +11,22 @@ use hyperscale_messages::{ExecutionCertificatesNotification, ExecutionVotesNotif
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_types::{
-    Bls12381G1PublicKey, ExecutionCertificate, ExecutionResult, ExecutionVote, Hash,
-    RoutableTransaction, ShardGroupId,
+    Bls12381G1PublicKey, ConsensusTransaction, ExecutionCertificate, ExecutionResult,
+    ExecutionVote, Hash, ShardGroupId, TypeConfig,
 };
 use std::sync::Arc;
 
-impl<Cfg: NodeConfig> IoLoop<Cfg> {
+impl<Cfg: NodeConfig> IoLoop<Cfg>
+where
+    Cfg::C: TypeConfig<
+        Transaction = hyperscale_types::RoutableTransaction,
+        ExecutionReceipt = hyperscale_types::LedgerTransactionReceipt,
+    >,
+{
     // ─── Transaction Validation Batching ──────────────────────────────
 
     /// Queue a transaction for batch validation.
-    pub(super) fn queue_validation(&mut self, tx: Arc<RoutableTransaction>) {
+    pub(super) fn queue_validation(&mut self, tx: Arc<<Cfg::C as TypeConfig>::Transaction>) {
         if self.validation_batch.push(tx, self.state.now()) {
             self.flush_validation_batch();
         }
@@ -54,7 +60,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                         submitted_locally: false, // IoLoop sets from locally_submitted
                     });
                 } else {
-                    failed_hashes.push(tx.hash());
+                    failed_hashes.push(tx.tx_hash());
                 }
             }
             if !failed_hashes.is_empty() {
@@ -194,7 +200,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     pub(super) fn accumulate_cross_shard_execution(
         &mut self,
         tx_hash: Hash,
-        transaction: Arc<RoutableTransaction>,
+        transaction: Arc<<Cfg::C as TypeConfig>::Transaction>,
         provisions: Vec<hyperscale_types::StateProvision>,
     ) {
         let req = CrossShardExecutionRequest {

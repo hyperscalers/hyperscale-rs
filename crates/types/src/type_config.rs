@@ -74,6 +74,9 @@ pub trait ConsensusExecutionReceipt: Clone + Send + Sync + BasicEncode + BasicDe
 
     /// Whether the receipt indicates successful execution.
     fn is_success(&self) -> bool;
+
+    /// Create a default failure receipt (no state changes or events).
+    fn failure() -> Self;
 }
 
 /// Core trait that parameterizes the consensus framework over
@@ -93,7 +96,7 @@ pub trait TypeConfig: Send + Sync + 'static {
     type ExecutionReceipt: ConsensusExecutionReceipt;
 
     /// State delta produced by execution.
-    type StateUpdate: Clone + Send + Sync;
+    type StateUpdate: Clone + Default + Send + Sync;
 
     // ── State update operations ──
 
@@ -121,6 +124,15 @@ pub trait TypeConfig: Send + Sync + 'static {
         update: &Self::StateUpdate,
         declared_writes: &[NodeId],
     ) -> Self::StateUpdate;
+
+    /// Extract deduplicated, deterministically-ordered NodeIds from a state update.
+    fn extract_write_nodes(update: &Self::StateUpdate) -> Vec<NodeId>;
+
+    /// Convert a receipt into a state update.
+    ///
+    /// Used by syncing nodes that receive receipts from peers instead of
+    /// executing transactions locally.
+    fn receipt_to_state_update(receipt: &Self::ExecutionReceipt) -> Self::StateUpdate;
 }
 
 /// Internal concrete config used as the default type parameter during migration.
@@ -247,5 +259,232 @@ impl TypeConfig for ConcreteConfig {
             }
         }
         filtered
+    }
+
+    fn extract_write_nodes(update: &DatabaseUpdates) -> Vec<NodeId> {
+        const HASH_PREFIX_LEN: usize = 20;
+        const NODE_ID_LEN: usize = 30;
+        update
+            .node_updates
+            .keys()
+            .filter_map(|db_node_key| {
+                if db_node_key.len() >= HASH_PREFIX_LEN + NODE_ID_LEN {
+                    let mut bytes = [0u8; NODE_ID_LEN];
+                    bytes.copy_from_slice(
+                        &db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN],
+                    );
+                    Some(NodeId(bytes))
+                } else {
+                    None
+                }
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn receipt_to_state_update(receipt: &LedgerTransactionReceipt) -> DatabaseUpdates {
+        use crate::SubstateChangeAction;
+        use radix_common::prelude::DatabaseUpdate;
+        use radix_substate_store_interface::db_key_mapper::{
+            DatabaseKeyMapper, SpreadPrefixKeyMapper,
+        };
+        use radix_substate_store_interface::interface::{DbSortKey, PartitionDatabaseUpdates};
+
+        let mut updates = DatabaseUpdates::default();
+        for change in &receipt.state_changes {
+            let radix_node_id = radix_common::types::NodeId(change.substate_ref.node_id.0);
+            let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
+            let radix_partition =
+                radix_common::types::PartitionNumber(change.substate_ref.partition.0);
+            let db_partition_num = SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
+            let db_sort_key = DbSortKey(change.substate_ref.sort_key.clone());
+
+            let db_update = match &change.action {
+                SubstateChangeAction::Create { new_value } => {
+                    DatabaseUpdate::Set(new_value.clone())
+                }
+                SubstateChangeAction::Update { new_value, .. } => {
+                    DatabaseUpdate::Set(new_value.clone())
+                }
+                SubstateChangeAction::Delete { .. } => DatabaseUpdate::Delete,
+            };
+
+            let node_updates = updates.node_updates.entry(db_node_key).or_default();
+            let partition_updates = node_updates
+                .partition_updates
+                .entry(db_partition_num)
+                .or_insert_with(|| PartitionDatabaseUpdates::Delta {
+                    substate_updates: radix_common::prelude::IndexMap::new(),
+                });
+
+            if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
+                substate_updates.insert(db_sort_key, db_update);
+            }
+        }
+        updates
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyperscale_codec as sbor;
+
+    /// Minimal transaction type proving framework genericity.
+    #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
+    struct MockTransaction {
+        hash: Hash,
+        reads: Vec<NodeId>,
+        writes: Vec<NodeId>,
+    }
+
+    impl ConsensusTransaction for MockTransaction {
+        fn tx_hash(&self) -> Hash {
+            self.hash
+        }
+        fn reads(&self) -> Vec<NodeId> {
+            self.reads.clone()
+        }
+        fn writes(&self) -> Vec<NodeId> {
+            self.writes.clone()
+        }
+        fn is_retry(&self) -> bool {
+            false
+        }
+        fn original_hash(&self) -> Hash {
+            self.hash
+        }
+        fn retry_count(&self) -> u32 {
+            0
+        }
+        fn create_retry(&self, _deferred_by: Hash, _deferred_at: BlockHeight) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Minimal receipt type.
+    #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
+    struct MockReceipt {
+        success: bool,
+    }
+
+    impl ConsensusExecutionReceipt for MockReceipt {
+        fn consensus_receipt_hash(&self) -> Hash {
+            Hash::ZERO
+        }
+        fn is_success(&self) -> bool {
+            self.success
+        }
+        fn failure() -> Self {
+            Self { success: false }
+        }
+    }
+
+    /// Minimal state update type.
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    struct MockStateUpdate {
+        entries: Vec<(NodeId, Vec<u8>)>,
+    }
+
+    /// Non-Radix TypeConfig proving the framework is generic.
+    #[derive(Debug, Clone)]
+    struct MockConfig;
+
+    impl TypeConfig for MockConfig {
+        type Transaction = MockTransaction;
+        type ExecutionReceipt = MockReceipt;
+        type StateUpdate = MockStateUpdate;
+
+        fn merge_state_updates(updates: &[MockStateUpdate]) -> MockStateUpdate {
+            let mut merged = MockStateUpdate::default();
+            for u in updates {
+                merged.entries.extend(u.entries.iter().cloned());
+            }
+            merged
+        }
+
+        fn filter_state_update_to_shard(
+            update: &MockStateUpdate,
+            local_shard: ShardGroupId,
+            num_shards: u64,
+        ) -> MockStateUpdate {
+            MockStateUpdate {
+                entries: update
+                    .entries
+                    .iter()
+                    .filter(|(node_id, _)| {
+                        crate::shard_for_node(node_id, num_shards) == local_shard
+                    })
+                    .cloned()
+                    .collect(),
+            }
+        }
+
+        fn filter_state_update_to_writes(
+            update: &MockStateUpdate,
+            declared_writes: &[NodeId],
+        ) -> MockStateUpdate {
+            let allowed: std::collections::HashSet<NodeId> =
+                declared_writes.iter().copied().collect();
+            MockStateUpdate {
+                entries: update
+                    .entries
+                    .iter()
+                    .filter(|(node_id, _)| allowed.contains(node_id))
+                    .cloned()
+                    .collect(),
+            }
+        }
+
+        fn extract_write_nodes(update: &MockStateUpdate) -> Vec<NodeId> {
+            update.entries.iter().map(|(id, _)| *id).collect()
+        }
+
+        fn receipt_to_state_update(_receipt: &MockReceipt) -> MockStateUpdate {
+            MockStateUpdate::default()
+        }
+    }
+
+    #[test]
+    fn mock_config_block_compiles() {
+        // Prove Block<MockConfig> can be constructed and used.
+        use crate::{Block, ValidatorId};
+
+        let block = Block::<MockConfig>::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
+        assert_eq!(block.header.height, BlockHeight(0));
+        assert!(block.transactions.is_empty());
+    }
+
+    #[test]
+    fn mock_config_type_config_methods() {
+        let node_id = NodeId([0u8; 30]);
+        let update = MockStateUpdate {
+            entries: vec![(node_id, vec![1, 2, 3])],
+        };
+
+        // merge
+        let merged = MockConfig::merge_state_updates(&[update.clone(), update.clone()]);
+        assert_eq!(merged.entries.len(), 2);
+
+        // extract_write_nodes
+        let nodes = MockConfig::extract_write_nodes(&update);
+        assert_eq!(nodes, vec![node_id]);
+
+        // filter_to_writes
+        let filtered = MockConfig::filter_state_update_to_writes(&update, &[node_id]);
+        assert_eq!(filtered.entries.len(), 1);
+
+        let empty = MockConfig::filter_state_update_to_writes(&update, &[]);
+        assert!(empty.entries.is_empty());
+
+        // receipt_to_state_update
+        let receipt = MockReceipt { success: true };
+        let from_receipt = MockConfig::receipt_to_state_update(&receipt);
+        assert!(from_receipt.entries.is_empty());
+
+        // failure
+        let fail_receipt = MockReceipt::failure();
+        assert!(!fail_receipt.is_success());
     }
 }

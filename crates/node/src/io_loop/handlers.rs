@@ -7,9 +7,14 @@ use hyperscale_messages::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
     ExecutionVotesNotification, TransactionGossip,
 };
+use hyperscale_types::{LedgerTransactionReceipt, RoutableTransaction, TypeConfig};
 use tracing::warn;
 
-impl<Cfg: NodeConfig> IoLoop<Cfg> {
+impl<Cfg: NodeConfig> IoLoop<Cfg>
+where
+    Cfg::C:
+        TypeConfig<Transaction = RoutableTransaction, ExecutionReceipt = LedgerTransactionReceipt>,
+{
     /// Register per-type request handlers with the network.
     ///
     /// Each handler is a closure that captures shared state and delegates to
@@ -29,7 +34,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
         let storage = Arc::clone(&self.storage);
         self.network
             .register_request_handler::<GetBlockRequest>(move |req| {
-                serve_block_request(&*storage, req)
+                serve_block_request::<Cfg::C>(&*storage, req)
             });
 
         // ── transaction.request → fetch protocol ─────────────────────
@@ -38,7 +43,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
         let tx_cache = Arc::clone(&self.tx_cache);
         self.network
             .register_request_handler::<GetTransactionsRequest>(move |req| {
-                serve_transaction_request(&*storage, &tx_cache, req)
+                serve_transaction_request::<Cfg::C>(&*storage, &tx_cache, req)
             });
 
         // ── certificate.request → fetch protocol ─────────────────────
@@ -47,7 +52,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
         let cert_cache = Arc::clone(&self.cert_cache);
         self.network
             .register_request_handler::<GetCertificatesRequest>(move |req| {
-                serve_certificate_request(&*storage, &cert_cache, req)
+                serve_certificate_request::<Cfg::C>(&*storage, &cert_cache, req)
             });
 
         // ── provision.request → provision fetch protocol ─────────────
@@ -57,7 +62,12 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
         self.network
             .register_request_handler::<GetProvisionsRequest>(move |req| {
                 let topo = topology.load();
-                serve_provision_request(&*storage, topo.local_shard(), topo.num_shards(), req)
+                serve_provision_request::<Cfg::C>(
+                    &*storage,
+                    topo.local_shard(),
+                    topo.num_shards(),
+                    req,
+                )
             });
     }
 
@@ -70,18 +80,19 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
         // The existing step() intercept handles dedup + validation queueing.
 
         let tx = self.event_sender.clone();
-        self.network.register_gossip_handler::<TransactionGossip>(
-            TopicScope::Shard,
-            move |gossip: TransactionGossip| -> GossipVerdict {
-                let _ = tx.send(NodeInput::Protocol(
-                    ProtocolEvent::TransactionGossipReceived {
-                        tx: gossip.transaction,
-                        submitted_locally: false,
-                    },
-                ));
-                GossipVerdict::Accept
-            },
-        );
+        self.network
+            .register_gossip_handler::<TransactionGossip<Cfg::C>>(
+                TopicScope::Shard,
+                move |gossip: TransactionGossip<Cfg::C>| -> GossipVerdict {
+                    let _ = tx.send(NodeInput::Protocol(
+                        ProtocolEvent::TransactionGossipReceived {
+                            tx: gossip.transaction,
+                            submitted_locally: false,
+                        },
+                    ));
+                    GossipVerdict::Accept
+                },
+            );
 
         // ── block.committed → pre-filter, then NodeInput::CommittedBlockGossipReceived ─
 

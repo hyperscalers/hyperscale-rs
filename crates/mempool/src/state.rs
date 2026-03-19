@@ -443,7 +443,7 @@ impl<C: TypeConfig> MempoolState<C> {
         topology: &TopologySnapshot,
         tx: &Arc<C::Transaction>,
     ) -> Vec<Action<C>> {
-        let shards = topology.all_shards_for_transaction_generic(tx.as_ref());
+        let shards = topology.all_shards_for_transaction(tx.as_ref());
         let gossip = hyperscale_messages::TransactionGossip::from_arc(Arc::clone(tx));
 
         shards

@@ -187,6 +187,10 @@ impl ConsensusExecutionReceipt for LedgerTransactionReceipt {
     fn is_success(&self) -> bool {
         self.outcome == LedgerTransactionOutcome::Success
     }
+
+    fn failure() -> Self {
+        LedgerTransactionReceipt::failure()
+    }
 }
 
 // ─── Local Execution (Tier 3) ────────────────────────────────────────────────

@@ -15,7 +15,9 @@ use hyperscale_messages::request::{GetCertificatesRequest, GetTransactionsReques
 use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ConsensusStore;
-use hyperscale_types::{Hash, RoutableTransaction, TransactionCertificate, ValidatorId};
+use hyperscale_types::{
+    ConcreteConfig, ConsensusTransaction, Hash, TransactionCertificate, TypeConfig, ValidatorId,
+};
 use quick_cache::sync::Cache as QuickCache;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -77,7 +79,7 @@ pub struct FetchStatus {
 
 /// Inputs to the fetch protocol state machine.
 #[derive(Debug)]
-pub enum FetchInput {
+pub enum FetchInput<C: TypeConfig = ConcreteConfig> {
     /// Request transactions for a pending block.
     RequestTransactions {
         block_hash: Hash,
@@ -93,7 +95,7 @@ pub enum FetchInput {
     /// Transactions were received for a block.
     TransactionsReceived {
         block_hash: Hash,
-        transactions: Vec<Arc<RoutableTransaction>>,
+        transactions: Vec<Arc<C::Transaction>>,
     },
     /// Certificates were received for a block.
     CertificatesReceived {
@@ -114,7 +116,7 @@ pub enum FetchInput {
 
 /// Outputs from the fetch protocol state machine.
 #[derive(Debug)]
-pub enum FetchOutput {
+pub enum FetchOutput<C: TypeConfig = ConcreteConfig> {
     /// Request the runner to fetch transactions.
     FetchTransactions {
         block_hash: Hash,
@@ -130,7 +132,7 @@ pub enum FetchOutput {
     /// Deliver fetched transactions to BFT.
     DeliverTransactions {
         block_hash: Hash,
-        transactions: Vec<Arc<RoutableTransaction>>,
+        transactions: Vec<Arc<C::Transaction>>,
     },
     /// Deliver fetched certificates to BFT.
     DeliverCertificates {
@@ -220,7 +222,7 @@ impl FetchProtocol {
     }
 
     /// Process an input and return outputs.
-    pub fn handle(&mut self, input: FetchInput) -> Vec<FetchOutput> {
+    pub fn handle<C: TypeConfig>(&mut self, input: FetchInput<C>) -> Vec<FetchOutput<C>> {
         match input {
             FetchInput::RequestTransactions {
                 block_hash,
@@ -235,11 +237,11 @@ impl FetchProtocol {
             FetchInput::TransactionsReceived {
                 block_hash,
                 transactions,
-            } => self.handle_transactions_received(block_hash, transactions),
+            } => self.handle_transactions_received::<C>(block_hash, transactions),
             FetchInput::CertificatesReceived {
                 block_hash,
                 certificates,
-            } => self.handle_certificates_received(block_hash, certificates),
+            } => self.handle_certificates_received::<C>(block_hash, certificates),
             FetchInput::FetchFailed {
                 block_hash,
                 kind,
@@ -275,12 +277,12 @@ impl FetchProtocol {
     // Input Handlers
     // ═══════════════════════════════════════════════════════════════════════
 
-    fn handle_request_transactions(
+    fn handle_request_transactions<C: TypeConfig>(
         &mut self,
         block_hash: Hash,
         proposer: ValidatorId,
         tx_hashes: Vec<Hash>,
-    ) -> Vec<FetchOutput> {
+    ) -> Vec<FetchOutput<C>> {
         if tx_hashes.is_empty() {
             return vec![];
         }
@@ -307,12 +309,12 @@ impl FetchProtocol {
         vec![]
     }
 
-    fn handle_request_certificates(
+    fn handle_request_certificates<C: TypeConfig>(
         &mut self,
         block_hash: Hash,
         proposer: ValidatorId,
         cert_hashes: Vec<Hash>,
-    ) -> Vec<FetchOutput> {
+    ) -> Vec<FetchOutput<C>> {
         if cert_hashes.is_empty() {
             return vec![];
         }
@@ -339,11 +341,11 @@ impl FetchProtocol {
         vec![]
     }
 
-    fn handle_transactions_received(
+    fn handle_transactions_received<C: TypeConfig>(
         &mut self,
         block_hash: Hash,
-        transactions: Vec<Arc<RoutableTransaction>>,
-    ) -> Vec<FetchOutput> {
+        transactions: Vec<Arc<C::Transaction>>,
+    ) -> Vec<FetchOutput<C>> {
         let Some(state) = self.tx_fetches.get_mut(&block_hash) else {
             trace!(?block_hash, "Transactions received for unknown fetch");
             return vec![];
@@ -351,7 +353,7 @@ impl FetchProtocol {
 
         state.mark_fetch_complete();
 
-        let received_hashes: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
+        let received_hashes: Vec<Hash> = transactions.iter().map(|tx| tx.tx_hash()).collect();
         let received_count = received_hashes.len();
         state.mark_received(received_hashes);
         metrics::record_fetch_items_received("transaction", received_count);
@@ -381,11 +383,11 @@ impl FetchProtocol {
         outputs
     }
 
-    fn handle_certificates_received(
+    fn handle_certificates_received<C: TypeConfig>(
         &mut self,
         block_hash: Hash,
         certificates: Vec<TransactionCertificate>,
-    ) -> Vec<FetchOutput> {
+    ) -> Vec<FetchOutput<C>> {
         let Some(state) = self.cert_fetches.get_mut(&block_hash) else {
             trace!(?block_hash, "Certificates received for unknown fetch");
             return vec![];
@@ -423,12 +425,12 @@ impl FetchProtocol {
         outputs
     }
 
-    fn handle_fetch_failed(
+    fn handle_fetch_failed<C: TypeConfig>(
         &mut self,
         block_hash: Hash,
         kind: FetchKind,
         hashes: Vec<Hash>,
-    ) -> Vec<FetchOutput> {
+    ) -> Vec<FetchOutput<C>> {
         let state = match kind {
             FetchKind::Transaction => self.tx_fetches.get_mut(&block_hash),
             FetchKind::Certificate => self.cert_fetches.get_mut(&block_hash),
@@ -443,7 +445,7 @@ impl FetchProtocol {
     }
 
     /// Spawn pending fetch operations across all blocks.
-    fn spawn_pending_fetches(&mut self) -> Vec<FetchOutput> {
+    fn spawn_pending_fetches<C: TypeConfig>(&mut self) -> Vec<FetchOutput<C>> {
         let mut outputs = Vec::new();
 
         // Transaction fetches
@@ -517,9 +519,11 @@ const MAX_ITEMS_PER_RESPONSE: usize = 500;
 ///
 /// Checks the in-memory cache first (for recently received but not yet
 /// committed transactions), then falls back to storage.
-pub fn serve_transaction_request(
-    storage: &impl ConsensusStore,
-    tx_cache: &QuickCache<Hash, Arc<RoutableTransaction>>,
+pub fn serve_transaction_request<
+    C: TypeConfig<Transaction = hyperscale_types::RoutableTransaction>,
+>(
+    storage: &impl ConsensusStore<C>,
+    tx_cache: &QuickCache<Hash, Arc<C::Transaction>>,
     req: GetTransactionsRequest,
 ) -> GetTransactionsResponse {
     let requested_count = req.tx_hashes.len();
@@ -569,8 +573,10 @@ pub fn serve_transaction_request(
 /// Checks the in-memory cache first (for recently built but not yet
 /// persisted certificates), then falls back to storage. Includes ledger
 /// receipts for each found certificate.
-pub fn serve_certificate_request(
-    storage: &impl ConsensusStore,
+pub fn serve_certificate_request<
+    C: TypeConfig<ExecutionReceipt = hyperscale_types::LedgerTransactionReceipt>,
+>(
+    storage: &impl ConsensusStore<C>,
     cert_cache: &QuickCache<Hash, Arc<TransactionCertificate>>,
     req: GetCertificatesRequest,
 ) -> GetCertificatesResponse {
@@ -645,14 +651,14 @@ mod tests {
             Hash::from_bytes(b"tx2_hash_data_here"),
         ];
 
-        protocol.handle(FetchInput::RequestTransactions {
+        protocol.handle::<ConcreteConfig>(FetchInput::RequestTransactions {
             block_hash,
             proposer: ValidatorId(1),
             tx_hashes: hashes.clone(),
         });
 
         // Tick should emit FetchTransactions
-        let outputs = protocol.handle(FetchInput::Tick);
+        let outputs = protocol.handle::<ConcreteConfig>(FetchInput::Tick);
         assert!(!outputs.is_empty());
         assert!(outputs
             .iter()

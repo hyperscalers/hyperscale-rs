@@ -7,10 +7,14 @@ use crate::protocol::sync::SyncOutput;
 use hyperscale_core::{NodeConfig, NodeInput, ProtocolEvent, TimerId};
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ConsensusStore;
-use hyperscale_types::BlockHeight;
+use hyperscale_types::{BlockHeight, LedgerTransactionReceipt, RoutableTransaction, TypeConfig};
 use std::time::Duration;
 
-impl<Cfg: NodeConfig> IoLoop<Cfg> {
+impl<Cfg: NodeConfig> IoLoop<Cfg>
+where
+    Cfg::C:
+        TypeConfig<Transaction = RoutableTransaction, ExecutionReceipt = LedgerTransactionReceipt>,
+{
     /// Interval for the periodic fetch tick timer.
     const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -93,7 +97,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     ///
     /// FetchTransactions/FetchCertificates use the Network trait to make requests.
     /// DeliverTransactions/DeliverCertificates feed events directly to the state machine.
-    pub(super) fn process_fetch_outputs(&mut self, outputs: Vec<FetchOutput>) {
+    pub(super) fn process_fetch_outputs(&mut self, outputs: Vec<FetchOutput<Cfg::C>>) {
         for output in outputs {
             match output {
                 FetchOutput::FetchTransactions {

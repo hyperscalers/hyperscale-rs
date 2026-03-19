@@ -50,4 +50,12 @@ impl TypeConfig for RadixConfig {
     ) -> DatabaseUpdates {
         hyperscale_execution::handlers::filter_to_declared_writes(update, declared_writes)
     }
+
+    fn extract_write_nodes(update: &DatabaseUpdates) -> Vec<NodeId> {
+        hyperscale_execution::handlers::extract_write_nodes(update)
+    }
+
+    fn receipt_to_state_update(receipt: &LedgerTransactionReceipt) -> DatabaseUpdates {
+        hyperscale_storage::receipt_to_database_updates(receipt)
+    }
 }

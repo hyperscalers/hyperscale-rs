@@ -39,9 +39,10 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::CommitStore;
 use hyperscale_types::{
-    Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
-    ExecutionVote, Hash, QuorumCertificate, ReceiptBundle, ShardGroupId, TopologySnapshot,
-    TransactionCertificate, TypeConfig, ValidatorId,
+    Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ConsensusTransaction,
+    ExecutionCertificate, ExecutionVote, Hash, LedgerTransactionReceipt, QuorumCertificate,
+    ReceiptBundle, RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionCertificate,
+    TypeConfig, ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -214,7 +215,11 @@ pub struct IoLoop<Cfg: NodeConfig> {
     pending_timer_ops: Vec<TimerOp>,
 }
 
-impl<Cfg: NodeConfig> IoLoop<Cfg> {
+impl<Cfg: NodeConfig> IoLoop<Cfg>
+where
+    Cfg::C:
+        TypeConfig<Transaction = RoutableTransaction, ExecutionReceipt = LedgerTransactionReceipt>,
+{
     /// Create a new IoLoop.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -447,7 +452,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 tx,
                 submitted_locally,
             } => {
-                let tx_hash = tx.hash();
+                let tx_hash = tx.tx_hash();
                 self.pending_validation.remove(&tx_hash);
                 let is_local = submitted_locally || self.locally_submitted.remove(&tx_hash);
                 self.tx_cache.insert(tx_hash, Arc::clone(&tx));
@@ -468,7 +473,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
 
             // Intercept gossip-received transactions for validation.
             NodeInput::Protocol(ProtocolEvent::TransactionGossipReceived { tx, .. }) => {
-                let tx_hash = tx.hash();
+                let tx_hash = tx.tx_hash();
                 if self.tx_cache.get(&tx_hash).is_none()
                     && !self.state.mempool().is_tombstoned(&tx_hash)
                 {
@@ -478,17 +483,18 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
             }
 
             NodeInput::SubmitTransaction { tx } => {
-                let tx_hash = tx.hash();
+                let tx_hash = tx.tx_hash();
 
                 // Gossip to all relevant shards (reads + writes).
                 let shards: std::collections::BTreeSet<ShardGroupId> = tx
-                    .declared_reads
+                    .reads()
                     .iter()
-                    .chain(tx.declared_writes.iter())
+                    .chain(tx.writes().iter())
                     .map(|node_id| hyperscale_types::shard_for_node(node_id, self.num_shards))
                     .collect();
                 for shard in shards {
-                    let gossip: TransactionGossip = TransactionGossip::from_arc(Arc::clone(&tx));
+                    let gossip: TransactionGossip<Cfg::C> =
+                        TransactionGossip::from_arc(Arc::clone(&tx));
                     self.network.broadcast_to_shard(shard, &gossip);
                 }
 

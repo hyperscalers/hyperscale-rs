@@ -5,8 +5,8 @@
 
 use crate::tracker::{CommittedCrossShardTracker, ProvisionTracker, RemoteStateNeeds};
 use hyperscale_types::{
-    BlockHeight, CommitmentProof, ConsensusTransaction, DeferReason, Hash, NodeId,
-    RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionDefer, TypeConfig,
+    BlockHeight, CommitmentProof, ConsensusTransaction, DeferReason, Hash, NodeId, ShardGroupId,
+    TopologySnapshot, TransactionDefer, TypeConfig,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -122,37 +122,7 @@ impl LivelockState {
     ///
     /// Registers the transaction for cycle detection by tracking which
     /// shards and specific nodes it needs provisions from.
-    pub fn on_cross_shard_committed(
-        &mut self,
-        topology: &TopologySnapshot,
-        tx: &RoutableTransaction,
-        height: BlockHeight,
-    ) {
-        let tx_hash = tx.hash();
-
-        // Determine which shards and nodes we need provisions from
-        let needs = self.compute_remote_state_needs(topology, tx);
-
-        if needs.shards.is_empty() {
-            // Not actually cross-shard, nothing to track
-            return;
-        }
-
-        debug!(
-            tx_hash = %tx_hash,
-            height = height.0,
-            shards = ?needs.shards,
-            "Tracking committed cross-shard TX for cycle detection"
-        );
-
-        self.committed_tracker.add(tx_hash, needs);
-    }
-
-    /// Generic version of `on_cross_shard_committed` using [`ConsensusTransaction`] operations.
-    ///
-    /// Registers a cross-shard transaction for cycle detection using generic
-    /// transaction accessors instead of direct field access.
-    pub fn on_cross_shard_committed_generic<T: ConsensusTransaction>(
+    pub fn on_cross_shard_committed<T: ConsensusTransaction>(
         &mut self,
         topology: &TopologySnapshot,
         tx: &T,
@@ -178,41 +148,6 @@ impl LivelockState {
         );
 
         self.committed_tracker.add(tx_hash, needs);
-    }
-
-    /// Compute which remote shards and nodes a transaction needs provisions from.
-    fn compute_remote_state_needs(
-        &self,
-        topology: &TopologySnapshot,
-        tx: &RoutableTransaction,
-    ) -> RemoteStateNeeds {
-        let local_shard = topology.local_shard();
-
-        // Collect all reads and writes, grouped by shard
-        let mut nodes_by_shard: HashMap<ShardGroupId, HashSet<NodeId>> = HashMap::new();
-
-        // Add read nodes (provisions come from read shards)
-        for node_id in &tx.declared_reads {
-            let shard = topology.shard_for_node_id(node_id);
-            if shard != local_shard {
-                nodes_by_shard.entry(shard).or_default().insert(*node_id);
-            }
-        }
-
-        // Add write nodes from remote shards (for read-your-writes scenarios)
-        for node_id in &tx.declared_writes {
-            let shard = topology.shard_for_node_id(node_id);
-            if shard != local_shard {
-                nodes_by_shard.entry(shard).or_default().insert(*node_id);
-            }
-        }
-
-        let shards = nodes_by_shard.keys().copied().collect();
-
-        RemoteStateNeeds {
-            shards,
-            nodes_by_shard,
-        }
     }
 
     /// Compute remote state needs from pre-extracted read/write node lists.
@@ -538,14 +473,6 @@ impl LivelockState {
                 "Cleaned up expired tombstones"
             );
         }
-    }
-
-    /// Check if a transaction is cross-shard (needs provisions from other shards).
-    pub fn is_cross_shard(&self, topology: &TopologySnapshot, tx: &RoutableTransaction) -> bool {
-        !self
-            .compute_remote_state_needs(topology, tx)
-            .shards
-            .is_empty()
     }
 
     /// Get statistics for metrics.

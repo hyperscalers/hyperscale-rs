@@ -5,8 +5,7 @@
 //! and receipts. `ExecutionOutput<C>` is a batch wrapper.
 
 use hyperscale_types::{
-    ConcreteConfig, DatabaseUpdates, Hash, LedgerTransactionReceipt, LocalTransactionExecution,
-    TypeConfig,
+    ConcreteConfig, ConsensusExecutionReceipt, Hash, LocalTransactionExecution, TypeConfig,
 };
 
 /// Output from executing a batch of transactions.
@@ -114,21 +113,16 @@ impl<C: TypeConfig> SingleTxResult<C> {
     }
 }
 
-/// Create a failure result with default receipt and empty state.
-///
-/// Available for any TypeConfig whose associated types match the Radix
-/// concrete types (`LedgerTransactionReceipt`, `DatabaseUpdates`).
-impl<C> SingleTxResult<C>
-where
-    C: TypeConfig<ExecutionReceipt = LedgerTransactionReceipt, StateUpdate = DatabaseUpdates>,
-{
+impl<C: TypeConfig> SingleTxResult<C> {
     /// Create a failed result with default empty receipt.
     pub fn failure(tx_hash: Hash, error: impl Into<String>) -> Self {
+        let receipt = C::ExecutionReceipt::failure();
+        let receipt_hash = receipt.consensus_receipt_hash();
         Self {
             tx_hash,
             success: false,
-            receipt_hash: LedgerTransactionReceipt::failure().receipt_hash(),
-            receipt: LedgerTransactionReceipt::failure(),
+            receipt_hash,
+            receipt,
             local_execution: LocalTransactionExecution::failure(None),
             state_update: Default::default(),
             error: Some(error.into()),

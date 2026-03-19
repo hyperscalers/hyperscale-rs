@@ -17,7 +17,10 @@ use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ConsensusStore;
-use hyperscale_types::{Block, ConcreteConfig, Hash, QuorumCertificate, TypeConfig};
+use hyperscale_types::{
+    Block, ConcreteConfig, Hash, LedgerTransactionReceipt, QuorumCertificate, RoutableTransaction,
+    TypeConfig,
+};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -379,8 +382,10 @@ impl SyncProtocol {
 ///
 /// Includes ledger receipts for each certificate in the block so the
 /// syncing peer can apply state changes without re-executing.
-pub fn serve_block_request(
-    storage: &(impl ConsensusStore + ?Sized),
+pub fn serve_block_request<
+    C: TypeConfig<Transaction = RoutableTransaction, ExecutionReceipt = LedgerTransactionReceipt>,
+>(
+    storage: &(impl ConsensusStore<C> + ?Sized),
     req: GetBlockRequest,
 ) -> GetBlockResponse {
     trace!(height = req.height.0, "Handling block sync request");
@@ -409,7 +414,7 @@ pub fn serve_block_request(
                 return GetBlockResponse::not_found();
             }
 
-            GetBlockResponse::found(block, qc, ledger_receipts)
+            GetBlockResponse::found(block.reconfig::<ConcreteConfig>(), qc, ledger_receipts)
         }
         None => GetBlockResponse::not_found(),
     }

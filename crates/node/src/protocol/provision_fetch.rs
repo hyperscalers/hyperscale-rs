@@ -14,7 +14,9 @@
 use hyperscale_messages::request::GetProvisionsRequest;
 use hyperscale_messages::response::GetProvisionsResponse;
 use hyperscale_storage::{ConsensusStore, SubstateStore};
-use hyperscale_types::{BlockHeight, ShardGroupId, StateProvision, ValidatorId};
+use hyperscale_types::{
+    BlockHeight, ConsensusTransaction, ShardGroupId, StateProvision, TypeConfig, ValidatorId,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
@@ -346,8 +348,8 @@ impl ProvisionFetchProtocol {
 ///
 /// Takes `local_shard` and `num_shards` instead of `&TopologyState`
 /// to avoid topology dependency in the I/O layer.
-pub fn serve_provision_request(
-    storage: &(impl ConsensusStore + SubstateStore),
+pub fn serve_provision_request<C: TypeConfig>(
+    storage: &(impl ConsensusStore<C> + SubstateStore),
     local_shard: ShardGroupId,
     num_shards: u64,
     req: GetProvisionsRequest,
@@ -380,21 +382,18 @@ pub fn serve_provision_request(
 
     for tx in all_txs {
         // Check if this transaction involves the requesting target shard
-        let involves_target = tx
-            .declared_reads
-            .iter()
-            .chain(tx.declared_writes.iter())
-            .any(|node_id| {
-                hyperscale_types::shard_for_node(node_id, num_shards) == req.target_shard
-            });
+        let reads = tx.reads();
+        let writes = tx.writes();
+        let involves_target = reads.iter().chain(writes.iter()).any(|node_id| {
+            hyperscale_types::shard_for_node(node_id, num_shards) == req.target_shard
+        });
         if !involves_target {
             continue;
         }
 
-        let mut owned_nodes: Vec<_> = tx
-            .declared_reads
+        let mut owned_nodes: Vec<_> = reads
             .iter()
-            .chain(tx.declared_writes.iter())
+            .chain(writes.iter())
             .filter(|&node_id| hyperscale_types::shard_for_node(node_id, num_shards) == local_shard)
             .copied()
             .collect();
@@ -420,7 +419,7 @@ pub fn serve_provision_request(
         let merkle_proofs = storage.generate_merkle_proofs(&storage_keys, jmt_version);
 
         provisions.push(StateProvision {
-            transaction_hash: tx.hash(),
+            transaction_hash: tx.tx_hash(),
             target_shard: req.target_shard,
             source_shard: local_shard,
             block_height: req.block_height,

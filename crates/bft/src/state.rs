@@ -928,8 +928,8 @@ impl<C: TypeConfig> BftState<C> {
             .chain(priority_transactions.iter())
             .chain(other_transactions.iter())
         {
-            if !topology.is_single_shard_transaction_generic(tx.as_ref()) {
-                for shard in topology.all_shards_for_transaction_generic(tx.as_ref()) {
+            if !topology.is_single_shard_transaction(tx.as_ref()) {
+                for shard in topology.all_shards_for_transaction(tx.as_ref()) {
                     if shard != local_shard {
                         provision_target_set.insert(shard);
                     }
@@ -2135,8 +2135,8 @@ impl<C: TypeConfig> BftState<C> {
         let local_shard = topology.local_shard();
         let mut expected = std::collections::BTreeSet::new();
         for tx in block.all_transactions() {
-            if !topology.is_single_shard_transaction_generic(tx.as_ref()) {
-                for shard in topology.all_shards_for_transaction_generic(tx.as_ref()) {
+            if !topology.is_single_shard_transaction(tx.as_ref()) {
+                for shard in topology.all_shards_for_transaction(tx.as_ref()) {
                     if shard != local_shard {
                         expected.insert(shard);
                     }

@@ -7,8 +7,7 @@
 
 use crate::{
     BlockHeight, Bls12381G1PublicKey, ConsensusTransaction, EpochConfig, EpochId, NodeId,
-    RoutableTransaction, ShardCommitteeConfig, ShardGroupId, ValidatorId, ValidatorSet,
-    ValidatorShardState, VotePower,
+    ShardCommitteeConfig, ShardGroupId, ValidatorId, ValidatorSet, ValidatorShardState, VotePower,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -386,17 +385,7 @@ impl TopologySnapshot {
     }
 
     /// Compute write shards for a transaction.
-    pub fn consensus_shards(&self, tx: &RoutableTransaction) -> Vec<ShardGroupId> {
-        tx.declared_writes
-            .iter()
-            .map(|node_id| self.shard_for_node_id(node_id))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-
-    /// Generic: compute write shards for a transaction using [`ConsensusTransaction`] operations.
-    pub fn consensus_shards_generic<T: ConsensusTransaction>(&self, tx: &T) -> Vec<ShardGroupId> {
+    pub fn consensus_shards(&self, tx: &impl ConsensusTransaction) -> Vec<ShardGroupId> {
         let writes = tx.writes();
         writes
             .iter()
@@ -407,27 +396,7 @@ impl TopologySnapshot {
     }
 
     /// Compute read-only shards for a transaction.
-    pub fn provisioning_shards(&self, tx: &RoutableTransaction) -> Vec<ShardGroupId> {
-        let write_shards: BTreeSet<_> = tx
-            .declared_writes
-            .iter()
-            .map(|node_id| self.shard_for_node_id(node_id))
-            .collect();
-
-        tx.declared_reads
-            .iter()
-            .map(|node_id| self.shard_for_node_id(node_id))
-            .filter(|shard| !write_shards.contains(shard))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-
-    /// Generic: compute read-only shards for a transaction using [`ConsensusTransaction`] operations.
-    pub fn provisioning_shards_generic<T: ConsensusTransaction>(
-        &self,
-        tx: &T,
-    ) -> Vec<ShardGroupId> {
+    pub fn provisioning_shards(&self, tx: &impl ConsensusTransaction) -> Vec<ShardGroupId> {
         let writes = tx.writes();
         let reads = tx.reads();
         let write_shards: BTreeSet<_> = writes
@@ -445,46 +414,20 @@ impl TopologySnapshot {
     }
 
     /// Check if a transaction is cross-shard.
-    pub fn is_cross_shard_transaction(&self, tx: &RoutableTransaction) -> bool {
+    pub fn is_cross_shard_transaction(&self, tx: &impl ConsensusTransaction) -> bool {
         self.consensus_shards(tx).len() > 1
     }
 
-    /// Generic: check if a transaction is cross-shard using [`ConsensusTransaction`] operations.
-    pub fn is_cross_shard_transaction_generic<T: ConsensusTransaction>(&self, tx: &T) -> bool {
-        self.consensus_shards_generic(tx).len() > 1
-    }
-
     /// Check if a transaction is single-shard.
-    pub fn is_single_shard_transaction(&self, tx: &RoutableTransaction) -> bool {
+    pub fn is_single_shard_transaction(&self, tx: &impl ConsensusTransaction) -> bool {
         self.consensus_shards(tx).len() <= 1
     }
 
-    /// Generic: check if a transaction is single-shard using [`ConsensusTransaction`] operations.
-    pub fn is_single_shard_transaction_generic<T: ConsensusTransaction>(&self, tx: &T) -> bool {
-        let writes = tx.writes();
-        let shards: std::collections::BTreeSet<_> = writes
-            .iter()
-            .map(|node_id| self.shard_for_node_id(node_id))
-            .collect();
-        shards.len() <= 1
-    }
-
     /// Get all shards involved in a transaction (both consensus and provisioning).
-    pub fn all_shards_for_transaction(&self, tx: &RoutableTransaction) -> Vec<ShardGroupId> {
-        let consensus = self.consensus_shards(tx);
-        let provisioning = self.provisioning_shards(tx);
-        let all: BTreeSet<_> = consensus.into_iter().chain(provisioning).collect();
-        all.into_iter().collect()
-    }
-
-    /// Generic: get all shards involved in a transaction using [`ConsensusTransaction`] operations.
-    pub fn all_shards_for_transaction_generic<T: ConsensusTransaction>(
-        &self,
-        tx: &T,
-    ) -> Vec<ShardGroupId> {
+    pub fn all_shards_for_transaction(&self, tx: &impl ConsensusTransaction) -> Vec<ShardGroupId> {
         let reads = tx.reads();
         let writes = tx.writes();
-        let all: std::collections::BTreeSet<_> = reads
+        let all: BTreeSet<_> = reads
             .iter()
             .chain(writes.iter())
             .map(|node_id| self.shard_for_node_id(node_id))
@@ -493,17 +436,7 @@ impl TopologySnapshot {
     }
 
     /// Check if a transaction involves the local shard for consensus.
-    pub fn involves_local_shard_for_consensus(&self, tx: &RoutableTransaction) -> bool {
-        tx.declared_writes
-            .iter()
-            .any(|node_id| self.shard_for_node_id(node_id) == self.local_shard)
-    }
-
-    /// Generic: check if a transaction involves the local shard for consensus using [`ConsensusTransaction`] operations.
-    pub fn involves_local_shard_for_consensus_generic<T: ConsensusTransaction>(
-        &self,
-        tx: &T,
-    ) -> bool {
+    pub fn involves_local_shard_for_consensus(&self, tx: &impl ConsensusTransaction) -> bool {
         let writes = tx.writes();
         writes
             .iter()
@@ -511,16 +444,7 @@ impl TopologySnapshot {
     }
 
     /// Check if this shard is involved in a transaction at all.
-    pub fn involves_local_shard(&self, tx: &RoutableTransaction) -> bool {
-        let local = self.local_shard;
-        tx.declared_writes
-            .iter()
-            .chain(tx.declared_reads.iter())
-            .any(|node_id| self.shard_for_node_id(node_id) == local)
-    }
-
-    /// Generic: check if this shard is involved in a transaction at all using [`ConsensusTransaction`] operations.
-    pub fn involves_local_shard_generic<T: ConsensusTransaction>(&self, tx: &T) -> bool {
+    pub fn involves_local_shard(&self, tx: &impl ConsensusTransaction) -> bool {
         let local = self.local_shard;
         let reads = tx.reads();
         let writes = tx.writes();

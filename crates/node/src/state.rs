@@ -586,7 +586,7 @@ impl<C: TypeConfig> NodeStateMachine<C> {
         // Must happen BEFORE livelock.on_block_committed() processes deferrals.
         for tx in block.all_transactions() {
             if tx.is_cross_shard(num_shards) {
-                self.livelock.on_cross_shard_committed_generic(
+                self.livelock.on_cross_shard_committed(
                     self.topology.snapshot(),
                     tx.as_ref(),
                     block_height,
@@ -758,11 +758,7 @@ impl<C: TypeConfig> NodeStateMachine<C> {
     ) -> Vec<Action<C>> {
         // Only add to our mempool if this transaction involves our shard.
         // Cross-shard transactions that don't touch our shard should be ignored.
-        if !self
-            .topology
-            .snapshot()
-            .involves_local_shard_generic(tx.as_ref())
-        {
+        if !self.topology.snapshot().involves_local_shard(tx.as_ref()) {
             return vec![];
         }
 

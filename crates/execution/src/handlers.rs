@@ -17,7 +17,7 @@ use hyperscale_types::{
     batch_verify_bls_different_messages, batch_verify_bls_same_message, exec_vote_message,
     verify_bls12381_v1, zero_bls_signature, Bls12381G1PrivateKey, Bls12381G1PublicKey,
     Bls12381G2Signature, ConsensusTransaction, ExecutionCertificate, ExecutionVote, Hash, NodeId,
-    RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision, ValidatorId,
+    ShardGroupId, SignerBitfield, StateProvision, ValidatorId,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -307,31 +307,28 @@ pub fn batch_verify_execution_certificate_signatures(
 pub fn execute_and_sign_single_shard<C, E, S>(
     executor: &E,
     storage: &S,
-    tx: &Arc<RoutableTransaction>,
+    tx: &Arc<C::Transaction>,
     signing_key: &Bls12381G1PrivateKey,
     local_shard: ShardGroupId,
     validator_id: ValidatorId,
 ) -> (ExecutionVote, SingleTxResult<C>)
 where
-    C: hyperscale_types::TypeConfig<
-        Transaction = RoutableTransaction,
-        StateUpdate = hyperscale_storage::DatabaseUpdates,
-        ExecutionReceipt = hyperscale_types::LedgerTransactionReceipt,
-    >,
+    C: hyperscale_types::TypeConfig,
     E: ExecutionBackend<C>,
     S: SubstateStore,
 {
+    let tx_hash = tx.tx_hash();
     let result = match executor.execute_single_shard(storage, std::slice::from_ref(tx)) {
         Ok(output) => {
             if let Some(r) = output.results.first() {
                 r.clone()
             } else {
-                SingleTxResult::failure(tx.hash(), "No execution result returned")
+                SingleTxResult::failure(tx_hash, "No execution result returned")
             }
         }
         Err(e) => {
-            tracing::warn!(tx_hash = ?tx.hash(), error = %e, "Transaction execution failed");
-            SingleTxResult::failure(tx.hash(), e.to_string())
+            tracing::warn!(?tx_hash, error = %e, "Transaction execution failed");
+            SingleTxResult::failure(tx_hash, e.to_string())
         }
     };
 
@@ -340,7 +337,7 @@ where
     let declared_writes = tx.writes();
     result.state_update = C::filter_state_update_to_writes(&result.state_update, &declared_writes);
 
-    let write_nodes = extract_write_nodes(&result.state_update);
+    let write_nodes = C::extract_write_nodes(&result.state_update);
 
     // Sign immediately after execution
     let message = exec_vote_message(
@@ -377,18 +374,14 @@ pub fn execute_and_sign_cross_shard<C, E, S>(
     executor: &E,
     storage: &S,
     tx_hash: Hash,
-    transaction: &Arc<RoutableTransaction>,
+    transaction: &Arc<C::Transaction>,
     provisions: &[StateProvision],
     signing_key: &Bls12381G1PrivateKey,
     local_shard: ShardGroupId,
     validator_id: ValidatorId,
 ) -> (ExecutionVote, SingleTxResult<C>)
 where
-    C: hyperscale_types::TypeConfig<
-        Transaction = RoutableTransaction,
-        StateUpdate = hyperscale_storage::DatabaseUpdates,
-        ExecutionReceipt = hyperscale_types::LedgerTransactionReceipt,
-    >,
+    C: hyperscale_types::TypeConfig,
     E: ExecutionBackend<C>,
     S: SubstateStore,
 {
@@ -415,7 +408,7 @@ where
     let declared_writes = transaction.writes();
     result.state_update = C::filter_state_update_to_writes(&result.state_update, &declared_writes);
 
-    let write_nodes = extract_write_nodes(&result.state_update);
+    let write_nodes = C::extract_write_nodes(&result.state_update);
 
     // Sign immediately after execution
     let message = exec_vote_message(

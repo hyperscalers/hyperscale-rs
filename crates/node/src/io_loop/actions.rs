@@ -15,7 +15,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
-impl<Cfg: NodeConfig> IoLoop<Cfg> {
+impl<Cfg: NodeConfig> IoLoop<Cfg>
+where
+    Cfg::C: hyperscale_types::TypeConfig<
+        Transaction = hyperscale_types::RoutableTransaction,
+        ExecutionReceipt = hyperscale_types::LedgerTransactionReceipt,
+    >,
+{
     // ─── Action Processing ──────────────────────────────────────────────
 
     /// Process a single action from the state machine.
@@ -365,8 +371,9 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                     hash: block_hash,
                     qc: qc.clone(),
                 };
-                // Empty blocks have no certificate writes — pass empty DatabaseUpdates.
-                let empty_updates = hyperscale_types::DatabaseUpdates::default();
+                // Empty blocks have no certificate writes — pass empty state update.
+                let empty_updates =
+                    <<Cfg::C as hyperscale_types::TypeConfig>::StateUpdate>::default();
                 let result = CommitStore::<Cfg::C>::commit_block(
                     &*self.storage,
                     &empty_updates,
@@ -461,7 +468,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 } else if !block.certificates.is_empty() {
                     // Sync path: no execution cache, reconstruct DatabaseUpdates
                     // from receipts stored during sync.
-                    let per_cert: Vec<hyperscale_types::DatabaseUpdates> = block
+                    let per_cert: Vec<<Cfg::C as hyperscale_types::TypeConfig>::StateUpdate> = block
                         .certificates
                         .iter()
                         .map(|cert| {
@@ -476,7 +483,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                                     cert.transaction_hash, height.0,
                                 )
                             });
-                            let updates = hyperscale_storage::receipt_to_database_updates(&receipt);
+                            let updates = <Cfg::C as hyperscale_types::TypeConfig>::receipt_to_state_update(&receipt);
                             <Cfg::C as hyperscale_types::TypeConfig>::filter_state_update_to_shard(
                                 &updates,
                                 local_shard,
@@ -495,7 +502,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                     )
                 } else {
                     // Empty block: no updates needed.
-                    let empty_updates = hyperscale_types::DatabaseUpdates::default();
+                    let empty_updates = <<Cfg::C as hyperscale_types::TypeConfig>::StateUpdate>::default();
                     CommitStore::<Cfg::C>::commit_block(
                         &*storage,
                         &empty_updates,
@@ -570,12 +577,13 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 proposer,
                 tx_hashes,
             } => {
-                self.fetch_protocol.handle(FetchInput::RequestTransactions {
-                    block_hash,
-                    proposer,
-                    tx_hashes,
-                });
-                let outputs = self.fetch_protocol.handle(FetchInput::Tick);
+                self.fetch_protocol
+                    .handle::<Cfg::C>(FetchInput::RequestTransactions {
+                        block_hash,
+                        proposer,
+                        tx_hashes,
+                    });
+                let outputs = self.fetch_protocol.handle::<Cfg::C>(FetchInput::Tick);
                 self.process_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
             }
@@ -584,18 +592,19 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 proposer,
                 cert_hashes,
             } => {
-                self.fetch_protocol.handle(FetchInput::RequestCertificates {
-                    block_hash,
-                    proposer,
-                    cert_hashes,
-                });
-                let outputs = self.fetch_protocol.handle(FetchInput::Tick);
+                self.fetch_protocol
+                    .handle::<Cfg::C>(FetchInput::RequestCertificates {
+                        block_hash,
+                        proposer,
+                        cert_hashes,
+                    });
+                let outputs = self.fetch_protocol.handle::<Cfg::C>(FetchInput::Tick);
                 self.process_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
             }
             Action::CancelFetch { block_hash } => {
                 self.fetch_protocol
-                    .handle(FetchInput::CancelFetch { block_hash });
+                    .handle::<Cfg::C>(FetchInput::CancelFetch { block_hash });
             }
             Action::RequestMissingProvisions {
                 source_shard,
