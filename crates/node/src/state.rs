@@ -9,9 +9,9 @@ use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommitmentProof,
-    CommittedBlockHeader, ConcreteConfig, Hash, QuorumCertificate, ReadyTransactions,
-    ReceiptBundle, ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate,
-    TransactionDefer, TypeConfig,
+    CommittedBlockHeader, ConcreteConfig, ConsensusTransaction, Hash, QuorumCertificate,
+    ReadyTransactions, ReceiptBundle, ShardGroupId, TopologySnapshot, TransactionAbort,
+    TransactionCertificate, TransactionDefer, TypeConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -254,7 +254,7 @@ impl<C: TypeConfig> NodeStateMachine<C> {
 
         // Only priority transactions have verified provisions
         for tx in &ready_txs.priority {
-            let tx_hash = C::transaction_hash(tx);
+            let tx_hash = tx.tx_hash();
             if let Some(proof) = self.provisions.build_commitment_proof(&tx_hash) {
                 proofs.insert(tx_hash, proof);
             }
@@ -585,10 +585,10 @@ impl<C: TypeConfig> NodeStateMachine<C> {
         // Register newly committed cross-shard TXs with livelock for cycle detection.
         // Must happen BEFORE livelock.on_block_committed() processes deferrals.
         for tx in block.all_transactions() {
-            if C::transaction_is_cross_shard(tx, num_shards) {
-                self.livelock.on_cross_shard_committed_generic::<C>(
+            if tx.is_cross_shard(num_shards) {
+                self.livelock.on_cross_shard_committed_generic(
                     self.topology.snapshot(),
-                    tx,
+                    tx.as_ref(),
                     block_height,
                 );
             }
@@ -614,11 +614,11 @@ impl<C: TypeConfig> NodeStateMachine<C> {
         // cleaned up so T' can execute fresh. The mempool marks T as Retried and
         // releases its locks; here we clean up execution tracking.
         for retry_tx in &block.retry_transactions {
-            let original_hash = C::transaction_original_hash(retry_tx);
+            let original_hash = retry_tx.original_hash();
             // Only cleanup if the original is different from the retry
             // (original_hash returns self.hash() for non-retries, but retry_transactions
             // should only contain actual retries)
-            if original_hash != C::transaction_hash(retry_tx) {
+            if original_hash != retry_tx.tx_hash() {
                 self.execution.cleanup_transaction(&original_hash);
             }
         }
@@ -761,12 +761,12 @@ impl<C: TypeConfig> NodeStateMachine<C> {
         if !self
             .topology
             .snapshot()
-            .involves_local_shard_generic::<C>(&tx)
+            .involves_local_shard_generic(tx.as_ref())
         {
             return vec![];
         }
 
-        let tx_hash = C::transaction_hash(&tx);
+        let tx_hash = tx.tx_hash();
         let mut actions =
             self.mempool
                 .on_transaction_gossip_arc(self.topology.snapshot(), tx, submitted_locally);

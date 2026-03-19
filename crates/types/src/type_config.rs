@@ -11,86 +11,89 @@ use crate::BlockHeight;
 use hyperscale_codec::prelude::{BasicDecode, BasicEncode};
 
 use crate::{
-    DatabaseUpdates, Hash, LedgerTransactionOutcome, LedgerTransactionReceipt, NodeId,
-    RoutableTransaction, ShardGroupId,
+    DatabaseUpdates, Hash, LedgerTransactionReceipt, NodeId, RoutableTransaction, ShardGroupId,
 };
 
-/// Core trait that parameterizes the consensus framework over
-/// application-specific types.
+// ── Trait bounds for associated types ────────────────────────────────────────
+
+/// Operations the consensus framework requires on transaction types.
 ///
-/// Crypto stays concrete (BLS12-381) — only transaction, receipt, and state
-/// update types are abstracted.
-pub trait TypeConfig: Send + Sync + 'static {
-    // ── Transaction ──
+/// Implementations provide hashing, read/write set introspection, retry
+/// lifecycle, and cross-shard classification. The framework never inspects
+/// transaction internals beyond these methods.
+pub trait ConsensusTransaction: Clone + Debug + Send + Sync + BasicEncode + BasicDecode {
+    /// Compute the content-addressed hash of this transaction.
+    fn tx_hash(&self) -> Hash;
 
-    /// Application-level transaction type.
-    /// The framework treats this as opaque — it never inspects internals.
-    type Transaction: Clone + Debug + Send + Sync + BasicEncode + BasicDecode;
+    /// Node addresses this transaction reads from.
+    fn reads(&self) -> Vec<NodeId>;
 
-    /// Receipt/result from executing a transaction.
-    type ExecutionReceipt: Clone + Send + Sync + BasicEncode + BasicDecode;
+    /// Node addresses this transaction writes to.
+    fn writes(&self) -> Vec<NodeId>;
 
-    /// State delta produced by execution.
-    /// Used in state root computation and cross-shard provisioning.
-    type StateUpdate: Clone + Send + Sync;
-
-    // ── Transaction operations ──
-
-    /// Compute the hash of a transaction.
-    fn transaction_hash(tx: &Self::Transaction) -> Hash;
-
-    /// Get the read set (node addresses this tx reads from).
-    fn transaction_reads(tx: &Self::Transaction) -> Vec<NodeId>;
-
-    /// Get the write set (node addresses this tx writes to).
-    fn transaction_writes(tx: &Self::Transaction) -> Vec<NodeId>;
-
-    /// Get all declared nodes (reads + writes combined).
-    fn transaction_all_nodes(tx: &Self::Transaction) -> Vec<NodeId> {
-        let mut nodes = Self::transaction_reads(tx);
-        nodes.extend(Self::transaction_writes(tx));
+    /// All declared nodes (reads + writes combined).
+    fn all_nodes(&self) -> Vec<NodeId> {
+        let mut nodes = self.reads();
+        nodes.extend(self.writes());
         nodes
     }
 
-    /// Check if a transaction is a retry (deferred and resubmitted).
-    fn transaction_is_retry(tx: &Self::Transaction) -> bool;
+    /// Whether this transaction is a retry of a deferred transaction.
+    fn is_retry(&self) -> bool;
 
-    /// Get the original transaction hash (before retries).
-    fn transaction_original_hash(tx: &Self::Transaction) -> Hash;
+    /// The original transaction hash (before any retries).
+    fn original_hash(&self) -> Hash;
 
-    /// Get the retry count for a transaction.
-    fn transaction_retry_count(tx: &Self::Transaction) -> u32;
+    /// How many times this transaction has been retried.
+    fn retry_count(&self) -> u32;
 
-    /// Check if a transaction has exceeded the maximum retry count.
-    fn transaction_exceeds_max_retries(tx: &Self::Transaction, max_retries: u32) -> bool {
-        Self::transaction_retry_count(tx) >= max_retries
+    /// Whether this transaction has exceeded the maximum retry count.
+    fn exceeds_max_retries(&self, max_retries: u32) -> bool {
+        self.retry_count() >= max_retries
     }
 
-    /// Create a retry transaction from a deferred transaction.
-    fn transaction_create_retry(
-        tx: &Self::Transaction,
-        deferred_by: Hash,
-        deferred_at: BlockHeight,
-    ) -> Self::Transaction;
+    /// Create a retry of this transaction with new retry metadata.
+    fn create_retry(&self, deferred_by: Hash, deferred_at: BlockHeight) -> Self;
 
-    /// Check if a transaction is cross-shard (touches multiple shards).
-    fn transaction_is_cross_shard(tx: &Self::Transaction, num_shards: u64) -> bool {
-        let reads = Self::transaction_reads(tx);
-        let writes = Self::transaction_writes(tx);
+    /// Whether this transaction touches multiple shards.
+    fn is_cross_shard(&self, num_shards: u64) -> bool {
+        let reads = self.reads();
+        let writes = self.writes();
         let mut shards = std::collections::BTreeSet::new();
         for node in reads.iter().chain(writes.iter()) {
             shards.insert(crate::shard_for_node(node, num_shards));
         }
         shards.len() > 1
     }
+}
 
-    // ── Receipt operations ──
+/// Operations the consensus framework requires on execution receipt types.
+pub trait ConsensusExecutionReceipt: Clone + Send + Sync + BasicEncode + BasicDecode {
+    /// Compute the consensus receipt hash (signed over in votes/certificates).
+    fn consensus_receipt_hash(&self) -> Hash;
 
-    /// Compute receipt hash for consensus voting.
-    fn receipt_hash(receipt: &Self::ExecutionReceipt) -> Hash;
+    /// Whether the receipt indicates successful execution.
+    fn is_success(&self) -> bool;
+}
 
-    /// Whether the receipt indicates success.
-    fn receipt_success(receipt: &Self::ExecutionReceipt) -> bool;
+/// Core trait that parameterizes the consensus framework over
+/// application-specific types.
+///
+/// Transaction and receipt operations live on their respective trait bounds
+/// ([`ConsensusTransaction`], [`ConsensusReceipt`]). Only state update
+/// operations remain here because `StateUpdate` may be a foreign type
+/// where the orphan rule prevents adding a trait impl.
+///
+/// Crypto stays concrete (BLS12-381).
+pub trait TypeConfig: Send + Sync + 'static {
+    /// Application-level transaction type.
+    type Transaction: ConsensusTransaction;
+
+    /// Receipt/result from executing a transaction.
+    type ExecutionReceipt: ConsensusExecutionReceipt;
+
+    /// State delta produced by execution.
+    type StateUpdate: Clone + Send + Sync;
 
     // ── State update operations ──
 
@@ -135,46 +138,6 @@ impl TypeConfig for ConcreteConfig {
     type Transaction = RoutableTransaction;
     type ExecutionReceipt = LedgerTransactionReceipt;
     type StateUpdate = DatabaseUpdates;
-
-    fn transaction_hash(tx: &RoutableTransaction) -> Hash {
-        tx.hash()
-    }
-
-    fn transaction_is_retry(tx: &RoutableTransaction) -> bool {
-        tx.is_retry()
-    }
-
-    fn transaction_reads(tx: &RoutableTransaction) -> Vec<NodeId> {
-        tx.declared_reads.clone()
-    }
-
-    fn transaction_writes(tx: &RoutableTransaction) -> Vec<NodeId> {
-        tx.declared_writes.clone()
-    }
-
-    fn transaction_original_hash(tx: &RoutableTransaction) -> Hash {
-        tx.original_hash()
-    }
-
-    fn transaction_retry_count(tx: &RoutableTransaction) -> u32 {
-        tx.retry_count()
-    }
-
-    fn transaction_create_retry(
-        tx: &RoutableTransaction,
-        deferred_by: Hash,
-        deferred_at: BlockHeight,
-    ) -> RoutableTransaction {
-        tx.create_retry(deferred_by, deferred_at)
-    }
-
-    fn receipt_hash(receipt: &LedgerTransactionReceipt) -> Hash {
-        receipt.consensus_receipt().receipt_hash()
-    }
-
-    fn receipt_success(receipt: &LedgerTransactionReceipt) -> bool {
-        receipt.outcome == LedgerTransactionOutcome::Success
-    }
 
     fn merge_state_updates(updates: &[DatabaseUpdates]) -> DatabaseUpdates {
         // Delegate to the merge logic in hyperscale_storage at runtime.

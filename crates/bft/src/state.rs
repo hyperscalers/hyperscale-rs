@@ -31,8 +31,9 @@ pub type NodeIndex = u32;
 use hyperscale_types::{
     block_header_message, committed_block_header_message, Block, BlockHeader, BlockHeight,
     BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommitmentProof,
-    ConcreteConfig, Hash, QuorumCertificate, ReadyTransactions, ShardGroupId, TopologySnapshot,
-    TransactionAbort, TransactionCertificate, TransactionDefer, TypeConfig, ValidatorId, VotePower,
+    ConcreteConfig, ConsensusTransaction, Hash, QuorumCertificate, ReadyTransactions, ShardGroupId,
+    TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer, TypeConfig,
+    ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -927,8 +928,8 @@ impl<C: TypeConfig> BftState<C> {
             .chain(priority_transactions.iter())
             .chain(other_transactions.iter())
         {
-            if !topology.is_single_shard_transaction_generic::<C>(tx) {
-                for shard in topology.all_shards_for_transaction_generic::<C>(tx) {
+            if !topology.is_single_shard_transaction_generic(tx.as_ref()) {
+                for shard in topology.all_shards_for_transaction_generic(tx.as_ref()) {
                     if shard != local_shard {
                         provision_target_set.insert(shard);
                     }
@@ -2076,18 +2077,18 @@ impl<C: TypeConfig> BftState<C> {
 
         // 2. Verify retry section contains only retry transactions
         for tx in &block.retry_transactions {
-            if !C::transaction_is_retry(tx) {
+            if !tx.is_retry() {
                 return Err(format!(
                     "Transaction {} in retry section but is_retry() = false",
-                    C::transaction_hash(tx)
+                    tx.tx_hash()
                 ));
             }
         }
 
         // 3. Verify priority section contains only non-retry TXs with commitment proofs
         for tx in &block.priority_transactions {
-            let tx_hash = C::transaction_hash(tx);
-            if C::transaction_is_retry(tx) {
+            let tx_hash = tx.tx_hash();
+            if tx.is_retry() {
                 return Err(format!(
                     "Retry transaction {} in priority section (should be in retry section)",
                     tx_hash
@@ -2103,8 +2104,8 @@ impl<C: TypeConfig> BftState<C> {
 
         // 4. Verify other section contains no retries and no TXs with proofs
         for tx in &block.transactions {
-            let tx_hash = C::transaction_hash(tx);
-            if C::transaction_is_retry(tx) {
+            let tx_hash = tx.tx_hash();
+            if tx.is_retry() {
                 return Err(format!(
                     "Retry transaction {} in other section (should be in retry section)",
                     tx_hash
@@ -2134,8 +2135,8 @@ impl<C: TypeConfig> BftState<C> {
         let local_shard = topology.local_shard();
         let mut expected = std::collections::BTreeSet::new();
         for tx in block.all_transactions() {
-            if !topology.is_single_shard_transaction_generic::<C>(tx) {
-                for shard in topology.all_shards_for_transaction_generic::<C>(tx) {
+            if !topology.is_single_shard_transaction_generic(tx.as_ref()) {
+                for shard in topology.all_shards_for_transaction_generic(tx.as_ref()) {
                     if shard != local_shard {
                         expected.insert(shard);
                     }
@@ -2157,12 +2158,12 @@ impl<C: TypeConfig> BftState<C> {
     /// Verify that a list of transactions is sorted by hash in ascending order.
     fn verify_hash_sorted(txs: &[Arc<C::Transaction>], section: &str) -> Result<(), String> {
         for window in txs.windows(2) {
-            if C::transaction_hash(&window[0]) >= C::transaction_hash(&window[1]) {
+            if window[0].tx_hash() >= window[1].tx_hash() {
                 return Err(format!(
                     "{} section not in hash order: {} >= {}",
                     section,
-                    C::transaction_hash(&window[0]),
-                    C::transaction_hash(&window[1])
+                    window[0].tx_hash(),
+                    window[1].tx_hash()
                 ));
             }
         }

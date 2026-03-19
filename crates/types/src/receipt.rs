@@ -15,7 +15,10 @@ use std::sync::Arc;
 
 use hyperscale_codec as sbor;
 
-use crate::{compute_merkle_root, ConcreteConfig, Hash, NodeId, PartitionNumber, TypeConfig};
+use crate::{
+    compute_merkle_root, ConcreteConfig, ConsensusExecutionReceipt, Hash, NodeId, PartitionNumber,
+    TypeConfig,
+};
 
 // ─── Outcome ─────────────────────────────────────────────────────────────────
 
@@ -173,6 +176,16 @@ impl LedgerTransactionReceipt {
             state_changes: vec![],
             application_events: vec![],
         }
+    }
+}
+
+impl ConsensusExecutionReceipt for LedgerTransactionReceipt {
+    fn consensus_receipt_hash(&self) -> Hash {
+        self.receipt_hash()
+    }
+
+    fn is_success(&self) -> bool {
+        self.outcome == LedgerTransactionOutcome::Success
     }
 }
 

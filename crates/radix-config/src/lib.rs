@@ -8,14 +8,18 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHeight, DatabaseUpdates, Hash, LedgerTransactionOutcome, LedgerTransactionReceipt, NodeId,
-    RoutableTransaction, ShardGroupId, TypeConfig,
+    DatabaseUpdates, LedgerTransactionReceipt, NodeId, RoutableTransaction, ShardGroupId,
+    TypeConfig,
 };
 
 /// Radix-specific `TypeConfig` implementation.
 ///
 /// This is the reference (and currently only) implementation. It binds the
 /// framework's generic types to the concrete Radix ledger types.
+///
+/// Transaction and receipt operations are provided by the [`ConsensusTransaction`]
+/// and [`ConsensusExecutionReceipt`] trait impls on the concrete types themselves.
+/// Only state update operations remain here.
 #[derive(Debug, Clone)]
 pub struct RadixConfig;
 
@@ -23,46 +27,6 @@ impl TypeConfig for RadixConfig {
     type Transaction = RoutableTransaction;
     type ExecutionReceipt = LedgerTransactionReceipt;
     type StateUpdate = DatabaseUpdates;
-
-    fn transaction_hash(tx: &RoutableTransaction) -> Hash {
-        tx.hash()
-    }
-
-    fn transaction_is_retry(tx: &RoutableTransaction) -> bool {
-        tx.is_retry()
-    }
-
-    fn transaction_reads(tx: &RoutableTransaction) -> Vec<NodeId> {
-        tx.declared_reads.clone()
-    }
-
-    fn transaction_writes(tx: &RoutableTransaction) -> Vec<NodeId> {
-        tx.declared_writes.clone()
-    }
-
-    fn transaction_original_hash(tx: &RoutableTransaction) -> Hash {
-        tx.original_hash()
-    }
-
-    fn transaction_retry_count(tx: &RoutableTransaction) -> u32 {
-        tx.retry_count()
-    }
-
-    fn transaction_create_retry(
-        tx: &RoutableTransaction,
-        deferred_by: Hash,
-        deferred_at: BlockHeight,
-    ) -> RoutableTransaction {
-        tx.create_retry(deferred_by, deferred_at)
-    }
-
-    fn receipt_hash(receipt: &LedgerTransactionReceipt) -> Hash {
-        receipt.consensus_receipt().receipt_hash()
-    }
-
-    fn receipt_success(receipt: &LedgerTransactionReceipt) -> bool {
-        receipt.outcome == LedgerTransactionOutcome::Success
-    }
 
     fn merge_state_updates(updates: &[DatabaseUpdates]) -> DatabaseUpdates {
         hyperscale_storage::merge_database_updates(updates)

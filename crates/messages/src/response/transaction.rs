@@ -2,7 +2,9 @@
 
 use hyperscale_codec as sbor;
 use hyperscale_codec::{Decoder as _, Encoder as _};
-use hyperscale_types::{ConcreteConfig, MessagePriority, NetworkMessage, TypeConfig};
+use hyperscale_types::{
+    ConcreteConfig, ConsensusTransaction, MessagePriority, NetworkMessage, TypeConfig,
+};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -70,7 +72,7 @@ impl<C: TypeConfig> PartialEq for GetTransactionsResponse<C> {
         self.transactions
             .iter()
             .zip(other.transactions.iter())
-            .all(|(a, b)| C::transaction_hash(a) == C::transaction_hash(b))
+            .all(|(a, b)| a.tx_hash() == b.tx_hash())
     }
 }
 

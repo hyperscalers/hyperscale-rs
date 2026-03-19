@@ -6,9 +6,9 @@
 //! (in the `hyperscale-topology` crate) which builds new snapshots.
 
 use crate::{
-    BlockHeight, Bls12381G1PublicKey, EpochConfig, EpochId, NodeId, RoutableTransaction,
-    ShardCommitteeConfig, ShardGroupId, TypeConfig, ValidatorId, ValidatorSet, ValidatorShardState,
-    VotePower,
+    BlockHeight, Bls12381G1PublicKey, ConsensusTransaction, EpochConfig, EpochId, NodeId,
+    RoutableTransaction, ShardCommitteeConfig, ShardGroupId, ValidatorId, ValidatorSet,
+    ValidatorShardState, VotePower,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -395,12 +395,9 @@ impl TopologySnapshot {
             .collect()
     }
 
-    /// Generic: compute write shards for a transaction using `TypeConfig` operations.
-    pub fn consensus_shards_generic<C: TypeConfig>(
-        &self,
-        tx: &C::Transaction,
-    ) -> Vec<ShardGroupId> {
-        let writes = C::transaction_writes(tx);
+    /// Generic: compute write shards for a transaction using [`ConsensusTransaction`] operations.
+    pub fn consensus_shards_generic<T: ConsensusTransaction>(&self, tx: &T) -> Vec<ShardGroupId> {
+        let writes = tx.writes();
         writes
             .iter()
             .map(|node_id| self.shard_for_node_id(node_id))
@@ -426,13 +423,13 @@ impl TopologySnapshot {
             .collect()
     }
 
-    /// Generic: compute read-only shards for a transaction using `TypeConfig` operations.
-    pub fn provisioning_shards_generic<C: TypeConfig>(
+    /// Generic: compute read-only shards for a transaction using [`ConsensusTransaction`] operations.
+    pub fn provisioning_shards_generic<T: ConsensusTransaction>(
         &self,
-        tx: &C::Transaction,
+        tx: &T,
     ) -> Vec<ShardGroupId> {
-        let writes = C::transaction_writes(tx);
-        let reads = C::transaction_reads(tx);
+        let writes = tx.writes();
+        let reads = tx.reads();
         let write_shards: BTreeSet<_> = writes
             .iter()
             .map(|node_id| self.shard_for_node_id(node_id))
@@ -452,9 +449,9 @@ impl TopologySnapshot {
         self.consensus_shards(tx).len() > 1
     }
 
-    /// Generic: check if a transaction is cross-shard using `TypeConfig` operations.
-    pub fn is_cross_shard_transaction_generic<C: TypeConfig>(&self, tx: &C::Transaction) -> bool {
-        self.consensus_shards_generic::<C>(tx).len() > 1
+    /// Generic: check if a transaction is cross-shard using [`ConsensusTransaction`] operations.
+    pub fn is_cross_shard_transaction_generic<T: ConsensusTransaction>(&self, tx: &T) -> bool {
+        self.consensus_shards_generic(tx).len() > 1
     }
 
     /// Check if a transaction is single-shard.
@@ -462,9 +459,9 @@ impl TopologySnapshot {
         self.consensus_shards(tx).len() <= 1
     }
 
-    /// Generic: check if a transaction is single-shard using `TypeConfig` operations.
-    pub fn is_single_shard_transaction_generic<C: TypeConfig>(&self, tx: &C::Transaction) -> bool {
-        let writes = C::transaction_writes(tx);
+    /// Generic: check if a transaction is single-shard using [`ConsensusTransaction`] operations.
+    pub fn is_single_shard_transaction_generic<T: ConsensusTransaction>(&self, tx: &T) -> bool {
+        let writes = tx.writes();
         let shards: std::collections::BTreeSet<_> = writes
             .iter()
             .map(|node_id| self.shard_for_node_id(node_id))
@@ -480,13 +477,13 @@ impl TopologySnapshot {
         all.into_iter().collect()
     }
 
-    /// Generic: get all shards involved in a transaction using `TypeConfig` operations.
-    pub fn all_shards_for_transaction_generic<C: TypeConfig>(
+    /// Generic: get all shards involved in a transaction using [`ConsensusTransaction`] operations.
+    pub fn all_shards_for_transaction_generic<T: ConsensusTransaction>(
         &self,
-        tx: &C::Transaction,
+        tx: &T,
     ) -> Vec<ShardGroupId> {
-        let reads = C::transaction_reads(tx);
-        let writes = C::transaction_writes(tx);
+        let reads = tx.reads();
+        let writes = tx.writes();
         let all: std::collections::BTreeSet<_> = reads
             .iter()
             .chain(writes.iter())
@@ -502,12 +499,12 @@ impl TopologySnapshot {
             .any(|node_id| self.shard_for_node_id(node_id) == self.local_shard)
     }
 
-    /// Generic: check if a transaction involves the local shard for consensus using `TypeConfig` operations.
-    pub fn involves_local_shard_for_consensus_generic<C: TypeConfig>(
+    /// Generic: check if a transaction involves the local shard for consensus using [`ConsensusTransaction`] operations.
+    pub fn involves_local_shard_for_consensus_generic<T: ConsensusTransaction>(
         &self,
-        tx: &C::Transaction,
+        tx: &T,
     ) -> bool {
-        let writes = C::transaction_writes(tx);
+        let writes = tx.writes();
         writes
             .iter()
             .any(|node_id| self.shard_for_node_id(node_id) == self.local_shard)
@@ -522,11 +519,11 @@ impl TopologySnapshot {
             .any(|node_id| self.shard_for_node_id(node_id) == local)
     }
 
-    /// Generic: check if this shard is involved in a transaction at all using `TypeConfig` operations.
-    pub fn involves_local_shard_generic<C: TypeConfig>(&self, tx: &C::Transaction) -> bool {
+    /// Generic: check if this shard is involved in a transaction at all using [`ConsensusTransaction`] operations.
+    pub fn involves_local_shard_generic<T: ConsensusTransaction>(&self, tx: &T) -> bool {
         let local = self.local_shard;
-        let reads = C::transaction_reads(tx);
-        let writes = C::transaction_writes(tx);
+        let reads = tx.reads();
+        let writes = tx.writes();
         reads
             .iter()
             .chain(writes.iter())

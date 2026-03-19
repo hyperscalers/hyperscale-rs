@@ -3,7 +3,8 @@
 //! Tracks blocks being assembled from headers + gossiped transactions.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockManifest, ConcreteConfig, Hash, TransactionCertificate, TypeConfig,
+    Block, BlockHeader, BlockManifest, ConcreteConfig, ConsensusTransaction, Hash,
+    TransactionCertificate, TypeConfig,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -87,17 +88,17 @@ impl<C: TypeConfig> PendingBlock<C> {
         for tx in &block.retry_transactions {
             pending
                 .received_transactions
-                .insert(C::transaction_hash(tx), Arc::clone(tx));
+                .insert(tx.tx_hash(), Arc::clone(tx));
         }
         for tx in &block.priority_transactions {
             pending
                 .received_transactions
-                .insert(C::transaction_hash(tx), Arc::clone(tx));
+                .insert(tx.tx_hash(), Arc::clone(tx));
         }
         for tx in &block.transactions {
             pending
                 .received_transactions
-                .insert(C::transaction_hash(tx), Arc::clone(tx));
+                .insert(tx.tx_hash(), Arc::clone(tx));
         }
         for cert in &block.certificates {
             pending
@@ -111,7 +112,7 @@ impl<C: TypeConfig> PendingBlock<C> {
     ///
     /// Returns true if this transaction was needed, false if duplicate or not in this block.
     pub fn add_transaction_arc(&mut self, tx: Arc<C::Transaction>) -> bool {
-        let hash = C::transaction_hash(&tx);
+        let hash = tx.tx_hash();
         // O(1) lookup and removal with HashSet
         if self.missing_transaction_hashes.remove(&hash) {
             self.received_transactions.insert(hash, tx);

@@ -1,9 +1,9 @@
 //! Block and BlockHeader types for consensus.
 
 use crate::{
-    compute_merkle_root, BlockHeight, CommitmentProof, ConcreteConfig, Hash, QuorumCertificate,
-    ShardGroupId, TransactionAbort, TransactionCertificate, TransactionDefer, TypeConfig,
-    ValidatorId,
+    compute_merkle_root, BlockHeight, CommitmentProof, ConcreteConfig, ConsensusTransaction, Hash,
+    QuorumCertificate, ShardGroupId, TransactionAbort, TransactionCertificate, TransactionDefer,
+    TypeConfig, ValidatorId,
 };
 use hyperscale_codec as sbor;
 use hyperscale_codec::prelude::*;
@@ -54,26 +54,17 @@ pub fn compute_transaction_root<C: TypeConfig>(
 
     // Add retry transaction leaves
     for tx in retry_transactions {
-        leaves.push(Hash::from_parts(&[
-            RETRY_TAG,
-            C::transaction_hash(tx).as_bytes(),
-        ]));
+        leaves.push(Hash::from_parts(&[RETRY_TAG, tx.tx_hash().as_bytes()]));
     }
 
     // Add priority transaction leaves
     for tx in priority_transactions {
-        leaves.push(Hash::from_parts(&[
-            PRIORITY_TAG,
-            C::transaction_hash(tx).as_bytes(),
-        ]));
+        leaves.push(Hash::from_parts(&[PRIORITY_TAG, tx.tx_hash().as_bytes()]));
     }
 
     // Add normal transaction leaves
     for tx in transactions {
-        leaves.push(Hash::from_parts(&[
-            NORMAL_TAG,
-            C::transaction_hash(tx).as_bytes(),
-        ]));
+        leaves.push(Hash::from_parts(&[NORMAL_TAG, tx.tx_hash().as_bytes()]));
     }
 
     compute_merkle_root(&leaves)
@@ -313,7 +304,7 @@ impl<C: TypeConfig> PartialEq for Block<C> {
             a.len() == b.len()
                 && a.iter()
                     .zip(b.iter())
-                    .all(|(x, y)| C::transaction_hash(x) == C::transaction_hash(y))
+                    .all(|(x, y)| x.tx_hash() == y.tx_hash())
         }
 
         self.header == other.header
@@ -562,22 +553,19 @@ impl<C: TypeConfig> Block<C> {
 
     /// Check if this block contains a specific transaction by hash.
     pub fn contains_transaction(&self, tx_hash: &Hash) -> bool {
-        self.all_transactions()
-            .any(|tx| C::transaction_hash(tx) == *tx_hash)
+        self.all_transactions().any(|tx| tx.tx_hash() == *tx_hash)
     }
 
     /// Get all transaction hashes in priority order.
     pub fn all_transaction_hashes(&self) -> Vec<Hash> {
-        self.all_transactions()
-            .map(|tx| C::transaction_hash(tx))
-            .collect()
+        self.all_transactions().map(|tx| tx.tx_hash()).collect()
     }
 
     /// Get retry transaction hashes.
     pub fn retry_hashes(&self) -> Vec<Hash> {
         self.retry_transactions
             .iter()
-            .map(|tx| C::transaction_hash(tx))
+            .map(|tx| tx.tx_hash())
             .collect()
     }
 
@@ -585,16 +573,13 @@ impl<C: TypeConfig> Block<C> {
     pub fn priority_hashes(&self) -> Vec<Hash> {
         self.priority_transactions
             .iter()
-            .map(|tx| C::transaction_hash(tx))
+            .map(|tx| tx.tx_hash())
             .collect()
     }
 
     /// Get other transaction hashes.
     pub fn transaction_hashes(&self) -> Vec<Hash> {
-        self.transactions
-            .iter()
-            .map(|tx| C::transaction_hash(tx))
-            .collect()
+        self.transactions.iter().map(|tx| tx.tx_hash()).collect()
     }
 
     /// Check if this is the genesis block.
@@ -722,18 +707,14 @@ impl BlockManifest {
             retry_hashes: block
                 .retry_transactions
                 .iter()
-                .map(|tx| C::transaction_hash(tx))
+                .map(|tx| tx.tx_hash())
                 .collect(),
             priority_hashes: block
                 .priority_transactions
                 .iter()
-                .map(|tx| C::transaction_hash(tx))
+                .map(|tx| tx.tx_hash())
                 .collect(),
-            tx_hashes: block
-                .transactions
-                .iter()
-                .map(|tx| C::transaction_hash(tx))
-                .collect(),
+            tx_hashes: block.transactions.iter().map(|tx| tx.tx_hash()).collect(),
             cert_hashes: block
                 .certificates
                 .iter()

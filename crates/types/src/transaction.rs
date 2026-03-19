@@ -1,8 +1,8 @@
 //! Transaction types for consensus.
 
 use crate::{
-    BlockHeight, CommitmentProof, ConcreteConfig, ExecutionCertificate, Hash, NodeId, ShardGroupId,
-    TypeConfig,
+    BlockHeight, CommitmentProof, ConcreteConfig, ConsensusTransaction, ExecutionCertificate, Hash,
+    NodeId, ShardGroupId, TypeConfig,
 };
 use hyperscale_codec as sbor;
 use hyperscale_codec::prelude::*;
@@ -256,6 +256,40 @@ impl RoutableTransaction {
     /// Check if this is a retry transaction.
     pub fn is_retry(&self) -> bool {
         self.retry_details.is_some()
+    }
+}
+
+impl ConsensusTransaction for RoutableTransaction {
+    fn tx_hash(&self) -> Hash {
+        self.hash()
+    }
+
+    fn reads(&self) -> Vec<NodeId> {
+        self.declared_reads.clone()
+    }
+
+    fn writes(&self) -> Vec<NodeId> {
+        self.declared_writes.clone()
+    }
+
+    fn is_retry(&self) -> bool {
+        self.retry_details.is_some()
+    }
+
+    fn original_hash(&self) -> Hash {
+        self.original_hash()
+    }
+
+    fn retry_count(&self) -> u32 {
+        self.retry_count()
+    }
+
+    fn create_retry(&self, deferred_by: Hash, deferred_at: BlockHeight) -> Self {
+        self.create_retry(deferred_by, deferred_at)
+    }
+
+    fn is_cross_shard(&self, num_shards: u64) -> bool {
+        self.is_cross_shard(num_shards)
     }
 }
 

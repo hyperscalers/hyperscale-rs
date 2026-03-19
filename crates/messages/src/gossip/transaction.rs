@@ -3,7 +3,9 @@
 use crate::trace_context::TraceContext;
 use hyperscale_codec as sbor;
 use hyperscale_codec::{Decoder as _, Encoder as _};
-use hyperscale_types::{ConcreteConfig, MessagePriority, NetworkMessage, ShardMessage, TypeConfig};
+use hyperscale_types::{
+    ConcreteConfig, ConsensusTransaction, MessagePriority, NetworkMessage, ShardMessage, TypeConfig,
+};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -91,7 +93,7 @@ impl<C: TypeConfig> TransactionGossip<C> {
 // Manual PartialEq/Eq - compare by transaction hash for efficiency
 impl<C: TypeConfig> PartialEq for TransactionGossip<C> {
     fn eq(&self, other: &Self) -> bool {
-        C::transaction_hash(&self.transaction) == C::transaction_hash(&other.transaction)
+        self.transaction.tx_hash() == other.transaction.tx_hash()
             && self.trace_context == other.trace_context
     }
 }

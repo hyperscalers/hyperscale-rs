@@ -5,8 +5,8 @@
 
 use crate::tracker::{CommittedCrossShardTracker, ProvisionTracker, RemoteStateNeeds};
 use hyperscale_types::{
-    BlockHeight, CommitmentProof, DeferReason, Hash, NodeId, RoutableTransaction, ShardGroupId,
-    TopologySnapshot, TransactionDefer, TypeConfig,
+    BlockHeight, CommitmentProof, ConsensusTransaction, DeferReason, Hash, NodeId,
+    RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionDefer, TypeConfig,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -148,19 +148,19 @@ impl LivelockState {
         self.committed_tracker.add(tx_hash, needs);
     }
 
-    /// Generic version of `on_cross_shard_committed` using `TypeConfig` operations.
+    /// Generic version of `on_cross_shard_committed` using [`ConsensusTransaction`] operations.
     ///
     /// Registers a cross-shard transaction for cycle detection using generic
     /// transaction accessors instead of direct field access.
-    pub fn on_cross_shard_committed_generic<C: TypeConfig>(
+    pub fn on_cross_shard_committed_generic<T: ConsensusTransaction>(
         &mut self,
         topology: &TopologySnapshot,
-        tx: &C::Transaction,
+        tx: &T,
         height: BlockHeight,
     ) {
-        let tx_hash = C::transaction_hash(tx);
-        let reads = C::transaction_reads(tx);
-        let writes = C::transaction_writes(tx);
+        let tx_hash = tx.tx_hash();
+        let reads = tx.reads();
+        let writes = tx.writes();
 
         // Determine which shards and nodes we need provisions from
         let needs = self.compute_remote_state_needs_from_nodes(topology, &reads, &writes);
