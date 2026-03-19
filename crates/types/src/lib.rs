@@ -13,6 +13,7 @@
 //! This crate is self-contained with minimal dependencies. It does not depend on
 //! any other workspace crates, making it the foundation layer.
 
+pub mod bls;
 mod crypto;
 mod hash;
 mod identifiers;
@@ -46,10 +47,12 @@ pub use crypto::{
     verify_ed25519,
     zero_bls_signature,
     zero_ed25519_signature,
-    // Vendor types
+    // BLS types (framework-owned)
     Bls12381G1PrivateKey,
     Bls12381G1PublicKey,
     Bls12381G2Signature,
+    BlsError,
+    // Ed25519 types (radix_common)
     Ed25519PrivateKey,
     Ed25519PublicKey,
     Ed25519Signature,
