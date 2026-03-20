@@ -1,0 +1,15 @@
+[package]
+name = "hyperscale-radix-simulation"
+version.workspace = true
+edition.workspace = true
+description = "Radix simulation setup for hyperscale"
+
+[dependencies]
+hyperscale-simulation.workspace = true
+hyperscale-radix-config.workspace = true
+hyperscale-engine.workspace = true
+hyperscale-dispatch-sync.workspace = true
+hyperscale-storage.workspace = true
+hyperscale-storage-memory.workspace = true
+radix-common.workspace = true
+tracing.workspace = true

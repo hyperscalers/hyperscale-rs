@@ -12,6 +12,7 @@
 //! These tests verify the system behavior without hitting that limit.
 
 use hyperscale_core::{NodeInput, TransactionStatus};
+use hyperscale_radix_simulation::RadixSimulationSetup;
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
 use hyperscale_types::{
     ed25519_keypair_from_seed, sign_and_notarize, Ed25519PrivateKey, RoutableTransaction,
@@ -24,6 +25,8 @@ use radix_common::types::ComponentAddress;
 use radix_transactions::builder::ManifestBuilder;
 use std::sync::Arc;
 use std::time::Duration;
+
+type RadixSimRunner = SimulationRunner<RadixSimulationSetup>;
 
 /// Create a multi-shard network configuration for cross-shard tests.
 fn multi_shard_config() -> NetworkConfig {
@@ -74,7 +77,7 @@ fn simulator_network() -> NetworkDefinition {
 #[test]
 fn test_single_shard_unaffected_by_backpressure() {
     let config = single_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12345);
+    let mut runner = RadixSimRunner::new(config.clone(), 12345);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -140,7 +143,7 @@ fn test_single_shard_unaffected_by_backpressure() {
 #[test]
 fn test_provision_coordinator_tracking() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12346);
+    let mut runner = RadixSimRunner::new(config.clone(), 12346);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -203,7 +206,7 @@ fn test_provision_coordinator_tracking() {
 #[test]
 fn test_mempool_backpressure_integration() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12347);
+    let mut runner = RadixSimRunner::new(config.clone(), 12347);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -259,7 +262,7 @@ fn test_mempool_backpressure_integration() {
 #[test]
 fn test_provision_lifecycle_tracking() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12348);
+    let mut runner = RadixSimRunner::new(config.clone(), 12348);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -298,7 +301,7 @@ fn test_provision_lifecycle_tracking() {
 #[test]
 fn test_provision_metrics_accessible() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12349);
+    let mut runner = RadixSimRunner::new(config.clone(), 12349);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -330,7 +333,7 @@ fn test_provision_metrics_accessible() {
 #[test]
 fn test_provisions_pending_verification() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12350);
+    let mut runner = RadixSimRunner::new(config.clone(), 12350);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -358,7 +361,7 @@ fn test_provisions_pending_verification() {
 #[test]
 fn test_completed_tx_cleanup() {
     let config = single_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12351);
+    let mut runner = RadixSimRunner::new(config.clone(), 12351);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -408,7 +411,7 @@ fn test_completed_tx_cleanup() {
 #[test]
 fn test_multi_node_provision_consistency() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config.clone(), 12352);
+    let mut runner = RadixSimRunner::new(config.clone(), 12352);
 
     // Initialize genesis
     runner.initialize_genesis();

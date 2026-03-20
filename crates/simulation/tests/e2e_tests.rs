@@ -11,6 +11,7 @@
 //! - Inline execution - Radix Engine runs synchronously (not in thread pool)
 
 use hyperscale_core::{NodeInput, TransactionStatus};
+use hyperscale_radix_simulation::{RadixGenesisExt, RadixSimulationSetup};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
 use hyperscale_types::{
     ed25519_keypair_from_seed, shard_for_node, sign_and_notarize, Ed25519PrivateKey, NodeId,
@@ -25,6 +26,8 @@ use radix_transactions::builder::ManifestBuilder;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_test::traced_test;
+
+type RadixSimRunner = SimulationRunner<RadixSimulationSetup>;
 
 /// Create a basic single-shard network configuration.
 fn single_shard_config() -> NetworkConfig {
@@ -101,7 +104,7 @@ fn test_e2e_single_shard_transaction() {
     println!("\n=== E2E Test: Single-Shard Transaction (Deterministic) ===\n");
 
     let config = single_shard_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis - creates genesis blocks and sets up timers
     runner.initialize_genesis();
@@ -365,7 +368,7 @@ fn test_e2e_single_shard_determinism() {
     let transaction: RoutableTransaction = notarized.try_into().expect("valid transaction");
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = RadixSimRunner::new(config.clone(), seed);
     runner1.initialize_genesis();
     runner1.schedule_initial_event(
         0,
@@ -382,7 +385,7 @@ fn test_e2e_single_shard_determinism() {
         .collect();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = RadixSimRunner::new(config.clone(), seed);
     runner2.initialize_genesis();
     runner2.schedule_initial_event(
         0,
@@ -435,7 +438,7 @@ fn test_e2e_multi_shard_consensus() {
     println!("\n=== E2E Test: Multi-Shard Consensus (Deterministic) ===\n");
 
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis for all shards
     runner.initialize_genesis();
@@ -525,7 +528,7 @@ fn test_e2e_cross_shard_transaction() {
 
     let config = multi_shard_config();
     let num_shards = config.num_shards as u64;
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Find accounts that route to different shards
     let mut shard0_keypair = None;
@@ -777,7 +780,7 @@ fn test_e2e_cross_shard_determinism() {
     let transaction: RoutableTransaction = notarized.try_into().expect("valid transaction");
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = RadixSimRunner::new(config.clone(), seed);
     runner1.initialize_genesis();
     runner1.schedule_initial_event(
         0,
@@ -794,7 +797,7 @@ fn test_e2e_cross_shard_determinism() {
         .collect();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = RadixSimRunner::new(config.clone(), seed);
     runner2.initialize_genesis();
     runner2.schedule_initial_event(
         0,
@@ -838,7 +841,7 @@ fn test_e2e_transaction_throughput() {
     println!("\n=== E2E Test: Transaction Throughput ===\n");
 
     let config = single_shard_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     runner.initialize_genesis();
 

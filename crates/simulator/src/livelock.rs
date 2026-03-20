@@ -26,11 +26,15 @@
 //! report.print_summary();
 //! ```
 
+use hyperscale_radix_simulation::RadixSimulationSetup;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{
     shard_for_node, Hash, NodeId, RoutableTransaction, ShardGroupId, TransactionStatus,
 };
 use std::collections::{HashMap, HashSet};
+
+/// Type alias for the Radix-specific simulation runner.
+type RadixSimRunner = SimulationRunner<RadixSimulationSetup>;
 
 /// Information about a stuck transaction.
 #[derive(Debug, Clone)]
@@ -194,7 +198,7 @@ impl LivelockAnalyzer {
     ///
     /// Collects incomplete transactions from all nodes in all shards.
     pub fn from_runner(
-        runner: &SimulationRunner,
+        runner: &RadixSimRunner,
         num_shards: u64,
         validators_per_shard: u32,
     ) -> Self {

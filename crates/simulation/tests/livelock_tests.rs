@@ -11,6 +11,7 @@
 //! 5. Stress testing with many cross-shard transactions
 
 use hyperscale_core::{NodeInput, TransactionStatus};
+use hyperscale_radix_simulation::{RadixGenesisExt, RadixSimulationSetup};
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
 use hyperscale_types::{
     ed25519_keypair_from_seed, shard_for_node, sign_and_notarize, Ed25519PrivateKey, NodeId,
@@ -25,6 +26,8 @@ use radix_transactions::builder::ManifestBuilder;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_test::traced_test;
+
+type RadixSimRunner = SimulationRunner<RadixSimulationSetup>;
 
 /// Create a two-shard network configuration.
 fn two_shard_config() -> NetworkConfig {
@@ -122,7 +125,7 @@ fn test_two_shard_cycle_detection() {
 
     let config = two_shard_config();
     let num_shards = config.num_shards as u64;
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Find accounts on different shards
     let (kp0, account0, kp1, account1) = find_accounts_for_shards(num_shards);
@@ -334,7 +337,7 @@ fn test_retry_completion_after_winner() {
 
     let config = two_shard_config();
     let num_shards = config.num_shards as u64;
-    let mut runner = SimulationRunner::new(config, 123);
+    let mut runner = RadixSimRunner::new(config, 123);
 
     let (kp0, account0, _kp1, account1) = find_accounts_for_shards(num_shards);
 
@@ -449,7 +452,7 @@ fn test_many_cross_shard_transactions() {
 
     let config = two_shard_config();
     let num_shards = config.num_shards as u64;
-    let mut runner = SimulationRunner::new(config, 999);
+    let mut runner = RadixSimRunner::new(config, 999);
 
     let (kp0, account0, _kp1, account1) = find_accounts_for_shards(num_shards);
 
@@ -574,7 +577,7 @@ fn test_resolves_livelocks_in_under_x_seconds() {
 
     let config = two_shard_config();
     let num_shards = config.num_shards as u64;
-    let mut runner = SimulationRunner::new(config, 54321);
+    let mut runner = RadixSimRunner::new(config, 54321);
 
     // Find accounts on different shards
     let (kp0, account0, kp1, account1) = find_accounts_for_shards(num_shards);
@@ -877,7 +880,7 @@ fn test_timeout_abort_mechanism() {
     // Use a config that will exercise the timeout path
     let config = two_shard_config();
     let num_shards = config.num_shards as u64;
-    let mut runner = SimulationRunner::new(config, 777);
+    let mut runner = RadixSimRunner::new(config, 777);
 
     let (kp0, account0, _kp1, account1) = find_accounts_for_shards(num_shards);
 

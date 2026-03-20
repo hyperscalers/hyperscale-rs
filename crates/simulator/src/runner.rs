@@ -7,6 +7,7 @@ use crate::config::SimulatorConfig;
 use crate::metrics::{MetricsCollector, SimulationReport};
 use hyperscale_core::NodeInput;
 use hyperscale_mempool::LockContentionStats;
+use hyperscale_radix_simulation::{RadixGenesisExt, RadixSimulationSetup};
 use hyperscale_simulation::NodeIndex;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_spammer::{AccountPool, AccountPoolError, TransferWorkload, WorkloadGenerator};
@@ -20,10 +21,13 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{debug, info};
 
+/// Type alias for the Radix-specific simulation runner.
+type RadixSimRunner = SimulationRunner<RadixSimulationSetup>;
+
 /// Main simulator that orchestrates workload generation and metrics collection.
 pub struct Simulator {
     /// Underlying deterministic simulation runner.
-    runner: SimulationRunner,
+    runner: RadixSimRunner,
 
     /// Account pool for transaction generation.
     accounts: AccountPool,
@@ -51,7 +55,7 @@ impl Simulator {
     /// Create a new simulator with the given configuration.
     pub fn new(config: SimulatorConfig) -> Result<Self, SimulatorError> {
         let network_config = config.to_network_config();
-        let runner = SimulationRunner::new(network_config, config.seed);
+        let runner = RadixSimRunner::new(network_config, config.seed);
 
         // Generate accounts
         let accounts = AccountPool::generate(config.num_shards as u64, config.accounts_per_shard)?;
@@ -349,12 +353,12 @@ impl Simulator {
     }
 
     /// Get the underlying simulation runner (for advanced use).
-    pub fn runner(&self) -> &SimulationRunner {
+    pub fn runner(&self) -> &RadixSimRunner {
         &self.runner
     }
 
     /// Get mutable access to the simulation runner.
-    pub fn runner_mut(&mut self) -> &mut SimulationRunner {
+    pub fn runner_mut(&mut self) -> &mut RadixSimRunner {
         &mut self.runner
     }
 

@@ -4,51 +4,33 @@
 //! controlling event scheduling, network delivery, and time.
 
 use crate::event_queue::EventKey;
+use crate::setup::SimulationSetup;
 use crate::NodeIndex;
 use hyperscale_bft::{BftConfig, RecoveredState};
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
 use hyperscale_dispatch_sync::SyncDispatch;
-use hyperscale_engine::{RadixExecutor, TransactionValidation};
 use hyperscale_execution::{DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_network_memory::{
-    NetworkConfig, NetworkTrafficAnalyzer, SimNetworkAdapter, SimulatedNetwork,
-};
+use hyperscale_network_memory::{NetworkConfig, NetworkTrafficAnalyzer, SimulatedNetwork};
 use hyperscale_node::io_loop::{IoLoop, StepOutput};
 use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp};
-use hyperscale_radix_config::RadixConfig;
-use hyperscale_storage::{ConsensusStore, GenesisWrapper};
+use hyperscale_storage::ConsensusStore;
 use hyperscale_storage_memory::SimStorage;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     bls_keypair_from_seed, Bls12381G1PrivateKey, Bls12381G1PublicKey, Hash as TxHash, ShardGroupId,
     TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
 };
-use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::{BTreeMap, HashMap};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
-/// NodeConfig implementation for simulation.
-pub struct SimConfig;
-
-impl NodeConfig for SimConfig {
-    type C = hyperscale_radix_config::RadixConfig;
-    type S = SimStorage<SyncDispatch>;
-    type N = SimNetworkAdapter;
-    type D = SyncDispatch;
-    type E = RadixExecutor;
-    type V = TransactionValidation;
-}
-
 /// Type alias for the simulation's concrete IoLoop.
-type SimIoLoop = IoLoop<SimConfig>;
-
-/// Type alias for the simulation's genesis wrapper.
-type SimGenesisWrapper<'a> = GenesisWrapper<'a, SimStorage<SyncDispatch>>;
+type SimIoLoop<S> = IoLoop<crate::setup::SimNodeConfig<S>>;
 
 /// Deterministic simulation runner.
 ///
@@ -58,15 +40,15 @@ type SimGenesisWrapper<'a> = GenesisWrapper<'a, SimStorage<SyncDispatch>>;
 /// Each node has its own independent storage and executor inside its `IoLoop`.
 /// The harness controls the event queue, network delivery (latency, partitions,
 /// packet loss), and time advancement.
-pub struct SimulationRunner {
+pub struct SimulationRunner<S: SimulationSetup> {
     /// Per-node IoLoop instances. Index corresponds to NodeIndex.
-    io_loops: Vec<SimIoLoop>,
+    io_loops: Vec<SimIoLoop<S>>,
 
     /// Per-node event receivers (from crossbeam channels passed to IoLoop).
-    event_rxs: Vec<crossbeam::channel::Receiver<NodeInput<RadixConfig>>>,
+    event_rxs: Vec<crossbeam::channel::Receiver<NodeInput<S::C>>>,
 
     /// Global event queue, ordered deterministically.
-    event_queue: BTreeMap<EventKey, NodeInput<RadixConfig>>,
+    event_queue: BTreeMap<EventKey, NodeInput<S::C>>,
 
     /// Sequence counter for deterministic ordering.
     sequence: u64,
@@ -92,6 +74,9 @@ pub struct SimulationRunner {
 
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
+
+    /// Phantom data for the setup type.
+    _phantom: PhantomData<S>,
 }
 
 /// Statistics collected during simulation.
@@ -134,7 +119,7 @@ impl SimulationStats {
     }
 }
 
-impl SimulationRunner {
+impl<S: SimulationSetup> SimulationRunner<S> {
     // ═══════════════════════════════════════════════════════════════════════
     // Construction
     // ═══════════════════════════════════════════════════════════════════════
@@ -223,15 +208,12 @@ impl SimulationRunner {
 
                 let (event_tx, event_rx) = crossbeam::channel::unbounded();
 
-                let network_def = NetworkDefinition::simulator();
-                let tx_validator = Arc::new(hyperscale_engine::TransactionValidation::permissive(
-                    network_def.clone(),
-                ));
+                let (executor, tx_validator) = S::create_executor_and_validator(node_index);
 
                 let io_loop = IoLoop::new(
                     state,
                     SimStorage::new(SyncDispatch),
-                    RadixExecutor::new(network_def),
+                    executor,
                     network.create_adapter(node_index),
                     SyncDispatch,
                     event_tx,
@@ -266,6 +248,7 @@ impl SimulationRunner {
             stats: SimulationStats::default(),
             genesis_executed: vec![false; num_nodes],
             traffic_analyzer: None,
+            _phantom: PhantomData,
         }
     }
 
@@ -322,7 +305,7 @@ impl SimulationRunner {
     }
 
     /// Get a reference to a node's state machine by index.
-    pub fn node(&self, index: NodeIndex) -> Option<&NodeStateMachine<RadixConfig>> {
+    pub fn node(&self, index: NodeIndex) -> Option<&NodeStateMachine<S::C>> {
         self.io_loops.get(index as usize).map(|nl| nl.state())
     }
 
@@ -341,7 +324,7 @@ impl SimulationRunner {
         self.io_loops
             .get(node as usize)
             .map(|nl| {
-                let s: &dyn ConsensusStore<RadixConfig> = nl.storage();
+                let s: &dyn ConsensusStore<S::C> = nl.storage();
                 let committed = s.committed_height();
                 if committed.0 == 0 {
                     if s.get_block(hyperscale_types::BlockHeight(0)).is_some() {
@@ -361,7 +344,7 @@ impl SimulationRunner {
         self.io_loops
             .get(node as usize)
             .map(|nl| {
-                let s: &dyn ConsensusStore<RadixConfig> = nl.storage();
+                let s: &dyn ConsensusStore<S::C> = nl.storage();
                 s.get_block(hyperscale_types::BlockHeight(height)).is_some()
             })
             .unwrap_or(false)
@@ -372,10 +355,45 @@ impl SimulationRunner {
         &mut self,
         node: NodeIndex,
         delay: Duration,
-        event: NodeInput<RadixConfig>,
+        event: NodeInput<S::C>,
     ) {
         let time = self.now + delay;
         self.schedule_event(node, time, event);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Genesis Helpers (for extension methods in downstream crates)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Get the total number of nodes in the simulation.
+    pub fn num_nodes(&self) -> usize {
+        self.io_loops.len()
+    }
+
+    /// Check whether engine genesis has been executed on a node.
+    pub fn is_genesis_executed(&self, node_idx: usize) -> bool {
+        self.genesis_executed.get(node_idx).copied().unwrap_or(true)
+    }
+
+    /// Mark engine genesis as executed on a node.
+    pub fn mark_genesis_executed(&mut self, node_idx: usize) {
+        if let Some(slot) = self.genesis_executed.get_mut(node_idx) {
+            *slot = true;
+        }
+    }
+
+    /// Access a node's storage and executor for genesis operations.
+    ///
+    /// This delegates to [`IoLoop::with_storage_and_executor`], which also
+    /// registers inbound network handlers on first call.
+    pub fn with_storage_and_executor<F>(&mut self, node_idx: usize, f: F)
+    where
+        F: FnOnce(
+            &mut SimStorage<SyncDispatch>,
+            &<crate::setup::SimNodeConfig<S> as NodeConfig>::E,
+        ),
+    {
+        self.io_loops[node_idx].with_storage_and_executor(f);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -384,67 +402,22 @@ impl SimulationRunner {
 
     /// Initialize all nodes with genesis blocks and start consensus.
     pub fn initialize_genesis(&mut self) {
-        // Run Radix Engine genesis on each node's storage.
+        // Run engine genesis on each node's storage.
         // SimGenesisWrapper writes substates only (no JMT) during bootstrap,
         // then computes JMT once at version 0 to avoid collisions with block 1.
         for node_idx in 0..self.io_loops.len() {
             if !self.genesis_executed[node_idx] {
                 self.io_loops[node_idx].with_storage_and_executor(|storage, executor| {
-                    let mut wrapper = SimGenesisWrapper::new(storage);
-                    if let Err(e) = executor.run_genesis(&mut wrapper) {
-                        warn!(node = node_idx, "Radix Engine genesis failed: {:?}", e);
-                        return;
+                    if let Err(e) = S::run_genesis(storage, executor) {
+                        warn!(node = node_idx, "Engine genesis failed: {:?}", e);
                     }
-                    let merged = wrapper.into_merged();
-                    storage.finalize_genesis_jmt(&merged);
                 });
                 self.genesis_executed[node_idx] = true;
             }
         }
         info!(
             num_nodes = self.io_loops.len(),
-            "Radix Engine genesis complete on all nodes"
-        );
-
-        self.finalize_genesis();
-    }
-
-    /// Initialize genesis with pre-funded accounts.
-    pub fn initialize_genesis_with_balances(
-        &mut self,
-        balances: Vec<(
-            radix_common::types::ComponentAddress,
-            radix_common::math::Decimal,
-        )>,
-    ) {
-        use hyperscale_engine::GenesisConfig;
-
-        // Run Radix Engine genesis on each node's storage with balances.
-        // SimGenesisWrapper writes substates only (no JMT) during bootstrap,
-        // then computes JMT once at version 0 to avoid collisions with block 1.
-        for node_idx in 0..self.io_loops.len() {
-            if !self.genesis_executed[node_idx] {
-                let balances = balances.clone();
-                self.io_loops[node_idx].with_storage_and_executor(|storage, executor| {
-                    let mut wrapper = SimGenesisWrapper::new(storage);
-                    let config = GenesisConfig {
-                        xrd_balances: balances,
-                        ..GenesisConfig::test_default()
-                    };
-                    if let Err(e) = executor.run_genesis_with_config(&mut wrapper, config) {
-                        warn!(node = node_idx, "Radix Engine genesis failed: {:?}", e);
-                        return;
-                    }
-                    let merged = wrapper.into_merged();
-                    storage.finalize_genesis_jmt(&merged);
-                });
-                self.genesis_executed[node_idx] = true;
-            }
-        }
-        info!(
-            num_nodes = self.io_loops.len(),
-            num_funded_accounts = balances.len(),
-            "Radix Engine genesis complete with funded accounts"
+            "Engine genesis complete on all nodes"
         );
 
         self.finalize_genesis();
@@ -455,7 +428,7 @@ impl SimulationRunner {
     /// Called after engine genesis via `with_storage_and_executor` (which also
     /// registers inbound handlers). Creates genesis blocks per shard and
     /// initializes each node's state machine.
-    fn finalize_genesis(&mut self) {
+    pub fn finalize_genesis(&mut self) {
         use hyperscale_storage::SubstateStore;
         use hyperscale_types::Block;
 
@@ -606,10 +579,10 @@ impl SimulationRunner {
     /// buffered events from a node.
     ///
     /// Converts IoLoop-internal outputs into harness-level operations:
-    /// - Outbox entries → gossip latency queue
-    /// - Pending requests → handler invoked, response callback deferred
-    /// - Pending notifications → notification latency queue
-    /// - Buffered events (from error callbacks, IoLoop step) → event queue
+    /// - Outbox entries -> gossip latency queue
+    /// - Pending requests -> handler invoked, response callback deferred
+    /// - Pending notifications -> notification latency queue
+    /// - Buffered events (from error callbacks, IoLoop step) -> event queue
     fn drain_node_io(&mut self, node: NodeIndex) {
         let i = node as usize;
         let outbox = self.io_loops[i].network().drain_outbox();
@@ -697,7 +670,7 @@ impl SimulationRunner {
         &mut self,
         node: NodeIndex,
         time: Duration,
-        event: NodeInput<RadixConfig>,
+        event: NodeInput<S::C>,
     ) -> EventKey {
         self.sequence += 1;
         let key = EventKey::new(time, &event, node, self.sequence);

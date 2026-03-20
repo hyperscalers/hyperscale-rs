@@ -5,10 +5,13 @@
 //! and replay.
 
 use hyperscale_core::NodeInput;
+use hyperscale_radix_simulation::RadixSimulationSetup;
 use hyperscale_simulation::{NetworkConfig, SimulationRunner};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_test::traced_test;
+
+type RadixSimRunner = SimulationRunner<RadixSimulationSetup>;
 
 /// Create a basic network configuration for testing.
 fn test_network_config() -> NetworkConfig {
@@ -26,7 +29,7 @@ fn test_network_config() -> NetworkConfig {
 #[test]
 fn test_simulation_runner_creation() {
     let config = test_network_config();
-    let runner = SimulationRunner::new(config, 42);
+    let runner = RadixSimRunner::new(config, 42);
 
     // Should have 4 nodes (1 shard * 4 validators)
     assert!(runner.node(0).is_some());
@@ -40,7 +43,7 @@ fn test_simulation_runner_creation() {
 #[test]
 fn test_schedule_initial_events() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Schedule proposal timers for all nodes
     for node in 0..4 {
@@ -69,7 +72,7 @@ fn test_determinism_same_seed() {
     let seed = 12345u64;
 
     // Run simulation with seed
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = RadixSimRunner::new(config.clone(), seed);
     for node in 0..4 {
         runner1.schedule_initial_event(
             node,
@@ -81,7 +84,7 @@ fn test_determinism_same_seed() {
     let stats1 = runner1.stats().clone();
 
     // Run simulation again with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = RadixSimRunner::new(config.clone(), seed);
     for node in 0..4 {
         runner2.schedule_initial_event(
             node,
@@ -117,7 +120,7 @@ fn test_different_seeds_diverge() {
     let config = test_network_config();
 
     // Run simulation with seed 1
-    let mut runner1 = SimulationRunner::new(config.clone(), 111);
+    let mut runner1 = RadixSimRunner::new(config.clone(), 111);
     for node in 0..4 {
         runner1.schedule_initial_event(
             node,
@@ -128,7 +131,7 @@ fn test_different_seeds_diverge() {
     runner1.run_until(Duration::from_secs(1));
 
     // Run simulation with seed 2
-    let mut runner2 = SimulationRunner::new(config.clone(), 222);
+    let mut runner2 = RadixSimRunner::new(config.clone(), 222);
     for node in 0..4 {
         runner2.schedule_initial_event(
             node,
@@ -158,7 +161,7 @@ fn test_multi_shard_simulation() {
         ..Default::default()
     };
 
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Should have 6 nodes (2 shards * 3 validators)
     assert!(runner.node(0).is_some());
@@ -190,7 +193,7 @@ fn test_multi_shard_simulation() {
 #[test]
 fn test_round_advancement_via_proposal_timer() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Schedule proposal timers - these handle both proposals AND round advancement
     for node in 0..4 {
@@ -214,7 +217,7 @@ fn test_round_advancement_via_proposal_timer() {
 #[test]
 fn test_extended_simulation() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Schedule initial proposal timers
     for node in 0..4 {
@@ -253,7 +256,7 @@ fn test_extended_simulation_determinism() {
     let seed = 999u64;
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = RadixSimRunner::new(config.clone(), seed);
     for node in 0..4 {
         runner1.schedule_initial_event(
             node,
@@ -265,7 +268,7 @@ fn test_extended_simulation_determinism() {
     let stats1 = runner1.stats().clone();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = RadixSimRunner::new(config.clone(), seed);
     for node in 0..4 {
         runner2.schedule_initial_event(
             node,
@@ -293,7 +296,7 @@ fn test_extended_simulation_determinism() {
 #[test]
 fn test_genesis_initialization() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis - this should set proposal timers for all nodes
     runner.initialize_genesis();
@@ -321,13 +324,13 @@ fn test_genesis_initialization_determinism() {
     let seed = 7777u64;
 
     // First run with genesis init
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = RadixSimRunner::new(config.clone(), seed);
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(2));
     let stats1 = runner1.stats().clone();
 
     // Second run with same seed and genesis init
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = RadixSimRunner::new(config.clone(), seed);
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(2));
     let stats2 = runner2.stats().clone();
@@ -344,7 +347,7 @@ fn test_genesis_initialization_determinism() {
 #[test]
 fn test_full_consensus_simulation() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -396,7 +399,7 @@ fn test_multi_shard_genesis() {
         ..Default::default()
     };
 
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis for all shards
     runner.initialize_genesis();
@@ -430,7 +433,7 @@ fn test_multi_shard_genesis() {
 #[test]
 fn test_proposal_timer_setup() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis - this should set proposal timers (which also handle round advancement)
     runner.initialize_genesis();
@@ -448,7 +451,7 @@ fn test_proposal_timer_setup() {
 #[test]
 fn test_view_change_integration() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -480,13 +483,13 @@ fn test_view_change_determinism() {
     let seed = 8888u64;
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = RadixSimRunner::new(config.clone(), seed);
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(8));
     let stats1 = runner1.stats().clone();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = RadixSimRunner::new(config.clone(), seed);
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(8));
     let stats2 = runner2.stats().clone();
@@ -514,7 +517,7 @@ fn test_view_change_determinism() {
 #[test]
 fn test_view_change_complete_flow() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -599,7 +602,7 @@ fn test_view_change_complete_flow() {
 #[test]
 fn test_view_change_quorum_after_commit() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -654,7 +657,7 @@ fn test_view_change_quorum_after_commit() {
 #[test]
 fn test_view_change_vote_broadcast() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -695,7 +698,7 @@ fn test_proposer_rotation_after_view_change() {
     // - Round 3: proposer = (1 + 3) % 4 = 0 -> Validator 0
 
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
     runner.initialize_genesis();
 
     // Get initial view for all nodes
@@ -741,7 +744,7 @@ fn test_proposer_rotation_after_view_change() {
 #[test]
 fn test_round_reset_on_commit() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -782,7 +785,7 @@ fn test_round_reset_on_commit() {
 #[test]
 fn test_block_commit_diagnostic() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -885,7 +888,7 @@ fn test_round_determinism() {
     let seed = 54321u64;
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = RadixSimRunner::new(config.clone(), seed);
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(12));
 
@@ -897,7 +900,7 @@ fn test_round_determinism() {
         .collect();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = RadixSimRunner::new(config.clone(), seed);
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(12));
 
@@ -936,7 +939,7 @@ fn test_round_determinism() {
 #[test]
 fn test_block_commit_verification() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -1008,7 +1011,7 @@ fn test_block_commit_determinism() {
     let seed = 12345u64;
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = RadixSimRunner::new(config.clone(), seed);
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(2));
 
@@ -1028,7 +1031,7 @@ fn test_block_commit_determinism() {
     let stats1 = runner1.stats().clone();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config.clone(), seed);
+    let mut runner2 = RadixSimRunner::new(config.clone(), seed);
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(2));
 
@@ -1071,7 +1074,7 @@ fn test_block_commit_determinism() {
 #[test]
 fn test_sequential_commit() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -1131,7 +1134,7 @@ fn test_sequential_commit() {
 #[test]
 fn test_consensus_throughput() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     runner.initialize_genesis();
 
@@ -1183,7 +1186,7 @@ fn test_mempool_to_block_integration() {
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Initialize genesis
     runner.initialize_genesis();
@@ -1278,7 +1281,7 @@ fn test_execution_flow() {
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     runner.initialize_genesis();
 
@@ -1332,7 +1335,7 @@ fn test_transaction_gossip() {
     use hyperscale_types::test_utils::test_transaction;
 
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     runner.initialize_genesis();
 
@@ -1392,7 +1395,7 @@ fn multi_shard_config() -> NetworkConfig {
 #[test]
 fn test_multi_shard_initialization() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     // Should have 8 nodes (2 shards * 4 validators)
     assert!(runner.node(0).is_some());
@@ -1433,7 +1436,7 @@ fn test_multi_shard_initialization() {
 #[test]
 fn test_multi_shard_consensus_progress() {
     let config = multi_shard_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
     runner.initialize_genesis();
 
     // Run for 5 seconds
@@ -1488,7 +1491,7 @@ fn test_multi_shard_consensus_progress() {
 #[test]
 fn test_cross_shard_latency() {
     let config = multi_shard_config();
-    let runner = SimulationRunner::new(config.clone(), 42);
+    let runner = RadixSimRunner::new(config.clone(), 42);
 
     // Intra-shard: nodes in same shard
     let network = runner.network();
@@ -1609,7 +1612,7 @@ fn test_multi_shard_determinism() {
     let seed = 98765u64;
 
     // First run
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = RadixSimRunner::new(config.clone(), seed);
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(3));
 
@@ -1619,7 +1622,7 @@ fn test_multi_shard_determinism() {
     let stats1 = runner1.stats().clone();
 
     // Second run with same seed
-    let mut runner2 = SimulationRunner::new(config, seed);
+    let mut runner2 = RadixSimRunner::new(config, seed);
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(3));
 
@@ -1659,7 +1662,7 @@ fn test_multi_shard_determinism() {
 #[test]
 fn test_consensus_with_isolated_node() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     runner.initialize_genesis();
 
@@ -1739,7 +1742,7 @@ fn test_consensus_with_isolated_node() {
 #[test]
 fn test_partition_recovery_hotstuff2() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     runner.initialize_genesis();
 
@@ -1878,7 +1881,7 @@ fn test_partition_recovery_hotstuff2() {
 #[test]
 fn test_consensus_during_partition() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     runner.initialize_genesis();
 
@@ -1941,7 +1944,7 @@ fn test_packet_loss_application() {
         packet_loss_rate: 0.10, // 10% packet loss
     };
 
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
     runner.initialize_genesis();
 
     // Run with packet loss
@@ -1999,7 +2002,7 @@ fn test_packet_loss_determinism() {
     let seed = 12345u64;
 
     // Run 1
-    let mut runner1 = SimulationRunner::new(config.clone(), seed);
+    let mut runner1 = RadixSimRunner::new(config.clone(), seed);
     runner1.initialize_genesis();
     runner1.run_until(Duration::from_secs(3));
     let stats1 = runner1.stats().clone();
@@ -2008,7 +2011,7 @@ fn test_packet_loss_determinism() {
         .collect();
 
     // Run 2
-    let mut runner2 = SimulationRunner::new(config, seed);
+    let mut runner2 = RadixSimRunner::new(config, seed);
     runner2.initialize_genesis();
     runner2.run_until(Duration::from_secs(3));
     let stats2 = runner2.stats().clone();
@@ -2045,7 +2048,7 @@ fn test_packet_loss_determinism() {
 #[test]
 fn test_sync_triggers_when_behind() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     runner.initialize_genesis();
 
@@ -2091,7 +2094,7 @@ fn test_sync_triggers_when_behind() {
 #[test]
 fn test_sync_detection_threshold() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     runner.initialize_genesis();
 
@@ -2123,7 +2126,7 @@ fn test_sync_detection_threshold() {
 #[test]
 fn test_committed_blocks_stored_for_sync() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     runner.initialize_genesis();
 
@@ -2147,7 +2150,7 @@ fn test_committed_blocks_stored_for_sync() {
 #[test]
 fn test_sync_state_isolation() {
     let config = test_network_config();
-    let runner = SimulationRunner::new(config, 42);
+    let runner = RadixSimRunner::new(config, 42);
 
     // Fresh nodes should all be at height 0 (before genesis)
     for i in 0..4u32 {
@@ -2179,7 +2182,7 @@ fn test_sync_state_isolation() {
 #[test]
 fn test_isolated_node_divergence() {
     let config = test_network_config();
-    let mut runner = SimulationRunner::new(config, 42);
+    let mut runner = RadixSimRunner::new(config, 42);
 
     runner.initialize_genesis();
 
