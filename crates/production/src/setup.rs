@@ -61,10 +61,10 @@ pub trait ProductionSetup: Send + Sync + 'static {
 pub struct ProdNodeConfig<S: ProductionSetup>(PhantomData<fn() -> S>);
 
 impl<S: ProductionSetup> NodeConfig for ProdNodeConfig<S> {
-    type C = S::C;
-    type S = SharedStorage<PooledDispatch>;
-    type N = Libp2pNetwork;
-    type D = PooledDispatch;
-    type E = S::E;
-    type V = S::V;
+    type Types = S::C;
+    type Storage = SharedStorage<PooledDispatch>;
+    type Net = Libp2pNetwork;
+    type Pool = PooledDispatch;
+    type Executor = S::E;
+    type Validator = S::V;
 }

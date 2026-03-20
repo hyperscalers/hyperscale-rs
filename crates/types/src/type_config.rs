@@ -24,15 +24,15 @@ pub trait ConsensusTransaction: Clone + Debug + Send + Sync + BasicEncode + Basi
     fn tx_hash(&self) -> Hash;
 
     /// Node addresses this transaction reads from.
-    fn reads(&self) -> Vec<NodeId>;
+    fn reads(&self) -> &[NodeId];
 
     /// Node addresses this transaction writes to.
-    fn writes(&self) -> Vec<NodeId>;
+    fn writes(&self) -> &[NodeId];
 
     /// All declared nodes (reads + writes combined).
     fn all_nodes(&self) -> Vec<NodeId> {
-        let mut nodes = self.reads();
-        nodes.extend(self.writes());
+        let mut nodes = self.reads().to_vec();
+        nodes.extend_from_slice(self.writes());
         nodes
     }
 
@@ -55,10 +55,8 @@ pub trait ConsensusTransaction: Clone + Debug + Send + Sync + BasicEncode + Basi
 
     /// Whether this transaction touches multiple shards.
     fn is_cross_shard(&self, num_shards: u64) -> bool {
-        let reads = self.reads();
-        let writes = self.writes();
         let mut shards = std::collections::BTreeSet::new();
-        for node in reads.iter().chain(writes.iter()) {
+        for node in self.reads().iter().chain(self.writes().iter()) {
             shards.insert(crate::shard_for_node(node, num_shards));
         }
         shards.len() > 1
@@ -83,9 +81,9 @@ pub trait ConsensusExecutionReceipt:
 /// application-specific types.
 ///
 /// Transaction and receipt operations live on their respective trait bounds
-/// ([`ConsensusTransaction`], [`ConsensusReceipt`]). Only state update
-/// operations remain here because `StateUpdate` may be a foreign type
-/// where the orphan rule prevents adding a trait impl.
+/// ([`ConsensusTransaction`], [`ConsensusExecutionReceipt`]).
+/// State update operations are static methods here because the orphan rule
+/// prevents adding trait impls to foreign types like `DatabaseUpdates`.
 ///
 /// Crypto stays concrete (BLS12-381).
 pub trait TypeConfig: Send + Sync + 'static {
@@ -168,11 +166,11 @@ mod tests {
         fn tx_hash(&self) -> Hash {
             self.hash
         }
-        fn reads(&self) -> Vec<NodeId> {
-            self.reads.clone()
+        fn reads(&self) -> &[NodeId] {
+            &self.reads
         }
-        fn writes(&self) -> Vec<NodeId> {
-            self.writes.clone()
+        fn writes(&self) -> &[NodeId] {
+            &self.writes
         }
         fn is_retry(&self) -> bool {
             false

@@ -28,8 +28,8 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
 
         let storage = Arc::clone(&self.storage);
         self.network
-            .register_request_handler::<Cfg::C, GetBlockRequest>(move |req| {
-                serve_block_request::<Cfg::C>(&*storage, req)
+            .register_request_handler::<Cfg::Types, GetBlockRequest>(move |req| {
+                serve_block_request::<Cfg::Types>(&*storage, req)
             });
 
         // ── transaction.request → fetch protocol ─────────────────────
@@ -37,8 +37,8 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
         let storage = Arc::clone(&self.storage);
         let tx_cache = Arc::clone(&self.tx_cache);
         self.network
-            .register_request_handler::<Cfg::C, GetTransactionsRequest>(move |req| {
-                serve_transaction_request::<Cfg::C>(&*storage, &tx_cache, req)
+            .register_request_handler::<Cfg::Types, GetTransactionsRequest>(move |req| {
+                serve_transaction_request::<Cfg::Types>(&*storage, &tx_cache, req)
             });
 
         // ── certificate.request → fetch protocol ─────────────────────
@@ -46,8 +46,8 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
         let storage = Arc::clone(&self.storage);
         let cert_cache = Arc::clone(&self.cert_cache);
         self.network
-            .register_request_handler::<Cfg::C, GetCertificatesRequest>(move |req| {
-                serve_certificate_request::<Cfg::C>(&*storage, &cert_cache, req)
+            .register_request_handler::<Cfg::Types, GetCertificatesRequest>(move |req| {
+                serve_certificate_request::<Cfg::Types>(&*storage, &cert_cache, req)
             });
 
         // ── provision.request → provision fetch protocol ─────────────
@@ -56,9 +56,9 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
         let topology = self.topology.clone();
         let executor = self.executor.clone();
         self.network
-            .register_request_handler::<Cfg::C, GetProvisionsRequest>(move |req| {
+            .register_request_handler::<Cfg::Types, GetProvisionsRequest>(move |req| {
                 let topo = topology.load();
-                serve_provision_request::<Cfg::C, Cfg::E>(
+                serve_provision_request::<Cfg::Types, Cfg::Executor>(
                     &*storage,
                     &executor,
                     topo.local_shard(),
@@ -78,9 +78,9 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
 
         let tx = self.event_sender.clone();
         self.network
-            .register_gossip_handler::<TransactionGossip<Cfg::C>>(
+            .register_gossip_handler::<TransactionGossip<Cfg::Types>>(
                 TopicScope::Shard,
-                move |gossip: TransactionGossip<Cfg::C>| -> GossipVerdict {
+                move |gossip: TransactionGossip<Cfg::Types>| -> GossipVerdict {
                     let _ = tx.send(NodeInput::Protocol(
                         ProtocolEvent::TransactionGossipReceived {
                             tx: gossip.transaction,

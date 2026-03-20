@@ -390,7 +390,7 @@ impl<S: SimulationSetup> SimulationRunner<S> {
     where
         F: FnOnce(
             &mut SimStorage<SyncDispatch>,
-            &<crate::setup::SimNodeConfig<S> as NodeConfig>::E,
+            &<crate::setup::SimNodeConfig<S> as NodeConfig>::Executor,
         ),
     {
         self.io_loops[node_idx].with_storage_and_executor(f);

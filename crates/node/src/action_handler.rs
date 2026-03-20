@@ -22,13 +22,13 @@ use std::sync::Arc;
 
 /// Context for executing delegated actions.
 pub(crate) struct ActionContext<'a, Cfg: NodeConfig> {
-    pub storage: &'a Cfg::S,
-    pub executor: &'a Cfg::E,
+    pub storage: &'a Cfg::Storage,
+    pub executor: &'a Cfg::Executor,
     pub signing_key: &'a Bls12381G1PrivateKey,
     pub local_shard: ShardGroupId,
     pub num_shards: u64,
     pub validator_id: ValidatorId,
-    pub dispatch: &'a Cfg::D,
+    pub dispatch: &'a Cfg::Pool,
 }
 
 /// Result of handling a delegated action.
@@ -42,8 +42,8 @@ pub(crate) struct DelegatedResult<C: TypeConfig, P: Send> {
 
 /// Alias for `DelegatedResult` parameterized by a `NodeConfig`.
 pub(crate) type DelegatedActionResult<Cfg> = DelegatedResult<
-    <Cfg as NodeConfig>::C,
-    <<Cfg as NodeConfig>::S as CommitStore<<Cfg as NodeConfig>::C>>::PreparedCommit,
+    <Cfg as NodeConfig>::Types,
+    <<Cfg as NodeConfig>::Storage as CommitStore<<Cfg as NodeConfig>::Types>>::PreparedCommit,
 >;
 
 /// Which dispatch pool an action should run on in production.
@@ -94,7 +94,7 @@ pub(crate) fn dispatch_pool_for<C: TypeConfig>(action: &Action<C>) -> Option<Dis
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
-    action: Action<Cfg::C>,
+    action: Action<Cfg::Types>,
     ctx: &ActionContext<'_, Cfg>,
 ) -> Option<DelegatedActionResult<Cfg>> {
     match action {
@@ -189,7 +189,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
             transactions,
         } => {
             let start = std::time::Instant::now();
-            let valid = hyperscale_bft::handlers::verify_transaction_root::<Cfg::C>(
+            let valid = hyperscale_bft::handlers::verify_transaction_root::<Cfg::Types>(
                 expected_root,
                 &retry_transactions,
                 &priority_transactions,
@@ -236,8 +236,9 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
             block_height,
         } => {
             let start = std::time::Instant::now();
-            let merged = <Cfg::C as TypeConfig>::merge_state_updates_from_arcs(&per_cert_updates);
-            let result = hyperscale_bft::handlers::verify_state_root::<Cfg::C, _>(
+            let merged =
+                <Cfg::Types as TypeConfig>::merge_state_updates_from_arcs(&per_cert_updates);
+            let result = hyperscale_bft::handlers::verify_state_root::<Cfg::Types, _>(
                 ctx.storage,
                 parent_state_root,
                 expected_root,
@@ -281,8 +282,8 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
             provision_targets,
         } => {
             let merged_updates =
-                <Cfg::C as TypeConfig>::merge_state_updates_from_arcs(&per_cert_updates);
-            let result = hyperscale_bft::handlers::build_proposal::<Cfg::C, _>(
+                <Cfg::Types as TypeConfig>::merge_state_updates_from_arcs(&per_cert_updates);
+            let result = hyperscale_bft::handlers::build_proposal::<Cfg::Types, _>(
                 ctx.storage,
                 proposer,
                 height,
@@ -447,7 +448,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
                 .map(|r| {
                     let mut db_updates = r.state_update;
                     if num_shards > 1 {
-                        db_updates = <Cfg::C as TypeConfig>::filter_state_update_to_shard(
+                        db_updates = <Cfg::Types as TypeConfig>::filter_state_update_to_shard(
                             &db_updates,
                             local_shard,
                             num_shards,
@@ -498,7 +499,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
                 .map(|r| {
                     let mut db_updates = r.state_update;
                     if num_shards > 1 {
-                        db_updates = <Cfg::C as TypeConfig>::filter_state_update_to_shard(
+                        db_updates = <Cfg::Types as TypeConfig>::filter_state_update_to_shard(
                             &db_updates,
                             local_shard,
                             num_shards,

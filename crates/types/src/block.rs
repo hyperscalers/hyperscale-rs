@@ -826,11 +826,11 @@ mod tests {
         fn tx_hash(&self) -> Hash {
             self.hash
         }
-        fn reads(&self) -> Vec<crate::NodeId> {
-            vec![]
+        fn reads(&self) -> &[crate::NodeId] {
+            &[]
         }
-        fn writes(&self) -> Vec<crate::NodeId> {
-            vec![]
+        fn writes(&self) -> &[crate::NodeId] {
+            &[]
         }
         fn is_retry(&self) -> bool {
             false

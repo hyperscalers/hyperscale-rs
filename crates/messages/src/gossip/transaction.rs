@@ -100,68 +100,10 @@ impl<C: TypeConfig> PartialEq for TransactionGossip<C> {
 
 impl<C: TypeConfig> Eq for TransactionGossip<C> {}
 
-// ============================================================================
-// Manual SBOR implementation (since Arc doesn't derive BasicSbor)
-// We serialize/deserialize the inner transaction directly.
-// ============================================================================
-
-impl<'a, C: TypeConfig> sbor::Encode<sbor::NoCustomValueKind, sbor::BasicEncoder<'a>>
-    for TransactionGossip<C>
-{
-    fn encode_value_kind(
-        &self,
-        encoder: &mut sbor::BasicEncoder<'a>,
-    ) -> Result<(), sbor::EncodeError> {
-        encoder.write_value_kind(sbor::ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut sbor::BasicEncoder<'a>) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(2)?; // 2 fields
-        encoder.encode(self.transaction.as_ref())?;
-        encoder.encode(&self.trace_context)?;
-        Ok(())
-    }
-}
-
-impl<'a, C: TypeConfig> sbor::Decode<sbor::NoCustomValueKind, sbor::BasicDecoder<'a>>
-    for TransactionGossip<C>
-{
-    fn decode_body_with_value_kind(
-        decoder: &mut sbor::BasicDecoder<'a>,
-        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
-    ) -> Result<Self, sbor::DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-
-        if length != 2 {
-            return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 2,
-                actual: length,
-            });
-        }
-
-        let transaction: C::Transaction = decoder.decode()?;
-        let trace_context: TraceContext = decoder.decode()?;
-
-        Ok(Self {
-            transaction: Arc::new(transaction),
-            trace_context,
-        })
-    }
-}
-
-impl<C: TypeConfig> sbor::Categorize<sbor::NoCustomValueKind> for TransactionGossip<C> {
-    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
-        sbor::ValueKind::Tuple
-    }
-}
-
-impl<C: TypeConfig> sbor::Describe<sbor::NoCustomTypeKind> for TransactionGossip<C> {
-    const TYPE_ID: sbor::RustTypeId =
-        sbor::RustTypeId::novel_with_code("TransactionGossip", &[], &[]);
-
-    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
-        sbor::TypeData::unnamed(sbor::TypeKind::Any)
+sbor::impl_sbor_for_generic_struct! {
+    struct TransactionGossip<C: TypeConfig> ["TransactionGossip"] {
+        transaction: Arc<C::Transaction>;
+        trace_context: TraceContext,
     }
 }
 

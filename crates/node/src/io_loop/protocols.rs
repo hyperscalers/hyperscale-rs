@@ -18,7 +18,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     ///
     /// DeliverBlock and SyncComplete are fed directly to the state machine
     /// (no round-trip through the runner). FetchBlock uses the Network trait.
-    pub(super) fn process_sync_outputs(&mut self, outputs: Vec<SyncOutput<Cfg::C>>) {
+    pub(super) fn process_sync_outputs(&mut self, outputs: Vec<SyncOutput<Cfg::Types>>) {
         for output in outputs {
             match output {
                 SyncOutput::FetchBlock { height } => {
@@ -26,7 +26,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                     use hyperscale_network::Network;
                     let es = self.event_sender.clone();
                     let peers = self.local_peers();
-                    self.network.request::<Cfg::C, _>(
+                    self.network.request::<Cfg::Types, _>(
                         peers,
                         None,
                         GetBlockRequest {
@@ -92,7 +92,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     ///
     /// FetchTransactions/FetchCertificates use the Network trait to make requests.
     /// DeliverTransactions/DeliverCertificates feed events directly to the state machine.
-    pub(super) fn process_fetch_outputs(&mut self, outputs: Vec<FetchOutput<Cfg::C>>) {
+    pub(super) fn process_fetch_outputs(&mut self, outputs: Vec<FetchOutput<Cfg::Types>>) {
         for output in outputs {
             match output {
                 FetchOutput::FetchTransactions {
@@ -106,7 +106,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                     let bh = block_hash;
                     let hs = tx_hashes.clone();
                     let peers = self.local_peers();
-                    self.network.request::<Cfg::C, _>(
+                    self.network.request::<Cfg::Types, _>(
                         peers,
                         Some(proposer),
                         GetTransactionsRequest::new(block_hash, tx_hashes),
@@ -137,7 +137,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                     let bh = block_hash;
                     let hs = cert_hashes.clone();
                     let peers = self.local_peers();
-                    self.network.request::<Cfg::C, _>(
+                    self.network.request::<Cfg::Types, _>(
                         peers,
                         Some(proposer),
                         GetCertificatesRequest::new(block_hash, cert_hashes),
@@ -174,7 +174,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 } => {
                     // Persist fetched certificates to storage so they survive restarts.
                     for cert in &certificates {
-                        ConsensusStore::<Cfg::C>::store_certificate(&*self.storage, cert);
+                        ConsensusStore::<Cfg::Types>::store_certificate(&*self.storage, cert);
                     }
                     self.feed_event(ProtocolEvent::CertificateFetchDelivered {
                         block_hash,
@@ -205,7 +205,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                         target_shard,
                     };
                     let sender = self.event_sender.clone();
-                    self.network.request::<Cfg::C, _>(
+                    self.network.request::<Cfg::Types, _>(
                         &[peer],
                         None,
                         request,

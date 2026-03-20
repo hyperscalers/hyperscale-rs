@@ -54,10 +54,10 @@ pub trait SimulationSetup: 'static {
 pub struct SimNodeConfig<S: SimulationSetup>(PhantomData<fn() -> S>);
 
 impl<S: SimulationSetup> NodeConfig for SimNodeConfig<S> {
-    type C = S::C;
-    type S = SimStorage<SyncDispatch>;
-    type N = SimNetworkAdapter;
-    type D = SyncDispatch;
-    type E = S::E;
-    type V = S::V;
+    type Types = S::C;
+    type Storage = SimStorage<SyncDispatch>;
+    type Net = SimNetworkAdapter;
+    type Pool = SyncDispatch;
+    type Executor = S::E;
+    type Validator = S::V;
 }

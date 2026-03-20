@@ -464,11 +464,11 @@ mod tests {
         fn tx_hash(&self) -> Hash {
             self.hash
         }
-        fn reads(&self) -> Vec<NodeId> {
-            vec![]
+        fn reads(&self) -> &[NodeId] {
+            &[]
         }
-        fn writes(&self) -> Vec<NodeId> {
-            vec![]
+        fn writes(&self) -> &[NodeId] {
+            &[]
         }
         fn is_retry(&self) -> bool {
             false

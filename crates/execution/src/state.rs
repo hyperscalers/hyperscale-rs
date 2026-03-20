@@ -548,7 +548,7 @@ impl<C: TypeConfig> ExecutionState<C> {
         let vote_tracker = VoteTracker::new(
             tx_hash,
             vec![local_shard], // Only our shard participates
-            tx.reads(),
+            tx.reads().to_vec(),
             quorum,
         );
         self.vote_trackers.insert(tx_hash, vote_tracker);
@@ -664,7 +664,7 @@ impl<C: TypeConfig> ExecutionState<C> {
         let vote_tracker = VoteTracker::new(
             tx_hash,
             participating_shards.iter().copied().collect(),
-            tx.reads(),
+            tx.reads().to_vec(),
             quorum,
         );
         self.vote_trackers.insert(tx_hash, vote_tracker);
@@ -1896,7 +1896,7 @@ impl<C: TypeConfig> ExecutionState<C> {
             // Get the read set from the transaction's declared_reads
             let read_set: HashSet<NodeId> = tx_map
                 .get(&tx_hash)
-                .map(|tx| tx.reads().into_iter().collect())
+                .map(|tx| tx.reads().iter().copied().collect())
                 .unwrap_or_default();
 
             // Index for fast invalidation

@@ -39,7 +39,6 @@ fn node_id_from_db_key(db_node_key: &[u8]) -> Option<NodeId> {
 ///
 /// Transaction and receipt operations are provided by the [`ConsensusTransaction`]
 /// and [`ConsensusExecutionReceipt`] trait impls on the concrete types themselves.
-/// Only state update operations remain here.
 #[derive(Debug, Clone)]
 pub struct RadixConfig;
 

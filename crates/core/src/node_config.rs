@@ -14,37 +14,41 @@ use crate::{ExecutionBackend, TransactionValidator};
 ///
 /// This trait collapses the 6 infrastructure type parameters that IoLoop,
 /// runners, and related infrastructure need into a single associated-type
-/// bundle. `C` selects the [`TypeConfig`] that parameterizes
-/// transactions, receipts, blocks, and other generic types.
+/// bundle.
 ///
 /// # Usage
 ///
 /// ```ignore
 /// pub struct IoLoop<Cfg: NodeConfig> {
-///     state: NodeStateMachine<Cfg::C>,
-///     storage: Arc<Cfg::S>,
-///     executor: Cfg::E,
-///     network: Cfg::N,
-///     dispatch: Cfg::D,
+///     state: NodeStateMachine<Cfg::Types>,
+///     storage: Arc<Cfg::Storage>,
+///     executor: Cfg::Executor,
+///     network: Cfg::Net,
+///     dispatch: Cfg::Pool,
 ///     // ...
 /// }
 /// ```
 pub trait NodeConfig: Send + Sync + 'static {
     /// TypeConfig selecting transaction, receipt, and state update types.
-    type C: TypeConfig;
+    type Types: TypeConfig;
 
     /// Storage backend (consensus + commit + substate).
-    type S: CommitStore<Self::C> + SubstateStore + ConsensusStore<Self::C> + Send + Sync + 'static;
+    type Storage: CommitStore<Self::Types>
+        + SubstateStore
+        + ConsensusStore<Self::Types>
+        + Send
+        + Sync
+        + 'static;
 
     /// Network backend.
-    type N: Network;
+    type Net: Network;
 
     /// Dispatch backend (thread pool / sync).
-    type D: Dispatch + 'static;
+    type Pool: Dispatch + 'static;
 
     /// Execution backend.
-    type E: ExecutionBackend<Self::C>;
+    type Executor: ExecutionBackend<Self::Types>;
 
     /// Transaction validator.
-    type V: TransactionValidator<Self::C>;
+    type Validator: TransactionValidator<Self::Types>;
 }

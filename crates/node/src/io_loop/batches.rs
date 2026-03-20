@@ -20,7 +20,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     // ─── Transaction Validation Batching ──────────────────────────────
 
     /// Queue a transaction for batch validation.
-    pub(super) fn queue_validation(&mut self, tx: Arc<<Cfg::C as TypeConfig>::Transaction>) {
+    pub(super) fn queue_validation(&mut self, tx: Arc<super::Tx<Cfg>>) {
         if self.validation_batch.push(tx, self.state.now()) {
             self.flush_validation_batch();
         }
@@ -107,7 +107,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                     let mut result = ExecutionResult::from(r);
                     if num_shards > 1 {
                         result.database_updates =
-                            <Cfg::C as hyperscale_types::TypeConfig>::filter_state_update_to_shard(
+                            <Cfg::Types as TypeConfig>::filter_state_update_to_shard(
                                 &result.database_updates,
                                 local_shard,
                                 num_shards,
@@ -194,7 +194,7 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
     pub(super) fn accumulate_cross_shard_execution(
         &mut self,
         tx_hash: Hash,
-        transaction: Arc<<Cfg::C as TypeConfig>::Transaction>,
+        transaction: Arc<super::Tx<Cfg>>,
         provisions: Vec<hyperscale_types::StateProvision>,
     ) {
         let req = CrossShardExecutionRequest {

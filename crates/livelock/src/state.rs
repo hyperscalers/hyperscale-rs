@@ -133,7 +133,7 @@ impl LivelockState {
         let writes = tx.writes();
 
         // Determine which shards and nodes we need provisions from
-        let needs = self.compute_remote_state_needs_from_nodes(topology, &reads, &writes);
+        let needs = self.compute_remote_state_needs_from_nodes(topology, reads, writes);
 
         if needs.shards.is_empty() {
             // Not actually cross-shard, nothing to track

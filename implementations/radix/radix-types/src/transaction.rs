@@ -261,12 +261,12 @@ impl ConsensusTransaction for RoutableTransaction {
         self.hash()
     }
 
-    fn reads(&self) -> Vec<NodeId> {
-        self.declared_reads.clone()
+    fn reads(&self) -> &[NodeId] {
+        &self.declared_reads
     }
 
-    fn writes(&self) -> Vec<NodeId> {
-        self.declared_writes.clone()
+    fn writes(&self) -> &[NodeId] {
+        &self.declared_writes
     }
 
     fn is_retry(&self) -> bool {
