@@ -1,0 +1,61 @@
+[package]
+name = "hyperscale-radix-production"
+version.workspace = true
+edition.workspace = true
+description = "Radix production setup for hyperscale"
+
+[[bin]]
+name = "hyperscale-validator"
+path = "src/bin/validator.rs"
+
+[[bin]]
+name = "hyperscale-keygen"
+path = "src/bin/keygen.rs"
+
+[dependencies]
+hyperscale-production.workspace = true
+hyperscale-radix-config.workspace = true
+hyperscale-engine.workspace = true
+hyperscale-core.workspace = true
+hyperscale-dispatch-pooled.workspace = true
+hyperscale-storage.workspace = true
+hyperscale-storage-rocksdb.workspace = true
+hyperscale-types.workspace = true
+hyperscale-bft.workspace = true
+hyperscale-mempool.workspace = true
+hyperscale-topology.workspace = true
+hyperscale-network-libp2p.workspace = true
+
+# Radix types for genesis configuration parsing
+radix-common.workspace = true
+
+# CLI and configuration (for validator binary)
+clap.workspace = true
+toml.workspace = true
+anyhow = "1.0"
+hex.workspace = true
+rand.workspace = true
+
+# Networking (for Multiaddr/PeerId in validator binary)
+libp2p.workspace = true
+
+# Async runtime
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
+tracing-appender = "0.2.4"
+
+# Serialization
+serde.workspace = true
+
+# Lock-free concurrent data structures
+arc-swap.workspace = true
+
+# UPnP
+igd-next = { version = "0.14.3", features = ["aio_tokio"] }
+
+# Cryptographic primitives for deterministic PeerId derivation
+sha2 = "0.10"
+ed25519-dalek.workspace = true
+
+[dev-dependencies]

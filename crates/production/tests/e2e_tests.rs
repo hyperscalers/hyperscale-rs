@@ -14,6 +14,7 @@ use hyperscale_bft::BftConfig;
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_production::{ProductionRunner, RocksDbStorage};
+use hyperscale_radix_production::RadixProductionSetup;
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
     generate_bls_keypair, validator_bind_message, Block, BlockHeader, BlockHeight, Hash,
@@ -568,7 +569,7 @@ async fn test_production_runner_with_network() {
 
     let runner = timeout(
         CONNECTION_TIMEOUT,
-        ProductionRunner::builder()
+        ProductionRunner::<RadixProductionSetup>::builder()
             .topology(fixtures.topology(0))
             .signing_key(fixtures.signing_key(0))
             .bft_config(BftConfig::default())
@@ -631,7 +632,7 @@ async fn test_graceful_shutdown() {
         ..Default::default()
     };
 
-    let mut runner = ProductionRunner::builder()
+    let mut runner = ProductionRunner::<RadixProductionSetup>::builder()
         .topology(fixtures.topology(0))
         .signing_key(fixtures.signing_key(0))
         .bft_config(BftConfig::default())

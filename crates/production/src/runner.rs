@@ -42,18 +42,18 @@
 
 use crate::event_loop::{spawn_pinned_loop, PinnedLoopConfig, ProdIoLoop};
 use crate::rpc::{MempoolSnapshot, NodeStatusState};
+use crate::setup::ProductionSetup;
 use arc_swap::ArcSwap;
 use hyperscale_bft::BftConfig;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_dispatch_pooled::PooledDispatch;
-use hyperscale_engine::{NetworkDefinition, RadixExecutor};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics as metrics;
 use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_network_libp2p::{
     generate_random_keypair, Libp2pAdapter, Libp2pConfig, NetworkError,
 };
-use hyperscale_storage::GenesisWrapper;
+use hyperscale_storage::ConsensusStore;
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use quick_cache::sync::Cache as QuickCache;
 
@@ -68,9 +68,6 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
-
-/// Type alias for the production genesis wrapper.
-type GenesisMutWrapper<'a> = GenesisWrapper<'a, RocksDbStorage<PooledDispatch>>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RunnerError
@@ -134,7 +131,7 @@ impl Drop for ShutdownHandle {
 /// Optional fields:
 /// - `dispatch` - Dispatch implementation (defaults to auto-configured)
 /// - `channel_capacity` - Event channel capacity (defaults to 10,000)
-pub struct ProductionRunnerBuilder {
+pub struct ProductionRunnerBuilder<S: ProductionSetup> {
     topology: Option<TopologyState>,
     signing_key: Option<Bls12381G1PrivateKey>,
     bft_config: Option<BftConfig>,
@@ -146,10 +143,7 @@ pub struct ProductionRunnerBuilder {
     mempool_snapshot: Option<Arc<ArcSwap<MempoolSnapshot>>>,
     sync_status: Option<Arc<ArcSwap<crate::status::SyncStatus>>>,
     /// Optional genesis configuration for initial state.
-    genesis_config: Option<hyperscale_engine::GenesisConfig>,
-    /// Radix network definition for transaction validation.
-    /// Defaults to simulator network if not set.
-    network_definition: Option<NetworkDefinition>,
+    genesis_config: Option<S::GenesisConfig>,
     /// Maximum transactions for speculative execution (in-flight + cached).
     speculative_max_txs: usize,
     /// Rounds to pause speculation after a view change.
@@ -158,13 +152,13 @@ pub struct ProductionRunnerBuilder {
     mempool_config: MempoolConfig,
 }
 
-impl Default for ProductionRunnerBuilder {
+impl<S: ProductionSetup> Default for ProductionRunnerBuilder<S> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ProductionRunnerBuilder {
+impl<S: ProductionSetup> ProductionRunnerBuilder<S> {
     /// Create a new builder with default channel capacity.
     pub fn new() -> Self {
         Self {
@@ -179,17 +173,10 @@ impl ProductionRunnerBuilder {
             mempool_snapshot: None,
             sync_status: None,
             genesis_config: None,
-            network_definition: None,
             speculative_max_txs: 500,
             view_change_cooldown_rounds: 3,
             mempool_config: MempoolConfig::default(),
         }
-    }
-
-    /// Set the Radix network definition for transaction validation.
-    pub fn network_definition(mut self, network: NetworkDefinition) -> Self {
-        self.network_definition = Some(network);
-        self
     }
 
     /// Set the network topology.
@@ -268,7 +255,7 @@ impl ProductionRunnerBuilder {
     }
 
     /// Set the genesis configuration for initial state.
-    pub fn genesis_config(mut self, config: hyperscale_engine::GenesisConfig) -> Self {
+    pub fn genesis_config(mut self, config: S::GenesisConfig) -> Self {
         self.genesis_config = Some(config);
         self
     }
@@ -282,7 +269,7 @@ impl ProductionRunnerBuilder {
     /// # Errors
     ///
     /// Returns an error if any required field is missing or if network setup fails.
-    pub async fn build(self) -> Result<ProductionRunner, RunnerError> {
+    pub async fn build(self) -> Result<ProductionRunner<S>, RunnerError> {
         // Install the Prometheus metrics backend before anything records metrics.
         hyperscale_metrics_prometheus::install();
 
@@ -379,31 +366,10 @@ impl ProductionRunnerBuilder {
         // ── Create SharedStorage ────────────────────────────────────────
         let shared_storage = SharedStorage::new(Arc::clone(&storage));
 
-        // ── Create Libp2pNetwork ───────────────────────────────────────────
-        //
-        // Wraps the Libp2p adapter for use by IoLoop's action handler.
-        // SBOR encode + compress + adapter.publish() is sync-safe (non-blocking send).
-        // Note: We create the adapter below, then wrap it.
-        // Libp2pNetwork is created after the adapter.
-
-        // ── Use configured network definition or default ─────────────────
-        let network_definition = self
-            .network_definition
-            .unwrap_or_else(NetworkDefinition::simulator);
-
-        // ── Create transaction validator ─────────────────────────────────
-        let tx_validator = Arc::new(hyperscale_engine::TransactionValidation::new(
-            network_definition.clone(),
-        ));
-
         // ── Create shared handler registry ────────────────────────────────
         let registry = Arc::new(hyperscale_network::HandlerRegistry::new());
 
         // ── Create Libp2p network adapter ────────────────────────────────
-        //
-        // Gossip and request handlers are registered per message type by the
-        // IoLoop during initialization. Topic subscriptions happen automatically
-        // when handlers are registered.
         let adapter = Libp2pAdapter::new(
             network_config,
             ed25519_keypair,
@@ -422,10 +388,6 @@ impl ProductionRunnerBuilder {
         ));
 
         // ── Now create Libp2pNetwork wrapping the adapter ──────────────────
-        //
-        // Libp2pNetwork owns the RequestManager for generic request-response.
-        // It SBOR-encodes requests, frames them with type_id, and dispatches
-        // through the RequestManager's retry/peer-selection logic.
         let libp2p_network = Libp2pNetwork::new(
             adapter.clone(),
             request_manager.clone(),
@@ -434,16 +396,10 @@ impl ProductionRunnerBuilder {
             local_shard,
         );
 
-        // ── Create RadixExecutor ─────────────────────────────────────────
-        let executor = RadixExecutor::new(network_definition);
+        // ── Create executor and validator via ProductionSetup ───────────
+        let (executor, tx_validator) = S::create_executor_and_validator();
 
         // ── Create IoLoop ──────────────────────────────────────────────
-        //
-        // The IoLoop owns the state machine, storage, executor, network,
-        // dispatch, and event sender. It processes ALL actions from the
-        // state machine on the pinned thread. Timer ops are returned in
-        // StepOutput and managed by ProdTimerManager on the pinned thread.
-
         let io_loop = IoLoop::new(
             state,
             shared_storage,
@@ -498,34 +454,31 @@ impl ProductionRunnerBuilder {
 /// All state machine processing, storage I/O, action handling, and gossip cert
 /// verification happen on that thread. The tokio runtime handles async I/O
 /// routing, RPC transaction handling, sync/fetch management, and metrics.
-pub struct ProductionRunner {
+pub struct ProductionRunner<S: ProductionSetup> {
     // ── IoLoop (moved to pinned thread on run()) ───────────────────────
     /// The IoLoop, wrapped in Option because it's moved to the pinned thread.
     /// `None` after `run()` extracts it.
-    io_loop: Option<ProdIoLoop>,
+    io_loop: Option<ProdIoLoop<S>>,
 
     // ── Crossbeam senders (async → pinned thread) ────────────────────────
     /// Timer events to pinned thread (for external timer injection if needed).
     #[allow(dead_code)]
-    xb_timer_tx: crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>,
+    xb_timer_tx: crossbeam::channel::Sender<NodeInput<S::C>>,
     /// Consensus events to pinned thread (from Libp2p adapter routing).
-    xb_consensus_tx: crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>,
+    xb_consensus_tx: crossbeam::channel::Sender<NodeInput<S::C>>,
     /// Callback events to pinned thread (from bridge tasks, direct sends).
     #[allow(dead_code)] // Kept alive to prevent crossbeam channel closure
-    xb_callback_tx: crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>,
+    xb_callback_tx: crossbeam::channel::Sender<NodeInput<S::C>>,
     /// Shutdown signal to pinned thread.
     xb_shutdown_tx: crossbeam::channel::Sender<()>,
 
     // ── Crossbeam receivers (extracted for PinnedLoopConfig) ─────────────
     /// Timer receiver (moved to PinnedLoopConfig).
-    xb_timer_rx:
-        Option<crossbeam::channel::Receiver<NodeInput<hyperscale_radix_config::RadixConfig>>>,
+    xb_timer_rx: Option<crossbeam::channel::Receiver<NodeInput<S::C>>>,
     /// Callback receiver (moved to PinnedLoopConfig).
-    xb_callback_rx:
-        Option<crossbeam::channel::Receiver<NodeInput<hyperscale_radix_config::RadixConfig>>>,
+    xb_callback_rx: Option<crossbeam::channel::Receiver<NodeInput<S::C>>>,
     /// Consensus receiver (moved to PinnedLoopConfig).
-    xb_consensus_rx:
-        Option<crossbeam::channel::Receiver<NodeInput<hyperscale_radix_config::RadixConfig>>>,
+    xb_consensus_rx: Option<crossbeam::channel::Receiver<NodeInput<S::C>>>,
     /// Shutdown receiver (moved to PinnedLoopConfig).
     xb_shutdown_rx: Option<crossbeam::channel::Receiver<()>>,
 
@@ -549,7 +502,7 @@ pub struct ProductionRunner {
 
     // ── Genesis ──────────────────────────────────────────────────────────
     /// Optional genesis configuration for initial state.
-    genesis_config: Option<hyperscale_engine::GenesisConfig>,
+    genesis_config: Option<S::GenesisConfig>,
 
     // ── Caches ───────────────────────────────────────────────────────────
     /// Transaction status cache, shared from IoLoop.
@@ -563,9 +516,9 @@ pub struct ProductionRunner {
     shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
-impl ProductionRunner {
+impl<S: ProductionSetup> ProductionRunner<S> {
     /// Create a new builder for constructing a production runner.
-    pub fn builder() -> ProductionRunnerBuilder {
+    pub fn builder() -> ProductionRunnerBuilder<S> {
         ProductionRunnerBuilder::new()
     }
 
@@ -597,9 +550,7 @@ impl ProductionRunner {
     ///
     /// Events sent through this sender are forwarded to the pinned IoLoop
     /// thread via the crossbeam consensus channel.
-    pub fn event_sender(
-        &self,
-    ) -> crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>> {
+    pub fn event_sender(&self) -> crossbeam::channel::Sender<NodeInput<S::C>> {
         self.xb_consensus_tx.clone()
     }
 
@@ -608,9 +559,7 @@ impl ProductionRunner {
     /// Returns a crossbeam channel sender that feeds directly into the IoLoop.
     /// RPC handlers wrap transactions in `Event::SubmitTransaction` before sending.
     /// IoLoop handles gossip, validation, and mempool dispatch.
-    pub fn tx_submission_sender(
-        &self,
-    ) -> crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>> {
+    pub fn tx_submission_sender(&self) -> crossbeam::channel::Sender<NodeInput<S::C>> {
         self.xb_consensus_tx.clone()
     }
 
@@ -630,8 +579,9 @@ impl ProductionRunner {
 
     /// Initialize genesis if this is a fresh start.
     ///
-    /// Checks if we have any committed blocks. If not, creates a genesis block
-    /// and initializes the state machine (which sets up the initial proposal timer).
+    /// Checks if we have any committed blocks. If not, delegates to
+    /// `S::run_genesis()` for implementation-specific genesis bootstrap,
+    /// then creates a genesis block and initializes the state machine.
     ///
     /// This MUST be called before the IoLoop is moved to the pinned thread,
     /// since it needs mutable access to the IoLoop.
@@ -642,7 +592,7 @@ impl ProductionRunner {
             .expect("io_loop must exist for genesis");
 
         // Check if we already have committed blocks
-        let height = hyperscale_storage::ConsensusStore::<hyperscale_radix_config::RadixConfig>::committed_height(io_loop.storage());
+        let height = ConsensusStore::<S::C>::committed_height(io_loop.storage());
         let has_blocks = height.0 > 0;
 
         if has_blocks {
@@ -655,32 +605,13 @@ impl ProductionRunner {
             "No committed blocks - initializing genesis"
         );
 
-        // Run Radix Engine genesis to set up initial state.
-        //
-        // GenesisMutWrapper writes substates only (no JMT) during bootstrap, then
-        // we compute the JMT once at version 0. This ensures block 1 cleanly
-        // writes at JMT version 1 without colliding with genesis versions.
+        // Run implementation-specific genesis via ProductionSetup trait.
         let genesis_config = self.genesis_config.take();
         let genesis_jmt_root = io_loop.with_storage_and_executor(|storage, executor| {
-            // SharedStorage derefs to &RocksDbStorage.
-            let mut wrapper = GenesisMutWrapper::new(storage);
-            let result = if let Some(config) = genesis_config {
-                info!(
-                    xrd_balances = config.xrd_balances.len(),
-                    "Running genesis with custom configuration"
-                );
-                executor.run_genesis_with_config(&mut wrapper, config)
-            } else {
-                executor.run_genesis(&mut wrapper)
-            };
-
-            if let Err(e) = result {
-                panic!("Radix Engine genesis failed: {e:?}");
+            match S::run_genesis(storage, executor, genesis_config) {
+                Ok(root) => root,
+                Err(e) => panic!("Genesis bootstrap failed: {e:?}"),
             }
-
-            // Compute JMT once at version 0 from merged genesis updates.
-            let merged = wrapper.into_merged();
-            storage.finalize_genesis_jmt(&merged)
         });
 
         info!(

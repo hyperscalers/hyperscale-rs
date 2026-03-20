@@ -1,6 +1,6 @@
 //! Hyperscale Validator Node
 //!
-//! Production binary for running a validator node.
+//! Production binary for running a validator node with the Radix Engine.
 //!
 //! # Usage
 //!
@@ -55,6 +55,7 @@ use hyperscale_production::{
     init_telemetry, PooledDispatch, ProductionRunner, RocksDbConfig, RocksDbStorage,
     TelemetryConfig, ThreadPoolConfig,
 };
+use hyperscale_radix_production::RadixProductionSetup;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     bls_keypair_from_seed, generate_bls_keypair, Bls12381G1PrivateKey, Bls12381G1PublicKey,
@@ -320,41 +321,26 @@ fn default_max_certificates_per_block() -> usize {
 }
 
 fn default_speculative_max_txs() -> usize {
-    500 // Matches hyperscale_execution::DEFAULT_SPECULATIVE_MAX_TXS
+    500
 }
 
 fn default_view_change_cooldown_rounds() -> u64 {
-    3 // Matches hyperscale_execution::DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS
+    3
 }
 
 /// Thread pool configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ThreadsConfig {
-    /// Number of consensus crypto threads (0 = auto, default 2).
-    /// These are liveness-critical for block vote and QC verification.
     #[serde(default)]
     pub consensus_crypto_threads: usize,
-
-    /// Number of crypto verification threads (0 = auto)
     #[serde(default)]
     pub crypto_threads: usize,
-
-    /// Number of transaction validation threads (0 = auto).
-    /// Isolated from general crypto to prevent transaction floods
-    /// from blocking provision/execution vote verification.
     #[serde(default)]
     pub tx_validation_threads: usize,
-
-    /// Number of execution threads (0 = auto)
     #[serde(default)]
     pub execution_threads: usize,
-
-    /// Number of tokio runtime worker threads (0 = auto).
-    /// Controls the async I/O runtime used for networking, timers, and RPC.
     #[serde(default)]
     pub io_threads: usize,
-
-    /// Enable CPU core pinning (Linux only)
     #[serde(default)]
     pub pin_cores: bool,
 }
@@ -388,46 +374,22 @@ impl From<CompressionType> for hyperscale_production::CompressionType {
 /// Storage configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
-    /// Maximum background jobs for RocksDB
     #[serde(default = "default_max_background_jobs")]
     pub max_background_jobs: i32,
-
-    /// Write buffer size in MB
     #[serde(default = "default_write_buffer_mb")]
     pub write_buffer_mb: usize,
-
-    /// Maximum number of write buffers
     #[serde(default = "default_max_write_buffer_number")]
     pub max_write_buffer_number: i32,
-
-    /// Block cache size in MB (0 to disable)
     #[serde(default = "default_block_cache_mb")]
     pub block_cache_mb: usize,
-
-    /// Compression type (none, snappy, zlib, lz4, lz4hc, zstd)
     #[serde(default)]
     pub compression: CompressionType,
-
-    /// Bloom filter bits per key (0 to disable)
     #[serde(default = "default_bloom_filter_bits")]
     pub bloom_filter_bits: f64,
-
-    /// Bytes per sync in MB (0 to disable)
     #[serde(default = "default_bytes_per_sync_mb")]
     pub bytes_per_sync_mb: usize,
-
-    /// Number of log files to keep
     #[serde(default = "default_keep_log_file_num")]
     pub keep_log_file_num: usize,
-
-    /// Number of block heights of JMT history to retain before garbage collection.
-    ///
-    /// Stale JMT nodes and their associations are kept for this many heights
-    /// before being eligible for deletion. This enables historical queries within
-    /// this window.
-    ///
-    /// Set to 0 for immediate deletion (no history retention).
-    /// Defaults to 60,000 (matching Babylon's default).
     #[serde(default = "default_jmt_history_length")]
     pub jmt_history_length: u64,
 }
@@ -451,31 +413,24 @@ impl Default for StorageConfig {
 fn default_jmt_history_length() -> u64 {
     256
 }
-
 fn default_max_background_jobs() -> i32 {
     4
 }
-
 fn default_write_buffer_mb() -> usize {
     128
 }
-
 fn default_max_write_buffer_number() -> i32 {
     3
 }
-
 fn default_block_cache_mb() -> usize {
     512
 }
-
 fn default_bloom_filter_bits() -> f64 {
     10.0
 }
-
 fn default_bytes_per_sync_mb() -> usize {
     1
 }
-
 fn default_keep_log_file_num() -> usize {
     10
 }
@@ -483,11 +438,8 @@ fn default_keep_log_file_num() -> usize {
 /// Metrics configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MetricsConfig {
-    /// Enable metrics endpoint
     #[serde(default = "default_metrics_enabled")]
     pub enabled: bool,
-
-    /// Metrics HTTP listen address
     #[serde(default = "default_metrics_addr")]
     pub listen_addr: String,
 }
@@ -504,7 +456,6 @@ impl Default for MetricsConfig {
 fn default_metrics_enabled() -> bool {
     true
 }
-
 fn default_metrics_addr() -> String {
     "0.0.0.0:9090".to_string()
 }
@@ -512,19 +463,12 @@ fn default_metrics_addr() -> String {
 /// Telemetry configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TelemetryConfigToml {
-    /// Enable OpenTelemetry tracing
     #[serde(default)]
     pub enabled: bool,
-
-    /// OTLP endpoint for traces
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
-
-    /// Service name for tracing
     #[serde(default = "default_service_name")]
     pub service_name: String,
-
-    /// Optional log file path. If provided, logs are written to this file.
     #[serde(default)]
     pub log_file: Option<PathBuf>,
 }
@@ -536,11 +480,8 @@ fn default_service_name() -> String {
 /// Genesis configuration defining the validator set and initial balances.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct GenesisConfig {
-    /// Validators in the network
     #[serde(default)]
     pub validators: Vec<ValidatorEntry>,
-
-    /// Initial XRD balances for accounts
     #[serde(default)]
     pub xrd_balances: Vec<XrdBalanceEntry>,
 }
@@ -548,27 +489,17 @@ pub struct GenesisConfig {
 /// An XRD balance entry for genesis configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct XrdBalanceEntry {
-    /// Bech32-encoded account address (e.g., "account_sim1...")
     pub address: String,
-
-    /// Balance as a string (parsed as Decimal)
     pub balance: String,
 }
 
 /// A validator entry in genesis configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ValidatorEntry {
-    /// Validator ID
     pub id: u64,
-
-    /// Shard this validator belongs to
     #[serde(default)]
     pub shard: Option<u64>,
-
-    /// Hex-encoded public key
     pub public_key: String,
-
-    /// Voting power (default: 1)
     #[serde(default = "default_voting_power")]
     pub voting_power: u64,
 }
@@ -578,7 +509,6 @@ fn default_voting_power() -> u64 {
 }
 
 impl ValidatorConfig {
-    /// Load configuration from a TOML file.
     pub fn load(path: &PathBuf) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("Failed to read config file: {}", path.display()))?;
@@ -587,47 +517,35 @@ impl ValidatorConfig {
             .with_context(|| format!("Failed to parse config file: {}", path.display()))
     }
 
-    /// Apply CLI overrides to the configuration.
     fn apply_overrides(&mut self, cli: &Cli) {
         if let Some(ref key_path) = cli.key {
             self.node.key_path = Some(key_path.clone());
         }
-
         if let Some(ref data_dir) = cli.data_dir {
             self.node.data_dir = data_dir.clone();
         }
-
         if let Some(ref metrics_addr) = cli.metrics_addr {
             self.metrics.listen_addr = metrics_addr.clone();
         }
-
         if !cli.bootstrap.is_empty() {
             self.network.bootstrap_peers.extend(cli.bootstrap.clone());
         }
-
         if cli.no_upnp {
             self.network.upnp_enabled = false;
         }
-
         if let Some(mode) = cli.version_interop_mode {
             self.network.version_interop_mode = Some(mode);
         }
-
         if let Some(ref logfile) = cli.logfile {
             self.telemetry.log_file = Some(logfile.clone());
         }
     }
 }
 
-/// Format a public key as a hex string.
 fn format_public_key(pk: &Bls12381G1PublicKey) -> String {
     hex::encode(pk.to_vec())
 }
 
-/// Load or generate a signing keypair.
-///
-/// The key file stores a 32-byte seed that deterministically generates the keypair.
-/// This seed can be stored as raw bytes or hex-encoded.
 fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1PrivateKey> {
     match key_path {
         Some(path) => {
@@ -635,12 +553,9 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1Priv
                 let key_bytes = fs::read(path)
                     .with_context(|| format!("Failed to read key file: {}", path.display()))?;
 
-                // Try to decode as hex first, then as raw bytes
                 let decoded = if key_bytes.len() == 64 {
-                    // Likely hex-encoded (64 hex chars = 32 bytes)
                     hex::decode(&key_bytes).with_context(|| "Failed to decode hex key")?
                 } else if key_bytes.len() == 32 {
-                    // Raw bytes
                     key_bytes
                 } else {
                     bail!(
@@ -649,24 +564,20 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1Priv
                     );
                 };
 
-                // Convert to fixed array
                 let seed: [u8; 32] = decoded
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("Key must be exactly 32 bytes"))?;
 
-                // Use BLS12-381 for consensus (supports signature aggregation)
                 Ok(bls_keypair_from_seed(&seed))
             } else {
                 info!("Key file not found, generating new keypair");
 
-                // Generate random seed
                 let mut seed = [0u8; 32];
                 use rand::RngCore;
                 rand::rngs::OsRng.fill_bytes(&mut seed);
 
                 let keypair = bls_keypair_from_seed(&seed);
 
-                // Save the seed
                 if let Some(parent) = path.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -683,7 +594,6 @@ fn load_or_generate_keypair(key_path: Option<&PathBuf>) -> Result<Bls12381G1Priv
     }
 }
 
-/// Build the topology from genesis configuration.
 fn build_topology(
     config: &ValidatorConfig,
     local_keypair: &Bls12381G1PrivateKey,
@@ -694,9 +604,7 @@ fn build_topology(
     let local_shard = ShardGroupId(config.node.shard);
     let num_shards = config.node.num_shards;
 
-    // Build validator set from genesis config
     let validators: Vec<ValidatorInfo> = if config.genesis.validators.is_empty() {
-        // Single validator mode (development/testing)
         warn!("No validators in genesis config, running in single-validator mode");
         vec![ValidatorInfo {
             validator_id: local_validator_id,
@@ -710,15 +618,12 @@ fn build_topology(
             .iter()
             .map(|v| {
                 let public_key = if v.id == config.node.validator_id {
-                    // Use our own key for our validator ID
                     local_keypair.public_key()
                 } else {
-                    // Parse hex-encoded public key (BLS12-381 only)
                     let key_bytes = hex::decode(&v.public_key).with_context(|| {
                         format!("Invalid hex public key for validator {}", v.id)
                     })?;
 
-                    // BLS12-381 public key (compressed, 48 bytes)
                     if key_bytes.len() != 48 {
                         bail!(
                             "Invalid public key length for validator {}: expected 48 (BLS), got {}",
@@ -742,17 +647,12 @@ fn build_topology(
 
     let validator_set = ValidatorSet::new(validators);
 
-    // Check if validators have explicit shard assignments
     let has_shard_assignments = config.genesis.validators.iter().any(|v| v.shard.is_some());
 
     if has_shard_assignments {
-        // Build shard committees from explicit shard assignments in config
-        // This is required for multi-shard setups where each validator needs to know
-        // about ALL validators across ALL shards for cross-shard message verification
         let mut shard_committees: HashMap<ShardGroupId, Vec<ValidatorId>> = HashMap::new();
 
         for v in &config.genesis.validators {
-            // Use explicit shard if provided, otherwise fall back to validator_id % num_shards
             let shard = ShardGroupId(v.shard.unwrap_or(v.id % num_shards));
             shard_committees
                 .entry(shard)
@@ -774,8 +674,6 @@ fn build_topology(
             shard_committees,
         ))
     } else {
-        // Legacy mode: all validators in genesis belong to local shard only
-        // This only works for single-shard deployments
         if num_shards > 1 {
             warn!(
                 "Multi-shard deployment without explicit shard assignments in genesis config. \
@@ -792,10 +690,6 @@ fn build_topology(
     }
 }
 
-/// Build engine genesis configuration from TOML config.
-///
-/// Converts the TOML-friendly genesis config (with string addresses and balances)
-/// to the engine's GenesisConfig type.
 fn build_engine_genesis_config(config: &GenesisConfig) -> Result<hyperscale_engine::GenesisConfig> {
     use radix_common::math::Decimal;
     use radix_common::types::ComponentAddress;
@@ -806,9 +700,7 @@ fn build_engine_genesis_config(config: &GenesisConfig) -> Result<hyperscale_engi
 
     let mut engine_config = hyperscale_engine::GenesisConfig::test_default();
 
-    // Convert XRD balances
     for entry in &config.xrd_balances {
-        // Decode bech32 address
         let (_, address_bytes) = decoder
             .validate_and_decode(&entry.address)
             .map_err(|e| anyhow::anyhow!("Invalid address '{}': {:?}", entry.address, e))?;
@@ -817,7 +709,6 @@ fn build_engine_genesis_config(config: &GenesisConfig) -> Result<hyperscale_engi
             anyhow::anyhow!("Invalid component address '{}': {:?}", entry.address, e)
         })?;
 
-        // Parse balance
         let balance = Decimal::from_str(&entry.balance)
             .map_err(|e| anyhow::anyhow!("Invalid balance '{}': {:?}", entry.balance, e))?;
 
@@ -832,23 +723,10 @@ fn build_engine_genesis_config(config: &GenesisConfig) -> Result<hyperscale_engi
     Ok(engine_config)
 }
 
-/// Compute rayon pool thread counts for a given number of available cores.
-///
-/// Reserves 1 core for the state machine thread, then splits the remainder:
-/// - Consensus Crypto: 2 threads (fixed, liveness-critical for block votes/QC)
-/// - Execution: 25% of pool budget (Radix Engine)
-/// - TX Validation: 15% of pool budget (transaction signature verification)
-/// - Crypto: remainder (provisions, execution votes, certificate verification)
-///
-/// On systems with fewer than 8 cores, all variable pools get 1 thread each.
 fn for_core_count(total_cores: usize) -> (usize, usize, usize, usize) {
-    // Reserve 1 core for state machine + 2 for consensus crypto.
-    // Floor at 5 so small machines still get 1 thread per pool (over-subscribing is fine).
-    // 5 = 2 (consensus crypto) + 1 (crypto) + 1 (tx validation) + 1 (execution)
     let pool_budget = total_cores.saturating_sub(3).max(5);
 
     if pool_budget <= 5 {
-        // Minimum viable: 2 consensus crypto + 1 each for other pools
         (2, 1, 1, 1)
     } else {
         let consensus_crypto = 2;
@@ -862,13 +740,7 @@ fn for_core_count(total_cores: usize) -> (usize, usize, usize, usize) {
     }
 }
 
-/// Build thread pool configuration from TOML config.
-///
-/// When TOML values are 0 (auto), computes thread counts based on available cores.
-/// The I/O (tokio) thread count is returned separately since it is not part of
-/// the rayon pool configuration.
 fn build_thread_pool_config(config: &ThreadsConfig) -> ThreadPoolConfig {
-    // If all pool counts are zero, auto-detect based on available cores.
     let all_auto = config.consensus_crypto_threads == 0
         && config.crypto_threads == 0
         && config.tx_validation_threads == 0
@@ -908,7 +780,6 @@ fn build_thread_pool_config(config: &ThreadsConfig) -> ThreadPoolConfig {
     builder.build_unchecked()
 }
 
-/// Build BFT configuration from TOML config.
 fn build_bft_config(config: &ConsensusConfig) -> BftConfig {
     BftConfig::new()
         .with_proposal_interval(Duration::from_millis(config.proposal_interval_ms))
@@ -916,7 +787,6 @@ fn build_bft_config(config: &ConsensusConfig) -> BftConfig {
         .with_max_transactions(config.max_transactions_per_block)
 }
 
-/// Build network configuration from TOML config.
 fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
     let listen_addr: libp2p::Multiaddr = config
         .listen_addr
@@ -925,7 +795,6 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
 
     let listen_addresses = vec![listen_addr.clone()];
 
-    // Calculate default TCP fallback port if enabled but not specified (UDP port + 21500)
     let tcp_fallback_port = if config.tcp_fallback_enabled && config.tcp_fallback_port.is_none() {
         listen_addr.iter().find_map(|p| match p {
             libp2p::multiaddr::Protocol::Udp(port) => Some(port + 21500),
@@ -935,13 +804,10 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
         config.tcp_fallback_port
     };
 
-    // Filter out our own listen addresses from bootstrap peers
-    // Also filter TCP addresses if TCP fallback is disabled
     let bootstrap_peers: Vec<_> = config
         .bootstrap_peers
         .iter()
         .filter_map(|addr| {
-            // Skip TCP addresses if TCP transport is disabled
             if !config.tcp_fallback_enabled && addr.contains("/tcp/") {
                 trace!("Skipping TCP bootstrap peer (TCP disabled): {}", addr);
                 return None;
@@ -952,13 +818,9 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
                 None
             })?;
 
-            // Check if this bootstrap peer matches any of our listen addresses
-            // We compare string representations to handle minor formatting differences
-            let is_self = listen_addresses.iter().any(|listen| {
-                // Check if port and protocol match
-                // We're aggressive here: if it looks like us, don't dial it
-                listen.to_string() == parsed.to_string()
-            });
+            let is_self = listen_addresses
+                .iter()
+                .any(|listen| listen.to_string() == parsed.to_string());
 
             if is_self {
                 info!("Removing self from bootstrap peers: {}", addr);
@@ -984,7 +846,6 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
         ))
 }
 
-/// Build RocksDB configuration from TOML config.
 fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
     RocksDbConfig {
         max_background_jobs: config.max_background_jobs,
@@ -1004,7 +865,6 @@ fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
     }
 }
 
-/// Setup UPnP port forwarding.
 async fn setup_upnp(config: &NetworkConfig) {
     if !config.upnp_enabled {
         info!("UPnP disabled in configuration");
@@ -1013,8 +873,6 @@ async fn setup_upnp(config: &NetworkConfig) {
 
     info!("Attempting to setup UPnP port forwarding...");
 
-    // Determine local IP address by connecting to a public DNS (no data is sent)
-    // We try multiple reliable DNS servers to ensure robustness
     let dns_servers = ["8.8.8.8:80", "1.1.1.1:80", "9.9.9.9:80"];
     let mut local_ip = None;
 
@@ -1045,7 +903,6 @@ async fn setup_upnp(config: &NetworkConfig) {
         }
     };
 
-    // Parse listen address to get the port
     let listen_addr_parsed: libp2p::Multiaddr = match config.listen_addr.parse() {
         Ok(addr) => addr,
         Err(e) => {
@@ -1062,7 +919,6 @@ async fn setup_upnp(config: &NetworkConfig) {
         }
     }
 
-    // Use igd-next for UPnP
     match igd_next::aio::tokio::search_gateway(Default::default()).await {
         Ok(gateway) => {
             let external_ip = match gateway.get_external_ip().await {
@@ -1074,7 +930,6 @@ async fn setup_upnp(config: &NetworkConfig) {
             };
             info!("UPnP Gateway found. External IP: {}", external_ip);
 
-            // Map QUIC port (UDP)
             if let Some(port) = quic_port {
                 let local_addr = SocketAddr::new(local_ip, port);
                 match gateway
@@ -1082,7 +937,7 @@ async fn setup_upnp(config: &NetworkConfig) {
                         igd_next::PortMappingProtocol::UDP,
                         port,
                         local_addr,
-                        60 * 60, // 1 hour lease
+                        60 * 60,
                         "Hyperscale Validator QUIC",
                     )
                     .await
@@ -1094,7 +949,6 @@ async fn setup_upnp(config: &NetworkConfig) {
                 warn!("Could not determine QUIC port from listen address for UPnP");
             }
 
-            // Map TCP fallback port
             if config.tcp_fallback_enabled {
                 if let Some(port) = config.tcp_fallback_port {
                     let local_addr = SocketAddr::new(local_ip, port);
@@ -1103,7 +957,7 @@ async fn setup_upnp(config: &NetworkConfig) {
                             igd_next::PortMappingProtocol::TCP,
                             port,
                             local_addr,
-                            60 * 60, // 1 hour lease
+                            60 * 60,
                             "Hyperscale Validator TCP",
                         )
                         .await
@@ -1126,12 +980,9 @@ async fn setup_upnp(config: &NetworkConfig) {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Load configuration first (before runtime construction) to read io_threads
     let mut config = ValidatorConfig::load(&cli.config)?;
     config.apply_overrides(&cli);
 
-    // Build tokio runtime with configurable worker threads.
-    // io_threads = 0 means auto (tokio default: one thread per CPU core).
     let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
     rt_builder.enable_all();
     if config.threads.io_threads > 0 {
@@ -1145,9 +996,6 @@ fn main() -> Result<()> {
 }
 
 async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
-    // Initialize telemetry/logging
-    // If telemetry is enabled, init_telemetry sets up the global subscriber with OTLP export.
-    // Otherwise, use basic fmt subscriber.
     #[allow(dead_code)]
     enum UnifiedGuard {
         Telemetry(hyperscale_production::TelemetryGuard),
@@ -1159,14 +1007,13 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
             service_name: config.telemetry.service_name.clone(),
             otlp_endpoint: config.telemetry.otlp_endpoint.clone(),
             sampling_ratio: 1.0,
-            prometheus_enabled: false, // We handle metrics separately
+            prometheus_enabled: false,
             prometheus_port: 9090,
             resource_attributes: vec![("shard".to_string(), config.node.shard.to_string())],
             log_file: config.telemetry.log_file.clone(),
         };
         UnifiedGuard::Telemetry(init_telemetry(&telemetry_config)?)
     } else {
-        // Basic logging without OTLP export
         let builder = tracing_subscriber::fmt();
 
         let inner_guard = if let Some(log_file) = &config.telemetry.log_file {
@@ -1188,7 +1035,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
             builder
                 .with_writer(non_blocking)
-                .with_ansi(false) // Disable ANSI colors in file logs
+                .with_ansi(false)
                 .with_target(true)
                 .with_thread_ids(true)
                 .with_env_filter(
@@ -1218,7 +1065,6 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         "Node configuration loaded"
     );
 
-    // Clean data directory if requested via cli parameter
     if cli.clean {
         if config.node.data_dir.exists() {
             info!(
@@ -1239,20 +1085,16 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         }
     }
 
-    // Ensure data directory exists
     fs::create_dir_all(&config.node.data_dir)?;
 
-    // Setup UPnP
     setup_upnp(&config.network).await;
 
-    // Load or generate keys
     let signing_keypair = load_or_generate_keypair(config.node.key_path.as_ref())?;
     info!(
         public_key = %format_public_key(&signing_keypair.public_key()),
         "Loaded signing keypair"
     );
 
-    // Build topology
     let topology = build_topology(&config, &signing_keypair)?;
     info!(
         committee_size = topology.snapshot().local_committee_size(),
@@ -1260,31 +1102,25 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         "Topology initialized"
     );
 
-    // Build configurations
     let thread_config = build_thread_pool_config(&config.threads);
     let bft_config = build_bft_config(&config.consensus);
     let network_config = build_network_config(&config.network)?;
     let rocksdb_config = build_rocksdb_config(&config.storage);
 
-    // Initialize dispatch pools
     let dispatch =
         Arc::new(PooledDispatch::new(thread_config).context("Failed to initialize thread pools")?);
 
-    // Open storage
     let db_path = config.node.data_dir.join("db");
     let storage = RocksDbStorage::open_with_config(&db_path, rocksdb_config, (*dispatch).clone())
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
     let storage = Arc::new(storage);
     info!("Storage opened at {}", db_path.display());
 
-    // Create shared RPC state objects that will be used by both runner and RPC server.
-    // These are created first so they can be wired into both components.
     use arc_swap::ArcSwap;
     use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState};
     use std::sync::atomic::AtomicBool;
 
     let rpc_ready = Arc::new(AtomicBool::new(false));
-    // Use ArcSwap for lock-free reads of sync status from HTTP handlers
     let rpc_sync_status = Arc::new(ArcSwap::new(Arc::new(
         hyperscale_production::SyncStatus::default(),
     )));
@@ -1296,10 +1132,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     })));
     let rpc_mempool_snapshot = Arc::new(ArcSwap::new(Arc::new(MempoolSnapshot::default())));
 
-    // Create production runner first (before RPC server)
-    // The runner creates the crossbeam event channel that the RPC server needs
-    // for submitting transactions directly to IoLoop.
-    let mut runner_builder = ProductionRunner::builder()
+    let mut runner_builder = ProductionRunner::<RadixProductionSetup>::builder()
         .topology(topology)
         .signing_key(signing_keypair)
         .bft_config(bft_config)
@@ -1313,7 +1146,6 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         .view_change_cooldown_rounds(config.consensus.view_change_cooldown_rounds)
         .mempool_config(config.mempool.clone());
 
-    // Wire up genesis configuration if XRD balances are specified
     if !config.genesis.xrd_balances.is_empty() {
         let engine_genesis = build_engine_genesis_config(&config.genesis)
             .context("Failed to parse genesis configuration")?;
@@ -1325,15 +1157,9 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         .await
         .context("Failed to create production runner")?;
 
-    // Get the transaction submission sender from the runner
-    // RPC-submitted transactions go through this channel to:
-    // 1. Gossip to all relevant shards (RPC submissions need gossip)
-    // 2. Validate via the shared batcher
-    // 3. Dispatch to mempool
     let tx_submission_sender = runner.tx_submission_sender();
     let rpc_tx_status_cache = runner.tx_status_cache();
 
-    // Start RPC server with the transaction submission channel and state
     let rpc_handle = if config.metrics.enabled {
         let rpc_config = RpcServerConfig {
             listen_addr: config.metrics.listen_addr.parse().with_context(|| {
@@ -1346,7 +1172,6 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
             sync_backpressure_threshold: Some(10),
         };
 
-        // Use with_state to pass all shared state objects
         let rpc_server = RpcServer::with_state(
             rpc_config,
             rpc_ready.clone(),
@@ -1366,10 +1191,8 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         None
     };
 
-    // Get shutdown handle
     let shutdown_handle = runner.shutdown_handle();
 
-    // Spawn shutdown signal handler
     tokio::spawn(async move {
         let ctrl_c = async {
             signal::ctrl_c()
@@ -1399,19 +1222,16 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
         }
     });
 
-    // Mark node as ready
     if let Some(ref handle) = rpc_handle {
         handle.set_ready(true);
     }
 
     info!("Validator node started, press Ctrl+C to stop");
 
-    // Run the main event loop
     if let Err(e) = runner.run().await {
         bail!("Runner error: {}", e);
     }
 
-    // Cleanup RPC server
     if let Some(handle) = rpc_handle {
         handle.abort();
     }
@@ -1426,31 +1246,24 @@ mod tests {
 
     #[test]
     fn test_for_core_count() {
-        // 6 cores: pool_budget = max(6-3, 5) = 5, minimum viable mode
         let (cc, crypto, tx_val, exec) = for_core_count(6);
         assert_eq!(cc, 2);
         assert_eq!(crypto, 1);
         assert_eq!(tx_val, 1);
         assert_eq!(exec, 1);
 
-        // 12 cores: pool_budget = 9 (percentage mode)
-        // execution 25% = 2, tx_validation 15% = 1, crypto = remainder = 6
         let (cc, crypto, tx_val, exec) = for_core_count(12);
         assert_eq!(cc, 2);
         assert_eq!(crypto, 6);
         assert_eq!(tx_val, 1);
         assert_eq!(exec, 2);
 
-        // 18 cores: pool_budget = 15
-        // execution 25% = 3, tx_validation 15% = 2, crypto = remainder = 10
         let (cc, crypto, tx_val, exec) = for_core_count(18);
         assert_eq!(cc, 2);
         assert_eq!(crypto, 10);
         assert_eq!(tx_val, 2);
         assert_eq!(exec, 3);
 
-        // 32 cores: pool_budget = 29
-        // execution 25% = 7, tx_validation 15% = 4, crypto = remainder = 18
         let (cc, crypto, tx_val, exec) = for_core_count(32);
         assert_eq!(cc, 2);
         assert_eq!(crypto, 18);
@@ -1462,7 +1275,6 @@ mod tests {
     fn test_build_thread_pool_config_auto() {
         let config = ThreadsConfig::default();
         let pool_config = build_thread_pool_config(&config);
-        // All auto → should have at least 1 thread per pool
         assert!(pool_config.consensus_crypto_threads >= 1);
         assert!(pool_config.crypto_threads >= 1);
         assert!(pool_config.tx_validation_threads >= 1);

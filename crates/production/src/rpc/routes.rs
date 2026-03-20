@@ -6,31 +6,32 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use hyperscale_types::TypeConfig;
 
 /// Create the full router with all RPC routes.
-pub fn create_router(state: RpcState) -> Router {
+pub fn create_router<C: TypeConfig>(state: RpcState<C>) -> Router {
     Router::new()
         // Health & readiness probes (no prefix)
         .route("/health", get(health_handler))
-        .route("/ready", get(ready_handler))
+        .route("/ready", get(ready_handler::<C>))
         // Metrics (no prefix, for Prometheus scraping)
         .route("/metrics", get(metrics_handler))
         // API v1 routes
-        .nest("/api/v1", api_v1_routes())
+        .nest("/api/v1", api_v1_routes::<C>())
         .with_state(state)
 }
 
 /// Create the `/api/v1` router.
-fn api_v1_routes() -> Router<RpcState> {
+fn api_v1_routes<C: TypeConfig>() -> Router<RpcState<C>> {
     Router::new()
         // Status endpoints
-        .route("/status", get(status_handler))
-        .route("/sync", get(sync_handler))
+        .route("/status", get(status_handler::<C>))
+        .route("/sync", get(sync_handler::<C>))
         // Transaction endpoints
-        .route("/transactions", post(submit_transaction_handler))
-        .route("/transactions/{hash}", get(get_transaction_handler))
+        .route("/transactions", post(submit_transaction_handler::<C>))
+        .route("/transactions/{hash}", get(get_transaction_handler::<C>))
         // Mempool endpoint
-        .route("/mempool", get(mempool_handler))
+        .route("/mempool", get(mempool_handler::<C>))
 }
 
 #[cfg(test)]
@@ -44,7 +45,9 @@ mod tests {
     use std::time::Instant;
     use tower::ServiceExt;
 
-    fn create_test_state() -> RpcState {
+    type TestConfig = hyperscale_radix_config::RadixConfig;
+
+    fn create_test_state() -> RpcState<TestConfig> {
         let (tx_submission_tx, _rx) = crossbeam::channel::unbounded();
         RpcState {
             ready: Arc::new(AtomicBool::new(true)),

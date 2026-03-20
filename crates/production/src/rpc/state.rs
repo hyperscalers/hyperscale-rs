@@ -3,7 +3,7 @@
 use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
 use hyperscale_core::{NodeInput, TransactionStatus};
-use hyperscale_types::Hash;
+use hyperscale_types::{Hash, TypeConfig};
 use quick_cache::sync::Cache as QuickCache;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -13,12 +13,12 @@ use std::time::Instant;
 ///
 /// RPC handlers send `Event::SubmitTransaction` directly to the IoLoop's
 /// crossbeam event channel, bypassing tokio mpsc bridges entirely.
-pub type TxSubmissionSender =
-    crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>;
+pub type TxSubmissionSender<C> = crossbeam::channel::Sender<NodeInput<C>>;
 
 /// Shared state for RPC handlers.
-#[derive(Clone)]
-pub struct RpcState {
+///
+/// Generic over `C: TypeConfig` so the RPC server works with any implementation.
+pub struct RpcState<C: TypeConfig> {
     /// Ready flag for readiness probe.
     pub ready: Arc<AtomicBool>,
     /// Sync status provider.
@@ -32,7 +32,7 @@ pub struct RpcState {
     /// 1. Gossips to all relevant shards
     /// 2. Queues for batch validation (via Dispatch)
     /// 3. Dispatches to the mempool after validation
-    pub tx_submission_tx: TxSubmissionSender,
+    pub tx_submission_tx: TxSubmissionSender<C>,
     /// Server start time for uptime calculation.
     pub start_time: Instant,
     /// Transaction status cache for querying transaction state.
@@ -47,6 +47,21 @@ pub struct RpcState {
     /// When set and the node is this many blocks behind, new transaction
     /// submissions are rejected to allow the node to catch up.
     pub sync_backpressure_threshold: Option<u64>,
+}
+
+impl<C: TypeConfig> Clone for RpcState<C> {
+    fn clone(&self) -> Self {
+        Self {
+            ready: self.ready.clone(),
+            sync_status: self.sync_status.clone(),
+            node_status: self.node_status.clone(),
+            tx_submission_tx: self.tx_submission_tx.clone(),
+            start_time: self.start_time,
+            tx_status_cache: self.tx_status_cache.clone(),
+            mempool_snapshot: self.mempool_snapshot.clone(),
+            sync_backpressure_threshold: self.sync_backpressure_threshold,
+        }
+    }
 }
 
 /// Snapshot of mempool state for RPC queries.

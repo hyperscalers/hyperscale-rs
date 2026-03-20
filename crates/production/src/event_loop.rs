@@ -12,32 +12,18 @@
 //! IoLoop's internal `QuickCache`, shared with RPC handlers via `Arc`.
 
 use crate::rpc::state::{MempoolSnapshot, NodeStatusState};
+use crate::setup::{ProdNodeConfig, ProductionSetup};
 use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
 use crossbeam::channel::Receiver;
 use hyperscale_core::{NodeInput, TimerId};
-use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_metrics as metrics;
-use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_node::io_loop::{IoLoop, NodeStatusSnapshot, TimerOp};
-use hyperscale_storage_rocksdb::SharedStorage;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
-
-/// NodeConfig implementation for production.
-pub struct ProdConfig;
-
-impl hyperscale_node::NodeConfig for ProdConfig {
-    type C = hyperscale_radix_config::RadixConfig;
-    type S = SharedStorage<PooledDispatch>;
-    type N = Libp2pNetwork;
-    type D = PooledDispatch;
-    type E = hyperscale_engine::RadixExecutor;
-    type V = hyperscale_engine::TransactionValidation;
-}
 
 /// Concrete IoLoop type for the production runner.
 ///
@@ -46,18 +32,18 @@ impl hyperscale_node::NodeConfig for ProdConfig {
 /// storage to be shared between the pinned IoLoop thread and async tasks
 /// (InboundRouter) via cheap Arc clones.
 /// Certificate and transaction caches live inside IoLoop itself.
-pub type ProdIoLoop = IoLoop<ProdConfig>;
+pub type ProdIoLoop<S> = IoLoop<ProdNodeConfig<S>>;
 
 /// Configuration for the pinned event loop.
-pub struct PinnedLoopConfig {
+pub struct PinnedLoopConfig<S: ProductionSetup> {
     /// Timer-fired events sender (for ProdTimerManager to send timer events).
-    pub timer_tx: crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>,
+    pub timer_tx: crossbeam::channel::Sender<NodeInput<S::C>>,
     /// Timer-fired events (highest priority).
-    pub timer_rx: Receiver<NodeInput<hyperscale_radix_config::RadixConfig>>,
+    pub timer_rx: Receiver<NodeInput<S::C>>,
     /// Crypto/execution callback events + internal events.
-    pub callback_rx: Receiver<NodeInput<hyperscale_radix_config::RadixConfig>>,
+    pub callback_rx: Receiver<NodeInput<S::C>>,
     /// BFT consensus messages from network peers.
-    pub consensus_rx: Receiver<NodeInput<hyperscale_radix_config::RadixConfig>>,
+    pub consensus_rx: Receiver<NodeInput<S::C>>,
     /// Graceful shutdown signal.
     pub shutdown_rx: Receiver<()>,
     /// Tokio runtime handle for spawning timer sleep tasks.
@@ -78,16 +64,16 @@ pub struct PinnedLoopConfig {
 ///
 /// Spawns async sleep tasks via the tokio handle that fire timer events
 /// into the crossbeam timer channel. Replaces the former `ProdTimer` trait impl.
-struct ProdTimerManager {
+struct ProdTimerManager<S: ProductionSetup> {
     tokio_handle: tokio::runtime::Handle,
-    timer_tx: crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>,
+    timer_tx: crossbeam::channel::Sender<NodeInput<S::C>>,
     active: HashMap<TimerId, JoinHandle<()>>,
 }
 
-impl ProdTimerManager {
+impl<S: ProductionSetup> ProdTimerManager<S> {
     fn new(
         tokio_handle: tokio::runtime::Handle,
-        timer_tx: crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>,
+        timer_tx: crossbeam::channel::Sender<NodeInput<S::C>>,
     ) -> Self {
         Self {
             tokio_handle,
@@ -120,7 +106,7 @@ impl ProdTimerManager {
     }
 }
 
-impl Drop for ProdTimerManager {
+impl<S: ProductionSetup> Drop for ProdTimerManager<S> {
     fn drop(&mut self) {
         for (_, handle) in self.active.drain() {
             handle.abort();
@@ -147,7 +133,10 @@ fn wall_clock_duration() -> Duration {
 }
 
 /// Push a [`NodeStatusSnapshot`] into the shared RPC state objects.
-fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
+fn update_rpc_state<S: ProductionSetup>(
+    config: &PinnedLoopConfig<S>,
+    snapshot: &NodeStatusSnapshot,
+) {
     if let Some(ref rpc_status) = config.rpc_status {
         let current = rpc_status.load();
         rpc_status.store(Arc::new(NodeStatusState {
@@ -204,10 +193,14 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
 /// 6. Writes emitted statuses to tx_status_cache and records RPC latency
 /// 7. Flushes expired batches
 /// 8. Periodic metrics collection and JMT garbage collection
-pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
+pub fn run_pinned_loop<S: ProductionSetup>(
+    mut io_loop: ProdIoLoop<S>,
+    mut config: PinnedLoopConfig<S>,
+) {
     info!("Pinned event loop starting");
 
-    let mut timer_mgr = ProdTimerManager::new(config.tokio_handle.clone(), config.timer_tx.clone());
+    let mut timer_mgr =
+        ProdTimerManager::<S>::new(config.tokio_handle.clone(), config.timer_tx.clone());
 
     // Process timer ops from genesis initialization (e.g. ProposalTimer).
     for op in std::mem::take(&mut config.initial_timer_ops) {
@@ -307,9 +300,9 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
 ///
 /// Returns a `JoinHandle` for the spawned thread. The caller should hold
 /// on to this and join on shutdown.
-pub fn spawn_pinned_loop(
-    io_loop: ProdIoLoop,
-    config: PinnedLoopConfig,
+pub fn spawn_pinned_loop<S: ProductionSetup>(
+    io_loop: ProdIoLoop<S>,
+    config: PinnedLoopConfig<S>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("io-loop".to_string())

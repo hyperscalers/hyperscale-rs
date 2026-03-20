@@ -5,7 +5,7 @@ use super::state::{MempoolSnapshot, NodeStatusState, RpcState, TxSubmissionSende
 use crate::status::SyncStatus;
 use arc_swap::ArcSwap;
 use hyperscale_core::TransactionStatus;
-use hyperscale_types::Hash;
+use hyperscale_types::{Hash, TypeConfig};
 use quick_cache::sync::Cache as QuickCache;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -104,12 +104,12 @@ impl RpcServerHandle {
 }
 
 /// RPC server for validator nodes.
-pub struct RpcServer {
+pub struct RpcServer<C: TypeConfig> {
     config: RpcServerConfig,
-    state: RpcState,
+    state: RpcState<C>,
 }
 
-impl RpcServer {
+impl<C: TypeConfig> RpcServer<C> {
     /// Create a new RPC server.
     ///
     /// # Arguments
@@ -119,7 +119,7 @@ impl RpcServer {
     /// * `tx_status_cache` - Transaction status cache shared from IoLoop
     pub fn new(
         config: RpcServerConfig,
-        tx_submission_tx: TxSubmissionSender,
+        tx_submission_tx: TxSubmissionSender<C>,
         tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
     ) -> Self {
         let sync_backpressure_threshold = config.sync_backpressure_threshold;
@@ -146,7 +146,7 @@ impl RpcServer {
         ready: Arc<AtomicBool>,
         sync_status: Arc<ArcSwap<SyncStatus>>,
         node_status: Arc<ArcSwap<NodeStatusState>>,
-        tx_submission_tx: TxSubmissionSender,
+        tx_submission_tx: TxSubmissionSender<C>,
         tx_status_cache: Arc<QuickCache<Hash, TransactionStatus>>,
         mempool_snapshot: Arc<ArcSwap<MempoolSnapshot>>,
     ) -> Self {
@@ -207,6 +207,8 @@ impl RpcServer {
 mod tests {
     use super::*;
 
+    type TestConfig = hyperscale_radix_config::RadixConfig;
+
     #[test]
     fn test_default_config() {
         let config = RpcServerConfig::default();
@@ -219,7 +221,7 @@ mod tests {
         let config = RpcServerConfig::default();
         let (tx_submission_tx, _rx) = crossbeam::channel::unbounded();
         let tx_status_cache = Arc::new(QuickCache::new(1000));
-        let server = RpcServer::new(config, tx_submission_tx, tx_status_cache);
+        let server = RpcServer::<TestConfig>::new(config, tx_submission_tx, tx_status_cache);
 
         // Server should be created successfully
         assert!(!server.state.ready.load(Ordering::SeqCst));

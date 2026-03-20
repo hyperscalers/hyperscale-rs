@@ -11,7 +11,7 @@ use axum::{
 use hyperscale_codec as sbor;
 use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_metrics as metrics;
-use hyperscale_types::{Hash, RoutableTransaction, TransactionDecision};
+use hyperscale_types::{ConsensusTransaction, Hash, TransactionDecision, TypeConfig};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ pub async fn health_handler() -> impl IntoResponse {
 }
 
 /// Handler for `GET /ready` - readiness probe.
-pub async fn ready_handler(State(state): State<RpcState>) -> impl IntoResponse {
+pub async fn ready_handler<C: TypeConfig>(State(state): State<RpcState<C>>) -> impl IntoResponse {
     if state.ready.load(Ordering::SeqCst) {
         (
             StatusCode::OK,
@@ -71,7 +71,7 @@ pub async fn metrics_handler() -> impl IntoResponse {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Handler for `GET /api/v1/status` - node status.
-pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse {
+pub async fn status_handler<C: TypeConfig>(State(state): State<RpcState<C>>) -> impl IntoResponse {
     let node_status = state.node_status.load();
     let mempool_snapshot = state.mempool_snapshot.load();
     let uptime = state.start_time.elapsed().as_secs();
@@ -99,7 +99,7 @@ pub async fn status_handler(State(state): State<RpcState>) -> impl IntoResponse 
 }
 
 /// Handler for `GET /api/v1/sync` - sync status.
-pub async fn sync_handler(State(state): State<RpcState>) -> impl IntoResponse {
+pub async fn sync_handler<C: TypeConfig>(State(state): State<RpcState<C>>) -> impl IntoResponse {
     let sync_status = state.sync_status.load();
 
     Json(SyncStatusResponse {
@@ -130,8 +130,8 @@ pub async fn sync_handler(State(state): State<RpcState>) -> impl IntoResponse {
 ///
 /// Returns 503 Service Unavailable if the mempool is full (backpressure) or
 /// if the node is syncing and too far behind.
-pub async fn submit_transaction_handler(
-    State(state): State<RpcState>,
+pub async fn submit_transaction_handler<C: TypeConfig>(
+    State(state): State<RpcState<C>>,
     Json(request): Json<SubmitTransactionRequest>,
 ) -> impl IntoResponse {
     // Check if node is syncing and too far behind to accept transactions.
@@ -206,7 +206,7 @@ pub async fn submit_transaction_handler(
     };
 
     // Decode SBOR - structural validation, return error immediately
-    let transaction: RoutableTransaction = match sbor::prelude::basic_decode(&tx_bytes) {
+    let transaction: C::Transaction = match sbor::prelude::basic_decode(&tx_bytes) {
         Ok(tx) => tx,
         Err(e) => {
             metrics::record_transaction_rejected("invalid_format");
@@ -221,7 +221,7 @@ pub async fn submit_transaction_handler(
         }
     };
 
-    let hash = hex::encode(transaction.hash().as_bytes());
+    let hash = hex::encode(transaction.tx_hash().as_bytes());
     let tx_arc = Arc::new(transaction);
 
     // Submit directly to IoLoop via crossbeam channel.
@@ -257,8 +257,8 @@ pub async fn submit_transaction_handler(
 }
 
 /// Handler for `GET /api/v1/transactions/:hash` - get transaction status.
-pub async fn get_transaction_handler(
-    State(state): State<RpcState>,
+pub async fn get_transaction_handler<C: TypeConfig>(
+    State(state): State<RpcState<C>>,
     Path(hash_hex): Path<String>,
 ) -> impl IntoResponse {
     // Parse the hash from hex (expects the raw hash bytes, not data to hash)
@@ -387,7 +387,7 @@ fn format_transaction_status(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Handler for `GET /api/v1/mempool` - mempool status.
-pub async fn mempool_handler(State(state): State<RpcState>) -> impl IntoResponse {
+pub async fn mempool_handler<C: TypeConfig>(State(state): State<RpcState<C>>) -> impl IntoResponse {
     let snapshot = state.mempool_snapshot.load();
     Json(MempoolStatusResponse {
         pending_count: snapshot.pending_count,
@@ -411,7 +411,11 @@ mod tests {
     use std::time::Instant;
     use tower::ServiceExt;
 
-    fn create_test_state() -> RpcState {
+    // Use a concrete TypeConfig for tests.
+    type TestConfig = hyperscale_radix_config::RadixConfig;
+    type TestRpcState = RpcState<TestConfig>;
+
+    fn create_test_state() -> TestRpcState {
         let (tx_submission_tx, _rx) = crossbeam::channel::unbounded();
         RpcState {
             ready: Arc::new(AtomicBool::new(false)),
@@ -452,7 +456,7 @@ mod tests {
     async fn test_ready_handler_not_ready() {
         let state = create_test_state();
         let app = Router::new()
-            .route("/ready", axum::routing::get(ready_handler))
+            .route("/ready", axum::routing::get(ready_handler::<TestConfig>))
             .with_state(state);
 
         let response = app
@@ -473,7 +477,7 @@ mod tests {
         let state = create_test_state();
         state.ready.store(true, Ordering::SeqCst);
         let app = Router::new()
-            .route("/ready", axum::routing::get(ready_handler))
+            .route("/ready", axum::routing::get(ready_handler::<TestConfig>))
             .with_state(state);
 
         let response = app
@@ -597,7 +601,10 @@ mod tests {
     async fn test_get_transaction_not_found() {
         let state = create_test_state();
         let app = Router::new()
-            .route("/tx/{hash}", axum::routing::get(get_transaction_handler))
+            .route(
+                "/tx/{hash}",
+                axum::routing::get(get_transaction_handler::<TestConfig>),
+            )
             .with_state(state);
 
         let tx_hash = hex::encode([0u8; 32]);
@@ -618,7 +625,10 @@ mod tests {
     async fn test_get_transaction_invalid_hex() {
         let state = create_test_state();
         let app = Router::new()
-            .route("/tx/{hash}", axum::routing::get(get_transaction_handler))
+            .route(
+                "/tx/{hash}",
+                axum::routing::get(get_transaction_handler::<TestConfig>),
+            )
             .with_state(state);
 
         let response = app
@@ -647,7 +657,10 @@ mod tests {
             .insert(tx_hash, TransactionStatus::Pending);
 
         let app = Router::new()
-            .route("/tx/{hash}", axum::routing::get(get_transaction_handler))
+            .route(
+                "/tx/{hash}",
+                axum::routing::get(get_transaction_handler::<TestConfig>),
+            )
             .with_state(state);
 
         let response = app
@@ -679,7 +692,10 @@ mod tests {
     async fn test_mempool_handler_default() {
         let state = create_test_state();
         let app = Router::new()
-            .route("/mempool", axum::routing::get(mempool_handler))
+            .route(
+                "/mempool",
+                axum::routing::get(mempool_handler::<TestConfig>),
+            )
             .with_state(state);
 
         let response = app
@@ -710,7 +726,10 @@ mod tests {
         }));
 
         let app = Router::new()
-            .route("/mempool", axum::routing::get(mempool_handler))
+            .route(
+                "/mempool",
+                axum::routing::get(mempool_handler::<TestConfig>),
+            )
             .with_state(state);
 
         let response = app
@@ -757,7 +776,7 @@ mod tests {
             queued_heights: 5,
         };
 
-        let state = RpcState {
+        let state: RpcState<TestConfig> = RpcState {
             ready: Arc::new(AtomicBool::new(true)),
             sync_status: Arc::new(ArcSwap::new(Arc::new(sync_status))),
             node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
@@ -769,7 +788,10 @@ mod tests {
         };
 
         let app = Router::new()
-            .route("/tx", axum::routing::post(submit_transaction_handler))
+            .route(
+                "/tx",
+                axum::routing::post(submit_transaction_handler::<TestConfig>),
+            )
             .with_state(state);
 
         // Submit a valid transaction (we expect it to be rejected due to sync)
@@ -820,7 +842,7 @@ mod tests {
             queued_heights: 2,
         };
 
-        let state = RpcState {
+        let state: RpcState<TestConfig> = RpcState {
             ready: Arc::new(AtomicBool::new(true)),
             sync_status: Arc::new(ArcSwap::new(Arc::new(sync_status))),
             node_status: Arc::new(ArcSwap::new(Arc::new(NodeStatusState::default()))),
@@ -832,7 +854,10 @@ mod tests {
         };
 
         let app = Router::new()
-            .route("/tx", axum::routing::post(submit_transaction_handler))
+            .route(
+                "/tx",
+                axum::routing::post(submit_transaction_handler::<TestConfig>),
+            )
             .with_state(state);
 
         // Submit a valid transaction

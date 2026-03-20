@@ -1,6 +1,6 @@
 //! Production runner with async I/O.
 //!
-//! This crate provides the production runner that wraps the deterministic
+//! This crate provides the generic production runner that wraps the deterministic
 //! state machine with real async I/O:
 //!
 //! - Network messages via tokio channels
@@ -26,7 +26,7 @@
 //! │    ┌───────────────────────────┼───────────────────────────────┐        │
 //! │    ▼                           ▼                               ▼        │
 //! │  Crypto Pool (rayon)      Execution Pool (rayon)       I/O Pool (tokio) │
-//! │  - BLS verification       - Radix Engine               - Network        │
+//! │  - BLS verification       - Engine execution           - Network        │
 //! │  - Signature checks       - Merkle computation         - Storage        │
 //! │                                                        - Timers         │
 //! └─────────────────────────────────────────────────────────────────────────┘
@@ -71,6 +71,7 @@
 mod event_loop;
 pub mod rpc;
 mod runner;
+mod setup;
 mod status;
 mod telemetry;
 pub use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
@@ -78,6 +79,7 @@ pub use hyperscale_network_libp2p::Libp2pConfig;
 pub use hyperscale_storage_rocksdb::{
     CompressionType, RocksDbConfig, RocksDbStorage, StorageError,
 };
-pub use runner::{ProductionRunner, RunnerError};
+pub use runner::{ProductionRunner, ProductionRunnerBuilder, RunnerError, ShutdownHandle};
+pub use setup::{ProdNodeConfig, ProductionSetup};
 pub use status::{SyncStateKind, SyncStatus};
 pub use telemetry::{init_telemetry, TelemetryConfig, TelemetryGuard};
