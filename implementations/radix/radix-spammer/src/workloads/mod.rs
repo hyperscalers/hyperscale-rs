@@ -8,7 +8,7 @@ mod transfer;
 pub use transfer::TransferWorkload;
 
 use crate::accounts::AccountPool;
-use hyperscale_types::RoutableTransaction;
+use hyperscale_radix_types::RoutableTransaction;
 use rand::RngCore;
 
 /// Trait for generating transaction workloads.

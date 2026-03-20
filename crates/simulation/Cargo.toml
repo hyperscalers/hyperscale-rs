@@ -31,6 +31,7 @@ rand_chacha.workspace = true
 [dev-dependencies]
 hyperscale-radix-config.workspace = true
 hyperscale-radix-simulation.workspace = true
+hyperscale-radix-types.workspace = true
 
 # Radix dependencies for e2e tests
 radix-common.workspace = true

@@ -3,9 +3,8 @@
 //! Provides a `FundedAccount` type and `AccountPool` for managing accounts
 //! distributed across shards. Accounts are funded at genesis time.
 
-use hyperscale_types::{
-    ed25519_keypair_from_seed, shard_for_node, Ed25519PrivateKey, NodeId, ShardGroupId,
-};
+use hyperscale_radix_types::{ed25519_keypair_from_seed, Ed25519PrivateKey};
+use hyperscale_types::{shard_for_node, NodeId, ShardGroupId};
 use radix_common::math::Decimal;
 use radix_common::types::ComponentAddress;
 use std::collections::HashMap;

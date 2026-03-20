@@ -1,0 +1,19 @@
+[package]
+name = "hyperscale-radix-types"
+version.workspace = true
+edition.workspace = true
+description = "Radix-specific types for hyperscale (RoutableTransaction, Ed25519, etc.)"
+
+[dependencies]
+hyperscale-types.workspace = true
+hyperscale-codec.workspace = true
+radix-common.workspace = true
+radix-transactions.workspace = true
+radix-substate-store-interface.workspace = true
+ed25519-dalek = { workspace = true, features = ["batch"] }
+blake3.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+
+[features]
+test-utils = []

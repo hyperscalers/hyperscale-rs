@@ -795,7 +795,7 @@ mod tests {
             .with_state(state);
 
         // Submit a valid transaction (we expect it to be rejected due to sync)
-        let tx = hyperscale_types::test_utils::test_transaction(1);
+        let tx = hyperscale_radix_types::test_utils::test_transaction(1);
         let tx_hex = hex::encode(sbor::prelude::basic_encode(&tx).unwrap());
 
         let response = app
@@ -861,7 +861,7 @@ mod tests {
             .with_state(state);
 
         // Submit a valid transaction
-        let tx = hyperscale_types::test_utils::test_transaction(1);
+        let tx = hyperscale_radix_types::test_utils::test_transaction(1);
         let tx_hex = hex::encode(sbor::prelude::basic_encode(&tx).unwrap());
 
         let response = app

@@ -1,8 +1,6 @@
 //! Cryptographic types and helpers.
 //!
 //! BLS12-381 types are framework-owned (see [`crate::bls`]).
-//! Ed25519 types are re-exported from `radix_common::crypto` and stay in the
-//! Radix implementation layer.
 
 // ── BLS (framework-owned) ───────────────────────────────────────────
 
@@ -12,83 +10,9 @@ pub use crate::bls::{
     zero_bls_signature, Bls12381G1PrivateKey, Bls12381G1PublicKey, Bls12381G2Signature, BlsError,
 };
 
-// ── Ed25519 (radix_common) ──────────────────────────────────────────
-
-pub use radix_common::crypto::{
-    verify_ed25519, Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature,
-};
-
-/// Generate a new random Ed25519 keypair.
-pub fn generate_ed25519_keypair() -> Ed25519PrivateKey {
-    let mut csprng = rand::rngs::OsRng;
-    let signing_key = ed25519_dalek::SigningKey::generate(&mut csprng);
-    Ed25519PrivateKey::from_bytes(&signing_key.to_bytes()).expect("valid key bytes")
-}
-
-/// Generate an Ed25519 keypair from a seed (deterministic, for testing/simulation).
-pub fn ed25519_keypair_from_seed(seed: &[u8; 32]) -> Ed25519PrivateKey {
-    Ed25519PrivateKey::from_bytes(seed).expect("valid seed bytes")
-}
-
-/// Create a zero/placeholder Ed25519 signature for testing.
-pub fn zero_ed25519_signature() -> Ed25519Signature {
-    Ed25519Signature([0u8; 64])
-}
-
-/// Batch verify multiple Ed25519 signatures.
-pub fn batch_verify_ed25519(
-    messages: &[&[u8]],
-    signatures: &[Ed25519Signature],
-    pubkeys: &[Ed25519PublicKey],
-) -> bool {
-    if messages.len() != signatures.len() || signatures.len() != pubkeys.len() {
-        return false;
-    }
-    if messages.is_empty() {
-        return true;
-    }
-
-    let mut dalek_sigs = Vec::with_capacity(signatures.len());
-    let mut dalek_pks = Vec::with_capacity(pubkeys.len());
-
-    for (sig, pk) in signatures.iter().zip(pubkeys.iter()) {
-        dalek_sigs.push(ed25519_dalek::Signature::from_bytes(&sig.0));
-
-        match ed25519_dalek::VerifyingKey::from_bytes(&pk.0) {
-            Ok(vk) => dalek_pks.push(vk),
-            Err(_) => return false,
-        }
-    }
-
-    ed25519_dalek::verify_batch(messages, &dalek_sigs, &dalek_pks).is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_ed25519_sign_verify() {
-        let keypair = generate_ed25519_keypair();
-        let message = b"test message";
-
-        let signature = keypair.sign(message);
-        let pubkey = keypair.public_key();
-
-        assert!(verify_ed25519(message, &pubkey, &signature));
-    }
-
-    #[test]
-    fn test_ed25519_verify_fails_wrong_message() {
-        let keypair = generate_ed25519_keypair();
-        let message = b"test message";
-        let wrong = b"wrong message";
-
-        let signature = keypair.sign(message);
-        let pubkey = keypair.public_key();
-
-        assert!(!verify_ed25519(wrong, &pubkey, &signature));
-    }
 
     #[test]
     fn test_bls_sign_verify() {
@@ -126,18 +50,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ed25519_keypair_from_seed() {
-        let seed = [42u8; 32];
-
-        let kp1 = ed25519_keypair_from_seed(&seed);
-        let kp2 = ed25519_keypair_from_seed(&seed);
-
-        let msg = b"test";
-        assert_eq!(kp1.sign(msg).0, kp2.sign(msg).0);
-        assert_eq!(kp1.public_key(), kp2.public_key());
-    }
-
-    #[test]
     fn test_bls_keypair_from_seed() {
         let seed = [42u8; 32];
         let kp1 = bls_keypair_from_seed(&seed);
@@ -164,54 +76,6 @@ mod tests {
             kp_b.public_key(),
             "Keys should differ even when first 8 bytes are identical"
         );
-    }
-
-    #[test]
-    fn test_batch_verify_ed25519() {
-        let kp1 = generate_ed25519_keypair();
-        let kp2 = generate_ed25519_keypair();
-        let kp3 = generate_ed25519_keypair();
-
-        let msg1 = b"message 1";
-        let msg2 = b"message 2";
-        let msg3 = b"message 3";
-
-        let sig1 = kp1.sign(msg1);
-        let sig2 = kp2.sign(msg2);
-        let sig3 = kp3.sign(msg3);
-
-        let messages: Vec<&[u8]> = vec![msg1, msg2, msg3];
-        let signatures = vec![sig1, sig2, sig3];
-        let pubkeys = vec![kp1.public_key(), kp2.public_key(), kp3.public_key()];
-
-        assert!(batch_verify_ed25519(&messages, &signatures, &pubkeys));
-    }
-
-    #[test]
-    fn test_batch_verify_ed25519_fails_with_bad_signature() {
-        let kp1 = generate_ed25519_keypair();
-        let kp2 = generate_ed25519_keypair();
-
-        let msg1 = b"message 1";
-        let msg2 = b"message 2";
-
-        let sig1 = kp1.sign(msg1);
-        let sig2 = kp2.sign(b"wrong message");
-
-        let messages: Vec<&[u8]> = vec![msg1, msg2];
-        let signatures = vec![sig1, sig2];
-        let pubkeys = vec![kp1.public_key(), kp2.public_key()];
-
-        assert!(!batch_verify_ed25519(&messages, &signatures, &pubkeys));
-    }
-
-    #[test]
-    fn test_batch_verify_ed25519_empty() {
-        let messages: Vec<&[u8]> = vec![];
-        let signatures: Vec<Ed25519Signature> = vec![];
-        let pubkeys: Vec<Ed25519PublicKey> = vec![];
-
-        assert!(batch_verify_ed25519(&messages, &signatures, &pubkeys));
     }
 
     #[test]

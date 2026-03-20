@@ -11,7 +11,7 @@ default = []
 trace-propagation = ["opentelemetry", "opentelemetry_sdk"]
 
 [dependencies]
-hyperscale-types = { workspace = true, features = ["test-utils"] }
+hyperscale-types.workspace = true
 
 # Serialization
 hyperscale-codec.workspace = true
@@ -22,3 +22,4 @@ opentelemetry_sdk = { workspace = true, optional = true }
 
 [dev-dependencies]
 hyperscale-radix-config.workspace = true
+hyperscale-radix-types = { workspace = true, features = ["test-utils"] }

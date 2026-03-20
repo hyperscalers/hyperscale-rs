@@ -33,30 +33,21 @@ mod topology;
 mod transaction;
 mod validator;
 
-// Re-export crypto types and helpers
+// Re-export crypto types and helpers (BLS only — Ed25519 moved to radix-types)
 pub use crypto::{
     // Helper functions
     batch_verify_bls_different_messages,
     batch_verify_bls_different_messages_all_or_nothing,
     batch_verify_bls_same_message,
-    batch_verify_ed25519,
     bls_keypair_from_seed,
-    ed25519_keypair_from_seed,
     generate_bls_keypair,
-    generate_ed25519_keypair,
     verify_bls12381_v1,
-    verify_ed25519,
     zero_bls_signature,
-    zero_ed25519_signature,
     // BLS types (framework-owned)
     Bls12381G1PrivateKey,
     Bls12381G1PublicKey,
     Bls12381G2Signature,
     BlsError,
-    // Ed25519 types (radix_common)
-    Ed25519PrivateKey,
-    Ed25519PublicKey,
-    Ed25519Signature,
 };
 pub use epoch::{
     EpochConfig, EpochId, GlobalConsensusConfig, GlobalValidatorInfo, ShardCommitteeConfig,
@@ -88,16 +79,12 @@ pub use signer_bitfield::SignerBitfield;
 pub use state::{ExecutionCertificate, ExecutionVote, StateEntry, StateProvision};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
-    sign_and_notarize, sign_and_notarize_with_options, AbortReason, DeferReason, ReadyTransactions,
-    RetryDetails, RoutableTransaction, TransactionAbort, TransactionCertificate,
-    TransactionDecision, TransactionDefer, TransactionError, TransactionStatus,
-    TransactionStatusParseError,
+    AbortReason, DeferReason, ReadyTransactions, RetryDetails, TransactionAbort,
+    TransactionCertificate, TransactionDecision, TransactionDefer, TransactionError,
+    TransactionStatus, TransactionStatusParseError,
 };
 pub use type_config::{ConsensusExecutionReceipt, ConsensusTransaction, TypeConfig};
 pub use validator::{ValidatorInfo, ValidatorSet};
-
-// Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)
-pub use radix_substate_store_interface::interface::DatabaseUpdates;
 
 use hyperscale_codec as sbor;
 
@@ -154,85 +141,6 @@ impl BlockVote {
             self.height.0,
             self.round,
             &self.block_hash,
-        )
-    }
-}
-
-/// Test utilities.
-#[cfg(any(test, feature = "test-utils"))]
-pub mod test_utils {
-    use super::*;
-    use radix_common::crypto::{Ed25519PublicKey, Ed25519Signature, PublicKey as RadixPublicKey};
-    use radix_common::prelude::Epoch;
-    use radix_transactions::model::{
-        BlobsV1, InstructionsV1, IntentSignaturesV1, IntentV1, MessageV1, NotarizedTransactionV1,
-        NotarySignatureV1, SignatureV1, SignedIntentV1, TransactionHeaderV1, UserTransaction,
-    };
-
-    /// Create a test NodeId from a seed byte.
-    pub fn test_node(seed: u8) -> NodeId {
-        NodeId([seed; 30])
-    }
-
-    /// Create a minimal test NotarizedTransactionV1 from seed bytes.
-    ///
-    /// This creates a valid but minimal transaction structure for testing.
-    /// The transaction won't execute successfully but is structurally valid.
-    pub fn test_notarized_transaction_v1(seed_bytes: &[u8]) -> NotarizedTransactionV1 {
-        // Create minimal header with unique nonce from seed
-        let header = TransactionHeaderV1 {
-            network_id: 0xf2, // Simulator network
-            start_epoch_inclusive: Epoch::of(0),
-            end_epoch_exclusive: Epoch::of(100),
-            nonce: {
-                let mut nonce_bytes = [0u8; 4];
-                for (i, &b) in seed_bytes.iter().take(4).enumerate() {
-                    nonce_bytes[i] = b;
-                }
-                u32::from_le_bytes(nonce_bytes)
-            },
-            notary_public_key: RadixPublicKey::Ed25519(Ed25519PublicKey([0u8; 32])),
-            notary_is_signatory: false,
-            tip_percentage: 0,
-        };
-
-        // Create a minimal intent
-        let intent = IntentV1 {
-            header,
-            instructions: InstructionsV1(vec![]),
-            blobs: BlobsV1 { blobs: vec![] },
-            message: MessageV1::None,
-        };
-
-        // Create signed intent with no signatures
-        let signed_intent = SignedIntentV1 {
-            intent,
-            intent_signatures: IntentSignaturesV1 { signatures: vec![] },
-        };
-
-        // Create notarized transaction with a zero signature
-        NotarizedTransactionV1 {
-            signed_intent,
-            notary_signature: NotarySignatureV1(SignatureV1::Ed25519(Ed25519Signature([0u8; 64]))),
-        }
-    }
-
-    /// Create a test transaction with specific read/write nodes.
-    pub fn test_transaction_with_nodes(
-        seed_bytes: &[u8],
-        read_nodes: Vec<NodeId>,
-        write_nodes: Vec<NodeId>,
-    ) -> RoutableTransaction {
-        let tx = test_notarized_transaction_v1(seed_bytes);
-        RoutableTransaction::new(UserTransaction::V1(tx), read_nodes, write_nodes)
-    }
-
-    /// Create a simple test transaction.
-    pub fn test_transaction(seed: u8) -> RoutableTransaction {
-        test_transaction_with_nodes(
-            &[seed, seed + 1, seed + 2],
-            vec![test_node(seed)],
-            vec![test_node(seed + 10)],
         )
     }
 }

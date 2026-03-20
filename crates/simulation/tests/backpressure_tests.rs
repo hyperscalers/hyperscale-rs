@@ -13,10 +13,10 @@
 
 use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_radix_simulation::RadixSimulationSetup;
-use hyperscale_simulation::{NetworkConfig, SimulationRunner};
-use hyperscale_types::{
+use hyperscale_radix_types::{
     ed25519_keypair_from_seed, sign_and_notarize, Ed25519PrivateKey, RoutableTransaction,
 };
+use hyperscale_simulation::{NetworkConfig, SimulationRunner};
 use radix_common::constants::XRD;
 use radix_common::crypto::Ed25519PublicKey;
 use radix_common::math::Decimal;

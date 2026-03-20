@@ -451,33 +451,60 @@ impl<C: TypeConfig> Clone for ExecutionResult<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DatabaseUpdates;
+    use crate::BlockHeight;
+    use hyperscale_codec as sbor;
 
-    /// Lightweight test TypeConfig for receipt tests.
+    /// Minimal mock transaction for receipt tests.
+    #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
+    struct MockTransaction {
+        hash: Hash,
+    }
+
+    impl crate::ConsensusTransaction for MockTransaction {
+        fn tx_hash(&self) -> Hash {
+            self.hash
+        }
+        fn reads(&self) -> Vec<NodeId> {
+            vec![]
+        }
+        fn writes(&self) -> Vec<NodeId> {
+            vec![]
+        }
+        fn is_retry(&self) -> bool {
+            false
+        }
+        fn original_hash(&self) -> Hash {
+            self.hash
+        }
+        fn retry_count(&self) -> u32 {
+            0
+        }
+        fn create_retry(&self, _: Hash, _: BlockHeight) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Lightweight test TypeConfig for receipt tests (no Radix deps).
     #[derive(Debug, Clone)]
     struct TestConfig;
     impl TypeConfig for TestConfig {
-        type Transaction = crate::RoutableTransaction;
+        type Transaction = MockTransaction;
         type ExecutionReceipt = LedgerTransactionReceipt;
-        type StateUpdate = DatabaseUpdates;
-        fn merge_state_updates(_: &[DatabaseUpdates]) -> DatabaseUpdates {
-            DatabaseUpdates::default()
+        type StateUpdate = Vec<u8>;
+        fn merge_state_updates(updates: &[Vec<u8>]) -> Vec<u8> {
+            updates.concat()
         }
-        fn filter_state_update_to_shard(
-            u: &DatabaseUpdates,
-            _: crate::ShardGroupId,
-            _: u64,
-        ) -> DatabaseUpdates {
+        fn filter_state_update_to_shard(u: &Vec<u8>, _: crate::ShardGroupId, _: u64) -> Vec<u8> {
             u.clone()
         }
-        fn filter_state_update_to_writes(u: &DatabaseUpdates, _: &[NodeId]) -> DatabaseUpdates {
+        fn filter_state_update_to_writes(u: &Vec<u8>, _: &[NodeId]) -> Vec<u8> {
             u.clone()
         }
-        fn extract_write_nodes(_: &DatabaseUpdates) -> Vec<NodeId> {
+        fn extract_write_nodes(_: &Vec<u8>) -> Vec<NodeId> {
             vec![]
         }
-        fn receipt_to_state_update(_: &LedgerTransactionReceipt) -> DatabaseUpdates {
-            DatabaseUpdates::default()
+        fn receipt_to_state_update(_: &LedgerTransactionReceipt) -> Vec<u8> {
+            vec![]
         }
     }
 

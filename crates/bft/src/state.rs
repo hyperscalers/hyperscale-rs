@@ -7326,7 +7326,7 @@ mod tests {
 
     fn make_test_block_with_transactions(
         height: u64,
-        transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
+        transactions: Vec<Arc<hyperscale_radix_types::RoutableTransaction>>,
     ) -> Block {
         Block {
             header: make_header_at_height(height, 100_000),
@@ -7343,9 +7343,9 @@ mod tests {
     /// Create a sectioned test block with transactions properly classified into sections.
     fn make_sectioned_test_block(
         height: u64,
-        retry_transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
-        priority_transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
-        transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
+        retry_transactions: Vec<Arc<hyperscale_radix_types::RoutableTransaction>>,
+        priority_transactions: Vec<Arc<hyperscale_radix_types::RoutableTransaction>>,
+        transactions: Vec<Arc<hyperscale_radix_types::RoutableTransaction>>,
         commitment_proofs: HashMap<Hash, CommitmentProof>,
     ) -> Block {
         Block {
@@ -7363,7 +7363,7 @@ mod tests {
     #[allow(dead_code)]
     fn make_test_block_with_proofs(
         height: u64,
-        transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
+        transactions: Vec<Arc<hyperscale_radix_types::RoutableTransaction>>,
         commitment_proofs: HashMap<Hash, CommitmentProof>,
     ) -> Block {
         Block {
@@ -7384,10 +7384,11 @@ mod tests {
         seed: u8,
         with_proof: bool,
     ) -> (
-        Arc<hyperscale_types::RoutableTransaction>,
+        Arc<hyperscale_radix_types::RoutableTransaction>,
         Option<CommitmentProof>,
     ) {
-        use hyperscale_types::{test_utils, ShardGroupId, StateEntry, SubstateInclusionProof};
+        use hyperscale_radix_types::test_utils;
+        use hyperscale_types::{ShardGroupId, StateEntry, SubstateInclusionProof};
 
         let tx = test_utils::test_transaction(seed);
         let tx_arc = Arc::new(tx);
@@ -7412,21 +7413,24 @@ mod tests {
         (tx_arc, proof)
     }
 
-    fn make_test_tx(seed: u8, _with_proof: bool) -> Arc<hyperscale_types::RoutableTransaction> {
-        use hyperscale_types::test_utils;
+    fn make_test_tx(
+        seed: u8,
+        _with_proof: bool,
+    ) -> Arc<hyperscale_radix_types::RoutableTransaction> {
+        use hyperscale_radix_types::test_utils;
         Arc::new(test_utils::test_transaction(seed))
     }
 
     /// Create a retry transaction for testing.
-    fn make_retry_tx(seed: u8) -> Arc<hyperscale_types::RoutableTransaction> {
-        use hyperscale_types::test_utils;
+    fn make_retry_tx(seed: u8) -> Arc<hyperscale_radix_types::RoutableTransaction> {
+        use hyperscale_radix_types::test_utils;
         let original = test_utils::test_transaction(seed);
         let winner_hash = Hash::from_bytes(&[seed.wrapping_add(100); 32]);
         Arc::new(original.create_retry(winner_hash, BlockHeight(1)))
     }
 
     /// Sort transactions by hash for test setup
-    fn sort_txs_by_hash(txs: &mut [Arc<hyperscale_types::RoutableTransaction>]) {
+    fn sort_txs_by_hash(txs: &mut [Arc<hyperscale_radix_types::RoutableTransaction>]) {
         txs.sort_by_key(|tx| tx.hash());
     }
 
@@ -8240,7 +8244,9 @@ mod tests {
         let ready_txs = ReadyTransactions {
             retries: vec![],
             priority: vec![],
-            others: vec![Arc::new(hyperscale_types::test_utils::test_transaction(1))],
+            others: vec![Arc::new(
+                hyperscale_radix_types::test_utils::test_transaction(1),
+            )],
         };
 
         let actions = state.on_proposal_timer(

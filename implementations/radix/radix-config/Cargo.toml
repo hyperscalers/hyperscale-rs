@@ -5,6 +5,7 @@ edition.workspace = true
 description = "RadixConfig — concrete TypeConfig binding for the Radix implementation"
 
 [dependencies]
+hyperscale-radix-types.workspace = true
 hyperscale-types = { workspace = true }
 radix-common.workspace = true
 radix-substate-store-interface.workspace = true

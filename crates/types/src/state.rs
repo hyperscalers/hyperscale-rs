@@ -85,7 +85,6 @@ impl StateEntry {
     /// Creates a storage key in the correct format so that `node_id()` can extract
     /// the node ID. Uses a dummy hash prefix (zeros) since tests don't need real
     /// SpreadPrefixKeyMapper hashes.
-    #[cfg(any(test, feature = "test-utils"))]
     pub fn test_entry(
         node_id: NodeId,
         partition: u8,

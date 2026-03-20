@@ -183,7 +183,7 @@ impl<C: TypeConfig> ShardMessage for TransactionGossip<C> {}
 mod tests {
     use super::*;
     use hyperscale_radix_config::RadixConfig;
-    use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
+    use hyperscale_radix_types::test_utils::{test_node, test_transaction_with_nodes};
 
     #[test]
     fn test_transaction_gossip_creation() {

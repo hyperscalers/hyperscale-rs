@@ -8,7 +8,6 @@ description = "Core types for Hyperscale consensus"
 # Cryptographic primitives
 blake3.workspace = true
 hex.workspace = true
-ed25519-dalek = { workspace = true, features = ["batch"] }
 blst = "0.3"
 rand.workspace = true
 
@@ -17,13 +16,5 @@ hyperscale-codec.workspace = true
 
 # Error handling
 thiserror.workspace = true
-
-# Radix transaction types
-radix-common.workspace = true
-radix-transactions.workspace = true
-radix-substate-store-interface.workspace = true
-
-[features]
-test-utils = []
 
 [dev-dependencies]

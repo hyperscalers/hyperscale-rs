@@ -6,7 +6,8 @@ use crate::config::SpammerConfig;
 use crate::latency::{LatencyReport, LatencyTracker};
 use crate::workloads::TransferWorkload;
 use futures::future::join_all;
-use hyperscale_types::{RoutableTransaction, ShardGroupId};
+use hyperscale_radix_types::RoutableTransaction;
+use hyperscale_types::ShardGroupId;
 use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use radix_common::types::ComponentAddress;
@@ -683,7 +684,7 @@ impl PartitionWorkload {
 
         let nonce = from.next_nonce();
 
-        let notarized = match hyperscale_types::sign_and_notarize(
+        let notarized = match hyperscale_radix_types::sign_and_notarize(
             manifest,
             &self.network,
             nonce as u32,

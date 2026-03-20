@@ -23,7 +23,7 @@
 //! ```
 
 use hyperscale_core::ValidationError;
-use hyperscale_types::RoutableTransaction;
+use hyperscale_radix_types::RoutableTransaction;
 use radix_common::network::NetworkDefinition;
 use radix_transactions::validation::TransactionValidator;
 
@@ -170,7 +170,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::generate_ed25519_keypair;
+    use hyperscale_radix_types::generate_ed25519_keypair;
     use radix_common::network::NetworkDefinition;
     use radix_transactions::builder::ManifestBuilder;
 
@@ -203,7 +203,7 @@ mod tests {
 
         // Sign and notarize
         let notarized =
-            hyperscale_types::sign_and_notarize(manifest, &network, 1, &signer).unwrap();
+            hyperscale_radix_types::sign_and_notarize(manifest, &network, 1, &signer).unwrap();
 
         // Convert to RoutableTransaction
         let routable: RoutableTransaction = notarized.try_into().unwrap();
@@ -227,7 +227,7 @@ mod tests {
 
         let manifest = ManifestBuilder::new().drop_all_proofs().build();
         let notarized =
-            hyperscale_types::sign_and_notarize(manifest, &network, 1, &signer).unwrap();
+            hyperscale_radix_types::sign_and_notarize(manifest, &network, 1, &signer).unwrap();
         let routable: RoutableTransaction = notarized.try_into().unwrap();
         let expected_hash = routable.hash();
 
@@ -248,9 +248,9 @@ mod tests {
         let manifest2 = ManifestBuilder::new().drop_all_proofs().build();
 
         let notarized1 =
-            hyperscale_types::sign_and_notarize(manifest1, &network, 1, &signer).unwrap();
+            hyperscale_radix_types::sign_and_notarize(manifest1, &network, 1, &signer).unwrap();
         let notarized2 =
-            hyperscale_types::sign_and_notarize(manifest2, &network, 2, &signer).unwrap();
+            hyperscale_radix_types::sign_and_notarize(manifest2, &network, 2, &signer).unwrap();
 
         let routable1: RoutableTransaction = notarized1.try_into().unwrap();
         let routable2: RoutableTransaction = notarized2.try_into().unwrap();

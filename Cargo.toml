@@ -37,6 +37,7 @@ members = [
     "implementations/radix/radix-simulation",
     "implementations/radix/radix-production",
     "implementations/radix/radix-spammer",
+    "implementations/radix/radix-types",
 ]
 
 default-members = [
@@ -76,6 +77,7 @@ default-members = [
     "implementations/radix/radix-simulation",
     "implementations/radix/radix-production",
     "implementations/radix/radix-spammer",
+    "implementations/radix/radix-types",
 ]
 
 [workspace.package]
@@ -109,6 +111,7 @@ hyperscale-node = { path = "crates/node" }
 hyperscale-production = { path = "crates/production" }
 hyperscale-provisions = { path = "crates/provisions" }
 hyperscale-radix-config = { path = "implementations/radix/radix-config" }
+hyperscale-radix-types = { path = "implementations/radix/radix-types" }
 hyperscale-radix-production = { path = "implementations/radix/radix-production" }
 hyperscale-radix-simulation = { path = "implementations/radix/radix-simulation" }
 hyperscale-simulation = { path = "crates/simulation" }

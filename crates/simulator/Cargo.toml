@@ -10,6 +10,7 @@ hyperscale-mempool.workspace = true
 hyperscale-radix-simulation.workspace = true
 hyperscale-simulation.workspace = true
 hyperscale-spammer.workspace = true
+hyperscale-radix-types.workspace = true
 hyperscale-types.workspace = true
 hyperscale-engine.workspace = true
 

@@ -2132,7 +2132,7 @@ impl<C: TypeConfig> std::fmt::Debug for ExecutionState<C> {
 mod tests {
     use super::*;
     use hyperscale_radix_config::RadixConfig;
-    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_radix_types::test_utils::test_transaction;
 
     type ExecutionState = super::ExecutionState<RadixConfig>;
     use hyperscale_types::{

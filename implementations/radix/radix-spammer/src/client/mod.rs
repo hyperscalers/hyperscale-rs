@@ -6,7 +6,7 @@ mod types;
 
 pub use types::*;
 
-use hyperscale_types::RoutableTransaction;
+use hyperscale_radix_types::RoutableTransaction;
 use reqwest::Client;
 use std::time::Duration;
 

@@ -281,7 +281,7 @@ impl Simulator {
     }
 
     /// Determine the target shard for a transaction.
-    fn get_target_shard(&self, tx: &hyperscale_types::RoutableTransaction) -> ShardGroupId {
+    fn get_target_shard(&self, tx: &hyperscale_radix_types::RoutableTransaction) -> ShardGroupId {
         tx.declared_writes
             .first()
             .map(|node_id| shard_for_node(node_id, self.config.num_shards as u64))

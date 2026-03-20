@@ -15,4 +15,4 @@ serde.workspace = true
 
 [dev-dependencies]
 hyperscale-radix-config.workspace = true
-hyperscale-types = { workspace = true, features = ["test-utils"] }
+hyperscale-radix-types = { workspace = true, features = ["test-utils"] }

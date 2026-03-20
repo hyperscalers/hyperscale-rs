@@ -8,6 +8,7 @@ description = "Radix Engine integration"
 # Internal crates
 hyperscale-core.workspace = true
 hyperscale-radix-config.workspace = true
+hyperscale-radix-types.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
 

@@ -238,10 +238,8 @@ impl Network for SimNetworkAdapter {
 mod tests {
     use super::*;
     use hyperscale_messages::TransactionGossip;
-    use hyperscale_types::{
-        test_utils::{test_node, test_transaction_with_nodes},
-        BlockHeight, ShardGroupId,
-    };
+    use hyperscale_radix_types::test_utils::{test_node, test_transaction_with_nodes};
+    use hyperscale_types::{BlockHeight, ShardGroupId};
     use std::sync::Mutex as StdMutex;
 
     fn test_gossip() -> TransactionGossip<hyperscale_radix_config::RadixConfig> {

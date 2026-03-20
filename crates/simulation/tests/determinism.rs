@@ -1183,7 +1183,7 @@ fn test_consensus_throughput() {
 #[test]
 fn test_mempool_to_block_integration() {
     use hyperscale_core::NodeInput;
-    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_radix_types::test_utils::test_transaction;
 
     let config = test_network_config();
     let mut runner = RadixSimRunner::new(config, 42);
@@ -1278,7 +1278,7 @@ fn test_mempool_to_block_integration() {
 #[test]
 fn test_execution_flow() {
     use hyperscale_core::NodeInput;
-    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_radix_types::test_utils::test_transaction;
 
     let config = test_network_config();
     let mut runner = RadixSimRunner::new(config, 42);
@@ -1332,7 +1332,7 @@ fn test_execution_flow() {
 #[test]
 fn test_transaction_gossip() {
     use hyperscale_core::NodeInput;
-    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_radix_types::test_utils::test_transaction;
 
     let config = test_network_config();
     let mut runner = RadixSimRunner::new(config, 42);
@@ -1524,8 +1524,8 @@ fn test_cross_shard_latency() {
 /// Test that Topology correctly identifies cross-shard transactions.
 #[test]
 fn test_cross_shard_transaction_detection() {
+    use hyperscale_radix_types::test_utils::{test_node, test_transaction_with_nodes};
     use hyperscale_topology::TopologyState;
-    use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
     use hyperscale_types::{
         generate_bls_keypair, Bls12381G1PrivateKey, ShardGroupId, ValidatorId, ValidatorInfo,
         ValidatorSet,

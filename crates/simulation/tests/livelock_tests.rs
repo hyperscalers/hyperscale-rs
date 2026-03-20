@@ -12,11 +12,11 @@
 
 use hyperscale_core::{NodeInput, TransactionStatus};
 use hyperscale_radix_simulation::{RadixGenesisExt, RadixSimulationSetup};
-use hyperscale_simulation::{NetworkConfig, SimulationRunner};
-use hyperscale_types::{
-    ed25519_keypair_from_seed, shard_for_node, sign_and_notarize, Ed25519PrivateKey, NodeId,
-    RoutableTransaction, ShardGroupId,
+use hyperscale_radix_types::{
+    ed25519_keypair_from_seed, sign_and_notarize, Ed25519PrivateKey, RoutableTransaction,
 };
+use hyperscale_simulation::{NetworkConfig, SimulationRunner};
+use hyperscale_types::{shard_for_node, NodeId, ShardGroupId};
 use radix_common::constants::XRD;
 use radix_common::crypto::Ed25519PublicKey;
 use radix_common::math::Decimal;

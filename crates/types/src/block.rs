@@ -813,36 +813,84 @@ impl CommittedBlockHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DatabaseUpdates, LedgerTransactionReceipt, RoutableTransaction};
+    use crate::ConsensusExecutionReceipt;
+    use hyperscale_codec as sbor;
 
-    /// Lightweight test TypeConfig for block tests.
+    /// Minimal mock transaction for block tests.
+    #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
+    struct MockTransaction {
+        hash: Hash,
+    }
+
+    impl ConsensusTransaction for MockTransaction {
+        fn tx_hash(&self) -> Hash {
+            self.hash
+        }
+        fn reads(&self) -> Vec<crate::NodeId> {
+            vec![]
+        }
+        fn writes(&self) -> Vec<crate::NodeId> {
+            vec![]
+        }
+        fn is_retry(&self) -> bool {
+            false
+        }
+        fn original_hash(&self) -> Hash {
+            self.hash
+        }
+        fn retry_count(&self) -> u32 {
+            0
+        }
+        fn create_retry(&self, _: Hash, _: BlockHeight) -> Self {
+            self.clone()
+        }
+    }
+
+    /// Minimal mock receipt for block tests.
+    #[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
+    struct MockReceipt {
+        success: bool,
+    }
+
+    impl ConsensusExecutionReceipt for MockReceipt {
+        fn consensus_receipt_hash(&self) -> Hash {
+            Hash::ZERO
+        }
+        fn is_success(&self) -> bool {
+            self.success
+        }
+        fn failure() -> Self {
+            Self { success: false }
+        }
+    }
+
+    /// Lightweight test TypeConfig for block tests (no Radix deps).
     #[derive(Debug, Clone)]
     struct TestConfig;
     impl TypeConfig for TestConfig {
-        type Transaction = RoutableTransaction;
-        type ExecutionReceipt = LedgerTransactionReceipt;
-        type StateUpdate = DatabaseUpdates;
-        fn merge_state_updates(_: &[DatabaseUpdates]) -> DatabaseUpdates {
-            DatabaseUpdates::default()
+        type Transaction = MockTransaction;
+        type ExecutionReceipt = MockReceipt;
+        type StateUpdate = Vec<u8>;
+        fn merge_state_updates(updates: &[Vec<u8>]) -> Vec<u8> {
+            updates.concat()
         }
-        fn filter_state_update_to_shard(
-            u: &DatabaseUpdates,
-            _: ShardGroupId,
-            _: u64,
-        ) -> DatabaseUpdates {
+        fn filter_state_update_to_shard(u: &Vec<u8>, _: ShardGroupId, _: u64) -> Vec<u8> {
             u.clone()
         }
-        fn filter_state_update_to_writes(
-            u: &DatabaseUpdates,
-            _: &[crate::NodeId],
-        ) -> DatabaseUpdates {
+        fn filter_state_update_to_writes(u: &Vec<u8>, _: &[crate::NodeId]) -> Vec<u8> {
             u.clone()
         }
-        fn extract_write_nodes(_: &DatabaseUpdates) -> Vec<crate::NodeId> {
+        fn extract_write_nodes(_: &Vec<u8>) -> Vec<crate::NodeId> {
             vec![]
         }
-        fn receipt_to_state_update(_: &LedgerTransactionReceipt) -> DatabaseUpdates {
-            DatabaseUpdates::default()
+        fn receipt_to_state_update(_: &MockReceipt) -> Vec<u8> {
+            vec![]
+        }
+    }
+
+    fn mock_tx(seed: u8) -> MockTransaction {
+        MockTransaction {
+            hash: Hash::from_bytes(&[seed; 32]),
         }
     }
 
@@ -888,15 +936,7 @@ mod tests {
 
     #[test]
     fn test_compute_transaction_root_deterministic() {
-        use radix_common::network::NetworkDefinition;
-        use radix_transactions::builder::ManifestBuilder;
-
-        // Create a simple transaction for testing
-        let manifest = ManifestBuilder::new().drop_all_proofs().build();
-        let network = NetworkDefinition::simulator();
-        let key = crate::generate_ed25519_keypair();
-        let notarized = crate::sign_and_notarize(manifest, &network, 1, &key).unwrap();
-        let tx = Arc::new(RoutableTransaction::try_from(notarized).unwrap());
+        let tx = Arc::new(mock_tx(1));
 
         let root1 = compute_transaction_root::<TestConfig>(&[], &[], std::slice::from_ref(&tx));
         let root2 = compute_transaction_root::<TestConfig>(&[], &[], std::slice::from_ref(&tx));
@@ -906,15 +946,7 @@ mod tests {
 
     #[test]
     fn test_compute_transaction_root_slot_affects_hash() {
-        use radix_common::network::NetworkDefinition;
-        use radix_transactions::builder::ManifestBuilder;
-
-        // Create a transaction
-        let manifest = ManifestBuilder::new().drop_all_proofs().build();
-        let network = NetworkDefinition::simulator();
-        let key = crate::generate_ed25519_keypair();
-        let notarized = crate::sign_and_notarize(manifest, &network, 1, &key).unwrap();
-        let tx = Arc::new(RoutableTransaction::try_from(notarized).unwrap());
+        let tx = Arc::new(mock_tx(1));
 
         // Same tx in different slots should produce different roots
         let root_retry =

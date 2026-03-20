@@ -1370,7 +1370,7 @@ mod tests {
         let storage = SimStorage::new(SyncDispatch::new());
         let mut block = make_test_block(1);
 
-        let tx = Arc::new(hyperscale_types::test_utils::test_transaction(42));
+        let tx = Arc::new(hyperscale_radix_types::test_utils::test_transaction(42));
         let tx_hash = tx.hash();
         block.transactions = vec![tx];
 

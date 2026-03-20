@@ -5,4 +5,4 @@ edition.workspace = true
 description = "Test helpers for Hyperscale - provides properly-signed fixtures for crypto testing"
 
 [dependencies]
-hyperscale-types = { path = "../types", features = ["test-utils"] }
+hyperscale-types = { path = "../types" }

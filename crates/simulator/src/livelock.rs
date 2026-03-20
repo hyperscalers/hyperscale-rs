@@ -27,10 +27,9 @@
 //! ```
 
 use hyperscale_radix_simulation::RadixSimulationSetup;
+use hyperscale_radix_types::RoutableTransaction;
 use hyperscale_simulation::SimulationRunner;
-use hyperscale_types::{
-    shard_for_node, Hash, NodeId, RoutableTransaction, ShardGroupId, TransactionStatus,
-};
+use hyperscale_types::{shard_for_node, Hash, NodeId, ShardGroupId, TransactionStatus};
 use std::collections::{HashMap, HashSet};
 
 /// Type alias for the Radix-specific simulation runner.

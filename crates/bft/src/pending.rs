@@ -382,9 +382,8 @@ mod tests {
 
     #[test]
     fn test_block_needs_both_transactions_and_certificates() {
-        use hyperscale_types::{
-            test_utils::test_transaction, TransactionCertificate, TransactionDecision,
-        };
+        use hyperscale_radix_types::test_utils::test_transaction;
+        use hyperscale_types::{TransactionCertificate, TransactionDecision};
         use std::collections::BTreeMap;
 
         // Create a test transaction

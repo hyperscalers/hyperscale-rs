@@ -13,6 +13,7 @@ path = "src/bin/spammer.rs"
 
 [dependencies]
 # Workspace dependencies
+hyperscale-radix-types.workspace = true
 hyperscale-types.workspace = true
 
 # Radix dependencies

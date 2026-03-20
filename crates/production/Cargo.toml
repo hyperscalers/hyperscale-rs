@@ -79,6 +79,7 @@ tracing-appender = "0.2.4"
 hyperscale-dispatch-sync.workspace = true
 hyperscale-radix-config.workspace = true
 hyperscale-radix-production.workspace = true
+hyperscale-radix-types = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 serial_test = "3"
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }

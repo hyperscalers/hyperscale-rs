@@ -17,5 +17,6 @@ serde.workspace = true
 
 [dev-dependencies]
 hyperscale-radix-config.workspace = true
+hyperscale-radix-types = { workspace = true, features = ["test-utils"] }
 tracing-test.workspace = true
 hyperscale-test-helpers.workspace = true

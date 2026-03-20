@@ -15,5 +15,5 @@ tracing.workspace = true
 [dev-dependencies]
 hyperscale-dispatch-sync.workspace = true
 hyperscale-radix-config.workspace = true
+hyperscale-radix-types = { workspace = true, features = ["test-utils"] }
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
-hyperscale-types = { workspace = true, features = ["test-utils"] }

@@ -2058,10 +2058,10 @@ impl<C: TypeConfig> MempoolState<C> {
 mod tests {
     use super::*;
     use hyperscale_radix_config::RadixConfig;
+    use hyperscale_radix_types::{test_utils::test_transaction, RoutableTransaction};
     use hyperscale_types::{
-        generate_bls_keypair, test_utils::test_transaction, Block, BlockHeader, DeferReason,
-        QuorumCertificate, RoutableTransaction, ShardGroupId, TransactionCertificate,
-        TransactionDefer, ValidatorId, ValidatorInfo, ValidatorSet,
+        generate_bls_keypair, Block, BlockHeader, DeferReason, QuorumCertificate, ShardGroupId,
+        TransactionCertificate, TransactionDefer, ValidatorId, ValidatorInfo, ValidatorSet,
     };
 
     /// Concrete mempool type for tests.
@@ -2981,8 +2981,8 @@ mod tests {
 
     /// Create a cross-shard transaction (writes to nodes in different shards)
     fn test_cross_shard_transaction(seed: u8) -> RoutableTransaction {
+        use hyperscale_radix_types::test_utils::test_node;
         use hyperscale_types::shard_for_node;
-        use hyperscale_types::test_utils::test_node;
 
         // Find two seeds that map to different shards with 2 shards
         // We'll search for a pair starting from the given seed
@@ -3004,7 +3004,7 @@ mod tests {
         }
 
         // Create cross-shard transaction
-        hyperscale_types::test_utils::test_transaction_with_nodes(
+        hyperscale_radix_types::test_utils::test_transaction_with_nodes(
             &[seed, seed + 1, seed + 2],
             vec![test_node(seed)],                        // read from one shard
             vec![test_node(seed), test_node(node2_seed)], // write to both shards

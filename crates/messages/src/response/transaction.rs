@@ -174,7 +174,7 @@ mod tests {
     use super::*;
     use hyperscale_codec::{basic_decode, basic_encode};
     use hyperscale_radix_config::RadixConfig;
-    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_radix_types::test_utils::test_transaction;
 
     #[test]
     fn test_get_transactions_response() {

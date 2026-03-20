@@ -16,4 +16,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 hyperscale-radix-config.workspace = true
+hyperscale-radix-types = { workspace = true, features = ["test-utils"] }
 hyperscale-messages.workspace = true

@@ -7,10 +7,12 @@
 
 use std::sync::Arc;
 
+use hyperscale_radix_types::RoutableTransaction;
 use hyperscale_types::{
-    DatabaseUpdates, LedgerTransactionReceipt, NodeId, PartitionNumber, RoutableTransaction,
-    ShardGroupId, SubstateChange, SubstateChangeAction, SubstateRef, TypeConfig,
+    LedgerTransactionReceipt, NodeId, PartitionNumber, ShardGroupId, SubstateChange,
+    SubstateChangeAction, SubstateRef, TypeConfig,
 };
+use radix_substate_store_interface::interface::DatabaseUpdates;
 
 /// Radix-specific `TypeConfig` implementation.
 ///

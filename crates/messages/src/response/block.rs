@@ -145,9 +145,10 @@ impl<C: TypeConfig> NetworkMessage for GetBlockResponse<C> {
 mod tests {
     use super::*;
     use hyperscale_radix_config::RadixConfig;
+    use hyperscale_radix_types::test_utils::test_transaction;
     use hyperscale_types::{
-        test_utils::test_transaction, zero_bls_signature, BlockHeader, BlockHeight, Hash,
-        ShardGroupId, SignerBitfield, ValidatorId,
+        zero_bls_signature, BlockHeader, BlockHeight, Hash, ShardGroupId, SignerBitfield,
+        ValidatorId,
     };
 
     fn create_test_block() -> Block<RadixConfig> {

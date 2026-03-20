@@ -1584,10 +1584,8 @@ mod tests {
     #[test]
     fn test_full_gossip_roundtrip() {
         use hyperscale_messages::TransactionGossip;
-        use hyperscale_types::{
-            test_utils::{test_node, test_transaction_with_nodes},
-            ShardGroupId,
-        };
+        use hyperscale_radix_types::test_utils::{test_node, test_transaction_with_nodes};
+        use hyperscale_types::ShardGroupId;
 
         let mut network = SimulatedNetwork::new(NetworkConfig {
             validators_per_shard: 2,

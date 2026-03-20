@@ -133,7 +133,6 @@ pub struct SubstateInclusionProof {
 
 impl SubstateInclusionProof {
     /// Create a dummy proof for testing. Not cryptographically valid.
-    #[cfg(any(test, feature = "test-utils"))]
     pub fn dummy() -> Self {
         let tier = MerkleInclusionProof {
             leaf_key: None,
