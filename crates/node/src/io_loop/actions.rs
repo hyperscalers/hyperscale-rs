@@ -10,7 +10,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore};
-use hyperscale_types::{TypeConfig, ValidatorId};
+use hyperscale_types::{ConsensusStateUpdate, TypeConfig, ValidatorId};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, trace};
@@ -485,14 +485,10 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                                 )
                             });
                             let updates = Cfg::Types::receipt_to_state_update(&receipt);
-                            Cfg::Types::filter_state_update_to_shard(
-                                &updates,
-                                local_shard,
-                                num_shards,
-                            )
+                            updates.filter_to_shard(local_shard, num_shards)
                         })
                         .collect();
-                    let merged = Cfg::Types::merge_state_updates(&per_cert);
+                    let merged = <<Cfg::Types as TypeConfig>::StateUpdate>::merge(&per_cert);
                     CommitStore::<Cfg::Types>::commit_block(
                         &*storage,
                         &merged,

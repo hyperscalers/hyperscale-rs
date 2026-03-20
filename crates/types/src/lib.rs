@@ -83,7 +83,9 @@ pub use transaction::{
     TransactionCertificate, TransactionDecision, TransactionDefer, TransactionError,
     TransactionStatus, TransactionStatusParseError,
 };
-pub use type_config::{ConsensusExecutionReceipt, ConsensusTransaction, TypeConfig};
+pub use type_config::{
+    ConsensusExecutionReceipt, ConsensusStateUpdate, ConsensusTransaction, TypeConfig,
+};
 pub use validator::{ValidatorInfo, ValidatorSet};
 
 use hyperscale_codec as sbor;

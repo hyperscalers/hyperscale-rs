@@ -14,6 +14,39 @@ use crate::{Hash, NodeId, ShardGroupId};
 
 // ── Trait bounds for associated types ────────────────────────────────────────
 
+/// Operations the consensus framework requires on state update types.
+///
+/// State updates are the deltas produced by transaction execution. The
+/// framework needs to merge, filter, and inspect them without knowing
+/// their internal structure.
+pub trait ConsensusStateUpdate: Clone + Default + Send + Sync {
+    /// Merge multiple state updates into one (last writer wins for conflicts).
+    ///
+    /// Updates are processed left-to-right; later entries take precedence.
+    fn merge(updates: &[Self]) -> Self;
+
+    /// Merge Arc-wrapped state updates into one.
+    ///
+    /// Default impl clones through Arc; implementations can override for
+    /// zero-copy merging.
+    fn merge_from_arcs(updates: &[Arc<Self>]) -> Self {
+        let dereffed: Vec<Self> = updates.iter().map(|a| (**a).clone()).collect();
+        Self::merge(&dereffed)
+    }
+
+    /// Filter to entries owned by a specific shard.
+    fn filter_to_shard(&self, local_shard: ShardGroupId, num_shards: u64) -> Self;
+
+    /// Filter to entries matching declared write addresses.
+    ///
+    /// When `declared_writes` is empty, the update is returned unfiltered
+    /// (empty means "no write set declared", not "no writes allowed").
+    fn filter_to_writes(&self, declared_writes: &[NodeId]) -> Self;
+
+    /// Extract deduplicated, deterministically-ordered NodeIds from this update.
+    fn extract_write_nodes(&self) -> Vec<NodeId>;
+}
+
 /// Operations the consensus framework requires on transaction types.
 ///
 /// Implementations provide hashing, read/write set introspection, retry
@@ -94,40 +127,7 @@ pub trait TypeConfig: Send + Sync + 'static {
     type ExecutionReceipt: ConsensusExecutionReceipt;
 
     /// State delta produced by execution.
-    type StateUpdate: Clone + Default + Send + Sync;
-
-    // ── State update operations ──
-
-    /// Merge multiple state updates into one.
-    fn merge_state_updates(updates: &[Self::StateUpdate]) -> Self::StateUpdate;
-
-    /// Merge Arc-wrapped state updates into one.
-    ///
-    /// Default impl clones through Arc; implementations can override for
-    /// zero-copy merging.
-    fn merge_state_updates_from_arcs(updates: &[Arc<Self::StateUpdate>]) -> Self::StateUpdate {
-        let dereffed: Vec<Self::StateUpdate> = updates.iter().map(|a| (**a).clone()).collect();
-        Self::merge_state_updates(&dereffed)
-    }
-
-    /// Filter state update to entries owned by a specific shard.
-    fn filter_state_update_to_shard(
-        update: &Self::StateUpdate,
-        local_shard: ShardGroupId,
-        num_shards: u64,
-    ) -> Self::StateUpdate;
-
-    /// Filter state update to only the entries for declared write addresses.
-    ///
-    /// When `declared_writes` is empty, the update is returned unfiltered
-    /// (empty means "no write set declared", not "no writes allowed").
-    fn filter_state_update_to_writes(
-        update: &Self::StateUpdate,
-        declared_writes: &[NodeId],
-    ) -> Self::StateUpdate;
-
-    /// Extract deduplicated, deterministically-ordered NodeIds from a state update.
-    fn extract_write_nodes(update: &Self::StateUpdate) -> Vec<NodeId>;
+    type StateUpdate: ConsensusStateUpdate;
 
     /// Convert a receipt into a state update.
     ///
@@ -210,30 +210,18 @@ mod tests {
         entries: Vec<(NodeId, Vec<u8>)>,
     }
 
-    /// Non-Radix TypeConfig proving the framework is generic.
-    #[derive(Debug, Clone)]
-    struct MockConfig;
-
-    impl TypeConfig for MockConfig {
-        type Transaction = MockTransaction;
-        type ExecutionReceipt = MockReceipt;
-        type StateUpdate = MockStateUpdate;
-
-        fn merge_state_updates(updates: &[MockStateUpdate]) -> MockStateUpdate {
-            let mut merged = MockStateUpdate::default();
+    impl ConsensusStateUpdate for MockStateUpdate {
+        fn merge(updates: &[Self]) -> Self {
+            let mut merged = Self::default();
             for u in updates {
                 merged.entries.extend(u.entries.iter().cloned());
             }
             merged
         }
 
-        fn filter_state_update_to_shard(
-            update: &MockStateUpdate,
-            local_shard: ShardGroupId,
-            num_shards: u64,
-        ) -> MockStateUpdate {
-            MockStateUpdate {
-                entries: update
+        fn filter_to_shard(&self, local_shard: ShardGroupId, num_shards: u64) -> Self {
+            Self {
+                entries: self
                     .entries
                     .iter()
                     .filter(|(node_id, _)| {
@@ -244,17 +232,14 @@ mod tests {
             }
         }
 
-        fn filter_state_update_to_writes(
-            update: &MockStateUpdate,
-            declared_writes: &[NodeId],
-        ) -> MockStateUpdate {
+        fn filter_to_writes(&self, declared_writes: &[NodeId]) -> Self {
             if declared_writes.is_empty() {
-                return update.clone();
+                return self.clone();
             }
             let allowed: std::collections::HashSet<NodeId> =
                 declared_writes.iter().copied().collect();
-            MockStateUpdate {
-                entries: update
+            Self {
+                entries: self
                     .entries
                     .iter()
                     .filter(|(node_id, _)| allowed.contains(node_id))
@@ -263,9 +248,19 @@ mod tests {
             }
         }
 
-        fn extract_write_nodes(update: &MockStateUpdate) -> Vec<NodeId> {
-            update.entries.iter().map(|(id, _)| *id).collect()
+        fn extract_write_nodes(&self) -> Vec<NodeId> {
+            self.entries.iter().map(|(id, _)| *id).collect()
         }
+    }
+
+    /// Non-Radix TypeConfig proving the framework is generic.
+    #[derive(Debug, Clone)]
+    struct MockConfig;
+
+    impl TypeConfig for MockConfig {
+        type Transaction = MockTransaction;
+        type ExecutionReceipt = MockReceipt;
+        type StateUpdate = MockStateUpdate;
 
         fn receipt_to_state_update(_receipt: &MockReceipt) -> MockStateUpdate {
             MockStateUpdate::default()
@@ -290,19 +285,19 @@ mod tests {
         };
 
         // merge
-        let merged = MockConfig::merge_state_updates(&[update.clone(), update.clone()]);
+        let merged = MockStateUpdate::merge(&[update.clone(), update.clone()]);
         assert_eq!(merged.entries.len(), 2);
 
         // extract_write_nodes
-        let nodes = MockConfig::extract_write_nodes(&update);
+        let nodes = update.extract_write_nodes();
         assert_eq!(nodes, vec![node_id]);
 
         // filter_to_writes
-        let filtered = MockConfig::filter_state_update_to_writes(&update, &[node_id]);
+        let filtered = update.filter_to_writes(&[node_id]);
         assert_eq!(filtered.entries.len(), 1);
 
         // Empty declared_writes = no filtering (pass everything through).
-        let unfiltered = MockConfig::filter_state_update_to_writes(&update, &[]);
+        let unfiltered = update.filter_to_writes(&[]);
         assert_eq!(unfiltered.entries.len(), 1);
 
         // receipt_to_state_update

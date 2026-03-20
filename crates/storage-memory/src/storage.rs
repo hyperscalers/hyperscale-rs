@@ -15,6 +15,7 @@
 use hyperscale_codec as sbor;
 use hyperscale_codec::prelude::*;
 use hyperscale_dispatch::Dispatch;
+use hyperscale_radix_config::RadixStateUpdate;
 use hyperscale_storage::{
     jmt::{EntityTier, StoredTreeNodeKey, TypedInMemoryTreeStore, WriteableTreeStore},
     keys, CommitStore, ConsensusStore, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
@@ -605,7 +606,7 @@ pub struct SimPreparedCommit {
     merged_updates: DatabaseUpdates,
 }
 
-impl<C: TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch + 'static> CommitStore<C>
+impl<C: TypeConfig<StateUpdate = RadixStateUpdate>, D: Dispatch + 'static> CommitStore<C>
     for SimStorage<D>
 {
     type PreparedCommit = SimPreparedCommit;
@@ -613,7 +614,7 @@ impl<C: TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch + 'static> Commit
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
-        merged_updates: &DatabaseUpdates,
+        merged_updates: &RadixStateUpdate,
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit) {
         // Read lock: clone data + compute speculative JMT root concurrently.
@@ -661,7 +662,7 @@ impl<C: TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch + 'static> Commit
         let prepared = SimPreparedCommit {
             snapshot,
             resulting_data,
-            merged_updates: merged_updates.clone(),
+            merged_updates: merged_updates.0.clone(),
         };
 
         (result_root, prepared)
@@ -705,9 +706,10 @@ impl<C: TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch + 'static> Commit
 
         // Stale cache: fall back to full block commit which recomputes JMT.
         // Use the stored merged_updates to ensure substate writes aren't lost.
+        let wrapped = RadixStateUpdate(prepared.merged_updates);
         <Self as CommitStore<C>>::commit_block(
             self,
-            &prepared.merged_updates,
+            &wrapped,
             certificates,
             block_height,
             consensus,
@@ -716,7 +718,7 @@ impl<C: TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch + 'static> Commit
 
     fn commit_block(
         &self,
-        merged_updates: &DatabaseUpdates,
+        merged_updates: &RadixStateUpdate,
         certificates: &[Arc<TransactionCertificate>],
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
@@ -1498,7 +1500,7 @@ mod tests {
     fn test_commit_block_single_cert() {
         let storage = SimStorage::new(SyncDispatch::new());
         let shard = ShardGroupId(0);
-        let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
+        let updates = RadixStateUpdate(make_mapped_database_update(1, 0, vec![10], vec![42]));
         let cert = Arc::new(make_test_certificate(1, shard));
 
         let result = CommitStore::<RadixConfig>::commit_block(&storage, &updates, &[cert], 1, None);
@@ -1511,7 +1513,9 @@ mod tests {
         let shard = ShardGroupId(0);
         let updates1 = make_mapped_database_update(1, 0, vec![10], vec![1]);
         let updates2 = make_mapped_database_update(2, 0, vec![20], vec![2]);
-        let merged = hyperscale_radix_config::merge::merge_database_updates(&[updates1, updates2]);
+        let merged = RadixStateUpdate(hyperscale_radix_config::merge::merge_database_updates(&[
+            updates1, updates2,
+        ]));
         let cert1 = Arc::new(make_test_certificate(1, shard));
         let cert2 = Arc::new(make_test_certificate(2, shard));
 
@@ -1526,7 +1530,7 @@ mod tests {
         let storage = SimStorage::new(SyncDispatch::new());
         CommitStore::<RadixConfig>::commit_block(
             &storage,
-            &DatabaseUpdates::default(),
+            &RadixStateUpdate::default(),
             &[],
             1,
             None,
@@ -1549,7 +1553,7 @@ mod tests {
         let (spec_root, prepared) = CommitStore::<RadixConfig>::prepare_block_commit(
             &s_prepared,
             parent_root,
-            &DatabaseUpdates::default(),
+            &RadixStateUpdate::default(),
             1,
         );
         let certs = std::slice::from_ref(&cert);
@@ -1559,7 +1563,7 @@ mod tests {
         // Direct path
         let result_direct = CommitStore::<RadixConfig>::commit_block(
             &s_direct,
-            &DatabaseUpdates::default(),
+            &RadixStateUpdate::default(),
             std::slice::from_ref(&cert),
             1,
             None,
@@ -1579,7 +1583,7 @@ mod tests {
         let (spec_root, prepared) = CommitStore::<RadixConfig>::prepare_block_commit(
             &storage,
             parent_root,
-            &DatabaseUpdates::default(),
+            &RadixStateUpdate::default(),
             1,
         );
         let result =
@@ -1615,7 +1619,7 @@ mod tests {
 
         let _ = CommitStore::<RadixConfig>::commit_block(
             &storage,
-            &DatabaseUpdates::default(),
+            &RadixStateUpdate::default(),
             &[cert],
             1,
             None,
@@ -1697,14 +1701,14 @@ mod tests {
         let shard = ShardGroupId(0);
 
         // Block height 1: commit value [100] for node 1
-        let updates1 = make_mapped_database_update(1, 0, vec![10], vec![100]);
+        let updates1 = RadixStateUpdate(make_mapped_database_update(1, 0, vec![10], vec![100]));
         let cert1 = Arc::new(make_test_certificate(1, shard));
         let result1 =
             CommitStore::<RadixConfig>::commit_block(&storage, &updates1, &[cert1], 1, None);
         let root_v1 = result1;
 
         // Block height 2: overwrite with value [200]
-        let updates2 = make_mapped_database_update(1, 0, vec![10], vec![200]);
+        let updates2 = RadixStateUpdate(make_mapped_database_update(1, 0, vec![10], vec![200]));
         let cert2 = Arc::new(make_test_certificate(2, shard));
         let result2 =
             CommitStore::<RadixConfig>::commit_block(&storage, &updates2, &[cert2], 2, None);

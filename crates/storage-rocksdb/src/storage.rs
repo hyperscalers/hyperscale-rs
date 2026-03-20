@@ -15,6 +15,7 @@ use hyperscale_codec as sbor;
 use hyperscale_codec::prelude::*;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
+use hyperscale_radix_config::RadixStateUpdate;
 use hyperscale_storage::{
     jmt::{
         encode_key as encode_jmt_key, EntityTier, ReadableTreeStore, StaleTreePart,
@@ -2398,7 +2399,7 @@ pub struct RocksDbPreparedCommit {
     merged_updates: DatabaseUpdates,
 }
 
-impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch + 'static>
+impl<C: hyperscale_types::TypeConfig<StateUpdate = RadixStateUpdate>, D: Dispatch + 'static>
     hyperscale_storage::CommitStore<C> for RocksDbStorage<D>
 {
     type PreparedCommit = RocksDbPreparedCommit;
@@ -2406,12 +2407,12 @@ impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch
     fn prepare_block_commit(
         &self,
         parent_state_root: hyperscale_types::Hash,
-        merged_updates: &DatabaseUpdates,
+        merged_updates: &RadixStateUpdate,
         block_height: u64,
     ) -> (hyperscale_types::Hash, Self::PreparedCommit) {
         let (computed_root, jmt_snapshot) = self.compute_speculative_root_from_base(
             parent_state_root,
-            std::slice::from_ref(merged_updates),
+            std::slice::from_ref(&**merged_updates),
             block_height,
         );
 
@@ -2421,7 +2422,7 @@ impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch
         let prepared = RocksDbPreparedCommit {
             write_batch,
             jmt_snapshot,
-            merged_updates: merged_updates.clone(),
+            merged_updates: merged_updates.0.clone(),
         };
 
         (computed_root, prepared)
@@ -2457,9 +2458,10 @@ impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch
             // Stale cache: fall back to recompute from scratch.
             // The JMT base root changed, so the prepared snapshot is invalid.
             // Use the stored merged_updates to ensure substate writes aren't lost.
+            let wrapped = RadixStateUpdate(prepared.merged_updates);
             <Self as hyperscale_storage::CommitStore<C>>::commit_block(
                 self,
-                &prepared.merged_updates,
+                &wrapped,
                 certificates,
                 block_height,
                 consensus,
@@ -2469,7 +2471,7 @@ impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch
 
     fn commit_block(
         &self,
-        merged_updates: &DatabaseUpdates,
+        merged_updates: &RadixStateUpdate,
         certificates: &[Arc<TransactionCertificate>],
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
@@ -2770,7 +2772,7 @@ impl<D: Dispatch + 'static> SubstateStore for SharedStorage<D> {
     }
 }
 
-impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch + 'static>
+impl<C: hyperscale_types::TypeConfig<StateUpdate = RadixStateUpdate>, D: Dispatch + 'static>
     hyperscale_storage::CommitStore<C> for SharedStorage<D>
 {
     type PreparedCommit = RocksDbPreparedCommit;
@@ -2778,7 +2780,7 @@ impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch
     fn prepare_block_commit(
         &self,
         parent_state_root: Hash,
-        merged_updates: &DatabaseUpdates,
+        merged_updates: &RadixStateUpdate,
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit) {
         <RocksDbStorage<D> as hyperscale_storage::CommitStore<C>>::prepare_block_commit(
@@ -2805,7 +2807,7 @@ impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch
 
     fn commit_block(
         &self,
-        merged_updates: &DatabaseUpdates,
+        merged_updates: &RadixStateUpdate,
         certificates: &[std::sync::Arc<TransactionCertificate>],
         block_height: u64,
         consensus: Option<hyperscale_storage::ConsensusCommitData>,
@@ -3381,6 +3383,7 @@ mod tests {
         let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
         let cert = Arc::new(make_test_certificate(1, shard));
 
+        let updates = RadixStateUpdate(updates);
         let result = CommitStore::<RadixConfig>::commit_block(&storage, &updates, &[cert], 1, None);
         assert_ne!(result, Hash::ZERO);
     }
@@ -3393,7 +3396,9 @@ mod tests {
         let shard = ShardGroupId(0);
         let updates1 = make_mapped_database_update(1, 0, vec![10], vec![1]);
         let updates2 = make_mapped_database_update(2, 0, vec![20], vec![2]);
-        let merged = hyperscale_radix_config::merge::merge_database_updates(&[updates1, updates2]);
+        let merged = RadixStateUpdate(hyperscale_radix_config::merge::merge_database_updates(&[
+            updates1, updates2,
+        ]));
         let cert1 = Arc::new(make_test_certificate(1, shard));
         let cert2 = Arc::new(make_test_certificate(2, shard));
 
@@ -3410,7 +3415,7 @@ mod tests {
 
         CommitStore::<RadixConfig>::commit_block(
             &storage,
-            &DatabaseUpdates::default(),
+            &RadixStateUpdate::default(),
             &[],
             1,
             None,
@@ -3431,7 +3436,7 @@ mod tests {
         let (spec_root, prepared) = CommitStore::<RadixConfig>::prepare_block_commit(
             &s_prepared,
             parent_root,
-            &DatabaseUpdates::default(),
+            &RadixStateUpdate::default(),
             1,
         );
         let certs = std::slice::from_ref(&cert);
@@ -3443,7 +3448,7 @@ mod tests {
         let s_direct = RocksDbStorage::open(temp_dir2.path(), SyncDispatch::new()).unwrap();
         let result_direct = CommitStore::<RadixConfig>::commit_block(
             &s_direct,
-            &DatabaseUpdates::default(),
+            &RadixStateUpdate::default(),
             std::slice::from_ref(&cert),
             1,
             None,
@@ -3464,7 +3469,7 @@ mod tests {
 
         let _ = CommitStore::<RadixConfig>::commit_block(
             &storage,
-            &DatabaseUpdates::default(),
+            &RadixStateUpdate::default(),
             &[cert],
             1,
             None,

@@ -491,18 +491,6 @@ mod tests {
         type Transaction = MockTransaction;
         type ExecutionReceipt = LedgerTransactionReceipt;
         type StateUpdate = Vec<u8>;
-        fn merge_state_updates(updates: &[Vec<u8>]) -> Vec<u8> {
-            updates.concat()
-        }
-        fn filter_state_update_to_shard(u: &Vec<u8>, _: crate::ShardGroupId, _: u64) -> Vec<u8> {
-            u.clone()
-        }
-        fn filter_state_update_to_writes(u: &Vec<u8>, _: &[NodeId]) -> Vec<u8> {
-            u.clone()
-        }
-        fn extract_write_nodes(_: &Vec<u8>) -> Vec<NodeId> {
-            vec![]
-        }
         fn receipt_to_state_update(_: &LedgerTransactionReceipt) -> Vec<u8> {
             vec![]
         }

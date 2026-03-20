@@ -20,6 +20,7 @@ hyperscale-execution.workspace = true
 hyperscale-mempool.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-metrics-prometheus.workspace = true
+hyperscale-radix-config.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-storage-rocksdb.workspace = true
 hyperscale-node.workspace = true

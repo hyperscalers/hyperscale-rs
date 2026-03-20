@@ -11,8 +11,8 @@ use hyperscale_messages::{ExecutionCertificatesNotification, ExecutionVotesNotif
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_types::{
-    Bls12381G1PublicKey, ConsensusTransaction, ExecutionCertificate, ExecutionResult,
-    ExecutionVote, Hash, ShardGroupId, TypeConfig,
+    Bls12381G1PublicKey, ConsensusStateUpdate, ConsensusTransaction, ExecutionCertificate,
+    ExecutionResult, ExecutionVote, Hash, ShardGroupId,
 };
 use std::sync::Arc;
 
@@ -106,12 +106,9 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
                 .map(|r| {
                     let mut result = ExecutionResult::from(r);
                     if num_shards > 1 {
-                        result.database_updates =
-                            <Cfg::Types as TypeConfig>::filter_state_update_to_shard(
-                                &result.database_updates,
-                                local_shard,
-                                num_shards,
-                            );
+                        result.database_updates = result
+                            .database_updates
+                            .filter_to_shard(local_shard, num_shards);
                     }
                     result
                 })

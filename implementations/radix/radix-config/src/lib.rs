@@ -11,10 +11,44 @@ use std::sync::Arc;
 
 use hyperscale_radix_types::RoutableTransaction;
 use hyperscale_types::{
-    LedgerTransactionReceipt, NodeId, PartitionNumber, ShardGroupId, SubstateChange,
-    SubstateChangeAction, SubstateRef, TypeConfig,
+    ConsensusStateUpdate, LedgerTransactionReceipt, NodeId, PartitionNumber, ShardGroupId,
+    SubstateChange, SubstateChangeAction, SubstateRef, TypeConfig,
 };
 use radix_substate_store_interface::interface::DatabaseUpdates;
+
+/// Newtype wrapper around Radix's `DatabaseUpdates` that implements
+/// [`ConsensusStateUpdate`].
+///
+/// This exists because the orphan rule prevents implementing a framework
+/// trait on a foreign type. Use `Deref`/`DerefMut` for transparent access
+/// to the inner `DatabaseUpdates`.
+#[derive(Debug, Clone, Default)]
+pub struct RadixStateUpdate(pub DatabaseUpdates);
+
+impl std::ops::Deref for RadixStateUpdate {
+    type Target = DatabaseUpdates;
+    fn deref(&self) -> &DatabaseUpdates {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for RadixStateUpdate {
+    fn deref_mut(&mut self) -> &mut DatabaseUpdates {
+        &mut self.0
+    }
+}
+
+impl From<DatabaseUpdates> for RadixStateUpdate {
+    fn from(updates: DatabaseUpdates) -> Self {
+        Self(updates)
+    }
+}
+
+impl From<RadixStateUpdate> for DatabaseUpdates {
+    fn from(wrapper: RadixStateUpdate) -> Self {
+        wrapper.0
+    }
+}
 
 /// Length of the hash prefix in spread-prefix-mapped db node keys.
 const HASH_PREFIX_LEN: usize = 20;
@@ -44,30 +78,23 @@ fn node_id_from_db_key(db_node_key: &[u8]) -> Option<NodeId> {
 #[derive(Debug, Clone)]
 pub struct RadixConfig;
 
-impl TypeConfig for RadixConfig {
-    type Transaction = RoutableTransaction;
-    type ExecutionReceipt = LedgerTransactionReceipt;
-    type StateUpdate = DatabaseUpdates;
-
-    fn merge_state_updates(updates: &[DatabaseUpdates]) -> DatabaseUpdates {
-        merge::merge_database_updates(updates)
+impl ConsensusStateUpdate for RadixStateUpdate {
+    fn merge(updates: &[Self]) -> Self {
+        let inner: Vec<DatabaseUpdates> = updates.iter().map(|u| u.0.clone()).collect();
+        RadixStateUpdate(merge::merge_database_updates(&inner))
     }
 
-    fn merge_state_updates_from_arcs(updates: &[Arc<DatabaseUpdates>]) -> DatabaseUpdates {
-        let dereffed: Vec<DatabaseUpdates> = updates.iter().map(|a| (**a).clone()).collect();
-        Self::merge_state_updates(&dereffed)
+    fn merge_from_arcs(updates: &[Arc<Self>]) -> Self {
+        let inner: Vec<DatabaseUpdates> = updates.iter().map(|a| a.0.clone()).collect();
+        RadixStateUpdate(merge::merge_database_updates(&inner))
     }
 
-    fn filter_state_update_to_shard(
-        update: &DatabaseUpdates,
-        local_shard: ShardGroupId,
-        num_shards: u64,
-    ) -> DatabaseUpdates {
+    fn filter_to_shard(&self, local_shard: ShardGroupId, num_shards: u64) -> Self {
         if num_shards <= 1 {
-            return update.clone();
+            return self.clone();
         }
         let mut filtered = DatabaseUpdates::default();
-        for (db_node_key, node_updates) in &update.node_updates {
+        for (db_node_key, node_updates) in &self.0.node_updates {
             let dominated_by_local = node_id_from_db_key(db_node_key)
                 .map(|id| hyperscale_types::shard_for_node(&id, num_shards) == local_shard)
                 .unwrap_or(true); // keep metadata keys
@@ -77,20 +104,16 @@ impl TypeConfig for RadixConfig {
                     .insert(db_node_key.clone(), node_updates.clone());
             }
         }
-        filtered
+        RadixStateUpdate(filtered)
     }
 
-    fn filter_state_update_to_writes(
-        update: &DatabaseUpdates,
-        declared_writes: &[NodeId],
-    ) -> DatabaseUpdates {
+    fn filter_to_writes(&self, declared_writes: &[NodeId]) -> Self {
         if declared_writes.is_empty() {
-            // No declared writes = no filtering (pass everything through).
-            return update.clone();
+            return self.clone();
         }
         let allowed: std::collections::HashSet<NodeId> = declared_writes.iter().copied().collect();
         let mut filtered = DatabaseUpdates::default();
-        for (db_node_key, node_updates) in &update.node_updates {
+        for (db_node_key, node_updates) in &self.0.node_updates {
             let passes = node_id_from_db_key(db_node_key)
                 .map(|id| allowed.contains(&id))
                 .unwrap_or(true); // keep metadata keys
@@ -100,11 +123,11 @@ impl TypeConfig for RadixConfig {
                     .insert(db_node_key.clone(), node_updates.clone());
             }
         }
-        filtered
+        RadixStateUpdate(filtered)
     }
 
-    fn extract_write_nodes(update: &DatabaseUpdates) -> Vec<NodeId> {
-        update
+    fn extract_write_nodes(&self) -> Vec<NodeId> {
+        self.0
             .node_updates
             .keys()
             .filter_map(|db_node_key| node_id_from_db_key(db_node_key))
@@ -112,8 +135,14 @@ impl TypeConfig for RadixConfig {
             .into_iter()
             .collect()
     }
+}
 
-    fn receipt_to_state_update(receipt: &LedgerTransactionReceipt) -> DatabaseUpdates {
+impl TypeConfig for RadixConfig {
+    type Transaction = RoutableTransaction;
+    type ExecutionReceipt = LedgerTransactionReceipt;
+    type StateUpdate = RadixStateUpdate;
+
+    fn receipt_to_state_update(receipt: &LedgerTransactionReceipt) -> RadixStateUpdate {
         use hyperscale_types::SubstateChangeAction;
         use radix_common::prelude::DatabaseUpdate;
         use radix_substate_store_interface::db_key_mapper::{
@@ -152,18 +181,18 @@ impl TypeConfig for RadixConfig {
                 substate_updates.insert(db_sort_key, db_update);
             }
         }
-        updates
+        RadixStateUpdate(updates)
     }
 
     fn enrich_receipt_for_storage(
         receipt: &LedgerTransactionReceipt,
-        state_update: &DatabaseUpdates,
+        state_update: &RadixStateUpdate,
     ) -> LedgerTransactionReceipt {
         use radix_common::prelude::DatabaseUpdate;
         use radix_substate_store_interface::interface::PartitionDatabaseUpdates;
 
         let mut changes = Vec::new();
-        for (db_node_key, node_updates) in &state_update.node_updates {
+        for (db_node_key, node_updates) in &state_update.0.node_updates {
             let node_id = match node_id_from_db_key(db_node_key) {
                 Some(id) => id,
                 None => continue,

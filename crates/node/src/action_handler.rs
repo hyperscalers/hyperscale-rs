@@ -15,8 +15,8 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{CommitStore, SubstateStore};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ShardGroupId, TypeConfig,
-    ValidatorId,
+    Bls12381G1PrivateKey, ConsensusStateUpdate, ExecutionResult, ExecutionVote, Hash, ShardGroupId,
+    TypeConfig, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -237,7 +237,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
         } => {
             let start = std::time::Instant::now();
             let merged =
-                <Cfg::Types as TypeConfig>::merge_state_updates_from_arcs(&per_cert_updates);
+                <<Cfg::Types as TypeConfig>::StateUpdate>::merge_from_arcs(&per_cert_updates);
             let result = hyperscale_bft::handlers::verify_state_root::<Cfg::Types, _>(
                 ctx.storage,
                 parent_state_root,
@@ -282,7 +282,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
             provision_targets,
         } => {
             let merged_updates =
-                <Cfg::Types as TypeConfig>::merge_state_updates_from_arcs(&per_cert_updates);
+                <<Cfg::Types as TypeConfig>::StateUpdate>::merge_from_arcs(&per_cert_updates);
             let result = hyperscale_bft::handlers::build_proposal::<Cfg::Types, _>(
                 ctx.storage,
                 proposer,
@@ -448,11 +448,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
                 .map(|r| {
                     let mut db_updates = r.state_update;
                     if num_shards > 1 {
-                        db_updates = <Cfg::Types as TypeConfig>::filter_state_update_to_shard(
-                            &db_updates,
-                            local_shard,
-                            num_shards,
-                        );
+                        db_updates = db_updates.filter_to_shard(local_shard, num_shards);
                     }
                     ExecutionResult {
                         tx_hash: r.tx_hash,
@@ -499,11 +495,7 @@ pub(crate) fn handle_delegated_action<Cfg: NodeConfig>(
                 .map(|r| {
                     let mut db_updates = r.state_update;
                     if num_shards > 1 {
-                        db_updates = <Cfg::Types as TypeConfig>::filter_state_update_to_shard(
-                            &db_updates,
-                            local_shard,
-                            num_shards,
-                        );
+                        db_updates = db_updates.filter_to_shard(local_shard, num_shards);
                     }
                     ExecutionResult {
                         tx_hash: r.tx_hash,

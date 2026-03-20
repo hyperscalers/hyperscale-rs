@@ -7,7 +7,7 @@ use hyperscale_core::{ExecutionBackend, TransactionValidator};
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_node::NodeConfig;
-use hyperscale_storage::DatabaseUpdates;
+use hyperscale_radix_config::RadixStateUpdate;
 use hyperscale_storage_rocksdb::SharedStorage;
 use hyperscale_types::{Hash, TypeConfig};
 use std::marker::PhantomData;
@@ -26,9 +26,9 @@ use std::sync::Arc;
 pub trait ProductionSetup: Send + Sync + 'static {
     /// The TypeConfig for this implementation.
     ///
-    /// `StateUpdate = DatabaseUpdates` is required because `SharedStorage` (RocksDB)
+    /// `StateUpdate = RadixStateUpdate` is required because `SharedStorage`
     /// stores state updates as `DatabaseUpdates` internally.
-    type C: TypeConfig<StateUpdate = DatabaseUpdates>;
+    type C: TypeConfig<StateUpdate = RadixStateUpdate>;
 
     /// The execution backend.
     type E: ExecutionBackend<Self::C>;

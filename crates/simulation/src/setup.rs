@@ -7,7 +7,7 @@ use hyperscale_core::{ExecutionBackend, TransactionValidator};
 use hyperscale_dispatch_sync::SyncDispatch;
 use hyperscale_network_memory::SimNetworkAdapter;
 use hyperscale_node::NodeConfig;
-use hyperscale_storage::DatabaseUpdates;
+use hyperscale_radix_config::RadixStateUpdate;
 use hyperscale_storage_memory::SimStorage;
 use hyperscale_types::TypeConfig;
 use std::marker::PhantomData;
@@ -25,9 +25,9 @@ use std::sync::Arc;
 pub trait SimulationSetup: 'static {
     /// The TypeConfig for this implementation.
     ///
-    /// `StateUpdate = DatabaseUpdates` is required because `SimStorage` stores
-    /// state updates as `DatabaseUpdates` internally.
-    type C: TypeConfig<StateUpdate = DatabaseUpdates>;
+    /// `StateUpdate = RadixStateUpdate` is required because `SimStorage`
+    /// stores state updates as `DatabaseUpdates` internally.
+    type C: TypeConfig<StateUpdate = RadixStateUpdate>;
 
     /// The execution backend.
     type E: ExecutionBackend<Self::C>;

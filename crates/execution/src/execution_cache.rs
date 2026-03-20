@@ -109,12 +109,12 @@ impl<C: TypeConfig> Default for ExecutionCache<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_storage::DatabaseUpdates;
+    use hyperscale_radix_config::RadixStateUpdate;
 
     type ExecutionCache = super::ExecutionCache<hyperscale_radix_config::RadixConfig>;
 
-    fn make_updates() -> Arc<DatabaseUpdates> {
-        Arc::new(DatabaseUpdates::default())
+    fn make_updates() -> Arc<RadixStateUpdate> {
+        Arc::new(RadixStateUpdate::default())
     }
 
     fn hash(seed: u8) -> Hash {

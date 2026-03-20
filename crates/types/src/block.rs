@@ -813,7 +813,7 @@ impl CommittedBlockHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ConsensusExecutionReceipt;
+    use crate::{ConsensusExecutionReceipt, ConsensusStateUpdate, NodeId, ShardGroupId};
     use hyperscale_codec as sbor;
 
     /// Minimal mock transaction for block tests.
@@ -864,6 +864,21 @@ mod tests {
         }
     }
 
+    impl ConsensusStateUpdate for Vec<u8> {
+        fn merge(updates: &[Self]) -> Self {
+            updates.concat()
+        }
+        fn filter_to_shard(&self, _local_shard: ShardGroupId, _num_shards: u64) -> Self {
+            self.clone()
+        }
+        fn filter_to_writes(&self, _declared_writes: &[NodeId]) -> Self {
+            self.clone()
+        }
+        fn extract_write_nodes(&self) -> Vec<NodeId> {
+            vec![]
+        }
+    }
+
     /// Lightweight test TypeConfig for block tests (no Radix deps).
     #[derive(Debug, Clone)]
     struct TestConfig;
@@ -871,18 +886,6 @@ mod tests {
         type Transaction = MockTransaction;
         type ExecutionReceipt = MockReceipt;
         type StateUpdate = Vec<u8>;
-        fn merge_state_updates(updates: &[Vec<u8>]) -> Vec<u8> {
-            updates.concat()
-        }
-        fn filter_state_update_to_shard(u: &Vec<u8>, _: ShardGroupId, _: u64) -> Vec<u8> {
-            u.clone()
-        }
-        fn filter_state_update_to_writes(u: &Vec<u8>, _: &[crate::NodeId]) -> Vec<u8> {
-            u.clone()
-        }
-        fn extract_write_nodes(_: &Vec<u8>) -> Vec<crate::NodeId> {
-            vec![]
-        }
         fn receipt_to_state_update(_: &MockReceipt) -> Vec<u8> {
             vec![]
         }

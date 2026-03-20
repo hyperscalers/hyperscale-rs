@@ -16,8 +16,8 @@ use hyperscale_storage::SubstateStore;
 use hyperscale_types::{
     batch_verify_bls_different_messages, batch_verify_bls_same_message, exec_vote_message,
     verify_bls12381_v1, zero_bls_signature, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    Bls12381G2Signature, ConsensusTransaction, ExecutionCertificate, ExecutionVote, Hash, NodeId,
-    ShardGroupId, SignerBitfield, StateProvision, ValidatorId,
+    Bls12381G2Signature, ConsensusStateUpdate, ConsensusTransaction, ExecutionCertificate,
+    ExecutionVote, Hash, NodeId, ShardGroupId, SignerBitfield, StateProvision, ValidatorId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -335,9 +335,9 @@ where
     // Filter out undeclared system state writes
     let mut result = result;
     let declared_writes = tx.writes();
-    result.state_update = C::filter_state_update_to_writes(&result.state_update, declared_writes);
+    result.state_update = result.state_update.filter_to_writes(declared_writes);
 
-    let write_nodes = C::extract_write_nodes(&result.state_update);
+    let write_nodes = result.state_update.extract_write_nodes();
 
     // Sign immediately after execution
     let message = exec_vote_message(
@@ -406,9 +406,9 @@ where
     // Filter out undeclared system state writes
     let mut result = result;
     let declared_writes = transaction.writes();
-    result.state_update = C::filter_state_update_to_writes(&result.state_update, declared_writes);
+    result.state_update = result.state_update.filter_to_writes(declared_writes);
 
-    let write_nodes = C::extract_write_nodes(&result.state_update);
+    let write_nodes = result.state_update.extract_write_nodes();
 
     // Sign immediately after execution
     let message = exec_vote_message(
