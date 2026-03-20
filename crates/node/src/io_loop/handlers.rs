@@ -54,11 +54,13 @@ impl<Cfg: NodeConfig> IoLoop<Cfg> {
 
         let storage = Arc::clone(&self.storage);
         let topology = self.topology.clone();
+        let executor = self.executor.clone();
         self.network
             .register_request_handler::<Cfg::C, GetProvisionsRequest>(move |req| {
                 let topo = topology.load();
-                serve_provision_request::<Cfg::C>(
+                serve_provision_request::<Cfg::C, Cfg::E>(
                     &*storage,
+                    &executor,
                     topo.local_shard(),
                     topo.num_shards(),
                     req,

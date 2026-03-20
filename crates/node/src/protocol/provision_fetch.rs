@@ -348,8 +348,9 @@ impl ProvisionFetchProtocol {
 ///
 /// Takes `local_shard` and `num_shards` instead of `&TopologyState`
 /// to avoid topology dependency in the I/O layer.
-pub fn serve_provision_request<C: TypeConfig>(
+pub fn serve_provision_request<C: TypeConfig, E: hyperscale_core::ExecutionBackend<C>>(
     storage: &(impl ConsensusStore<C> + SubstateStore),
+    executor: &E,
     local_shard: ShardGroupId,
     num_shards: u64,
     req: GetProvisionsRequest,
@@ -404,17 +405,16 @@ pub fn serve_provision_request<C: TypeConfig>(
             continue;
         }
 
-        let entries =
-            match hyperscale_engine::fetch_state_entries(storage, &owned_nodes, jmt_version) {
-                Some(entries) => entries,
-                None => {
-                    warn!(
-                        block_height = req.block_height.0,
-                        jmt_version, "Provision request: historical JMT version unavailable"
-                    );
-                    return GetProvisionsResponse { provisions: None };
-                }
-            };
+        let entries = match executor.fetch_state_entries(storage, &owned_nodes, jmt_version) {
+            Some(entries) => entries,
+            None => {
+                warn!(
+                    block_height = req.block_height.0,
+                    jmt_version, "Provision request: historical JMT version unavailable"
+                );
+                return GetProvisionsResponse { provisions: None };
+            }
+        };
         let storage_keys: Vec<Vec<u8>> = entries.iter().map(|e| e.storage_key.clone()).collect();
         let merkle_proofs = storage.generate_merkle_proofs(&storage_keys, jmt_version);
 
