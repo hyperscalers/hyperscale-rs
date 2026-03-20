@@ -5,7 +5,6 @@ edition.workspace = true
 description = "RocksDB storage implementation for production"
 
 [dependencies]
-hyperscale-radix-config.workspace = true
 hyperscale-storage.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-types.workspace = true
@@ -19,5 +18,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 hyperscale-dispatch-sync.workspace = true
+hyperscale-radix-config.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true

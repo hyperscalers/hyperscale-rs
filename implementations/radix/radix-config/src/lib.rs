@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    DatabaseUpdates, LedgerTransactionReceipt, NodeId, RoutableTransaction, ShardGroupId,
-    TypeConfig,
+    DatabaseUpdates, LedgerTransactionReceipt, NodeId, PartitionNumber, RoutableTransaction,
+    ShardGroupId, SubstateChange, SubstateChangeAction, SubstateRef, TypeConfig,
 };
 
 /// Radix-specific `TypeConfig` implementation.
@@ -196,5 +196,72 @@ impl TypeConfig for RadixConfig {
             }
         }
         updates
+    }
+
+    fn enrich_receipt_for_storage(
+        receipt: &LedgerTransactionReceipt,
+        state_update: &DatabaseUpdates,
+    ) -> LedgerTransactionReceipt {
+        use radix_common::prelude::DatabaseUpdate;
+        use radix_substate_store_interface::interface::PartitionDatabaseUpdates;
+
+        const HASH_PREFIX_LEN: usize = 20;
+        const NODE_ID_LEN: usize = 30;
+
+        let mut changes = Vec::new();
+        for (db_node_key, node_updates) in &state_update.node_updates {
+            let node_id = if db_node_key.len() >= HASH_PREFIX_LEN + NODE_ID_LEN {
+                let mut id = [0u8; NODE_ID_LEN];
+                id.copy_from_slice(&db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN]);
+                NodeId(id)
+            } else {
+                continue;
+            };
+            for (partition_num, partition_updates) in &node_updates.partition_updates {
+                let partition = PartitionNumber(*partition_num);
+                match partition_updates {
+                    PartitionDatabaseUpdates::Delta { substate_updates } => {
+                        for (db_sort_key, update) in substate_updates {
+                            let action = match update {
+                                DatabaseUpdate::Set(new_value) => SubstateChangeAction::Create {
+                                    new_value: new_value.clone(),
+                                },
+                                DatabaseUpdate::Delete => SubstateChangeAction::Delete {
+                                    previous_value: vec![],
+                                },
+                            };
+                            changes.push(SubstateChange {
+                                substate_ref: SubstateRef {
+                                    node_id,
+                                    partition,
+                                    sort_key: db_sort_key.0.clone(),
+                                },
+                                action,
+                            });
+                        }
+                    }
+                    PartitionDatabaseUpdates::Reset {
+                        new_substate_values,
+                    } => {
+                        for (sort_key, new_value) in new_substate_values {
+                            changes.push(SubstateChange {
+                                substate_ref: SubstateRef {
+                                    node_id,
+                                    partition,
+                                    sort_key: sort_key.0.clone(),
+                                },
+                                action: SubstateChangeAction::Create {
+                                    new_value: new_value.clone(),
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut enriched = receipt.clone();
+        enriched.state_changes = changes;
+        enriched
     }
 }

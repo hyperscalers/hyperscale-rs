@@ -37,7 +37,6 @@ use hyperscale_core::{
 use hyperscale_messages::TransactionGossip;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
-use hyperscale_radix_config::RadixConfig;
 use hyperscale_storage::CommitStore;
 use hyperscale_types::{
     Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ConsensusTransaction,
@@ -215,7 +214,7 @@ pub struct IoLoop<Cfg: NodeConfig> {
     pending_timer_ops: Vec<TimerOp>,
 }
 
-impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
+impl<Cfg: NodeConfig> IoLoop<Cfg> {
     /// Create a new IoLoop.
     #[allow(clippy::too_many_arguments)]
     pub fn new(

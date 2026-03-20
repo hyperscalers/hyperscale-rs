@@ -16,7 +16,7 @@ use hyperscale_types::{
 };
 use std::sync::Arc;
 
-impl<Cfg: NodeConfig<C = hyperscale_radix_config::RadixConfig>> IoLoop<Cfg> {
+impl<Cfg: NodeConfig> IoLoop<Cfg> {
     // ─── Transaction Validation Batching ──────────────────────────────
 
     /// Queue a transaction for batch validation.

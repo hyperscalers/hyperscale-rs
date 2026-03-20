@@ -1,9 +1,10 @@
 //! Provision fetch request for fallback recovery.
 
-use crate::response::GetProvisionsResponse;
 use hyperscale_codec as sbor;
 use hyperscale_codec::BasicSbor;
-use hyperscale_types::{BlockHeight, MessagePriority, NetworkMessage, Request, ShardGroupId};
+use hyperscale_types::{
+    BlockHeight, MessagePriority, NetworkMessage, Request, ShardGroupId, TypeConfig,
+};
 
 /// Request to fetch missing provisions from a source shard.
 ///
@@ -30,8 +31,8 @@ impl NetworkMessage for GetProvisionsRequest {
     }
 }
 
-impl Request for GetProvisionsRequest {
-    type Response = GetProvisionsResponse;
+impl<C: TypeConfig> Request<C> for GetProvisionsRequest {
+    type Response = crate::response::GetProvisionsResponse;
 }
 
 #[cfg(test)]

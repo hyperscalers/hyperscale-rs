@@ -8,7 +8,8 @@
 //! The `HandlerRegistry` owns SBOR serialization — `Network` impls just forward.
 
 use hyperscale_types::{
-    Bls12381G1PublicKey, NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId,
+    Bls12381G1PublicKey, NetworkMessage, Request, ShardGroupId, ShardMessage, TypeConfig,
+    ValidatorId,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,12 +100,18 @@ impl<M: NetworkMessage, F: Fn(M) + Send + Sync + 'static> NotificationHandler<M>
 /// Called after the network layer SBOR-decodes the raw request into `R`.
 /// The returned `R::Response` is SBOR-encoded by the network layer before
 /// sending back to the requester.
-pub trait RequestHandler<R: Request>: Send + Sync + 'static {
+///
+/// Generic over `C: TypeConfig` so the response type can carry the right
+/// concrete types. The `C` parameter is erased after handler registration
+/// (the registry stores type-erased `Box<dyn Fn(&[u8]) -> Vec<u8>>`).
+pub trait RequestHandler<C: TypeConfig, R: Request<C>>: Send + Sync + 'static {
     fn handle_request(&self, request: R) -> R::Response;
 }
 
 /// Blanket impl: any `Fn(R) -> R::Response` can serve as a typed request handler.
-impl<R: Request, F: Fn(R) -> R::Response + Send + Sync + 'static> RequestHandler<R> for F {
+impl<C: TypeConfig, R: Request<C>, F: Fn(R) -> R::Response + Send + Sync + 'static>
+    RequestHandler<C, R> for F
+{
     fn handle_request(&self, request: R) -> R::Response {
         (self)(request)
     }
@@ -150,7 +157,10 @@ pub trait Network: Send + Sync {
     /// and an empty response is returned.
     ///
     /// Called during node initialization — once per request type.
-    fn register_request_handler<R: Request>(&self, handler: impl RequestHandler<R>);
+    fn register_request_handler<C: TypeConfig, R: Request<C>>(
+        &self,
+        handler: impl RequestHandler<C, R>,
+    );
 
     // ── Unicast notifications ──
 
@@ -192,7 +202,7 @@ pub trait Network: Send + Sync {
     /// The callback is called on a network thread when the response arrives,
     /// or with an error on timeout/failure. Compatible with sync main loops —
     /// the callback typically pushes into the main loop's event channel.
-    fn request<R: Request + 'static>(
+    fn request<C: TypeConfig, R: Request<C> + 'static>(
         &self,
         peers: &[ValidatorId],
         preferred_peer: Option<ValidatorId>,

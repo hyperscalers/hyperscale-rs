@@ -53,7 +53,7 @@ use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_network_libp2p::{
     generate_random_keypair, Libp2pAdapter, Libp2pConfig, NetworkError,
 };
-use hyperscale_storage::{ConsensusStore, GenesisWrapper};
+use hyperscale_storage::GenesisWrapper;
 use hyperscale_storage_rocksdb::{RocksDbStorage, SharedStorage};
 use quick_cache::sync::Cache as QuickCache;
 
@@ -642,7 +642,7 @@ impl ProductionRunner {
             .expect("io_loop must exist for genesis");
 
         // Check if we already have committed blocks
-        let height = io_loop.storage().committed_height();
+        let height = hyperscale_storage::ConsensusStore::<hyperscale_radix_config::RadixConfig>::committed_height(io_loop.storage());
         let has_blocks = height.0 > 0;
 
         if has_blocks {

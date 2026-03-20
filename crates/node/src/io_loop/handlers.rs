@@ -7,10 +7,9 @@ use hyperscale_messages::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
     ExecutionVotesNotification, TransactionGossip,
 };
-use hyperscale_radix_config::RadixConfig;
 use tracing::warn;
 
-impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
+impl<Cfg: NodeConfig> IoLoop<Cfg> {
     /// Register per-type request handlers with the network.
     ///
     /// Each handler is a closure that captures shared state and delegates to
@@ -29,7 +28,7 @@ impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
 
         let storage = Arc::clone(&self.storage);
         self.network
-            .register_request_handler::<GetBlockRequest>(move |req| {
+            .register_request_handler::<Cfg::C, GetBlockRequest>(move |req| {
                 serve_block_request::<Cfg::C>(&*storage, req)
             });
 
@@ -38,7 +37,7 @@ impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
         let storage = Arc::clone(&self.storage);
         let tx_cache = Arc::clone(&self.tx_cache);
         self.network
-            .register_request_handler::<GetTransactionsRequest>(move |req| {
+            .register_request_handler::<Cfg::C, GetTransactionsRequest>(move |req| {
                 serve_transaction_request::<Cfg::C>(&*storage, &tx_cache, req)
             });
 
@@ -47,7 +46,7 @@ impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
         let storage = Arc::clone(&self.storage);
         let cert_cache = Arc::clone(&self.cert_cache);
         self.network
-            .register_request_handler::<GetCertificatesRequest>(move |req| {
+            .register_request_handler::<Cfg::C, GetCertificatesRequest>(move |req| {
                 serve_certificate_request::<Cfg::C>(&*storage, &cert_cache, req)
             });
 
@@ -56,7 +55,7 @@ impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
         let storage = Arc::clone(&self.storage);
         let topology = self.topology.clone();
         self.network
-            .register_request_handler::<GetProvisionsRequest>(move |req| {
+            .register_request_handler::<Cfg::C, GetProvisionsRequest>(move |req| {
                 let topo = topology.load();
                 serve_provision_request::<Cfg::C>(
                     &*storage,

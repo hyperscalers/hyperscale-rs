@@ -6,12 +6,11 @@ use crate::protocol::provision_fetch::ProvisionFetchOutput;
 use crate::protocol::sync::SyncOutput;
 use hyperscale_core::{NodeConfig, NodeInput, ProtocolEvent, TimerId};
 use hyperscale_metrics as metrics;
-use hyperscale_radix_config::RadixConfig;
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::BlockHeight;
 use std::time::Duration;
 
-impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
+impl<Cfg: NodeConfig> IoLoop<Cfg> {
     /// Interval for the periodic fetch tick timer.
     const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -27,7 +26,7 @@ impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
                     use hyperscale_network::Network;
                     let es = self.event_sender.clone();
                     let peers = self.local_peers();
-                    self.network.request(
+                    self.network.request::<Cfg::C, _>(
                         peers,
                         None,
                         GetBlockRequest {
@@ -107,7 +106,7 @@ impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
                     let bh = block_hash;
                     let hs = tx_hashes.clone();
                     let peers = self.local_peers();
-                    self.network.request(
+                    self.network.request::<Cfg::C, _>(
                         peers,
                         Some(proposer),
                         GetTransactionsRequest::new(block_hash, tx_hashes),
@@ -138,7 +137,7 @@ impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
                     let bh = block_hash;
                     let hs = cert_hashes.clone();
                     let peers = self.local_peers();
-                    self.network.request(
+                    self.network.request::<Cfg::C, _>(
                         peers,
                         Some(proposer),
                         GetCertificatesRequest::new(block_hash, cert_hashes),
@@ -206,7 +205,7 @@ impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
                         target_shard,
                     };
                     let sender = self.event_sender.clone();
-                    self.network.request(
+                    self.network.request::<Cfg::C, _>(
                         &[peer],
                         None,
                         request,

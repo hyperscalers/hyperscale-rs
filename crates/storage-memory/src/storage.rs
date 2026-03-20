@@ -12,8 +12,9 @@
 //! `jmt_version()` and `state_root_hash()` for state commitment. This ensures
 //! simulation has identical JMT behavior to production.
 
+use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
 use hyperscale_dispatch::Dispatch;
-use hyperscale_radix_config::RadixConfig;
 use hyperscale_storage::{
     jmt::{EntityTier, StoredTreeNodeKey, TypedInMemoryTreeStore, WriteableTreeStore},
     keys, CommitStore, ConsensusStore, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
@@ -21,8 +22,8 @@ use hyperscale_storage::{
     SubstateDatabase, SubstateReader, SubstateStore,
 };
 use hyperscale_types::{
-    Block, BlockHeight, Hash, LedgerTransactionReceipt, LocalTransactionExecution, NodeId,
-    QuorumCertificate, ReceiptBundle, RoutableTransaction, TransactionCertificate, TypeConfig,
+    Block, BlockHeight, ConsensusTransaction, Hash, LocalTransactionExecution, NodeId,
+    QuorumCertificate, ReceiptBundle, TransactionCertificate, TypeConfig,
 };
 use im::OrdMap;
 use std::collections::{BTreeMap, HashMap};
@@ -71,24 +72,28 @@ impl SharedState {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// All consensus-related metadata bundled into a single RwLock.
+///
+/// Blocks, transactions, and receipts are stored as SBOR-encoded bytes so the
+/// struct stays concrete (no type parameter) while `ConsensusStore<C>` can
+/// decode them for any `C: TypeConfig`.
 struct ConsensusState {
-    /// Committed blocks indexed by height.
-    blocks: BTreeMap<BlockHeight, (Block<RadixConfig>, QuorumCertificate)>,
+    /// Committed blocks indexed by height (SBOR bytes for block + QC).
+    blocks: BTreeMap<BlockHeight, (Vec<u8>, Vec<u8>)>,
     /// Committed height.
     committed_height: BlockHeight,
     /// Committed block hash.
     committed_hash: Option<Hash>,
     /// Latest QC.
     committed_qc: Option<QuorumCertificate>,
-    /// Transactions indexed by hash.
-    transactions: HashMap<Hash, RoutableTransaction>,
+    /// Transactions indexed by hash (SBOR-encoded bytes).
+    transactions: HashMap<Hash, Vec<u8>>,
     /// Transaction certificates indexed by transaction hash.
     certificates: HashMap<Hash, TransactionCertificate>,
     /// Our own votes indexed by height.
     /// **BFT Safety Critical**: Used to prevent equivocation after restart.
     own_votes: HashMap<u64, (Hash, u64)>,
-    /// Ledger receipts keyed by transaction hash.
-    ledger_receipts: HashMap<Hash, Arc<LedgerTransactionReceipt>>,
+    /// Ledger receipts keyed by transaction hash (SBOR-encoded bytes).
+    ledger_receipts: HashMap<Hash, Vec<u8>>,
     /// Local execution details keyed by transaction hash.
     local_executions: HashMap<Hash, LocalTransactionExecution>,
     /// Insertion height for each receipt, enabling height-based pruning.
@@ -776,8 +781,8 @@ impl<C: TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch + 'static> Commit
 // ConsensusStore implementation
 // ═══════════════════════════════════════════════════════════════════════
 
-impl<D: Dispatch + 'static> ConsensusStore<RadixConfig> for SimStorage<D> {
-    fn put_block(&self, height: BlockHeight, block: &Block<RadixConfig>, qc: &QuorumCertificate) {
+impl<C: TypeConfig, D: Dispatch + 'static> ConsensusStore<C> for SimStorage<D> {
+    fn put_block(&self, height: BlockHeight, block: &Block<C>, qc: &QuorumCertificate) {
         let mut c = self.consensus.write().unwrap();
         // Index all transactions by hash for batch lookups
         for tx in block
@@ -786,13 +791,21 @@ impl<D: Dispatch + 'static> ConsensusStore<RadixConfig> for SimStorage<D> {
             .chain(block.priority_transactions.iter())
             .chain(block.transactions.iter())
         {
-            c.transactions.insert(tx.hash(), tx.as_ref().clone());
+            let tx_bytes =
+                sbor::basic_encode(tx.as_ref()).expect("transaction encoding must succeed");
+            c.transactions.insert(tx.tx_hash(), tx_bytes);
         }
-        c.blocks.insert(height, (block.clone(), qc.clone()));
+        let block_bytes = sbor::basic_encode(block).expect("block encoding must succeed");
+        let qc_bytes = sbor::basic_encode(qc).expect("QC encoding must succeed");
+        c.blocks.insert(height, (block_bytes, qc_bytes));
     }
 
-    fn get_block(&self, height: BlockHeight) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
-        self.consensus.read().unwrap().blocks.get(&height).cloned()
+    fn get_block(&self, height: BlockHeight) -> Option<(Block<C>, QuorumCertificate)> {
+        let c = self.consensus.read().unwrap();
+        let (block_bytes, qc_bytes) = c.blocks.get(&height)?;
+        let block: Block<C> = sbor::basic_decode(block_bytes).expect("block decoding must succeed");
+        let qc: QuorumCertificate = sbor::basic_decode(qc_bytes).expect("QC decoding must succeed");
+        Some((block, qc))
     }
 
     fn set_committed_height(&self, height: BlockHeight) {
@@ -864,18 +877,19 @@ impl<D: Dispatch + 'static> ConsensusStore<RadixConfig> for SimStorage<D> {
             .retain(|height, _| *height > committed_height);
     }
 
-    fn get_block_for_sync(
-        &self,
-        height: BlockHeight,
-    ) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
-        self.consensus.read().unwrap().blocks.get(&height).cloned()
+    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block<C>, QuorumCertificate)> {
+        self.get_block(height)
     }
 
-    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {
+    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<C::Transaction> {
         let c = self.consensus.read().unwrap();
         hashes
             .iter()
-            .filter_map(|h| c.transactions.get(h).cloned())
+            .filter_map(|h| {
+                c.transactions
+                    .get(h)
+                    .and_then(|bytes| sbor::basic_decode(bytes).ok())
+            })
             .collect()
     }
 
@@ -887,30 +901,30 @@ impl<D: Dispatch + 'static> ConsensusStore<RadixConfig> for SimStorage<D> {
             .collect()
     }
 
-    fn store_receipt_bundle(&self, bundle: &ReceiptBundle<RadixConfig>) {
+    fn store_receipt_bundle(&self, bundle: &ReceiptBundle<C>) {
         let mut c = self.consensus.write().unwrap();
         let receipt = if let Some(ref updates) = bundle.database_updates {
-            let mut r = (*bundle.ledger_receipt).clone();
-            r.state_changes = hyperscale_storage::extract_state_changes(updates);
-            Arc::new(r)
+            C::enrich_receipt_for_storage(&bundle.ledger_receipt, updates)
         } else {
-            Arc::clone(&bundle.ledger_receipt)
+            (*bundle.ledger_receipt).clone()
         };
+        let receipt_bytes = sbor::basic_encode(&receipt).expect("receipt encoding must succeed");
         let height = c.committed_height.0;
-        c.ledger_receipts.insert(bundle.tx_hash, receipt);
+        c.ledger_receipts.insert(bundle.tx_hash, receipt_bytes);
         c.receipt_heights.insert(bundle.tx_hash, height);
         if let Some(ref local) = bundle.local_execution {
             c.local_executions.insert(bundle.tx_hash, local.clone());
         }
     }
 
-    fn get_ledger_receipt(&self, tx_hash: &Hash) -> Option<Arc<LedgerTransactionReceipt>> {
+    fn get_ledger_receipt(&self, tx_hash: &Hash) -> Option<Arc<C::ExecutionReceipt>> {
         self.consensus
             .read()
             .unwrap()
             .ledger_receipts
             .get(tx_hash)
-            .cloned()
+            .and_then(|bytes| sbor::basic_decode(bytes).ok())
+            .map(Arc::new)
     }
 
     fn get_local_execution(&self, tx_hash: &Hash) -> Option<LocalTransactionExecution> {
@@ -1026,6 +1040,12 @@ mod tests {
         SubstateDatabase, SubstateStore,
     };
     use hyperscale_types::{zero_bls_signature, Hash, NodeId, ShardGroupId, SignerBitfield};
+
+    /// Helper to bind `SimStorage` to `ConsensusStore<RadixConfig>`, resolving
+    /// the generic `C` that would otherwise be ambiguous.
+    fn cs(s: &SimStorage<SyncDispatch>) -> &dyn ConsensusStore<RadixConfig> {
+        s
+    }
 
     #[test]
     fn test_basic_substate_operations() {
@@ -1193,11 +1213,11 @@ mod tests {
         let block = make_test_block(42);
         let qc = make_test_qc(&block);
 
-        assert!(storage.get_block(BlockHeight(42)).is_none());
+        assert!(cs(&storage).get_block(BlockHeight(42)).is_none());
 
-        storage.put_block(BlockHeight(42), &block, &qc);
+        cs(&storage).put_block(BlockHeight(42), &block, &qc);
 
-        let (stored_block, stored_qc) = storage.get_block(BlockHeight(42)).unwrap();
+        let (stored_block, stored_qc) = cs(&storage).get_block(BlockHeight(42)).unwrap();
         assert_eq!(stored_block.header.height, BlockHeight(42));
         assert_eq!(stored_block.header.timestamp, 42_000);
         assert_eq!(stored_qc.block_hash, block.hash());
@@ -1206,7 +1226,7 @@ mod tests {
     #[test]
     fn test_block_get_nonexistent() {
         let storage = SimStorage::new(SyncDispatch::new());
-        assert!(storage.get_block(BlockHeight(999)).is_none());
+        assert!(cs(&storage).get_block(BlockHeight(999)).is_none());
     }
 
     #[test]
@@ -1224,11 +1244,11 @@ mod tests {
             weighted_timestamp_ms: 10_000,
         };
 
-        storage.set_committed_state(BlockHeight(10), hash, &qc);
+        cs(&storage).set_committed_state(BlockHeight(10), hash, &qc);
 
-        assert_eq!(storage.committed_height(), BlockHeight(10));
-        assert_eq!(storage.committed_hash(), Some(hash));
-        let stored_qc = storage.latest_qc().unwrap();
+        assert_eq!(cs(&storage).committed_height(), BlockHeight(10));
+        assert_eq!(cs(&storage).committed_hash(), Some(hash));
+        let stored_qc = cs(&storage).latest_qc().unwrap();
         assert_eq!(stored_qc.height, BlockHeight(10));
         assert_eq!(stored_qc.round, 3);
     }
@@ -1236,9 +1256,9 @@ mod tests {
     #[test]
     fn test_committed_height_default() {
         let storage = SimStorage::new(SyncDispatch::new());
-        assert_eq!(storage.committed_height(), BlockHeight(0));
-        assert!(storage.committed_hash().is_none());
-        assert!(storage.latest_qc().is_none());
+        assert_eq!(cs(&storage).committed_height(), BlockHeight(0));
+        assert!(cs(&storage).committed_hash().is_none());
+        assert!(cs(&storage).latest_qc().is_none());
     }
 
     #[test]
@@ -1247,16 +1267,16 @@ mod tests {
         let cert = make_test_certificate(1, ShardGroupId(0));
         let tx_hash = cert.transaction_hash;
 
-        storage.store_certificate(&cert);
+        cs(&storage).store_certificate(&cert);
 
-        let stored = storage.get_certificate(&tx_hash).unwrap();
+        let stored = cs(&storage).get_certificate(&tx_hash).unwrap();
         assert_eq!(stored.transaction_hash, tx_hash);
     }
 
     #[test]
     fn test_certificate_get_missing() {
         let storage = SimStorage::new(SyncDispatch::new());
-        assert!(storage
+        assert!(cs(&storage)
             .get_certificate(&Hash::from_bytes(&[99; 32]))
             .is_none());
     }
@@ -1266,16 +1286,16 @@ mod tests {
         let storage = SimStorage::new(SyncDispatch::new());
         let block_hash = Hash::from_bytes(&[1; 32]);
 
-        storage.put_own_vote(100, 5, block_hash);
+        cs(&storage).put_own_vote(100, 5, block_hash);
 
-        let vote = storage.get_own_vote(100);
+        let vote = cs(&storage).get_own_vote(100);
         assert_eq!(vote, Some((block_hash, 5)));
     }
 
     #[test]
     fn test_vote_get_missing() {
         let storage = SimStorage::new(SyncDispatch::new());
-        assert!(storage.get_own_vote(100).is_none());
+        assert!(cs(&storage).get_own_vote(100).is_none());
     }
 
     #[test]
@@ -1284,13 +1304,13 @@ mod tests {
         let hash_a = Hash::from_bytes(&[1; 32]);
         let hash_b = Hash::from_bytes(&[2; 32]);
 
-        storage.put_own_vote(100, 0, hash_a);
-        assert_eq!(storage.get_own_vote(100), Some((hash_a, 0)));
+        cs(&storage).put_own_vote(100, 0, hash_a);
+        assert_eq!(cs(&storage).get_own_vote(100), Some((hash_a, 0)));
 
-        storage.put_own_vote(100, 1, hash_b);
-        assert_eq!(storage.get_own_vote(100), Some((hash_b, 1)));
+        cs(&storage).put_own_vote(100, 1, hash_b);
+        assert_eq!(cs(&storage).get_own_vote(100), Some((hash_b, 1)));
 
-        let all = storage.get_all_own_votes();
+        let all = cs(&storage).get_all_own_votes();
         assert_eq!(all.len(), 1);
     }
 
@@ -1299,15 +1319,15 @@ mod tests {
         let storage = SimStorage::new(SyncDispatch::new());
         let hash = Hash::from_bytes(&[1; 32]);
 
-        storage.put_own_vote(10, 0, hash);
-        storage.put_own_vote(20, 0, hash);
-        storage.put_own_vote(30, 0, hash);
+        cs(&storage).put_own_vote(10, 0, hash);
+        cs(&storage).put_own_vote(20, 0, hash);
+        cs(&storage).put_own_vote(30, 0, hash);
 
-        storage.prune_own_votes(20);
+        cs(&storage).prune_own_votes(20);
 
-        assert!(storage.get_own_vote(10).is_none());
-        assert!(storage.get_own_vote(20).is_none());
-        assert!(storage.get_own_vote(30).is_some());
+        assert!(cs(&storage).get_own_vote(10).is_none());
+        assert!(cs(&storage).get_own_vote(20).is_none());
+        assert!(cs(&storage).get_own_vote(30).is_some());
     }
 
     #[test]
@@ -1315,10 +1335,10 @@ mod tests {
         let storage = SimStorage::new(SyncDispatch::new());
         let hash = Hash::from_bytes(&[1; 32]);
 
-        storage.put_own_vote(10, 0, hash);
-        storage.put_own_vote(20, 1, hash);
+        cs(&storage).put_own_vote(10, 0, hash);
+        cs(&storage).put_own_vote(20, 1, hash);
 
-        let all = storage.get_all_own_votes();
+        let all = cs(&storage).get_all_own_votes();
         assert_eq!(all.len(), 2);
         assert_eq!(all.get(&10), Some(&(hash, 0)));
         assert_eq!(all.get(&20), Some(&(hash, 1)));
@@ -1329,19 +1349,19 @@ mod tests {
         let storage = SimStorage::new(SyncDispatch::new());
         let block = make_test_block(5);
         let qc = make_test_qc(&block);
-        storage.put_block(BlockHeight(5), &block, &qc);
+        cs(&storage).put_block(BlockHeight(5), &block, &qc);
 
-        let result = storage.get_block_for_sync(BlockHeight(5));
+        let result = cs(&storage).get_block_for_sync(BlockHeight(5));
         assert!(result.is_some());
         assert_eq!(result.unwrap().0.header.height, BlockHeight(5));
 
-        assert!(storage.get_block_for_sync(BlockHeight(999)).is_none());
+        assert!(cs(&storage).get_block_for_sync(BlockHeight(999)).is_none());
     }
 
     #[test]
     fn test_transactions_batch_missing() {
         let storage = SimStorage::new(SyncDispatch::new());
-        let result = storage.get_transactions_batch(&[Hash::from_bytes(&[1; 32])]);
+        let result = cs(&storage).get_transactions_batch(&[Hash::from_bytes(&[1; 32])]);
         assert!(result.is_empty());
     }
 
@@ -1355,15 +1375,15 @@ mod tests {
         block.transactions = vec![tx];
 
         let qc = make_test_qc(&block);
-        storage.put_block(BlockHeight(1), &block, &qc);
+        cs(&storage).put_block(BlockHeight(1), &block, &qc);
 
-        let result = storage.get_transactions_batch(&[tx_hash]);
+        let result = cs(&storage).get_transactions_batch(&[tx_hash]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].hash(), tx_hash);
 
         // Missing hash still excluded
         let missing = Hash::from_bytes(&[99; 32]);
-        let partial = storage.get_transactions_batch(&[tx_hash, missing]);
+        let partial = cs(&storage).get_transactions_batch(&[tx_hash, missing]);
         assert_eq!(partial.len(), 1);
     }
 
@@ -1375,10 +1395,10 @@ mod tests {
         let hash1 = cert1.transaction_hash;
         let hash2 = cert2.transaction_hash;
 
-        storage.store_certificate(&cert1);
-        storage.store_certificate(&cert2);
+        cs(&storage).store_certificate(&cert1);
+        cs(&storage).store_certificate(&cert2);
 
-        let result = storage.get_certificates_batch(&[hash1, hash2]);
+        let result = cs(&storage).get_certificates_batch(&[hash1, hash2]);
         assert_eq!(result.len(), 2);
     }
 
@@ -1387,10 +1407,10 @@ mod tests {
         let storage = SimStorage::new(SyncDispatch::new());
         let cert = make_test_certificate(1, ShardGroupId(0));
         let hash = cert.transaction_hash;
-        storage.store_certificate(&cert);
+        cs(&storage).store_certificate(&cert);
 
         let missing = Hash::from_bytes(&[99; 32]);
-        let result = storage.get_certificates_batch(&[hash, missing]);
+        let result = cs(&storage).get_certificates_batch(&[hash, missing]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].transaction_hash, hash);
     }
@@ -1581,7 +1601,9 @@ mod tests {
         assert_eq!(storage.jmt_version(), 0);
         assert_eq!(storage.state_root_hash(), Hash::ZERO);
         // Certificate should be stored
-        assert!(storage.get_certificate(&cert.transaction_hash).is_some());
+        assert!(cs(&storage)
+            .get_certificate(&cert.transaction_hash)
+            .is_some());
     }
 
     #[test]
@@ -1599,7 +1621,7 @@ mod tests {
             None,
         );
 
-        assert!(storage.get_certificate(&tx_hash).is_some());
+        assert!(cs(&storage).get_certificate(&tx_hash).is_some());
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1613,7 +1635,7 @@ mod tests {
         // Add some data
         storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
         let hash = Hash::from_bytes(&[1; 32]);
-        storage.put_own_vote(10, 0, hash);
+        cs(&storage).put_own_vote(10, 0, hash);
         assert!(storage.jmt_version() > 0);
         assert!(!storage.is_empty());
 
@@ -1622,7 +1644,7 @@ mod tests {
         assert_eq!(storage.jmt_version(), 0);
         assert_eq!(storage.state_root_hash(), Hash::ZERO);
         assert!(storage.is_empty());
-        assert!(storage.get_own_vote(10).is_none());
+        assert!(cs(&storage).get_own_vote(10).is_none());
     }
 
     #[test]

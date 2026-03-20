@@ -1,9 +1,8 @@
 //! Certificate fetch request.
 
-use crate::response::GetCertificatesResponse;
 use hyperscale_codec as sbor;
 use hyperscale_codec::BasicSbor;
-use hyperscale_types::{Hash, MessagePriority, NetworkMessage, Request};
+use hyperscale_types::{Hash, MessagePriority, NetworkMessage, Request, TypeConfig};
 
 /// Fetch type discriminator for request routing.
 /// This distinguishes certificate requests from transaction requests
@@ -55,9 +54,8 @@ impl NetworkMessage for GetCertificatesRequest {
     }
 }
 
-/// Type-safe request/response pairing.
-impl Request for GetCertificatesRequest {
-    type Response = GetCertificatesResponse<hyperscale_radix_config::RadixConfig>;
+impl<C: TypeConfig> Request<C> for GetCertificatesRequest {
+    type Response = crate::response::GetCertificatesResponse<C>;
 }
 
 #[cfg(test)]

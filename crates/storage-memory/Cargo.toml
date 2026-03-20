@@ -8,11 +8,12 @@ description = "In-memory storage implementation for simulation"
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
 hyperscale-dispatch.workspace = true
-hyperscale-radix-config.workspace = true
+hyperscale-codec.workspace = true
 im.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 hyperscale-dispatch-sync.workspace = true
+hyperscale-radix-config.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-types = { workspace = true, features = ["test-utils"] }

@@ -16,7 +16,7 @@
 use hyperscale_codec as sbor;
 
 use crate::traits::{GossipHandler, GossipVerdict, NotificationHandler, RequestHandler};
-use hyperscale_types::{NetworkMessage, Request};
+use hyperscale_types::{NetworkMessage, Request, TypeConfig};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -83,7 +83,10 @@ impl HandlerRegistry {
     ///
     /// Wraps the handler in a closure that SBOR-decodes the request,
     /// calls the handler, and SBOR-encodes the response.
-    pub fn register_request<R: Request>(&self, handler: impl RequestHandler<R>) {
+    pub fn register_request<C: TypeConfig, R: Request<C>>(
+        &self,
+        handler: impl RequestHandler<C, R>,
+    ) {
         let raw: Arc<RawRequestHandler> = Arc::new(move |payload: &[u8]| -> Vec<u8> {
             let req = match sbor::basic_decode::<R>(payload) {
                 Ok(r) => r,
@@ -249,7 +252,7 @@ mod tests {
 
     #[test]
     fn test_register_and_lookup_request() {
-        use hyperscale_types::{NetworkMessage, Request};
+        use hyperscale_types::{NetworkMessage, Request, TypeConfig};
         use sbor::{Decode, Encode};
 
         #[derive(Debug, Encode, Decode)]
@@ -268,13 +271,17 @@ mod tests {
             }
         }
 
-        impl Request for TestReq {
+        impl<C: TypeConfig> Request<C> for TestReq {
             type Response = TestResp;
         }
 
         let registry = HandlerRegistry::new();
 
-        registry.register_request(|req: TestReq| TestResp(req.0 * 2));
+        // The concrete TypeConfig used here doesn't matter — C is erased
+        // after registration. We use RadixConfig as a convenient concrete type.
+        registry.register_request::<hyperscale_radix_config::RadixConfig, TestReq>(
+            |req: TestReq| TestResp(req.0 * 2),
+        );
 
         let handler = registry.get_request("test.request").unwrap();
         let req_bytes = sbor::basic_encode(&TestReq(21)).unwrap();

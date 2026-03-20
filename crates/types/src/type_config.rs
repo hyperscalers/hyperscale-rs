@@ -133,6 +133,19 @@ pub trait TypeConfig: Send + Sync + 'static {
     /// Used by syncing nodes that receive receipts from peers instead of
     /// executing transactions locally.
     fn receipt_to_state_update(receipt: &Self::ExecutionReceipt) -> Self::StateUpdate;
+
+    /// Enrich a receipt with derived data from the state update before persisting.
+    ///
+    /// For Radix, this populates `state_changes` on `LedgerTransactionReceipt`
+    /// from the `DatabaseUpdates`. Other implementations may be a no-op.
+    ///
+    /// Default: returns the receipt unchanged.
+    fn enrich_receipt_for_storage(
+        receipt: &Self::ExecutionReceipt,
+        _state_update: &Self::StateUpdate,
+    ) -> Self::ExecutionReceipt {
+        receipt.clone()
+    }
 }
 
 #[cfg(test)]

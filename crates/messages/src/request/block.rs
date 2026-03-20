@@ -1,9 +1,8 @@
 //! Block fetch request.
 
-use crate::response::GetBlockResponse;
 use hyperscale_codec as sbor;
 use hyperscale_codec::BasicSbor;
-use hyperscale_types::{BlockHeight, MessagePriority, NetworkMessage, Request};
+use hyperscale_types::{BlockHeight, MessagePriority, NetworkMessage, Request, TypeConfig};
 
 /// Request to fetch a full Block by height during sync or catch-up.
 ///
@@ -33,10 +32,8 @@ impl NetworkMessage for GetBlockRequest {
     }
 }
 
-/// Type-safe request/response pairing.
-/// GetBlockRequest expects GetBlockResponse.
-impl Request for GetBlockRequest {
-    type Response = GetBlockResponse<hyperscale_radix_config::RadixConfig>;
+impl<C: TypeConfig> Request<C> for GetBlockRequest {
+    type Response = crate::response::GetBlockResponse<C>;
 }
 
 #[cfg(test)]

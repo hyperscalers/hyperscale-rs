@@ -129,7 +129,12 @@ pub trait NetworkMessage: Send + Sync + Sized + BasicEncode + BasicDecode {
 pub trait ShardMessage: NetworkMessage {}
 
 /// Marker trait for request messages that expect a response.
-pub trait Request: NetworkMessage {
+///
+/// Generic over `C: TypeConfig` so the response type can carry the right
+/// concrete types for the implementation. The generic parameter only matters
+/// at handler registration and request dispatch — the type is erased before
+/// going on the wire.
+pub trait Request<C: crate::TypeConfig>: NetworkMessage {
     /// The response type for this request.
     type Response: NetworkMessage;
 }

@@ -13,7 +13,9 @@ use hyperscale_network::{
     compression, GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError,
     RequestHandler, Topic, TopicScope, ValidatorKeyMap,
 };
-use hyperscale_types::{NetworkMessage, Request, ShardGroupId, ShardMessage, ValidatorId};
+use hyperscale_types::{
+    NetworkMessage, Request, ShardGroupId, ShardMessage, TypeConfig, ValidatorId,
+};
 use libp2p::PeerId;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -150,12 +152,15 @@ impl Network for Libp2pNetwork {
         self.registry.register_notification(handler);
     }
 
-    fn register_request_handler<R: Request>(&self, handler: impl RequestHandler<R>) {
+    fn register_request_handler<C: TypeConfig, R: Request<C>>(
+        &self,
+        handler: impl RequestHandler<C, R>,
+    ) {
         // Registry owns SBOR decode/encode — just forward.
-        self.registry.register_request(handler);
+        self.registry.register_request::<C, R>(handler);
     }
 
-    fn request<R: Request + 'static>(
+    fn request<C: TypeConfig, R: Request<C> + 'static>(
         &self,
         peers: &[ValidatorId],
         preferred_peer: Option<ValidatorId>,

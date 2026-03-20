@@ -15,7 +15,6 @@ use hyperscale_codec as sbor;
 use hyperscale_codec::prelude::*;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
-use hyperscale_radix_config::RadixConfig;
 use hyperscale_storage::{
     jmt::{
         encode_key as encode_jmt_key, EntityTier, ReadableTreeStore, StaleTreePart,
@@ -1134,8 +1133,8 @@ impl SubstateReader for RocksDbSnapshot<'_> {
 // ═══════════════════════════════════════════════════════════════════════
 
 use hyperscale_types::{
-    Block, BlockHeight, BlockMetadata, Hash, QuorumCertificate, RoutableTransaction,
-    TransactionCertificate,
+    Block, BlockHeight, BlockMetadata, ConsensusTransaction, Hash, QuorumCertificate,
+    TransactionCertificate, TypeConfig,
 };
 
 impl<D: Dispatch + 'static> RocksDbStorage<D> {
@@ -1144,15 +1143,15 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     /// Returns blocks in ascending height order. Uses `get_block_denormalized`
     /// for each height to properly reconstruct blocks from metadata + individual
     /// transaction/certificate entries.
-    pub fn get_blocks_range(
+    pub fn get_blocks_range<C: TypeConfig>(
         &self,
         from: BlockHeight,
         to: BlockHeight,
-    ) -> Vec<(Block<RadixConfig>, QuorumCertificate)> {
+    ) -> Vec<(Block<C>, QuorumCertificate)> {
         let mut result = Vec::new();
         let mut h = from.0;
         while h < to.0 {
-            if let Some(block_qc) = self.get_block_denormalized(BlockHeight(h)) {
+            if let Some(block_qc) = self.get_block_denormalized::<C>(BlockHeight(h)) {
                 result.push(block_qc);
             }
             h += 1;
@@ -1168,13 +1167,12 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     ///
     /// This is idempotent - storing the same transaction twice is safe.
     /// Used by `put_block_denormalized` to store transactions separately from block metadata.
-    pub fn put_transaction(&self, tx: &RoutableTransaction) {
+    pub fn put_transaction<T: hyperscale_codec::prelude::BasicEncode>(&self, tx: &T, hash: Hash) {
         let cf = self
             .db
             .cf_handle("transactions")
             .expect("transactions column family must exist");
 
-        let hash = tx.hash();
         let value = sbor::basic_encode(tx).expect("transaction encoding must succeed");
 
         self.db
@@ -1183,7 +1181,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     }
 
     /// Get a transaction by hash.
-    pub fn get_transaction(&self, hash: &Hash) -> Option<RoutableTransaction> {
+    pub fn get_transaction<T: hyperscale_codec::prelude::BasicDecode>(
+        &self,
+        hash: &Hash,
+    ) -> Option<T> {
         let start = Instant::now();
         let cf = self.db.cf_handle("transactions")?;
 
@@ -1202,7 +1203,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     ///
     /// Uses RocksDB's `multi_get_cf` for efficient batch retrieval.
     /// Returns only transactions that were found (missing hashes are skipped).
-    pub fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {
+    pub fn get_transactions_batch<T: hyperscale_codec::prelude::BasicDecode>(
+        &self,
+        hashes: &[Hash],
+    ) -> Vec<T> {
         if hashes.is_empty() {
             return vec![];
         }
@@ -1247,9 +1251,9 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     ///
     /// Panics if the block cannot be persisted. This is intentional: committed blocks
     /// are essential for crash recovery.
-    pub(crate) fn put_block_denormalized(
+    pub(crate) fn put_block_denormalized<C: TypeConfig>(
         &self,
-        block: &Block<RadixConfig>,
+        block: &Block<C>,
         qc: &QuorumCertificate,
     ) {
         let start = Instant::now();
@@ -1278,7 +1282,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         // 2. Store transactions (deduplicated - RocksDB overwrites are idempotent)
         // Must store all transaction sections: retry, priority, and normal
         for tx in block.all_transactions() {
-            let tx_hash = tx.hash();
+            let tx_hash = tx.tx_hash();
             let tx_value =
                 sbor::basic_encode(tx.as_ref()).expect("transaction encoding must succeed");
             batch.put_cf(txs_cf, tx_hash.as_bytes(), tx_value);
@@ -1313,10 +1317,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     /// Returns `None` if the block metadata is not found, or if any referenced
     /// transactions or certificates are missing. This ensures sync responses
     /// always contain complete, self-contained blocks.
-    pub(crate) fn get_block_denormalized(
+    pub(crate) fn get_block_denormalized<C: TypeConfig>(
         &self,
         height: BlockHeight,
-    ) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
+    ) -> Option<(Block<C>, QuorumCertificate)> {
         let start = Instant::now();
 
         // 1. Get block metadata
@@ -1332,10 +1336,11 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
 
         // 2. Batch-fetch transactions for each section (preserving order)
         let retry_transactions =
-            self.get_transactions_batch_ordered(&metadata.manifest.retry_hashes);
-        let priority_transactions =
-            self.get_transactions_batch_ordered(&metadata.manifest.priority_hashes);
-        let transactions = self.get_transactions_batch_ordered(&metadata.manifest.tx_hashes);
+            self.get_transactions_batch_ordered::<C::Transaction>(&metadata.manifest.retry_hashes);
+        let priority_transactions = self
+            .get_transactions_batch_ordered::<C::Transaction>(&metadata.manifest.priority_hashes);
+        let transactions =
+            self.get_transactions_batch_ordered::<C::Transaction>(&metadata.manifest.tx_hashes);
 
         // Verify we got ALL transactions - return None if any are missing
         let total_expected = metadata.manifest.transaction_count();
@@ -1366,7 +1371,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         }
 
         // 4. Reconstruct block
-        let block = Block::<RadixConfig> {
+        let block = Block::<C> {
             header: metadata.header,
             retry_transactions,
             priority_transactions,
@@ -1422,10 +1427,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     ///
     /// This ensures sync responses always contain complete, self-contained blocks.
     /// If a peer can't provide a complete block, the requester should try another peer.
-    pub fn get_block_for_sync(
+    pub fn get_block_for_sync<C: TypeConfig>(
         &self,
         height: BlockHeight,
-    ) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
+    ) -> Option<(Block<C>, QuorumCertificate)> {
         let start = Instant::now();
 
         // 1. Get block metadata
@@ -1441,10 +1446,11 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
 
         // 2. Try to batch-fetch transactions for each section (preserving order)
         let retry_transactions =
-            self.get_transactions_batch_ordered(&metadata.manifest.retry_hashes);
-        let priority_transactions =
-            self.get_transactions_batch_ordered(&metadata.manifest.priority_hashes);
-        let transactions = self.get_transactions_batch_ordered(&metadata.manifest.tx_hashes);
+            self.get_transactions_batch_ordered::<C::Transaction>(&metadata.manifest.retry_hashes);
+        let priority_transactions = self
+            .get_transactions_batch_ordered::<C::Transaction>(&metadata.manifest.priority_hashes);
+        let transactions =
+            self.get_transactions_batch_ordered::<C::Transaction>(&metadata.manifest.tx_hashes);
 
         // Check if all transactions are present - if not, return None
         let total_expected = metadata.manifest.transaction_count();
@@ -1479,7 +1485,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         }
 
         // 4. Full block available - reconstruct it
-        let block = Block::<RadixConfig> {
+        let block = Block::<C> {
             header: metadata.header,
             retry_transactions,
             priority_transactions,
@@ -1502,7 +1508,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     /// Unlike `get_transactions_batch`, this returns results in the same order
     /// as the input hashes, with missing entries causing the result to be shorter.
     /// Callers should check that the result length matches the input length.
-    fn get_transactions_batch_ordered(&self, hashes: &[Hash]) -> Vec<Arc<RoutableTransaction>> {
+    fn get_transactions_batch_ordered<T: hyperscale_codec::prelude::BasicDecode>(
+        &self,
+        hashes: &[Hash],
+    ) -> Vec<Arc<T>> {
         if hashes.is_empty() {
             return vec![];
         }
@@ -1520,7 +1529,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             .into_iter()
             .zip(hashes.iter())
             .filter_map(|(result, hash)| match result {
-                Ok(Some(bytes)) => match sbor::basic_decode::<RoutableTransaction>(&bytes) {
+                Ok(Some(bytes)) => match sbor::basic_decode::<T>(&bytes) {
                     Ok(tx) => Some(Arc::new(tx)),
                     Err(e) => {
                         tracing::warn!(?hash, error = ?e, "Failed to decode transaction");
@@ -1825,22 +1834,25 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Store a receipt bundle (ledger receipt + optional local execution).
-    pub fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle<RadixConfig>) {
+    pub fn store_receipt_bundle<C: TypeConfig>(&self, bundle: &hyperscale_types::ReceiptBundle<C>) {
         let mut batch = WriteBatch::default();
-        self.add_receipt_bundle_to_batch(&mut batch, bundle);
+        self.add_receipt_bundle_to_batch::<C>(&mut batch, bundle);
         self.db
             .write(batch)
             .expect("failed to persist receipt bundle");
     }
 
     /// Store multiple receipt bundles in a single atomic WriteBatch.
-    pub fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle<RadixConfig>]) {
+    pub fn store_receipt_bundles<C: TypeConfig>(
+        &self,
+        bundles: &[hyperscale_types::ReceiptBundle<C>],
+    ) {
         if bundles.is_empty() {
             return;
         }
         let mut batch = WriteBatch::default();
         for bundle in bundles {
-            self.add_receipt_bundle_to_batch(&mut batch, bundle);
+            self.add_receipt_bundle_to_batch::<C>(&mut batch, bundle);
         }
         tracing::debug!(
             count = bundles.len(),
@@ -1853,19 +1865,18 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     }
 
     /// Add a single receipt bundle's writes to an existing WriteBatch.
-    fn add_receipt_bundle_to_batch(
+    fn add_receipt_bundle_to_batch<C: TypeConfig>(
         &self,
         batch: &mut WriteBatch,
-        bundle: &hyperscale_types::ReceiptBundle<RadixConfig>,
+        bundle: &hyperscale_types::ReceiptBundle<C>,
     ) {
         let receipts_cf = self
             .db
             .cf_handle("ledger_receipts")
             .expect("ledger_receipts column family must exist");
         let receipt_bytes = if let Some(ref updates) = bundle.database_updates {
-            let mut receipt = (*bundle.ledger_receipt).clone();
-            receipt.state_changes = hyperscale_storage::extract_state_changes(updates);
-            sbor::basic_encode(&receipt).expect("ledger receipt encoding must succeed")
+            let enriched = C::enrich_receipt_for_storage(&bundle.ledger_receipt, updates);
+            sbor::basic_encode(&enriched).expect("ledger receipt encoding must succeed")
         } else {
             sbor::basic_encode(bundle.ledger_receipt.as_ref())
                 .expect("ledger receipt encoding must succeed")
@@ -1884,26 +1895,24 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     }
 
     /// Retrieve the ledger receipt for a transaction.
-    pub fn get_ledger_receipt(
+    pub fn get_ledger_receipt<R: hyperscale_codec::prelude::BasicDecode>(
         &self,
         tx_hash: &Hash,
-    ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
+    ) -> Option<Arc<R>> {
         let cf = self.db.cf_handle("ledger_receipts")?;
         match self.db.get_cf(cf, tx_hash.as_bytes()) {
-            Ok(Some(value)) => {
-                match sbor::basic_decode::<hyperscale_types::LedgerTransactionReceipt>(&value) {
-                    Ok(receipt) => Some(Arc::new(receipt)),
-                    Err(e) => {
-                        tracing::error!(
-                            ?tx_hash,
-                            bytes_len = value.len(),
-                            error = ?e,
-                            "Ledger receipt exists in storage but SBOR decode failed"
-                        );
-                        None
-                    }
+            Ok(Some(value)) => match sbor::basic_decode::<R>(&value) {
+                Ok(receipt) => Some(Arc::new(receipt)),
+                Err(e) => {
+                    tracing::error!(
+                        ?tx_hash,
+                        bytes_len = value.len(),
+                        error = ?e,
+                        "Ledger receipt exists in storage but SBOR decode failed"
+                    );
+                    None
                 }
-            }
+            },
             _ => None,
         }
     }
@@ -2534,8 +2543,10 @@ impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch
 // ConsensusStore implementation
 // ═══════════════════════════════════════════════════════════════════════
 
-impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore<RadixConfig> for RocksDbStorage<D> {
-    fn put_block(&self, height: BlockHeight, block: &Block<RadixConfig>, qc: &QuorumCertificate) {
+impl<C: TypeConfig, D: Dispatch + 'static> hyperscale_storage::ConsensusStore<C>
+    for RocksDbStorage<D>
+{
+    fn put_block(&self, height: BlockHeight, block: &Block<C>, qc: &QuorumCertificate) {
         debug_assert_eq!(
             height, block.header.height,
             "height must match block header"
@@ -2543,7 +2554,7 @@ impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore<RadixConfig> for 
         self.put_block_denormalized(block, qc);
     }
 
-    fn get_block(&self, height: BlockHeight) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
+    fn get_block(&self, height: BlockHeight) -> Option<(Block<C>, QuorumCertificate)> {
         self.get_block_denormalized(height)
     }
 
@@ -2591,14 +2602,11 @@ impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore<RadixConfig> for 
         RocksDbStorage::prune_own_votes(self, committed_height);
     }
 
-    fn get_block_for_sync(
-        &self,
-        height: BlockHeight,
-    ) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
+    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block<C>, QuorumCertificate)> {
         RocksDbStorage::get_block_for_sync(self, height)
     }
 
-    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {
+    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<C::Transaction> {
         RocksDbStorage::get_transactions_batch(self, hashes)
     }
 
@@ -2606,18 +2614,15 @@ impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore<RadixConfig> for 
         RocksDbStorage::get_certificates_batch(self, hashes)
     }
 
-    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle<RadixConfig>) {
+    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle<C>) {
         RocksDbStorage::store_receipt_bundle(self, bundle)
     }
 
-    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle<RadixConfig>]) {
+    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle<C>]) {
         RocksDbStorage::store_receipt_bundles(self, bundles)
     }
 
-    fn get_ledger_receipt(
-        &self,
-        tx_hash: &Hash,
-    ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
+    fn get_ledger_receipt(&self, tx_hash: &Hash) -> Option<Arc<C::ExecutionReceipt>> {
         RocksDbStorage::get_ledger_receipt(self, tx_hash)
     }
 
@@ -2815,94 +2820,118 @@ impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch
     }
 }
 
-impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore<RadixConfig> for SharedStorage<D> {
-    fn put_block(&self, height: BlockHeight, block: &Block<RadixConfig>, qc: &QuorumCertificate) {
-        self.0.put_block(height, block, qc)
+impl<C: TypeConfig, D: Dispatch + 'static> hyperscale_storage::ConsensusStore<C>
+    for SharedStorage<D>
+{
+    fn put_block(&self, height: BlockHeight, block: &Block<C>, qc: &QuorumCertificate) {
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::put_block(
+            &self.0, height, block, qc,
+        )
     }
 
-    fn get_block(&self, height: BlockHeight) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
-        self.0.get_block(height)
+    fn get_block(&self, height: BlockHeight) -> Option<(Block<C>, QuorumCertificate)> {
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::get_block(&self.0, height)
     }
 
     fn set_committed_height(&self, height: BlockHeight) {
-        self.0.set_committed_height(height)
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::set_committed_height(
+            &self.0, height,
+        )
     }
 
     fn committed_height(&self) -> BlockHeight {
-        self.0.committed_height()
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::committed_height(&self.0)
     }
 
     fn set_committed_state(&self, height: BlockHeight, hash: Hash, qc: &QuorumCertificate) {
-        self.0.set_committed_state(height, hash, qc)
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::set_committed_state(
+            &self.0, height, hash, qc,
+        )
     }
 
     fn committed_hash(&self) -> Option<Hash> {
-        self.0.committed_hash()
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::committed_hash(&self.0)
     }
 
     fn latest_qc(&self) -> Option<QuorumCertificate> {
-        self.0.latest_qc()
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::latest_qc(&self.0)
     }
 
     fn store_certificate(&self, certificate: &TransactionCertificate) {
-        self.0.store_certificate(certificate)
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::store_certificate(
+            &self.0,
+            certificate,
+        )
     }
 
     fn get_certificate(&self, hash: &Hash) -> Option<TransactionCertificate> {
-        self.0.get_certificate(hash)
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::get_certificate(&self.0, hash)
     }
 
     fn put_own_vote(&self, height: u64, round: u64, block_hash: Hash) {
-        self.0.put_own_vote(height, round, block_hash)
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::put_own_vote(
+            &self.0, height, round, block_hash,
+        )
     }
 
     fn get_own_vote(&self, height: u64) -> Option<(Hash, u64)> {
-        self.0.get_own_vote(height)
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::get_own_vote(&self.0, height)
     }
 
     fn get_all_own_votes(&self) -> std::collections::HashMap<u64, (Hash, u64)> {
-        self.0.get_all_own_votes()
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::get_all_own_votes(&self.0)
     }
 
     fn prune_own_votes(&self, committed_height: u64) {
-        self.0.prune_own_votes(committed_height)
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::prune_own_votes(
+            &self.0,
+            committed_height,
+        )
     }
 
-    fn get_block_for_sync(
-        &self,
-        height: BlockHeight,
-    ) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
-        self.0.get_block_for_sync(height)
+    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block<C>, QuorumCertificate)> {
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::get_block_for_sync(
+            &self.0, height,
+        )
     }
 
-    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<RoutableTransaction> {
-        self.0.get_transactions_batch(hashes)
+    fn get_transactions_batch(&self, hashes: &[Hash]) -> Vec<C::Transaction> {
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::get_transactions_batch(
+            &self.0, hashes,
+        )
     }
 
     fn get_certificates_batch(&self, hashes: &[Hash]) -> Vec<TransactionCertificate> {
-        self.0.get_certificates_batch(hashes)
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::get_certificates_batch(
+            &self.0, hashes,
+        )
     }
 
-    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle<RadixConfig>) {
-        self.0.store_receipt_bundle(bundle)
+    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle<C>) {
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::store_receipt_bundle(
+            &self.0, bundle,
+        )
     }
 
-    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle<RadixConfig>]) {
-        self.0.store_receipt_bundles(bundles)
+    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle<C>]) {
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::store_receipt_bundles(
+            &self.0, bundles,
+        )
     }
 
-    fn get_ledger_receipt(
-        &self,
-        tx_hash: &Hash,
-    ) -> Option<Arc<hyperscale_types::LedgerTransactionReceipt>> {
-        self.0.get_ledger_receipt(tx_hash)
+    fn get_ledger_receipt(&self, tx_hash: &Hash) -> Option<Arc<C::ExecutionReceipt>> {
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::get_ledger_receipt(
+            &self.0, tx_hash,
+        )
     }
 
     fn get_local_execution(
         &self,
         tx_hash: &Hash,
     ) -> Option<hyperscale_types::LocalTransactionExecution> {
-        self.0.get_local_execution(tx_hash)
+        <RocksDbStorage<D> as hyperscale_storage::ConsensusStore<C>>::get_local_execution(
+            &self.0, tx_hash,
+        )
     }
 }
 
@@ -2918,6 +2947,12 @@ mod tests {
     use hyperscale_storage::{CommitStore, ConsensusStore, NodeDatabaseUpdates, SubstateStore};
     use hyperscale_types::ShardGroupId;
     use tempfile::TempDir;
+
+    /// Helper to bind `RocksDbStorage` to `ConsensusStore<RadixConfig>`, resolving
+    /// the generic `C` that would otherwise be ambiguous.
+    fn cs(s: &RocksDbStorage<SyncDispatch>) -> &dyn ConsensusStore<RadixConfig> {
+        s
+    }
 
     #[test]
     fn test_basic_substate_operations() {
@@ -3170,11 +3205,11 @@ mod tests {
         let block = make_test_block(42);
         let qc = make_test_qc(&block);
 
-        assert!(storage.get_block(BlockHeight(42)).is_none());
+        assert!(cs(&storage).get_block(BlockHeight(42)).is_none());
 
-        storage.put_block(BlockHeight(42), &block, &qc);
+        cs(&storage).put_block(BlockHeight(42), &block, &qc);
 
-        let (stored_block, stored_qc) = storage.get_block(BlockHeight(42)).unwrap();
+        let (stored_block, stored_qc) = cs(&storage).get_block(BlockHeight(42)).unwrap();
         assert_eq!(stored_block.header.height, BlockHeight(42));
         assert_eq!(stored_block.header.timestamp, 42_000);
         assert_eq!(stored_qc.block_hash, block.hash());
@@ -3188,10 +3223,10 @@ mod tests {
         for h in 10..15u64 {
             let block = make_test_block(h);
             let qc = make_test_qc(&block);
-            storage.put_block(BlockHeight(h), &block, &qc);
+            cs(&storage).put_block(BlockHeight(h), &block, &qc);
         }
 
-        let blocks = storage.get_blocks_range(BlockHeight(11), BlockHeight(14));
+        let blocks = storage.get_blocks_range::<RadixConfig>(BlockHeight(11), BlockHeight(14));
         assert_eq!(blocks.len(), 3);
         assert_eq!(blocks[0].0.header.height, BlockHeight(11));
         assert_eq!(blocks[1].0.header.height, BlockHeight(12));
@@ -3447,7 +3482,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
-        let result = storage.get_transactions_batch(&[Hash::from_bytes(&[1; 32])]);
+        let result = cs(&storage).get_transactions_batch(&[Hash::from_bytes(&[1; 32])]);
         assert!(result.is_empty());
     }
 
@@ -3461,8 +3496,8 @@ mod tests {
         let hash1 = cert1.transaction_hash;
         let hash2 = cert2.transaction_hash;
 
-        storage.store_certificate(&cert1);
-        storage.store_certificate(&cert2);
+        cs(&storage).store_certificate(&cert1);
+        cs(&storage).store_certificate(&cert2);
 
         let result = storage.get_certificates_batch(&[hash1, hash2]);
         assert_eq!(result.len(), 2);
@@ -3531,7 +3566,7 @@ mod tests {
         let cert = make_test_certificate(1, ShardGroupId(0));
         let tx_hash = cert.transaction_hash;
 
-        storage.store_certificate(&cert);
+        cs(&storage).store_certificate(&cert);
 
         let stored = storage.get_certificate(&tx_hash).unwrap();
         assert_eq!(stored.transaction_hash, tx_hash);
@@ -3553,13 +3588,13 @@ mod tests {
 
         let block = make_test_block(5);
         let qc = make_test_qc(&block);
-        storage.put_block(BlockHeight(5), &block, &qc);
+        cs(&storage).put_block(BlockHeight(5), &block, &qc);
 
-        let result = storage.get_block_for_sync(BlockHeight(5));
+        let result = cs(&storage).get_block_for_sync(BlockHeight(5));
         assert!(result.is_some());
         assert_eq!(result.unwrap().0.header.height, BlockHeight(5));
 
-        assert!(storage.get_block_for_sync(BlockHeight(999)).is_none());
+        assert!(cs(&storage).get_block_for_sync(BlockHeight(999)).is_none());
     }
 
     #[test]
@@ -3642,7 +3677,7 @@ mod tests {
             let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
             let block = make_test_block(10);
             let qc = make_test_qc(&block);
-            storage.put_block(BlockHeight(10), &block, &qc);
+            cs(&storage).put_block(BlockHeight(10), &block, &qc);
             storage.put_own_vote(10, 3, vote_hash);
         }
 
@@ -3650,7 +3685,7 @@ mod tests {
         {
             let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
-            let (block, qc) = storage
+            let (block, qc) = cs(&storage)
                 .get_block(BlockHeight(10))
                 .expect("block should survive reopen");
             assert_eq!(block.header.height, BlockHeight(10));
@@ -3701,13 +3736,17 @@ mod tests {
 
         {
             let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
-            storage.store_receipt_bundle(&bundle);
+            storage.store_receipt_bundle::<RadixConfig>(&bundle);
         }
 
         {
             let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
-            assert!(storage.has_receipt(&tx_hash));
-            let retrieved = storage.get_ledger_receipt(&tx_hash).unwrap();
+            assert!(ConsensusStore::<RadixConfig>::has_receipt(
+                &storage, &tx_hash
+            ));
+            let retrieved = storage
+                .get_ledger_receipt::<hyperscale_types::LedgerTransactionReceipt>(&tx_hash)
+                .unwrap();
             assert_eq!(*retrieved, *bundle.ledger_receipt);
             let local = storage.get_local_execution(&tx_hash).unwrap();
             assert_eq!(local, bundle.local_execution.unwrap());

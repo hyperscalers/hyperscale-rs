@@ -341,7 +341,7 @@ impl SimulationRunner {
         self.io_loops
             .get(node as usize)
             .map(|nl| {
-                let s = nl.storage();
+                let s: &dyn ConsensusStore<RadixConfig> = nl.storage();
                 let committed = s.committed_height();
                 if committed.0 == 0 {
                     if s.get_block(hyperscale_types::BlockHeight(0)).is_some() {
@@ -361,9 +361,8 @@ impl SimulationRunner {
         self.io_loops
             .get(node as usize)
             .map(|nl| {
-                nl.storage()
-                    .get_block(hyperscale_types::BlockHeight(height))
-                    .is_some()
+                let s: &dyn ConsensusStore<RadixConfig> = nl.storage();
+                s.get_block(hyperscale_types::BlockHeight(height)).is_some()
             })
             .unwrap_or(false)
     }

@@ -65,7 +65,7 @@ async fn test_storage_operations() {
         provision_targets: vec![],
     };
 
-    let block = Block {
+    let block = Block::<hyperscale_radix_config::RadixConfig> {
         header: header.clone(),
         retry_transactions: vec![],
         priority_transactions: vec![],
@@ -78,18 +78,19 @@ async fn test_storage_operations() {
 
     let qc = QuorumCertificate::genesis();
 
-    storage.put_block(BlockHeight(1), &block, &qc);
+    let cs: &dyn ConsensusStore<hyperscale_radix_config::RadixConfig> = &storage;
+    cs.put_block(BlockHeight(1), &block, &qc);
 
     // Retrieve the block
-    let retrieved = storage.get_block(BlockHeight(1));
+    let retrieved = cs.get_block(BlockHeight(1));
     assert!(retrieved.is_some());
     let (retrieved_block, _retrieved_qc) = retrieved.unwrap();
     assert_eq!(retrieved_block.header.height, BlockHeight(1));
 
     // Test chain metadata
-    storage.set_committed_state(BlockHeight(1), Hash::from_bytes(&[1u8; 32]), &qc);
-    assert_eq!(storage.committed_height(), BlockHeight(1));
-    assert!(storage.committed_hash().is_some());
+    cs.set_committed_state(BlockHeight(1), Hash::from_bytes(&[1u8; 32]), &qc);
+    assert_eq!(cs.committed_height(), BlockHeight(1));
+    assert!(cs.committed_hash().is_some());
 
     info!("Storage operations verified");
 }
