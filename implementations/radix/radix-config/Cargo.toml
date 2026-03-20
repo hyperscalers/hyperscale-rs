@@ -7,5 +7,6 @@ description = "RadixConfig — concrete TypeConfig binding for the Radix impleme
 [dependencies]
 hyperscale-radix-types.workspace = true
 hyperscale-types = { workspace = true }
+indexmap.workspace = true
 radix-common.workspace = true
 radix-substate-store-interface.workspace = true

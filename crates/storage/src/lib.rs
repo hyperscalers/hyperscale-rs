@@ -1,31 +1,33 @@
 //! Storage traits and shared types.
 //!
-//! This crate defines the storage abstraction used by runners to persist Radix state,
-//! along with shared types and utilities that both in-memory and RocksDB storage
-//! implementations need.
+//! This crate defines the storage abstraction used by runners to persist state,
+//! along with shared types and utilities that storage implementations need.
 //!
 //! # Design
 //!
 //! Storage is an implementation detail of runners, not the state machine.
 //! The state machine emits `Action::ExecuteTransactions` and receives
-//! `ProtocolEvent::ExecutionBatchCompleted` - it never touches storage directly.
+//! `ProtocolEvent::ExecutionBatchCompleted` — it never touches storage directly.
 //!
 //! Runners own storage and pass it to the executor:
 //! - `SimulationRunner` uses in-memory storage (`SimStorage`)
 //! - `ProductionRunner` uses RocksDB (`RocksDbStorage`)
 //!
-//! # Architecture
+//! # Framework Traits
 //!
-//! Rather than having our own `Storage` trait that we adapt to Radix's `SubstateDatabase`,
-//! runner storage types implement `SubstateDatabase` directly, plus our `SubstateStore`
-//! extension trait for snapshots, node listing, and JMT state roots.
+//! The framework-level storage traits ([`SubstateReader`], [`SubstateStore`],
+//! [`CommitStore`], [`ConsensusStore`]) are generic — they use `TypeConfig`
+//! associated types and raw byte interfaces, with no Radix-specific types.
+//!
+//! Storage backends additionally implement Radix's `SubstateDatabase` trait
+//! for engine execution compatibility.
 //!
 //! # Jellyfish Merkle Tree (JMT)
 //!
 //! All `SubstateStore` implementations use JMT internally to maintain a cryptographic
 //! commitment to the entire state. This provides:
-//! - `jmt_version()` - Block height of last committed JMT state
-//! - `state_root_hash()` - Merkle root of all substates at current version
+//! - `jmt_version()` — Block height of last committed JMT state
+//! - `state_root_hash()` — Merkle root of all substates at current version
 
 #![warn(missing_docs)]
 
@@ -38,7 +40,6 @@ mod overlay;
 pub mod proofs;
 mod reader;
 mod store;
-mod writes;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_helpers;
@@ -50,10 +51,6 @@ pub use jmt_snapshot::{JmtSnapshot, LeafSubstateKeyAssociation};
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use reader::SubstateReader;
 pub use store::{RawSubstateEntry, SubstateStore, RADIX_PREFIX};
-pub use writes::{
-    extract_state_changes, filter_updates_to_shard, merge_database_updates,
-    merge_database_updates_from_arcs, merge_into, receipt_to_database_updates,
-};
 
 /// Returns `None` when the JMT is truly empty (height 0 with zero root),
 /// indicating no parent node exists. Otherwise returns `Some(block_height)`.
@@ -65,8 +62,17 @@ pub fn jmt_parent_height(block_height: u64, root: StateRootHash) -> Option<u64> 
     }
 }
 
-// Re-export commonly needed Radix types for storage implementations
+/// Framework-level state root hash type.
 pub use hyperscale_types::Hash as StateRootHash;
+
+// ── Radix type re-exports for storage backends ──────────────────────────────
+//
+// Storage backends (storage-memory, storage-rocksdb) and runners need these
+// Radix types. They are re-exported here as a convenience so backends don't
+// need to add direct deps on radix-common / radix-substate-store-interface.
+//
+// Framework crates (core, bft, execution, node, etc.) should NOT import these.
+// The framework uses generic TypeConfig associated types instead.
 pub use radix_common::prelude::{DatabaseUpdate, DbSubstateValue};
 pub use radix_substate_store_interface::interface::{
     CommittableSubstateDatabase, DatabaseUpdates, DbPartitionKey, DbSortKey, NodeDatabaseUpdates,

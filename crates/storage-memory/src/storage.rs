@@ -1511,7 +1511,7 @@ mod tests {
         let shard = ShardGroupId(0);
         let updates1 = make_mapped_database_update(1, 0, vec![10], vec![1]);
         let updates2 = make_mapped_database_update(2, 0, vec![20], vec![2]);
-        let merged = hyperscale_storage::merge_database_updates(&[updates1, updates2]);
+        let merged = hyperscale_radix_config::merge::merge_database_updates(&[updates1, updates2]);
         let cert1 = Arc::new(make_test_certificate(1, shard));
         let cert2 = Arc::new(make_test_certificate(2, shard));
 
@@ -1669,7 +1669,7 @@ mod tests {
         // Commit two substates for the same node
         let updates1 = make_mapped_database_update(1, 0, vec![10], vec![100]);
         let updates2 = make_mapped_database_update(1, 0, vec![20], vec![200]);
-        let merged = hyperscale_storage::merge_database_updates(&[updates1, updates2]);
+        let merged = hyperscale_radix_config::merge::merge_database_updates(&[updates1, updates2]);
         let cert = make_test_certificate(1, ShardGroupId(0));
         storage.commit_certificate_with_writes(&cert, &merged);
 

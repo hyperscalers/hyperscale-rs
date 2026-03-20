@@ -5,6 +5,8 @@
 //! - `ExecutionReceipt` → `LedgerTransactionReceipt`
 //! - `StateUpdate` → `DatabaseUpdates`
 
+pub mod merge;
+
 use std::sync::Arc;
 
 use hyperscale_radix_types::RoutableTransaction;
@@ -48,44 +50,7 @@ impl TypeConfig for RadixConfig {
     type StateUpdate = DatabaseUpdates;
 
     fn merge_state_updates(updates: &[DatabaseUpdates]) -> DatabaseUpdates {
-        use radix_substate_store_interface::interface::NodeDatabaseUpdates;
-        if updates.is_empty() {
-            return DatabaseUpdates::default();
-        }
-        if updates.len() == 1 {
-            return updates[0].clone();
-        }
-        let mut merged = DatabaseUpdates::default();
-        for update in updates {
-            for (entity_key, node_updates) in &update.node_updates {
-                let target = merged
-                    .node_updates
-                    .entry(entity_key.clone())
-                    .or_insert_with(NodeDatabaseUpdates::default);
-                for (partition, part_updates) in &node_updates.partition_updates {
-                    target
-                        .partition_updates
-                        .entry(*partition)
-                        .and_modify(|existing| {
-                            match (existing, part_updates) {
-                                (
-                                    radix_substate_store_interface::interface::PartitionDatabaseUpdates::Delta { substate_updates: target_updates },
-                                    radix_substate_store_interface::interface::PartitionDatabaseUpdates::Delta { substate_updates: source_updates },
-                                ) => {
-                                    for (k, v) in source_updates {
-                                        target_updates.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                (existing, source) => {
-                                    *existing = source.clone();
-                                }
-                            }
-                        })
-                        .or_insert_with(|| part_updates.clone());
-                }
-            }
-        }
-        merged
+        merge::merge_database_updates(updates)
     }
 
     fn merge_state_updates_from_arcs(updates: &[Arc<DatabaseUpdates>]) -> DatabaseUpdates {

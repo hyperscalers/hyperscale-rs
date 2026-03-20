@@ -909,7 +909,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         }
 
         // Merge all certificates into a single update — later cert wins for conflicts.
-        let merged = hyperscale_storage::merge_database_updates(updates_per_cert);
+        let merged = hyperscale_radix_config::merge::merge_database_updates(updates_per_cert);
 
         let parent_version = hyperscale_storage::jmt_parent_height(base_version, base_root);
         let (root, collected) = hyperscale_storage::jmt::put_at_version(
@@ -3393,7 +3393,7 @@ mod tests {
         let shard = ShardGroupId(0);
         let updates1 = make_mapped_database_update(1, 0, vec![10], vec![1]);
         let updates2 = make_mapped_database_update(2, 0, vec![20], vec![2]);
-        let merged = hyperscale_storage::merge_database_updates(&[updates1, updates2]);
+        let merged = hyperscale_radix_config::merge::merge_database_updates(&[updates1, updates2]);
         let cert1 = Arc::new(make_test_certificate(1, shard));
         let cert2 = Arc::new(make_test_certificate(2, shard));
 

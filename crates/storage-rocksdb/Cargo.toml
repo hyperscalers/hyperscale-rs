@@ -10,6 +10,7 @@ hyperscale-metrics.workspace = true
 hyperscale-types.workspace = true
 hyperscale-bft.workspace = true
 hyperscale-dispatch.workspace = true
+hyperscale-radix-config.workspace = true
 rocksdb.workspace = true
 hyperscale-codec.workspace = true
 hex.workspace = true
