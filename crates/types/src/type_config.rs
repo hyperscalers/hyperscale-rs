@@ -120,6 +120,9 @@ pub trait TypeConfig: Send + Sync + 'static {
     ) -> Self::StateUpdate;
 
     /// Filter state update to only the entries for declared write addresses.
+    ///
+    /// When `declared_writes` is empty, the update is returned unfiltered
+    /// (empty means "no write set declared", not "no writes allowed").
     fn filter_state_update_to_writes(
         update: &Self::StateUpdate,
         declared_writes: &[NodeId],
@@ -247,6 +250,9 @@ mod tests {
             update: &MockStateUpdate,
             declared_writes: &[NodeId],
         ) -> MockStateUpdate {
+            if declared_writes.is_empty() {
+                return update.clone();
+            }
             let allowed: std::collections::HashSet<NodeId> =
                 declared_writes.iter().copied().collect();
             MockStateUpdate {
@@ -297,8 +303,9 @@ mod tests {
         let filtered = MockConfig::filter_state_update_to_writes(&update, &[node_id]);
         assert_eq!(filtered.entries.len(), 1);
 
-        let empty = MockConfig::filter_state_update_to_writes(&update, &[]);
-        assert!(empty.entries.is_empty());
+        // Empty declared_writes = no filtering (pass everything through).
+        let unfiltered = MockConfig::filter_state_update_to_writes(&update, &[]);
+        assert_eq!(unfiltered.entries.len(), 1);
 
         // receipt_to_state_update
         let receipt = MockReceipt { success: true };

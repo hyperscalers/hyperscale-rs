@@ -275,7 +275,6 @@ mod tests {
     use hyperscale_types::{BlockHeight, QuorumCertificate, ShardGroupId, ValidatorId};
 
     type PendingBlock = super::PendingBlock<RadixConfig>;
-    type Block = hyperscale_types::Block<RadixConfig>;
 
     fn make_header(height: u64) -> BlockHeader {
         BlockHeader {

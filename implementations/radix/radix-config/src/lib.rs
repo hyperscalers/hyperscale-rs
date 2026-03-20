@@ -14,6 +14,24 @@ use hyperscale_types::{
 };
 use radix_substate_store_interface::interface::DatabaseUpdates;
 
+/// Length of the hash prefix in spread-prefix-mapped db node keys.
+const HASH_PREFIX_LEN: usize = 20;
+/// Length of the raw NodeId bytes after the hash prefix.
+const NODE_ID_LEN: usize = 30;
+
+/// Extract a `NodeId` from a spread-prefix-mapped db node key.
+///
+/// Returns `None` if the key is too short (e.g., metadata keys).
+fn node_id_from_db_key(db_node_key: &[u8]) -> Option<NodeId> {
+    if db_node_key.len() >= HASH_PREFIX_LEN + NODE_ID_LEN {
+        let mut bytes = [0u8; NODE_ID_LEN];
+        bytes.copy_from_slice(&db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN]);
+        Some(NodeId(bytes))
+    } else {
+        None
+    }
+}
+
 /// Radix-specific `TypeConfig` implementation.
 ///
 /// This is the reference (and currently only) implementation. It binds the
@@ -84,20 +102,12 @@ impl TypeConfig for RadixConfig {
         if num_shards <= 1 {
             return update.clone();
         }
-        const HASH_PREFIX_LEN: usize = 20;
-        const NODE_ID_LEN: usize = 30;
         let mut filtered = DatabaseUpdates::default();
         for (db_node_key, node_updates) in &update.node_updates {
-            if db_node_key.len() >= HASH_PREFIX_LEN + NODE_ID_LEN {
-                let mut bytes = [0u8; NODE_ID_LEN];
-                bytes.copy_from_slice(&db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN]);
-                let node_id = NodeId(bytes);
-                if hyperscale_types::shard_for_node(&node_id, num_shards) == local_shard {
-                    filtered
-                        .node_updates
-                        .insert(db_node_key.clone(), node_updates.clone());
-                }
-            } else {
+            let dominated_by_local = node_id_from_db_key(db_node_key)
+                .map(|id| hyperscale_types::shard_for_node(&id, num_shards) == local_shard)
+                .unwrap_or(true); // keep metadata keys
+            if dominated_by_local {
                 filtered
                     .node_updates
                     .insert(db_node_key.clone(), node_updates.clone());
@@ -111,23 +121,16 @@ impl TypeConfig for RadixConfig {
         declared_writes: &[NodeId],
     ) -> DatabaseUpdates {
         if declared_writes.is_empty() {
+            // No declared writes = no filtering (pass everything through).
             return update.clone();
         }
-        const HASH_PREFIX_LEN: usize = 20;
-        const NODE_ID_LEN: usize = 30;
         let allowed: std::collections::HashSet<NodeId> = declared_writes.iter().copied().collect();
         let mut filtered = DatabaseUpdates::default();
         for (db_node_key, node_updates) in &update.node_updates {
-            if db_node_key.len() >= HASH_PREFIX_LEN + NODE_ID_LEN {
-                let mut bytes = [0u8; NODE_ID_LEN];
-                bytes.copy_from_slice(&db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN]);
-                let node_id = NodeId(bytes);
-                if allowed.contains(&node_id) {
-                    filtered
-                        .node_updates
-                        .insert(db_node_key.clone(), node_updates.clone());
-                }
-            } else {
+            let passes = node_id_from_db_key(db_node_key)
+                .map(|id| allowed.contains(&id))
+                .unwrap_or(true); // keep metadata keys
+            if passes {
                 filtered
                     .node_updates
                     .insert(db_node_key.clone(), node_updates.clone());
@@ -137,22 +140,10 @@ impl TypeConfig for RadixConfig {
     }
 
     fn extract_write_nodes(update: &DatabaseUpdates) -> Vec<NodeId> {
-        const HASH_PREFIX_LEN: usize = 20;
-        const NODE_ID_LEN: usize = 30;
         update
             .node_updates
             .keys()
-            .filter_map(|db_node_key| {
-                if db_node_key.len() >= HASH_PREFIX_LEN + NODE_ID_LEN {
-                    let mut bytes = [0u8; NODE_ID_LEN];
-                    bytes.copy_from_slice(
-                        &db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN],
-                    );
-                    Some(NodeId(bytes))
-                } else {
-                    None
-                }
-            })
+            .filter_map(|db_node_key| node_id_from_db_key(db_node_key))
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -207,17 +198,11 @@ impl TypeConfig for RadixConfig {
         use radix_common::prelude::DatabaseUpdate;
         use radix_substate_store_interface::interface::PartitionDatabaseUpdates;
 
-        const HASH_PREFIX_LEN: usize = 20;
-        const NODE_ID_LEN: usize = 30;
-
         let mut changes = Vec::new();
         for (db_node_key, node_updates) in &state_update.node_updates {
-            let node_id = if db_node_key.len() >= HASH_PREFIX_LEN + NODE_ID_LEN {
-                let mut id = [0u8; NODE_ID_LEN];
-                id.copy_from_slice(&db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN]);
-                NodeId(id)
-            } else {
-                continue;
+            let node_id = match node_id_from_db_key(db_node_key) {
+                Some(id) => id,
+                None => continue,
             };
             for (partition_num, partition_updates) in &node_updates.partition_updates {
                 let partition = PartitionNumber(*partition_num);
