@@ -239,7 +239,7 @@ mod tests {
     };
     use std::sync::Mutex as StdMutex;
 
-    fn test_gossip() -> TransactionGossip {
+    fn test_gossip() -> TransactionGossip<hyperscale_radix_config::RadixConfig> {
         TransactionGossip::new(test_transaction_with_nodes(
             &[1, 2, 3],
             vec![test_node(1)],
@@ -301,7 +301,9 @@ mod tests {
         let adapter = SimNetworkAdapter::new(registry.clone());
 
         assert!(registry.get_request("block.request").is_none());
-        adapter.register_request_handler::<GetBlockRequest>(|_req| GetBlockResponse::not_found());
+        adapter.register_request_handler::<GetBlockRequest>(|_req| {
+            GetBlockResponse::<hyperscale_radix_config::RadixConfig>::not_found()
+        });
         assert!(registry.get_request("block.request").is_some());
     }
 
@@ -312,8 +314,12 @@ mod tests {
 
         let adapter = SimNetworkAdapter::default();
 
-        adapter.register_request_handler::<GetBlockRequest>(|_req| GetBlockResponse::not_found());
-        adapter.register_request_handler::<GetBlockRequest>(|_req| GetBlockResponse::not_found());
+        adapter.register_request_handler::<GetBlockRequest>(|_req| {
+            GetBlockResponse::<hyperscale_radix_config::RadixConfig>::not_found()
+        });
+        adapter.register_request_handler::<GetBlockRequest>(|_req| {
+            GetBlockResponse::<hyperscale_radix_config::RadixConfig>::not_found()
+        });
 
         // Second handler should have won (overwrites).
         // Encode a real request, call the raw handler, verify it works.
@@ -357,8 +363,13 @@ mod tests {
         use hyperscale_messages::response::GetBlockResponse;
 
         let adapter = SimNetworkAdapter::default();
-        let result: Arc<StdMutex<Option<Result<GetBlockResponse, RequestError>>>> =
-            Arc::new(StdMutex::new(None));
+        let result: Arc<
+            StdMutex<
+                Option<
+                    Result<GetBlockResponse<hyperscale_radix_config::RadixConfig>, RequestError>,
+                >,
+            >,
+        > = Arc::new(StdMutex::new(None));
         let result_clone = result.clone();
 
         adapter.request(
@@ -374,7 +385,8 @@ mod tests {
         let on_response = requests.into_iter().next().unwrap().on_response;
 
         // Simulate a successful response with SBOR-encoded bytes
-        let response = GetBlockResponse::not_found();
+        let response: GetBlockResponse<hyperscale_radix_config::RadixConfig> =
+            GetBlockResponse::<hyperscale_radix_config::RadixConfig>::not_found();
         let response_bytes = sbor::basic_encode(&response).unwrap();
         on_response(Ok(response_bytes));
 
@@ -389,8 +401,13 @@ mod tests {
         use hyperscale_messages::response::GetBlockResponse;
 
         let adapter = SimNetworkAdapter::default();
-        let result: Arc<StdMutex<Option<Result<GetBlockResponse, RequestError>>>> =
-            Arc::new(StdMutex::new(None));
+        let result: Arc<
+            StdMutex<
+                Option<
+                    Result<GetBlockResponse<hyperscale_radix_config::RadixConfig>, RequestError>,
+                >,
+            >,
+        > = Arc::new(StdMutex::new(None));
         let result_clone = result.clone();
 
         adapter.request(

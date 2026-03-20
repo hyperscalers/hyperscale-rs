@@ -8,6 +8,7 @@ description = "In-memory storage implementation for simulation"
 hyperscale-storage.workspace = true
 hyperscale-types.workspace = true
 hyperscale-dispatch.workspace = true
+hyperscale-radix-config.workspace = true
 im.workspace = true
 tracing.workspace = true
 

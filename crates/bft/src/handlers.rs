@@ -8,9 +8,8 @@ use hyperscale_storage::{CommitStore, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_receipt_root, compute_transaction_root,
     verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
-    Bls12381G2Signature, CommitmentProof, ConcreteConfig, Hash, QuorumCertificate, ShardGroupId,
-    SignerBitfield, TransactionAbort, TransactionCertificate, TransactionDefer, TypeConfig,
-    ValidatorId, VotePower,
+    Bls12381G2Signature, CommitmentProof, Hash, QuorumCertificate, ShardGroupId, SignerBitfield,
+    TransactionAbort, TransactionCertificate, TransactionDefer, TypeConfig, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -308,7 +307,7 @@ pub fn verify_state_root<C: TypeConfig, S: CommitStore<C>>(
 }
 
 /// Result of building a proposal block.
-pub struct ProposalResult<P: Send, C: TypeConfig = ConcreteConfig> {
+pub struct ProposalResult<P: Send, C: TypeConfig> {
     pub block: Block<C>,
     pub block_hash: Hash,
     pub prepared_commit: Option<P>,

@@ -36,7 +36,7 @@ impl NetworkMessage for GetBlockRequest {
 /// Type-safe request/response pairing.
 /// GetBlockRequest expects GetBlockResponse.
 impl Request for GetBlockRequest {
-    type Response = GetBlockResponse;
+    type Response = GetBlockResponse<hyperscale_radix_config::RadixConfig>;
 }
 
 #[cfg(test)]

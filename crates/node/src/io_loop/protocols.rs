@@ -6,15 +6,12 @@ use crate::protocol::provision_fetch::ProvisionFetchOutput;
 use crate::protocol::sync::SyncOutput;
 use hyperscale_core::{NodeConfig, NodeInput, ProtocolEvent, TimerId};
 use hyperscale_metrics as metrics;
+use hyperscale_radix_config::RadixConfig;
 use hyperscale_storage::ConsensusStore;
-use hyperscale_types::{BlockHeight, LedgerTransactionReceipt, RoutableTransaction, TypeConfig};
+use hyperscale_types::BlockHeight;
 use std::time::Duration;
 
-impl<Cfg: NodeConfig> IoLoop<Cfg>
-where
-    Cfg::C:
-        TypeConfig<Transaction = RoutableTransaction, ExecutionReceipt = LedgerTransactionReceipt>,
-{
+impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
     /// Interval for the periodic fetch tick timer.
     const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
 
@@ -57,7 +54,6 @@ where
                                 });
 
                                 if receipts_complete {
-                                    let block = block.map(|(b, q)| (b.reconfig::<Cfg::C>(), q));
                                     let _ = es.send(NodeInput::SyncBlockResponseReceived {
                                         height,
                                         block: Box::new(block),

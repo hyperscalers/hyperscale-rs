@@ -1,8 +1,8 @@
 //! Transaction types for consensus.
 
 use crate::{
-    BlockHeight, CommitmentProof, ConcreteConfig, ConsensusTransaction, ExecutionCertificate, Hash,
-    NodeId, ShardGroupId, TypeConfig,
+    BlockHeight, CommitmentProof, ConsensusTransaction, ExecutionCertificate, Hash, NodeId,
+    ShardGroupId, TypeConfig,
 };
 use hyperscale_codec as sbor;
 use hyperscale_codec::prelude::*;
@@ -1720,7 +1720,7 @@ pub fn sign_and_notarize_with_options(
 /// Each section is sorted by transaction hash (from BTreeMap iteration order).
 /// This structure allows block building without reclassification.
 #[derive(Clone, Debug)]
-pub struct ReadyTransactions<C: TypeConfig = ConcreteConfig> {
+pub struct ReadyTransactions<C: TypeConfig> {
     /// Retry transactions (highest priority, bypass soft limit).
     pub retries: Vec<std::sync::Arc<C::Transaction>>,
     /// Priority transactions (cross-shard with verified provisions, bypass soft limit).

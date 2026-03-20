@@ -16,6 +16,7 @@ use hyperscale_network_memory::{
 };
 use hyperscale_node::io_loop::{IoLoop, StepOutput};
 use hyperscale_node::{NodeConfig, NodeStateMachine, TimerOp};
+use hyperscale_radix_config::RadixConfig;
 use hyperscale_storage::{ConsensusStore, GenesisWrapper};
 use hyperscale_storage_memory::SimStorage;
 use hyperscale_topology::TopologyState;
@@ -35,7 +36,7 @@ use tracing::{debug, info, trace, warn};
 pub struct SimConfig;
 
 impl NodeConfig for SimConfig {
-    type C = hyperscale_types::ConcreteConfig;
+    type C = hyperscale_radix_config::RadixConfig;
     type S = SimStorage<SyncDispatch>;
     type N = SimNetworkAdapter;
     type D = SyncDispatch;
@@ -62,10 +63,10 @@ pub struct SimulationRunner {
     io_loops: Vec<SimIoLoop>,
 
     /// Per-node event receivers (from crossbeam channels passed to IoLoop).
-    event_rxs: Vec<crossbeam::channel::Receiver<NodeInput>>,
+    event_rxs: Vec<crossbeam::channel::Receiver<NodeInput<RadixConfig>>>,
 
     /// Global event queue, ordered deterministically.
-    event_queue: BTreeMap<EventKey, NodeInput>,
+    event_queue: BTreeMap<EventKey, NodeInput<RadixConfig>>,
 
     /// Sequence counter for deterministic ordering.
     sequence: u64,
@@ -321,7 +322,7 @@ impl SimulationRunner {
     }
 
     /// Get a reference to a node's state machine by index.
-    pub fn node(&self, index: NodeIndex) -> Option<&NodeStateMachine> {
+    pub fn node(&self, index: NodeIndex) -> Option<&NodeStateMachine<RadixConfig>> {
         self.io_loops.get(index as usize).map(|nl| nl.state())
     }
 
@@ -368,7 +369,12 @@ impl SimulationRunner {
     }
 
     /// Schedule an initial event (e.g., to start the simulation).
-    pub fn schedule_initial_event(&mut self, node: NodeIndex, delay: Duration, event: NodeInput) {
+    pub fn schedule_initial_event(
+        &mut self,
+        node: NodeIndex,
+        delay: Duration,
+        event: NodeInput<RadixConfig>,
+    ) {
         let time = self.now + delay;
         self.schedule_event(node, time, event);
     }
@@ -688,7 +694,12 @@ impl SimulationRunner {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Schedule a [`NodeInput`] event for delivery at the given time.
-    fn schedule_event(&mut self, node: NodeIndex, time: Duration, event: NodeInput) -> EventKey {
+    fn schedule_event(
+        &mut self,
+        node: NodeIndex,
+        time: Duration,
+        event: NodeInput<RadixConfig>,
+    ) -> EventKey {
         self.sequence += 1;
         let key = EventKey::new(time, &event, node, self.sequence);
         self.event_queue.insert(key, event);

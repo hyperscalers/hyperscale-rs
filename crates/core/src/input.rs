@@ -2,9 +2,9 @@
 
 use crate::ProtocolEvent;
 use hyperscale_types::{
-    Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
-    ConcreteConfig, Hash, LedgerReceiptEntry, QuorumCertificate, ShardGroupId, StateProvision,
-    TransactionCertificate, TypeConfig, ValidatorId,
+    Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, Hash,
+    LedgerReceiptEntry, QuorumCertificate, ShardGroupId, StateProvision, TransactionCertificate,
+    TypeConfig, ValidatorId,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -42,7 +42,7 @@ pub enum EventPriority {
 ///   (sync, fetch, validation pipeline) before potentially converting them
 ///   into `ProtocolEvent`s.
 #[allow(clippy::large_enum_variant)] // TODO: Box ProtocolEvent
-pub enum NodeInput<C: TypeConfig = ConcreteConfig> {
+pub enum NodeInput<C: TypeConfig> {
     /// Pass-through to state machine. IoLoop extracts the ProtocolEvent and
     /// passes it to state.handle() directly.
     Protocol(ProtocolEvent<C>),
@@ -55,7 +55,7 @@ pub enum NodeInput<C: TypeConfig = ConcreteConfig> {
         height: u64,
         block: Box<Option<(Block<C>, QuorumCertificate)>>,
         /// Ledger receipts for the block's certificates (from sync peer).
-        ledger_receipts: Vec<LedgerReceiptEntry>,
+        ledger_receipts: Vec<LedgerReceiptEntry<C>>,
     },
 
     /// Sync block fetch failed from network callback.
@@ -81,7 +81,7 @@ pub enum NodeInput<C: TypeConfig = ConcreteConfig> {
         block_hash: Hash,
         certificates: Vec<TransactionCertificate>,
         /// Ledger receipts for the certificates (from fetch peer).
-        ledger_receipts: Vec<LedgerReceiptEntry>,
+        ledger_receipts: Vec<LedgerReceiptEntry<C>>,
     },
 
     /// Transaction validated by the validation pipeline.

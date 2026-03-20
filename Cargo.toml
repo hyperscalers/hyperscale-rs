@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
+    # Generic framework
     "crates/bft",
     "crates/codec",
     "crates/core",
     "crates/dispatch",
     "crates/dispatch-pooled",
     "crates/dispatch-sync",
-    "crates/engine",
     "crates/jmt",
     "crates/execution",
     "crates/livelock",
@@ -22,26 +22,29 @@ members = [
     "crates/node",
     "crates/production",
     "crates/provisions",
-    "crates/radix-config",
     "crates/simulation",
     "crates/simulator",
-    "crates/spammer",
     "crates/storage",
     "crates/storage-memory",
     "crates/storage-rocksdb",
     "crates/test-helpers",
     "crates/topology",
     "crates/types",
+
+    # Radix implementation
+    "implementations/radix/radix-config",
+    "implementations/radix/radix-engine",
+    "implementations/radix/radix-spammer",
 ]
 
 default-members = [
+    # Generic framework
     "crates/bft",
     "crates/codec",
     "crates/core",
     "crates/dispatch",
     "crates/dispatch-pooled",
     "crates/dispatch-sync",
-    "crates/engine",
     "crates/jmt",
     "crates/execution",
     "crates/livelock",
@@ -56,16 +59,19 @@ default-members = [
     "crates/node",
     "crates/production",
     "crates/provisions",
-    "crates/radix-config",
     "crates/simulation",
     "crates/simulator",
-    "crates/spammer",
     "crates/storage",
     "crates/storage-memory",
     "crates/storage-rocksdb",
     "crates/test-helpers",
     "crates/topology",
     "crates/types",
+
+    # Radix implementation
+    "implementations/radix/radix-config",
+    "implementations/radix/radix-engine",
+    "implementations/radix/radix-spammer",
 ]
 
 [workspace.package]
@@ -86,7 +92,7 @@ hyperscale-dispatch-sync = { path = "crates/dispatch-sync" }
 hyperscale-storage = { path = "crates/storage" }
 hyperscale-storage-memory = { path = "crates/storage-memory" }
 hyperscale-storage-rocksdb = { path = "crates/storage-rocksdb" }
-hyperscale-engine = { path = "crates/engine" }
+hyperscale-engine = { path = "implementations/radix/radix-engine" }
 hyperscale-jmt = { path = "crates/jmt" }
 hyperscale-execution = { path = "crates/execution" }
 hyperscale-livelock = { path = "crates/livelock" }
@@ -98,10 +104,10 @@ hyperscale-network-memory = { path = "crates/network-memory" }
 hyperscale-node = { path = "crates/node" }
 hyperscale-production = { path = "crates/production" }
 hyperscale-provisions = { path = "crates/provisions" }
-hyperscale-radix-config = { path = "crates/radix-config" }
+hyperscale-radix-config = { path = "implementations/radix/radix-config" }
 hyperscale-simulation = { path = "crates/simulation" }
 hyperscale-simulator = { path = "crates/simulator" }
-hyperscale-spammer = { path = "crates/spammer" }
+hyperscale-spammer = { path = "implementations/radix/radix-spammer" }
 hyperscale-test-helpers = { path = "crates/test-helpers" }
 hyperscale-topology = { path = "crates/topology" }
 hyperscale-types = { path = "crates/types" }

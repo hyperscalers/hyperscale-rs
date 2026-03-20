@@ -2,8 +2,8 @@
 
 use hyperscale_core::{Action, TransactionStatus};
 use hyperscale_types::{
-    AbortReason, Block, BlockHeight, ConcreteConfig, ConsensusTransaction, DeferReason, Hash,
-    NodeId, ReadyTransactions, TopologySnapshot, TransactionAbort, TransactionDecision, TypeConfig,
+    AbortReason, Block, BlockHeight, ConsensusTransaction, DeferReason, Hash, NodeId,
+    ReadyTransactions, TopologySnapshot, TransactionAbort, TransactionDecision, TypeConfig,
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -119,7 +119,7 @@ impl LockContentionStats {
 
 /// Entry in the transaction pool.
 #[derive(Debug)]
-struct PoolEntry<C: TypeConfig = ConcreteConfig> {
+struct PoolEntry<C: TypeConfig> {
     tx: Arc<C::Transaction>,
     status: TransactionStatus,
     added_at: Duration,
@@ -135,7 +135,7 @@ struct PoolEntry<C: TypeConfig = ConcreteConfig> {
 /// Contains cached information needed for ready_transactions() to avoid
 /// re-computing properties on each call.
 #[derive(Debug, Clone)]
-struct ReadyEntry<C: TypeConfig = ConcreteConfig> {
+struct ReadyEntry<C: TypeConfig> {
     tx: Arc<C::Transaction>,
     /// Whether this transaction has verified provisions (for cross-shard priority).
     has_provisions: bool,
@@ -158,7 +158,7 @@ struct ReadyEntry<C: TypeConfig = ConcreteConfig> {
 /// Transactions are added to these sets when they become ready (Pending status,
 /// no conflicts with locked nodes) and removed when they are no longer ready
 /// (status changes, conflicts arise, or evicted).
-pub struct MempoolState<C: TypeConfig = ConcreteConfig> {
+pub struct MempoolState<C: TypeConfig> {
     /// Transaction pool sorted by hash (BTreeMap for ordered iteration).
     pool: BTreeMap<Hash, PoolEntry<C>>,
 
@@ -2057,14 +2057,15 @@ impl<C: TypeConfig> MempoolState<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_radix_config::RadixConfig;
     use hyperscale_types::{
-        generate_bls_keypair, test_utils::test_transaction, Block, BlockHeader, ConcreteConfig,
-        DeferReason, QuorumCertificate, RoutableTransaction, ShardGroupId, TransactionCertificate,
+        generate_bls_keypair, test_utils::test_transaction, Block, BlockHeader, DeferReason,
+        QuorumCertificate, RoutableTransaction, ShardGroupId, TransactionCertificate,
         TransactionDefer, ValidatorId, ValidatorInfo, ValidatorSet,
     };
 
     /// Concrete mempool type for tests.
-    type TestMempool = MempoolState<ConcreteConfig>;
+    type TestMempool = MempoolState<RadixConfig>;
     use std::collections::BTreeMap;
 
     fn make_test_topology() -> TopologySnapshot {
@@ -2085,7 +2086,7 @@ mod tests {
         deferred: Vec<TransactionDefer>,
         certificates: Vec<TransactionCertificate>,
         aborted: Vec<TransactionAbort>,
-    ) -> Block {
+    ) -> Block<RadixConfig> {
         Block {
             header: BlockHeader {
                 shard_group_id: ShardGroupId(0),
@@ -2945,7 +2946,7 @@ mod tests {
     }
 
     /// Put a mempool at the backpressure limit by adding committed transactions.
-    fn put_mempool_at_limit(mempool: &mut MempoolState, topology: &TopologySnapshot) {
+    fn put_mempool_at_limit(mempool: &mut MempoolState<RadixConfig>, topology: &TopologySnapshot) {
         let limit = mempool.config.max_in_flight;
 
         // Add TXs and mark them as Committed to hold locks
@@ -3060,7 +3061,7 @@ mod tests {
             required_shards: std::iter::once(ShardGroupId(1)).collect(),
             registered_at: BlockHeight(1),
         };
-        coordinator.on_tx_registered::<ConcreteConfig>(tx_hash, reg);
+        coordinator.on_tx_registered::<RadixConfig>(tx_hash, reg);
 
         // Simulate a verified provision being added (need to call internal method)
         // For this test, we'll just verify the logic by checking has_any_verified_provisions
@@ -3223,7 +3224,7 @@ mod tests {
         mempool.on_submit_transaction(&topology, normal2.clone());
 
         // Request transactions - retry should be in retries section, others in others section
-        let ready: ReadyTransactions = mempool.ready_transactions(10, 0, 0);
+        let ready: ReadyTransactions<RadixConfig> = mempool.ready_transactions(10, 0, 0);
 
         assert_eq!(ready.len(), 3, "All transactions should be returned");
 

@@ -4,17 +4,17 @@ use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
-    CommittedBlockHeader, ConcreteConfig, EpochConfig, EpochId, ExecutionCertificate,
-    ExecutionVote, Hash, NodeId, QuorumCertificate, ReceiptBundle, ShardGroupId, SignerBitfield,
-    StateProvision, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
-    TypeConfig, ValidatorId, VotePower,
+    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId,
+    QuorumCertificate, ReceiptBundle, ShardGroupId, SignerBitfield, StateProvision,
+    TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer, TypeConfig,
+    ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// A request to execute a cross-shard transaction with its provisions.
-pub struct CrossShardExecutionRequest<C: TypeConfig = ConcreteConfig> {
+pub struct CrossShardExecutionRequest<C: TypeConfig> {
     /// Transaction hash (for correlation).
     pub tx_hash: Hash,
     /// The transaction to execute.
@@ -60,7 +60,7 @@ pub struct ProvisionRequest {
 ///
 /// Actions are **commands** - they describe something to do.
 /// The runner executes actions and may convert results back into events.
-pub enum Action<C: TypeConfig = ConcreteConfig> {
+pub enum Action<C: TypeConfig> {
     // ═══════════════════════════════════════════════════════════════════════
     // Network: BFT Consensus
     // ═══════════════════════════════════════════════════════════════════════

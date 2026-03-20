@@ -57,7 +57,7 @@ impl NetworkMessage for GetTransactionsRequest {
 
 /// Type-safe request/response pairing.
 impl Request for GetTransactionsRequest {
-    type Response = GetTransactionsResponse;
+    type Response = GetTransactionsResponse<hyperscale_radix_config::RadixConfig>;
 }
 
 #[cfg(test)]

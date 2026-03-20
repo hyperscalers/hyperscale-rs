@@ -4,7 +4,7 @@
 //! synced block QC verifications. BftState owns this as a field and
 //! delegates sync-specific bookkeeping here.
 
-use hyperscale_types::{Block, ConcreteConfig, Hash, QuorumCertificate, TypeConfig};
+use hyperscale_types::{Block, Hash, QuorumCertificate, TypeConfig};
 use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, info, warn};
 
@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 /// When we receive a synced block, we must verify its QC signature before
 /// applying it to our state.
 #[derive(Debug, Clone)]
-pub(crate) struct PendingSyncedBlockVerification<C: TypeConfig = ConcreteConfig> {
+pub(crate) struct PendingSyncedBlockVerification<C: TypeConfig> {
     /// The synced block awaiting QC verification.
     pub block: Block<C>,
     /// The QC that certifies this block.
@@ -27,7 +27,7 @@ pub(crate) struct PendingSyncedBlockVerification<C: TypeConfig = ConcreteConfig>
 /// BftState owns this as a field and delegates sync-specific bookkeeping
 /// to it. Core protocol state changes (committed_height, latest_qc) remain
 /// on BftState.
-pub(crate) struct SyncManager<C: TypeConfig = ConcreteConfig> {
+pub(crate) struct SyncManager<C: TypeConfig> {
     /// Whether we are currently syncing (catching up to the network).
     syncing: bool,
 

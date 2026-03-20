@@ -15,6 +15,7 @@ use hyperscale_codec as sbor;
 use hyperscale_codec::prelude::*;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
+use hyperscale_radix_config::RadixConfig;
 use hyperscale_storage::{
     jmt::{
         encode_key as encode_jmt_key, EntityTier, ReadableTreeStore, StaleTreePart,
@@ -1147,7 +1148,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         &self,
         from: BlockHeight,
         to: BlockHeight,
-    ) -> Vec<(Block, QuorumCertificate)> {
+    ) -> Vec<(Block<RadixConfig>, QuorumCertificate)> {
         let mut result = Vec::new();
         let mut h = from.0;
         while h < to.0 {
@@ -1246,7 +1247,11 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     ///
     /// Panics if the block cannot be persisted. This is intentional: committed blocks
     /// are essential for crash recovery.
-    pub(crate) fn put_block_denormalized(&self, block: &Block, qc: &QuorumCertificate) {
+    pub(crate) fn put_block_denormalized(
+        &self,
+        block: &Block<RadixConfig>,
+        qc: &QuorumCertificate,
+    ) {
         let start = Instant::now();
         let mut batch = rocksdb::WriteBatch::default();
 
@@ -1311,7 +1316,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     pub(crate) fn get_block_denormalized(
         &self,
         height: BlockHeight,
-    ) -> Option<(Block, QuorumCertificate)> {
+    ) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
         let start = Instant::now();
 
         // 1. Get block metadata
@@ -1361,7 +1366,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         }
 
         // 4. Reconstruct block
-        let block = Block {
+        let block = Block::<RadixConfig> {
             header: metadata.header,
             retry_transactions,
             priority_transactions,
@@ -1417,7 +1422,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     ///
     /// This ensures sync responses always contain complete, self-contained blocks.
     /// If a peer can't provide a complete block, the requester should try another peer.
-    pub fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+    pub fn get_block_for_sync(
+        &self,
+        height: BlockHeight,
+    ) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
         let start = Instant::now();
 
         // 1. Get block metadata
@@ -1471,7 +1479,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         }
 
         // 4. Full block available - reconstruct it
-        let block = Block {
+        let block = Block::<RadixConfig> {
             header: metadata.header,
             retry_transactions,
             priority_transactions,
@@ -1817,7 +1825,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Store a receipt bundle (ledger receipt + optional local execution).
-    pub fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
+    pub fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle<RadixConfig>) {
         let mut batch = WriteBatch::default();
         self.add_receipt_bundle_to_batch(&mut batch, bundle);
         self.db
@@ -1826,7 +1834,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     }
 
     /// Store multiple receipt bundles in a single atomic WriteBatch.
-    pub fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
+    pub fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle<RadixConfig>]) {
         if bundles.is_empty() {
             return;
         }
@@ -1848,7 +1856,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     fn add_receipt_bundle_to_batch(
         &self,
         batch: &mut WriteBatch,
-        bundle: &hyperscale_types::ReceiptBundle,
+        bundle: &hyperscale_types::ReceiptBundle<RadixConfig>,
     ) {
         let receipts_cf = self
             .db
@@ -2526,8 +2534,8 @@ impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch
 // ConsensusStore implementation
 // ═══════════════════════════════════════════════════════════════════════
 
-impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for RocksDbStorage<D> {
-    fn put_block(&self, height: BlockHeight, block: &Block, qc: &QuorumCertificate) {
+impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore<RadixConfig> for RocksDbStorage<D> {
+    fn put_block(&self, height: BlockHeight, block: &Block<RadixConfig>, qc: &QuorumCertificate) {
         debug_assert_eq!(
             height, block.header.height,
             "height must match block header"
@@ -2535,7 +2543,7 @@ impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for RocksDbStorag
         self.put_block_denormalized(block, qc);
     }
 
-    fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+    fn get_block(&self, height: BlockHeight) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
         self.get_block_denormalized(height)
     }
 
@@ -2583,7 +2591,10 @@ impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for RocksDbStorag
         RocksDbStorage::prune_own_votes(self, committed_height);
     }
 
-    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+    fn get_block_for_sync(
+        &self,
+        height: BlockHeight,
+    ) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
         RocksDbStorage::get_block_for_sync(self, height)
     }
 
@@ -2595,11 +2606,11 @@ impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for RocksDbStorag
         RocksDbStorage::get_certificates_batch(self, hashes)
     }
 
-    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
+    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle<RadixConfig>) {
         RocksDbStorage::store_receipt_bundle(self, bundle)
     }
 
-    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
+    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle<RadixConfig>]) {
         RocksDbStorage::store_receipt_bundles(self, bundles)
     }
 
@@ -2804,12 +2815,12 @@ impl<C: hyperscale_types::TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch
     }
 }
 
-impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for SharedStorage<D> {
-    fn put_block(&self, height: BlockHeight, block: &Block, qc: &QuorumCertificate) {
+impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore<RadixConfig> for SharedStorage<D> {
+    fn put_block(&self, height: BlockHeight, block: &Block<RadixConfig>, qc: &QuorumCertificate) {
         self.0.put_block(height, block, qc)
     }
 
-    fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+    fn get_block(&self, height: BlockHeight) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
         self.0.get_block(height)
     }
 
@@ -2857,7 +2868,10 @@ impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for SharedStorage
         self.0.prune_own_votes(committed_height)
     }
 
-    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+    fn get_block_for_sync(
+        &self,
+        height: BlockHeight,
+    ) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
         self.0.get_block_for_sync(height)
     }
 
@@ -2869,11 +2883,11 @@ impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for SharedStorage
         self.0.get_certificates_batch(hashes)
     }
 
-    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle) {
+    fn store_receipt_bundle(&self, bundle: &hyperscale_types::ReceiptBundle<RadixConfig>) {
         self.0.store_receipt_bundle(bundle)
     }
 
-    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle]) {
+    fn store_receipt_bundles(&self, bundles: &[hyperscale_types::ReceiptBundle<RadixConfig>]) {
         self.0.store_receipt_bundles(bundles)
     }
 
@@ -2896,12 +2910,13 @@ impl<D: Dispatch + 'static> hyperscale_storage::ConsensusStore for SharedStorage
 mod tests {
     use super::*;
     use hyperscale_dispatch_sync::SyncDispatch;
+    use hyperscale_radix_config::RadixConfig;
     use hyperscale_storage::test_helpers::{
         make_database_update, make_mapped_database_update, make_test_block, make_test_certificate,
         make_test_qc,
     };
     use hyperscale_storage::{CommitStore, ConsensusStore, NodeDatabaseUpdates, SubstateStore};
-    use hyperscale_types::{ConcreteConfig, ShardGroupId};
+    use hyperscale_types::ShardGroupId;
     use tempfile::TempDir;
 
     #[test]
@@ -3331,8 +3346,7 @@ mod tests {
         let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
         let cert = Arc::new(make_test_certificate(1, shard));
 
-        let result =
-            CommitStore::<ConcreteConfig>::commit_block(&storage, &updates, &[cert], 1, None);
+        let result = CommitStore::<RadixConfig>::commit_block(&storage, &updates, &[cert], 1, None);
         assert_ne!(result, Hash::ZERO);
     }
 
@@ -3348,13 +3362,8 @@ mod tests {
         let cert1 = Arc::new(make_test_certificate(1, shard));
         let cert2 = Arc::new(make_test_certificate(2, shard));
 
-        let result = CommitStore::<ConcreteConfig>::commit_block(
-            &storage,
-            &merged,
-            &[cert1, cert2],
-            1,
-            None,
-        );
+        let result =
+            CommitStore::<RadixConfig>::commit_block(&storage, &merged, &[cert1, cert2], 1, None);
         // Certificate merging: all certs applied as single JMT version = block_height
         assert_ne!(result, Hash::ZERO);
     }
@@ -3364,7 +3373,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let storage = RocksDbStorage::open(temp_dir.path(), SyncDispatch::new()).unwrap();
 
-        CommitStore::<ConcreteConfig>::commit_block(
+        CommitStore::<RadixConfig>::commit_block(
             &storage,
             &DatabaseUpdates::default(),
             &[],
@@ -3384,24 +3393,20 @@ mod tests {
         let temp_dir1 = TempDir::new().unwrap();
         let s_prepared = RocksDbStorage::open(temp_dir1.path(), SyncDispatch::new()).unwrap();
         let parent_root = s_prepared.state_root_hash();
-        let (spec_root, prepared) = CommitStore::<ConcreteConfig>::prepare_block_commit(
+        let (spec_root, prepared) = CommitStore::<RadixConfig>::prepare_block_commit(
             &s_prepared,
             parent_root,
             &DatabaseUpdates::default(),
             1,
         );
         let certs = std::slice::from_ref(&cert);
-        let result_prepared = CommitStore::<ConcreteConfig>::commit_prepared_block(
-            &s_prepared,
-            prepared,
-            certs,
-            None,
-        );
+        let result_prepared =
+            CommitStore::<RadixConfig>::commit_prepared_block(&s_prepared, prepared, certs, None);
 
         // Direct path
         let temp_dir2 = TempDir::new().unwrap();
         let s_direct = RocksDbStorage::open(temp_dir2.path(), SyncDispatch::new()).unwrap();
-        let result_direct = CommitStore::<ConcreteConfig>::commit_block(
+        let result_direct = CommitStore::<RadixConfig>::commit_block(
             &s_direct,
             &DatabaseUpdates::default(),
             std::slice::from_ref(&cert),
@@ -3422,7 +3427,7 @@ mod tests {
         let cert = Arc::new(make_test_certificate(1, shard));
         let tx_hash = cert.transaction_hash;
 
-        let _ = CommitStore::<ConcreteConfig>::commit_block(
+        let _ = CommitStore::<RadixConfig>::commit_block(
             &storage,
             &DatabaseUpdates::default(),
             &[cert],

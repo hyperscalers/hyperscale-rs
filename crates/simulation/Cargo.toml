@@ -6,6 +6,7 @@ description = "Simulation runner"
 
 [dependencies]
 hyperscale-core.workspace = true
+hyperscale-radix-config.workspace = true
 hyperscale-bft.workspace = true
 hyperscale-engine.workspace = true
 hyperscale-execution.workspace = true

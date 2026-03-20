@@ -9,19 +9,14 @@ use hyperscale_core::{Action, NodeConfig, NodeInput, ProtocolEvent, StateMachine
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
+use hyperscale_radix_config::RadixConfig;
 use hyperscale_storage::{CommitStore, ConsensusStore};
 use hyperscale_types::ValidatorId;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, trace};
 
-impl<Cfg: NodeConfig> IoLoop<Cfg>
-where
-    Cfg::C: hyperscale_types::TypeConfig<
-        Transaction = hyperscale_types::RoutableTransaction,
-        ExecutionReceipt = hyperscale_types::LedgerTransactionReceipt,
-    >,
-{
+impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
     // ─── Action Processing ──────────────────────────────────────────────
 
     /// Process a single action from the state machine.

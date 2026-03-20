@@ -57,7 +57,7 @@ impl NetworkMessage for GetCertificatesRequest {
 
 /// Type-safe request/response pairing.
 impl Request for GetCertificatesRequest {
-    type Response = GetCertificatesResponse;
+    type Response = GetCertificatesResponse<hyperscale_radix_config::RadixConfig>;
 }
 
 #[cfg(test)]

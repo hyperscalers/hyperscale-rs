@@ -37,12 +37,12 @@ use hyperscale_core::{
 use hyperscale_messages::TransactionGossip;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
+use hyperscale_radix_config::RadixConfig;
 use hyperscale_storage::CommitStore;
 use hyperscale_types::{
     Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ConsensusTransaction,
-    ExecutionCertificate, ExecutionVote, Hash, LedgerTransactionReceipt, QuorumCertificate,
-    ReceiptBundle, RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionCertificate,
-    TypeConfig, ValidatorId,
+    ExecutionCertificate, ExecutionVote, Hash, QuorumCertificate, ReceiptBundle, ShardGroupId,
+    TopologySnapshot, TransactionCertificate, TypeConfig, ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -215,11 +215,7 @@ pub struct IoLoop<Cfg: NodeConfig> {
     pending_timer_ops: Vec<TimerOp>,
 }
 
-impl<Cfg: NodeConfig> IoLoop<Cfg>
-where
-    Cfg::C:
-        TypeConfig<Transaction = RoutableTransaction, ExecutionReceipt = LedgerTransactionReceipt>,
-{
+impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
     /// Create a new IoLoop.
     #[allow(clippy::too_many_arguments)]
     pub fn new(

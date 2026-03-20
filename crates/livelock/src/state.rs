@@ -499,9 +499,9 @@ pub struct LivelockStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_radix_config::RadixConfig;
     use hyperscale_types::{
-        zero_bls_signature, ConcreteConfig, SignerBitfield, StateEntry, SubstateInclusionProof,
-        ValidatorId,
+        zero_bls_signature, SignerBitfield, StateEntry, SubstateInclusionProof, ValidatorId,
     };
     use std::sync::Arc;
 
@@ -844,7 +844,7 @@ mod tests {
             commitment_proofs: std::collections::HashMap::new(),
         };
 
-        state.on_block_committed::<ConcreteConfig>(&block);
+        state.on_block_committed::<RadixConfig>(&block);
 
         // TX should be removed from committed tracker
         assert!(
@@ -904,7 +904,7 @@ mod tests {
             commitment_proofs: std::collections::HashMap::new(),
         };
 
-        state.on_block_committed::<ConcreteConfig>(&block);
+        state.on_block_committed::<RadixConfig>(&block);
 
         // TX should be removed from committed tracker (completed successfully)
         assert!(
@@ -990,7 +990,7 @@ mod tests {
             commitment_proofs: std::collections::HashMap::new(),
         };
 
-        state.on_block_committed::<ConcreteConfig>(&block);
+        state.on_block_committed::<RadixConfig>(&block);
 
         // Tombstone should be added for certificate commit
         assert!(
@@ -1052,7 +1052,7 @@ mod tests {
             commitment_proofs: std::collections::HashMap::new(),
         };
 
-        state.on_block_committed::<ConcreteConfig>(&block);
+        state.on_block_committed::<RadixConfig>(&block);
 
         // Tombstone should be added for abort commit
         assert!(

@@ -38,6 +38,7 @@ use crate::execution::{
 use crate::genesis::{GenesisBuilder, GenesisConfig, GenesisError};
 use crate::result::{ExecutionOutput, SingleTxResult};
 use hyperscale_core::ExecutionBackend;
+use hyperscale_radix_config::RadixConfig;
 use hyperscale_storage::{CommittableSubstateDatabase, SubstateDatabase, SubstateStore};
 use hyperscale_types::{
     DatabaseUpdates, Hash, LedgerTransactionReceipt, NodeId, RoutableTransaction, StateEntry,
@@ -201,7 +202,7 @@ impl RadixExecutor {
         &self,
         storage: &S,
         transactions: &[Arc<RoutableTransaction>],
-    ) -> Result<ExecutionOutput, ExecutionError> {
+    ) -> Result<ExecutionOutput<RadixConfig>, ExecutionError> {
         let start = Instant::now();
         let mut results = Vec::with_capacity(transactions.len());
 
@@ -211,7 +212,7 @@ impl RadixExecutor {
         }
 
         tracing::Span::current().record("latency_us", start.elapsed().as_micros() as u64);
-        Ok(ExecutionOutput::new(results))
+        Ok(ExecutionOutput::<RadixConfig>::new(results))
     }
 
     /// Execute cross-shard transactions with provisions (READ-ONLY).
@@ -238,7 +239,7 @@ impl RadixExecutor {
         storage: &S,
         transactions: &[Arc<RoutableTransaction>],
         provisions: &[StateProvision],
-    ) -> Result<ExecutionOutput, ExecutionError> {
+    ) -> Result<ExecutionOutput<RadixConfig>, ExecutionError> {
         let start = Instant::now();
 
         let mut results = Vec::with_capacity(transactions.len());
@@ -272,7 +273,7 @@ impl RadixExecutor {
         }
 
         tracing::Span::current().record("latency_us", start.elapsed().as_micros() as u64);
-        Ok(ExecutionOutput::new(results))
+        Ok(ExecutionOutput::<RadixConfig>::new(results))
     }
 
     /// Execute a single transaction (READ-ONLY).
@@ -283,7 +284,7 @@ impl RadixExecutor {
         &self,
         storage: &S,
         tx: &RoutableTransaction,
-    ) -> Result<SingleTxResult, ExecutionError> {
+    ) -> Result<SingleTxResult<RadixConfig>, ExecutionError> {
         // Take a snapshot for isolated execution
         let snapshot = storage.snapshot();
         let db = RadixStorageAdapter(&snapshot);
@@ -312,7 +313,11 @@ impl RadixExecutor {
     }
 
     /// Convert a receipt to a result.
-    fn receipt_to_result(&self, tx_hash: Hash, receipt: &TransactionReceipt) -> SingleTxResult {
+    fn receipt_to_result(
+        &self,
+        tx_hash: Hash,
+        receipt: &TransactionReceipt,
+    ) -> SingleTxResult<RadixConfig> {
         let success = is_committed(receipt);
 
         if success {
@@ -320,7 +325,7 @@ impl RadixExecutor {
             let ledger_receipt = build_ledger_receipt(receipt);
             let local_execution = build_local_execution(receipt);
             let receipt_hash = ledger_receipt.receipt_hash();
-            SingleTxResult {
+            SingleTxResult::<RadixConfig> {
                 tx_hash,
                 success: true,
                 receipt_hash,
@@ -354,7 +359,7 @@ impl RadixExecutor {
         &self,
         storage: &S,
         transactions: &[Arc<RoutableTransaction>],
-    ) -> Result<ExecutionOutput, ExecutionError> {
+    ) -> Result<ExecutionOutput<RadixConfig>, ExecutionError> {
         self.execute_single_shard_inner(storage, transactions)
     }
 
@@ -364,7 +369,7 @@ impl RadixExecutor {
         storage: &S,
         transactions: &[Arc<RoutableTransaction>],
         provisions: &[StateProvision],
-    ) -> Result<ExecutionOutput, ExecutionError> {
+    ) -> Result<ExecutionOutput<RadixConfig>, ExecutionError> {
         self.execute_cross_shard_inner(storage, transactions, provisions)
     }
 
@@ -423,13 +428,13 @@ where
     }
 }
 
-/// Convert `ExecutionOutput<ConcreteConfig>` to `ExecutionOutput<C>` for any
+/// Convert `ExecutionOutput<RadixConfig>` to `ExecutionOutput<C>` for any
 /// config whose associated types match the concrete Radix types.
 ///
 /// This is a field-by-field move with no actual data transformation — the
 /// associated types (`RoutableTransaction`, `LedgerTransactionReceipt`,
 /// `DatabaseUpdates`) are identical on both sides.
-fn into_config_output<C>(output: ExecutionOutput) -> ExecutionOutput<C>
+fn into_config_output<C>(output: ExecutionOutput<RadixConfig>) -> ExecutionOutput<C>
 where
     C: TypeConfig<
         Transaction = RoutableTransaction,
@@ -441,7 +446,7 @@ where
         output
             .results
             .into_iter()
-            .map(|r| SingleTxResult {
+            .map(|r| SingleTxResult::<C> {
                 tx_hash: r.tx_hash,
                 success: r.success,
                 receipt_hash: r.receipt_hash,

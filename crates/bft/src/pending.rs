@@ -3,8 +3,8 @@
 //! Tracks blocks being assembled from headers + gossiped transactions.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockManifest, ConcreteConfig, ConsensusTransaction, Hash,
-    TransactionCertificate, TypeConfig,
+    Block, BlockHeader, BlockManifest, ConsensusTransaction, Hash, TransactionCertificate,
+    TypeConfig,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// - **Priority**: Cross-shard transactions with commitment proofs
 /// - **Other**: Fresh transactions with no special priority
 #[derive(Debug, Clone)]
-pub struct PendingBlock<C: TypeConfig = ConcreteConfig> {
+pub struct PendingBlock<C: TypeConfig> {
     /// Block header (received first).
     header: BlockHeader,
 
@@ -271,7 +271,11 @@ impl<C: TypeConfig> PendingBlock<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_radix_config::RadixConfig;
     use hyperscale_types::{BlockHeight, QuorumCertificate, ShardGroupId, ValidatorId};
+
+    type PendingBlock = super::PendingBlock<RadixConfig>;
+    type Block = hyperscale_types::Block<RadixConfig>;
 
     fn make_header(height: u64) -> BlockHeader {
         BlockHeader {

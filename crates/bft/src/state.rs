@@ -31,7 +31,7 @@ pub type NodeIndex = u32;
 use hyperscale_types::{
     block_header_message, committed_block_header_message, Block, BlockHeader, BlockHeight,
     BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommitmentProof,
-    ConcreteConfig, ConsensusTransaction, Hash, QuorumCertificate, ReadyTransactions, ShardGroupId,
+    ConsensusTransaction, Hash, QuorumCertificate, ReadyTransactions, ShardGroupId,
     TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer, TypeConfig,
     ValidatorId, VotePower,
 };
@@ -94,7 +94,7 @@ struct PendingProposal {
 /// 3. **Block Vote Received** → Collect votes, form QC when quorum reached
 /// 4. **QC Formed** → Update chain state, commit if ready (two-chain rule)
 /// 5. **View Change Timer** → Initiate view change if no progress
-pub struct BftState<C: TypeConfig = ConcreteConfig> {
+pub struct BftState<C: TypeConfig> {
     // ═══════════════════════════════════════════════════════════════════════════
     // Identity
     // ═══════════════════════════════════════════════════════════════════════════
@@ -4752,7 +4752,12 @@ impl<C: TypeConfig> BftState<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_radix_config::RadixConfig;
     use hyperscale_types::TopologySnapshot;
+
+    type BftState = super::BftState<RadixConfig>;
+    type Block = hyperscale_types::Block<RadixConfig>;
+    type PendingBlock = super::super::pending::PendingBlock<RadixConfig>;
     use hyperscale_types::{
         batch_verify_bls_same_message, generate_bls_keypair, verify_bls12381_v1,
         zero_bls_signature, Bls12381G2Signature, SignerBitfield, ValidatorInfo, ValidatorSet,

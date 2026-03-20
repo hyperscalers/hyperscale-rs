@@ -7,9 +7,9 @@
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommitmentProof,
-    CommittedBlockHeader, ConcreteConfig, EpochConfig, EpochId, ExecutionCertificate,
-    ExecutionVote, Hash, QuorumCertificate, ShardGroupId, StateProvision, TransactionCertificate,
-    TypeConfig, ValidatorId,
+    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash,
+    QuorumCertificate, ShardGroupId, StateProvision, TransactionCertificate, TypeConfig,
+    ValidatorId,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ pub struct ProvisionVerificationResult {
 ///
 /// [`IoLoop`] translates [`NodeInput`] into `ProtocolEvent` before passing
 /// to the state machine.
-pub enum ProtocolEvent<C: TypeConfig = ConcreteConfig> {
+pub enum ProtocolEvent<C: TypeConfig> {
     // ═══════════════════════════════════════════════════════════════════════
     // Timers
     // ═══════════════════════════════════════════════════════════════════════

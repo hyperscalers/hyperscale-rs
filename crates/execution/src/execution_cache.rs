@@ -10,7 +10,7 @@
 //! its thread (insert on execution completion, read on block commit, remove
 //! after commit).
 
-use hyperscale_types::{ConcreteConfig, Hash, TypeConfig};
+use hyperscale_types::{Hash, TypeConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -31,7 +31,7 @@ struct CachedExecution<C: TypeConfig> {
 ///
 /// This cache does NOT persist across restarts. After restart, the node
 /// syncs (fetches receipts from peers) to rebuild state.
-pub struct ExecutionCache<C: TypeConfig = ConcreteConfig> {
+pub struct ExecutionCache<C: TypeConfig> {
     entries: HashMap<Hash, CachedExecution<C>>,
 }
 
@@ -110,6 +110,8 @@ impl<C: TypeConfig> Default for ExecutionCache<C> {
 mod tests {
     use super::*;
     use hyperscale_storage::DatabaseUpdates;
+
+    type ExecutionCache = super::ExecutionCache<hyperscale_radix_config::RadixConfig>;
 
     fn make_updates() -> Arc<DatabaseUpdates> {
         Arc::new(DatabaseUpdates::default())

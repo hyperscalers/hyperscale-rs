@@ -13,7 +13,8 @@ use std::time::Instant;
 ///
 /// RPC handlers send `Event::SubmitTransaction` directly to the IoLoop's
 /// crossbeam event channel, bypassing tokio mpsc bridges entirely.
-pub type TxSubmissionSender = crossbeam::channel::Sender<NodeInput>;
+pub type TxSubmissionSender =
+    crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>;
 
 /// Shared state for RPC handlers.
 #[derive(Clone)]

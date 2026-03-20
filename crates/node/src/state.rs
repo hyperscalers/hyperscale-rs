@@ -9,9 +9,9 @@ use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommitmentProof,
-    CommittedBlockHeader, ConcreteConfig, ConsensusTransaction, Hash, QuorumCertificate,
-    ReadyTransactions, ReceiptBundle, ShardGroupId, TopologySnapshot, TransactionAbort,
-    TransactionCertificate, TransactionDefer, TypeConfig,
+    CommittedBlockHeader, ConsensusTransaction, Hash, QuorumCertificate, ReadyTransactions,
+    ReceiptBundle, ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate,
+    TransactionDefer, TypeConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,7 +43,7 @@ const SPECULATIVE_MAX_AGE: Duration = Duration::from_secs(30);
 ///
 /// Note: Sync is handled entirely by the runner (production: SyncManager, simulation: runner logic).
 /// The runner sends SyncBlockReadyToApply events directly to BFT when synced blocks are ready.
-pub struct NodeStateMachine<C: TypeConfig = ConcreteConfig> {
+pub struct NodeStateMachine<C: TypeConfig> {
     /// This node's index (simulation-only, for routing).
     node_index: NodeIndex,
 

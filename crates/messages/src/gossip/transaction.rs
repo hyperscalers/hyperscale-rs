@@ -4,7 +4,7 @@ use crate::trace_context::TraceContext;
 use hyperscale_codec as sbor;
 use hyperscale_codec::{Decoder as _, Encoder as _};
 use hyperscale_types::{
-    ConcreteConfig, ConsensusTransaction, MessagePriority, NetworkMessage, ShardMessage, TypeConfig,
+    ConsensusTransaction, MessagePriority, NetworkMessage, ShardMessage, TypeConfig,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 /// Broadcast to union of write_shards (cross-shard execution) and read_shards (provisioning).
 ///
 /// When serializing for network transmission, the transaction data is fully copied.
-pub struct TransactionGossip<C: TypeConfig = ConcreteConfig> {
+pub struct TransactionGossip<C: TypeConfig> {
     /// The transaction being gossiped.
     pub transaction: Arc<C::Transaction>,
     /// Trace context for distributed tracing (empty when feature disabled).
@@ -182,14 +182,14 @@ impl<C: TypeConfig> ShardMessage for TransactionGossip<C> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use hyperscale_radix_config::RadixConfig;
     use hyperscale_types::test_utils::{test_node, test_transaction_with_nodes};
 
     #[test]
     fn test_transaction_gossip_creation() {
         let tx = test_transaction_with_nodes(&[1, 2, 3], vec![test_node(1)], vec![test_node(2)]);
 
-        let gossip: TransactionGossip = TransactionGossip::new(tx.clone());
+        let gossip: TransactionGossip<RadixConfig> = TransactionGossip::new(tx.clone());
         assert_eq!(gossip.transaction().hash(), tx.hash());
     }
 
@@ -198,7 +198,7 @@ mod tests {
         let tx = test_transaction_with_nodes(&[1, 2, 3], vec![], vec![test_node(1)]);
 
         let hash = tx.hash();
-        let gossip: TransactionGossip = TransactionGossip::new(tx);
+        let gossip: TransactionGossip<RadixConfig> = TransactionGossip::new(tx);
         let extracted = gossip.into_transaction();
         assert_eq!(extracted.hash(), hash);
     }
@@ -208,8 +208,8 @@ mod tests {
         let tx1 = test_transaction_with_nodes(&[1, 2, 3], vec![test_node(1)], vec![test_node(2)]);
         let tx2 = test_transaction_with_nodes(&[1, 2, 3], vec![test_node(1)], vec![test_node(2)]);
 
-        let gossip1: TransactionGossip = TransactionGossip::new(tx1);
-        let gossip2: TransactionGossip = TransactionGossip::new(tx2);
+        let gossip1: TransactionGossip<RadixConfig> = TransactionGossip::new(tx1);
+        let gossip2: TransactionGossip<RadixConfig> = TransactionGossip::new(tx2);
 
         // Same data should produce same transaction hash
         assert_eq!(gossip1.transaction().hash(), gossip2.transaction().hash());
@@ -220,11 +220,12 @@ mod tests {
         let tx = test_transaction_with_nodes(&[1, 2, 3], vec![test_node(1)], vec![test_node(2)]);
 
         // new() should have empty trace context
-        let gossip: TransactionGossip = TransactionGossip::new(tx.clone());
+        let gossip: TransactionGossip<RadixConfig> = TransactionGossip::new(tx.clone());
         assert!(!gossip.trace_context().has_trace());
 
         // with_trace_context() without active span should also be empty
-        let gossip_with_ctx: TransactionGossip = TransactionGossip::with_trace_context(tx);
+        let gossip_with_ctx: TransactionGossip<RadixConfig> =
+            TransactionGossip::with_trace_context(tx);
         // When no span is active, trace context will be empty
         assert!(!gossip_with_ctx.trace_context().has_trace() || TraceContext::is_enabled());
     }

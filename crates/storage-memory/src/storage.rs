@@ -13,6 +13,7 @@
 //! simulation has identical JMT behavior to production.
 
 use hyperscale_dispatch::Dispatch;
+use hyperscale_radix_config::RadixConfig;
 use hyperscale_storage::{
     jmt::{EntityTier, StoredTreeNodeKey, TypedInMemoryTreeStore, WriteableTreeStore},
     keys, CommitStore, ConsensusStore, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
@@ -72,7 +73,7 @@ impl SharedState {
 /// All consensus-related metadata bundled into a single RwLock.
 struct ConsensusState {
     /// Committed blocks indexed by height.
-    blocks: BTreeMap<BlockHeight, (Block, QuorumCertificate)>,
+    blocks: BTreeMap<BlockHeight, (Block<RadixConfig>, QuorumCertificate)>,
     /// Committed height.
     committed_height: BlockHeight,
     /// Committed block hash.
@@ -775,8 +776,8 @@ impl<C: TypeConfig<StateUpdate = DatabaseUpdates>, D: Dispatch + 'static> Commit
 // ConsensusStore implementation
 // ═══════════════════════════════════════════════════════════════════════
 
-impl<D: Dispatch + 'static> ConsensusStore for SimStorage<D> {
-    fn put_block(&self, height: BlockHeight, block: &Block, qc: &QuorumCertificate) {
+impl<D: Dispatch + 'static> ConsensusStore<RadixConfig> for SimStorage<D> {
+    fn put_block(&self, height: BlockHeight, block: &Block<RadixConfig>, qc: &QuorumCertificate) {
         let mut c = self.consensus.write().unwrap();
         // Index all transactions by hash for batch lookups
         for tx in block
@@ -790,7 +791,7 @@ impl<D: Dispatch + 'static> ConsensusStore for SimStorage<D> {
         c.blocks.insert(height, (block.clone(), qc.clone()));
     }
 
-    fn get_block(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+    fn get_block(&self, height: BlockHeight) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
         self.consensus.read().unwrap().blocks.get(&height).cloned()
     }
 
@@ -863,7 +864,10 @@ impl<D: Dispatch + 'static> ConsensusStore for SimStorage<D> {
             .retain(|height, _| *height > committed_height);
     }
 
-    fn get_block_for_sync(&self, height: BlockHeight) -> Option<(Block, QuorumCertificate)> {
+    fn get_block_for_sync(
+        &self,
+        height: BlockHeight,
+    ) -> Option<(Block<RadixConfig>, QuorumCertificate)> {
         self.consensus.read().unwrap().blocks.get(&height).cloned()
     }
 
@@ -883,7 +887,7 @@ impl<D: Dispatch + 'static> ConsensusStore for SimStorage<D> {
             .collect()
     }
 
-    fn store_receipt_bundle(&self, bundle: &ReceiptBundle) {
+    fn store_receipt_bundle(&self, bundle: &ReceiptBundle<RadixConfig>) {
         let mut c = self.consensus.write().unwrap();
         let receipt = if let Some(ref updates) = bundle.database_updates {
             let mut r = (*bundle.ledger_receipt).clone();
@@ -1012,6 +1016,7 @@ impl SubstateReader for SimSnapshot {
 mod tests {
     use super::*;
     use hyperscale_dispatch_sync::SyncDispatch;
+    use hyperscale_radix_config::RadixConfig;
     use hyperscale_storage::test_helpers::{
         make_database_update, make_mapped_database_update, make_test_block, make_test_certificate,
         make_test_qc,
@@ -1020,9 +1025,7 @@ mod tests {
         CommitStore, CommittableSubstateDatabase, ConsensusStore, NodeDatabaseUpdates,
         SubstateDatabase, SubstateStore,
     };
-    use hyperscale_types::{
-        zero_bls_signature, ConcreteConfig, Hash, NodeId, ShardGroupId, SignerBitfield,
-    };
+    use hyperscale_types::{zero_bls_signature, Hash, NodeId, ShardGroupId, SignerBitfield};
 
     #[test]
     fn test_basic_substate_operations() {
@@ -1478,8 +1481,7 @@ mod tests {
         let updates = make_mapped_database_update(1, 0, vec![10], vec![42]);
         let cert = Arc::new(make_test_certificate(1, shard));
 
-        let result =
-            CommitStore::<ConcreteConfig>::commit_block(&storage, &updates, &[cert], 1, None);
+        let result = CommitStore::<RadixConfig>::commit_block(&storage, &updates, &[cert], 1, None);
         assert_ne!(result, Hash::ZERO);
     }
 
@@ -1493,13 +1495,8 @@ mod tests {
         let cert1 = Arc::new(make_test_certificate(1, shard));
         let cert2 = Arc::new(make_test_certificate(2, shard));
 
-        let result = CommitStore::<ConcreteConfig>::commit_block(
-            &storage,
-            &merged,
-            &[cert1, cert2],
-            1,
-            None,
-        );
+        let result =
+            CommitStore::<RadixConfig>::commit_block(&storage, &merged, &[cert1, cert2], 1, None);
         // Certificate merging: all certs applied as single JMT version = block_height
         assert_ne!(result, Hash::ZERO);
     }
@@ -1507,7 +1504,7 @@ mod tests {
     #[test]
     fn test_commit_block_empty_certs() {
         let storage = SimStorage::new(SyncDispatch::new());
-        CommitStore::<ConcreteConfig>::commit_block(
+        CommitStore::<RadixConfig>::commit_block(
             &storage,
             &DatabaseUpdates::default(),
             &[],
@@ -1529,22 +1526,18 @@ mod tests {
 
         // Prepare path
         let parent_root = s_prepared.state_root_hash();
-        let (spec_root, prepared) = CommitStore::<ConcreteConfig>::prepare_block_commit(
+        let (spec_root, prepared) = CommitStore::<RadixConfig>::prepare_block_commit(
             &s_prepared,
             parent_root,
             &DatabaseUpdates::default(),
             1,
         );
         let certs = std::slice::from_ref(&cert);
-        let result_prepared = CommitStore::<ConcreteConfig>::commit_prepared_block(
-            &s_prepared,
-            prepared,
-            certs,
-            None,
-        );
+        let result_prepared =
+            CommitStore::<RadixConfig>::commit_prepared_block(&s_prepared, prepared, certs, None);
 
         // Direct path
-        let result_direct = CommitStore::<ConcreteConfig>::commit_block(
+        let result_direct = CommitStore::<RadixConfig>::commit_block(
             &s_direct,
             &DatabaseUpdates::default(),
             std::slice::from_ref(&cert),
@@ -1563,14 +1556,14 @@ mod tests {
         let cert = Arc::new(make_test_certificate(1, shard));
 
         let parent_root = storage.state_root_hash();
-        let (spec_root, prepared) = CommitStore::<ConcreteConfig>::prepare_block_commit(
+        let (spec_root, prepared) = CommitStore::<RadixConfig>::prepare_block_commit(
             &storage,
             parent_root,
             &DatabaseUpdates::default(),
             1,
         );
         let result =
-            CommitStore::<ConcreteConfig>::commit_prepared_block(&storage, prepared, &[cert], None);
+            CommitStore::<RadixConfig>::commit_prepared_block(&storage, prepared, &[cert], None);
 
         assert_eq!(spec_root, result);
     }
@@ -1598,7 +1591,7 @@ mod tests {
         let cert = Arc::new(make_test_certificate(1, shard));
         let tx_hash = cert.transaction_hash;
 
-        let _ = CommitStore::<ConcreteConfig>::commit_block(
+        let _ = CommitStore::<RadixConfig>::commit_block(
             &storage,
             &DatabaseUpdates::default(),
             &[cert],
@@ -1685,14 +1678,14 @@ mod tests {
         let updates1 = make_mapped_database_update(1, 0, vec![10], vec![100]);
         let cert1 = Arc::new(make_test_certificate(1, shard));
         let result1 =
-            CommitStore::<ConcreteConfig>::commit_block(&storage, &updates1, &[cert1], 1, None);
+            CommitStore::<RadixConfig>::commit_block(&storage, &updates1, &[cert1], 1, None);
         let root_v1 = result1;
 
         // Block height 2: overwrite with value [200]
         let updates2 = make_mapped_database_update(1, 0, vec![10], vec![200]);
         let cert2 = Arc::new(make_test_certificate(2, shard));
         let result2 =
-            CommitStore::<ConcreteConfig>::commit_block(&storage, &updates2, &[cert2], 2, None);
+            CommitStore::<RadixConfig>::commit_block(&storage, &updates2, &[cert2], 2, None);
         let root_v2 = result2;
         assert_ne!(root_v1, root_v2, "roots must differ after overwrite");
 

@@ -155,8 +155,8 @@ impl TransactionValidation {
 }
 
 // Implement the generic TransactionValidator trait for any TypeConfig whose
-// Transaction = RoutableTransaction. This covers both ConcreteConfig and RadixConfig
-// without creating a circular dependency on hyperscale-radix-config.
+// Transaction = RoutableTransaction. This covers RadixConfig (and any future
+// TypeConfig that also uses RoutableTransaction).
 impl<C> hyperscale_core::TransactionValidator<C> for TransactionValidation
 where
     C: hyperscale_types::TypeConfig<Transaction = RoutableTransaction>,

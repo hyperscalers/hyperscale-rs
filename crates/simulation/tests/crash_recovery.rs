@@ -46,7 +46,7 @@ fn test_recovered_votes_prevent_equivocation() {
         jmt_root: None, // Fresh start for simulation test
     };
 
-    let mut state: BftState = BftState::new(
+    let mut state: BftState<hyperscale_radix_config::RadixConfig> = BftState::new(
         1,
         {
             let key_bytes = keys[1].to_bytes();
@@ -179,7 +179,7 @@ fn test_stale_votes_pruned_on_recovery() {
         jmt_root: None, // Fresh start for simulation test
     };
 
-    let state: BftState = BftState::new(
+    let state: BftState<hyperscale_radix_config::RadixConfig> = BftState::new(
         0,
         {
             let key_bytes = keys[0].to_bytes();
@@ -267,7 +267,7 @@ fn test_chain_metadata_recovery() {
         jmt_root: None, // Fresh start for simulation test
     };
 
-    let state: BftState = BftState::new(
+    let state: BftState<hyperscale_radix_config::RadixConfig> = BftState::new(
         0,
         {
             let key_bytes = keys[0].to_bytes();
@@ -309,7 +309,7 @@ fn test_fresh_start_with_default_recovered_state() {
     let topology = TopologyState::new(ValidatorId(0), 1, validator_set);
 
     // Fresh start - no recovered state
-    let state: BftState = BftState::new(
+    let state: BftState<hyperscale_radix_config::RadixConfig> = BftState::new(
         0,
         {
             let key_bytes = keys[0].to_bytes();

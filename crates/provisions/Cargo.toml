@@ -11,4 +11,5 @@ hyperscale-types.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+hyperscale-radix-config.workspace = true
 hyperscale-test-helpers.workspace = true

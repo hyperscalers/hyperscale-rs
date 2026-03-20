@@ -10,9 +10,7 @@ use std::sync::Arc;
 use crate::BlockHeight;
 use hyperscale_codec::prelude::{BasicDecode, BasicEncode};
 
-use crate::{
-    DatabaseUpdates, Hash, LedgerTransactionReceipt, NodeId, RoutableTransaction, ShardGroupId,
-};
+use crate::{Hash, NodeId, ShardGroupId};
 
 // ── Trait bounds for associated types ────────────────────────────────────────
 
@@ -68,7 +66,9 @@ pub trait ConsensusTransaction: Clone + Debug + Send + Sync + BasicEncode + Basi
 }
 
 /// Operations the consensus framework requires on execution receipt types.
-pub trait ConsensusExecutionReceipt: Clone + Send + Sync + BasicEncode + BasicDecode {
+pub trait ConsensusExecutionReceipt:
+    Clone + Debug + Send + Sync + BasicEncode + BasicDecode
+{
     /// Compute the consensus receipt hash (signed over in votes/certificates).
     fn consensus_receipt_hash(&self) -> Hash;
 
@@ -133,197 +133,6 @@ pub trait TypeConfig: Send + Sync + 'static {
     /// Used by syncing nodes that receive receipts from peers instead of
     /// executing transactions locally.
     fn receipt_to_state_update(receipt: &Self::ExecutionReceipt) -> Self::StateUpdate;
-}
-
-/// Internal concrete config used as the default type parameter during migration.
-///
-/// This allows `Block`, `ReceiptBundle`, etc. to be used without angle brackets
-/// while downstream consumers are incrementally parameterized. It binds the
-/// same concrete types that were previously hardcoded.
-///
-/// **Not for external use.** Use `RadixConfig` from `hyperscale-radix-config`
-/// for production code.
-#[derive(Debug, Clone)]
-pub struct ConcreteConfig;
-
-impl TypeConfig for ConcreteConfig {
-    type Transaction = RoutableTransaction;
-    type ExecutionReceipt = LedgerTransactionReceipt;
-    type StateUpdate = DatabaseUpdates;
-
-    fn merge_state_updates(updates: &[DatabaseUpdates]) -> DatabaseUpdates {
-        // Delegate to the merge logic in hyperscale_storage at runtime.
-        // ConcreteConfig is only used where the storage crate is also available,
-        // so this is always reachable. The implementation is provided by the
-        // storage crate's free function, called through the RadixConfig path
-        // (which has an identical impl). For ConcreteConfig we inline a simple
-        // version using DatabaseUpdates' IndexMap structure.
-        use radix_substate_store_interface::interface::NodeDatabaseUpdates;
-        if updates.is_empty() {
-            return DatabaseUpdates::default();
-        }
-        if updates.len() == 1 {
-            return updates[0].clone();
-        }
-        let mut merged = DatabaseUpdates::default();
-        for update in updates {
-            for (entity_key, node_updates) in &update.node_updates {
-                let target = merged
-                    .node_updates
-                    .entry(entity_key.clone())
-                    .or_insert_with(NodeDatabaseUpdates::default);
-                for (partition, part_updates) in &node_updates.partition_updates {
-                    target
-                        .partition_updates
-                        .entry(*partition)
-                        .and_modify(|existing| {
-                            // Merge: source overwrites target for overlapping keys
-                            match (existing, part_updates) {
-                                (
-                                    radix_substate_store_interface::interface::PartitionDatabaseUpdates::Delta { substate_updates: target_updates },
-                                    radix_substate_store_interface::interface::PartitionDatabaseUpdates::Delta { substate_updates: source_updates },
-                                ) => {
-                                    for (k, v) in source_updates {
-                                        target_updates.insert(k.clone(), v.clone());
-                                    }
-                                }
-                                (existing, source) => {
-                                    *existing = source.clone();
-                                }
-                            }
-                        })
-                        .or_insert_with(|| part_updates.clone());
-                }
-            }
-        }
-        merged
-    }
-
-    fn filter_state_update_to_shard(
-        update: &DatabaseUpdates,
-        local_shard: ShardGroupId,
-        num_shards: u64,
-    ) -> DatabaseUpdates {
-        if num_shards <= 1 {
-            return update.clone();
-        }
-        // Extract NodeId from db_node_key: 20-byte hash prefix + 30-byte NodeId.
-        const HASH_PREFIX_LEN: usize = 20;
-        const NODE_ID_LEN: usize = 30;
-        let mut filtered = DatabaseUpdates::default();
-        for (db_node_key, node_updates) in &update.node_updates {
-            if db_node_key.len() >= HASH_PREFIX_LEN + NODE_ID_LEN {
-                let mut bytes = [0u8; NODE_ID_LEN];
-                bytes.copy_from_slice(&db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN]);
-                let node_id = NodeId(bytes);
-                if crate::shard_for_node(&node_id, num_shards) == local_shard {
-                    filtered
-                        .node_updates
-                        .insert(db_node_key.clone(), node_updates.clone());
-                }
-            } else {
-                // Keep system/unknown entries
-                filtered
-                    .node_updates
-                    .insert(db_node_key.clone(), node_updates.clone());
-            }
-        }
-        filtered
-    }
-
-    fn filter_state_update_to_writes(
-        update: &DatabaseUpdates,
-        declared_writes: &[NodeId],
-    ) -> DatabaseUpdates {
-        if declared_writes.is_empty() {
-            return update.clone();
-        }
-        const HASH_PREFIX_LEN: usize = 20;
-        const NODE_ID_LEN: usize = 30;
-        let allowed: std::collections::HashSet<NodeId> = declared_writes.iter().copied().collect();
-        let mut filtered = DatabaseUpdates::default();
-        for (db_node_key, node_updates) in &update.node_updates {
-            if db_node_key.len() >= HASH_PREFIX_LEN + NODE_ID_LEN {
-                let mut bytes = [0u8; NODE_ID_LEN];
-                bytes.copy_from_slice(&db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN]);
-                let node_id = NodeId(bytes);
-                if allowed.contains(&node_id) {
-                    filtered
-                        .node_updates
-                        .insert(db_node_key.clone(), node_updates.clone());
-                }
-            } else {
-                filtered
-                    .node_updates
-                    .insert(db_node_key.clone(), node_updates.clone());
-            }
-        }
-        filtered
-    }
-
-    fn extract_write_nodes(update: &DatabaseUpdates) -> Vec<NodeId> {
-        const HASH_PREFIX_LEN: usize = 20;
-        const NODE_ID_LEN: usize = 30;
-        update
-            .node_updates
-            .keys()
-            .filter_map(|db_node_key| {
-                if db_node_key.len() >= HASH_PREFIX_LEN + NODE_ID_LEN {
-                    let mut bytes = [0u8; NODE_ID_LEN];
-                    bytes.copy_from_slice(
-                        &db_node_key[HASH_PREFIX_LEN..HASH_PREFIX_LEN + NODE_ID_LEN],
-                    );
-                    Some(NodeId(bytes))
-                } else {
-                    None
-                }
-            })
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    }
-
-    fn receipt_to_state_update(receipt: &LedgerTransactionReceipt) -> DatabaseUpdates {
-        use crate::SubstateChangeAction;
-        use radix_common::prelude::DatabaseUpdate;
-        use radix_substate_store_interface::db_key_mapper::{
-            DatabaseKeyMapper, SpreadPrefixKeyMapper,
-        };
-        use radix_substate_store_interface::interface::{DbSortKey, PartitionDatabaseUpdates};
-
-        let mut updates = DatabaseUpdates::default();
-        for change in &receipt.state_changes {
-            let radix_node_id = radix_common::types::NodeId(change.substate_ref.node_id.0);
-            let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
-            let radix_partition =
-                radix_common::types::PartitionNumber(change.substate_ref.partition.0);
-            let db_partition_num = SpreadPrefixKeyMapper::to_db_partition_num(radix_partition);
-            let db_sort_key = DbSortKey(change.substate_ref.sort_key.clone());
-
-            let db_update = match &change.action {
-                SubstateChangeAction::Create { new_value } => {
-                    DatabaseUpdate::Set(new_value.clone())
-                }
-                SubstateChangeAction::Update { new_value, .. } => {
-                    DatabaseUpdate::Set(new_value.clone())
-                }
-                SubstateChangeAction::Delete { .. } => DatabaseUpdate::Delete,
-            };
-
-            let node_updates = updates.node_updates.entry(db_node_key).or_default();
-            let partition_updates = node_updates
-                .partition_updates
-                .entry(db_partition_num)
-                .or_insert_with(|| PartitionDatabaseUpdates::Delta {
-                    substate_updates: radix_common::prelude::IndexMap::new(),
-                });
-
-            if let PartitionDatabaseUpdates::Delta { substate_updates } = partition_updates {
-                substate_updates.insert(db_sort_key, db_update);
-            }
-        }
-        updates
-    }
 }
 
 #[cfg(test)]

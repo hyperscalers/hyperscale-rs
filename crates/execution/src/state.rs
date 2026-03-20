@@ -32,9 +32,9 @@
 
 use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, ConcreteConfig, ConsensusTransaction, ExecutionCertificate,
-    ExecutionVote, Hash, NodeId, ShardGroupId, StateProvision, TopologySnapshot,
-    TransactionCertificate, TransactionDecision, TypeConfig, ValidatorId,
+    BlockHeight, Bls12381G1PublicKey, ConsensusTransaction, ExecutionCertificate, ExecutionVote,
+    Hash, NodeId, ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate,
+    TransactionDecision, TypeConfig, ValidatorId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -93,7 +93,7 @@ pub struct SpeculativeResult {
 /// Execution state machine.
 ///
 /// Handles transaction execution after blocks are committed.
-pub struct ExecutionState<C: TypeConfig = ConcreteConfig> {
+pub struct ExecutionState<C: TypeConfig> {
     /// Current time.
     now: Duration,
 
@@ -2131,7 +2131,10 @@ impl<C: TypeConfig> std::fmt::Debug for ExecutionState<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_radix_config::RadixConfig;
     use hyperscale_types::test_utils::test_transaction;
+
+    type ExecutionState = super::ExecutionState<RadixConfig>;
     use hyperscale_types::{
         generate_bls_keypair, verify_bls12381_v1, Bls12381G1PrivateKey, ValidatorInfo, ValidatorSet,
     };

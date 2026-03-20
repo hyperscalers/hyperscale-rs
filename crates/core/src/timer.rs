@@ -24,7 +24,7 @@ pub enum TimerId {
 
 impl TimerId {
     /// Convert this timer ID to the corresponding [`NodeInput`] event.
-    pub fn into_event(self) -> NodeInput {
+    pub fn into_event<C: hyperscale_types::TypeConfig>(self) -> NodeInput<C> {
         match self {
             TimerId::Proposal => NodeInput::Protocol(ProtocolEvent::ProposalTimer),
             TimerId::Cleanup => NodeInput::Protocol(ProtocolEvent::CleanupTimer),

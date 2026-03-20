@@ -7,6 +7,7 @@
 use crate::{
     ConsensusStore, DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
 };
+use hyperscale_radix_config::RadixConfig;
 use hyperscale_types::{
     zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, ExecutionCertificate,
     FeeSummary, Hash, LedgerTransactionOutcome, LedgerTransactionReceipt,
@@ -98,11 +99,11 @@ pub fn make_test_certificate(tx_seed: u8, shard: ShardGroupId) -> TransactionCer
 }
 
 /// Build a minimal `Block` at the given height.
-pub fn make_test_block(height: u64) -> Block {
+pub fn make_test_block(height: u64) -> Block<RadixConfig> {
     // Use the full u64 bytes for the parent hash so heights > 255 don't alias.
     let mut parent_bytes = [0u8; 32];
     parent_bytes[..8].copy_from_slice(&height.to_le_bytes());
-    Block {
+    Block::<RadixConfig> {
         header: BlockHeader {
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(height),
@@ -155,7 +156,7 @@ pub fn make_multi_shard_certificate(
 }
 
 /// Build a `QuorumCertificate` that references the given block.
-pub fn make_test_qc(block: &Block) -> QuorumCertificate {
+pub fn make_test_qc(block: &Block<RadixConfig>) -> QuorumCertificate {
     QuorumCertificate {
         block_hash: block.hash(),
         shard_group_id: ShardGroupId(0),
@@ -169,7 +170,7 @@ pub fn make_test_qc(block: &Block) -> QuorumCertificate {
 }
 
 /// Build a `ReceiptBundle` with both ledger receipt and local execution.
-pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
+pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle<RadixConfig> {
     let tx_hash = Hash::from_bytes(&[seed; 32]);
     let ledger_receipt = Arc::new(LedgerTransactionReceipt {
         outcome: LedgerTransactionOutcome::Success,
@@ -198,7 +199,7 @@ pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
         log_messages: vec![(LogLevel::Info, format!("tx {seed}"))],
         error_message: None,
     });
-    ReceiptBundle {
+    ReceiptBundle::<RadixConfig> {
         tx_hash,
         ledger_receipt,
         local_execution,
@@ -207,14 +208,14 @@ pub fn make_test_receipt_bundle(seed: u8) -> ReceiptBundle {
 }
 
 /// Build a `ReceiptBundle` without local execution (simulates synced receipt).
-pub fn make_synced_receipt_bundle(seed: u8) -> ReceiptBundle {
+pub fn make_synced_receipt_bundle(seed: u8) -> ReceiptBundle<RadixConfig> {
     let mut bundle = make_test_receipt_bundle(seed);
     bundle.local_execution = None;
     bundle
 }
 
 /// Shared receipt storage roundtrip test. Call from each backend's test suite.
-pub fn test_receipt_storage_roundtrip(storage: &impl ConsensusStore) {
+pub fn test_receipt_storage_roundtrip(storage: &impl ConsensusStore<RadixConfig>) {
     let bundle = make_test_receipt_bundle(42);
     let tx_hash = bundle.tx_hash;
 
@@ -235,7 +236,7 @@ pub fn test_receipt_storage_roundtrip(storage: &impl ConsensusStore) {
 }
 
 /// Shared test for synced receipt (no local execution).
-pub fn test_receipt_storage_synced(storage: &impl ConsensusStore) {
+pub fn test_receipt_storage_synced(storage: &impl ConsensusStore<RadixConfig>) {
     let bundle = make_synced_receipt_bundle(43);
     let tx_hash = bundle.tx_hash;
 
@@ -250,8 +251,8 @@ pub fn test_receipt_storage_synced(storage: &impl ConsensusStore) {
 }
 
 /// Shared test for batch receipt storage.
-pub fn test_receipt_batch_storage(storage: &impl ConsensusStore) {
-    let bundles: Vec<ReceiptBundle> = (10..13).map(make_test_receipt_bundle).collect();
+pub fn test_receipt_batch_storage(storage: &impl ConsensusStore<RadixConfig>) {
+    let bundles: Vec<ReceiptBundle<RadixConfig>> = (10..13).map(make_test_receipt_bundle).collect();
 
     storage.store_receipt_bundles(&bundles);
 
@@ -263,7 +264,7 @@ pub fn test_receipt_batch_storage(storage: &impl ConsensusStore) {
 }
 
 /// Shared test for idempotent receipt overwrite.
-pub fn test_receipt_idempotent_overwrite(storage: &impl ConsensusStore) {
+pub fn test_receipt_idempotent_overwrite(storage: &impl ConsensusStore<RadixConfig>) {
     let bundle = make_test_receipt_bundle(44);
     let tx_hash = bundle.tx_hash;
 

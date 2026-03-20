@@ -93,9 +93,7 @@ pub use transaction::{
     TransactionDecision, TransactionDefer, TransactionError, TransactionStatus,
     TransactionStatusParseError,
 };
-pub use type_config::{
-    ConcreteConfig, ConsensusExecutionReceipt, ConsensusTransaction, TypeConfig,
-};
+pub use type_config::{ConsensusExecutionReceipt, ConsensusTransaction, TypeConfig};
 pub use validator::{ValidatorInfo, ValidatorSet};
 
 // Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)

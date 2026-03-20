@@ -7,14 +7,10 @@ use hyperscale_messages::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
     ExecutionVotesNotification, TransactionGossip,
 };
-use hyperscale_types::{LedgerTransactionReceipt, RoutableTransaction, TypeConfig};
+use hyperscale_radix_config::RadixConfig;
 use tracing::warn;
 
-impl<Cfg: NodeConfig> IoLoop<Cfg>
-where
-    Cfg::C:
-        TypeConfig<Transaction = RoutableTransaction, ExecutionReceipt = LedgerTransactionReceipt>,
-{
+impl<Cfg: NodeConfig<C = RadixConfig>> IoLoop<Cfg> {
     /// Register per-type request handlers with the network.
     ///
     /// Each handler is a closure that captures shared state and delegates to

@@ -4,8 +4,8 @@
 //! All methods take `&self` — implementations use interior mutability.
 
 use hyperscale_types::{
-    Block, BlockHeight, ConcreteConfig, Hash, LocalTransactionExecution, QuorumCertificate,
-    ReceiptBundle, TransactionCertificate, TypeConfig,
+    Block, BlockHeight, Hash, LocalTransactionExecution, QuorumCertificate, ReceiptBundle,
+    TransactionCertificate, TypeConfig,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +14,7 @@ use std::sync::Arc;
 ///
 /// Provides a uniform interface for storing blocks, certificates, votes,
 /// and chain metadata across different storage backends.
-pub trait ConsensusStore<C: TypeConfig = ConcreteConfig>: Send + Sync {
+pub trait ConsensusStore<C: TypeConfig>: Send + Sync {
     /// Store a committed block with its quorum certificate.
     fn put_block(&self, height: BlockHeight, block: &Block<C>, qc: &QuorumCertificate);
 

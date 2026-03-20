@@ -507,22 +507,25 @@ pub struct ProductionRunner {
     // ── Crossbeam senders (async → pinned thread) ────────────────────────
     /// Timer events to pinned thread (for external timer injection if needed).
     #[allow(dead_code)]
-    xb_timer_tx: crossbeam::channel::Sender<NodeInput>,
+    xb_timer_tx: crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>,
     /// Consensus events to pinned thread (from Libp2p adapter routing).
-    xb_consensus_tx: crossbeam::channel::Sender<NodeInput>,
+    xb_consensus_tx: crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>,
     /// Callback events to pinned thread (from bridge tasks, direct sends).
     #[allow(dead_code)] // Kept alive to prevent crossbeam channel closure
-    xb_callback_tx: crossbeam::channel::Sender<NodeInput>,
+    xb_callback_tx: crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>,
     /// Shutdown signal to pinned thread.
     xb_shutdown_tx: crossbeam::channel::Sender<()>,
 
     // ── Crossbeam receivers (extracted for PinnedLoopConfig) ─────────────
     /// Timer receiver (moved to PinnedLoopConfig).
-    xb_timer_rx: Option<crossbeam::channel::Receiver<NodeInput>>,
+    xb_timer_rx:
+        Option<crossbeam::channel::Receiver<NodeInput<hyperscale_radix_config::RadixConfig>>>,
     /// Callback receiver (moved to PinnedLoopConfig).
-    xb_callback_rx: Option<crossbeam::channel::Receiver<NodeInput>>,
+    xb_callback_rx:
+        Option<crossbeam::channel::Receiver<NodeInput<hyperscale_radix_config::RadixConfig>>>,
     /// Consensus receiver (moved to PinnedLoopConfig).
-    xb_consensus_rx: Option<crossbeam::channel::Receiver<NodeInput>>,
+    xb_consensus_rx:
+        Option<crossbeam::channel::Receiver<NodeInput<hyperscale_radix_config::RadixConfig>>>,
     /// Shutdown receiver (moved to PinnedLoopConfig).
     xb_shutdown_rx: Option<crossbeam::channel::Receiver<()>>,
 
@@ -594,7 +597,9 @@ impl ProductionRunner {
     ///
     /// Events sent through this sender are forwarded to the pinned IoLoop
     /// thread via the crossbeam consensus channel.
-    pub fn event_sender(&self) -> crossbeam::channel::Sender<NodeInput> {
+    pub fn event_sender(
+        &self,
+    ) -> crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>> {
         self.xb_consensus_tx.clone()
     }
 
@@ -603,7 +608,9 @@ impl ProductionRunner {
     /// Returns a crossbeam channel sender that feeds directly into the IoLoop.
     /// RPC handlers wrap transactions in `Event::SubmitTransaction` before sending.
     /// IoLoop handles gossip, validation, and mempool dispatch.
-    pub fn tx_submission_sender(&self) -> crossbeam::channel::Sender<NodeInput> {
+    pub fn tx_submission_sender(
+        &self,
+    ) -> crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>> {
         self.xb_consensus_tx.clone()
     }
 

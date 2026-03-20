@@ -4,12 +4,10 @@
 //! `SingleTxResult<C>` carries full execution output including state updates
 //! and receipts. `ExecutionOutput<C>` is a batch wrapper.
 
-use hyperscale_types::{
-    ConcreteConfig, ConsensusExecutionReceipt, Hash, LocalTransactionExecution, TypeConfig,
-};
+use hyperscale_types::{ConsensusExecutionReceipt, Hash, LocalTransactionExecution, TypeConfig};
 
 /// Output from executing a batch of transactions.
-pub struct ExecutionOutput<C: TypeConfig = ConcreteConfig> {
+pub struct ExecutionOutput<C: TypeConfig> {
     /// Results for each transaction, in the same order as input.
     pub results: Vec<SingleTxResult<C>>,
 }
@@ -53,7 +51,7 @@ impl<C: TypeConfig> ExecutionOutput<C> {
 }
 
 /// Result of executing a single transaction.
-pub struct SingleTxResult<C: TypeConfig = ConcreteConfig> {
+pub struct SingleTxResult<C: TypeConfig> {
     /// Hash of the executed transaction.
     pub tx_hash: Hash,
 

@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 pub struct ProdConfig;
 
 impl hyperscale_node::NodeConfig for ProdConfig {
-    type C = hyperscale_types::ConcreteConfig;
+    type C = hyperscale_radix_config::RadixConfig;
     type S = SharedStorage<PooledDispatch>;
     type N = Libp2pNetwork;
     type D = PooledDispatch;
@@ -51,13 +51,13 @@ pub type ProdIoLoop = IoLoop<ProdConfig>;
 /// Configuration for the pinned event loop.
 pub struct PinnedLoopConfig {
     /// Timer-fired events sender (for ProdTimerManager to send timer events).
-    pub timer_tx: crossbeam::channel::Sender<NodeInput>,
+    pub timer_tx: crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>,
     /// Timer-fired events (highest priority).
-    pub timer_rx: Receiver<NodeInput>,
+    pub timer_rx: Receiver<NodeInput<hyperscale_radix_config::RadixConfig>>,
     /// Crypto/execution callback events + internal events.
-    pub callback_rx: Receiver<NodeInput>,
+    pub callback_rx: Receiver<NodeInput<hyperscale_radix_config::RadixConfig>>,
     /// BFT consensus messages from network peers.
-    pub consensus_rx: Receiver<NodeInput>,
+    pub consensus_rx: Receiver<NodeInput<hyperscale_radix_config::RadixConfig>>,
     /// Graceful shutdown signal.
     pub shutdown_rx: Receiver<()>,
     /// Tokio runtime handle for spawning timer sleep tasks.
@@ -80,14 +80,14 @@ pub struct PinnedLoopConfig {
 /// into the crossbeam timer channel. Replaces the former `ProdTimer` trait impl.
 struct ProdTimerManager {
     tokio_handle: tokio::runtime::Handle,
-    timer_tx: crossbeam::channel::Sender<NodeInput>,
+    timer_tx: crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>,
     active: HashMap<TimerId, JoinHandle<()>>,
 }
 
 impl ProdTimerManager {
     fn new(
         tokio_handle: tokio::runtime::Handle,
-        timer_tx: crossbeam::channel::Sender<NodeInput>,
+        timer_tx: crossbeam::channel::Sender<NodeInput<hyperscale_radix_config::RadixConfig>>,
     ) -> Self {
         Self {
             tokio_handle,

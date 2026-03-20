@@ -17,10 +17,7 @@ use hyperscale_messages::request::GetBlockRequest;
 use hyperscale_messages::response::GetBlockResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ConsensusStore;
-use hyperscale_types::{
-    Block, ConcreteConfig, Hash, LedgerTransactionReceipt, QuorumCertificate, RoutableTransaction,
-    TypeConfig,
-};
+use hyperscale_types::{Block, Hash, QuorumCertificate, TypeConfig};
 use serde::Serialize;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashSet};
@@ -98,7 +95,7 @@ impl Default for SyncStatus {
 
 /// Inputs to the sync protocol state machine.
 #[derive(Debug)]
-pub enum SyncInput<C: TypeConfig = ConcreteConfig> {
+pub enum SyncInput<C: TypeConfig> {
     /// Start or update sync target.
     StartSync {
         target_height: u64,
@@ -118,7 +115,7 @@ pub enum SyncInput<C: TypeConfig = ConcreteConfig> {
 
 /// Outputs from the sync protocol state machine.
 #[derive(Debug)]
-pub enum SyncOutput<C: TypeConfig = ConcreteConfig> {
+pub enum SyncOutput<C: TypeConfig> {
     /// Request the runner to fetch a block at this height.
     FetchBlock { height: u64 },
     /// A validated block is ready to deliver to BFT.
@@ -382,12 +379,10 @@ impl SyncProtocol {
 ///
 /// Includes ledger receipts for each certificate in the block so the
 /// syncing peer can apply state changes without re-executing.
-pub fn serve_block_request<
-    C: TypeConfig<Transaction = RoutableTransaction, ExecutionReceipt = LedgerTransactionReceipt>,
->(
+pub fn serve_block_request<C: TypeConfig>(
     storage: &(impl ConsensusStore<C> + ?Sized),
     req: GetBlockRequest,
-) -> GetBlockResponse {
+) -> GetBlockResponse<C> {
     trace!(height = req.height.0, "Handling block sync request");
     match storage.get_block_for_sync(req.height) {
         Some((block, qc)) => {
@@ -396,7 +391,7 @@ pub fn serve_block_request<
             for cert in &block.certificates {
                 let tx_hash = cert.transaction_hash;
                 if let Some(receipt) = storage.get_ledger_receipt(&tx_hash) {
-                    ledger_receipts.push(hyperscale_types::LedgerReceiptEntry {
+                    ledger_receipts.push(hyperscale_types::LedgerReceiptEntry::<C> {
                         tx_hash,
                         receipt: (*receipt).clone(),
                     });
@@ -414,7 +409,7 @@ pub fn serve_block_request<
                 return GetBlockResponse::not_found();
             }
 
-            GetBlockResponse::found(block.reconfig::<ConcreteConfig>(), qc, ledger_receipts)
+            GetBlockResponse::found(block, qc, ledger_receipts)
         }
         None => GetBlockResponse::not_found(),
     }
@@ -423,6 +418,7 @@ pub fn serve_block_request<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_radix_config::RadixConfig;
 
     #[test]
     fn test_sync_config_defaults() {
@@ -446,7 +442,7 @@ mod tests {
             sync_window_size: 10,
         });
 
-        let outputs = protocol.handle::<ConcreteConfig>(SyncInput::StartSync {
+        let outputs = protocol.handle::<RadixConfig>(SyncInput::StartSync {
             target_height: 5,
             target_hash: Hash::ZERO,
         });
@@ -470,7 +466,7 @@ mod tests {
             sync_window_size: 64,
         });
 
-        protocol.handle::<ConcreteConfig>(SyncInput::StartSync {
+        protocol.handle::<RadixConfig>(SyncInput::StartSync {
             target_height: 2,
             target_hash: Hash::ZERO,
         });
@@ -478,7 +474,7 @@ mod tests {
         assert!(protocol.is_syncing());
 
         // Commit up to target
-        let outputs = protocol.handle::<ConcreteConfig>(SyncInput::BlockCommitted { height: 2 });
+        let outputs = protocol.handle::<RadixConfig>(SyncInput::BlockCommitted { height: 2 });
 
         assert!(!protocol.is_syncing());
         assert!(outputs
@@ -493,13 +489,13 @@ mod tests {
             sync_window_size: 10,
         });
 
-        protocol.handle::<ConcreteConfig>(SyncInput::StartSync {
+        protocol.handle::<RadixConfig>(SyncInput::StartSync {
             target_height: 3,
             target_hash: Hash::ZERO,
         });
 
         // Fail the first fetch
-        let outputs = protocol.handle::<ConcreteConfig>(SyncInput::BlockFetchFailed { height: 1 });
+        let outputs = protocol.handle::<RadixConfig>(SyncInput::BlockFetchFailed { height: 1 });
 
         // Should re-emit a FetchBlock for height 1
         assert!(outputs

@@ -4,7 +4,7 @@
 //! The executor does not own storage — storage is provided per call by the runner.
 
 use hyperscale_storage::SubstateStore;
-use hyperscale_types::{ConcreteConfig, NodeId, StateEntry, StateProvision, TypeConfig};
+use hyperscale_types::{NodeId, StateEntry, StateProvision, TypeConfig};
 use std::sync::Arc;
 
 use crate::result::ExecutionOutput;
@@ -19,7 +19,7 @@ use crate::result::ExecutionOutput;
 /// An associated type would force one storage type per executor, preventing the same
 /// `RadixExecutor` from being used in both simulation (SimStorage) and production
 /// (RocksDbStorage).
-pub trait ExecutionBackend<C: TypeConfig = ConcreteConfig>: Clone + Send + Sync + 'static {
+pub trait ExecutionBackend<C: TypeConfig>: Clone + Send + Sync + 'static {
     /// Error type for execution failures.
     type Error: std::error::Error + Send + 'static;
 

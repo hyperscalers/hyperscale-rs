@@ -1620,11 +1620,12 @@ mod tests {
         let adapter0 = network.create_adapter(0);
 
         // Node 0 broadcasts a transaction via its adapter
-        let gossip: TransactionGossip = TransactionGossip::new(test_transaction_with_nodes(
-            &[1, 2, 3],
-            vec![test_node(1)],
-            vec![test_node(2)],
-        ));
+        let gossip: TransactionGossip<hyperscale_radix_config::RadixConfig> =
+            TransactionGossip::new(test_transaction_with_nodes(
+                &[1, 2, 3],
+                vec![test_node(1)],
+                vec![test_node(2)],
+            ));
         hyperscale_network::Network::broadcast_to_shard(&adapter0, ShardGroupId(0), &gossip);
 
         // Drain and deliver via accept_gossip + flush_gossip

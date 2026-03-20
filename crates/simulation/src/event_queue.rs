@@ -26,7 +26,12 @@ pub struct EventKey {
 
 impl EventKey {
     /// Create a new event key from a [`NodeInput`].
-    pub fn new(time: Duration, event: &NodeInput, node_index: NodeIndex, sequence: u64) -> Self {
+    pub fn new<C: hyperscale_types::TypeConfig>(
+        time: Duration,
+        event: &NodeInput<C>,
+        node_index: NodeIndex,
+        sequence: u64,
+    ) -> Self {
         Self {
             time,
             priority: event.priority(),

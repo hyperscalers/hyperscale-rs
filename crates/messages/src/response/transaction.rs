@@ -2,9 +2,7 @@
 
 use hyperscale_codec as sbor;
 use hyperscale_codec::{Decoder as _, Encoder as _};
-use hyperscale_types::{
-    ConcreteConfig, ConsensusTransaction, MessagePriority, NetworkMessage, TypeConfig,
-};
+use hyperscale_types::{ConsensusTransaction, MessagePriority, NetworkMessage, TypeConfig};
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -12,7 +10,7 @@ use std::sync::Arc;
 ///
 /// Contains the requested transactions (those that the responder has).
 /// Missing transactions are simply not included in the response.
-pub struct GetTransactionsResponse<C: TypeConfig = ConcreteConfig> {
+pub struct GetTransactionsResponse<C: TypeConfig> {
     /// The requested transactions that were found.
     /// Uses Arc to avoid copying transaction data.
     pub transactions: Vec<Arc<C::Transaction>>,
@@ -175,6 +173,7 @@ impl<C: TypeConfig> NetworkMessage for GetTransactionsResponse<C> {
 mod tests {
     use super::*;
     use hyperscale_codec::{basic_decode, basic_encode};
+    use hyperscale_radix_config::RadixConfig;
     use hyperscale_types::test_utils::test_transaction;
 
     #[test]
@@ -182,7 +181,7 @@ mod tests {
         let tx1 = Arc::new(test_transaction(1));
         let tx2 = Arc::new(test_transaction(2));
 
-        let response: GetTransactionsResponse =
+        let response: GetTransactionsResponse<RadixConfig> =
             GetTransactionsResponse::new(vec![tx1.clone(), tx2.clone()]);
         assert_eq!(response.count(), 2);
         assert!(!response.is_empty());
@@ -190,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_empty_response() {
-        let response: GetTransactionsResponse = GetTransactionsResponse::empty();
+        let response: GetTransactionsResponse<RadixConfig> = GetTransactionsResponse::empty();
         assert_eq!(response.count(), 0);
         assert!(response.is_empty());
     }
@@ -200,11 +199,11 @@ mod tests {
         let tx1 = Arc::new(test_transaction(1));
         let tx2 = Arc::new(test_transaction(2));
 
-        let response: GetTransactionsResponse =
+        let response: GetTransactionsResponse<RadixConfig> =
             GetTransactionsResponse::new(vec![tx1.clone(), tx2.clone()]);
 
         let encoded = basic_encode(&response).expect("encode");
-        let decoded: GetTransactionsResponse = basic_decode(&encoded).expect("decode");
+        let decoded: GetTransactionsResponse<RadixConfig> = basic_decode(&encoded).expect("decode");
 
         assert_eq!(response, decoded);
     }

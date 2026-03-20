@@ -833,9 +833,10 @@ impl ProvisionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_radix_config::RadixConfig;
     use hyperscale_types::{
-        bls_keypair_from_seed, BlockHeader, Bls12381G1PrivateKey, ConcreteConfig,
-        QuorumCertificate, TopologySnapshot, ValidatorInfo, ValidatorSet,
+        bls_keypair_from_seed, BlockHeader, Bls12381G1PrivateKey, QuorumCertificate,
+        TopologySnapshot, ValidatorInfo, ValidatorSet,
     };
     use std::sync::Arc;
 
@@ -923,7 +924,7 @@ mod tests {
         let header = make_committed_header(ShardGroupId(1), 10);
         let sender = ValidatorId(3);
         let actions =
-            coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header, sender);
+            coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, sender);
         assert!(actions.is_empty());
 
         // Should be in unverified buffer
@@ -940,7 +941,7 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new();
 
         let header = make_committed_header(ShardGroupId(0), 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header, ValidatorId(0));
+        coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, ValidatorId(0));
 
         assert_eq!(coordinator.unverified_remote_header_count(), 0);
     }
@@ -951,18 +952,18 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new();
 
         let sender = ValidatorId(3);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             make_committed_header(ShardGroupId(1), 10),
             sender,
         );
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             make_committed_header(ShardGroupId(1), 11),
             sender,
         );
         // Use a different sender for shard 2 (since our topology has different validators per shard)
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             make_committed_header(ShardGroupId(2), 10),
             ValidatorId(4),
@@ -980,8 +981,8 @@ mod tests {
         let header2 = make_committed_header(ShardGroupId(1), 10);
 
         // Two different validators send headers for the same (shard, height)
-        coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header1, ValidatorId(3));
-        coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header2, ValidatorId(4));
+        coordinator.on_remote_block_committed::<RadixConfig>(&topology, header1, ValidatorId(3));
+        coordinator.on_remote_block_committed::<RadixConfig>(&topology, header2, ValidatorId(4));
 
         // Both should be stored (different sender keys)
         assert_eq!(coordinator.unverified_remote_header_count(), 2);
@@ -993,12 +994,12 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new();
 
         let sender = ValidatorId(3);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             make_committed_header(ShardGroupId(1), 10),
             sender,
         );
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             make_committed_header(ShardGroupId(1), 10),
             sender,
@@ -1033,7 +1034,7 @@ mod tests {
         qc.shard_group_id = ShardGroupId(1);
         let committed = CommittedBlockHeader { header, qc };
 
-        let actions = coordinator.on_remote_block_committed::<ConcreteConfig>(
+        let actions = coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             committed,
             ValidatorId(3),
@@ -1068,7 +1069,7 @@ mod tests {
         qc.shard_group_id = ShardGroupId(2); // Mismatch!
         let committed = CommittedBlockHeader { header, qc };
 
-        let actions = coordinator.on_remote_block_committed::<ConcreteConfig>(
+        let actions = coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             committed,
             ValidatorId(3),
@@ -1118,12 +1119,12 @@ mod tests {
 
         // First: header arrives
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header, ValidatorId(3));
+        coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, ValidatorId(3));
 
         // Then: provision arrives — should emit VerifyStateProvisions
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
         let actions =
-            coordinator.on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision]);
+            coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision]);
 
         assert_eq!(actions.len(), 1);
         assert!(matches!(
@@ -1146,7 +1147,7 @@ mod tests {
         // Provision arrives before header — should buffer
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
         let actions =
-            coordinator.on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision]);
+            coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision]);
 
         assert!(actions.is_empty());
         // Should still auto-register
@@ -1163,15 +1164,12 @@ mod tests {
 
         // Provision arrives first — buffered
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator.on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision]);
 
         // Then header arrives — should trigger verification of buffered provision
         let header = make_committed_header(source_shard, 10);
-        let actions = coordinator.on_remote_block_committed::<ConcreteConfig>(
-            &topology,
-            header,
-            ValidatorId(3),
-        );
+        let actions =
+            coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, ValidatorId(3));
 
         assert_eq!(actions.len(), 1);
         assert!(matches!(
@@ -1192,7 +1190,7 @@ mod tests {
             10,
         );
         let actions =
-            coordinator.on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision]);
+            coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision]);
 
         assert!(actions.is_empty());
         // Should NOT auto-register
@@ -1209,18 +1207,17 @@ mod tests {
 
         // Setup: header + provision + verification
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             header.clone(),
             ValidatorId(3),
         );
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator
-            .on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision.clone()]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision.clone()]);
 
         // Simulate successful verification
         let result = make_verified_result(provision.clone(), true);
-        coordinator.on_state_provisions_verified::<ConcreteConfig>(
+        coordinator.on_state_provisions_verified::<RadixConfig>(
             &topology,
             vec![result],
             Some(header),
@@ -1228,7 +1225,7 @@ mod tests {
 
         // Second provision for same (tx, shard) should be ignored
         let actions =
-            coordinator.on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision]);
+            coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision]);
         assert!(actions.is_empty());
     }
 
@@ -1242,18 +1239,17 @@ mod tests {
 
         // Setup
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             header.clone(),
             ValidatorId(3),
         );
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator
-            .on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision.clone()]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision.clone()]);
 
         // Verify
         let result = make_verified_result(provision, true);
-        let actions = coordinator.on_state_provisions_verified::<ConcreteConfig>(
+        let actions = coordinator.on_state_provisions_verified::<RadixConfig>(
             &topology,
             vec![result],
             Some(header),
@@ -1285,18 +1281,14 @@ mod tests {
         let source_shard = ShardGroupId(1);
 
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header, ValidatorId(3));
+        coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, ValidatorId(3));
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator
-            .on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision.clone()]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision.clone()]);
 
         // Verification fails — no committed_header returned
         let result = make_verified_result(provision, false);
-        let actions = coordinator.on_state_provisions_verified::<ConcreteConfig>(
-            &topology,
-            vec![result],
-            None,
-        );
+        let actions =
+            coordinator.on_state_provisions_verified::<RadixConfig>(&topology, vec![result], None);
 
         assert!(actions.is_empty());
         assert!(!coordinator.has_any_verified_provisions(&tx_hash));
@@ -1313,19 +1305,19 @@ mod tests {
 
         // Register tx requiring provisions from two shards
         let registration = make_registration(vec![shard1, shard2]);
-        coordinator.on_tx_registered::<ConcreteConfig>(tx_hash, registration);
+        coordinator.on_tx_registered::<RadixConfig>(tx_hash, registration);
 
         // Verify first shard
         let header1 = make_committed_header(shard1, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             header1.clone(),
             ValidatorId(3),
         );
         let prov1 = make_provision(tx_hash, shard1, ShardGroupId(0), 10);
-        coordinator.on_state_provisions_received::<ConcreteConfig>(&topology, vec![prov1.clone()]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![prov1.clone()]);
         let result1 = make_verified_result(prov1, true);
-        let actions = coordinator.on_state_provisions_verified::<ConcreteConfig>(
+        let actions = coordinator.on_state_provisions_verified::<RadixConfig>(
             &topology,
             vec![result1],
             Some(header1),
@@ -1339,15 +1331,15 @@ mod tests {
 
         // Verify second shard
         let header2 = make_committed_header(shard2, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             header2.clone(),
             ValidatorId(4),
         );
         let prov2 = make_provision(tx_hash, shard2, ShardGroupId(0), 10);
-        coordinator.on_state_provisions_received::<ConcreteConfig>(&topology, vec![prov2.clone()]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![prov2.clone()]);
         let result2 = make_verified_result(prov2, true);
-        let actions = coordinator.on_state_provisions_verified::<ConcreteConfig>(
+        let actions = coordinator.on_state_provisions_verified::<RadixConfig>(
             &topology,
             vec![result2],
             Some(header2),
@@ -1384,15 +1376,14 @@ mod tests {
 
         // Setup + verify
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             header.clone(),
             ValidatorId(3),
         );
-        coordinator
-            .on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision.clone()]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision.clone()]);
         let result = make_verified_result(provision, true);
-        coordinator.on_state_provisions_verified::<ConcreteConfig>(
+        coordinator.on_state_provisions_verified::<RadixConfig>(
             &topology,
             vec![result],
             Some(header),
@@ -1417,16 +1408,15 @@ mod tests {
 
         // Setup + verify
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             header.clone(),
             ValidatorId(3),
         );
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator
-            .on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision.clone()]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision.clone()]);
         let result = make_verified_result(provision, true);
-        coordinator.on_state_provisions_verified::<ConcreteConfig>(
+        coordinator.on_state_provisions_verified::<RadixConfig>(
             &topology,
             vec![result],
             Some(header),
@@ -1448,7 +1438,7 @@ mod tests {
 
         let source_shard = ShardGroupId(1);
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header, ValidatorId(3));
+        coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, ValidatorId(3));
 
         // Send batch of 3 provisions from the same block
         let provisions: Vec<_> = (0..3)
@@ -1463,7 +1453,7 @@ mod tests {
             .collect();
 
         let actions =
-            coordinator.on_state_provisions_received::<ConcreteConfig>(&topology, provisions);
+            coordinator.on_state_provisions_received::<RadixConfig>(&topology, provisions);
 
         // Should emit exactly ONE VerifyStateProvisions action with all 3 provisions
         assert_eq!(actions.len(), 1);
@@ -1484,8 +1474,8 @@ mod tests {
 
         // Two different validators send headers for the same (shard, height)
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header, ValidatorId(3));
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, ValidatorId(3));
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             make_committed_header(source_shard, 10),
             ValidatorId(4),
@@ -1495,7 +1485,7 @@ mod tests {
         // Provision arrives — should send BOTH candidates
         let provision = make_provision(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
         let actions =
-            coordinator.on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision]);
+            coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision]);
 
         assert_eq!(actions.len(), 1);
         match &actions[0] {
@@ -1515,7 +1505,7 @@ mod tests {
 
         let source_shard = ShardGroupId(1);
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             header.clone(),
             ValidatorId(3),
@@ -1523,9 +1513,9 @@ mod tests {
 
         // First provision verifies (promotes header to verified)
         let prov1 = make_provision(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
-        coordinator.on_state_provisions_received::<ConcreteConfig>(&topology, vec![prov1.clone()]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![prov1.clone()]);
         let result = make_verified_result(prov1, true);
-        coordinator.on_state_provisions_verified::<ConcreteConfig>(
+        coordinator.on_state_provisions_verified::<RadixConfig>(
             &topology,
             vec![result],
             Some(header.clone()),
@@ -1534,7 +1524,7 @@ mod tests {
         // Second provision for different tx at same (shard, height)
         let prov2 = make_provision(Hash::from_bytes(b"tx2"), source_shard, ShardGroupId(0), 10);
         let actions =
-            coordinator.on_state_provisions_received::<ConcreteConfig>(&topology, vec![prov2]);
+            coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![prov2]);
 
         // Should send only the verified header (single candidate)
         assert_eq!(actions.len(), 1);
@@ -1555,7 +1545,7 @@ mod tests {
 
         let source_shard = ShardGroupId(1);
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             header.clone(),
             ValidatorId(3),
@@ -1574,7 +1564,7 @@ mod tests {
             10,
         );
 
-        coordinator.on_state_provisions_received::<ConcreteConfig>(
+        coordinator.on_state_provisions_received::<RadixConfig>(
             &topology,
             vec![prov_ok.clone(), prov_bad.clone()],
         );
@@ -1584,7 +1574,7 @@ mod tests {
             make_verified_result(prov_ok.clone(), true),
             make_verified_result(prov_bad, false),
         ];
-        let actions = coordinator.on_state_provisions_verified::<ConcreteConfig>(
+        let actions = coordinator.on_state_provisions_verified::<RadixConfig>(
             &topology,
             results,
             Some(header),
@@ -1618,7 +1608,7 @@ mod tests {
         let sender = ValidatorId(3);
         // Store headers at heights 1..50 for shard 1
         for h in 1..=50 {
-            coordinator.on_remote_block_committed::<ConcreteConfig>(
+            coordinator.on_remote_block_committed::<RadixConfig>(
                 &topology,
                 make_committed_header(ShardGroupId(1), h),
                 sender,
@@ -1627,7 +1617,7 @@ mod tests {
         assert_eq!(coordinator.unverified_remote_header_count(), 50);
 
         // Insert a header at height 200 — prunes entries below height 100
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             make_committed_header(ShardGroupId(1), 200),
             sender,
@@ -1669,7 +1659,7 @@ mod tests {
     }
 
     /// Make a minimal Block at the given height for on_block_committed calls.
-    fn make_block(height: u64) -> hyperscale_types::Block {
+    fn make_block(height: u64) -> hyperscale_types::Block<RadixConfig> {
         hyperscale_types::Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO)
             .tap_mut(|b| b.header.height = BlockHeight(height))
     }
@@ -1692,7 +1682,7 @@ mod tests {
 
         // Remote shard 1 block targets shard 0 (our shard)
         let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(0)]);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header, ValidatorId(3));
+        coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, ValidatorId(3));
 
         // Should have one expected provision
         assert_eq!(coordinator.expected_provisions.len(), 1);
@@ -1705,7 +1695,7 @@ mod tests {
 
         // Remote shard 1 block targets shard 2 (NOT our shard)
         let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(2)]);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header, ValidatorId(3));
+        coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, ValidatorId(3));
 
         assert_eq!(coordinator.expected_provisions.len(), 0);
     }
@@ -1717,7 +1707,7 @@ mod tests {
 
         let source_shard = ShardGroupId(1);
         let header = make_committed_header_with_targets(source_shard, 10, vec![ShardGroupId(0)]);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             header.clone(),
             ValidatorId(3),
@@ -1726,10 +1716,9 @@ mod tests {
 
         // Provision arrives and is verified
         let provision = make_provision(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
-        coordinator
-            .on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision.clone()]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision.clone()]);
         let result = make_verified_result(provision, true);
-        coordinator.on_state_provisions_verified::<ConcreteConfig>(
+        coordinator.on_state_provisions_verified::<RadixConfig>(
             &topology,
             vec![result],
             Some(header),
@@ -1746,18 +1735,18 @@ mod tests {
 
         // Remote header arrives targeting our shard at local height 0
         let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(0)]);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header, ValidatorId(3));
+        coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, ValidatorId(3));
 
         // Advance blocks — should not emit before the timeout threshold
         for h in 1..=9 {
             let block = make_block(h);
-            let actions = coordinator.on_block_committed::<ConcreteConfig>(&topology, &block);
+            let actions = coordinator.on_block_committed::<RadixConfig>(&topology, &block);
             assert!(actions.is_empty(), "Should not emit request at height {h}");
         }
 
         // At height 10, age = 10 - 0 = 10 >= PROVISION_FALLBACK_TIMEOUT_BLOCKS → fires
         let block = make_block(10);
-        let actions = coordinator.on_block_committed::<ConcreteConfig>(&topology, &block);
+        let actions = coordinator.on_block_committed::<RadixConfig>(&topology, &block);
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
@@ -1778,17 +1767,16 @@ mod tests {
         let mut coordinator = ProvisionCoordinator::new();
 
         let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(0)]);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header, ValidatorId(3));
+        coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, ValidatorId(3));
 
         // Advance past timeout to trigger the one-time request at height 10
         for h in 1..=10 {
-            coordinator.on_block_committed::<ConcreteConfig>(&topology, &make_block(h));
+            coordinator.on_block_committed::<RadixConfig>(&topology, &make_block(h));
         }
 
         // Coordinator is fire-and-forget: no further emissions at any height.
         for h in 11..=100 {
-            let actions =
-                coordinator.on_block_committed::<ConcreteConfig>(&topology, &make_block(h));
+            let actions = coordinator.on_block_committed::<RadixConfig>(&topology, &make_block(h));
             assert!(
                 actions.is_empty(),
                 "Should never re-emit after initial request (height {h})"
@@ -1803,7 +1791,7 @@ mod tests {
 
         let source_shard = ShardGroupId(1);
         let header = make_committed_header_with_targets(source_shard, 10, vec![ShardGroupId(0)]);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             header.clone(),
             ValidatorId(3),
@@ -1811,15 +1799,14 @@ mod tests {
 
         // Advance a few blocks
         for h in 1..=5 {
-            coordinator.on_block_committed::<ConcreteConfig>(&topology, &make_block(h));
+            coordinator.on_block_committed::<RadixConfig>(&topology, &make_block(h));
         }
 
         // Provision arrives and is verified before timeout
         let provision = make_provision(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
-        coordinator
-            .on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision.clone()]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision.clone()]);
         let result = make_verified_result(provision, true);
-        coordinator.on_state_provisions_verified::<ConcreteConfig>(
+        coordinator.on_state_provisions_verified::<RadixConfig>(
             &topology,
             vec![result],
             Some(header),
@@ -1827,8 +1814,7 @@ mod tests {
 
         // Continue past timeout threshold
         for h in 6..=15 {
-            let actions =
-                coordinator.on_block_committed::<ConcreteConfig>(&topology, &make_block(h));
+            let actions = coordinator.on_block_committed::<RadixConfig>(&topology, &make_block(h));
             assert!(
                 actions.is_empty(),
                 "Should not request at height {h} (provision already verified)"
@@ -1846,11 +1832,7 @@ mod tests {
         // Receive headers at heights 1..=50 targeting our shard
         for h in 1..=50 {
             let header = make_committed_header_with_targets(source_shard, h, vec![ShardGroupId(0)]);
-            coordinator.on_remote_block_committed::<ConcreteConfig>(
-                &topology,
-                header,
-                ValidatorId(3),
-            );
+            coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, ValidatorId(3));
         }
         assert_eq!(coordinator.expected_provisions.len(), 50);
 
@@ -1864,14 +1846,14 @@ mod tests {
             .unverified_remote_headers
             .remove(&(source_shard, BlockHeight(10)));
         let actions =
-            coordinator.on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision]);
+            coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision]);
         assert!(actions.is_empty(), "Should buffer (no header)");
         assert_eq!(coordinator.pending_provisions.len(), 1);
 
         // Now advance the remote header tip to 200 — cutoff = 100
         // Heights 1..50 are all below cutoff, should all be pruned.
         let header = make_committed_header_with_targets(source_shard, 200, vec![ShardGroupId(0)]);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header, ValidatorId(3));
+        coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, ValidatorId(3));
 
         // Only height 200 should remain in expected_provisions
         assert_eq!(
@@ -1905,16 +1887,15 @@ mod tests {
 
         // Setup: header + provision + verification
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             header.clone(),
             ValidatorId(3),
         );
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator
-            .on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision.clone()]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision.clone()]);
         let result = make_verified_result(provision.clone(), true);
-        coordinator.on_state_provisions_verified::<ConcreteConfig>(
+        coordinator.on_state_provisions_verified::<RadixConfig>(
             &topology,
             vec![result],
             Some(header.clone()),
@@ -1933,7 +1914,7 @@ mod tests {
                 shard_proofs: std::collections::BTreeMap::new(),
             },
         ));
-        coordinator.on_block_committed::<ConcreteConfig>(&topology, &block);
+        coordinator.on_block_committed::<RadixConfig>(&topology, &block);
 
         // Tx should be cleaned up
         assert!(!coordinator.is_registered(&tx_hash));
@@ -1942,7 +1923,7 @@ mod tests {
         // Late provision arrives — should be blocked by tombstone
         let late_provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
         let actions = coordinator
-            .on_state_provisions_received::<ConcreteConfig>(&topology, vec![late_provision]);
+            .on_state_provisions_received::<RadixConfig>(&topology, vec![late_provision]);
         assert!(actions.is_empty());
 
         // Tx should NOT be re-registered
@@ -1965,7 +1946,7 @@ mod tests {
 
         // Register and cleanup at height 5
         coordinator
-            .on_tx_registered::<ConcreteConfig>(tx_hash, make_registration(vec![ShardGroupId(1)]));
+            .on_tx_registered::<RadixConfig>(tx_hash, make_registration(vec![ShardGroupId(1)]));
         let mut block = make_block(5);
         block.certificates.push(std::sync::Arc::new(
             hyperscale_types::TransactionCertificate {
@@ -1974,14 +1955,14 @@ mod tests {
                 shard_proofs: std::collections::BTreeMap::new(),
             },
         ));
-        coordinator.on_block_committed::<ConcreteConfig>(&topology, &block);
+        coordinator.on_block_committed::<RadixConfig>(&topology, &block);
 
         // Tombstone should exist
         assert!(coordinator.completed_tombstones.contains_key(&tx_hash));
 
         // Advance past retention window (100 blocks)
         let block = make_block(106);
-        coordinator.on_block_committed::<ConcreteConfig>(&topology, &block);
+        coordinator.on_block_committed::<RadixConfig>(&topology, &block);
 
         // Tombstone should be pruned
         assert!(
@@ -2003,7 +1984,7 @@ mod tests {
 
         // Remote header targeting our shard — creates expected_provision entry
         let header = make_committed_header_with_targets(source_shard, 10, vec![ShardGroupId(0)]);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             header.clone(),
             ValidatorId(3),
@@ -2012,10 +1993,9 @@ mod tests {
 
         // Provision arrives and is verified
         let provision = make_provision(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 10);
-        coordinator
-            .on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision.clone()]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision.clone()]);
         let result = make_verified_result(provision, true);
-        let actions = coordinator.on_state_provisions_verified::<ConcreteConfig>(
+        let actions = coordinator.on_state_provisions_verified::<RadixConfig>(
             &topology,
             vec![result],
             Some(header),
@@ -2048,16 +2028,15 @@ mod tests {
 
         // Setup: header + provision + verification
         let header = make_committed_header(source_shard, 10);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(
+        coordinator.on_remote_block_committed::<RadixConfig>(
             &topology,
             header.clone(),
             ValidatorId(3),
         );
         let provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
-        coordinator
-            .on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision.clone()]);
+        coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision.clone()]);
         let result = make_verified_result(provision, true);
-        coordinator.on_state_provisions_verified::<ConcreteConfig>(
+        coordinator.on_state_provisions_verified::<RadixConfig>(
             &topology,
             vec![result],
             Some(header),
@@ -2075,7 +2054,7 @@ mod tests {
                 shard_proofs: std::collections::BTreeMap::new(),
             },
         ));
-        coordinator.on_block_committed::<ConcreteConfig>(&topology, &block);
+        coordinator.on_block_committed::<RadixConfig>(&topology, &block);
 
         // Empty shard entry should be removed entirely
         assert!(
@@ -2093,12 +2072,12 @@ mod tests {
 
         // Advance remote header tip to 200 so cutoff = 100
         let header = make_committed_header_with_targets(source_shard, 200, vec![ShardGroupId(0)]);
-        coordinator.on_remote_block_committed::<ConcreteConfig>(&topology, header, ValidatorId(3));
+        coordinator.on_remote_block_committed::<RadixConfig>(&topology, header, ValidatorId(3));
 
         // Provision arrives for height 50 (below cutoff 100) — should be discarded
         let provision = make_provision(Hash::from_bytes(b"tx1"), source_shard, ShardGroupId(0), 50);
         let actions =
-            coordinator.on_state_provisions_received::<ConcreteConfig>(&topology, vec![provision]);
+            coordinator.on_state_provisions_received::<RadixConfig>(&topology, vec![provision]);
         assert!(actions.is_empty());
         assert_eq!(
             coordinator.pending_provisions.len(),

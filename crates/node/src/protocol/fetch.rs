@@ -16,7 +16,7 @@ use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResp
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ConsensusStore;
 use hyperscale_types::{
-    ConcreteConfig, ConsensusTransaction, Hash, TransactionCertificate, TypeConfig, ValidatorId,
+    ConsensusTransaction, Hash, TransactionCertificate, TypeConfig, ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use serde::Serialize;
@@ -79,7 +79,7 @@ pub struct FetchStatus {
 
 /// Inputs to the fetch protocol state machine.
 #[derive(Debug)]
-pub enum FetchInput<C: TypeConfig = ConcreteConfig> {
+pub enum FetchInput<C: TypeConfig> {
     /// Request transactions for a pending block.
     RequestTransactions {
         block_hash: Hash,
@@ -116,7 +116,7 @@ pub enum FetchInput<C: TypeConfig = ConcreteConfig> {
 
 /// Outputs from the fetch protocol state machine.
 #[derive(Debug)]
-pub enum FetchOutput<C: TypeConfig = ConcreteConfig> {
+pub enum FetchOutput<C: TypeConfig> {
     /// Request the runner to fetch transactions.
     FetchTransactions {
         block_hash: Hash,
@@ -519,13 +519,11 @@ const MAX_ITEMS_PER_RESPONSE: usize = 500;
 ///
 /// Checks the in-memory cache first (for recently received but not yet
 /// committed transactions), then falls back to storage.
-pub fn serve_transaction_request<
-    C: TypeConfig<Transaction = hyperscale_types::RoutableTransaction>,
->(
+pub fn serve_transaction_request<C: TypeConfig>(
     storage: &impl ConsensusStore<C>,
     tx_cache: &QuickCache<Hash, Arc<C::Transaction>>,
     req: GetTransactionsRequest,
-) -> GetTransactionsResponse {
+) -> GetTransactionsResponse<C> {
     let requested_count = req.tx_hashes.len();
     trace!(
         block_hash = ?req.block_hash,
@@ -573,13 +571,11 @@ pub fn serve_transaction_request<
 /// Checks the in-memory cache first (for recently built but not yet
 /// persisted certificates), then falls back to storage. Includes ledger
 /// receipts for each found certificate.
-pub fn serve_certificate_request<
-    C: TypeConfig<ExecutionReceipt = hyperscale_types::LedgerTransactionReceipt>,
->(
+pub fn serve_certificate_request<C: TypeConfig>(
     storage: &impl ConsensusStore<C>,
     cert_cache: &QuickCache<Hash, Arc<TransactionCertificate>>,
     req: GetCertificatesRequest,
-) -> GetCertificatesResponse {
+) -> GetCertificatesResponse<C> {
     let requested_count = req.cert_hashes.len();
     trace!(
         block_hash = ?req.block_hash,
@@ -611,7 +607,7 @@ pub fn serve_certificate_request<
     for cert in &found {
         let tx_hash = cert.transaction_hash;
         if let Some(receipt) = storage.get_ledger_receipt(&tx_hash) {
-            ledger_receipts.push(hyperscale_types::LedgerReceiptEntry {
+            ledger_receipts.push(hyperscale_types::LedgerReceiptEntry::<C> {
                 tx_hash,
                 receipt: (*receipt).clone(),
             });
@@ -633,6 +629,7 @@ pub fn serve_certificate_request<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_radix_config::RadixConfig;
 
     #[test]
     fn test_fetch_config_defaults() {
@@ -651,14 +648,14 @@ mod tests {
             Hash::from_bytes(b"tx2_hash_data_here"),
         ];
 
-        protocol.handle::<ConcreteConfig>(FetchInput::RequestTransactions {
+        protocol.handle::<RadixConfig>(FetchInput::RequestTransactions {
             block_hash,
             proposer: ValidatorId(1),
             tx_hashes: hashes.clone(),
         });
 
         // Tick should emit FetchTransactions
-        let outputs = protocol.handle::<ConcreteConfig>(FetchInput::Tick);
+        let outputs = protocol.handle::<RadixConfig>(FetchInput::Tick);
         assert!(!outputs.is_empty());
         assert!(outputs
             .iter()

@@ -1,7 +1,7 @@
 //! Block and BlockHeader types for consensus.
 
 use crate::{
-    compute_merkle_root, BlockHeight, CommitmentProof, ConcreteConfig, ConsensusTransaction, Hash,
+    compute_merkle_root, BlockHeight, CommitmentProof, ConsensusTransaction, Hash,
     QuorumCertificate, ShardGroupId, TransactionAbort, TransactionCertificate, TransactionDefer,
     TypeConfig, ValidatorId,
 };
@@ -199,7 +199,7 @@ impl BlockHeader {
 /// Transactions and certificates are stored as `Arc` for efficient cloning
 /// and sharing across the system. When serialized (for storage or network),
 /// the underlying data is written directly.
-pub struct Block<C: TypeConfig = ConcreteConfig> {
+pub struct Block<C: TypeConfig> {
     /// Block header with consensus metadata.
     pub header: BlockHeader,
 
@@ -243,25 +243,6 @@ pub struct Block<C: TypeConfig = ConcreteConfig> {
     /// Maps transaction hash to its CommitmentProof. These proofs justify
     /// why transactions are in the priority section.
     pub commitment_proofs: HashMap<Hash, CommitmentProof>,
-}
-
-impl<C: TypeConfig> Block<C> {
-    /// Re-tag this block with a different [`TypeConfig`] that shares the
-    /// same `Transaction` associated type. This is a zero-cost, field-by-field
-    /// move used at generic/concrete boundaries (e.g. network deserialization
-    /// produces `Block<ConcreteConfig>` but `IoLoop<Cfg>` needs `Block<Cfg::C>`).
-    pub fn reconfig<C2: TypeConfig<Transaction = C::Transaction>>(self) -> Block<C2> {
-        Block {
-            header: self.header,
-            retry_transactions: self.retry_transactions,
-            priority_transactions: self.priority_transactions,
-            transactions: self.transactions,
-            certificates: self.certificates,
-            deferred: self.deferred,
-            aborted: self.aborted,
-            commitment_proofs: self.commitment_proofs,
-        }
-    }
 }
 
 impl<C: TypeConfig> std::fmt::Debug for Block<C> {
@@ -832,7 +813,38 @@ impl CommittedBlockHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RoutableTransaction;
+    use crate::{DatabaseUpdates, LedgerTransactionReceipt, RoutableTransaction};
+
+    /// Lightweight test TypeConfig for block tests.
+    #[derive(Debug, Clone)]
+    struct TestConfig;
+    impl TypeConfig for TestConfig {
+        type Transaction = RoutableTransaction;
+        type ExecutionReceipt = LedgerTransactionReceipt;
+        type StateUpdate = DatabaseUpdates;
+        fn merge_state_updates(_: &[DatabaseUpdates]) -> DatabaseUpdates {
+            DatabaseUpdates::default()
+        }
+        fn filter_state_update_to_shard(
+            u: &DatabaseUpdates,
+            _: ShardGroupId,
+            _: u64,
+        ) -> DatabaseUpdates {
+            u.clone()
+        }
+        fn filter_state_update_to_writes(
+            u: &DatabaseUpdates,
+            _: &[crate::NodeId],
+        ) -> DatabaseUpdates {
+            u.clone()
+        }
+        fn extract_write_nodes(_: &DatabaseUpdates) -> Vec<crate::NodeId> {
+            vec![]
+        }
+        fn receipt_to_state_update(_: &LedgerTransactionReceipt) -> DatabaseUpdates {
+            DatabaseUpdates::default()
+        }
+    }
 
     #[test]
     fn test_block_header_hash_deterministic() {
@@ -858,7 +870,8 @@ mod tests {
 
     #[test]
     fn test_genesis_block() {
-        let genesis: Block = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
+        let genesis: Block<TestConfig> =
+            Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
 
         assert!(genesis.is_genesis());
         assert_eq!(genesis.height(), BlockHeight(0));
@@ -869,7 +882,7 @@ mod tests {
 
     #[test]
     fn test_compute_transaction_root_empty() {
-        let root = compute_transaction_root::<ConcreteConfig>(&[], &[], &[]);
+        let root = compute_transaction_root::<TestConfig>(&[], &[], &[]);
         assert_eq!(root, Hash::ZERO);
     }
 
@@ -885,8 +898,8 @@ mod tests {
         let notarized = crate::sign_and_notarize(manifest, &network, 1, &key).unwrap();
         let tx = Arc::new(RoutableTransaction::try_from(notarized).unwrap());
 
-        let root1 = compute_transaction_root::<ConcreteConfig>(&[], &[], std::slice::from_ref(&tx));
-        let root2 = compute_transaction_root::<ConcreteConfig>(&[], &[], std::slice::from_ref(&tx));
+        let root1 = compute_transaction_root::<TestConfig>(&[], &[], std::slice::from_ref(&tx));
+        let root2 = compute_transaction_root::<TestConfig>(&[], &[], std::slice::from_ref(&tx));
         assert_eq!(root1, root2);
         assert_ne!(root1, Hash::ZERO);
     }
@@ -905,11 +918,11 @@ mod tests {
 
         // Same tx in different slots should produce different roots
         let root_retry =
-            compute_transaction_root::<ConcreteConfig>(std::slice::from_ref(&tx), &[], &[]);
+            compute_transaction_root::<TestConfig>(std::slice::from_ref(&tx), &[], &[]);
         let root_priority =
-            compute_transaction_root::<ConcreteConfig>(&[], std::slice::from_ref(&tx), &[]);
+            compute_transaction_root::<TestConfig>(&[], std::slice::from_ref(&tx), &[]);
         let root_normal =
-            compute_transaction_root::<ConcreteConfig>(&[], &[], std::slice::from_ref(&tx));
+            compute_transaction_root::<TestConfig>(&[], &[], std::slice::from_ref(&tx));
 
         assert_ne!(root_retry, root_priority);
         assert_ne!(root_priority, root_normal);
@@ -994,7 +1007,8 @@ mod tests {
 
     #[test]
     fn test_genesis_receipt_root_is_zero() {
-        let genesis: Block = Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
+        let genesis: Block<TestConfig> =
+            Block::genesis(ShardGroupId(0), ValidatorId(0), Hash::ZERO);
         assert_eq!(genesis.header.receipt_root, Hash::ZERO);
     }
 }

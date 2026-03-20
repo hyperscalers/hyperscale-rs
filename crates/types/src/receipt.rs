@@ -14,10 +14,11 @@
 use std::sync::Arc;
 
 use hyperscale_codec as sbor;
+use hyperscale_codec::prelude::*;
+use hyperscale_codec::{Decoder as _, Encoder as _};
 
 use crate::{
-    compute_merkle_root, ConcreteConfig, ConsensusExecutionReceipt, Hash, NodeId, PartitionNumber,
-    TypeConfig,
+    compute_merkle_root, ConsensusExecutionReceipt, Hash, NodeId, PartitionNumber, TypeConfig,
 };
 
 // ─── Outcome ─────────────────────────────────────────────────────────────────
@@ -225,10 +226,76 @@ impl LocalTransactionExecution {
 // ─── Network / Storage Types ─────────────────────────────────────────────────
 
 /// A ledger receipt paired with its transaction hash, for network responses.
-#[derive(Debug, Clone, PartialEq, Eq, sbor::prelude::BasicSbor)]
-pub struct LedgerReceiptEntry {
+#[derive(Debug, PartialEq, Eq)]
+pub struct LedgerReceiptEntry<C: TypeConfig> {
     pub tx_hash: Hash,
-    pub receipt: LedgerTransactionReceipt,
+    pub receipt: C::ExecutionReceipt,
+}
+
+impl<C: TypeConfig> Clone for LedgerReceiptEntry<C> {
+    fn clone(&self) -> Self {
+        Self {
+            tx_hash: self.tx_hash,
+            receipt: self.receipt.clone(),
+        }
+    }
+}
+
+// Manual SBOR impls for LedgerReceiptEntry<C> — the derive macro would
+// add incorrect bounds on C itself rather than C::ExecutionReceipt.
+
+impl<'a, C: TypeConfig> sbor::Encode<sbor::NoCustomValueKind, sbor::BasicEncoder<'a>>
+    for LedgerReceiptEntry<C>
+{
+    fn encode_value_kind(
+        &self,
+        encoder: &mut sbor::BasicEncoder<'a>,
+    ) -> Result<(), sbor::EncodeError> {
+        encoder.write_value_kind(sbor::ValueKind::Tuple)
+    }
+
+    fn encode_body(&self, encoder: &mut sbor::BasicEncoder<'a>) -> Result<(), sbor::EncodeError> {
+        encoder.write_size(2)?;
+        encoder.encode(&self.tx_hash)?;
+        encoder.encode(&self.receipt)?;
+        Ok(())
+    }
+}
+
+impl<'a, C: TypeConfig> sbor::Decode<sbor::NoCustomValueKind, sbor::BasicDecoder<'a>>
+    for LedgerReceiptEntry<C>
+{
+    fn decode_body_with_value_kind(
+        decoder: &mut sbor::BasicDecoder<'a>,
+        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
+    ) -> Result<Self, sbor::DecodeError> {
+        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
+        let length = decoder.read_size()?;
+        if length != 2 {
+            return Err(sbor::DecodeError::UnexpectedSize {
+                expected: 2,
+                actual: length,
+            });
+        }
+        let tx_hash: Hash = decoder.decode()?;
+        let receipt: C::ExecutionReceipt = decoder.decode()?;
+        Ok(Self { tx_hash, receipt })
+    }
+}
+
+impl<C: TypeConfig> sbor::Categorize<sbor::NoCustomValueKind> for LedgerReceiptEntry<C> {
+    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
+        sbor::ValueKind::Tuple
+    }
+}
+
+impl<C: TypeConfig> sbor::Describe<sbor::NoCustomTypeKind> for LedgerReceiptEntry<C> {
+    const TYPE_ID: sbor::RustTypeId =
+        sbor::RustTypeId::novel_with_code("LedgerReceiptEntry", &[], &[]);
+
+    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
+        sbor::TypeData::unnamed(sbor::TypeKind::Any)
+    }
 }
 
 /// A receipt bundle for storage — ledger receipt + optional local execution.
@@ -236,7 +303,7 @@ pub struct LedgerReceiptEntry {
 /// `local_execution` and `database_updates` are `None` when the receipt was
 /// fetched from a peer (sync/catch-up).
 #[derive(Debug)]
-pub struct ReceiptBundle<C: TypeConfig = ConcreteConfig> {
+pub struct ReceiptBundle<C: TypeConfig> {
     pub tx_hash: Hash,
     pub ledger_receipt: Arc<C::ExecutionReceipt>,
     /// Only populated when this node executed the transaction locally.
@@ -353,7 +420,7 @@ impl<C: TypeConfig> sbor::Describe<sbor::NoCustomTypeKind> for ReceiptBundle<C> 
 /// 1. Populate the ExecutionCache (in-memory, for block commit fast path)
 /// 2. Dispatch receipt storage to disk (via StoreReceiptBundles action)
 #[derive(Debug)]
-pub struct ExecutionResult<C: TypeConfig = ConcreteConfig> {
+pub struct ExecutionResult<C: TypeConfig> {
     /// Hash of the executed transaction.
     pub tx_hash: Hash,
     /// Pre-computed consensus receipt hash (outcome + event_root).
@@ -384,6 +451,35 @@ impl<C: TypeConfig> Clone for ExecutionResult<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DatabaseUpdates;
+
+    /// Lightweight test TypeConfig for receipt tests.
+    #[derive(Debug, Clone)]
+    struct TestConfig;
+    impl TypeConfig for TestConfig {
+        type Transaction = crate::RoutableTransaction;
+        type ExecutionReceipt = LedgerTransactionReceipt;
+        type StateUpdate = DatabaseUpdates;
+        fn merge_state_updates(_: &[DatabaseUpdates]) -> DatabaseUpdates {
+            DatabaseUpdates::default()
+        }
+        fn filter_state_update_to_shard(
+            u: &DatabaseUpdates,
+            _: crate::ShardGroupId,
+            _: u64,
+        ) -> DatabaseUpdates {
+            u.clone()
+        }
+        fn filter_state_update_to_writes(u: &DatabaseUpdates, _: &[NodeId]) -> DatabaseUpdates {
+            u.clone()
+        }
+        fn extract_write_nodes(_: &DatabaseUpdates) -> Vec<NodeId> {
+            vec![]
+        }
+        fn receipt_to_state_update(_: &LedgerTransactionReceipt) -> DatabaseUpdates {
+            DatabaseUpdates::default()
+        }
+    }
 
     fn make_event(seed: u8) -> ApplicationEvent {
         ApplicationEvent {
@@ -502,7 +598,7 @@ mod tests {
         });
 
         // Bundle without local execution (synced from peer)
-        let synced: ReceiptBundle = ReceiptBundle {
+        let synced: ReceiptBundle<TestConfig> = ReceiptBundle {
             tx_hash: Hash::from_bytes(b"synced_tx"),
             ledger_receipt: Arc::clone(&receipt),
             local_execution: None,
@@ -511,7 +607,7 @@ mod tests {
         assert!(synced.local_execution.is_none());
 
         // Bundle with local execution (executed locally)
-        let local: ReceiptBundle = ReceiptBundle {
+        let local: ReceiptBundle<TestConfig> = ReceiptBundle {
             tx_hash: Hash::from_bytes(b"local_tx"),
             ledger_receipt: receipt,
             local_execution: Some(LocalTransactionExecution::failure(Some(

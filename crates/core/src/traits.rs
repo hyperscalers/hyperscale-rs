@@ -1,7 +1,7 @@
 //! Core traits for state machines.
 
 use crate::{Action, ProtocolEvent};
-use hyperscale_types::{ConcreteConfig, TypeConfig};
+use hyperscale_types::TypeConfig;
 use std::time::Duration;
 
 /// A state machine that processes events.
@@ -32,7 +32,7 @@ use std::time::Duration;
 ///     }
 /// }
 /// ```
-pub trait StateMachine<C: TypeConfig = ConcreteConfig> {
+pub trait StateMachine<C: TypeConfig> {
     /// Process a protocol event, returning actions to perform.
     ///
     /// # Guarantees
