@@ -378,24 +378,32 @@ pub(crate) fn handle_delegated_action<
                 qc_start.elapsed().as_secs_f64(),
             );
 
-            // Check merkle proofs per provision against the verified header's state root.
+            // Verify merkle proofs against the verified header's state root.
+            // All provisions from the same block share a single batched proof,
+            // so we collect all entries and verify once instead of N times.
             let merkle_start = std::time::Instant::now();
-            let valid_flags: Vec<bool> = ctx.dispatch.map_local(&provisions, |provision| {
-                verified_header.as_ref().is_some_and(|header| {
-                    hyperscale_storage::proofs::verify_all_merkle_proofs(
-                        &provision.entries,
-                        &provision.proof,
-                        header.header.state_root,
-                    )
-                })
+            let all_valid = verified_header.as_ref().is_some_and(|header| {
+                // Collect all entries across all provisions for a single batched verify.
+                let all_entries: Vec<hyperscale_types::StateEntry> = provisions
+                    .iter()
+                    .flat_map(|p| p.entries.iter().cloned())
+                    .collect();
+                if all_entries.is_empty() {
+                    return true;
+                }
+                // Use the proof from the first provision (all share the same Arc).
+                hyperscale_storage::proofs::verify_all_merkle_proofs(
+                    &all_entries,
+                    &provisions[0].proof,
+                    header.header.state_root,
+                )
             });
             let results: Vec<ProvisionVerificationResult> = provisions
                 .into_iter()
-                .zip(valid_flags)
-                .map(|(provision, valid)| ProvisionVerificationResult {
+                .map(|provision| ProvisionVerificationResult {
                     tx_hash: provision.transaction_hash,
                     source_shard: provision.source_shard,
-                    valid,
+                    valid: all_valid,
                     provision,
                 })
                 .collect();
@@ -525,14 +533,15 @@ pub(crate) fn handle_delegated_action<
             use hyperscale_types::StateProvision;
             use std::collections::HashMap;
 
-            let mut batches: HashMap<ShardGroupId, Vec<StateProvision>> = HashMap::new();
+            // Phase 1: Fetch state entries for all transactions.
+            let mut per_tx: Vec<(
+                Hash,
+                Vec<ShardGroupId>,
+                Arc<Vec<hyperscale_types::StateEntry>>,
+            )> = Vec::with_capacity(requests.len());
+            let mut all_storage_keys: Vec<Vec<u8>> = Vec::new();
 
-            for req in requests {
-                // Fetch state entries from storage at the block's height (= JMT version).
-                // This is the proactive path — the proposer just committed this
-                // block, so the version should still be available. If it was
-                // garbage-collected (aggressive GC + slow dispatch), skip this
-                // request — the target shard will recover via fallback.
+            for req in &requests {
                 let entries =
                     match ctx
                         .executor
@@ -549,32 +558,46 @@ pub(crate) fn handle_delegated_action<
                             continue;
                         }
                     };
-                let storage_keys: Vec<Vec<u8>> =
-                    entries.iter().map(|e| e.storage_key.clone()).collect();
-                let proof = match ctx
-                    .storage
-                    .generate_merkle_proofs(&storage_keys, block_height.0)
-                {
-                    Some(p) => p,
-                    None => {
-                        tracing::warn!(
-                            block_height = block_height.0,
-                            tx_hash = ?req.tx_hash,
-                            "Proactive provision: proof generation failed (version unavailable), \
-                             skipping (target shard will use fallback recovery)"
-                        );
-                        continue;
-                    }
-                };
+                for e in &entries {
+                    all_storage_keys.push(e.storage_key.clone());
+                }
+                per_tx.push((req.tx_hash, req.target_shards.clone(), Arc::new(entries)));
+            }
 
-                // Wrap in Arc for efficient sharing across target shards
-                let entries = Arc::new(entries);
-                let proof = Arc::new(proof);
+            if per_tx.is_empty() {
+                return Some(DelegatedResult {
+                    events: vec![NodeInput::ProvisionsReady { batches: vec![] }],
+                    prepared_commit: None,
+                });
+            }
 
-                // Build a provision per target shard
-                for &target_shard in &req.target_shards {
+            // Phase 2: Generate ONE batched proof covering all entries across all transactions.
+            all_storage_keys.sort();
+            all_storage_keys.dedup();
+            let proof = match ctx
+                .storage
+                .generate_merkle_proofs(&all_storage_keys, block_height.0)
+            {
+                Some(p) => Arc::new(p),
+                None => {
+                    tracing::warn!(
+                        block_height = block_height.0,
+                        "Proactive provision: batched proof generation failed, \
+                         skipping all (target shards will use fallback recovery)"
+                    );
+                    return Some(DelegatedResult {
+                        events: vec![NodeInput::ProvisionsReady { batches: vec![] }],
+                        prepared_commit: None,
+                    });
+                }
+            };
+
+            // Phase 3: Build provisions sharing the single proof.
+            let mut batches: HashMap<ShardGroupId, Vec<StateProvision>> = HashMap::new();
+            for (tx_hash, target_shards, entries) in per_tx {
+                for &target_shard in &target_shards {
                     let provision = StateProvision {
-                        transaction_hash: req.tx_hash,
+                        transaction_hash: tx_hash,
                         target_shard,
                         source_shard,
                         block_height,

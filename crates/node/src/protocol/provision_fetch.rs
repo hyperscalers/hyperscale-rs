@@ -370,13 +370,19 @@ pub fn serve_provision_request(
     };
 
     let jmt_version = block.header.height.0;
-    let mut provisions = Vec::new();
 
     let all_txs = block
         .retry_transactions
         .iter()
         .chain(block.priority_transactions.iter())
         .chain(block.transactions.iter());
+
+    // Phase 1: Fetch state entries for all matching transactions.
+    let mut per_tx: Vec<(
+        hyperscale_types::Hash,
+        Arc<Vec<hyperscale_types::StateEntry>>,
+    )> = Vec::new();
+    let mut all_storage_keys: Vec<Vec<u8>> = Vec::new();
 
     for tx in all_txs {
         // Check if this transaction involves the requesting target shard
@@ -416,26 +422,43 @@ pub fn serve_provision_request(
                     return GetProvisionsResponse { provisions: None };
                 }
             };
-        let storage_keys: Vec<Vec<u8>> = entries.iter().map(|e| e.storage_key.clone()).collect();
-        let proof = match storage.generate_merkle_proofs(&storage_keys, jmt_version) {
-            Some(p) => p,
-            None => {
-                tracing::warn!(
-                    block_height = req.block_height.0,
-                    "Fallback provision: proof generation failed (version unavailable)"
-                );
-                continue;
-            }
-        };
+        for e in &entries {
+            all_storage_keys.push(e.storage_key.clone());
+        }
+        per_tx.push((tx.hash(), Arc::new(entries)));
+    }
 
+    if per_tx.is_empty() {
+        return GetProvisionsResponse {
+            provisions: Some(vec![]),
+        };
+    }
+
+    // Phase 2: Generate ONE batched proof covering all entries.
+    all_storage_keys.sort();
+    all_storage_keys.dedup();
+    let proof = match storage.generate_merkle_proofs(&all_storage_keys, jmt_version) {
+        Some(p) => Arc::new(p),
+        None => {
+            tracing::warn!(
+                block_height = req.block_height.0,
+                "Fallback provision: batched proof generation failed (version unavailable)"
+            );
+            return GetProvisionsResponse { provisions: None };
+        }
+    };
+
+    // Phase 3: Build provisions sharing the single proof.
+    let mut provisions = Vec::with_capacity(per_tx.len());
+    for (tx_hash, entries) in per_tx {
         provisions.push(StateProvision {
-            transaction_hash: tx.hash(),
+            transaction_hash: tx_hash,
             target_shard: req.target_shard,
             source_shard: local_shard,
             block_height: req.block_height,
             block_timestamp: block.header.timestamp,
-            entries: Arc::new(entries),
-            proof: Arc::new(proof),
+            entries,
+            proof: Arc::clone(&proof),
         });
     }
 
