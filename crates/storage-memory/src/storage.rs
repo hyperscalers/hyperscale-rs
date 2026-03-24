@@ -251,19 +251,10 @@ impl<D: Dispatch + 'static> SimStorage<D> {
             &self.dispatch,
         );
 
-        let associations = collected.apply_to(&s.tree_store);
+        collected.apply_to(&s.tree_store);
 
         s.current_block_height = new_version;
         s.current_root_hash = new_root;
-
-        // Resolve and store associations for historical queries.
-        // Because data and JMT are in the same struct under one lock,
-        // we can read substates directly without a second lock.
-        for a in associations {
-            if let Some((key, value)) = a.resolve(|pk, sk| ordmap_lookup(&s.data, pk, sk)) {
-                s.associations.insert(key, value);
-            }
-        }
     }
 
     /// Write only substate data (no JMT computation).
@@ -409,30 +400,33 @@ impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
         node_id: &NodeId,
         block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
-        // TODO(verkle): rewrite for verkle tree
-        // let entity_key = keys::node_entity_key(node_id);
-        //
-        // let s = self.state.read().unwrap();
-        //
-        // if block_height > s.current_block_height {
-        //     return None;
-        // }
-        //
-        // let entity_tier = EntityTier::new(&s.tree_store, Some(block_height));
-        // let partition_tier = entity_tier.get_entity_partition_tier(entity_key);
-        // let mut results = Vec::new();
-        //
-        // for substate_tier in partition_tier.into_iter_partition_substate_tiers_from(None) {
-        //     let partition_num = substate_tier.partition_key().partition_num;
-        //     for summary in substate_tier.into_iter_substate_summaries_from(None) {
-        //         if let Some(value) = s.associations.get(&summary.state_tree_leaf_key) {
-        //             results.push((partition_num, summary.sort_key, value.clone()));
-        //         }
-        //     }
-        // }
-        // Some(results)
-        let _ = (node_id, block_height);
-        todo!()
+        let entity_key = keys::node_entity_key(node_id);
+        let s = self.state.read().unwrap();
+
+        if block_height > s.current_block_height {
+            return None;
+        }
+
+        // Walk the verkle tree at the given version with the entity key as prefix.
+        // Leaf keys are: entity_key(50) || partition_num(1) || sort_key(var)
+        // Values are raw substate bytes stored directly in the tree.
+        let leaves = hyperscale_storage::jmt::list_leaves_with_prefix(
+            &s.tree_store,
+            block_height,
+            &entity_key,
+        )?;
+
+        let entity_len = entity_key.len();
+        let mut results = Vec::new();
+        for (leaf_key, value) in leaves {
+            if leaf_key.len() < entity_len + 1 {
+                continue; // malformed key
+            }
+            let partition_num = leaf_key[entity_len];
+            let sort_key = DbSortKey(leaf_key[entity_len + 1..].to_vec());
+            results.push((partition_num, sort_key, value));
+        }
+        Some(results)
     }
 
     fn generate_merkle_proofs(

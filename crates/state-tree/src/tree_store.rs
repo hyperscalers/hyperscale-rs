@@ -98,7 +98,8 @@ impl VersionedStoredNode {
 /// Physical tree node representation for persistence.
 ///
 /// This is the SBOR-serializable mirror of `jvt::Node`. Commitments are stored
-/// as 32-byte compressed curve points.
+/// as 64-byte uncompressed curve points (x, y coordinates) to avoid expensive
+/// field inversion + square root on every read.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, BasicCategorize, BasicEncode, BasicDecode)]
 pub enum StoredNode {
     Internal(StoredInternalNode),
@@ -109,8 +110,8 @@ pub enum StoredNode {
 #[derive(Clone, PartialEq, Eq, Hash, Debug, BasicCategorize, BasicEncode, BasicDecode)]
 pub struct StoredInternalNode {
     pub children: Vec<StoredChildEntry>,
-    /// Pedersen vector commitment, compressed to 32 bytes.
-    pub commitment: [u8; 32],
+    /// Pedersen vector commitment, uncompressed (64 bytes: x || y).
+    pub commitment: Vec<u8>,
 }
 
 /// A child reference in an internal node.
@@ -118,7 +119,7 @@ pub struct StoredInternalNode {
 pub struct StoredChildEntry {
     pub index: u8,
     pub version: u64,
-    pub commitment: [u8; 32],
+    pub commitment: Vec<u8>,
 }
 
 /// Extension-and-Suffix (EaS) node.
@@ -127,9 +128,9 @@ pub struct StoredEaSNode {
     pub stem: Vec<u8>,
     /// Sparse (suffix, value) pairs, sorted by suffix.
     pub values: Vec<(u8, Vec<u8>)>,
-    pub c1: [u8; 32],
-    pub c2: [u8; 32],
-    pub extension_commitment: [u8; 32],
+    pub c1: Vec<u8>,
+    pub c2: Vec<u8>,
+    pub extension_commitment: Vec<u8>,
 }
 
 /// A part of the tree that has become stale and needs pruning.
@@ -146,23 +147,34 @@ pub enum StaleTreePart {
 use ark_ed_on_bls12_381_bandersnatch::EdwardsAffine;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 
-fn commitment_to_bytes(c: jvt::Commitment) -> [u8; 32] {
-    let mut buf = [0u8; 32];
-    c.0.serialize_compressed(&mut buf[..])
+/// Serialize a commitment as uncompressed (64 bytes: x || y).
+/// No field inversion — just two coordinate writes.
+fn commitment_to_bytes(c: jvt::Commitment) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64);
+    c.0.serialize_uncompressed(&mut buf)
         .expect("Bandersnatch point serialization should never fail");
     buf
 }
 
-fn bytes_to_commitment(bytes: &[u8; 32]) -> jvt::Commitment {
+/// Deserialize a commitment from uncompressed bytes (64 bytes: x || y).
+/// No field inversion or square root — just two coordinate reads + on-curve check.
+fn bytes_to_commitment(bytes: &[u8]) -> jvt::Commitment {
     jvt::Commitment(
-        EdwardsAffine::deserialize_compressed(&bytes[..])
+        EdwardsAffine::deserialize_uncompressed(bytes)
             .expect("stored commitment bytes should be valid"),
     )
 }
 
 /// Convert a JVT commitment to a hyperscale Hash (for state root, value hashes).
+///
+/// Uses compressed serialization (32 bytes) for the consensus-visible identity.
+/// This is separate from the storage format (uncompressed) — the hash is what
+/// goes into block headers and QCs.
 pub fn commitment_to_hash(c: jvt::Commitment) -> Hash {
-    Hash::from_hash_bytes(&commitment_to_bytes(c))
+    let mut buf = [0u8; 32];
+    c.0.serialize_compressed(&mut buf[..])
+        .expect("Bandersnatch point serialization should never fail");
+    Hash::from_hash_bytes(&buf)
 }
 
 // ─── JVT ↔ Stored conversions ──────────────────────────────────────────

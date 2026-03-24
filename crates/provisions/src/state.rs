@@ -1081,7 +1081,7 @@ mod tests {
             block_height: BlockHeight(height),
             block_timestamp: 1000 + height,
             entries: Arc::new(vec![]),
-            merkle_proofs: Arc::new(vec![]),
+            proof: Arc::new(hyperscale_types::SubstateInclusionProof::dummy()),
         }
     }
 
@@ -1323,7 +1323,7 @@ mod tests {
         let entry = hyperscale_types::StateEntry::new(storage_key, Some(vec![1, 2, 3]));
         let mut provision = make_provision(tx_hash, source_shard, ShardGroupId(0), 10);
         provision.entries = Arc::new(vec![entry]);
-        provision.merkle_proofs = Arc::new(vec![hyperscale_types::SubstateInclusionProof::dummy()]);
+        provision.proof = Arc::new(hyperscale_types::SubstateInclusionProof::dummy());
 
         // Setup + verify
         let header = make_committed_header(source_shard, 10);

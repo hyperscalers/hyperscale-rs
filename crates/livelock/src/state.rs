@@ -539,7 +539,7 @@ mod tests {
                 weighted_timestamp_ms: 0,
             },
             Arc::new(vec![]),
-            Arc::new(vec![]),
+            Arc::new(SubstateInclusionProof::dummy()),
         )
     }
 
@@ -549,13 +549,9 @@ mod tests {
         node_ids: Vec<NodeId>,
     ) -> CommitmentProof {
         // Create a commitment proof with specific nodes
-        let entry_count = node_ids.len();
         let entries: Vec<_> = node_ids
             .into_iter()
             .map(|node_id| StateEntry::test_entry(node_id, 0, vec![], None))
-            .collect();
-        let merkle_proofs: Vec<_> = (0..entry_count)
-            .map(|_| SubstateInclusionProof::dummy())
             .collect();
         CommitmentProof::new(
             tx_hash,
@@ -575,7 +571,7 @@ mod tests {
                 weighted_timestamp_ms: 0,
             },
             Arc::new(entries),
-            Arc::new(merkle_proofs),
+            Arc::new(SubstateInclusionProof::dummy()),
         )
     }
 
@@ -625,7 +621,7 @@ mod tests {
                 weighted_timestamp_ms: 0,
             },
             Arc::new(vec![]),
-            Arc::new(vec![]),
+            Arc::new(SubstateInclusionProof::dummy()),
         )
     }
 

@@ -2130,7 +2130,7 @@ mod tests {
             Hash::ZERO,
             QuorumCertificate::genesis(),
             Arc::new(vec![]),
-            Arc::new(vec![]),
+            Arc::new(hyperscale_types::SubstateInclusionProof::dummy()),
         );
 
         TransactionDefer {
