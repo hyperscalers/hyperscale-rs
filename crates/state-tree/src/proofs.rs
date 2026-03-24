@@ -181,7 +181,10 @@ pub fn generate_proof<S: ReadableTreeStore>(
     // Check root exists before attempting proof generation
     adapter.get_node(&root_key)?;
 
-    let jvt_keys: Vec<jvt::Key> = storage_keys.iter().map(|sk| sk.to_vec()).collect();
+    let jvt_keys: Vec<jvt::Key> = storage_keys
+        .iter()
+        .map(|sk| crate::storage_key_to_jvt_key(sk))
+        .collect();
 
     let proof = jvt::verkle_proof::prove(&adapter, &root_key, &jvt_keys)?;
 
@@ -215,10 +218,10 @@ pub fn verify_proof(
         None => return false,
     };
 
-    // Build expected keys and values for verification
+    // Build expected keys and values for verification.
     let keys: Vec<jvt::Key> = entries
         .iter()
-        .map(|e| storage_key_for_entry(e).to_vec())
+        .map(|e| crate::storage_key_to_jvt_key(storage_key_for_entry(e)))
         .collect();
 
     // Values are stored directly in the tree (raw bytes, not hashes)

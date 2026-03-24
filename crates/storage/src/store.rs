@@ -84,9 +84,3 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync {
         block_height: u64,
     ) -> Option<SubstateInclusionProof>;
 }
-
-/// Prefix for all Radix Engine data in storage.
-///
-/// All Radix substates are stored with this prefix to allow other data
-/// (consensus metadata, etc.) to coexist in the same storage backend.
-pub const RADIX_PREFIX: &[u8] = b"radix:";

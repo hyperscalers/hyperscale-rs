@@ -1313,8 +1313,7 @@ mod tests {
         let source_shard = ShardGroupId(1);
 
         // Create a provision with entries that have valid node IDs
-        let mut storage_key = Vec::with_capacity(6 + 20 + 30 + 1 + 1);
-        storage_key.extend_from_slice(b"radix:");
+        let mut storage_key = Vec::with_capacity(20 + 30 + 1 + 1);
         storage_key.extend_from_slice(&[0u8; 20]);
         storage_key.extend_from_slice(&[42u8; 30]); // node_id
         storage_key.push(0); // partition

@@ -274,8 +274,7 @@ mod tests {
 
     /// Create a test StateEntry with a valid storage key format.
     fn test_entry(seed: u8) -> StateEntry {
-        let mut storage_key = Vec::with_capacity(6 + 20 + 30 + 1 + 1);
-        storage_key.extend_from_slice(b"radix:");
+        let mut storage_key = Vec::with_capacity(20 + 30 + 1 + 1);
         storage_key.extend_from_slice(&[0u8; 20]);
         storage_key.extend_from_slice(&[seed; 30]);
         storage_key.push(0);

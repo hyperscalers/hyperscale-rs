@@ -28,11 +28,11 @@ use jellyfish_verkle_tree as jvt;
 use jvt::TreeReader as _;
 use tree_store::*;
 
-/// Convert a storage key to a JVT key (direct passthrough — no hashing).
+/// Convert a storage key to a JVT key (direct passthrough).
 ///
-/// JVT now supports variable-length keys, so we use the raw storage key
-/// directly. This preserves entity locality in the tree.
-pub fn to_jvt_key(storage_key: &[u8]) -> jvt::Key {
+/// Storage keys and JVT keys use the same format:
+/// `entity_key || partition_num || sort_key`
+pub fn storage_key_to_jvt_key(storage_key: &[u8]) -> jvt::Key {
     storage_key.to_vec()
 }
 
