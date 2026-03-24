@@ -8,6 +8,7 @@ use std::sync::RwLock;
 
 use hyperscale_types::Hash;
 use jellyfish_verkle_tree as jvt;
+use jvt::commitment::commitment_to_field;
 use sbor::prelude::*;
 
 /// Version = block height.
@@ -215,11 +216,13 @@ impl StoredNode {
                     .children
                     .iter()
                     .map(|entry| {
+                        let commitment = bytes_to_commitment(&entry.commitment);
                         (
                             entry.index,
                             jvt::Child {
                                 version: entry.version,
-                                commitment: bytes_to_commitment(&entry.commitment),
+                                commitment,
+                                field: commitment_to_field(commitment),
                             },
                         )
                     })
@@ -232,14 +235,18 @@ impl StoredNode {
             }
             StoredNode::EaS(eas) => {
                 let values: HashMap<u8, jvt::Value> = eas.values.iter().cloned().collect();
+                let c1 = bytes_to_commitment(&eas.c1);
+                let c2 = bytes_to_commitment(&eas.c2);
                 // Construct directly with stored commitments — skip recomputation
-                jvt::Node::EaS(jvt::EaSNode {
+                jvt::Node::EaS(Box::new(jvt::EaSNode {
                     stem: eas.stem.clone(),
                     values,
-                    c1: bytes_to_commitment(&eas.c1),
-                    c2: bytes_to_commitment(&eas.c2),
+                    c1,
+                    c2,
+                    c1_field: commitment_to_field(c1),
+                    c2_field: commitment_to_field(c2),
                     extension_commitment: bytes_to_commitment(&eas.extension_commitment),
-                })
+                }))
             }
         }
     }

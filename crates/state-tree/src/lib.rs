@@ -19,6 +19,7 @@ pub mod proofs;
 pub mod tree_store;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_types::Hash;
@@ -33,6 +34,14 @@ use tree_store::*;
 /// directly. This preserves entity locality in the tree.
 pub fn to_jvt_key(storage_key: &[u8]) -> jvt::Key {
     storage_key.to_vec()
+}
+
+/// Build a prefix for enumerating all substates in a partition.
+fn make_partition_prefix(entity_key: &[u8], partition_num: u8) -> Vec<u8> {
+    let mut prefix = Vec::with_capacity(entity_key.len() + 1);
+    prefix.extend_from_slice(entity_key);
+    prefix.push(partition_num);
+    prefix
 }
 
 /// Build a JVT key from entity_key + partition_num + sort_key.
@@ -50,9 +59,11 @@ struct StoreAdapter<'a, S> {
 }
 
 impl<S: ReadableTreeStore> jvt::TreeReader for StoreAdapter<'_, S> {
-    fn get_node(&self, key: &jvt::NodeKey) -> Option<jvt::Node> {
+    fn get_node(&self, key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
         let stored_key = StoredNodeKey::from_jvt(key);
-        self.store.get_node(&stored_key).map(|sn| sn.to_jvt())
+        self.store
+            .get_node(&stored_key)
+            .map(|sn| Arc::new(sn.to_jvt()))
     }
 
     fn get_root_key(&self, version: u64) -> Option<jvt::NodeKey> {
@@ -113,8 +124,20 @@ pub fn put_at_version<S: ReadableTreeStore + Sync, D: Dispatch>(
                 radix_substate_store_interface::interface::PartitionDatabaseUpdates::Reset {
                     new_substate_values,
                 } => {
-                    // TODO: handle Reset properly (delete old substates).
-                    // For now, treat as inserts only.
+                    // Reset = delete all existing substates in this partition,
+                    // then insert the new values. We enumerate existing leaves
+                    // under the partition prefix and mark them as deletes.
+                    if let Some(parent_ver) = parent_version {
+                        let prefix = make_partition_prefix(entity_key, partition_num);
+                        if let Some(existing) =
+                            list_leaves_with_prefix(tree_store, parent_ver, &prefix)
+                        {
+                            for (existing_key, _) in existing {
+                                updates.insert(existing_key, None);
+                            }
+                        }
+                    }
+                    // Insert the new values (overwrites any deletes for keys that reappear)
                     for (sort_key, value) in new_substate_values {
                         let jvt_key = make_jvt_key(entity_key, partition_num, &sort_key.0);
                         updates.insert(jvt_key, Some(value.clone()));
@@ -236,7 +259,7 @@ fn collect_prefix_leaves<S: jvt::TreeReader>(
         None => return,
     };
 
-    match &node {
+    match &*node {
         jvt::Node::Internal(internal) => {
             let depth = path_prefix.len();
             let mut child_indices: Vec<u8> = internal.children.keys().copied().collect();
