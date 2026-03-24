@@ -76,12 +76,13 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync {
         block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>>;
 
-    /// Generate 3-tier JMT inclusion proofs for the given storage keys.
+    /// Generate an aggregated verkle inclusion proof for the given storage keys.
+    /// Returns `None` if the requested version is unavailable (GC'd or not committed).
     fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Vec<SubstateInclusionProof>;
+    ) -> Option<SubstateInclusionProof>;
 }
 
 /// Prefix for all Radix Engine data in storage.

@@ -652,7 +652,7 @@ impl ProvisionCoordinator {
                 header.state_root(),
                 header.qc.clone(),
                 Arc::clone(&provision.entries),
-                Arc::clone(&provision.merkle_proofs),
+                Arc::clone(&provision.proof),
             );
 
             // Store provision and proof together

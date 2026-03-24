@@ -286,9 +286,9 @@ pub struct StateProvision {
     /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
     pub entries: Arc<Vec<StateEntry>>,
 
-    /// Merkle inclusion proofs, one per entry.
+    /// Aggregated merkle inclusion proof covering all entries.
     /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
-    pub merkle_proofs: Arc<Vec<crate::SubstateInclusionProof>>,
+    pub proof: Arc<crate::SubstateInclusionProof>,
 }
 
 // Manual PartialEq (compare Arc contents, not pointer identity)
@@ -300,7 +300,7 @@ impl PartialEq for StateProvision {
             && self.block_height == other.block_height
             && self.block_timestamp == other.block_timestamp
             && *self.entries == *other.entries
-            && *self.merkle_proofs == *other.merkle_proofs
+            && *self.proof == *other.proof
     }
 }
 
@@ -322,7 +322,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         encoder.encode(&self.block_height)?;
         encoder.encode(&self.block_timestamp)?;
         encoder.encode(self.entries.as_ref())?;
-        encoder.encode(self.merkle_proofs.as_ref())?;
+        encoder.encode(self.proof.as_ref())?;
         Ok(())
     }
 }
@@ -350,7 +350,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let block_height: BlockHeight = decoder.decode()?;
         let block_timestamp: u64 = decoder.decode()?;
         let entries: Vec<StateEntry> = decoder.decode()?;
-        let merkle_proofs: Vec<crate::SubstateInclusionProof> = decoder.decode()?;
+        let proof: crate::SubstateInclusionProof = decoder.decode()?;
 
         Ok(Self {
             transaction_hash,
@@ -359,7 +359,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             block_height,
             block_timestamp,
             entries: Arc::new(entries),
-            merkle_proofs: Arc::new(merkle_proofs),
+            proof: Arc::new(proof),
         })
     }
 }

@@ -215,7 +215,7 @@ pub fn verify_commitment_proof(
     // Verify individual merkle inclusion proofs against proof.state_root
     hyperscale_storage::proofs::verify_all_merkle_proofs(
         &proof.entries,
-        &proof.merkle_proofs,
+        &proof.proof,
         proof.state_root,
     )
 }

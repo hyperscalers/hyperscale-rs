@@ -11,8 +11,7 @@
 //! substate values. These associations are persisted to enable querying
 //! historical state at any past version (within the retention window).
 
-use crate::jmt::{StaleTreePart, StoredTreeNodeKey, TierCollectedWrites, TreeNode};
-use crate::overlay::SubstateLookup;
+use crate::jmt::{CollectedWrites, StaleTreePart, StoredNode, StoredNodeKey};
 use crate::StateRootHash;
 
 /// Associates a JMT leaf node with the substate value it represents.
@@ -31,7 +30,7 @@ use crate::StateRootHash;
 pub struct LeafSubstateKeyAssociation {
     /// The JMT leaf node key. This uniquely identifies the leaf in the
     /// versioned tree structure.
-    pub tree_node_key: StoredTreeNodeKey,
+    pub tree_node_key: StoredNodeKey,
 
     /// The substate value associated with this leaf.
     /// This is the actual data, not a hash.
@@ -80,7 +79,7 @@ pub struct JmtSnapshot {
 
     /// Nodes created during speculative computation.
     /// These are inserted directly into the real JMT on apply.
-    pub nodes: Vec<(StoredTreeNodeKey, TreeNode)>,
+    pub nodes: Vec<(StoredNodeKey, StoredNode)>,
 
     /// Stale tree parts to prune when applying the snapshot.
     pub stale_tree_parts: Vec<StaleTreePart>,
@@ -93,33 +92,14 @@ pub struct JmtSnapshot {
 }
 
 impl JmtSnapshot {
-    /// Create a snapshot from tier-collected writes.
-    ///
-    /// When `lookup` is `Some`, `Unchanged` associations are resolved by looking up
-    /// the actual substate value. When `None`, associations are discarded.
+    /// Create a snapshot from collected writes.
     pub fn from_collected_writes(
-        collected: TierCollectedWrites,
+        collected: CollectedWrites,
         base_root: StateRootHash,
         base_version: u64,
         result_root: StateRootHash,
         new_version: u64,
-        lookup: Option<&(dyn SubstateLookup + Sync)>,
     ) -> Self {
-        let leaf_substate_associations = match lookup {
-            Some(lookup) => collected
-                .associations
-                .into_iter()
-                .filter_map(|a| {
-                    let (tree_node_key, substate_value) =
-                        a.resolve(|pk, sk| lookup.lookup_substate(pk, sk))?;
-                    Some(LeafSubstateKeyAssociation {
-                        tree_node_key,
-                        substate_value,
-                    })
-                })
-                .collect(),
-            None => Vec::new(),
-        };
         Self {
             base_root,
             base_version,
@@ -127,7 +107,7 @@ impl JmtSnapshot {
             new_version,
             nodes: collected.nodes,
             stale_tree_parts: collected.stale_tree_parts,
-            leaf_substate_associations,
+            leaf_substate_associations: Vec::new(),
         }
     }
 }

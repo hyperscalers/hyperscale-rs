@@ -71,28 +71,17 @@ pub use radix_substate_store_interface::interface::{
     PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase,
 };
 
-/// JMT implementation types re-exported for storage backends.
+/// State tree implementation types re-exported for storage backends.
 ///
 /// These are implementation details needed by `storage-memory` and `storage-rocksdb`.
 /// They are not part of the abstract storage interface.
 pub mod jmt {
-    pub use hyperscale_jmt::put_at_version;
-    pub use hyperscale_jmt::put_at_version_and_apply;
-    pub use hyperscale_jmt::tier_framework::TierCollectedWrites;
-    pub use hyperscale_jmt::tree_store::{
-        encode_key, ReadableTreeStore, StaleTreePart, StoredTreeNodeKey, TreeNode,
-        TypedInMemoryTreeStore, Version, VersionedTreeNode, WriteableTreeStore,
+    pub use hyperscale_state_tree::list_leaves_with_prefix;
+    pub use hyperscale_state_tree::put_at_version;
+    pub use hyperscale_state_tree::put_at_version_and_apply;
+    pub use hyperscale_state_tree::tree_store::{
+        encode_key, ReadableTreeStore, StaleTreePart, StoredNode, StoredNodeKey,
+        TypedInMemoryTreeStore, Version, VersionedStoredNode, WriteableTreeStore,
     };
-
-    // Re-export types needed for proof generation and verification
-    pub use hyperscale_jmt::types::{
-        IteratedLeafKey, LeafKey, SparseMerkleLeafNode, SparseMerkleProof, INTERNAL_HASH_DOMAIN,
-        LEAF_HASH_DOMAIN,
-    };
-
-    // Re-export tier types for proof generation and historical reads
-    pub use hyperscale_jmt::entity_tier::EntityTier;
-    pub use hyperscale_jmt::partition_tier::PartitionTier;
-    pub use hyperscale_jmt::substate_tier::{SubstateSummary, SubstateTier};
-    pub use hyperscale_jmt::tier_framework::ReadableTier;
+    pub use hyperscale_state_tree::CollectedWrites;
 }

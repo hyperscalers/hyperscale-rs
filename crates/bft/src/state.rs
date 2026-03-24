@@ -5525,7 +5525,7 @@ mod tests {
             state_root: Hash::ZERO,
             qc: QuorumCertificate::genesis(),
             entries: Arc::new(vec![]),
-            merkle_proofs: Arc::new(vec![]),
+            proof: Arc::new(hyperscale_types::SubstateInclusionProof::dummy()),
         }
     }
 
@@ -7393,7 +7393,7 @@ mod tests {
                 Hash::ZERO,
                 QuorumCertificate::genesis(),
                 Arc::new(vec![StateEntry::test_entry(node, 0, vec![], None)]),
-                Arc::new(vec![SubstateInclusionProof::dummy()]),
+                Arc::new(SubstateInclusionProof::dummy()),
             ))
         } else {
             None

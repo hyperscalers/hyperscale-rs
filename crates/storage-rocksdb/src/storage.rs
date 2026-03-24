@@ -15,8 +15,8 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{
     jmt::{
-        encode_key as encode_jmt_key, EntityTier, ReadableTreeStore, StaleTreePart,
-        StoredTreeNodeKey, TreeNode, VersionedTreeNode,
+        encode_key as encode_jmt_key, ReadableTreeStore, StaleTreePart, StoredNode, StoredNodeKey,
+        VersionedStoredNode,
     },
     keys, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey, DbSubstateValue, JmtSnapshot,
     PartitionDatabaseUpdates, PartitionEntry, StateRootHash, SubstateDatabase, SubstateLookup,
@@ -207,9 +207,8 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             .expect("jmt_nodes column family must exist");
         for (key, node) in &snapshot.nodes {
             let encoded_key = encode_jmt_key(key);
-            let encoded_node =
-                sbor::basic_encode(&VersionedTreeNode::from_latest_version(node.clone()))
-                    .expect("JMT node encoding must succeed");
+            let encoded_node = sbor::basic_encode(&VersionedStoredNode::from_latest(node.clone()))
+                .expect("JMT node encoding must succeed");
             batch.put_cf(jmt_cf, encoded_key, encoded_node);
         }
 
@@ -378,16 +377,16 @@ const ASSOCIATED_STATE_TREE_VALUES_CF: &str = "associated_state_tree_values";
 const STALE_STATE_HASH_TREE_PARTS_CF: &str = "stale_state_hash_tree_parts";
 
 impl<D: Dispatch + 'static> ReadableTreeStore for RocksDbStorage<D> {
-    fn get_node(&self, key: &StoredTreeNodeKey) -> Option<TreeNode> {
+    fn get_node(&self, key: &StoredNodeKey) -> Option<StoredNode> {
         let cf = self.db.cf_handle(JMT_NODES_CF)?;
         let encoded_key = encode_jmt_key(key);
         self.db
             .get_cf(cf, &encoded_key)
             .expect("RocksDB read failure on jmt_nodes CF")
             .map(|bytes| {
-                sbor::basic_decode::<VersionedTreeNode>(&bytes)
+                sbor::basic_decode::<VersionedStoredNode>(&bytes)
                     .unwrap_or_else(|e| panic!("JMT node corruption detected: {e:?}"))
-                    .fully_update_and_into_latest_version()
+                    .into_latest()
             })
     }
 }
@@ -479,16 +478,16 @@ impl<'a> SnapshotTreeStore<'a> {
 }
 
 impl ReadableTreeStore for SnapshotTreeStore<'_> {
-    fn get_node(&self, key: &StoredTreeNodeKey) -> Option<TreeNode> {
+    fn get_node(&self, key: &StoredNodeKey) -> Option<StoredNode> {
         let cf = self.db.cf_handle(JMT_NODES_CF)?;
         let encoded_key = encode_jmt_key(key);
         self.snapshot
             .get_cf(cf, &encoded_key)
             .expect("RocksDB snapshot read failure on jmt_nodes CF")
             .map(|bytes| {
-                sbor::basic_decode::<VersionedTreeNode>(&bytes)
+                sbor::basic_decode::<VersionedStoredNode>(&bytes)
                     .unwrap_or_else(|e| panic!("JMT node corruption detected: {e:?}"))
-                    .fully_update_and_into_latest_version()
+                    .into_latest()
             })
     }
 }
@@ -545,7 +544,6 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             base_version,
             new_root,
             new_version,
-            Some(&snapshot_store),
         );
 
         self.append_jmt_to_batch(&mut batch, &jmt_snapshot, new_version);
@@ -673,14 +671,8 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             merged,
             &self.dispatch,
         );
-        let jmt_snapshot = JmtSnapshot::from_collected_writes(
-            collected,
-            StateRootHash::ZERO,
-            0,
-            root,
-            0,
-            Some(&snapshot_store),
-        );
+        let jmt_snapshot =
+            JmtSnapshot::from_collected_writes(collected, StateRootHash::ZERO, 0, root, 0);
 
         let mut batch = WriteBatch::default();
         self.append_jmt_to_batch(&mut batch, &jmt_snapshot, 0);
@@ -749,65 +741,38 @@ impl<D: Dispatch + 'static> SubstateStore for RocksDbStorage<D> {
         node_id: &NodeId,
         block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
-        // Take a RocksDB snapshot for all reads in this method. This protects
-        // against concurrent JMT GC deleting nodes/associations mid-traversal.
+        use radix_substate_store_interface::db_key_mapper::{
+            DatabaseKeyMapper, SpreadPrefixKeyMapper,
+        };
+
+        // Compute the db_node_key (entity key) as prefix for tree walk
+        let radix_node_id = radix_common::types::NodeId(node_id.0);
+        let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
+
+        // Walk the verkle tree at the historical version, collecting all leaves
+        // whose key starts with this entity's db_node_key.
         let snapshot_store = SnapshotTreeStore::new(&self.db);
+        let leaves = hyperscale_storage::jmt::list_leaves_with_prefix(
+            &snapshot_store,
+            block_height,
+            &db_node_key,
+        )?;
 
-        // Use the snapshot's version for the bounds check, not the live DB
-        // version, so the entire method uses a single consistent snapshot.
-        let (snapshot_version, _) = snapshot_store.read_jmt_metadata();
-        if block_height > snapshot_version {
-            return None;
-        }
-
-        let entity_key = keys::node_entity_key(node_id);
-
-        let assoc_cf = self.db.cf_handle(ASSOCIATED_STATE_TREE_VALUES_CF)?;
-
-        // Pass 1: traverse the 3-tier JMT to collect substate metadata.
-        // Uses the snapshot store so GC can't delete nodes mid-traversal.
-        let entity_tier = EntityTier::new(&snapshot_store, Some(block_height));
-        let partition_tier = entity_tier.get_entity_partition_tier(entity_key);
-        let mut entries: Vec<(u8, DbSortKey, Vec<u8>)> = Vec::new();
-
-        for substate_tier in partition_tier.into_iter_partition_substate_tiers_from(None) {
-            let partition_num = substate_tier.partition_key().partition_num;
-            for summary in substate_tier.into_iter_substate_summaries_from(None) {
-                entries.push((
-                    partition_num,
-                    summary.sort_key,
-                    encode_jmt_key(&summary.state_tree_leaf_key),
-                ));
-            }
-        }
-
-        if entries.is_empty() {
-            return Some(vec![]);
-        }
-
-        // Pass 2: batch-read all association values from the same snapshot,
-        // ensuring consistency with the JMT traversal above.
-        let values = snapshot_store.snapshot.multi_get_cf(
-            entries
-                .iter()
-                .map(|(_, _, encoded_key)| (assoc_cf, encoded_key.as_slice())),
-        );
-
-        let mut results = Vec::with_capacity(entries.len());
-        for ((partition_num, sort_key, _), result) in entries.into_iter().zip(values) {
-            let value = result.expect("RocksDB read failure on associated_state_tree_values CF");
-            match value {
-                Some(v) => results.push((partition_num, sort_key, v)),
-                None => {
-                    // Association was garbage-collected — height likely GC'd.
-                    tracing::warn!(
-                        block_height,
-                        "Historical substate association missing — height likely GC'd"
-                    );
-                    return None;
+        // Parse each leaf key back into (partition_num, sort_key) and return with value.
+        // Key format: db_node_key || partition_num || sort_key_bytes
+        let prefix_len = db_node_key.len();
+        let results = leaves
+            .into_iter()
+            .filter_map(|(key, value)| {
+                if key.len() <= prefix_len {
+                    return None; // Key too short
                 }
-            }
-        }
+                let partition_num = key[prefix_len];
+                let sort_key = DbSortKey(key[prefix_len + 1..].to_vec());
+                Some((partition_num, sort_key, value))
+            })
+            .collect();
+
         Some(results)
     }
 
@@ -815,15 +780,11 @@ impl<D: Dispatch + 'static> SubstateStore for RocksDbStorage<D> {
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Vec<hyperscale_types::SubstateInclusionProof> {
+    ) -> Option<hyperscale_types::SubstateInclusionProof> {
         // Use a RocksDB snapshot for all reads so concurrent JMT GC cannot
         // delete nodes mid-proof-generation.
         let snapshot_store = SnapshotTreeStore::new(&self.db);
-        hyperscale_storage::proofs::generate_merkle_proofs(
-            &snapshot_store,
-            storage_keys,
-            block_height,
-        )
+        hyperscale_storage::proofs::generate_proof(&snapshot_store, storage_keys, block_height)
     }
 }
 
@@ -893,7 +854,6 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             base_version,
             root,
             block_height,
-            Some(&snapshot_store),
         );
 
         (root, snapshot)
@@ -2153,7 +2113,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     /// Recursively delete a subtree and its associations.
     fn delete_subtree_recursive(
         &self,
-        root_key: &StoredTreeNodeKey,
+        root_key: &StoredNodeKey,
         jmt_cf: &ColumnFamily,
         assoc_cf: Option<&ColumnFamily>,
         batch: &mut WriteBatch,
@@ -2163,8 +2123,8 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         let encoded_key = encode_jmt_key(root_key);
         let node = match self.db.get_cf(jmt_cf, &encoded_key) {
             Ok(Some(bytes)) => {
-                match sbor::basic_decode::<VersionedTreeNode>(&bytes) {
-                    Ok(versioned) => versioned.fully_update_and_into_latest_version(),
+                match sbor::basic_decode::<VersionedStoredNode>(&bytes) {
+                    Ok(versioned) => versioned.into_latest(),
                     Err(_) => {
                         // Can't decode - just delete the root
                         batch.delete_cf(jmt_cf, &encoded_key);
@@ -2184,9 +2144,9 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
 
         // Process children first (post-order traversal)
         match &node {
-            TreeNode::Internal(internal) => {
+            StoredNode::Internal(internal) => {
                 for child in &internal.children {
-                    let child_key = root_key.gen_child_node_key(child.version, child.nibble);
+                    let child_key = root_key.child_key(child.version, child.index);
                     self.delete_subtree_recursive(
                         &child_key,
                         jmt_cf,
@@ -2196,8 +2156,8 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
                     );
                 }
             }
-            TreeNode::Leaf(_) | TreeNode::Null => {
-                // Leaf nodes have no children
+            StoredNode::EaS(_) => {
+                // EaS nodes have no children
             }
         }
 
@@ -2434,7 +2394,6 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
             base_version,
             new_root,
             block_height,
-            Some(&snapshot_store),
         );
         self.append_jmt_to_batch(&mut batch, &jmt_snapshot, block_height);
 
@@ -2660,7 +2619,7 @@ impl<D: Dispatch + 'static> SubstateStore for SharedStorage<D> {
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Vec<hyperscale_types::SubstateInclusionProof> {
+    ) -> Option<hyperscale_types::SubstateInclusionProof> {
         self.0.generate_merkle_proofs(storage_keys, block_height)
     }
 }

@@ -14,7 +14,7 @@
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_storage::{
-    jmt::{EntityTier, StoredTreeNodeKey, TypedInMemoryTreeStore, WriteableTreeStore},
+    jmt::{StoredNodeKey, TypedInMemoryTreeStore, WriteableTreeStore},
     keys, CommitStore, ConsensusStore, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
     DbSubstateValue, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry, StateRootHash,
     SubstateDatabase, SubstateStore,
@@ -46,7 +46,7 @@ pub(crate) struct SharedState {
     pub current_block_height: u64,
     pub current_root_hash: StateRootHash,
     /// Leaf-key → substate-value associations for historical queries.
-    pub associations: HashMap<StoredTreeNodeKey, Vec<u8>>,
+    pub associations: HashMap<StoredNodeKey, Vec<u8>>,
 }
 
 impl SharedState {
@@ -298,16 +298,10 @@ impl<D: Dispatch + 'static> SimStorage<D> {
         let (root, collected) =
             hyperscale_storage::jmt::put_at_version(&s.tree_store, None, 0, merged, &self.dispatch);
 
-        let associations = collected.apply_to(&s.tree_store);
+        collected.apply_to(&s.tree_store);
 
         s.current_block_height = 0;
         s.current_root_hash = root;
-
-        for a in associations {
-            if let Some((key, value)) = a.resolve(|pk, sk| ordmap_lookup(&s.data, pk, sk)) {
-                s.associations.insert(key, value);
-            }
-        }
 
         root
     }
@@ -317,15 +311,6 @@ impl<D: Dispatch + 'static> SimStorage<D> {
 ///
 /// This avoids going through the `SubstateDatabase` trait (and its lock)
 /// when we already hold a reference to the data.
-fn ordmap_lookup(
-    data: &OrdMap<Vec<u8>, Vec<u8>>,
-    partition_key: &DbPartitionKey,
-    sort_key: &DbSortKey,
-) -> Option<Vec<u8>> {
-    let key = keys::to_storage_key(partition_key, sort_key);
-    data.get(&key).cloned()
-}
-
 impl<D: Dispatch + 'static> hyperscale_storage::SubstatesOnlyCommit for SimStorage<D> {
     fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         SimStorage::commit_substates_only(self, updates);
@@ -424,40 +409,39 @@ impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
         node_id: &NodeId,
         block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
-        let entity_key = keys::node_entity_key(node_id);
-
-        let s = self.state.read().unwrap();
-
-        if block_height > s.current_block_height {
-            return None;
-        }
-
-        let entity_tier = EntityTier::new(&s.tree_store, Some(block_height));
-        let partition_tier = entity_tier.get_entity_partition_tier(entity_key);
-        let mut results = Vec::new();
-
-        for substate_tier in partition_tier.into_iter_partition_substate_tiers_from(None) {
-            let partition_num = substate_tier.partition_key().partition_num;
-            for summary in substate_tier.into_iter_substate_summaries_from(None) {
-                if let Some(value) = s.associations.get(&summary.state_tree_leaf_key) {
-                    results.push((partition_num, summary.sort_key, value.clone()));
-                }
-            }
-        }
-        Some(results)
+        // TODO(verkle): rewrite for verkle tree
+        // let entity_key = keys::node_entity_key(node_id);
+        //
+        // let s = self.state.read().unwrap();
+        //
+        // if block_height > s.current_block_height {
+        //     return None;
+        // }
+        //
+        // let entity_tier = EntityTier::new(&s.tree_store, Some(block_height));
+        // let partition_tier = entity_tier.get_entity_partition_tier(entity_key);
+        // let mut results = Vec::new();
+        //
+        // for substate_tier in partition_tier.into_iter_partition_substate_tiers_from(None) {
+        //     let partition_num = substate_tier.partition_key().partition_num;
+        //     for summary in substate_tier.into_iter_substate_summaries_from(None) {
+        //         if let Some(value) = s.associations.get(&summary.state_tree_leaf_key) {
+        //             results.push((partition_num, summary.sort_key, value.clone()));
+        //         }
+        //     }
+        // }
+        // Some(results)
+        let _ = (node_id, block_height);
+        todo!()
     }
 
     fn generate_merkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Vec<hyperscale_types::SubstateInclusionProof> {
+    ) -> Option<hyperscale_types::SubstateInclusionProof> {
         let s = self.state.read().unwrap();
-        hyperscale_storage::proofs::generate_merkle_proofs(
-            &s.tree_store,
-            storage_keys,
-            block_height,
-        )
+        hyperscale_storage::proofs::generate_proof(&s.tree_store, storage_keys, block_height)
     }
 }
 
@@ -599,17 +583,12 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             &self.dispatch,
         );
 
-        let data_snapshot = SimSnapshot {
-            data: base_data.clone(),
-        };
-        let lookup = hyperscale_storage::SubstateDbLookup(&data_snapshot);
         let snapshot = JmtSnapshot::from_collected_writes(
             collected,
             base_root,
             base_version,
             result_root,
             block_height,
-            Some(&lookup),
         );
 
         drop(s); // Release read lock
@@ -703,17 +682,10 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             &self.dispatch,
         );
 
-        let associations = collected.apply_to(&s.tree_store);
+        collected.apply_to(&s.tree_store);
 
         s.current_block_height = block_height;
         s.current_root_hash = new_root;
-
-        // Resolve associations directly from the OrdMap (same lock).
-        for a in associations {
-            if let Some((key, value)) = a.resolve(|pk, sk| ordmap_lookup(&s.data, pk, sk)) {
-                s.associations.insert(key, value);
-            }
-        }
 
         drop(s);
 

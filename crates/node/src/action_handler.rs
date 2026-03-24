@@ -384,7 +384,7 @@ pub(crate) fn handle_delegated_action<
                 verified_header.as_ref().is_some_and(|header| {
                     hyperscale_storage::proofs::verify_all_merkle_proofs(
                         &provision.entries,
-                        &provision.merkle_proofs,
+                        &provision.proof,
                         header.header.state_root,
                     )
                 })
@@ -551,19 +551,25 @@ pub(crate) fn handle_delegated_action<
                     };
                 let storage_keys: Vec<Vec<u8>> =
                     entries.iter().map(|e| e.storage_key.clone()).collect();
-                let merkle_proofs = ctx
+                let proof = match ctx
                     .storage
-                    .generate_merkle_proofs(&storage_keys, block_height.0);
-
-                assert_eq!(
-                    entries.len(),
-                    merkle_proofs.len(),
-                    "entries and merkle_proofs must have the same length"
-                );
+                    .generate_merkle_proofs(&storage_keys, block_height.0)
+                {
+                    Some(p) => p,
+                    None => {
+                        tracing::warn!(
+                            block_height = block_height.0,
+                            tx_hash = ?req.tx_hash,
+                            "Proactive provision: proof generation failed (version unavailable), \
+                             skipping (target shard will use fallback recovery)"
+                        );
+                        continue;
+                    }
+                };
 
                 // Wrap in Arc for efficient sharing across target shards
                 let entries = Arc::new(entries);
-                let merkle_proofs = Arc::new(merkle_proofs);
+                let proof = Arc::new(proof);
 
                 // Build a provision per target shard
                 for &target_shard in &req.target_shards {
@@ -574,7 +580,7 @@ pub(crate) fn handle_delegated_action<
                         block_height,
                         block_timestamp,
                         entries: Arc::clone(&entries),
-                        merkle_proofs: Arc::clone(&merkle_proofs),
+                        proof: Arc::clone(&proof),
                     };
                     batches.entry(target_shard).or_default().push(provision);
                 }

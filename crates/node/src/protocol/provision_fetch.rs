@@ -417,7 +417,16 @@ pub fn serve_provision_request(
                 }
             };
         let storage_keys: Vec<Vec<u8>> = entries.iter().map(|e| e.storage_key.clone()).collect();
-        let merkle_proofs = storage.generate_merkle_proofs(&storage_keys, jmt_version);
+        let proof = match storage.generate_merkle_proofs(&storage_keys, jmt_version) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    block_height = req.block_height.0,
+                    "Fallback provision: proof generation failed (version unavailable)"
+                );
+                continue;
+            }
+        };
 
         provisions.push(StateProvision {
             transaction_hash: tx.hash(),
@@ -426,7 +435,7 @@ pub fn serve_provision_request(
             block_height: req.block_height,
             block_timestamp: block.header.timestamp,
             entries: Arc::new(entries),
-            merkle_proofs: Arc::new(merkle_proofs),
+            proof: Arc::new(proof),
         });
     }
 

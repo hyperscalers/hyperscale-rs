@@ -7,7 +7,6 @@ members = [
     "crates/dispatch-pooled",
     "crates/dispatch-sync",
     "crates/engine",
-    "crates/jmt",
     "crates/execution",
     "crates/livelock",
     "crates/mempool",
@@ -24,6 +23,7 @@ members = [
     "crates/simulation",
     "crates/simulator",
     "crates/spammer",
+    "crates/state-tree",
     "crates/storage",
     "crates/storage-memory",
     "crates/storage-rocksdb",
@@ -39,7 +39,6 @@ default-members = [
     "crates/dispatch-pooled",
     "crates/dispatch-sync",
     "crates/engine",
-    "crates/jmt",
     "crates/execution",
     "crates/livelock",
     "crates/mempool",
@@ -56,6 +55,7 @@ default-members = [
     "crates/simulation",
     "crates/simulator",
     "crates/spammer",
+    "crates/state-tree",
     "crates/storage",
     "crates/storage-memory",
     "crates/storage-rocksdb",
@@ -78,11 +78,7 @@ hyperscale-core = { path = "crates/core" }
 hyperscale-dispatch = { path = "crates/dispatch" }
 hyperscale-dispatch-pooled = { path = "crates/dispatch-pooled" }
 hyperscale-dispatch-sync = { path = "crates/dispatch-sync" }
-hyperscale-storage = { path = "crates/storage" }
-hyperscale-storage-memory = { path = "crates/storage-memory" }
-hyperscale-storage-rocksdb = { path = "crates/storage-rocksdb" }
 hyperscale-engine = { path = "crates/engine" }
-hyperscale-jmt = { path = "crates/jmt" }
 hyperscale-execution = { path = "crates/execution" }
 hyperscale-livelock = { path = "crates/livelock" }
 hyperscale-mempool = { path = "crates/mempool" }
@@ -96,11 +92,18 @@ hyperscale-provisions = { path = "crates/provisions" }
 hyperscale-simulation = { path = "crates/simulation" }
 hyperscale-simulator = { path = "crates/simulator" }
 hyperscale-spammer = { path = "crates/spammer" }
+hyperscale-state-tree = { path = "crates/state-tree" }
+hyperscale-storage = { path = "crates/storage" }
+hyperscale-storage-memory = { path = "crates/storage-memory" }
+hyperscale-storage-rocksdb = { path = "crates/storage-rocksdb" }
 hyperscale-test-helpers = { path = "crates/test-helpers" }
 hyperscale-topology = { path = "crates/topology" }
 hyperscale-types = { path = "crates/types" }
 
 # External dependencies
+ark-ec = "0.5"
+ark-ed-on-bls12-381-bandersnatch = "0.5"
+ark-serialize = "0.5"
 arc-swap = "1.8.0"
 blake3 = "1.5"
 bytes = "1.9"
@@ -115,6 +118,7 @@ hex = { version = "0.4.3", default-features = false }
 im = "15.1"
 indexmap = "2.13.0"
 itertools = "0.14.0"
+jellyfish-verkle-tree = { git = "https://github.com/flightofthefox/jvt", rev = "1d3913f" }
 libp2p = { version = "0.56.0", features = ["gossipsub", "kad", "quic", "tcp", "noise", "yamux", "tokio", "macros", "identify"] }
 libp2p-stream = "0.4.0-alpha"
 opentelemetry = "0.31.0"
