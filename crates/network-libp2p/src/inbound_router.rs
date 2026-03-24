@@ -220,7 +220,9 @@ impl InboundRouter {
             .ok_or(StreamError::UnknownMessageType)?;
 
         // Delegate to the handler (receives raw SBOR payload, returns SBOR response).
-        let response_sbor = handler(&sbor_payload);
+        // Handlers may do heavy blocking work (e.g. verkle proof generation),
+        // so tell tokio this thread is temporarily unavailable.
+        let response_sbor = tokio::task::block_in_place(|| handler(&sbor_payload));
 
         // Write length-prefixed compressed response with timeout.
         let resp_wire_bytes = tokio::time::timeout(
