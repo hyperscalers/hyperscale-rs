@@ -29,7 +29,7 @@ const REMOTE_HEADER_RETENTION_BLOCKS: u64 = 100;
 
 /// Number of local committed blocks to wait before requesting missing provisions.
 /// This gives the source shard proposer time to send provisions normally.
-const PROVISION_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
+const PROVISION_FALLBACK_TIMEOUT_BLOCKS: u64 = 30;
 
 /// Tracks an expected provision that hasn't arrived yet.
 ///

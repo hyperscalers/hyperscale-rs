@@ -42,10 +42,12 @@ pub(crate) struct DelegatedResult<P: Send> {
 pub(crate) enum DispatchPool {
     /// Liveness-critical consensus crypto (QC, state root, proposal).
     ConsensusCrypto,
-    /// General crypto verification (cert aggregation, provisions).
+    /// General crypto verification (cert aggregation).
     Crypto,
     /// Transaction execution (single-shard, merkle).
     Execution,
+    /// Provision proof generation and verification (IPA math).
+    Provisions,
 }
 
 /// Map a delegated action to its execution pool.
@@ -66,12 +68,10 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         // General crypto
         Action::AggregateExecutionCertificate { .. } => Some(DispatchPool::Crypto),
 
-        // Provision work: both prove and verify do IPA math. Runs on the
-        // execution pool to avoid starving AggregateExecutionCertificate on
-        // the crypto pool. The execution pool is larger and provision work
-        // is not latency-critical for consensus.
-        Action::VerifyStateProvisions { .. } => Some(DispatchPool::Execution),
-        Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Execution),
+        // Provision work: IPA proof generation and verification.
+        // Dedicated pool to avoid starving execution and crypto work.
+        Action::VerifyStateProvisions { .. } => Some(DispatchPool::Provisions),
+        Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Provisions),
 
         // Execution
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
@@ -601,6 +601,20 @@ pub(crate) fn handle_delegated_action<
 
             if per_tx.is_empty() {
                 eprintln!("[PROACTIVE] no entries, returning empty");
+                return Some(DelegatedResult {
+                    events: vec![NodeInput::ProvisionsReady { batches: vec![] }],
+                    prepared_commit: None,
+                });
+            }
+
+            // Skip proof generation if we've been queued too long — the provisions
+            // would arrive stale and the target shard will use fallback anyway.
+            let queued_ms = proactive_start.elapsed().as_millis();
+            if queued_ms > 5000 {
+                eprintln!(
+                    "[PROACTIVE] SKIPPING height={} — queued {}ms, too stale",
+                    block_height.0, queued_ms
+                );
                 return Some(DelegatedResult {
                     events: vec![NodeInput::ProvisionsReady { batches: vec![] }],
                     prepared_commit: None,

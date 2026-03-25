@@ -706,6 +706,7 @@ where
             DispatchPool::ConsensusCrypto => self.dispatch.spawn_consensus_crypto(spawn_fn),
             DispatchPool::Crypto => self.dispatch.spawn_crypto(spawn_fn),
             DispatchPool::Execution => self.dispatch.spawn_execution(spawn_fn),
+            DispatchPool::Provisions => self.dispatch.spawn_provisions(spawn_fn),
         }
     }
 

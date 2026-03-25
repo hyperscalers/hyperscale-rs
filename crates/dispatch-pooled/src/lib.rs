@@ -74,6 +74,11 @@ pub struct ThreadPoolConfig {
     /// These run the Radix Engine and are CPU/memory intensive.
     pub execution_threads: usize,
 
+    /// Number of threads for provision proof generation and verification.
+    /// Isolated from execution to prevent transaction floods from starving
+    /// time-sensitive provision work.
+    pub provisions_threads: usize,
+
     /// Whether to pin threads to specific CPU cores.
     /// Improves cache locality but reduces flexibility.
     pub pin_cores: bool,
@@ -111,6 +116,7 @@ impl ThreadPoolConfig {
             crypto_threads: 1,
             tx_validation_threads: 1,
             execution_threads: 1,
+            provisions_threads: 1,
             pin_cores: false,
             consensus_crypto_core_start: None,
             crypto_core_start: None,
@@ -127,6 +133,7 @@ impl ThreadPoolConfig {
             + self.crypto_threads
             + self.tx_validation_threads
             + self.execution_threads
+            + self.provisions_threads
     }
 
     /// Validate the configuration.
@@ -215,6 +222,12 @@ impl ThreadPoolConfigBuilder {
         self
     }
 
+    /// Set the number of provision threads (IPA proof generation/verification).
+    pub fn provisions_threads(mut self, count: usize) -> Self {
+        self.config.provisions_threads = count;
+        self
+    }
+
     /// Enable core pinning.
     pub fn pin_cores(mut self, enabled: bool) -> Self {
         self.config.pin_cores = enabled;
@@ -296,10 +309,12 @@ pub struct PooledDispatch {
     crypto_pool: Arc<rayon::ThreadPool>,
     tx_validation_pool: Arc<rayon::ThreadPool>,
     execution_pool: Arc<rayon::ThreadPool>,
+    provisions_pool: Arc<rayon::ThreadPool>,
     consensus_crypto_pending: Arc<AtomicUsize>,
     crypto_pending: Arc<AtomicUsize>,
     tx_validation_pending: Arc<AtomicUsize>,
     execution_pending: Arc<AtomicUsize>,
+    provisions_pending: Arc<AtomicUsize>,
 }
 
 impl PooledDispatch {
@@ -311,12 +326,14 @@ impl PooledDispatch {
         let crypto_pool = Arc::new(Self::build_crypto_pool(&config)?);
         let tx_validation_pool = Arc::new(Self::build_tx_validation_pool(&config)?);
         let execution_pool = Arc::new(Self::build_execution_pool(&config)?);
+        let provisions_pool = Arc::new(Self::build_provisions_pool(&config)?);
 
         tracing::info!(
             consensus_crypto_threads = config.consensus_crypto_threads,
             crypto_threads = config.crypto_threads,
             tx_validation_threads = config.tx_validation_threads,
             execution_threads = config.execution_threads,
+            provisions_threads = config.provisions_threads,
             pin_cores = config.pin_cores,
             "Thread pools initialized"
         );
@@ -327,10 +344,12 @@ impl PooledDispatch {
             crypto_pool,
             tx_validation_pool,
             execution_pool,
+            provisions_pool,
             consensus_crypto_pending: Arc::new(AtomicUsize::new(0)),
             crypto_pending: Arc::new(AtomicUsize::new(0)),
             tx_validation_pending: Arc::new(AtomicUsize::new(0)),
             execution_pending: Arc::new(AtomicUsize::new(0)),
+            provisions_pending: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -396,6 +415,17 @@ impl PooledDispatch {
             .num_threads(config.tx_validation_threads)
             .stack_size(config.crypto_stack_size)
             .thread_name(|i| format!("tx-val-{}", i))
+            .build()
+            .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
+    }
+
+    fn build_provisions_pool(
+        config: &ThreadPoolConfig,
+    ) -> Result<rayon::ThreadPool, ThreadPoolError> {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(config.provisions_threads)
+            .stack_size(config.crypto_stack_size)
+            .thread_name(|i| format!("provisions-{}", i))
             .build()
             .map_err(|e| ThreadPoolError::RayonBuildError(e.to_string()))
     }
@@ -499,6 +529,20 @@ impl Dispatch for PooledDispatch {
 
     fn execution_queue_depth(&self) -> usize {
         self.execution_pending.load(Ordering::Relaxed)
+    }
+
+    fn spawn_provisions(&self, f: impl FnOnce() + Send + 'static) {
+        self.provisions_pending.fetch_add(1, Ordering::Relaxed);
+        let pending = self.provisions_pending.clone();
+        let pool = Arc::clone(&self.provisions_pool);
+        self.provisions_pool.spawn(move || {
+            pool.install(f);
+            pending.fetch_sub(1, Ordering::Relaxed);
+        });
+    }
+
+    fn provisions_queue_depth(&self) -> usize {
+        self.provisions_pending.load(Ordering::Relaxed)
     }
 
     fn map_local<T, R>(&self, items: &[T], f: impl Fn(&T) -> R + Send + Sync) -> Vec<R>
