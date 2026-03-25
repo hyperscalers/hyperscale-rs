@@ -301,6 +301,7 @@ where
                             state_root: hyperscale_types::Hash::ZERO,
                             qc: hyperscale_types::QuorumCertificate::genesis(),
                             proof,
+                            entries: vec![],
                         });
                     let transactions: Vec<hyperscale_types::TxEntries> = provisions
                         .into_iter()

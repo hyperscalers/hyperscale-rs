@@ -96,6 +96,13 @@ pub struct SourceBlockAttestation {
 
     /// Aggregated verkle proof covering all entries for this block.
     pub proof: SubstateInclusionProof,
+
+    /// All state entries covered by this proof (sorted, deduped by storage_key).
+    ///
+    /// The verkle proof is a multipoint proof over these entries. Verification
+    /// requires the full set — passing a subset will fail the proof check.
+    /// Stored on the attestation so it forms a self-contained verifiable unit.
+    pub entries: Vec<StateEntry>,
 }
 
 impl SourceBlockAttestation {
@@ -109,6 +116,7 @@ impl SourceBlockAttestation {
             state_root: Hash::ZERO,
             qc: QuorumCertificate::genesis(),
             proof: SubstateInclusionProof::dummy(),
+            entries: vec![],
         }
     }
 }
@@ -327,6 +335,7 @@ mod tests {
             state_root: Hash::from_bytes(b"state_root"),
             qc: QuorumCertificate::genesis(),
             proof: VerkleInclusionProof::new(vec![1, 2, 3]),
+            entries: vec![test_entry(1), test_entry(2)],
         };
 
         let bytes = sbor::basic_encode(&original).unwrap();

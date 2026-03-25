@@ -336,7 +336,7 @@ impl LivelockState {
 
         // Get the stored attestation and entries for the winner.
         // These MUST be present - BFT validation rejects deferrals without proofs.
-        let Some((attestation, entries)) = self.tx_attestations.get(&winner_tx) else {
+        let Some((attestation, _)) = self.tx_attestations.get(&winner_tx) else {
             // This shouldn't happen in normal operation since we store the attestation
             // before calling check_for_cycle. But if it does, we can't create
             // a valid deferral, so we must skip it.
@@ -355,7 +355,6 @@ impl LivelockState {
             },
             block_height: BlockHeight(0), // Will be filled in when included in block
             attestation: SourceBlockAttestation::clone(attestation),
-            entries: entries.clone(),
         };
 
         debug!(
@@ -760,7 +759,6 @@ mod tests {
             },
             block_height: BlockHeight(5),
             attestation,
-            entries,
         };
 
         let block = hyperscale_types::Block {

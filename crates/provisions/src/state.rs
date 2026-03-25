@@ -645,7 +645,10 @@ impl ProvisionCoordinator {
             return actions;
         };
 
-        // Build the attestation from the batch's attestation + verified header
+        // Build the attestation from the batch's attestation + verified header.
+        // Include ALL deduped entries since the proof is a multipoint proof over
+        // the full set — verification requires the complete entry list.
+        let all_entries = batch.all_entries_deduped();
         let attestation = Arc::new(SourceBlockAttestation {
             source_shard,
             block_height: batch.block_height(),
@@ -653,6 +656,7 @@ impl ProvisionCoordinator {
             state_root: header.state_root(),
             qc: header.qc.clone(),
             proof: batch.attestation.proof.clone(),
+            entries: all_entries,
         });
 
         for tx_entries in &batch.transactions {
@@ -665,7 +669,7 @@ impl ProvisionCoordinator {
                 "State provision verified successfully"
             );
 
-            // Store entries and attestation together
+            // Store per-tx entries for execution, but full entries for attestation verification
             self.verified_provisions.entry(tx_hash).or_default().insert(
                 source_shard,
                 (tx_entries.entries.clone(), Arc::clone(&attestation)),
@@ -677,7 +681,9 @@ impl ProvisionCoordinator {
                 .or_default()
                 .insert(tx_hash);
 
-            // Emit provision accepted (used by livelock for cycle detection)
+            // Emit provision accepted (used by livelock for cycle detection).
+            // Per-tx entries for node-overlap cycle detection; the attestation
+            // carries the full entry set + proof for deferral verification.
             actions.push(Action::Continuation(ProtocolEvent::ProvisionAccepted {
                 tx_hash,
                 source_shard,

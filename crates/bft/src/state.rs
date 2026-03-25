@@ -2013,7 +2013,7 @@ impl BftState {
             // from the winner's source shard that will be verified asynchronously.
 
             // Rule 5: Deferral must have at least one state entry (entries prove winner's state)
-            if deferral.entries.is_empty() {
+            if deferral.attestation.entries.is_empty() {
                 return Err(format!(
                     "Invalid deferral: no state entries for tx {}",
                     deferral.tx_hash
@@ -5524,7 +5524,9 @@ mod tests {
     fn make_test_attestation() -> SourceBlockAttestation {
         use hyperscale_types::ShardGroupId;
 
-        SourceBlockAttestation::dummy(ShardGroupId(1), BlockHeight(1))
+        let mut att = SourceBlockAttestation::dummy(ShardGroupId(1), BlockHeight(1));
+        att.entries = vec![hyperscale_types::StateEntry::new(vec![0; 50], None)];
+        att
     }
 
     /// Create test state entries for a deferral.
@@ -5545,7 +5547,6 @@ mod tests {
             },
             block_height: BlockHeight(0),
             attestation: make_test_attestation(),
-            entries: make_test_entries(winner_tx),
         }
     }
 
@@ -5597,7 +5598,6 @@ mod tests {
             },
             block_height: BlockHeight(5),
             attestation: make_test_attestation(),
-            entries: make_test_entries(winner_hash),
         };
         let block = make_test_block(5, vec![valid_deferral], vec![], vec![]);
         assert!(state.validate_deferrals_and_aborts(&block).is_ok());
@@ -5610,7 +5610,6 @@ mod tests {
             },
             block_height: BlockHeight(5),
             attestation: make_test_attestation(),
-            entries: make_test_entries(loser_hash),
         };
         let block = make_test_block(5, vec![invalid_deferral], vec![], vec![]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -5643,7 +5642,6 @@ mod tests {
             },
             block_height: BlockHeight(5),
             attestation: make_test_attestation(),
-            entries: make_test_entries(winner_hash),
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![winner_cert]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -5676,7 +5674,6 @@ mod tests {
             },
             block_height: BlockHeight(5),
             attestation: make_test_attestation(),
-            entries: make_test_entries(winner_hash),
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![loser_cert]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -5695,15 +5692,16 @@ mod tests {
         let loser_hash = Hash::from_hash_bytes(&loser_bytes);
         let winner_hash = Hash::from_hash_bytes(&winner_bytes);
 
-        // Invalid: deferral with empty entries
+        // Invalid: deferral with empty entries in attestation
+        let mut empty_attestation = make_test_attestation();
+        empty_attestation.entries = vec![];
         let deferral = TransactionDefer {
             tx_hash: loser_hash,
             reason: hyperscale_types::DeferReason::LivelockCycle {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
-            attestation: make_test_attestation(),
-            entries: vec![], // Empty entries - invalid!
+            attestation: empty_attestation,
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![]);
         let result = state.validate_deferrals_and_aborts(&block);

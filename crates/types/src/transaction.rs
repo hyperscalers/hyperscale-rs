@@ -2,7 +2,6 @@
 
 use crate::{
     BlockHeight, ExecutionCertificate, Hash, NodeId, ShardGroupId, SourceBlockAttestation,
-    StateEntry,
 };
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
@@ -420,11 +419,9 @@ pub struct TransactionDefer {
     ///
     /// Required for block validation. Validators verify the QC signature and
     /// merkle proof to ensure the deferral is justified without needing to
-    /// have seen the same provisions.
+    /// have seen the same provisions. The attestation is self-contained: it
+    /// carries the QC, state_root, proof, AND all entries covered by the proof.
     pub attestation: SourceBlockAttestation,
-
-    /// State entries from the winner transaction, for cycle detection verification.
-    pub entries: Vec<StateEntry>,
 }
 
 /// Reason a transaction was aborted.

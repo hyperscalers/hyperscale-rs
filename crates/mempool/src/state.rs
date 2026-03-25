@@ -2130,7 +2130,6 @@ mod tests {
                 ShardGroupId(1),
                 BlockHeight(1),
             ),
-            entries: vec![],
         }
     }
 

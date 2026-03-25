@@ -659,6 +659,7 @@ pub(crate) fn handle_delegated_action<
                 state_root: Hash::ZERO, // Filled by verifier from committed header
                 qc: QuorumCertificate::genesis(), // Filled by verifier from committed header
                 proof: (*proof).clone(),
+                entries: vec![], // Populated at verification time from batch entries
             });
 
             let batches: Vec<_> = shard_tx_entries

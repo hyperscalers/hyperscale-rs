@@ -321,7 +321,7 @@ impl VerificationPipeline {
                     block_hash,
                     deferral_index: idx,
                     attestation: attestation.clone(),
-                    entries: deferral.entries.clone(),
+                    entries: deferral.attestation.entries.clone(),
                     public_keys,
                     voting_power,
                     quorum_threshold,
