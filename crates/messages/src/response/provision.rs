@@ -1,6 +1,6 @@
 //! Provision fetch response for fallback recovery.
 
-use hyperscale_types::{MessagePriority, NetworkMessage, StateProvision};
+use hyperscale_types::{MessagePriority, NetworkMessage, StateProvision, SubstateInclusionProof};
 use sbor::prelude::BasicSbor;
 
 /// Response to a provision fetch request containing the state provisions.
@@ -9,6 +9,9 @@ use sbor::prelude::BasicSbor;
 /// target shard, identical to what the proposer would have broadcast.
 /// The target shard feeds these into the normal verification pipeline
 /// (QC + merkle proof checks).
+///
+/// The aggregated verkle proof is stored once at the response level,
+/// not per-provision.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetProvisionsResponse {
     /// The provisions for the requested block and target shard.
@@ -19,6 +22,11 @@ pub struct GetProvisionsResponse {
     ///   or the historical state version has been garbage-collected). The
     ///   requester should try a different peer.
     pub provisions: Option<Vec<StateProvision>>,
+
+    /// Aggregated verkle proof covering all entries across all provisions.
+    ///
+    /// `None` when `provisions` is `None` or `Some(empty)`.
+    pub proof: Option<SubstateInclusionProof>,
 }
 
 impl NetworkMessage for GetProvisionsResponse {
@@ -39,6 +47,7 @@ mod tests {
     fn test_sbor_roundtrip_empty() {
         let response = GetProvisionsResponse {
             provisions: Some(vec![]),
+            proof: None,
         };
 
         let encoded = sbor::basic_encode(&response).unwrap();
@@ -48,7 +57,10 @@ mod tests {
 
     #[test]
     fn test_sbor_roundtrip_unavailable() {
-        let response = GetProvisionsResponse { provisions: None };
+        let response = GetProvisionsResponse {
+            provisions: None,
+            proof: None,
+        };
 
         let encoded = sbor::basic_encode(&response).unwrap();
         let decoded: GetProvisionsResponse = sbor::basic_decode(&encoded).unwrap();

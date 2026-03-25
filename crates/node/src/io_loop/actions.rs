@@ -109,13 +109,13 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::VerifyAndBuildQuorumCertificate { .. }
             | Action::VerifyQcSignature { .. }
-            | Action::VerifyCommitmentProof { .. }
+            | Action::VerifySourceAttestation { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyTransactionRoot { .. }
             | Action::VerifyReceiptRoot { .. }
             | Action::BuildProposal { .. }
             | Action::AggregateExecutionCertificate { .. }
-            | Action::VerifyStateProvisions { .. }
+            | Action::VerifyProvisionBatch { .. }
             | Action::ExecuteTransactions { .. }
             | Action::SpeculativeExecute { .. }
             | Action::FetchAndBroadcastProvisions { .. } => {
@@ -291,7 +291,7 @@ where
         let commit_latency_secs = (now_ms.saturating_sub(block.header.timestamp)) as f64 / 1000.0;
         metrics::record_block_committed(height.0, commit_latency_secs);
         metrics::set_block_height(height.0);
-        metrics::set_txs_with_commitment_proof(block.commitment_proofs.len());
+        metrics::set_txs_with_commitment_proof(block.commitment_entries.len());
 
         // Livelock metrics for deferrals in this block.
         for _deferral in &block.deferred {

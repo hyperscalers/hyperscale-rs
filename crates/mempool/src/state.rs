@@ -2106,7 +2106,8 @@ mod tests {
             certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
-            commitment_proofs: std::collections::HashMap::new(),
+            source_attestations: vec![],
+            commitment_entries: vec![],
         }
     }
 
@@ -2119,27 +2120,17 @@ mod tests {
     }
 
     fn make_test_deferral(loser_tx: Hash, winner_tx: Hash, height: u64) -> TransactionDefer {
-        use hyperscale_types::CommitmentProof;
-
-        let proof = CommitmentProof::new(
-            winner_tx,
-            ShardGroupId(1),
-            ShardGroupId(0),
-            BlockHeight(1),
-            1000,
-            Hash::ZERO,
-            QuorumCertificate::genesis(),
-            Arc::new(vec![]),
-            Arc::new(hyperscale_types::SubstateInclusionProof::dummy()),
-        );
-
         TransactionDefer {
             tx_hash: loser_tx,
             reason: DeferReason::LivelockCycle {
                 winner_tx_hash: winner_tx,
             },
             block_height: BlockHeight(height),
-            proof,
+            attestation: hyperscale_types::SourceBlockAttestation::dummy(
+                ShardGroupId(1),
+                BlockHeight(1),
+            ),
+            entries: vec![],
         }
     }
 

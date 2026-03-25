@@ -257,9 +257,11 @@ impl ExecutionCertificate {
 
 /// State provision from a source shard to a target shard.
 ///
-/// Only the block proposer sends these. Each provision contains merkle
-/// inclusion proofs that verify against the QC-committed state root,
-/// making the provision self-authenticating via the 2f+1 QC signature.
+/// Only the block proposer sends these. Provisions are always transported
+/// in a batch (per block) alongside a single aggregated verkle proof that
+/// covers all entries across all provisions in that batch. The proof lives
+/// at the batch level (e.g. `StateProvisionsNotification`) to avoid
+/// duplicating it per provision during serialization.
 #[derive(Debug, Clone)]
 pub struct StateProvision {
     /// Hash of the transaction this provision is for.
@@ -280,10 +282,6 @@ pub struct StateProvision {
     /// The state entries with pre-computed storage keys.
     /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
     pub entries: Arc<Vec<StateEntry>>,
-
-    /// Aggregated merkle inclusion proof covering all entries.
-    /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
-    pub proof: Arc<crate::SubstateInclusionProof>,
 }
 
 // Manual PartialEq (compare Arc contents, not pointer identity)
@@ -295,7 +293,6 @@ impl PartialEq for StateProvision {
             && self.block_height == other.block_height
             && self.block_timestamp == other.block_timestamp
             && *self.entries == *other.entries
-            && *self.proof == *other.proof
     }
 }
 
@@ -310,14 +307,13 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(7)?;
+        encoder.write_size(6)?;
         encoder.encode(&self.transaction_hash)?;
         encoder.encode(&self.target_shard)?;
         encoder.encode(&self.source_shard)?;
         encoder.encode(&self.block_height)?;
         encoder.encode(&self.block_timestamp)?;
         encoder.encode(self.entries.as_ref())?;
-        encoder.encode(self.proof.as_ref())?;
         Ok(())
     }
 }
@@ -332,9 +328,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 7 {
+        if length != 6 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 7,
+                expected: 6,
                 actual: length,
             });
         }
@@ -345,7 +341,6 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let block_height: BlockHeight = decoder.decode()?;
         let block_timestamp: u64 = decoder.decode()?;
         let entries: Vec<StateEntry> = decoder.decode()?;
-        let proof: crate::SubstateInclusionProof = decoder.decode()?;
 
         Ok(Self {
             transaction_hash,
@@ -354,7 +349,6 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             block_height,
             block_timestamp,
             entries: Arc::new(entries),
-            proof: Arc::new(proof),
         })
     }
 }

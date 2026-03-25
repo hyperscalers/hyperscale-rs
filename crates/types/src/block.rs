@@ -1,12 +1,11 @@
 //! Block and BlockHeader types for consensus.
 
 use crate::{
-    compute_merkle_root, BlockHeight, CommitmentProof, Hash, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, TransactionAbort, TransactionCertificate, TransactionDefer,
-    ValidatorId,
+    compute_merkle_root, BlockHeight, CommitmentEntry, Hash, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, SourceBlockAttestation, TransactionAbort,
+    TransactionCertificate, TransactionDefer, ValidatorId,
 };
 use sbor::prelude::*;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Tag prefixes for transaction slot provability in merkle tree.
@@ -238,11 +237,18 @@ pub struct Block {
     /// or for transactions that explicitly failed during execution.
     pub aborted: Vec<TransactionAbort>,
 
-    /// Commitment proofs for priority transaction ordering.
+    /// Source block attestations referenced by commitment entries and deferrals.
     ///
-    /// Maps transaction hash to its CommitmentProof. These proofs justify
-    /// why transactions are in the priority section.
-    pub commitment_proofs: HashMap<Hash, CommitmentProof>,
+    /// Deduplicated: if multiple transactions reference the same source block,
+    /// the attestation (QC + proof + state_root) is stored once here and
+    /// referenced by index from [`CommitmentEntry`] and [`TransactionDefer`].
+    pub source_attestations: Vec<SourceBlockAttestation>,
+
+    /// Per-transaction commitment data for priority transaction ordering.
+    ///
+    /// Each entry references a `source_attestations` element by index and
+    /// contains the transaction-specific state entries.
+    pub commitment_entries: Vec<CommitmentEntry>,
 }
 
 // Manual PartialEq - compare transaction/certificate content, not Arc pointers
@@ -264,7 +270,8 @@ impl PartialEq for Block {
                 .all(|(a, b)| a.as_ref() == b.as_ref())
             && self.deferred == other.deferred
             && self.aborted == other.aborted
-            && self.commitment_proofs == other.commitment_proofs
+            && self.source_attestations == other.source_attestations
+            && self.commitment_entries == other.commitment_entries
     }
 }
 
@@ -295,7 +302,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(8)?;
+        encoder.write_size(9)?;
         encoder.encode(&self.header)?;
         // Retry transactions
         encode_tx_vec(encoder, &self.retry_transactions)?;
@@ -312,18 +319,8 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         }
         encoder.encode(&self.deferred)?;
         encoder.encode(&self.aborted)?;
-        // Commitment proofs (HashMap<Hash, CommitmentProof>)
-        // Encode as array of (key, value) pairs for determinism
-        encoder.write_value_kind(sbor::ValueKind::Array)?;
-        encoder.write_value_kind(sbor::ValueKind::Tuple)?;
-        encoder.write_size(self.commitment_proofs.len())?;
-        // Sort by hash for deterministic encoding
-        let mut proofs: Vec<_> = self.commitment_proofs.iter().collect();
-        proofs.sort_by_key(|(k, _)| *k);
-        for (tx_hash, proof) in proofs {
-            encoder.encode(tx_hash)?;
-            encoder.encode(proof)?;
-        }
+        encoder.encode(&self.source_attestations)?;
+        encoder.encode(&self.commitment_entries)?;
         Ok(())
     }
 }
@@ -367,9 +364,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 8 {
+        if length != 9 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 8,
+                expected: 9,
                 actual: length,
             });
         }
@@ -400,23 +397,8 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
 
         let deferred: Vec<TransactionDefer> = decoder.decode()?;
         let aborted: Vec<TransactionAbort> = decoder.decode()?;
-
-        // Commitment proofs (array of (Hash, CommitmentProof) pairs)
-        decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
-        decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
-        let proof_count = decoder.read_size()?;
-        if proof_count > MAX_SBOR_COLLECTION_SIZE {
-            return Err(sbor::DecodeError::UnexpectedSize {
-                expected: MAX_SBOR_COLLECTION_SIZE,
-                actual: proof_count,
-            });
-        }
-        let mut commitment_proofs = HashMap::with_capacity(proof_count);
-        for _ in 0..proof_count {
-            let tx_hash: Hash = decoder.decode()?;
-            let proof: CommitmentProof = decoder.decode()?;
-            commitment_proofs.insert(tx_hash, proof);
-        }
+        let source_attestations: Vec<SourceBlockAttestation> = decoder.decode()?;
+        let commitment_entries: Vec<CommitmentEntry> = decoder.decode()?;
 
         Ok(Self {
             header,
@@ -426,7 +408,8 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             certificates,
             deferred,
             aborted,
-            commitment_proofs,
+            source_attestations,
+            commitment_entries,
         })
     }
 }
@@ -456,7 +439,8 @@ impl Block {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs: HashMap::new(),
+            source_attestations: vec![],
+            commitment_entries: vec![],
         }
     }
 
@@ -516,14 +500,26 @@ impl Block {
         self.header.is_genesis()
     }
 
-    /// Check if a transaction has a commitment proof in this block.
-    pub fn has_commitment_proof(&self, tx_hash: &Hash) -> bool {
-        self.commitment_proofs.contains_key(tx_hash)
+    /// Check if a transaction has a commitment entry in this block.
+    pub fn has_commitment_entry(&self, tx_hash: &Hash) -> bool {
+        self.commitment_entries
+            .iter()
+            .any(|e| e.tx_hash == *tx_hash)
     }
 
-    /// Get the commitment proof for a transaction, if present.
-    pub fn get_commitment_proof(&self, tx_hash: &Hash) -> Option<&CommitmentProof> {
-        self.commitment_proofs.get(tx_hash)
+    /// Get the commitment entry and its source attestation for a transaction.
+    pub fn commitment_for_tx(
+        &self,
+        tx_hash: &Hash,
+    ) -> Option<(&SourceBlockAttestation, &CommitmentEntry)> {
+        self.commitment_entries
+            .iter()
+            .find(|e| e.tx_hash == *tx_hash)
+            .and_then(|entry| {
+                self.source_attestations
+                    .get(entry.attestation_index as usize)
+                    .map(|att| (att, entry))
+            })
     }
 
     /// Get number of committed certificates in this block.
@@ -612,8 +608,11 @@ pub struct BlockManifest {
     /// Aborted transactions (small, stored inline).
     pub aborted: Vec<TransactionAbort>,
 
-    /// Commitment proofs for priority ordering (stored inline).
-    pub commitment_proofs: HashMap<Hash, CommitmentProof>,
+    /// Source block attestations (deduplicated).
+    pub source_attestations: Vec<SourceBlockAttestation>,
+
+    /// Per-transaction commitment entries.
+    pub commitment_entries: Vec<CommitmentEntry>,
 }
 
 impl BlockManifest {
@@ -651,7 +650,8 @@ impl BlockManifest {
                 .collect(),
             deferred: block.deferred.clone(),
             aborted: block.aborted.clone(),
-            commitment_proofs: block.commitment_proofs.clone(),
+            source_attestations: block.source_attestations.clone(),
+            commitment_entries: block.commitment_entries.clone(),
         }
     }
 }

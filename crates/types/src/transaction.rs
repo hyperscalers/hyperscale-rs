@@ -1,6 +1,9 @@
 //! Transaction types for consensus.
 
-use crate::{BlockHeight, CommitmentProof, ExecutionCertificate, Hash, NodeId, ShardGroupId};
+use crate::{
+    BlockHeight, ExecutionCertificate, Hash, NodeId, ShardGroupId, SourceBlockAttestation,
+    StateEntry,
+};
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
 use radix_transactions::validation::TransactionValidator;
@@ -396,7 +399,12 @@ impl std::fmt::Display for DeferReason {
 /// When a proposer detects that a transaction should be deferred (via cycle
 /// detection during provisioning), they include this in the block. All
 /// validators process it identically, releasing locks and queuing for retry.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The deferral carries a full [`SourceBlockAttestation`] and the relevant
+/// entries so it can be independently verified during block validation.
+/// Deferrals are rare (livelock resolution), so the per-deferral attestation
+/// cost is acceptable.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct TransactionDefer {
     /// Hash of the transaction being deferred.
     pub tx_hash: Hash,
@@ -408,79 +416,15 @@ pub struct TransactionDefer {
     /// Used for timeout calculations on the retry.
     pub block_height: BlockHeight,
 
-    /// Proof that the winner transaction was committed on another shard.
+    /// Attestation proving the winner transaction was committed on another shard.
     ///
-    /// Required for block validation. Validators verify this proof to ensure
-    /// the deferral is justified without needing to have seen the same provisions.
-    /// BFT rejects blocks containing deferrals without valid proofs.
-    pub proof: CommitmentProof,
-}
+    /// Required for block validation. Validators verify the QC signature and
+    /// merkle proof to ensure the deferral is justified without needing to
+    /// have seen the same provisions.
+    pub attestation: SourceBlockAttestation,
 
-// ============================================================================
-// Manual SBOR implementation for TransactionDefer (CommitmentProof contains Arc)
-// ============================================================================
-
-impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
-    for TransactionDefer
-{
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_value_kind(sbor::ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(4)?;
-        encoder.encode(&self.tx_hash)?;
-        encoder.encode(&self.reason)?;
-        encoder.encode(&self.block_height)?;
-        encoder.encode(&self.proof)?;
-        Ok(())
-    }
-}
-
-impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
-    for TransactionDefer
-{
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
-    ) -> Result<Self, sbor::DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-
-        if length != 4 {
-            return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 4,
-                actual: length,
-            });
-        }
-
-        let tx_hash: Hash = decoder.decode()?;
-        let reason: DeferReason = decoder.decode()?;
-        let block_height: BlockHeight = decoder.decode()?;
-        let proof: CommitmentProof = decoder.decode()?;
-
-        Ok(Self {
-            tx_hash,
-            reason,
-            block_height,
-            proof,
-        })
-    }
-}
-
-impl sbor::Categorize<sbor::NoCustomValueKind> for TransactionDefer {
-    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
-        sbor::ValueKind::Tuple
-    }
-}
-
-impl sbor::Describe<sbor::NoCustomTypeKind> for TransactionDefer {
-    const TYPE_ID: sbor::RustTypeId =
-        sbor::RustTypeId::novel_with_code("TransactionDefer", &[], &[]);
-
-    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
-        sbor::TypeData::unnamed(sbor::TypeKind::Any)
-    }
+    /// State entries from the winner transaction, for cycle detection verification.
+    pub entries: Vec<StateEntry>,
 }
 
 /// Reason a transaction was aborted.

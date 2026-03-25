@@ -8,13 +8,14 @@
 //! Batched work (execution votes, execution certs, cross-shard execution) and block
 //! commits are handled inline by the I/O loop's flush closures.
 
-use hyperscale_core::{Action, NodeInput, ProtocolEvent, ProvisionVerificationResult};
+use hyperscale_core::{Action, NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ShardGroupId, ValidatorId,
+    Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ProvisionBatch, QuorumCertificate,
+    ShardGroupId, SourceBlockAttestation, TxEntries, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -59,7 +60,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         // Consensus-critical crypto
         Action::VerifyAndBuildQuorumCertificate { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyQcSignature { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyCommitmentProof { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::VerifySourceAttestation { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
@@ -70,7 +71,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 
         // Provision work: IPA proof generation and verification.
         // Dedicated pool to avoid starving execution and crypto work.
-        Action::VerifyStateProvisions { .. } => Some(DispatchPool::Provisions),
+        Action::VerifyProvisionBatch { .. } => Some(DispatchPool::Provisions),
         Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Provisions),
 
         // Execution
@@ -150,30 +151,33 @@ pub(crate) fn handle_delegated_action<
             })
         }
 
-        Action::VerifyCommitmentProof {
+        Action::VerifySourceAttestation {
             block_hash,
             deferral_index,
-            commitment_proof,
+            attestation,
+            entries,
             public_keys,
             voting_power,
             quorum_threshold,
         } => {
             let start = std::time::Instant::now();
-            let valid = hyperscale_bft::handlers::verify_commitment_proof(
-                &commitment_proof,
+            let valid = hyperscale_bft::handlers::verify_source_attestation(
+                &attestation,
+                &entries,
                 &public_keys,
                 voting_power,
                 quorum_threshold,
             );
             metrics::record_signature_verification_latency(
-                "commitment_proof",
+                "source_attestation",
                 start.elapsed().as_secs_f64(),
             );
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
-                    ProtocolEvent::CommitmentProofVerified {
+                    ProtocolEvent::SourceAttestationVerified {
                         block_hash,
                         deferral_index,
+                        attestation,
                         valid,
                     },
                 )],
@@ -275,7 +279,8 @@ pub(crate) fn handle_delegated_action<
             transactions,
             certificates,
             per_cert_updates,
-            commitment_proofs,
+            source_attestations,
+            commitment_entries,
             deferred,
             aborted,
             provision_targets,
@@ -297,7 +302,8 @@ pub(crate) fn handle_delegated_action<
                 transactions,
                 certificates,
                 merged_updates,
-                commitment_proofs,
+                source_attestations,
+                commitment_entries,
                 deferred,
                 aborted,
                 shard_group_id,
@@ -348,8 +354,8 @@ pub(crate) fn handle_delegated_action<
         }
 
         // --- State Provision Batch Verification ---
-        Action::VerifyStateProvisions {
-            provisions,
+        Action::VerifyProvisionBatch {
+            batch,
             committed_headers,
             committee_public_keys,
             committee_voting_power,
@@ -385,48 +391,29 @@ pub(crate) fn handle_delegated_action<
 
             eprintln!(
                 "[VERIFY] START provisions={} qc_ms={}",
-                provisions.len(),
+                batch.transactions.len(),
                 qc_start.elapsed().as_millis()
             );
 
             // Verify merkle proofs against the verified header's state root.
-            // All provisions from the same block share a single batched proof,
-            // so we collect all entries and verify once instead of N times.
             let merkle_start = std::time::Instant::now();
             let all_valid = verified_header.as_ref().is_some_and(|header| {
-                // Collect all entries across all provisions, then sort+dedupe by
-                // storage_key to match the order used during proof generation.
-                let mut all_entries: Vec<hyperscale_types::StateEntry> = provisions
-                    .iter()
-                    .flat_map(|p| p.entries.iter().cloned())
-                    .collect();
+                let all_entries = batch.all_entries_deduped();
                 if all_entries.is_empty() {
                     return true;
                 }
-                all_entries.sort_by(|a, b| a.storage_key.cmp(&b.storage_key));
-                all_entries.dedup_by(|a, b| a.storage_key == b.storage_key);
-                // Use the proof from the first provision (all share the same Arc).
                 hyperscale_storage::proofs::verify_all_merkle_proofs(
                     &all_entries,
-                    &provisions[0].proof,
+                    &batch.attestation.proof,
                     header.header.state_root,
                 )
             });
             eprintln!(
-                "[VERIFY] DONE valid={} verify_ms={} provisions={}",
+                "[VERIFY] DONE valid={} verify_ms={} txs={}",
                 all_valid,
                 merkle_start.elapsed().as_millis(),
-                provisions.len()
+                batch.transactions.len()
             );
-            let results: Vec<ProvisionVerificationResult> = provisions
-                .into_iter()
-                .map(|provision| ProvisionVerificationResult {
-                    tx_hash: provision.transaction_hash,
-                    source_shard: provision.source_shard,
-                    valid: all_valid,
-                    provision,
-                })
-                .collect();
             metrics::record_signature_verification_latency(
                 "inclusion_proof",
                 merkle_start.elapsed().as_secs_f64(),
@@ -435,8 +422,9 @@ pub(crate) fn handle_delegated_action<
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
                     ProtocolEvent::StateProvisionsVerified {
-                        results,
+                        batch,
                         committed_header: verified_header,
+                        valid: all_valid,
                     },
                 )],
                 prepared_commit: None,
@@ -550,7 +538,6 @@ pub(crate) fn handle_delegated_action<
             block_timestamp,
             shard_recipients,
         } => {
-            use hyperscale_types::StateProvision;
             use std::collections::HashMap;
 
             let proactive_start = std::time::Instant::now();
@@ -651,27 +638,38 @@ pub(crate) fn handle_delegated_action<
             );
 
             // Phase 3: Build provisions sharing the single proof.
-            let mut batches: HashMap<ShardGroupId, Vec<StateProvision>> = HashMap::new();
+            // Group entries per target shard.
+            let mut shard_tx_entries: HashMap<ShardGroupId, Vec<TxEntries>> = HashMap::new();
             for (tx_hash, target_shards, entries) in per_tx {
                 for &target_shard in &target_shards {
-                    let provision = StateProvision {
-                        transaction_hash: tx_hash,
-                        target_shard,
-                        source_shard,
-                        block_height,
-                        block_timestamp,
-                        entries: Arc::clone(&entries),
-                        proof: Arc::clone(&proof),
-                    };
-                    batches.entry(target_shard).or_default().push(provision);
+                    shard_tx_entries
+                        .entry(target_shard)
+                        .or_default()
+                        .push(TxEntries {
+                            tx_hash,
+                            entries: (*entries).clone(),
+                        });
                 }
             }
 
-            let batches: Vec<_> = batches
+            let attestation = Arc::new(SourceBlockAttestation {
+                source_shard,
+                block_height,
+                block_timestamp,
+                state_root: Hash::ZERO, // Filled by verifier from committed header
+                qc: QuorumCertificate::genesis(), // Filled by verifier from committed header
+                proof: (*proof).clone(),
+            });
+
+            let batches: Vec<_> = shard_tx_entries
                 .into_iter()
-                .map(|(shard, provisions)| {
+                .map(|(shard, transactions)| {
                     let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
-                    (shard, provisions, recipients)
+                    let batch = ProvisionBatch {
+                        attestation: Arc::clone(&attestation),
+                        transactions,
+                    };
+                    (shard, batch, recipients)
                 })
                 .collect();
             Some(DelegatedResult {

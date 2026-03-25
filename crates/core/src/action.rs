@@ -3,11 +3,12 @@
 use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
-    Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
+    Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentEntry,
     CommittedBlockHeader, DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate,
-    ExecutionVote, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    SignerBitfield, StateProvision, TopologySnapshot, TransactionAbort, TransactionCertificate,
-    TransactionDefer, ValidatorId, VotePower,
+    ExecutionVote, Hash, NodeId, ProvisionBatch, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, SignerBitfield, SourceBlockAttestation, StateEntry, StateProvision,
+    TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId,
+    VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -172,17 +173,16 @@ pub enum Action {
         total_voting_power: u64,
     },
 
-    /// Verify a batch of state provisions' QC and merkle inclusion proofs.
+    /// Verify a provision batch's QC and verkle inclusion proofs.
     ///
-    /// The QC signature is verified once across candidate headers. Merkle
-    /// inclusion proofs are checked per provision against the verified
-    /// header's state root.
+    /// The QC signature is verified once for the batch's attestation. Verkle
+    /// proofs are checked against the verified state root.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::StateProvisionsVerified` when complete.
-    VerifyStateProvisions {
-        /// The state provisions to verify (all from the same block).
-        provisions: Vec<StateProvision>,
+    VerifyProvisionBatch {
+        /// The provision batch to verify (all from the same source block).
+        batch: ProvisionBatch,
         /// Candidate committed block headers to try.
         /// In normal operation there is one; with byzantine validators
         /// there may be multiple (one per sender for the same (shard, height)).
@@ -266,25 +266,27 @@ pub enum Action {
         block_hash: Hash,
     },
 
-    /// Verify a CommitmentProof's aggregated BLS signature.
+    /// Verify a SourceBlockAttestation's QC signature and verkle proof.
     ///
-    /// This is CRITICAL for BFT safety: we must verify that the CommitmentProof
-    /// has a valid aggregated signature from the claimed signers on the source shard.
-    /// Without this check, a Byzantine proposer could include deferrals with forged
-    /// proofs, causing honest validators to incorrectly defer transactions.
+    /// This is CRITICAL for BFT safety: we must verify that the attestation
+    /// has a valid QC from the source shard's committee. Without this check,
+    /// a Byzantine proposer could include deferrals with forged attestations,
+    /// causing honest validators to incorrectly defer transactions.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::CommitmentProofVerified` when complete.
-    VerifyCommitmentProof {
+    /// Returns `ProtocolEvent::SourceAttestationVerified` when complete.
+    VerifySourceAttestation {
         /// Block hash containing this deferral (for correlation).
         block_hash: Hash,
         /// Index of deferral in block's deferred list.
         deferral_index: usize,
-        /// The CommitmentProof to verify.
-        commitment_proof: CommitmentProof,
-        /// Public keys of signers (resolved from SignerBitfield).
+        /// The attestation to verify.
+        attestation: SourceBlockAttestation,
+        /// State entries to verify against the attestation's proof.
+        entries: Vec<StateEntry>,
+        /// Public keys of signers (resolved from QC's SignerBitfield).
         public_keys: Vec<Bls12381G1PublicKey>,
-        /// Total voting power of the signers (resolved from SignerBitfield + topology).
+        /// Total voting power of the signers (resolved from QC's SignerBitfield + topology).
         voting_power: u64,
         /// Quorum threshold for source shard.
         quorum_threshold: u64,
@@ -379,7 +381,8 @@ pub enum Action {
         /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
         /// Merged on the thread pool before proposal building.
         per_cert_updates: Vec<Arc<DatabaseUpdates>>,
-        commitment_proofs: HashMap<Hash, CommitmentProof>,
+        source_attestations: Vec<SourceBlockAttestation>,
+        commitment_entries: Vec<CommitmentEntry>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         /// Shard groups that need provisions from this block's transactions.
@@ -767,12 +770,12 @@ impl Action {
         matches!(
             self,
             Action::VerifyAndBuildQuorumCertificate { .. }
-                | Action::VerifyStateProvisions { .. }
+                | Action::VerifyProvisionBatch { .. }
                 | Action::AggregateExecutionCertificate { .. }
                 | Action::VerifyAndAggregateExecutionVotes { .. }
                 | Action::VerifyExecutionCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
-                | Action::VerifyCommitmentProof { .. }
+                | Action::VerifySourceAttestation { .. }
                 | Action::VerifyStateRoot { .. }
                 | Action::VerifyTransactionRoot { .. }
                 | Action::VerifyReceiptRoot { .. }
@@ -815,14 +818,14 @@ impl Action {
 
             // Delegated Work - Crypto Verification
             Action::VerifyAndBuildQuorumCertificate { .. } => "VerifyAndBuildQuorumCertificate",
-            Action::VerifyStateProvisions { .. } => "VerifyStateProvisions",
+            Action::VerifyProvisionBatch { .. } => "VerifyProvisionBatch",
             Action::AggregateExecutionCertificate { .. } => "AggregateExecutionCertificate",
             Action::VerifyAndAggregateExecutionVotes { .. } => "VerifyAndAggregateExecutionVotes",
             Action::VerifyExecutionCertificateSignature { .. } => {
                 "VerifyExecutionCertificateSignature"
             }
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
-            Action::VerifyCommitmentProof { .. } => "VerifyCommitmentProof",
+            Action::VerifySourceAttestation { .. } => "VerifySourceAttestation",
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
             Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
             Action::VerifyReceiptRoot { .. } => "VerifyReceiptRoot",

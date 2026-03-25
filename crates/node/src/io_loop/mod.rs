@@ -638,17 +638,15 @@ where
             }
 
             // ── Provision fetch protocol ──────────────────────────────
-            NodeInput::ProvisionFetchReceived {
-                source_shard,
-                block_height,
-                provisions,
-            } => {
+            NodeInput::ProvisionFetchReceived { batch } => {
+                let source_shard = batch.source_shard();
+                let block_height = batch.block_height();
                 let outputs = self
                     .provision_fetch_protocol
                     .handle(ProvisionFetchInput::Received {
                         source_shard,
                         block_height,
-                        provisions,
+                        batch,
                     });
                 self.process_provision_fetch_outputs(outputs);
                 self.update_fetch_tick_timer();
@@ -706,20 +704,41 @@ where
             // The FetchAndBroadcastProvisions delegated action built provisions
             // grouped by target shard. Broadcast one batch per shard.
             NodeInput::ProvisionsReady { batches } => {
-                for (shard, provisions, recipients) in batches {
+                for (shard, batch, recipients) in batches {
+                    // Convert ProvisionBatch back to Vec<StateProvision> for the notification.
+                    let block_height = batch.block_height();
+                    let source_shard = batch.source_shard();
+                    let block_timestamp = batch.attestation.block_timestamp;
+                    let proof = batch.attestation.proof.clone();
+                    let provisions: Vec<hyperscale_types::StateProvision> = batch
+                        .transactions
+                        .into_iter()
+                        .map(|tx| hyperscale_types::StateProvision {
+                            transaction_hash: tx.tx_hash,
+                            target_shard: shard,
+                            source_shard,
+                            block_height,
+                            block_timestamp,
+                            entries: std::sync::Arc::new(tx.entries),
+                        })
+                        .collect();
+                    if provisions.is_empty() {
+                        continue;
+                    }
                     let msg = hyperscale_types::state_provision_batch_message(
                         self.local_shard,
                         shard,
-                        provisions[0].block_height,
+                        block_height,
                         &provisions,
                     );
                     let sig = self.signing_key.sign_v1(&msg);
-                    let batch = hyperscale_messages::StateProvisionsNotification::new(
+                    let notification = hyperscale_messages::StateProvisionsNotification::new(
                         provisions,
+                        proof,
                         self.validator_id,
                         sig,
                     );
-                    self.network.notify(&recipients, &batch);
+                    self.network.notify(&recipients, &notification);
                 }
             }
 

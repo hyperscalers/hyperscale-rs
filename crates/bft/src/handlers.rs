@@ -8,11 +8,10 @@ use hyperscale_storage::{CommitStore, DatabaseUpdates, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_receipt_root, compute_transaction_root,
     verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
-    Bls12381G2Signature, CommitmentProof, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, SignerBitfield, TransactionAbort, TransactionCertificate, TransactionDefer,
-    ValidatorId, VotePower,
+    Bls12381G2Signature, CommitmentEntry, Hash, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, SignerBitfield, SourceBlockAttestation, StateEntry, TransactionAbort,
+    TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Result of QC verification and assembly.
@@ -187,15 +186,17 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
     }
 }
 
-/// Verify a commitment proof's QC signature and quorum threshold.
+/// Verify a source block attestation's QC signature, quorum threshold, and merkle proofs.
 ///
 /// Verifies the QC's aggregated BLS signature using the provided public keys,
-/// and checks that the signers' voting power meets the quorum threshold.
+/// checks that the signers' voting power meets the quorum threshold, and verifies
+/// the verkle inclusion proof against the attestation's state root.
 ///
 /// `voting_power` is the pre-computed total voting power of the signers
 /// (derived from the QC's signer bitfield and the topology).
-pub fn verify_commitment_proof(
-    proof: &CommitmentProof,
+pub fn verify_source_attestation(
+    attestation: &SourceBlockAttestation,
+    entries: &[StateEntry],
     public_keys: &[Bls12381G1PublicKey],
     voting_power: u64,
     quorum_threshold: u64,
@@ -205,18 +206,18 @@ pub fn verify_commitment_proof(
     }
 
     // Verify the QC's aggregated BLS signature
-    let qc_valid = verify_qc_signature(&proof.qc, public_keys);
+    let qc_valid = verify_qc_signature(&attestation.qc, public_keys);
 
     // Verify voting power meets quorum threshold
     if !qc_valid || voting_power < quorum_threshold {
         return false;
     }
 
-    // Verify individual merkle inclusion proofs against proof.state_root
+    // Verify individual merkle inclusion proofs against attestation's state_root
     hyperscale_storage::proofs::verify_all_merkle_proofs(
-        &proof.entries,
-        &proof.proof,
-        proof.state_root,
+        entries,
+        &attestation.proof,
+        attestation.state_root,
     )
 }
 
@@ -339,7 +340,8 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<TransactionCertificate>>,
     merged_updates: DatabaseUpdates,
-    commitment_proofs: HashMap<Hash, CommitmentProof>,
+    source_attestations: Vec<SourceBlockAttestation>,
+    commitment_entries: Vec<CommitmentEntry>,
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
     local_shard: ShardGroupId,
@@ -403,7 +405,8 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         certificates: certs_to_include,
         deferred,
         aborted,
-        commitment_proofs,
+        source_attestations,
+        commitment_entries,
     };
 
     let block_hash = block.hash();

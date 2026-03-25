@@ -30,9 +30,10 @@ pub struct BftStats {
 pub type NodeIndex = u32;
 use hyperscale_types::{
     block_header_message, committed_block_header_message, Block, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommitmentProof, Hash,
-    QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot,
-    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
+    BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommitmentEntry, Hash,
+    QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId,
+    SourceBlockAttestation, TopologySnapshot, TransactionAbort, TransactionCertificate,
+    TransactionDefer, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -722,12 +723,11 @@ impl BftState {
     ///
     /// Takes ready transactions from mempool (already sectioned and hash-sorted),
     /// plus deferrals, aborts, and certificates from execution.
-    #[instrument(skip(self, ready_txs, deferred, aborted, certificates, commitment_proofs, collect_updates), fields(
+    #[instrument(skip(self, ready_txs, deferred, aborted, certificates, source_attestations, commitment_entries, collect_updates), fields(
         tx_count = ready_txs.len(),
         deferred_count = deferred.len(),
         aborted_count = aborted.len(),
         cert_count = certificates.len(),
-        proof_count = commitment_proofs.len()
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn on_proposal_timer<F>(
@@ -737,7 +737,8 @@ impl BftState {
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        commitment_proofs: std::collections::HashMap<Hash, CommitmentProof>,
+        source_attestations: Vec<SourceBlockAttestation>,
+        commitment_entries: Vec<CommitmentEntry>,
         collect_updates: F,
     ) -> Vec<Action>
     where
@@ -812,21 +813,24 @@ impl BftState {
         let block_height = BlockHeight(next_height);
 
         // Set block_height on each deferral (proposer fills this in).
-        // Also filter out deferrals whose CommitmentProof doesn't have enough voting power.
+        // Also filter out deferrals whose attestation doesn't have enough voting power.
         // This prevents proposing blocks that other validators would reject due to
-        // insufficient quorum on the commitment proof.
+        // insufficient quorum on the source attestation.
         let deferred_with_height: Vec<TransactionDefer> = deferred
             .into_iter()
             .filter(|d| {
-                let quorum_threshold = topology.quorum_threshold_for_shard(d.proof.source_shard);
-                let (_, voting_power) =
-                    VerificationPipeline::resolve_commitment_proof_signers(topology, &d.proof);
+                let quorum_threshold =
+                    topology.quorum_threshold_for_shard(d.attestation.source_shard);
+                let (_, voting_power) = VerificationPipeline::resolve_source_attestation_signers(
+                    topology,
+                    &d.attestation,
+                );
                 if voting_power < quorum_threshold {
                     trace!(
                         tx_hash = %d.tx_hash,
                         voting_power = voting_power,
                         quorum_threshold = quorum_threshold,
-                        "Filtering deferral with insufficient CommitmentProof voting power"
+                        "Filtering deferral with insufficient attestation voting power"
                     );
                     return false;
                 }
@@ -964,7 +968,8 @@ impl BftState {
                 transactions: other_transactions,
                 certificates: certificates_to_propose,
                 per_cert_updates,
-                commitment_proofs,
+                source_attestations,
+                commitment_entries,
                 deferred: deferred_filtered,
                 aborted: aborted_with_height,
                 provision_targets,
@@ -1039,7 +1044,8 @@ impl BftState {
             certificates: vec![],       // Empty
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs: HashMap::new(), // Empty - no transactions
+            source_attestations: vec![],
+            commitment_entries: vec![],
         };
 
         let block_hash = block.hash();
@@ -1163,7 +1169,8 @@ impl BftState {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs: HashMap::new(),
+            source_attestations: vec![],
+            commitment_entries: vec![],
         };
 
         let block_hash = block.hash();
@@ -1882,18 +1889,18 @@ impl BftState {
                 }
 
                 // Initiate all async verifications in parallel.
-                // CommitmentProof, StateRoot, and TransactionRoot verifications run concurrently.
+                // SourceAttestation, StateRoot, and TransactionRoot verifications run concurrently.
                 let mut verification_actions = Vec::new();
 
-                // If block has deferrals with CommitmentProofs, initiate async verification.
+                // If block has deferrals with SourceBlockAttestations, initiate async verification.
                 if self
                     .verification
-                    .needs_commitment_proof_verification(&block)
+                    .needs_source_attestation_verification(&block)
                 {
-                    verification_actions.extend(
-                        self.verification
-                            .initiate_commitment_proof_verification(topology, block_hash, &block),
-                    );
+                    verification_actions
+                        .extend(self.verification.initiate_source_attestation_verification(
+                            topology, block_hash, &block,
+                        ));
                 }
 
                 // Verify state root if block has committed certificates.
@@ -1950,12 +1957,12 @@ impl BftState {
     /// - Hash ordering: deferred_hash > winner_hash (lower hash wins cycles)
     /// - Staleness: winner cert not in same block
     /// - Staleness: loser cert not in same block (loser already completed)
-    /// - CommitmentProof required: every deferral must have a CommitmentProof attached
-    /// - CommitmentProof consistency: proof's winner hash must match deferral reason
+    /// - Attestation required: every deferral must have a SourceBlockAttestation attached
+    /// - Attestation consistency: entries must contain the winner tx hash
     ///
-    /// Note: The CommitmentProof's BLS signature is verified asynchronously via
-    /// `Action::VerifyCommitmentProof` after structural validation passes. This method
-    /// only checks that the proof is present and structurally valid.
+    /// Note: The attestation's BLS signature is verified asynchronously via
+    /// `Action::VerifySourceAttestation` after structural validation passes. This method
+    /// only checks that the attestation is present and structurally valid.
     ///
     /// ## Aborts (TransactionAbort)
     /// - ExecutionTimeout: Structural rules only (timeout threshold is proposer's call)
@@ -2000,21 +2007,21 @@ impl BftState {
                 ));
             }
 
-            // Rule 4: CommitmentProof must be present
-            // BFT safety: Without a proof, a Byzantine proposer could cause honest validators
-            // to incorrectly defer transactions. The proof contains an aggregated BLS signature
+            // Rule 4: Attestation must be present (guaranteed by type system - field is not Optional)
+            // BFT safety: Without an attestation, a Byzantine proposer could cause honest validators
+            // to incorrectly defer transactions. The attestation contains an aggregated BLS signature
             // from the winner's source shard that will be verified asynchronously.
 
-            // Rule 5: CommitmentProof tx_hash must match deferral reason's winner
-            if deferral.proof.tx_hash != *winner_tx_hash {
+            // Rule 5: Deferral must have at least one state entry (entries prove winner's state)
+            if deferral.entries.is_empty() {
                 return Err(format!(
-                    "Invalid deferral: CommitmentProof tx_hash {} != deferral winner {}",
-                    deferral.proof.tx_hash, winner_tx_hash
+                    "Invalid deferral: no state entries for tx {}",
+                    deferral.tx_hash
                 ));
             }
 
-            // Note: The CommitmentProof's BLS signature is verified asynchronously via
-            // Action::VerifyCommitmentProof. We only check structural validity here.
+            // Note: The attestation's BLS signature is verified asynchronously via
+            // Action::VerifySourceAttestation. We only check structural validity here.
             // The signature verification happens after this passes.
         }
 
@@ -2093,7 +2100,7 @@ impl BftState {
                     tx_hash
                 ));
             }
-            if !block.has_commitment_proof(&tx_hash) {
+            if !block.has_commitment_entry(&tx_hash) {
                 return Err(format!(
                     "Transaction {} in priority section but has no commitment proof",
                     tx_hash
@@ -2110,7 +2117,7 @@ impl BftState {
                     tx_hash
                 ));
             }
-            if block.has_commitment_proof(&tx_hash) {
+            if block.has_commitment_entry(&tx_hash) {
                 return Err(format!(
                     "Transaction {} has commitment proof but is in other section (should be in priority section)",
                     tx_hash
@@ -2614,13 +2621,13 @@ impl BftState {
         self.try_vote_on_block(topology, block_hash, height, round)
     }
 
-    /// Handle CommitmentProof signature verification result.
+    /// Handle source attestation verification result.
     ///
-    /// Called when the runner completes `Action::VerifyCommitmentProof`.
-    /// If all proofs are valid, we proceed to vote on the block.
-    /// If any proof is invalid, the block is rejected.
+    /// Called when the runner completes `Action::VerifySourceAttestation`.
+    /// If all attestations are valid, we proceed to vote on the block.
+    /// If any attestation is invalid, the block is rejected.
     #[instrument(skip(self), fields(block_hash = ?block_hash, deferral_index = deferral_index, valid = valid))]
-    pub fn on_commitment_proof_verified(
+    pub fn on_source_attestation_verified(
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
@@ -2629,13 +2636,13 @@ impl BftState {
     ) -> Vec<Action> {
         match self
             .verification
-            .on_commitment_proof_verified(block_hash, deferral_index, valid)
+            .on_source_attestation_verified(block_hash, deferral_index, valid)
         {
             VerificationProgress::StillPending | VerificationProgress::NotTracked => return vec![],
             VerificationProgress::Failed => {
                 info!(
                     block_hash = ?block_hash,
-                    "Block rejected due to invalid CommitmentProof(s)"
+                    "Block rejected due to invalid source attestation(s)"
                 );
                 self.pending_blocks.remove(&block_hash);
                 return vec![];
@@ -2646,7 +2653,7 @@ impl BftState {
         let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
             warn!(
                 block_hash = ?block_hash,
-                "CommitmentProof verification complete but pending block not found"
+                "Source attestation verification complete but pending block not found"
             );
             return vec![];
         };
@@ -2660,7 +2667,7 @@ impl BftState {
         if !self.verification.is_block_verified(&block) {
             debug!(
                 block_hash = ?block_hash,
-                "CommitmentProofs done, waiting for other verifications"
+                "Source attestations done, waiting for other verifications"
             );
             return vec![];
         }
@@ -3033,7 +3040,7 @@ impl BftState {
     ///
     /// `state_root` is the computed JMT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
-    #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, commitment_proofs, collect_updates), fields(
+    #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, source_attestations, commitment_entries, collect_updates), fields(
         height = qc.height.0,
         block_hash = ?block_hash
     ))]
@@ -3047,7 +3054,8 @@ impl BftState {
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        commitment_proofs: HashMap<Hash, CommitmentProof>,
+        source_attestations: Vec<SourceBlockAttestation>,
+        commitment_entries: Vec<CommitmentEntry>,
         collect_updates: F,
     ) -> Vec<Action>
     where
@@ -3157,7 +3165,8 @@ impl BftState {
                 deferred,
                 aborted,
                 certificates,
-                commitment_proofs,
+                source_attestations,
+                commitment_entries,
                 collect_updates,
             ));
         } else if should_try_proposal && rate_limited {
@@ -5507,29 +5516,26 @@ mod tests {
     // Deferral and Abort Validation Tests
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Create a dummy CommitmentProof for testing structural validation.
+    /// Create a dummy SourceBlockAttestation for testing structural validation.
     ///
-    /// The proof is structurally valid but the signature is not cryptographically valid.
+    /// The attestation is structurally valid but the signature is not cryptographically valid.
     /// This is sufficient for testing structural validation logic which doesn't verify
-    /// the BLS signature (that's done asynchronously via Action::VerifyCommitmentProof).
-    fn make_test_commitment_proof(winner_tx_hash: Hash) -> hyperscale_types::CommitmentProof {
-        use hyperscale_types::{CommitmentProof, ShardGroupId};
-        use std::sync::Arc;
+    /// the BLS signature (that's done asynchronously via Action::VerifySourceAttestation).
+    fn make_test_attestation() -> SourceBlockAttestation {
+        use hyperscale_types::ShardGroupId;
 
-        CommitmentProof {
-            tx_hash: winner_tx_hash,
-            source_shard: ShardGroupId(1),
-            target_shard: ShardGroupId(0),
-            block_height: BlockHeight(1),
-            block_timestamp: 1000,
-            state_root: Hash::ZERO,
-            qc: QuorumCertificate::genesis(),
-            entries: Arc::new(vec![]),
-            proof: Arc::new(hyperscale_types::SubstateInclusionProof::dummy()),
-        }
+        SourceBlockAttestation::dummy(ShardGroupId(1), BlockHeight(1))
     }
 
-    /// Create a test deferral with a minimal proof.
+    /// Create test state entries for a deferral.
+    fn make_test_entries(_winner_tx_hash: Hash) -> Vec<hyperscale_types::StateEntry> {
+        vec![hyperscale_types::StateEntry {
+            storage_key: vec![0; 50],
+            value: None,
+        }]
+    }
+
+    /// Create a test deferral with a minimal attestation.
     fn make_test_deferral(loser_tx: Hash, winner_tx: Hash) -> TransactionDefer {
         use hyperscale_types::DeferReason;
         TransactionDefer {
@@ -5538,7 +5544,8 @@ mod tests {
                 winner_tx_hash: winner_tx,
             },
             block_height: BlockHeight(0),
-            proof: make_test_commitment_proof(winner_tx),
+            attestation: make_test_attestation(),
+            entries: make_test_entries(winner_tx),
         }
     }
 
@@ -5556,7 +5563,8 @@ mod tests {
             certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
-            commitment_proofs: HashMap::new(),
+            source_attestations: vec![],
+            commitment_entries: vec![],
         }
     }
 
@@ -5588,7 +5596,8 @@ mod tests {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_commitment_proof(winner_hash),
+            attestation: make_test_attestation(),
+            entries: make_test_entries(winner_hash),
         };
         let block = make_test_block(5, vec![valid_deferral], vec![], vec![]);
         assert!(state.validate_deferrals_and_aborts(&block).is_ok());
@@ -5600,7 +5609,8 @@ mod tests {
                 winner_tx_hash: loser_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_commitment_proof(loser_hash),
+            attestation: make_test_attestation(),
+            entries: make_test_entries(loser_hash),
         };
         let block = make_test_block(5, vec![invalid_deferral], vec![], vec![]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -5632,7 +5642,8 @@ mod tests {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_commitment_proof(winner_hash),
+            attestation: make_test_attestation(),
+            entries: make_test_entries(winner_hash),
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![winner_cert]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -5664,7 +5675,8 @@ mod tests {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_commitment_proof(winner_hash),
+            attestation: make_test_attestation(),
+            entries: make_test_entries(winner_hash),
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![loser_cert]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -5682,23 +5694,23 @@ mod tests {
         let other_bytes = [0x50u8; 32]; // Some other hash
         let loser_hash = Hash::from_hash_bytes(&loser_bytes);
         let winner_hash = Hash::from_hash_bytes(&winner_bytes);
-        let other_hash = Hash::from_hash_bytes(&other_bytes);
 
-        // Invalid: CommitmentProof has different winner than deferral reason
+        // Invalid: deferral with empty entries
         let deferral = TransactionDefer {
             tx_hash: loser_hash,
             reason: hyperscale_types::DeferReason::LivelockCycle {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_commitment_proof(other_hash), // Wrong winner!
+            attestation: make_test_attestation(),
+            entries: vec![], // Empty entries - invalid!
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![]);
         let result = state.validate_deferrals_and_aborts(&block);
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().contains("CommitmentProof tx_hash"),
-            "Error should mention CommitmentProof tx_hash mismatch"
+            result.unwrap_err().contains("no state entries"),
+            "Error should mention no state entries"
         );
     }
 
@@ -7110,7 +7122,8 @@ mod tests {
             vec![],                        // no deferrals
             vec![],                        // no aborts
             vec![],                        // no certificates
-            HashMap::new(),                // no commitment proofs
+            vec![],                        // no source attestations
+            vec![],                        // no commitment entries
             |_certs| vec![],
         );
 
@@ -7159,7 +7172,8 @@ mod tests {
             vec![deferral],                // has a deferral
             vec![],                        // no aborts
             vec![],                        // no certificates
-            HashMap::new(),                // no commitment proofs
+            vec![],                        // no source attestations
+            vec![],                        // no commitment entries
             |_certs| vec![],
         );
 
@@ -7326,7 +7340,8 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs: HashMap::new(),
+            source_attestations: vec![],
+            commitment_entries: vec![],
         }
     }
 
@@ -7336,8 +7351,18 @@ mod tests {
         retry_transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
         priority_transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
         transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
-        commitment_proofs: HashMap<Hash, CommitmentProof>,
+        commitment_entries: Vec<CommitmentEntry>,
     ) -> Block {
+        // Build source_attestations from the commitment entries' attestation indices.
+        // For tests, we create one dummy attestation if there are any entries.
+        let source_attestations = if commitment_entries.is_empty() {
+            vec![]
+        } else {
+            vec![SourceBlockAttestation::dummy(
+                hyperscale_types::ShardGroupId(1),
+                BlockHeight(1),
+            )]
+        };
         Block {
             header: make_header_at_height(height, 100_000),
             retry_transactions,
@@ -7346,60 +7371,38 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs,
+            source_attestations,
+            commitment_entries,
         }
     }
 
-    #[allow(dead_code)]
-    fn make_test_block_with_proofs(
-        height: u64,
-        transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
-        commitment_proofs: HashMap<Hash, CommitmentProof>,
-    ) -> Block {
-        Block {
-            header: make_header_at_height(height, 100_000),
-            retry_transactions: vec![],
-            priority_transactions: vec![],
-            transactions,
-            certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
-            commitment_proofs,
-        }
-    }
-
-    /// Create a test transaction and optionally a commitment proof for it.
-    /// Returns (transaction, Option<CommitmentProof>).
+    /// Create a test transaction and optionally a commitment entry for it.
+    /// Returns (transaction, Option<CommitmentEntry>).
+    /// All entries reference attestation_index 0 (a single shared attestation).
     fn make_test_tx_with_proof(
         seed: u8,
         with_proof: bool,
     ) -> (
         Arc<hyperscale_types::RoutableTransaction>,
-        Option<CommitmentProof>,
+        Option<CommitmentEntry>,
     ) {
-        use hyperscale_types::{test_utils, ShardGroupId, StateEntry, SubstateInclusionProof};
+        use hyperscale_types::test_utils;
 
         let tx = test_utils::test_transaction(seed);
         let tx_arc = Arc::new(tx);
 
-        let proof = if with_proof {
-            let node = test_utils::test_node(seed);
-            Some(CommitmentProof::new(
-                tx_arc.hash(),
-                ShardGroupId(1),
-                ShardGroupId(0),
-                BlockHeight(1),
-                1000, // block_timestamp
-                Hash::ZERO,
-                QuorumCertificate::genesis(),
-                Arc::new(vec![StateEntry::test_entry(node, 0, vec![], None)]),
-                Arc::new(SubstateInclusionProof::dummy()),
-            ))
+        let entry = if with_proof {
+            Some(CommitmentEntry {
+                tx_hash: tx_arc.hash(),
+                attestation_index: 0,
+                target_shard: hyperscale_types::ShardGroupId(0),
+                entries: vec![hyperscale_types::StateEntry::new(vec![0; 50], None)],
+            })
         } else {
             None
         };
 
-        (tx_arc, proof)
+        (tx_arc, entry)
     }
 
     fn make_test_tx(seed: u8, _with_proof: bool) -> Arc<hyperscale_types::RoutableTransaction> {
@@ -7487,13 +7490,11 @@ mod tests {
         let mut other_txs = vec![tx3, tx4];
         sort_txs_by_hash(&mut other_txs);
 
-        // Build proofs map for the block
-        let mut proofs = HashMap::new();
-        proofs.insert(tx1.hash(), proof1.unwrap());
-        proofs.insert(tx2.hash(), proof2.unwrap());
+        // Build commitment entries for the block
+        let entries = vec![proof1.unwrap(), proof2.unwrap()];
 
         // Use sectioned block with priority TXs in priority section
-        let block = make_sectioned_test_block(5, vec![], priority_txs, other_txs, proofs);
+        let block = make_sectioned_test_block(5, vec![], priority_txs, other_txs, entries);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7510,12 +7511,10 @@ mod tests {
         sort_txs_by_hash(&mut priority_txs);
         priority_txs.reverse();
 
-        // Build proofs map
-        let mut proofs = HashMap::new();
-        proofs.insert(tx1.hash(), proof1.unwrap());
-        proofs.insert(tx2.hash(), proof2.unwrap());
+        // Build commitment entries
+        let entries = vec![proof1.unwrap(), proof2.unwrap()];
 
-        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![], proofs);
+        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![], entries);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(result
@@ -7531,15 +7530,15 @@ mod tests {
         let (no_proof_tx, _) = make_test_tx_with_proof(10, false);
         let (proof_tx, proof) = make_test_tx_with_proof(20, true);
 
-        // Build proofs map (only proof_tx has a proof)
-        let mut proofs = HashMap::new();
-        proofs.insert(proof_tx.hash(), proof.unwrap());
+        // Build commitment entries (only proof_tx has an entry)
+        let entries = vec![proof.unwrap()];
 
-        // Put no_proof_tx in priority section (invalid - has no proof)
-        let block = make_sectioned_test_block(5, vec![], vec![no_proof_tx], vec![proof_tx], proofs);
+        // Put no_proof_tx in priority section (invalid - has no commitment entry)
+        let block =
+            make_sectioned_test_block(5, vec![], vec![no_proof_tx], vec![proof_tx], entries);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no commitment proof"));
+        assert!(result.unwrap_err().contains("no commitment"));
     }
 
     #[test]
@@ -7554,13 +7553,10 @@ mod tests {
         let mut priority_txs = vec![tx1.clone(), tx2.clone(), tx3.clone()];
         sort_txs_by_hash(&mut priority_txs);
 
-        // Build proofs map
-        let mut proofs = HashMap::new();
-        proofs.insert(tx1.hash(), proof1.unwrap());
-        proofs.insert(tx2.hash(), proof2.unwrap());
-        proofs.insert(tx3.hash(), proof3.unwrap());
+        // Build commitment entries
+        let entries = vec![proof1.unwrap(), proof2.unwrap(), proof3.unwrap()];
 
-        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![], proofs);
+        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![], entries);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7582,11 +7578,10 @@ mod tests {
 
         let others = vec![regular.clone()];
 
-        let mut proofs_map = HashMap::new();
-        proofs_map.insert(proof_tx.hash(), proof.unwrap());
+        let entries = vec![proof.unwrap()];
 
         // Use sectioned block: retries in retry section, proof TX in priority, regular in others
-        let block = make_sectioned_test_block(5, retries, priority_txs, others, proofs_map);
+        let block = make_sectioned_test_block(5, retries, priority_txs, others, entries);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7596,13 +7591,12 @@ mod tests {
 
         // Create a retry and a proof TX
         let retry = make_retry_tx(10);
-        let (proof_tx, proof) = make_test_tx_with_proof(30, true);
+        let (_proof_tx, proof) = make_test_tx_with_proof(30, true);
 
-        let mut proofs_map = HashMap::new();
-        proofs_map.insert(proof_tx.hash(), proof.unwrap());
+        let entries = vec![proof.unwrap()];
 
         // Invalid: put retry in priority section (it's not a non-retry TX with proof)
-        let block = make_sectioned_test_block(5, vec![], vec![retry], vec![], proofs_map);
+        let block = make_sectioned_test_block(5, vec![], vec![retry], vec![], entries);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(
@@ -7619,7 +7613,7 @@ mod tests {
         let retry = make_retry_tx(10);
 
         // Invalid: put retry in other section (should be in retry section)
-        let block = make_sectioned_test_block(5, vec![], vec![], vec![retry], HashMap::new());
+        let block = make_sectioned_test_block(5, vec![], vec![], vec![retry], vec![]);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(
@@ -7636,7 +7630,7 @@ mod tests {
         let mut retries = vec![make_retry_tx(10), make_retry_tx(20), make_retry_tx(30)];
         sort_txs_by_hash(&mut retries);
 
-        let block = make_sectioned_test_block(5, retries, vec![], vec![], HashMap::new());
+        let block = make_sectioned_test_block(5, retries, vec![], vec![], vec![]);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7649,7 +7643,7 @@ mod tests {
         sort_txs_by_hash(&mut retries);
         retries.reverse(); // Make invalid
 
-        let block = make_sectioned_test_block(5, retries, vec![], vec![], HashMap::new());
+        let block = make_sectioned_test_block(5, retries, vec![], vec![], vec![]);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(result
@@ -7696,7 +7690,8 @@ mod tests {
             vec![deferral],                // has content
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
+            vec![],
             |_certs| vec![],
         );
 
@@ -7750,7 +7745,8 @@ mod tests {
             vec![deferral],                // has content
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
+            vec![],
             |_certs| vec![],
         );
 
@@ -7831,7 +7827,8 @@ mod tests {
             vec![deferral],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
+            vec![],
             |_certs| vec![],
         );
 
@@ -7907,7 +7904,8 @@ mod tests {
             vec![deferral],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
+            vec![],
             |_certs| vec![],
         );
 
@@ -7958,7 +7956,8 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
+            vec![],
             |_certs| vec![],
         );
 
@@ -7997,7 +7996,8 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs: HashMap::new(),
+            source_attestations: vec![],
+            commitment_entries: vec![],
         };
         let block_hash = block.hash();
         let block_arc = Arc::new(block);
@@ -8239,7 +8239,8 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
+            vec![],
             |_certs| vec![],
         );
 
@@ -8315,7 +8316,8 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
+            vec![],
             |_certs| vec![],
         );
 
@@ -8551,7 +8553,8 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs: HashMap::new(),
+            source_attestations: vec![],
+            commitment_entries: vec![],
         };
 
         let qc = QuorumCertificate {
@@ -8605,7 +8608,8 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
+            vec![],
             |_certs| vec![],
         );
 
@@ -8725,7 +8729,8 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
+            vec![],
             |_certs| vec![],
         );
 

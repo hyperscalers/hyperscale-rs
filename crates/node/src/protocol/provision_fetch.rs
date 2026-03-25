@@ -14,7 +14,7 @@
 use hyperscale_messages::request::GetProvisionsRequest;
 use hyperscale_messages::response::GetProvisionsResponse;
 use hyperscale_storage::{ConsensusStore, SubstateStore};
-use hyperscale_types::{BlockHeight, ShardGroupId, StateProvision, ValidatorId};
+use hyperscale_types::{BlockHeight, ProvisionBatch, ShardGroupId, StateProvision, ValidatorId};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
@@ -52,7 +52,7 @@ pub enum ProvisionFetchInput {
     Received {
         source_shard: ShardGroupId,
         block_height: BlockHeight,
-        provisions: Vec<StateProvision>,
+        batch: ProvisionBatch,
     },
     /// A fetch attempt failed (network error or peer returned None).
     Failed {
@@ -79,7 +79,7 @@ pub enum ProvisionFetchOutput {
         peer: ValidatorId,
     },
     /// Deliver fetched provisions to the state machine.
-    Deliver { provisions: Vec<StateProvision> },
+    Deliver { batch: ProvisionBatch },
 }
 
 /// State for a single pending provision fetch.
@@ -128,8 +128,8 @@ impl ProvisionFetchProtocol {
             ProvisionFetchInput::Received {
                 source_shard,
                 block_height,
-                provisions,
-            } => self.handle_received(source_shard, block_height, provisions),
+                batch,
+            } => self.handle_received(source_shard, block_height, batch),
             ProvisionFetchInput::Failed {
                 source_shard,
                 block_height,
@@ -199,17 +199,17 @@ impl ProvisionFetchProtocol {
         &mut self,
         source_shard: ShardGroupId,
         block_height: BlockHeight,
-        provisions: Vec<StateProvision>,
+        batch: ProvisionBatch,
     ) -> Vec<ProvisionFetchOutput> {
         let key = (source_shard, block_height);
         if self.pending.remove(&key).is_some() {
             debug!(
                 source_shard = source_shard.0,
                 block_height = block_height.0,
-                count = provisions.len(),
+                count = batch.transactions.len(),
                 "Provision fetch complete"
             );
-            vec![ProvisionFetchOutput::Deliver { provisions }]
+            vec![ProvisionFetchOutput::Deliver { batch }]
         } else {
             trace!(
                 source_shard = source_shard.0,
@@ -365,7 +365,10 @@ pub fn serve_provision_request(
                 block_height = req.block_height.0,
                 "Provision request: block not found"
             );
-            return GetProvisionsResponse { provisions: None };
+            return GetProvisionsResponse {
+                provisions: None,
+                proof: None,
+            };
         }
     };
 
@@ -419,7 +422,10 @@ pub fn serve_provision_request(
                         block_height = req.block_height.0,
                         jmt_version, "Provision request: historical JMT version unavailable"
                     );
-                    return GetProvisionsResponse { provisions: None };
+                    return GetProvisionsResponse {
+                        provisions: None,
+                        proof: None,
+                    };
                 }
             };
         for e in &entries {
@@ -431,6 +437,7 @@ pub fn serve_provision_request(
     if per_tx.is_empty() {
         return GetProvisionsResponse {
             provisions: Some(vec![]),
+            proof: None,
         };
     }
 
@@ -444,7 +451,10 @@ pub fn serve_provision_request(
                 block_height = req.block_height.0,
                 "Fallback provision: batched proof generation failed (version unavailable)"
             );
-            return GetProvisionsResponse { provisions: None };
+            return GetProvisionsResponse {
+                provisions: None,
+                proof: None,
+            };
         }
     };
 
@@ -458,7 +468,6 @@ pub fn serve_provision_request(
             block_height: req.block_height,
             block_timestamp: block.header.timestamp,
             entries,
-            proof: Arc::clone(&proof),
         });
     }
 
@@ -471,6 +480,7 @@ pub fn serve_provision_request(
 
     GetProvisionsResponse {
         provisions: Some(provisions),
+        proof: Some((*proof).clone()),
     }
 }
 
@@ -666,13 +676,19 @@ mod tests {
         let outputs = protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(1),
             block_height: height(10),
-            provisions: vec![], // empty but valid
+            batch: ProvisionBatch {
+                attestation: std::sync::Arc::new(hyperscale_types::SourceBlockAttestation::dummy(
+                    shard(1),
+                    height(10),
+                )),
+                transactions: vec![],
+            },
         });
 
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
             &outputs[0],
-            ProvisionFetchOutput::Deliver { provisions } if provisions.is_empty()
+            ProvisionFetchOutput::Deliver { batch } if batch.transactions.is_empty()
         ));
         assert!(!protocol.has_pending());
     }
@@ -745,7 +761,13 @@ mod tests {
         let outputs = protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(99),
             block_height: height(999),
-            provisions: vec![],
+            batch: ProvisionBatch {
+                attestation: std::sync::Arc::new(hyperscale_types::SourceBlockAttestation::dummy(
+                    shard(99),
+                    height(999),
+                )),
+                transactions: vec![],
+            },
         });
         assert!(outputs.is_empty());
     }

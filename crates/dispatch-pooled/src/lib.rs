@@ -692,8 +692,9 @@ mod tests {
             .crypto_threads(4)
             .tx_validation_threads(3)
             .execution_threads(6)
+            .provisions_threads(2)
             .build_unchecked();
 
-        assert_eq!(config.total_threads(), 15); // 2 + 4 + 3 + 6
+        assert_eq!(config.total_threads(), 17); // 2 + 4 + 3 + 6 + 2
     }
 }

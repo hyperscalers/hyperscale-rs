@@ -288,9 +288,33 @@ where
                         return;
                     }
 
-                    let provisions = batch.into_provisions();
+                    let (provisions, proof) = batch.into_parts();
+                    if provisions.is_empty() {
+                        return;
+                    }
+                    let first = &provisions[0];
+                    let attestation =
+                        std::sync::Arc::new(hyperscale_types::SourceBlockAttestation {
+                            source_shard: first.source_shard,
+                            block_height: first.block_height,
+                            block_timestamp: first.block_timestamp,
+                            state_root: hyperscale_types::Hash::ZERO,
+                            qc: hyperscale_types::QuorumCertificate::genesis(),
+                            proof,
+                        });
+                    let transactions: Vec<hyperscale_types::TxEntries> = provisions
+                        .into_iter()
+                        .map(|p| hyperscale_types::TxEntries {
+                            tx_hash: p.transaction_hash,
+                            entries: (*p.entries).clone(),
+                        })
+                        .collect();
+                    let batch = hyperscale_types::ProvisionBatch {
+                        attestation,
+                        transactions,
+                    };
                     let _ = tx.send(NodeInput::Protocol(
-                        ProtocolEvent::StateProvisionsReceived { provisions },
+                        ProtocolEvent::StateProvisionsReceived { batch },
                     ));
                 },
             );

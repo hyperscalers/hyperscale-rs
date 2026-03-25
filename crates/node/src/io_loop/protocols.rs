@@ -214,22 +214,36 @@ where
                         request,
                         Box::new(move |result| match result {
                             Ok(response) => match response.provisions {
-                                Some(provisions) if !provisions.is_empty() => {
-                                    let _ = sender.send(NodeInput::ProvisionFetchReceived {
-                                        source_shard,
-                                        block_height,
-                                        provisions,
-                                    });
-                                }
-                                Some(_) => {
-                                    // Empty provisions — no matching transactions for
-                                    // our shard at this block height. Treat as success
-                                    // (removes the pending entry).
-                                    let _ = sender.send(NodeInput::ProvisionFetchReceived {
-                                        source_shard,
-                                        block_height,
-                                        provisions: vec![],
-                                    });
+                                Some(provisions) => {
+                                    // Build a ProvisionBatch from the response.
+                                    let proof = response.proof.unwrap_or_else(
+                                        hyperscale_types::SubstateInclusionProof::dummy,
+                                    );
+                                    let attestation = std::sync::Arc::new(
+                                        hyperscale_types::SourceBlockAttestation {
+                                            source_shard,
+                                            block_height,
+                                            block_timestamp: provisions
+                                                .first()
+                                                .map_or(0, |p| p.block_timestamp),
+                                            state_root: hyperscale_types::Hash::ZERO,
+                                            qc: hyperscale_types::QuorumCertificate::genesis(),
+                                            proof,
+                                        },
+                                    );
+                                    let transactions: Vec<hyperscale_types::TxEntries> = provisions
+                                        .into_iter()
+                                        .map(|p| hyperscale_types::TxEntries {
+                                            tx_hash: p.transaction_hash,
+                                            entries: (*p.entries).clone(),
+                                        })
+                                        .collect();
+                                    let batch = hyperscale_types::ProvisionBatch {
+                                        attestation,
+                                        transactions,
+                                    };
+                                    let _ =
+                                        sender.send(NodeInput::ProvisionFetchReceived { batch });
                                 }
                                 None => {
                                     // Peer cannot serve (state version GC'd) → fail
@@ -249,9 +263,9 @@ where
                         }),
                     );
                 }
-                ProvisionFetchOutput::Deliver { provisions } => {
-                    if !provisions.is_empty() {
-                        self.feed_event(ProtocolEvent::StateProvisionsReceived { provisions });
+                ProvisionFetchOutput::Deliver { batch } => {
+                    if !batch.transactions.is_empty() {
+                        self.feed_event(ProtocolEvent::StateProvisionsReceived { batch });
                     }
                 }
             }

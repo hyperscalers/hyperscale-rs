@@ -331,7 +331,6 @@ mod tests {
             block_height: BlockHeight(10),
             block_timestamp: 0,
             entries: Arc::new(vec![]),
-            proof: Arc::new(crate::SubstateInclusionProof::dummy()),
         }];
 
         let msg1 = state_provision_batch_message(

@@ -1,19 +1,18 @@
 //! Node state machine.
 
 use hyperscale_bft::{BftConfig, BftState, RecoveredState};
-use hyperscale_core::{Action, ProtocolEvent, ProvisionVerificationResult, StateMachine, TimerId};
+use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
 use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommitmentProof,
-    CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate,
-    TransactionDefer,
+    Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommittedBlockHeader,
+    Hash, ProvisionBatch, QuorumCertificate, ReadyTransactions, ReceiptBundle, RoutableTransaction,
+    ShardGroupId, SourceBlockAttestation, TopologySnapshot, TransactionAbort,
+    TransactionCertificate, TransactionDefer,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
@@ -95,7 +94,8 @@ impl std::fmt::Debug for NodeStateMachine {
 /// to avoid duplicating the ready-transaction gathering logic.
 struct ProposalInputs {
     ready_txs: ReadyTransactions,
-    commitment_proofs: HashMap<Hash, CommitmentProof>,
+    source_attestations: Vec<SourceBlockAttestation>,
+    commitment_entries: Vec<hyperscale_types::CommitmentEntry>,
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
     certificates: Vec<Arc<TransactionCertificate>>,
@@ -238,29 +238,51 @@ impl NodeStateMachine {
 
     // ─── Shared Helpers ─────────────────────────────────────────────────
 
-    /// Build commitment proofs for priority transactions.
+    /// Build source attestations and commitment entries for priority transactions.
     ///
-    /// Returns a HashMap mapping transaction hash to CommitmentProof for all
-    /// priority transactions (cross-shard with verified provisions). This is included
-    /// in the block to make it self-contained for validation.
-    ///
-    /// Only priority transactions need proofs - they are already classified by the
-    /// mempool as having verified provisions.
-    fn build_commitment_proofs(
+    /// Returns `(source_attestations, commitment_entries)` for inclusion in the block.
+    /// Each unique `SourceBlockAttestation` is deduplicated; `CommitmentEntry` references
+    /// the attestation by index.
+    fn build_block_attestation_data(
         &self,
         ready_txs: &ReadyTransactions,
-    ) -> HashMap<Hash, CommitmentProof> {
-        let mut proofs = HashMap::new();
+    ) -> (
+        Vec<SourceBlockAttestation>,
+        Vec<hyperscale_types::CommitmentEntry>,
+    ) {
+        let mut attestations: Vec<SourceBlockAttestation> = Vec::new();
+        let mut entries: Vec<hyperscale_types::CommitmentEntry> = Vec::new();
 
         // Only priority transactions have verified provisions
         for tx in &ready_txs.priority {
             let tx_hash = tx.hash();
-            if let Some(proof) = self.provisions.build_commitment_proof(&tx_hash) {
-                proofs.insert(tx_hash, proof);
+            if let Some((state_entries, attestation)) =
+                self.provisions.get_attestation_and_entries(&tx_hash)
+            {
+                // Find or insert the attestation, deduplicating by (source_shard, block_height).
+                let att_index = attestations
+                    .iter()
+                    .position(|a| {
+                        a.source_shard == attestation.source_shard
+                            && a.block_height == attestation.block_height
+                    })
+                    .unwrap_or_else(|| {
+                        let idx = attestations.len();
+                        attestations.push((*attestation).clone());
+                        idx
+                    });
+                // Determine the target shard for this transaction.
+                let target_shard = self.topology.snapshot().local_shard();
+                entries.push(hyperscale_types::CommitmentEntry {
+                    tx_hash,
+                    attestation_index: att_index as u16,
+                    target_shard,
+                    entries: state_entries,
+                });
             }
         }
 
-        proofs
+        (attestations, entries)
     }
 
     /// Gather all inputs needed for a block proposal.
@@ -272,7 +294,8 @@ impl NodeStateMachine {
         let ready_txs = self
             .mempool
             .ready_transactions(max_txs, pending_txs, pending_certs);
-        let commitment_proofs = self.build_commitment_proofs(&ready_txs);
+        let (source_attestations, commitment_entries) =
+            self.build_block_attestation_data(&ready_txs);
         let deferred = self.livelock.get_pending_deferrals().to_vec();
         let current_height = BlockHeight(self.bft.committed_height() + 1);
         let aborted = self.mempool.get_timed_out_transactions(
@@ -284,7 +307,8 @@ impl NodeStateMachine {
 
         ProposalInputs {
             ready_txs,
-            commitment_proofs,
+            source_attestations,
+            commitment_entries,
             deferred,
             aborted,
             certificates,
@@ -373,7 +397,8 @@ impl NodeStateMachine {
             pending_txs,               // txs in uncommitted pipeline blocks
             pending_certs + new_certs, // certs in pipeline + certs we're proposing
         );
-        let commitment_proofs = self.build_commitment_proofs(&ready_txs);
+        let (source_attestations, commitment_entries) =
+            self.build_block_attestation_data(&ready_txs);
         let deferred = self.livelock.get_pending_deferrals().to_vec();
         let current_height = BlockHeight(self.bft.committed_height() + 1);
         let aborted = self.mempool.get_timed_out_transactions(
@@ -401,7 +426,8 @@ impl NodeStateMachine {
             deferred,
             aborted,
             certificates,
-            commitment_proofs,
+            source_attestations,
+            commitment_entries,
             collect_updates,
         )
     }
@@ -531,7 +557,8 @@ impl NodeStateMachine {
             inputs.deferred,
             inputs.aborted,
             inputs.certificates,
-            inputs.commitment_proofs,
+            inputs.source_attestations,
+            inputs.commitment_entries,
             collect_updates,
         )
     }
@@ -707,18 +734,20 @@ impl NodeStateMachine {
     /// Handle state provisions verified — notify mempool and coordinator.
     fn on_state_provisions_verified(
         &mut self,
-        results: Vec<ProvisionVerificationResult>,
+        batch: ProvisionBatch,
         committed_header: Option<CommittedBlockHeader>,
+        valid: bool,
     ) -> Vec<Action> {
-        for result in &results {
-            if result.valid {
-                self.mempool.on_provision_verified(result.tx_hash);
+        if valid {
+            for tx in &batch.transactions {
+                self.mempool.on_provision_verified(tx.tx_hash);
             }
         }
         self.provisions.on_state_provisions_verified(
             self.topology.snapshot(),
-            results,
+            batch,
             committed_header,
+            valid,
         )
     }
 
@@ -847,11 +876,12 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::QcSignatureVerified { block_hash, valid } => self
                 .bft
                 .on_qc_signature_verified(self.topology.snapshot(), block_hash, valid),
-            ProtocolEvent::CommitmentProofVerified {
+            ProtocolEvent::SourceAttestationVerified {
                 block_hash,
                 deferral_index,
+                attestation: _,
                 valid,
-            } => self.bft.on_commitment_proof_verified(
+            } => self.bft.on_source_attestation_verified(
                 self.topology.snapshot(),
                 block_hash,
                 deferral_index,
@@ -892,13 +922,14 @@ impl StateMachine for NodeStateMachine {
             } => self.on_block_committed(block_hash, height, block),
 
             // ── Provisions ───────────────────────────────────────────────
-            ProtocolEvent::StateProvisionsReceived { provisions } => self
+            ProtocolEvent::StateProvisionsReceived { batch } => self
                 .provisions
-                .on_state_provisions_received(self.topology.snapshot(), provisions),
+                .on_state_provisions_received(self.topology.snapshot(), batch),
             ProtocolEvent::StateProvisionsVerified {
-                results,
+                batch,
                 committed_header,
-            } => self.on_state_provisions_verified(results, committed_header),
+                valid,
+            } => self.on_state_provisions_verified(batch, committed_header, valid),
             ProtocolEvent::CrossShardTxRegistered {
                 tx_hash,
                 required_shards,
@@ -913,10 +944,11 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ProvisionAccepted {
                 tx_hash,
                 source_shard,
-                commitment_proof,
+                attestation,
+                entries,
             } => {
                 self.livelock
-                    .on_provision_accepted(tx_hash, source_shard, &commitment_proof);
+                    .on_provision_accepted(tx_hash, source_shard, &attestation, &entries);
                 vec![]
             }
             ProtocolEvent::ProvisioningComplete {

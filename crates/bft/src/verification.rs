@@ -1,11 +1,11 @@
 //! Async verification pipeline for block voting.
 //!
-//! Tracks QC signature, CommitmentProof, state root, transaction root, and
+//! Tracks QC signature, SourceBlockAttestation, state root, transaction root, and
 //! receipt root verifications. BftState delegates verification bookkeeping
 //! here while retaining control-flow decisions (voting, block rejection).
 
 use hyperscale_types::{
-    Block, BlockHeader, Bls12381G1PublicKey, CommitmentProof, Hash, TopologySnapshot,
+    Block, BlockHeader, Bls12381G1PublicKey, Hash, SourceBlockAttestation, TopologySnapshot,
 };
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, trace, warn};
@@ -23,13 +23,13 @@ pub(crate) struct PendingQcVerification {
     pub header: BlockHeader,
 }
 
-/// Tracks pending CommitmentProof verifications for a block.
+/// Tracks pending source attestation verifications for a block.
 ///
-/// When a block contains deferrals with CommitmentProofs, we need to verify each
-/// proof's BLS signature before voting on the block. This struct tracks the
+/// When a block contains deferrals with SourceBlockAttestations, we need to verify each
+/// attestation's BLS signature before voting on the block. This struct tracks the
 /// verification progress for a single block.
 #[derive(Debug, Clone)]
-struct PendingCommitmentProofVerifications {
+struct PendingSourceAttestationVerifications {
     /// Total number of deferrals needing verification.
     total: usize,
     /// Number of deferrals verified so far.
@@ -74,7 +74,7 @@ pub struct ReadyStateRootVerification {
 // VerificationProgress
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Result of recording a multi-step verification (e.g., CommitmentProofs).
+/// Result of recording a multi-step verification (e.g., source attestations).
 pub(crate) enum VerificationProgress {
     /// This specific verification passed, but others still pending.
     StillPending,
@@ -105,12 +105,12 @@ pub(crate) struct VerificationPipeline {
     /// Maps QC's block_hash (the block the QC certifies) -> height.
     verified_qcs: HashMap<Hash, u64>,
 
-    // === CommitmentProof verification ===
-    /// Blocks waiting for CommitmentProof verification before voting.
-    pending_commitment_proof_verifications: HashMap<Hash, PendingCommitmentProofVerifications>,
+    // === Source attestation verification ===
+    /// Blocks waiting for source attestation verification before voting.
+    pending_source_attestation_verifications: HashMap<Hash, PendingSourceAttestationVerifications>,
 
-    /// Blocks with verified CommitmentProofs (prevents re-verification).
-    verified_commitment_proofs: HashSet<Hash>,
+    /// Blocks with verified source attestations (prevents re-verification).
+    verified_source_attestations: HashSet<Hash>,
 
     // === State root verification ===
     /// Blocks where state root verification is currently in-flight.
@@ -150,8 +150,8 @@ impl VerificationPipeline {
         Self {
             pending_qc_verifications: HashMap::new(),
             verified_qcs: HashMap::new(),
-            pending_commitment_proof_verifications: HashMap::new(),
-            verified_commitment_proofs: HashSet::new(),
+            pending_source_attestation_verifications: HashMap::new(),
+            verified_source_attestations: HashSet::new(),
             state_root_verifications_in_flight: HashSet::new(),
             pending_state_root_verifications: HashMap::new(),
             last_committed_jmt_root: jmt_root,
@@ -206,20 +206,20 @@ impl VerificationPipeline {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Block verification (commitment proofs, state root, tx root)
+    // Block verification (source attestations, state root, tx root)
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Check if all async verifications are complete for a block.
     ///
-    /// Returns true if CommitmentProof, state root, and transaction root
+    /// Returns true if source attestation, state root, and transaction root
     /// verifications are all done (or not needed).
     pub fn is_block_verified(&self, block: &Block) -> bool {
         let block_hash = block.hash();
 
-        let commitment_proof_ok = if block.deferred.is_empty() {
+        let attestation_ok = if block.deferred.is_empty() {
             true
         } else {
-            self.verified_commitment_proofs.contains(&block_hash)
+            self.verified_source_attestations.contains(&block_hash)
         };
 
         let state_root_ok = if block.certificates.is_empty() {
@@ -240,13 +240,13 @@ impl VerificationPipeline {
             self.verified_receipt_roots.contains(&block_hash)
         };
 
-        commitment_proof_ok && state_root_ok && transaction_root_ok && receipt_root_ok
+        attestation_ok && state_root_ok && transaction_root_ok && receipt_root_ok
     }
 
-    // ─── CommitmentProof ─────────────────────────────────────────────────
+    // ─── SourceBlockAttestation ────────────────────────────────────────────
 
-    /// Check if a block needs CommitmentProof verification before voting.
-    pub fn needs_commitment_proof_verification(&self, block: &Block) -> bool {
+    /// Check if a block needs source attestation verification before voting.
+    pub fn needs_source_attestation_verification(&self, block: &Block) -> bool {
         if block.deferred.is_empty() {
             return false;
         }
@@ -254,9 +254,9 @@ impl VerificationPipeline {
         let block_hash = block.hash();
 
         // Skip if already verified or verification in progress
-        if self.verified_commitment_proofs.contains(&block_hash)
+        if self.verified_source_attestations.contains(&block_hash)
             || self
-                .pending_commitment_proof_verifications
+                .pending_source_attestation_verifications
                 .contains_key(&block_hash)
         {
             return false;
@@ -265,10 +265,10 @@ impl VerificationPipeline {
         true
     }
 
-    /// Begin tracking CommitmentProof verification for a block.
+    /// Begin tracking source attestation verification for a block.
     ///
-    /// Returns verification actions for each deferral's proof.
-    pub fn initiate_commitment_proof_verification(
+    /// Returns verification actions for each deferral's attestation.
+    pub fn initiate_source_attestation_verification(
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
@@ -281,45 +281,47 @@ impl VerificationPipeline {
         debug!(
             block_hash = ?block_hash,
             deferral_count = block.deferred.len(),
-            "Initiating CommitmentProof verification for block"
+            "Initiating source attestation verification for block"
         );
 
         // Track pending verification
-        self.pending_commitment_proof_verifications.insert(
+        self.pending_source_attestation_verifications.insert(
             block_hash,
-            PendingCommitmentProofVerifications {
+            PendingSourceAttestationVerifications {
                 total: block.deferred.len(),
                 verified: 0,
                 all_valid: true,
             },
         );
 
-        // Generate verification actions for each deferral's proof
+        // Generate verification actions for each deferral's attestation
         block
             .deferred
             .iter()
             .enumerate()
             .map(|(idx, deferral)| {
-                let proof = &deferral.proof;
+                let attestation = &deferral.attestation;
 
                 // Resolve public keys and voting power from signer bitfield
                 let (public_keys, voting_power) =
-                    Self::resolve_commitment_proof_signers(topology, proof);
+                    Self::resolve_source_attestation_signers(topology, attestation);
 
                 if public_keys.is_empty() {
                     warn!(
                         block_hash = ?block_hash,
                         deferral_index = idx,
-                        "No public keys resolved for CommitmentProof verification"
+                        "No public keys resolved for source attestation verification"
                     );
                 }
 
-                let quorum_threshold = topology.quorum_threshold_for_shard(proof.source_shard);
+                let quorum_threshold =
+                    topology.quorum_threshold_for_shard(attestation.source_shard);
 
-                Action::VerifyCommitmentProof {
+                Action::VerifySourceAttestation {
                     block_hash,
                     deferral_index: idx,
-                    commitment_proof: proof.clone(),
+                    attestation: attestation.clone(),
+                    entries: deferral.entries.clone(),
                     public_keys,
                     voting_power,
                     quorum_threshold,
@@ -328,12 +330,12 @@ impl VerificationPipeline {
             .collect()
     }
 
-    /// Resolve public keys and total voting power from a CommitmentProof's signer bitfield.
-    pub(crate) fn resolve_commitment_proof_signers(
+    /// Resolve public keys and total voting power from a SourceBlockAttestation's signer bitfield.
+    pub(crate) fn resolve_source_attestation_signers(
         topology: &TopologySnapshot,
-        proof: &CommitmentProof,
+        attestation: &SourceBlockAttestation,
     ) -> (Vec<Bls12381G1PublicKey>, u64) {
-        let committee = topology.committee_for_shard(proof.source_shard);
+        let committee = topology.committee_for_shard(attestation.source_shard);
 
         // Collect ALL committee public keys in order — verify_qc_signature
         // uses positional indexing via the signer bitfield, so it needs the
@@ -349,7 +351,7 @@ impl VerificationPipeline {
 
         // Compute voting power from signers only
         let mut voting_power = 0u64;
-        for idx in proof.qc.signers.set_indices() {
+        for idx in attestation.qc.signers.set_indices() {
             if let Some(&validator_id) = committee.get(idx) {
                 voting_power += topology.voting_power(validator_id).unwrap_or(0);
             }
@@ -358,22 +360,22 @@ impl VerificationPipeline {
         (public_keys, voting_power)
     }
 
-    /// Record a commitment proof verification result.
-    pub fn on_commitment_proof_verified(
+    /// Record a source attestation verification result.
+    pub fn on_source_attestation_verified(
         &mut self,
         block_hash: Hash,
         deferral_index: usize,
         valid: bool,
     ) -> VerificationProgress {
         let pending = match self
-            .pending_commitment_proof_verifications
+            .pending_source_attestation_verifications
             .get_mut(&block_hash)
         {
             Some(p) => p,
             None => {
                 warn!(
                     block_hash = ?block_hash,
-                    "CommitmentProof verification result for unknown block - likely already cleaned up"
+                    "Source attestation verification result for unknown block - likely already cleaned up"
                 );
                 return VerificationProgress::NotTracked;
             }
@@ -386,13 +388,13 @@ impl VerificationPipeline {
             warn!(
                 block_hash = ?block_hash,
                 deferral_index = deferral_index,
-                "CommitmentProof signature verification FAILED - potential Byzantine attack!"
+                "Source attestation verification FAILED - potential Byzantine attack!"
             );
         } else {
             trace!(
                 block_hash = ?block_hash,
                 deferral_index = deferral_index,
-                "CommitmentProof verified successfully"
+                "Source attestation verified successfully"
             );
         }
 
@@ -402,24 +404,24 @@ impl VerificationPipeline {
                 block_hash = ?block_hash,
                 verified = pending.verified,
                 total = pending.total,
-                "Waiting for more CommitmentProof verifications"
+                "Waiting for more source attestation verifications"
             );
             return VerificationProgress::StillPending;
         }
 
         // All verifications complete
         let all_valid = pending.all_valid;
-        self.pending_commitment_proof_verifications
+        self.pending_source_attestation_verifications
             .remove(&block_hash);
 
         if !all_valid {
             return VerificationProgress::Failed;
         }
 
-        self.verified_commitment_proofs.insert(block_hash);
+        self.verified_source_attestations.insert(block_hash);
         debug!(
             block_hash = ?block_hash,
-            "All CommitmentProofs verified successfully"
+            "All source attestations verified successfully"
         );
         VerificationProgress::AllComplete
     }
@@ -736,10 +738,10 @@ impl VerificationPipeline {
         self.pending_qc_verifications
             .retain(|hash, _| pending_blocks.contains_key(hash));
 
-        self.pending_commitment_proof_verifications
+        self.pending_source_attestation_verifications
             .retain(|hash, _| pending_blocks.contains_key(hash));
 
-        self.verified_commitment_proofs
+        self.verified_source_attestations
             .retain(|hash| pending_blocks.contains_key(hash));
 
         self.pending_state_root_verifications
