@@ -1,9 +1,10 @@
 //! Block and BlockHeader types for consensus.
 
 use crate::{
-    compute_merkle_root, BlockHeight, CommitmentEntry, Hash, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, SourceBlockAttestation, TransactionAbort,
-    TransactionCertificate, TransactionDefer, ValidatorId,
+    compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root, BlockHeight,
+    CommitmentEntry, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    SourceBlockAttestation, TransactionAbort, TransactionCertificate, TransactionDefer,
+    TransactionInclusionProof, ValidatorId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -65,7 +66,55 @@ pub fn compute_transaction_root(
         leaves.push(Hash::from_parts(&[NORMAL_TAG, tx.hash().as_bytes()]));
     }
 
-    compute_merkle_root(&leaves)
+    // Use padded merkle root (power-of-2 padding with Hash::ZERO) so that
+    // merkle inclusion proofs can be generated and verified for any leaf.
+    compute_padded_merkle_root(&leaves)
+}
+
+/// Compute a transaction inclusion proof for a specific transaction in a block.
+///
+/// Reconstructs the tagged leaf list in the same order as `compute_transaction_root`
+/// (retry, priority, normal), finds the leaf matching `tx_hash`, and returns a
+/// merkle inclusion proof plus the tagged leaf hash.
+///
+/// Returns `None` if the transaction is not in the block.
+pub fn tx_inclusion_proof(
+    block: &Block,
+    tx_hash: &Hash,
+) -> Option<(TransactionInclusionProof, Hash)> {
+    let total_count = block.retry_transactions.len()
+        + block.priority_transactions.len()
+        + block.transactions.len();
+
+    if total_count == 0 {
+        return None;
+    }
+
+    // Build tagged leaves in the same order as compute_transaction_root
+    let mut leaves = Vec::with_capacity(total_count);
+
+    for tx in &block.retry_transactions {
+        leaves.push(Hash::from_parts(&[RETRY_TAG, tx.hash().as_bytes()]));
+    }
+    for tx in &block.priority_transactions {
+        leaves.push(Hash::from_parts(&[PRIORITY_TAG, tx.hash().as_bytes()]));
+    }
+    for tx in &block.transactions {
+        leaves.push(Hash::from_parts(&[NORMAL_TAG, tx.hash().as_bytes()]));
+    }
+
+    // Find which leaf matches tx_hash (check all tag variants)
+    let target_retry = Hash::from_parts(&[RETRY_TAG, tx_hash.as_bytes()]);
+    let target_priority = Hash::from_parts(&[PRIORITY_TAG, tx_hash.as_bytes()]);
+    let target_normal = Hash::from_parts(&[NORMAL_TAG, tx_hash.as_bytes()]);
+
+    let index = leaves.iter().position(|leaf| {
+        *leaf == target_retry || *leaf == target_priority || *leaf == target_normal
+    })?;
+
+    let leaf_hash = leaves[index];
+    let (_root, proof) = compute_merkle_root_with_proof(&leaves, index);
+    Some((proof, leaf_hash))
 }
 
 /// Block header containing consensus metadata.

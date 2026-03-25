@@ -27,6 +27,9 @@ mod verify;
 use crate::batch_accumulator::{BatchAccumulator, ShardedBatchAccumulator};
 use crate::config::NodeConfig;
 use crate::protocol::fetch::{FetchInput, FetchKind, FetchProtocol};
+use crate::protocol::inclusion_proof_fetch::{
+    InclusionProofFetchInput, InclusionProofFetchProtocol,
+};
 use crate::protocol::provision_fetch::{ProvisionFetchInput, ProvisionFetchProtocol};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use crate::NodeStateMachine;
@@ -181,6 +184,9 @@ where
     // Provision fetch protocol (cross-shard provision fetching with peer rotation)
     provision_fetch_protocol: ProvisionFetchProtocol,
 
+    // Inclusion proof fetch protocol (livelock tx inclusion proof fetching with peer rotation)
+    inclusion_proof_fetch_protocol: InclusionProofFetchProtocol,
+
     // Transaction validation
     tx_validator: Arc<TransactionValidation>,
     pending_validation: HashSet<Hash>,
@@ -263,6 +269,8 @@ where
         let sync_protocol = SyncProtocol::new(config.sync.clone());
         let fetch_protocol = FetchProtocol::new(config.fetch.clone());
         let provision_fetch_protocol = ProvisionFetchProtocol::new(config.provision_fetch.clone());
+        let inclusion_proof_fetch_protocol =
+            InclusionProofFetchProtocol::new(config.inclusion_proof_fetch.clone());
         Self {
             state,
             storage: Arc::new(storage),
@@ -284,6 +292,7 @@ where
             sync_protocol,
             fetch_protocol,
             provision_fetch_protocol,
+            inclusion_proof_fetch_protocol,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             cross_shard_batch: BatchAccumulator::new(b.cross_shard_max, b.cross_shard_window),
             execution_vote_batch: BatchAccumulator::new(
@@ -634,6 +643,11 @@ where
                     .provision_fetch_protocol
                     .handle(ProvisionFetchInput::Tick);
                 self.process_provision_fetch_outputs(prov_outputs);
+                // Also tick the inclusion proof fetch protocol.
+                let proof_outputs = self
+                    .inclusion_proof_fetch_protocol
+                    .handle(InclusionProofFetchInput::Tick);
+                self.process_inclusion_proof_fetch_outputs(proof_outputs);
                 self.update_fetch_tick_timer();
             }
 
@@ -649,6 +663,42 @@ where
                         batch,
                     });
                 self.process_provision_fetch_outputs(outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            // ── Inclusion proof fetch protocol (livelock) ─────────────
+            NodeInput::InclusionProofFetchReceived {
+                winner_tx_hash,
+                loser_tx_hash,
+                source_shard,
+                source_block_height,
+                proof,
+                leaf_hash,
+            } => {
+                let outputs = self.inclusion_proof_fetch_protocol.handle(
+                    InclusionProofFetchInput::Received {
+                        winner_tx_hash,
+                        loser_tx_hash,
+                        source_shard,
+                        source_block_height,
+                        proof,
+                        leaf_hash,
+                    },
+                );
+                self.process_inclusion_proof_fetch_outputs(outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            NodeInput::InclusionProofFetchFailed { winner_tx_hash } => {
+                let outputs = self
+                    .inclusion_proof_fetch_protocol
+                    .handle(InclusionProofFetchInput::Failed { winner_tx_hash });
+                self.process_inclusion_proof_fetch_outputs(outputs);
+                // Tick to retry immediately.
+                let tick_outputs = self
+                    .inclusion_proof_fetch_protocol
+                    .handle(InclusionProofFetchInput::Tick);
+                self.process_inclusion_proof_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
 

@@ -739,6 +739,10 @@ impl NodeStateMachine {
         valid: bool,
     ) -> Vec<Action> {
         if valid {
+            // Share verified header with BFT for deferral merkle proof verification
+            if let Some(ref header) = committed_header {
+                self.bft.update_remote_header(header.clone());
+            }
             for tx in &batch.transactions {
                 self.mempool.on_provision_verified(tx.tx_hash);
             }
@@ -749,6 +753,30 @@ impl NodeStateMachine {
             committed_header,
             valid,
         )
+    }
+
+    /// Handle an inclusion proof received from a source shard (livelock deferral).
+    ///
+    /// Called by the I/O loop when a `GetTxInclusionProofResponse` is received.
+    /// Forwards to the livelock state machine to finalize the deferral.
+    pub(crate) fn on_inclusion_proof_received(
+        &mut self,
+        winner_tx_hash: Hash,
+        loser_tx_hash: Hash,
+        source_shard: ShardGroupId,
+        source_block_height: BlockHeight,
+        proof: hyperscale_types::TransactionInclusionProof,
+        leaf_hash: Hash,
+    ) -> Vec<Action> {
+        self.livelock.on_inclusion_proof_received(
+            winner_tx_hash,
+            loser_tx_hash,
+            proof,
+            leaf_hash,
+            source_shard,
+            source_block_height,
+        );
+        vec![]
     }
 
     /// Handle transaction executed — notify mempool and check pending blocks.
@@ -855,11 +883,15 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::RemoteBlockCommitted {
                 committed_header,
                 sender,
-            } => self.provisions.on_remote_block_committed(
-                self.topology.snapshot(),
-                committed_header,
-                sender,
-            ),
+            } => {
+                // Share remote header with BFT for deferral merkle proof verification
+                self.bft.update_remote_header(committed_header.clone());
+                self.provisions.on_remote_block_committed(
+                    self.topology.snapshot(),
+                    committed_header,
+                    sender,
+                )
+            }
             ProtocolEvent::BlockVoteReceived { vote } => {
                 self.bft.on_block_vote(self.topology.snapshot(), vote)
             }
@@ -876,17 +908,6 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::QcSignatureVerified { block_hash, valid } => self
                 .bft
                 .on_qc_signature_verified(self.topology.snapshot(), block_hash, valid),
-            ProtocolEvent::SourceAttestationVerified {
-                block_hash,
-                deferral_index,
-                attestation: _,
-                valid,
-            } => self.bft.on_source_attestation_verified(
-                self.topology.snapshot(),
-                block_hash,
-                deferral_index,
-                valid,
-            ),
             ProtocolEvent::StateRootVerified { block_hash, valid } => self
                 .bft
                 .on_state_root_verified(self.topology.snapshot(), block_hash, valid),
@@ -944,12 +965,40 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ProvisionAccepted {
                 tx_hash,
                 source_shard,
-                attestation,
+                source_block_height,
                 entries,
             } => {
-                self.livelock
-                    .on_provision_accepted(tx_hash, source_shard, &attestation, &entries);
-                vec![]
+                let outputs = self.livelock.on_provision_accepted(
+                    tx_hash,
+                    source_shard,
+                    source_block_height,
+                    &entries,
+                );
+                let mut actions = Vec::new();
+                for output in outputs {
+                    match output {
+                        hyperscale_livelock::LivelockOutput::FetchInclusionProof {
+                            source_shard,
+                            source_block_height,
+                            winner_tx_hash,
+                            loser_tx_hash,
+                        } => {
+                            let peers = self
+                                .topology
+                                .snapshot()
+                                .committee_for_shard(source_shard)
+                                .to_vec();
+                            actions.push(Action::RequestTxInclusionProof {
+                                source_shard,
+                                source_block_height,
+                                winner_tx_hash,
+                                loser_tx_hash,
+                                peers,
+                            });
+                        }
+                    }
+                }
+                actions
             }
             ProtocolEvent::ProvisioningComplete {
                 tx_hash,

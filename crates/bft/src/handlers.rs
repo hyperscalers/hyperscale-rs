@@ -9,8 +9,8 @@ use hyperscale_types::{
     batch_verify_bls_same_message, compute_receipt_root, compute_transaction_root,
     verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
     Bls12381G2Signature, CommitmentEntry, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, SignerBitfield, SourceBlockAttestation, StateEntry, TransactionAbort,
-    TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
+    ShardGroupId, SignerBitfield, SourceBlockAttestation, TransactionAbort, TransactionCertificate,
+    TransactionDefer, ValidatorId, VotePower,
 };
 use std::sync::Arc;
 
@@ -184,41 +184,6 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
         }
         Err(_) => false,
     }
-}
-
-/// Verify a source block attestation's QC signature, quorum threshold, and merkle proofs.
-///
-/// Verifies the QC's aggregated BLS signature using the provided public keys,
-/// checks that the signers' voting power meets the quorum threshold, and verifies
-/// the verkle inclusion proof against the attestation's state root.
-///
-/// `voting_power` is the pre-computed total voting power of the signers
-/// (derived from the QC's signer bitfield and the topology).
-pub fn verify_source_attestation(
-    attestation: &SourceBlockAttestation,
-    entries: &[StateEntry],
-    public_keys: &[Bls12381G1PublicKey],
-    voting_power: u64,
-    quorum_threshold: u64,
-) -> bool {
-    if public_keys.is_empty() {
-        return false;
-    }
-
-    // Verify the QC's aggregated BLS signature
-    let qc_valid = verify_qc_signature(&attestation.qc, public_keys);
-
-    // Verify voting power meets quorum threshold
-    if !qc_valid || voting_power < quorum_threshold {
-        return false;
-    }
-
-    // Verify individual merkle inclusion proofs against attestation's state_root
-    hyperscale_storage::proofs::verify_all_merkle_proofs(
-        entries,
-        &attestation.proof,
-        attestation.state_root,
-    )
 }
 
 /// Verify that the computed transaction merkle root matches the expected root.

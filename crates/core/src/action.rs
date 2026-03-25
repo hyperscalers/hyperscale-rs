@@ -6,9 +6,8 @@ use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentEntry,
     CommittedBlockHeader, DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate,
     ExecutionVote, Hash, NodeId, ProvisionBatch, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, SignerBitfield, SourceBlockAttestation, StateEntry, StateProvision,
-    TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId,
-    VotePower,
+    ShardGroupId, SignerBitfield, SourceBlockAttestation, StateProvision, TopologySnapshot,
+    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -266,30 +265,23 @@ pub enum Action {
         block_hash: Hash,
     },
 
-    /// Verify a SourceBlockAttestation's QC signature and verkle proof.
+    /// Request a transaction inclusion proof from a source shard for livelock deferral.
     ///
-    /// This is CRITICAL for BFT safety: we must verify that the attestation
-    /// has a valid QC from the source shard's committee. Without this check,
-    /// a Byzantine proposer could include deferrals with forged attestations,
-    /// causing honest validators to incorrectly defer transactions.
-    ///
-    /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::SourceAttestationVerified` when complete.
-    VerifySourceAttestation {
-        /// Block hash containing this deferral (for correlation).
-        block_hash: Hash,
-        /// Index of deferral in block's deferred list.
-        deferral_index: usize,
-        /// The attestation to verify.
-        attestation: SourceBlockAttestation,
-        /// State entries to verify against the attestation's proof.
-        entries: Vec<StateEntry>,
-        /// Public keys of signers (resolved from QC's SignerBitfield).
-        public_keys: Vec<Bls12381G1PublicKey>,
-        /// Total voting power of the signers (resolved from QC's SignerBitfield + topology).
-        voting_power: u64,
-        /// Quorum threshold for source shard.
-        quorum_threshold: u64,
+    /// When a cycle is detected, the livelock state machine emits
+    /// `LivelockOutput::FetchInclusionProof`. The state machine converts that
+    /// into this action, which the I/O loop sends as a network request.
+    /// The response is delivered back as `NodeInput::InclusionProofFetchReceived`.
+    RequestTxInclusionProof {
+        /// Source shard to fetch the proof from.
+        source_shard: ShardGroupId,
+        /// Block height on the source shard.
+        source_block_height: BlockHeight,
+        /// Winner transaction hash (the one we need the proof for).
+        winner_tx_hash: Hash,
+        /// Loser transaction hash (the one being deferred).
+        loser_tx_hash: Hash,
+        /// Peers in the source shard to send the request to.
+        peers: Vec<ValidatorId>,
     },
 
     /// Verify a block's state root against the JMT.
@@ -762,6 +754,7 @@ impl Action {
                 | Action::PersistTransactionCertificate { .. }
                 | Action::RequestMissingProvisions { .. }
                 | Action::CancelProvisionFetch { .. }
+                | Action::RequestTxInclusionProof { .. }
         )
     }
 
@@ -775,7 +768,6 @@ impl Action {
                 | Action::VerifyAndAggregateExecutionVotes { .. }
                 | Action::VerifyExecutionCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
-                | Action::VerifySourceAttestation { .. }
                 | Action::VerifyStateRoot { .. }
                 | Action::VerifyTransactionRoot { .. }
                 | Action::VerifyReceiptRoot { .. }
@@ -825,7 +817,6 @@ impl Action {
                 "VerifyExecutionCertificateSignature"
             }
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
-            Action::VerifySourceAttestation { .. } => "VerifySourceAttestation",
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
             Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
             Action::VerifyReceiptRoot { .. } => "VerifyReceiptRoot",
@@ -873,6 +864,7 @@ impl Action {
             Action::CancelFetch { .. } => "CancelFetch",
             Action::RequestMissingProvisions { .. } => "RequestMissingProvisions",
             Action::CancelProvisionFetch { .. } => "CancelProvisionFetch",
+            Action::RequestTxInclusionProof { .. } => "RequestTxInclusionProof",
         }
     }
 }

@@ -4,7 +4,7 @@ use crate::ProtocolEvent;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, Hash,
     LedgerReceiptEntry, ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TransactionCertificate, ValidatorId,
+    TransactionCertificate, TransactionInclusionProof, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -129,6 +129,19 @@ pub enum NodeInput {
         source_shard: ShardGroupId,
         block_height: BlockHeight,
     },
+
+    /// Transaction inclusion proof fetched successfully from a source shard.
+    InclusionProofFetchReceived {
+        winner_tx_hash: Hash,
+        loser_tx_hash: Hash,
+        source_shard: ShardGroupId,
+        source_block_height: BlockHeight,
+        proof: TransactionInclusionProof,
+        leaf_hash: Hash,
+    },
+
+    /// Transaction inclusion proof fetch failed (network error or peer returned None).
+    InclusionProofFetchFailed { winner_tx_hash: Hash },
 }
 
 impl NodeInput {
@@ -176,6 +189,8 @@ impl NodeInput {
             NodeInput::ProvisionsReady { .. } => EventPriority::Internal,
             NodeInput::ProvisionFetchReceived { .. } => EventPriority::Internal,
             NodeInput::ProvisionFetchFailed { .. } => EventPriority::Internal,
+            NodeInput::InclusionProofFetchReceived { .. } => EventPriority::Internal,
+            NodeInput::InclusionProofFetchFailed { .. } => EventPriority::Internal,
         }
     }
 
@@ -213,6 +228,8 @@ impl NodeInput {
             NodeInput::ProvisionsReady { .. } => "ProvisionsReady",
             NodeInput::ProvisionFetchReceived { .. } => "ProvisionFetchReceived",
             NodeInput::ProvisionFetchFailed { .. } => "ProvisionFetchFailed",
+            NodeInput::InclusionProofFetchReceived { .. } => "InclusionProofFetchReceived",
+            NodeInput::InclusionProofFetchFailed { .. } => "InclusionProofFetchFailed",
         }
     }
 }

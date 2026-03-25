@@ -109,7 +109,6 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::VerifyAndBuildQuorumCertificate { .. }
             | Action::VerifyQcSignature { .. }
-            | Action::VerifySourceAttestation { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyTransactionRoot { .. }
             | Action::VerifyReceiptRoot { .. }
@@ -176,7 +175,8 @@ where
             | Action::FetchCertificates { .. }
             | Action::CancelFetch { .. }
             | Action::RequestMissingProvisions { .. }
-            | Action::CancelProvisionFetch { .. } => {
+            | Action::CancelProvisionFetch { .. }
+            | Action::RequestTxInclusionProof { .. } => {
                 self.process_sync_fetch_action(action);
             }
 
@@ -631,6 +631,33 @@ where
                         source_shard,
                         block_height,
                     });
+            }
+            Action::RequestTxInclusionProof {
+                source_shard,
+                source_block_height,
+                winner_tx_hash,
+                loser_tx_hash,
+                peers,
+            } => {
+                use crate::protocol::inclusion_proof_fetch::InclusionProofFetchInput;
+                let preferred_peer = peers.first().copied().unwrap_or(ValidatorId(0));
+                let outputs =
+                    self.inclusion_proof_fetch_protocol
+                        .handle(InclusionProofFetchInput::Request {
+                            source_shard,
+                            source_block_height,
+                            winner_tx_hash,
+                            loser_tx_hash,
+                            peers,
+                            preferred_peer,
+                        });
+                self.process_inclusion_proof_fetch_outputs(outputs);
+                // Tick immediately to start the fetch.
+                let tick_outputs = self
+                    .inclusion_proof_fetch_protocol
+                    .handle(InclusionProofFetchInput::Tick);
+                self.process_inclusion_proof_fetch_outputs(tick_outputs);
+                self.update_fetch_tick_timer();
             }
             _ => unreachable!(),
         }

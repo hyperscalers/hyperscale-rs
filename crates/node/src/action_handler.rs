@@ -60,7 +60,6 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         // Consensus-critical crypto
         Action::VerifyAndBuildQuorumCertificate { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyQcSignature { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifySourceAttestation { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
@@ -147,40 +146,6 @@ pub(crate) fn handle_delegated_action<
                     block_hash,
                     valid,
                 })],
-                prepared_commit: None,
-            })
-        }
-
-        Action::VerifySourceAttestation {
-            block_hash,
-            deferral_index,
-            attestation,
-            entries,
-            public_keys,
-            voting_power,
-            quorum_threshold,
-        } => {
-            let start = std::time::Instant::now();
-            let valid = hyperscale_bft::handlers::verify_source_attestation(
-                &attestation,
-                &entries,
-                &public_keys,
-                voting_power,
-                quorum_threshold,
-            );
-            metrics::record_signature_verification_latency(
-                "source_attestation",
-                start.elapsed().as_secs_f64(),
-            );
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::SourceAttestationVerified {
-                        block_hash,
-                        deferral_index,
-                        attestation,
-                        valid,
-                    },
-                )],
                 prepared_commit: None,
             })
         }
@@ -659,7 +624,6 @@ pub(crate) fn handle_delegated_action<
                 state_root: Hash::ZERO, // Filled by verifier from committed header
                 qc: QuorumCertificate::genesis(), // Filled by verifier from committed header
                 proof: (*proof).clone(),
-                entries: vec![], // Populated at verification time from batch entries
             });
 
             let batches: Vec<_> = shard_tx_entries

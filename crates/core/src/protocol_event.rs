@@ -8,8 +8,8 @@
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader, EpochConfig,
     EpochId, ExecutionCertificate, ExecutionVote, Hash, ProvisionBatch, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, SourceBlockAttestation, StateEntry, StateProvision,
-    TransactionCertificate, ValidatorId,
+    RoutableTransaction, ShardGroupId, StateEntry, StateProvision, TransactionCertificate,
+    ValidatorId,
 };
 use std::sync::Arc;
 
@@ -88,14 +88,6 @@ pub enum ProtocolEvent {
     /// QC signature verification completed.
     QcSignatureVerified { block_hash: Hash, valid: bool },
 
-    /// SourceBlockAttestation QC + proof verification completed.
-    SourceAttestationVerified {
-        block_hash: Hash,
-        deferral_index: usize,
-        attestation: SourceBlockAttestation,
-        valid: bool,
-    },
-
     /// State root verification completed.
     StateRootVerified { block_hash: Hash, valid: bool },
 
@@ -134,7 +126,7 @@ pub enum ProtocolEvent {
     ProvisionAccepted {
         tx_hash: Hash,
         source_shard: ShardGroupId,
-        attestation: Arc<SourceBlockAttestation>,
+        source_block_height: BlockHeight,
         entries: Vec<StateEntry>,
     },
 
@@ -362,7 +354,6 @@ impl ProtocolEvent {
             ProtocolEvent::BlockCommitted { .. } => "BlockCommitted",
             ProtocolEvent::QuorumCertificateResult { .. } => "QuorumCertificateResult",
             ProtocolEvent::QcSignatureVerified { .. } => "QcSignatureVerified",
-            ProtocolEvent::SourceAttestationVerified { .. } => "SourceAttestationVerified",
             ProtocolEvent::StateRootVerified { .. } => "StateRootVerified",
             ProtocolEvent::TransactionRootVerified { .. } => "TransactionRootVerified",
             ProtocolEvent::ReceiptRootVerified { .. } => "ReceiptRootVerified",

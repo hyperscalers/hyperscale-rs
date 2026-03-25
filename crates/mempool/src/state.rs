@@ -2126,10 +2126,13 @@ mod tests {
                 winner_tx_hash: winner_tx,
             },
             block_height: BlockHeight(height),
-            attestation: hyperscale_types::SourceBlockAttestation::dummy(
-                ShardGroupId(1),
-                BlockHeight(1),
-            ),
+            source_shard: ShardGroupId(1),
+            source_block_height: BlockHeight(1),
+            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
+                siblings: vec![],
+                leaf_index: 0,
+            },
+            leaf_hash: Hash::ZERO,
         }
     }
 

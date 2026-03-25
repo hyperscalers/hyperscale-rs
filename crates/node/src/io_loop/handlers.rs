@@ -57,6 +57,38 @@ where
                 serve_certificate_request(&*storage, &cert_cache, req)
             });
 
+        // ── tx_inclusion_proof.request → livelock proof serving ──────
+
+        let storage = Arc::clone(&self.storage);
+        self.network
+            .register_request_handler::<hyperscale_messages::request::GetTxInclusionProofRequest>(
+                move |req: hyperscale_messages::request::GetTxInclusionProofRequest| {
+                    use hyperscale_messages::response::GetTxInclusionProofResponse;
+                    use hyperscale_types::tx_inclusion_proof;
+
+                    let (block, _qc) = match storage.get_block(req.block_height) {
+                        Some(pair) => pair,
+                        None => {
+                            return GetTxInclusionProofResponse {
+                                proof: None,
+                                leaf_hash: None,
+                            };
+                        }
+                    };
+
+                    match tx_inclusion_proof(&block, &req.tx_hash) {
+                        Some((proof, leaf_hash)) => GetTxInclusionProofResponse {
+                            proof: Some(proof),
+                            leaf_hash: Some(leaf_hash),
+                        },
+                        None => GetTxInclusionProofResponse {
+                            proof: None,
+                            leaf_hash: None,
+                        },
+                    }
+                },
+            );
+
         // ── provision.request → provision fetch protocol ─────────────
         //
         // Dedup + cache: the proof for (block_height, target_shard) is
@@ -301,7 +333,6 @@ where
                             state_root: hyperscale_types::Hash::ZERO,
                             qc: hyperscale_types::QuorumCertificate::genesis(),
                             proof,
-                            entries: vec![],
                         });
                     let transactions: Vec<hyperscale_types::TxEntries> = provisions
                         .into_iter()

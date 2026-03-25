@@ -2,6 +2,7 @@
 
 use super::{IoLoop, TimerOp};
 use crate::protocol::fetch::FetchOutput;
+use crate::protocol::inclusion_proof_fetch::InclusionProofFetchOutput;
 use crate::protocol::provision_fetch::ProvisionFetchOutput;
 use crate::protocol::sync::SyncOutput;
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
@@ -229,7 +230,6 @@ where
                                             state_root: hyperscale_types::Hash::ZERO,
                                             qc: hyperscale_types::QuorumCertificate::genesis(),
                                             proof,
-                                            entries: vec![],
                                         },
                                     );
                                     let transactions: Vec<hyperscale_types::TxEntries> = provisions
@@ -273,6 +273,83 @@ where
         }
     }
 
+    /// Process InclusionProofFetchProtocol outputs.
+    ///
+    /// `Fetch` uses the Network trait to send a single-peer request.
+    /// `Deliver` forwards the proof to the state machine for livelock processing.
+    pub(super) fn process_inclusion_proof_fetch_outputs(
+        &mut self,
+        outputs: Vec<InclusionProofFetchOutput>,
+    ) {
+        for output in outputs {
+            match output {
+                InclusionProofFetchOutput::Fetch {
+                    source_shard,
+                    block_height,
+                    winner_tx_hash,
+                    loser_tx_hash,
+                    peer,
+                } => {
+                    use hyperscale_messages::request::GetTxInclusionProofRequest;
+                    let request = GetTxInclusionProofRequest {
+                        block_height,
+                        tx_hash: winner_tx_hash,
+                    };
+                    let sender = self.event_sender.clone();
+                    self.network.request(
+                        &[peer],
+                        None,
+                        request,
+                        Box::new(move |result| match result {
+                            Ok(response) => {
+                                if let (Some(proof), Some(leaf_hash)) =
+                                    (response.proof, response.leaf_hash)
+                                {
+                                    let _ = sender.send(NodeInput::InclusionProofFetchReceived {
+                                        winner_tx_hash,
+                                        loser_tx_hash,
+                                        source_shard,
+                                        source_block_height: block_height,
+                                        proof,
+                                        leaf_hash,
+                                    });
+                                } else {
+                                    let _ = sender.send(NodeInput::InclusionProofFetchFailed {
+                                        winner_tx_hash,
+                                    });
+                                }
+                            }
+                            Err(_) => {
+                                let _ = sender
+                                    .send(NodeInput::InclusionProofFetchFailed { winner_tx_hash });
+                            }
+                        }),
+                    );
+                }
+                InclusionProofFetchOutput::Deliver {
+                    winner_tx_hash,
+                    loser_tx_hash,
+                    source_shard,
+                    source_block_height,
+                    proof,
+                    leaf_hash,
+                } => {
+                    let actions = self.state.on_inclusion_proof_received(
+                        winner_tx_hash,
+                        loser_tx_hash,
+                        source_shard,
+                        source_block_height,
+                        proof,
+                        leaf_hash,
+                    );
+                    for action in actions {
+                        self.process_action(action);
+                    }
+                }
+            }
+        }
+    }
+
     /// Set or cancel the periodic fetch tick timer based on protocol state.
     ///
     /// When the fetch protocol has pending work, a recurring timer fires
@@ -282,7 +359,8 @@ where
         let status = self.fetch_protocol.status();
         let has_fetch_work = status.pending_tx_blocks > 0 || status.pending_cert_blocks > 0;
         let has_provision_work = self.provision_fetch_protocol.has_pending();
-        if has_fetch_work || has_provision_work {
+        let has_inclusion_proof_work = self.inclusion_proof_fetch_protocol.has_pending();
+        if has_fetch_work || has_provision_work || has_inclusion_proof_work {
             self.pending_timer_ops.push(TimerOp::Set {
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,

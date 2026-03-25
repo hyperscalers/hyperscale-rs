@@ -5,13 +5,28 @@
 
 use crate::tracker::{CommittedCrossShardTracker, ProvisionTracker, RemoteStateNeeds};
 use hyperscale_types::{
-    BlockHeight, DeferReason, Hash, NodeId, RoutableTransaction, ShardGroupId,
-    SourceBlockAttestation, StateEntry, TopologySnapshot, TransactionDefer,
+    BlockHeight, DeferReason, Hash, NodeId, RoutableTransaction, ShardGroupId, StateEntry,
+    TopologySnapshot, TransactionDefer, TransactionInclusionProof,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
+
+/// Output produced by the livelock state machine when a cycle is detected.
+///
+/// The caller must fetch the inclusion proof from the source shard and then
+/// call `on_inclusion_proof_received` to complete the deferral.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LivelockOutput {
+    /// A cycle was detected; fetch the merkle inclusion proof for the winner TX
+    /// from its source shard before we can queue the deferral.
+    FetchInclusionProof {
+        source_shard: ShardGroupId,
+        source_block_height: BlockHeight,
+        winner_tx_hash: Hash,
+        loser_tx_hash: Hash,
+    },
+}
 
 /// Configuration for livelock prevention.
 #[derive(Debug, Clone)]
@@ -58,10 +73,9 @@ pub struct LivelockState {
     /// Added when any terminal state COMMITS (certificate, abort, or deferral).
     tombstones: HashMap<Hash, Duration>,
 
-    /// Attestations and entries from remote transactions.
-    /// Attached to deferrals when a livelock cycle is detected.
-    /// Maps tx_hash -> (SourceBlockAttestation, Vec<StateEntry>)
-    tx_attestations: HashMap<Hash, (Arc<SourceBlockAttestation>, Vec<StateEntry>)>,
+    /// Loser tx hashes for which we've requested inclusion proofs but
+    /// haven't received them yet.
+    pending_proof_fetches: HashSet<Hash>,
 
     /// Deferrals ready to be included in next block proposal.
     /// Kept until they appear in a committed block.
@@ -106,7 +120,7 @@ impl LivelockState {
             committed_tracker: CommittedCrossShardTracker::new(),
             provision_tracker: ProvisionTracker::new(),
             tombstones: HashMap::new(),
-            tx_attestations: HashMap::new(),
+            pending_proof_fetches: HashSet::new(),
             pending_deferrals: Vec::new(),
             pending_deferral_hashes: HashSet::new(),
             now: Duration::ZERO,
@@ -191,18 +205,22 @@ impl LivelockState {
     /// proofs). This prevents Byzantine validators from triggering false deferrals
     /// with forged provisions.
     ///
+    /// Returns [`LivelockOutput::FetchInclusionProof`] entries for each cycle
+    /// detected. The caller must fetch the proof and call
+    /// [`on_inclusion_proof_received`] to finalize the deferral.
+    ///
     /// # Arguments
     /// * `remote_tx_hash` - The remote transaction's hash
     /// * `source_shard` - The shard that sent the verified provision
-    /// * `attestation` - The source block attestation proving the provision
-    /// * `entries` - The state entries from the remote transaction
+    /// * `source_block_height` - The block height on the source shard
+    /// * `entries` - The state entries from the remote transaction (used transiently for node-ID extraction)
     pub fn on_provision_accepted(
         &mut self,
         remote_tx_hash: Hash,
         source_shard: ShardGroupId,
-        attestation: &Arc<SourceBlockAttestation>,
+        source_block_height: BlockHeight,
         entries: &[StateEntry],
-    ) {
+    ) -> Vec<LivelockOutput> {
         trace!(
             remote_tx = %remote_tx_hash,
             source_shard = source_shard.0,
@@ -216,23 +234,24 @@ impl LivelockState {
                 remote_tx = %remote_tx_hash,
                 "Discarding quorum - TX has tombstone (already completed)"
             );
-            return;
+            return vec![];
         }
 
         // Check if we've already processed this (tx, shard) for cycle detection
         if !self.provision_tracker.add(remote_tx_hash, source_shard) {
-            return;
+            return vec![];
         }
 
-        // Store the attestation and entries for attaching to deferrals
-        self.tx_attestations
-            .insert(remote_tx_hash, (Arc::clone(attestation), entries.to_vec()));
-
-        // Get nodes from the entries
+        // Get nodes from the entries (transient — not stored)
         let remote_tx_nodes: HashSet<NodeId> = entries.iter().filter_map(|e| e.node_id()).collect();
 
         // Check for cycle with our local committed TXs
-        self.check_for_cycle(remote_tx_hash, source_shard, &remote_tx_nodes);
+        self.check_for_cycle(
+            remote_tx_hash,
+            source_shard,
+            source_block_height,
+            &remote_tx_nodes,
+        )
     }
 
     /// Check for a bidirectional cycle with a remote transaction.
@@ -250,16 +269,17 @@ impl LivelockState {
         &mut self,
         remote_tx_hash: Hash,
         source_shard: ShardGroupId,
+        source_block_height: BlockHeight,
         remote_tx_nodes: &HashSet<NodeId>,
-    ) {
+    ) -> Vec<LivelockOutput> {
         // Get all our committed TXs that need provisions from the remote shard
         let Some(local_txs_needing_source) = self.committed_tracker.txs_needing_shard(source_shard)
         else {
-            return;
+            return vec![];
         };
 
-        // Collect deferrals to queue
-        let mut deferrals_to_queue: Vec<(Hash, Hash)> = Vec::new();
+        // Collect outputs
+        let mut outputs: Vec<LivelockOutput> = Vec::new();
 
         // For each local TX that needs the source shard...
         for &local_tx_hash in local_txs_needing_source {
@@ -303,10 +323,22 @@ impl LivelockState {
                     local_tx = %local_tx_hash,
                     remote_tx = %remote_tx_hash,
                     winner = %winner,
-                    "TRUE cycle detected with overlapping nodes - our TX loses, queuing deferral"
+                    "TRUE cycle detected with overlapping nodes - requesting inclusion proof"
                 );
 
-                deferrals_to_queue.push((local_tx_hash, winner));
+                // Don't queue the deferral yet — we need the inclusion proof first.
+                // Track that we have an in-flight fetch for this loser.
+                if !self.pending_deferral_hashes.contains(&loser)
+                    && !self.pending_proof_fetches.contains(&loser)
+                {
+                    self.pending_proof_fetches.insert(loser);
+                    outputs.push(LivelockOutput::FetchInclusionProof {
+                        source_shard,
+                        source_block_height,
+                        winner_tx_hash: winner,
+                        loser_tx_hash: loser,
+                    });
+                }
             } else {
                 debug!(
                     local_tx = %local_tx_hash,
@@ -317,36 +349,51 @@ impl LivelockState {
             }
         }
 
-        // Queue all collected deferrals
-        for (loser, winner) in deferrals_to_queue {
-            self.queue_deferral(loser, winner);
-        }
+        outputs
+    }
+
+    /// Called when the inclusion proof for a winner transaction has been fetched.
+    ///
+    /// Completes the two-phase deferral: the proof is attached to the
+    /// `TransactionDefer` which is then queued for block inclusion.
+    pub fn on_inclusion_proof_received(
+        &mut self,
+        winner_tx_hash: Hash,
+        loser_tx_hash: Hash,
+        proof: TransactionInclusionProof,
+        leaf_hash: Hash,
+        source_shard: ShardGroupId,
+        source_block_height: BlockHeight,
+    ) {
+        self.pending_proof_fetches.remove(&loser_tx_hash);
+        self.queue_deferral(
+            loser_tx_hash,
+            winner_tx_hash,
+            source_shard,
+            source_block_height,
+            proof,
+            leaf_hash,
+        );
     }
 
     /// Queue a deferral for inclusion in the next block.
     ///
-    /// The deferral will only be queued if we have a valid attestation for the winner.
-    /// This is required for BFT safety - blocks with proof-less deferrals are rejected.
-    fn queue_deferral(&mut self, loser_tx: Hash, winner_tx: Hash) {
+    /// The deferral carries a merkle inclusion proof for the winner transaction.
+    /// BFT validation rejects deferrals without valid proofs.
+    fn queue_deferral(
+        &mut self,
+        loser_tx: Hash,
+        winner_tx: Hash,
+        source_shard: ShardGroupId,
+        source_block_height: BlockHeight,
+        proof: TransactionInclusionProof,
+        leaf_hash: Hash,
+    ) {
         // Check if already queued
         if self.pending_deferral_hashes.contains(&loser_tx) {
             trace!(tx = %loser_tx, "Deferral already queued");
             return;
         }
-
-        // Get the stored attestation and entries for the winner.
-        // These MUST be present - BFT validation rejects deferrals without proofs.
-        let Some((attestation, _)) = self.tx_attestations.get(&winner_tx) else {
-            // This shouldn't happen in normal operation since we store the attestation
-            // before calling check_for_cycle. But if it does, we can't create
-            // a valid deferral, so we must skip it.
-            warn!(
-                loser_tx = %loser_tx,
-                winner_tx = %winner_tx,
-                "Cannot queue deferral - no attestation for winner (BFT requires proof)"
-            );
-            return;
-        };
 
         let deferral = TransactionDefer {
             tx_hash: loser_tx,
@@ -354,13 +401,17 @@ impl LivelockState {
                 winner_tx_hash: winner_tx,
             },
             block_height: BlockHeight(0), // Will be filled in when included in block
-            attestation: SourceBlockAttestation::clone(attestation),
+            source_shard,
+            source_block_height,
+            tx_inclusion_proof: proof,
+            leaf_hash,
         };
 
         debug!(
             loser_tx = %loser_tx,
             winner_tx = %winner_tx,
-            "Queuing deferral with attestation"
+            source_shard = source_shard.0,
+            "Queuing deferral with inclusion proof"
         );
 
         self.pending_deferral_hashes.insert(loser_tx);
@@ -422,7 +473,7 @@ impl LivelockState {
         // Remove from tracking
         self.committed_tracker.remove(tx_hash);
         self.provision_tracker.remove_tx(tx_hash);
-        self.tx_attestations.remove(tx_hash);
+        self.pending_proof_fetches.remove(tx_hash);
 
         debug!(
             tx = %tx_hash,
@@ -440,7 +491,7 @@ impl LivelockState {
         // Remove from tracking
         self.committed_tracker.remove(tx_hash);
         self.provision_tracker.remove_tx(tx_hash);
-        self.tx_attestations.remove(tx_hash);
+        self.pending_proof_fetches.remove(tx_hash);
 
         debug!(tx = %tx_hash, "Abort committed - added tombstone");
     }
@@ -454,7 +505,7 @@ impl LivelockState {
         // Remove from tracking
         self.committed_tracker.remove(tx_hash);
         self.provision_tracker.remove_tx(tx_hash);
-        self.tx_attestations.remove(tx_hash);
+        self.pending_proof_fetches.remove(tx_hash);
 
         trace!(tx = %tx_hash, "Certificate committed - added tombstone");
     }
@@ -510,17 +561,13 @@ pub struct LivelockStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::ValidatorId;
+    use hyperscale_types::{TransactionInclusionProof, ValidatorId};
 
     fn make_test_node_id(id: u8) -> NodeId {
         // Create a simple NodeId from bytes
         let mut bytes = [0u8; 30];
         bytes[0] = id;
         NodeId::from_bytes(&bytes)
-    }
-
-    fn make_test_attestation(source_shard: ShardGroupId) -> Arc<SourceBlockAttestation> {
-        Arc::new(SourceBlockAttestation::dummy(source_shard, BlockHeight(1)))
     }
 
     fn make_test_entries_with_nodes(node_ids: Vec<NodeId>) -> Vec<StateEntry> {
@@ -552,41 +599,107 @@ mod tests {
         Hash::from_hash_bytes(&bytes)
     }
 
-    // Helper to create a minimal attestation and empty entries for testing
-    fn make_test_attestation_for_deferral() -> (SourceBlockAttestation, Vec<StateEntry>) {
-        (
-            SourceBlockAttestation::dummy(ShardGroupId(1), BlockHeight(1)),
-            vec![],
-        )
+    fn dummy_proof() -> TransactionInclusionProof {
+        TransactionInclusionProof {
+            siblings: vec![],
+            leaf_index: 0,
+        }
+    }
+
+    /// Helper: call on_provision_accepted and, if a FetchInclusionProof output
+    /// is returned for the expected loser, simulate receiving the proof so
+    /// the deferral gets queued (completing the two-phase flow).
+    fn accept_and_complete_deferral(
+        state: &mut LivelockState,
+        remote_tx_hash: Hash,
+        source_shard: ShardGroupId,
+        source_block_height: BlockHeight,
+        entries: &[StateEntry],
+    ) -> Vec<LivelockOutput> {
+        let outputs =
+            state.on_provision_accepted(remote_tx_hash, source_shard, source_block_height, entries);
+        for output in &outputs {
+            match output {
+                LivelockOutput::FetchInclusionProof {
+                    source_shard,
+                    source_block_height,
+                    winner_tx_hash,
+                    loser_tx_hash,
+                } => {
+                    state.on_inclusion_proof_received(
+                        *winner_tx_hash,
+                        *loser_tx_hash,
+                        dummy_proof(),
+                        Hash::ZERO,
+                        *source_shard,
+                        *source_block_height,
+                    );
+                }
+            }
+        }
+        outputs
+    }
+
+    fn make_test_deferral(loser: Hash, winner: Hash) -> TransactionDefer {
+        TransactionDefer {
+            tx_hash: loser,
+            reason: DeferReason::LivelockCycle {
+                winner_tx_hash: winner,
+            },
+            block_height: BlockHeight(5),
+            source_shard: ShardGroupId(1),
+            source_block_height: BlockHeight(1),
+            tx_inclusion_proof: dummy_proof(),
+            leaf_hash: Hash::ZERO,
+        }
     }
 
     #[test]
     fn test_cycle_detection_basic() {
         let mut state = LivelockState::new();
 
-        // Create hashes with predictable ordering
-        // local_tx has higher first byte (0xFF) so it loses
-        // remote_tx has lower first byte (0x00) so it wins
         let local_tx = hash_with_prefix(0xFF); // Higher hash (will lose)
         let remote_tx = hash_with_prefix(0x00); // Lower hash (will win)
 
-        // Create a node that both transactions will conflict on
         let conflicting_node = make_test_node_id(42);
 
-        // Register local TX as committed needing shard 1's state for the conflicting node
         let needs = make_remote_state_needs(
             &[ShardGroupId(1)],
             vec![(ShardGroupId(1), vec![conflicting_node])],
         );
         state.committed_tracker.add(local_tx, needs);
 
-        // Receive quorum of provisions from shard 1 for remote_tx with the SAME conflicting node
-        // This simulates shard 1 having committed a TX that also uses the conflicting node
-        let attestation = make_test_attestation(ShardGroupId(1));
         let entries = make_test_entries_with_nodes(vec![conflicting_node]);
-        state.on_provision_accepted(remote_tx, ShardGroupId(1), &attestation, &entries);
+        let outputs =
+            state.on_provision_accepted(remote_tx, ShardGroupId(1), BlockHeight(1), &entries);
 
-        // Should have queued a deferral (local_tx loses to remote_tx)
+        // Phase 1: should request inclusion proof
+        assert_eq!(outputs.len(), 1);
+        match &outputs[0] {
+            LivelockOutput::FetchInclusionProof {
+                winner_tx_hash,
+                loser_tx_hash,
+                ..
+            } => {
+                assert_eq!(*winner_tx_hash, remote_tx);
+                assert_eq!(*loser_tx_hash, local_tx);
+            }
+        }
+
+        // No deferral queued yet
+        assert!(state.get_pending_deferrals().is_empty());
+
+        // Phase 2: simulate proof received
+        state.on_inclusion_proof_received(
+            remote_tx,
+            local_tx,
+            dummy_proof(),
+            Hash::ZERO,
+            ShardGroupId(1),
+            BlockHeight(1),
+        );
+
+        // Now the deferral should be queued
         let deferrals = state.get_pending_deferrals();
         assert_eq!(deferrals.len(), 1);
         assert_eq!(deferrals[0].tx_hash, local_tx);
@@ -599,28 +712,22 @@ mod tests {
     fn test_no_cycle_when_we_win() {
         let mut state = LivelockState::new();
 
-        // Create hashes with predictable ordering
-        // local_tx has lower first byte (0x00) so it wins
-        // remote_tx has higher first byte (0xFF) so it loses
         let local_tx = hash_with_prefix(0x00); // Lower hash (will win)
         let remote_tx = hash_with_prefix(0xFF); // Higher hash (will lose)
 
-        // Create a conflicting node
         let conflicting_node = make_test_node_id(42);
 
-        // Register local TX as committed needing shard 1 for the conflicting node
         let needs = make_remote_state_needs(
             &[ShardGroupId(1)],
             vec![(ShardGroupId(1), vec![conflicting_node])],
         );
         state.committed_tracker.add(local_tx, needs);
 
-        // Receive quorum of provisions from shard 1 for remote_tx with overlapping node
-        let attestation = make_test_attestation(ShardGroupId(1));
         let entries = make_test_entries_with_nodes(vec![conflicting_node]);
-        state.on_provision_accepted(remote_tx, ShardGroupId(1), &attestation, &entries);
+        let outputs =
+            state.on_provision_accepted(remote_tx, ShardGroupId(1), BlockHeight(1), &entries);
 
-        // Should NOT have queued a deferral (we win, remote should defer)
+        assert!(outputs.is_empty());
         assert!(state.get_pending_deferrals().is_empty());
     }
 
@@ -628,27 +735,23 @@ mod tests {
     fn test_no_cycle_when_no_node_overlap() {
         let mut state = LivelockState::new();
 
-        // local_tx would lose by hash comparison
         let local_tx = hash_with_prefix(0xFF);
         let remote_tx = hash_with_prefix(0x00);
 
-        // Different nodes - no conflict!
         let local_node = make_test_node_id(1);
         let remote_node = make_test_node_id(2);
 
-        // Register local TX as committed needing shard 1 for local_node
         let needs = make_remote_state_needs(
             &[ShardGroupId(1)],
             vec![(ShardGroupId(1), vec![local_node])],
         );
         state.committed_tracker.add(local_tx, needs);
 
-        // Receive quorum of provisions from shard 1 for remote_tx with DIFFERENT node
-        let attestation = make_test_attestation(ShardGroupId(1));
         let entries = make_test_entries_with_nodes(vec![remote_node]);
-        state.on_provision_accepted(remote_tx, ShardGroupId(1), &attestation, &entries);
+        let outputs =
+            state.on_provision_accepted(remote_tx, ShardGroupId(1), BlockHeight(1), &entries);
 
-        // Should NOT have queued a deferral - no node overlap means no real conflict
+        assert!(outputs.is_empty());
         assert!(state.get_pending_deferrals().is_empty());
     }
 
@@ -662,10 +765,10 @@ mod tests {
         state.tombstones.insert(tx, Duration::from_secs(100));
 
         // Receive quorum of provisions for the deferred TX
-        let attestation = make_test_attestation(ShardGroupId(1));
         let entries: Vec<StateEntry> = vec![];
-        state.on_provision_accepted(tx, ShardGroupId(1), &attestation, &entries);
+        let outputs = state.on_provision_accepted(tx, ShardGroupId(1), BlockHeight(1), &entries);
 
+        assert!(outputs.is_empty());
         // Should not have added to provision tracker (tombstone filtered)
         assert!(!state.provision_tracker.has_provision(tx, ShardGroupId(1)));
     }
@@ -694,28 +797,34 @@ mod tests {
     fn test_pending_deferral_deduplication() {
         let mut state = LivelockState::new();
 
-        // Create hashes with predictable ordering
         let local_tx = hash_with_prefix(0xFF); // Higher hash (will lose)
         let remote_tx = hash_with_prefix(0x00); // Lower hash (will win)
 
         let conflicting_node = make_test_node_id(42);
 
-        // Register local TX as committed needing shard 1
         let needs = make_remote_state_needs(
             &[ShardGroupId(1)],
             vec![(ShardGroupId(1), vec![conflicting_node])],
         );
         state.committed_tracker.add(local_tx, needs);
 
-        // Receive quorum of provisions - should queue deferral
-        let attestation = make_test_attestation(ShardGroupId(1));
+        // Receive quorum of provisions - should trigger fetch + deferral
         let entries = make_test_entries_with_nodes(vec![conflicting_node]);
-        state.on_provision_accepted(remote_tx, ShardGroupId(1), &attestation, &entries);
+        accept_and_complete_deferral(
+            &mut state,
+            remote_tx,
+            ShardGroupId(1),
+            BlockHeight(1),
+            &entries,
+        );
 
         assert_eq!(state.get_pending_deferrals().len(), 1);
 
-        // Receive same quorum again - should NOT queue duplicate deferral
-        state.on_provision_accepted(remote_tx, ShardGroupId(1), &attestation, &entries);
+        // Receive same quorum again - should NOT queue duplicate
+        let entries = make_test_entries_with_nodes(vec![conflicting_node]);
+        let outputs =
+            state.on_provision_accepted(remote_tx, ShardGroupId(1), BlockHeight(1), &entries);
+        assert!(outputs.is_empty());
 
         assert_eq!(
             state.get_pending_deferrals().len(),
@@ -724,9 +833,10 @@ mod tests {
         );
 
         // Receive quorum from different shard for same cycle - still no duplicate
-        let attestation2 = make_test_attestation(ShardGroupId(2));
         let entries2 = make_test_entries_with_nodes(vec![conflicting_node]);
-        state.on_provision_accepted(remote_tx, ShardGroupId(2), &attestation2, &entries2);
+        let outputs =
+            state.on_provision_accepted(remote_tx, ShardGroupId(2), BlockHeight(1), &entries2);
+        assert!(outputs.is_empty());
 
         assert_eq!(
             state.get_pending_deferrals().len(),
@@ -742,24 +852,14 @@ mod tests {
         let tx = hash_with_prefix(0xFF);
         let node = make_test_node_id(1);
 
-        // Register TX as committed
         let needs =
             make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
         state.committed_tracker.add(tx, needs);
 
         assert!(state.committed_tracker.contains(&tx));
 
-        // Simulate deferral being committed in a block
         let winner = hash_with_prefix(0x00);
-        let (attestation, entries) = make_test_attestation_for_deferral();
-        let deferral = TransactionDefer {
-            tx_hash: tx,
-            reason: DeferReason::LivelockCycle {
-                winner_tx_hash: winner,
-            },
-            block_height: BlockHeight(5),
-            attestation,
-        };
+        let deferral = make_test_deferral(tx, winner);
 
         let block = hyperscale_types::Block {
             header: hyperscale_types::BlockHeader {
@@ -788,13 +888,11 @@ mod tests {
 
         state.on_block_committed(&block);
 
-        // TX should be removed from committed tracker
         assert!(
             !state.committed_tracker.contains(&tx),
             "Deferred TX should be removed from committed tracker"
         );
 
-        // Tombstone should be added
         assert!(
             state.tombstones.contains_key(&tx),
             "Tombstone should be added for deferred TX"
@@ -808,14 +906,12 @@ mod tests {
         let tx = hash_with_prefix(0xAA);
         let node = make_test_node_id(1);
 
-        // Register TX as committed
         let needs =
             make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
         state.committed_tracker.add(tx, needs);
 
         assert!(state.committed_tracker.contains(&tx));
 
-        // Simulate certificate being committed (TX completed successfully)
         let cert = hyperscale_types::TransactionCertificate {
             transaction_hash: tx,
             decision: hyperscale_types::TransactionDecision::Accept,
@@ -849,7 +945,6 @@ mod tests {
 
         state.on_block_committed(&block);
 
-        // TX should be removed from committed tracker (completed successfully)
         assert!(
             !state.committed_tracker.contains(&tx),
             "Completed TX should be removed from committed tracker"
@@ -858,7 +953,6 @@ mod tests {
 
     #[test]
     fn test_no_false_positive_unidirectional() {
-        // Test that unidirectional dependencies don't trigger cycle detection
         let mut state = LivelockState::new();
 
         let local_tx = hash_with_prefix(0xFF);
@@ -867,20 +961,15 @@ mod tests {
         let node1 = make_test_node_id(1);
         let node2 = make_test_node_id(2);
 
-        // Local TX needs shard 1, but shard 1's TX does NOT need us
         let needs =
             make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node1])]);
         state.committed_tracker.add(local_tx, needs);
 
-        // Receive quorum from shard 2 (not shard 1) for remote_tx
-        // This means remote_tx needs our state, but we don't need shard 2's state
-        // so there's no cycle with our local_tx
-        let attestation = make_test_attestation(ShardGroupId(2));
         let entries = make_test_entries_with_nodes(vec![node2]);
-        state.on_provision_accepted(remote_tx, ShardGroupId(2), &attestation, &entries);
+        let outputs =
+            state.on_provision_accepted(remote_tx, ShardGroupId(2), BlockHeight(1), &entries);
 
-        // Should NOT queue a deferral - no cycle exists
-        // Our local_tx needs shard 1, provision is from shard 2
+        assert!(outputs.is_empty());
         assert!(
             state.get_pending_deferrals().is_empty(),
             "Unidirectional dependency should not cause deferral"
@@ -898,12 +987,10 @@ mod tests {
         let tx = hash_with_prefix(0xAA);
         let node = make_test_node_id(1);
 
-        // Register TX as committed
         let needs =
             make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
         state.committed_tracker.add(tx, needs);
 
-        // Commit certificate
         let cert = hyperscale_types::TransactionCertificate {
             transaction_hash: tx,
             decision: hyperscale_types::TransactionDecision::Accept,
@@ -937,18 +1024,16 @@ mod tests {
 
         state.on_block_committed(&block);
 
-        // Tombstone should be added for certificate commit
         assert!(
             state.tombstones.contains_key(&tx),
             "Certificate commit should add tombstone"
         );
 
         // Late provision should be rejected
-        let attestation = make_test_attestation(ShardGroupId(1));
         let entries: Vec<StateEntry> = vec![];
-        state.on_provision_accepted(tx, ShardGroupId(1), &attestation, &entries);
+        let outputs = state.on_provision_accepted(tx, ShardGroupId(1), BlockHeight(1), &entries);
         assert!(
-            state.tx_attestations.is_empty(),
+            outputs.is_empty(),
             "Late provision after certificate should be rejected by tombstone"
         );
     }
@@ -960,12 +1045,10 @@ mod tests {
         let tx = hash_with_prefix(0xBB);
         let node = make_test_node_id(1);
 
-        // Register TX as committed
         let needs =
             make_remote_state_needs(&[ShardGroupId(1)], vec![(ShardGroupId(1), vec![node])]);
         state.committed_tracker.add(tx, needs);
 
-        // Commit abort
         let abort = hyperscale_types::TransactionAbort {
             tx_hash: tx,
             reason: hyperscale_types::AbortReason::ExecutionTimeout {
@@ -1001,18 +1084,16 @@ mod tests {
 
         state.on_block_committed(&block);
 
-        // Tombstone should be added for abort commit
         assert!(
             state.tombstones.contains_key(&tx),
             "Abort commit should add tombstone"
         );
 
         // Late provision should be rejected
-        let attestation = make_test_attestation(ShardGroupId(1));
         let entries: Vec<StateEntry> = vec![];
-        state.on_provision_accepted(tx, ShardGroupId(1), &attestation, &entries);
+        let outputs = state.on_provision_accepted(tx, ShardGroupId(1), BlockHeight(1), &entries);
         assert!(
-            state.tx_attestations.is_empty(),
+            outputs.is_empty(),
             "Late provision after abort should be rejected by tombstone"
         );
     }

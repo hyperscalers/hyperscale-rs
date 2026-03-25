@@ -1,7 +1,7 @@
 //! Transaction types for consensus.
 
 use crate::{
-    BlockHeight, ExecutionCertificate, Hash, NodeId, ShardGroupId, SourceBlockAttestation,
+    BlockHeight, ExecutionCertificate, Hash, NodeId, ShardGroupId, TransactionInclusionProof,
 };
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
@@ -399,10 +399,9 @@ impl std::fmt::Display for DeferReason {
 /// detection during provisioning), they include this in the block. All
 /// validators process it identically, releasing locks and queuing for retry.
 ///
-/// The deferral carries a full [`SourceBlockAttestation`] and the relevant
-/// entries so it can be independently verified during block validation.
-/// Deferrals are rare (livelock resolution), so the per-deferral attestation
-/// cost is acceptable.
+/// The deferral proves the winner transaction's inclusion in a committed
+/// remote block via a lightweight merkle inclusion proof (~320 bytes) verified
+/// against the block header's `transaction_root` (which is QC-attested).
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct TransactionDefer {
     /// Hash of the transaction being deferred.
@@ -415,13 +414,19 @@ pub struct TransactionDefer {
     /// Used for timeout calculations on the retry.
     pub block_height: BlockHeight,
 
-    /// Attestation proving the winner transaction was committed on another shard.
-    ///
-    /// Required for block validation. Validators verify the QC signature and
-    /// merkle proof to ensure the deferral is justified without needing to
-    /// have seen the same provisions. The attestation is self-contained: it
-    /// carries the QC, state_root, proof, AND all entries covered by the proof.
-    pub attestation: SourceBlockAttestation,
+    /// Source shard where the winner transaction was committed.
+    pub source_shard: ShardGroupId,
+
+    /// Block height on the source shard where the winner was committed.
+    pub source_block_height: BlockHeight,
+
+    /// Merkle inclusion proof for the winner transaction in the source block.
+    /// Verified against the source block header's `transaction_root`.
+    pub tx_inclusion_proof: TransactionInclusionProof,
+
+    /// Tagged leaf hash: `hash(TAG || winner_tx_hash)`.
+    /// Included so the verifier doesn't need to try all three tags.
+    pub leaf_hash: Hash,
 }
 
 /// Reason a transaction was aborted.

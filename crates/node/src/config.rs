@@ -1,6 +1,7 @@
 //! Consolidated configuration for IoLoop.
 
 use crate::protocol::fetch::FetchConfig;
+use crate::protocol::inclusion_proof_fetch::InclusionProofFetchConfig;
 use crate::protocol::provision_fetch::ProvisionFetchConfig;
 use crate::protocol::sync::SyncConfig;
 use std::time::Duration;
@@ -13,6 +14,7 @@ pub struct NodeConfig {
     pub sync: SyncConfig,
     pub fetch: FetchConfig,
     pub provision_fetch: ProvisionFetchConfig,
+    pub inclusion_proof_fetch: InclusionProofFetchConfig,
     pub batch: BatchConfig,
 }
 
