@@ -18,16 +18,18 @@ use crate::tree_store::ReadableTreeStore;
 // JVT VerkleProof serialization
 // ============================================================================
 
-/// Serialize a JVT `VerkleProof` to bytes.
+/// Serialize a JVT `VerkleProof` to bytes (compact format v2).
+///
+/// Layout: commitment_table + multipoint_proof + key_data.
+/// The verifier reconstructs opening triples from the commitment table
+/// and per-key metadata, eliminating redundant results and eval points.
 pub fn serialize_verkle_proof(proof: &jvt::verkle_proof::VerkleProof) -> Vec<u8> {
     let mut buf = Vec::with_capacity(proof.total_byte_size() + 64);
 
-    // Verifier queries
-    write_u32(&mut buf, proof.verifier_queries.len() as u32);
-    for (commitment, point, result) in &proof.verifier_queries {
-        write_point(&mut buf, commitment);
-        write_u32(&mut buf, *point as u32);
-        write_scalar(&mut buf, result);
+    // Commitment table (deduplicated)
+    write_u32(&mut buf, proof.commitments.len() as u32);
+    for comm in &proof.commitments {
+        write_point(&mut buf, comm);
     }
 
     // Multipoint proof
@@ -44,8 +46,6 @@ pub fn serialize_verkle_proof(proof: &jvt::verkle_proof::VerkleProof) -> Vec<u8>
     write_u32(&mut buf, proof.key_data.len() as u32);
     for kd in &proof.key_data {
         buf.extend_from_slice(&kd.key); // fixed 32 bytes
-        buf.push(kd.eas_stem.len() as u8);
-        buf.extend_from_slice(&kd.eas_stem);
         match &kd.value {
             Some(v) => {
                 buf.push(1);
@@ -53,17 +53,28 @@ pub fn serialize_verkle_proof(proof: &jvt::verkle_proof::VerkleProof) -> Vec<u8>
             }
             None => buf.push(0),
         }
-        buf.push(kd.depth as u8);
-        write_u32(&mut buf, kd.query_path.len() as u32);
-        for &idx in &kd.query_path {
-            write_u32(&mut buf, idx as u32);
+        buf.push(kd.depth);
+        // commitment_path: Vec<u16>
+        write_u32(&mut buf, kd.commitment_path.len() as u32);
+        for &idx in &kd.commitment_path {
+            buf.extend_from_slice(&idx.to_le_bytes());
         }
         match &kd.termination {
             jvt::verkle_proof::TerminationKind::FoundEaS => buf.push(0),
             jvt::verkle_proof::TerminationKind::EmptySlot => buf.push(1),
-            jvt::verkle_proof::TerminationKind::StemMismatch { diverge_byte } => {
+            jvt::verkle_proof::TerminationKind::StemMismatch {
+                diverge_byte,
+                actual_stem_byte,
+            } => {
                 buf.push(2);
                 buf.push(*diverge_byte as u8);
+                match actual_stem_byte {
+                    Some(b) => {
+                        buf.push(1);
+                        buf.push(*b);
+                    }
+                    None => buf.push(0),
+                }
             }
         }
     }
@@ -71,21 +82,20 @@ pub fn serialize_verkle_proof(proof: &jvt::verkle_proof::VerkleProof) -> Vec<u8>
     buf
 }
 
-/// Deserialize a JVT `VerkleProof` from bytes.
+/// Deserialize a JVT `VerkleProof` from bytes (compact format v2).
 pub fn deserialize_verkle_proof(
     data: &[u8],
 ) -> Result<jvt::verkle_proof::VerkleProof, ProofDeserializeError> {
     let mut cursor = Cursor::new(data);
 
-    let num_queries = cursor.read_u32()? as usize;
-    let mut verifier_queries = Vec::with_capacity(num_queries);
-    for _ in 0..num_queries {
-        let commitment = cursor.read_point()?;
-        let point = cursor.read_u32()? as usize;
-        let result = cursor.read_scalar()?;
-        verifier_queries.push((commitment, point, result));
+    // Commitment table
+    let num_commitments = cursor.read_u32()? as usize;
+    let mut commitments = Vec::with_capacity(num_commitments);
+    for _ in 0..num_commitments {
+        commitments.push(cursor.read_point()?);
     }
 
+    // Multipoint proof
     let d_comm = cursor.read_point()?;
     let num_rounds = cursor.read_u32()? as usize;
     let mut l_vec = Vec::with_capacity(num_rounds);
@@ -103,15 +113,14 @@ pub fn deserialize_verkle_proof(
     };
     let multipoint_proof = jvt::multiproof::prover::MultiPointProof { ipa_proof, d_comm };
 
+    // Key data
     let num_keys = cursor.read_u32()? as usize;
     let mut key_data = Vec::with_capacity(num_keys);
     for _ in 0..num_keys {
-        let key_bytes = cursor.read_bytes(32)?; // fixed 32 bytes
+        let key_bytes = cursor.read_bytes(32)?;
         let key: [u8; 32] = key_bytes
             .try_into()
             .map_err(|_| ProofDeserializeError::InvalidData)?;
-        let stem_len = cursor.read_u8()? as usize;
-        let eas_stem = cursor.read_bytes(stem_len)?;
         let has_value = cursor.read_u8()?;
         let value = if has_value == 1 {
             let scalar = cursor.read_scalar()?;
@@ -119,11 +128,12 @@ pub fn deserialize_verkle_proof(
         } else {
             None
         };
-        let depth = cursor.read_u8()? as usize;
+        let depth = cursor.read_u8()?;
         let num_path = cursor.read_u32()? as usize;
-        let mut query_path = Vec::with_capacity(num_path);
+        let mut commitment_path = Vec::with_capacity(num_path);
         for _ in 0..num_path {
-            query_path.push(cursor.read_u32()? as usize);
+            let idx_bytes = cursor.read_bytes(2)?;
+            commitment_path.push(u16::from_le_bytes([idx_bytes[0], idx_bytes[1]]));
         }
         let termination_tag = cursor.read_u8()?;
         let termination = match termination_tag {
@@ -131,25 +141,33 @@ pub fn deserialize_verkle_proof(
             1 => jvt::verkle_proof::TerminationKind::EmptySlot,
             2 => {
                 let diverge_byte = cursor.read_u8()? as usize;
-                jvt::verkle_proof::TerminationKind::StemMismatch { diverge_byte }
+                let has_actual = cursor.read_u8()?;
+                let actual_stem_byte = if has_actual == 1 {
+                    Some(cursor.read_u8()?)
+                } else {
+                    None
+                };
+                jvt::verkle_proof::TerminationKind::StemMismatch {
+                    diverge_byte,
+                    actual_stem_byte,
+                }
             }
             _ => return Err(ProofDeserializeError::InvalidData),
         };
 
         key_data.push(jvt::verkle_proof::KeyProofData {
             key,
-            eas_stem,
             value,
             depth,
-            query_path,
+            commitment_path,
             termination,
         });
     }
 
     Ok(jvt::verkle_proof::VerkleProof {
         multipoint_proof,
+        commitments,
         key_data,
-        verifier_queries,
     })
 }
 
