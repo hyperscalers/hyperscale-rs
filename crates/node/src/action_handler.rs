@@ -383,14 +383,17 @@ pub(crate) fn handle_delegated_action<
             // so we collect all entries and verify once instead of N times.
             let merkle_start = std::time::Instant::now();
             let all_valid = verified_header.as_ref().is_some_and(|header| {
-                // Collect all entries across all provisions for a single batched verify.
-                let all_entries: Vec<hyperscale_types::StateEntry> = provisions
+                // Collect all entries across all provisions, then sort+dedupe by
+                // storage_key to match the order used during proof generation.
+                let mut all_entries: Vec<hyperscale_types::StateEntry> = provisions
                     .iter()
                     .flat_map(|p| p.entries.iter().cloned())
                     .collect();
                 if all_entries.is_empty() {
                     return true;
                 }
+                all_entries.sort_by(|a, b| a.storage_key.cmp(&b.storage_key));
+                all_entries.dedup_by(|a, b| a.storage_key == b.storage_key);
                 // Use the proof from the first provision (all share the same Arc).
                 hyperscale_storage::proofs::verify_all_merkle_proofs(
                     &all_entries,

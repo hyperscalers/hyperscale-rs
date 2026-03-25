@@ -148,7 +148,7 @@ pub enum StaleTreePart {
 
 // ─── Commitment serialization helpers ───────────────────────────────────
 
-use ark_ed_on_bls12_381_bandersnatch::EdwardsAffine;
+use ark_ed_on_bls12_381_bandersnatch::{EdwardsAffine, Fr};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 
 /// Serialize a commitment as uncompressed (64 bytes: x || y).
@@ -179,10 +179,14 @@ fn field_element_to_bytes(fe: jvt::commitment::FieldElement) -> Vec<u8> {
 }
 
 /// Deserialize a field element from 32 bytes.
+///
+/// Must use `deserialize_compressed` to match `field_element_to_bytes` which uses
+/// `serialize_compressed`. Using `from_le_bytes_mod_order` would silently corrupt
+/// the value (it reduces mod p, which is not the inverse of canonical serialization).
 fn bytes_to_field_element(bytes: &[u8]) -> jvt::commitment::FieldElement {
-    use ark_ed_on_bls12_381_bandersnatch::Fr;
-    use ark_ff::PrimeField;
-    jvt::commitment::FieldElement(Fr::from_le_bytes_mod_order(bytes))
+    jvt::commitment::FieldElement(
+        Fr::deserialize_compressed(bytes).expect("stored field element bytes should be valid"),
+    )
 }
 
 /// Convert a JVT commitment to a hyperscale Hash (for state root, value hashes).
