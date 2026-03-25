@@ -334,6 +334,7 @@ where
                             qc: hyperscale_types::QuorumCertificate::genesis(),
                             proof,
                         });
+                    let recv_height = first.block_height;
                     let transactions: Vec<hyperscale_types::TxEntries> = provisions
                         .into_iter()
                         .map(|p| hyperscale_types::TxEntries {
@@ -341,6 +342,12 @@ where
                             entries: (*p.entries).clone(),
                         })
                         .collect();
+                    eprintln!(
+                        "[RECEIVE] provisions from shard={} height={} txs={}",
+                        source_shard.0,
+                        recv_height.0,
+                        transactions.len(),
+                    );
                     let batch = hyperscale_types::ProvisionBatch {
                         attestation,
                         transactions,

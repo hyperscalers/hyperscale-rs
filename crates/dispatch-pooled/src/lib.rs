@@ -116,7 +116,7 @@ impl ThreadPoolConfig {
             crypto_threads: 1,
             tx_validation_threads: 1,
             execution_threads: 1,
-            provisions_threads: 1,
+            provisions_threads: 2,
             pin_cores: false,
             consensus_crypto_core_start: None,
             crypto_core_start: None,
@@ -156,6 +156,12 @@ impl ThreadPoolConfig {
         if self.execution_threads == 0 {
             return Err(ThreadPoolError::InvalidConfig(
                 "execution_threads must be at least 1".to_string(),
+            ));
+        }
+        if self.provisions_threads < 2 {
+            return Err(ThreadPoolError::InvalidConfig(
+                "provisions_threads must be at least 2 (proactive generation + fallback serving)"
+                    .to_string(),
             ));
         }
 

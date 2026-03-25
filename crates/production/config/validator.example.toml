@@ -89,6 +89,9 @@ tx_validation_threads = 0
 # Threads for transaction execution (0 = auto-detect)
 execution_threads = 0
 
+# Threads for transaction provisions (0 = auto-detect)
+provisions_threads = 0
+
 # Tokio runtime worker threads for async I/O (network, timers, RPC) (0 = auto-detect)
 io_threads = 0
 

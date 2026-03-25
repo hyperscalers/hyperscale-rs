@@ -441,6 +441,7 @@ consensus_crypto_threads = 0
 crypto_threads = 0
 tx_validation_threads = 0
 execution_threads = 0
+provisions_threads = 0
 io_threads = 0
 pin_cores = false
 
