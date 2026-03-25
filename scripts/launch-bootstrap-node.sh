@@ -130,10 +130,11 @@ max_message_size = 10485760
 gossipsub_heartbeat_ms = 100
 
 [consensus]
-proposal_interval_ms = 300
-view_change_timeout_ms = 3000
+proposal_interval_ms = 1000
+min_block_interval_ms = 800
+view_change_timeout_ms = 5000
 max_transactions_per_block = 4096
-max_certificates_per_block = 4096
+max_certificates_per_block = 8192
 rpc_mempool_limit = 16384
 
 [threads]

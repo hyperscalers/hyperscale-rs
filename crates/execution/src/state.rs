@@ -51,16 +51,16 @@ use crate::trackers::{CertificateTracker, VoteTracker};
 /// Number of blocks to retain executed transaction hashes for deduplication.
 /// This prevents re-execution of recently committed transactions while allowing
 /// cleanup of old entries to prevent unbounded memory growth.
-const EXECUTED_TX_RETENTION_BLOCKS: u64 = 100;
+const EXECUTED_TX_RETENTION_BLOCKS: u64 = 50;
 
 /// Number of blocks to retain early arrival votes/certificates before cleanup.
 /// If an early arrival hasn't been processed within this many blocks, it's
 /// likely stale and should be removed to prevent unbounded memory growth.
-const EARLY_ARRIVAL_RETENTION_BLOCKS: u64 = 1000;
+const EARLY_ARRIVAL_RETENTION_BLOCKS: u64 = 500;
 
 /// Number of blocks to retain verified vote cache entries.
 /// Votes older than this are cleaned up regardless of finalization status.
-const VERIFIED_VOTE_RETENTION_BLOCKS: u64 = 200;
+const VERIFIED_VOTE_RETENTION_BLOCKS: u64 = 100;
 
 /// Key type for the pending verifications reverse index.
 /// Identifies which type of verification and the secondary key (validator or shard).

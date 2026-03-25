@@ -941,8 +941,8 @@ fn test_block_commit_verification() {
     // Initialize genesis
     runner.initialize_genesis();
 
-    // Run for 1 second - should commit several blocks
-    runner.run_until(Duration::from_secs(1));
+    // Run for 3 seconds - should commit several blocks
+    runner.run_until(Duration::from_secs(3));
 
     // Get committed heights for all nodes
     let committed_heights: Vec<u64> = (0..4u32)
@@ -1067,7 +1067,7 @@ fn test_block_commit_determinism() {
 /// - Blocks are committed in sequential order
 ///
 /// Note: With empty mempools, blocks are only produced via the proposal timer
-/// (~300ms interval), so we expect ~6 blocks in 2 seconds.
+/// (~1000ms interval), so we expect ~5 blocks in 7 seconds.
 #[test]
 fn test_sequential_commit() {
     let config = test_network_config();
@@ -1080,7 +1080,7 @@ fn test_sequential_commit() {
     let mut last_committed = 0u64;
 
     for step in 1..=10 {
-        runner.run_until(Duration::from_millis(step * 200));
+        runner.run_until(Duration::from_millis(step * 700));
 
         for node_idx in 0..4u32 {
             let node = runner.node(node_idx).expect("Node should exist");
@@ -1108,10 +1108,10 @@ fn test_sequential_commit() {
         final_heights
     );
 
-    // With 300ms proposal interval, expect ~6 blocks in 2 seconds
+    // With 1000ms proposal interval, expect ~5 blocks in 7 seconds
     assert!(
         max_h >= 5,
-        "Should have committed at least 5 blocks in 2 seconds, got {}",
+        "Should have committed at least 5 blocks in 7 seconds, got {}",
         max_h
     );
     println!(
@@ -1127,7 +1127,7 @@ fn test_sequential_commit() {
 /// - Messages per block
 ///
 /// Note: With empty mempools, blocks are only produced via the proposal timer
-/// (~300ms interval), so we expect ~16 blocks in 5 seconds (~3.3 blocks/second).
+/// (~1000ms interval), so we expect ~4 blocks in 5 seconds (~0.8 blocks/second).
 #[test]
 fn test_consensus_throughput() {
     let config = test_network_config();
@@ -1135,13 +1135,13 @@ fn test_consensus_throughput() {
 
     runner.initialize_genesis();
 
-    // Run for 5 seconds
-    runner.run_until(Duration::from_secs(5));
+    // Run for 10 seconds
+    runner.run_until(Duration::from_secs(10));
 
     let committed_height = runner.node(0).unwrap().bft().committed_height();
     let stats = runner.stats();
 
-    let blocks_per_second = committed_height as f64 / 5.0;
+    let blocks_per_second = committed_height as f64 / 10.0;
     let messages_per_block = if committed_height > 0 {
         stats.messages_sent as f64 / committed_height as f64
     } else {
@@ -1155,15 +1155,15 @@ fn test_consensus_throughput() {
     println!("  Messages per block: {:.1}", messages_per_block);
     println!("  Events processed: {}", stats.events_processed);
 
-    // With 300ms proposal interval and empty blocks, expect ~16 blocks in 5 seconds
-    // (5000ms / 300ms ≈ 16.6 blocks, accounting for latency)
+    // With 1000ms proposal interval and empty blocks, expect ~8 blocks in 10 seconds
+    // (10000ms / 1000ms ≈ 10 blocks, accounting for latency and min_block_interval)
     assert!(
-        committed_height >= 10,
-        "Should commit at least 10 blocks in 5 seconds with 300ms proposal interval"
+        committed_height >= 5,
+        "Should commit at least 5 blocks in 10 seconds with 1000ms proposal interval"
     );
     assert!(
-        blocks_per_second >= 2.0,
-        "Should achieve at least 2 blocks/second with timer-based proposals"
+        blocks_per_second >= 0.5,
+        "Should achieve at least 0.5 blocks/second with timer-based proposals"
     );
 }
 
@@ -1292,8 +1292,8 @@ fn test_execution_flow() {
         NodeInput::SubmitTransaction { tx: Arc::new(tx) },
     );
 
-    // Run for 2 seconds - should commit blocks and execute transactions
-    runner.run_until(Duration::from_secs(2));
+    // Run for 7 seconds - should commit blocks and execute transactions
+    runner.run_until(Duration::from_secs(7));
 
     let node0 = runner.node(0).expect("Node 0 should exist");
 
@@ -2050,7 +2050,7 @@ fn test_sync_triggers_when_behind() {
     runner.initialize_genesis();
 
     // Run to commit some blocks
-    runner.run_until(Duration::from_secs(3));
+    runner.run_until(Duration::from_secs(8));
 
     // Check all nodes have made progress
     let heights: Vec<u64> = (0..4u32)
@@ -2128,7 +2128,7 @@ fn test_committed_blocks_stored_for_sync() {
     runner.initialize_genesis();
 
     // Run to commit some blocks
-    runner.run_until(Duration::from_secs(3));
+    runner.run_until(Duration::from_secs(8));
 
     // Check that node 0 has committed blocks
     let height = runner.node(0).unwrap().bft().committed_height();

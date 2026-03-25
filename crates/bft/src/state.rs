@@ -208,9 +208,10 @@ pub struct BftState {
     /// Current time (set by runner before each handle call).
     now: Duration,
 
-    /// Timestamp of the last block proposal we made.
-    /// Used for rate limiting block production via min_block_interval.
-    last_proposal_time: Duration,
+    /// Timestamp when the last QC formed (for any proposer, not just us).
+    /// Used for global rate limiting: ensures min_block_interval between
+    /// successive blocks regardless of which validator proposed them.
+    last_qc_time: Duration,
 
     /// Time of last leader activity (for round timeout detection).
     /// Reset when we see leader activity (proposal, header receipt, QC, commit).
@@ -289,7 +290,7 @@ impl BftState {
             remote_headers: HashMap::new(),
             config,
             now: Duration::ZERO,
-            last_proposal_time: Duration::ZERO,
+            last_qc_time: Duration::ZERO,
             last_leader_activity: Duration::ZERO,
             last_header_reset: None,
             view_changes: 0,
@@ -792,6 +793,26 @@ impl BftState {
             return actions;
         }
 
+        // Global rate limit: ensure min_block_interval since the last QC from
+        // any proposer. Without this, the timer path bypasses the rate limit
+        // that on_qc_formed enforces, since the timer fires independently.
+        let time_since_last_qc = self.now.saturating_sub(self.last_qc_time);
+        if time_since_last_qc < self.config.min_block_interval {
+            // Reschedule for exactly when the rate limit expires instead of
+            // waiting for the next full proposal_interval.
+            let remaining = self.config.min_block_interval - time_since_last_qc;
+            trace!(
+                validator = ?topology.local_validator_id(),
+                time_since_last_ms = time_since_last_qc.as_millis(),
+                remaining_ms = remaining.as_millis(),
+                "Rate limiting proposal timer - rescheduling for rate limit expiry"
+            );
+            return vec![Action::SetTimer {
+                id: TimerId::Proposal,
+                duration: remaining,
+            }];
+        }
+
         // Check if we've already voted at this height.
         // If we have, don't propose again - we're committed to that block.
         // Re-proposing would create a different block hash (due to timestamp)
@@ -1070,7 +1091,6 @@ impl BftState {
         );
 
         // Track proposal time for rate limiting
-        self.last_proposal_time = self.now;
 
         // Record leader activity - we are producing blocks
         self.record_leader_activity();
@@ -1195,7 +1215,6 @@ impl BftState {
         );
 
         // Track proposal time for rate limiting
-        self.last_proposal_time = self.now;
 
         // Record leader activity - we are producing blocks
         self.record_leader_activity();
@@ -1299,7 +1318,6 @@ impl BftState {
         // vote should still be valid (votes are for block_hash + height, not round).
 
         // Track proposal time for rate limiting
-        self.last_proposal_time = self.now;
 
         // Record leader activity - we are producing blocks
         self.record_leader_activity();
@@ -2844,7 +2862,6 @@ impl BftState {
 
         self.pending_blocks.insert(block_hash, pending_block);
         self.fetch.track(block_hash, self.now);
-        self.last_proposal_time = self.now;
         self.record_leader_activity();
 
         let mut actions = vec![Action::BroadcastBlockHeader {
@@ -3085,8 +3102,12 @@ impl BftState {
             || !aborted.is_empty()
             || !certificates.is_empty();
 
-        let time_since_last_proposal = self.now.saturating_sub(self.last_proposal_time);
-        let rate_limited = time_since_last_proposal < self.config.min_block_interval;
+        // Rate limit against the latest QC time (any proposer), not just our own
+        // last proposal. With rotating proposers, per-validator tracking doesn't
+        // throttle the global block rate — per-validator tracking would be
+        // stale by the time it's their turn again with rotating proposers.
+        let time_since_last_qc = self.now.saturating_sub(self.last_qc_time);
+        let rate_limited = time_since_last_qc < self.config.min_block_interval;
 
         // Attempt immediate proposal if:
         // - We have content to include, OR
@@ -3111,14 +3132,26 @@ impl BftState {
                 collect_updates,
             ));
         } else if should_try_proposal && rate_limited {
+            // Schedule the proposal timer to fire exactly when the rate limit
+            // expires, rather than waiting for the next periodic timer fire.
+            // This avoids up to proposal_interval of unnecessary delay.
+            let remaining = self.config.min_block_interval - time_since_last_qc;
             trace!(
                 validator = ?topology.local_validator_id(),
                 next_height = next_height,
-                time_since_last_ms = time_since_last_proposal.as_millis(),
-                min_interval_ms = self.config.min_block_interval.as_millis(),
-                "Rate limiting immediate proposal after QC - waiting for proposal timer"
+                time_since_last_ms = time_since_last_qc.as_millis(),
+                remaining_ms = remaining.as_millis(),
+                "Rate limiting proposal - scheduling precise timer"
             );
+            actions.push(Action::SetTimer {
+                id: TimerId::Proposal,
+                duration: remaining,
+            });
         }
+
+        // Update last_qc_time AFTER the rate limit check so this QC's time
+        // gates the NEXT proposal, not the one we just decided about.
+        self.last_qc_time = self.now;
 
         actions
     }
@@ -7606,11 +7639,11 @@ mod tests {
 
         let (mut state, topology) = make_test_state();
 
-        // Set current time and simulate that we just proposed
+        // Set current time and simulate that a QC formed very recently
         state.set_time(Duration::from_millis(1000));
-        state.last_proposal_time = Duration::from_millis(950); // 50ms ago
+        state.last_qc_time = Duration::from_millis(950); // 50ms ago
 
-        // min_block_interval is 150ms by default, so we're within the rate limit window
+        // min_block_interval is 800ms by default, so we're within the rate limit window
 
         // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
         let qc = QuorumCertificate {
@@ -7650,7 +7683,7 @@ mod tests {
 
         assert!(
             !has_block_header,
-            "Should NOT propose immediately when rate limited (proposed 50ms ago, limit is 150ms)"
+            "Should NOT propose immediately when rate limited (last QC 50ms ago, limit is 500ms)"
         );
     }
 
@@ -7661,11 +7694,11 @@ mod tests {
 
         let (mut state, topology) = make_test_state();
 
-        // Set current time and simulate that we proposed long enough ago
+        // Set current time and simulate that enough time passed since last QC
         state.set_time(Duration::from_millis(1000));
-        state.last_proposal_time = Duration::from_millis(800); // 200ms ago
+        state.last_qc_time = Duration::from_millis(100); // 900ms ago
 
-        // min_block_interval is 150ms by default, so 200ms > 150ms - should be allowed
+        // min_block_interval is 800ms by default, so 900ms > 800ms - should be allowed
 
         // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
         let qc = QuorumCertificate {
@@ -7707,7 +7740,7 @@ mod tests {
 
         assert!(
             has_build_proposal,
-            "Should propose after rate limit interval has passed (200ms > 150ms)"
+            "Should propose after rate limit interval has passed (900ms > 800ms)"
         );
     }
 
@@ -7745,9 +7778,9 @@ mod tests {
             RecoveredState::default(),
         );
 
-        // Set current time and simulate that we proposed 200ms ago
+        // Set current time and simulate that QC formed 200ms ago
         state.set_time(Duration::from_millis(1000));
-        state.last_proposal_time = Duration::from_millis(800); // 200ms ago
+        state.last_qc_time = Duration::from_millis(800); // 200ms ago
 
         // With min_block_interval of 500ms, 200ms is not enough - should be rate limited
 
@@ -7824,9 +7857,9 @@ mod tests {
             RecoveredState::default(),
         );
 
-        // Propose just now (0ms ago) - normally would be rate limited
+        // QC just now (0ms ago) - normally would be rate limited
         state.set_time(Duration::from_millis(1000));
-        state.last_proposal_time = Duration::from_millis(1000);
+        state.last_qc_time = Duration::from_millis(1000);
 
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
@@ -7871,21 +7904,17 @@ mod tests {
     }
 
     #[test]
-    fn test_proposal_timer_updates_last_proposal_time() {
-        // Verify that on_proposal_built updates last_proposal_time when a proposal is broadcast.
-        // After the refactor, on_proposal_timer emits BuildProposal, and the runner calls back
-        // with on_proposal_built which updates last_proposal_time and broadcasts the block.
+    fn test_on_qc_formed_updates_last_qc_time() {
+        // Verify that on_qc_formed updates last_qc_time after the rate limit check.
+        // This ensures the NEXT proposal is rate-limited against this QC's time.
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_millis(5000));
 
-        // Ensure last_proposal_time starts at zero
-        assert_eq!(state.last_proposal_time, Duration::ZERO);
+        // Ensure last_qc_time starts at zero
+        assert_eq!(state.last_qc_time, Duration::ZERO);
 
-        // Proposer rotation is (height + round) % committee_size.
-        // With 4 validators, validator 0 proposes for height 0, 4, 8, etc.
-        // Since committed_height=0, next height is 1, and (1+0)%4=1, so validator 1 proposes.
-        // We need to set up a QC so that the next height is 4 (validator 0's turn).
-        let parent_qc = QuorumCertificate {
+        // Create a QC at height 3
+        let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
@@ -7895,11 +7924,11 @@ mod tests {
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp_ms: 5000,
         };
-        state.latest_qc = Some(parent_qc.clone());
 
-        // Now next_height = 4, (4+0)%4=0, so validator 0 proposes
-        let actions = state.on_proposal_timer(
+        let _actions = state.on_qc_formed(
             &topology,
+            qc.block_hash,
+            qc,
             &ReadyTransactions::default(),
             vec![],
             vec![],
@@ -7909,64 +7938,11 @@ mod tests {
             |_certs| vec![],
         );
 
-        // Check that a BuildProposal action was emitted (async proposal)
-        let build_proposal = actions.iter().any(
-            |a| matches!(a, Action::BuildProposal { height, .. } if height == &BlockHeight(4)),
-        );
-
-        assert!(
-            build_proposal,
-            "Validator 0 should request proposal build for height 4"
-        );
-
-        // last_proposal_time not yet updated - happens on_proposal_built
-        assert_eq!(state.last_proposal_time, Duration::ZERO);
-
-        // Simulate the runner completing the proposal build
-        let block = Block {
-            header: BlockHeader {
-                shard_group_id: ShardGroupId(0),
-                height: BlockHeight(4),
-                parent_hash: Hash::from_bytes(b"block_3"),
-                parent_qc,
-                proposer: ValidatorId(0),
-                timestamp: 5000,
-                round: 0,
-                is_fallback: false,
-                state_root: Hash::ZERO,
-                transaction_root: Hash::ZERO,
-                receipt_root: Hash::ZERO,
-                provision_targets: vec![],
-            },
-            retry_transactions: vec![],
-            priority_transactions: vec![],
-            transactions: vec![],
-            certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
-            source_attestations: vec![],
-            commitment_entries: vec![],
-        };
-        let block_hash = block.hash();
-        let block_arc = Arc::new(block);
-
-        let broadcast_actions =
-            state.on_proposal_built(&topology, BlockHeight(4), 0, block_arc, block_hash);
-
-        // Check that a BlockHeader broadcast was emitted
-        let has_broadcast = broadcast_actions
-            .iter()
-            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
-        assert!(
-            has_broadcast,
-            "Should broadcast block after on_proposal_built"
-        );
-
-        // Verify last_proposal_time was updated
+        // Verify last_qc_time was updated to current time
         assert_eq!(
-            state.last_proposal_time,
+            state.last_qc_time,
             Duration::from_millis(5000),
-            "last_proposal_time should be updated to current time"
+            "last_qc_time should be updated to current time after on_qc_formed"
         );
     }
 
@@ -8706,9 +8682,9 @@ mod tests {
         let (mut state, _topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
-        // Default config: base = 3s, increment = 500ms
-        let base_timeout = Duration::from_secs(3);
-        let increment = Duration::from_millis(500);
+        // Default config: base = 5s, increment = 1s
+        let base_timeout = Duration::from_secs(5);
+        let increment = Duration::from_secs(1);
 
         // At round 0 (same as view_at_height_start), timeout should be base
         assert_eq!(state.view, 0);
@@ -8749,8 +8725,8 @@ mod tests {
         let (mut state, _topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
-        let base_timeout = Duration::from_secs(3);
-        let increment = Duration::from_millis(500);
+        let base_timeout = Duration::from_secs(5);
+        let increment = Duration::from_secs(1);
 
         // Simulate several view changes at height 0
         state.view = 5;
@@ -8810,7 +8786,7 @@ mod tests {
         );
 
         state.set_time(Duration::from_secs(100));
-        let base_timeout = Duration::from_secs(3);
+        let base_timeout = Duration::from_secs(5);
 
         // With zero increment, timeout should always be base regardless of round
         assert_eq!(state.current_view_change_timeout(), base_timeout);
@@ -8839,49 +8815,49 @@ mod tests {
         state.view_at_height_start = 0;
         state.last_leader_activity = Duration::ZERO;
 
-        // Base timeout is 3s
-        // At exactly 3s, should trigger (rounds_at_height = 0)
-        state.set_time(Duration::from_secs(3));
+        // Base timeout is 5s
+        // At exactly 5s, should trigger (rounds_at_height = 0)
+        state.set_time(Duration::from_secs(5));
         assert!(
             state.should_advance_round(),
             "At base timeout, should trigger view change"
         );
 
-        // Now at round 1, timeout should be 3.5s
+        // Now at round 1, timeout should be 6s
         // Reset and simulate we're at round 1
         state.view = 1;
         state.last_leader_activity = Duration::from_secs(10);
 
-        // At 3s after last activity, should NOT trigger (need 3.5s)
-        state.set_time(Duration::from_secs(13));
+        // At 5s after last activity, should NOT trigger (need 6s)
+        state.set_time(Duration::from_secs(15));
         assert!(
             !state.should_advance_round(),
-            "At round 1, 3s is not enough (need 3.5s)"
+            "At round 1, 5s is not enough (need 6s)"
         );
 
-        // At 3.5s after last activity, should trigger
-        state.set_time(Duration::from_millis(13500));
+        // At 6s after last activity, should trigger
+        state.set_time(Duration::from_secs(16));
         assert!(
             state.should_advance_round(),
-            "At round 1, 3.5s should trigger view change"
+            "At round 1, 6s should trigger view change"
         );
 
-        // At round 5, timeout should be 5.5s
+        // At round 5, timeout should be 10s
         state.view = 5;
         state.last_leader_activity = Duration::from_secs(20);
 
-        // At 5s after last activity, should NOT trigger
-        state.set_time(Duration::from_secs(25));
+        // At 9s after last activity, should NOT trigger
+        state.set_time(Duration::from_secs(29));
         assert!(
             !state.should_advance_round(),
-            "At round 5, 5s is not enough (need 5.5s)"
+            "At round 5, 9s is not enough (need 10s)"
         );
 
-        // At 5.5s after last activity, should trigger
-        state.set_time(Duration::from_millis(25500));
+        // At 10s after last activity, should trigger
+        state.set_time(Duration::from_secs(30));
         assert!(
             state.should_advance_round(),
-            "At round 5, 5.5s should trigger view change"
+            "At round 5, 10s should trigger view change"
         );
     }
 
@@ -8917,35 +8893,35 @@ mod tests {
 
         state.set_time(Duration::from_secs(100));
 
-        let base_timeout = Duration::from_secs(3);
-        let increment = Duration::from_millis(500);
+        let base_timeout = Duration::from_secs(5);
+        let increment = Duration::from_secs(1);
         let max_timeout = Duration::from_secs(10);
 
         // At low rounds, timeout follows linear formula
+        state.view = 3;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout + increment * 3,
+            "At round 3: should be 8s (below cap)"
+        );
+
+        // At round 5: 5s + 5*1s = 10s (exactly at cap)
         state.view = 5;
         assert_eq!(
             state.current_view_change_timeout(),
-            base_timeout + increment * 5,
-            "At round 5: should be 5.5s (below cap)"
+            max_timeout,
+            "At round 5: should be exactly at cap (10s)"
         );
 
-        // At round 14: 3s + 14*0.5s = 10s (exactly at cap)
-        state.view = 14;
+        // At round 10: would be 15s, but capped at 10s
+        state.view = 10;
         assert_eq!(
             state.current_view_change_timeout(),
             max_timeout,
-            "At round 14: should be exactly at cap (10s)"
+            "At round 10: should be capped at 10s"
         );
 
-        // At round 20: would be 13s, but capped at 10s
-        state.view = 20;
-        assert_eq!(
-            state.current_view_change_timeout(),
-            max_timeout,
-            "At round 20: should be capped at 10s"
-        );
-
-        // At round 100: would be 53s, but capped at 10s
+        // At round 100: would be 105s, but capped at 10s
         state.view = 100;
         assert_eq!(
             state.current_view_change_timeout(),
@@ -8985,23 +8961,23 @@ mod tests {
 
         state.set_time(Duration::from_secs(100));
 
-        let base_timeout = Duration::from_secs(3);
-        let increment = Duration::from_millis(500);
+        let base_timeout = Duration::from_secs(5);
+        let increment = Duration::from_secs(1);
 
-        // At round 100: 3s + 100*0.5s = 53s (no cap)
+        // At round 100: 5s + 100*1s = 105s (no cap)
         state.view = 100;
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout + increment * 100,
-            "At round 100 with no cap: should be 53s"
+            "At round 100 with no cap: should be 105s"
         );
 
-        // At round 1000: 3s + 1000*0.5s = 503s (no cap)
+        // At round 1000: 5s + 1000*1s = 1005s (no cap)
         state.view = 1000;
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout + increment * 1000,
-            "At round 1000 with no cap: should be 503s (~8.4 minutes)"
+            "At round 1000 with no cap: should be 1005s (~16.75 minutes)"
         );
     }
 

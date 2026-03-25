@@ -31,9 +31,9 @@ REMOTE_PATH="~/git/hyperscale-rs/distributed-cluster-data/"
 REMOTE_USER="$(whoami)"
 
 # Mempool configuration
-MEMPOOL_MAX_IN_FLIGHT=512
-MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT=1024
-MEMPOOL_MAX_PENDING=2048
+MEMPOOL_MAX_IN_FLIGHT=2048
+MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT=4096
+MEMPOOL_MAX_PENDING=8192
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -342,8 +342,9 @@ idle_connection_timeout_ms = 30000
 keep_alive_interval_ms = 5000
 
 [consensus]
-proposal_interval_ms = 300
-view_change_timeout_ms = 3000
+proposal_interval_ms = 1000
+min_block_interval_ms = 800
+view_change_timeout_ms = 5000
 max_transactions_per_block = 4096
 max_certificates_per_block = 8192
 rpc_mempool_limit = 32768

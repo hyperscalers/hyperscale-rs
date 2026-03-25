@@ -24,13 +24,13 @@ pub type NodeIndex = u32;
 // ─── Constants ──────────────────────────────────────────────────────────
 
 /// How many blocks a cross-shard transaction can wait before being aborted.
-const EXECUTION_TIMEOUT_BLOCKS: u64 = 30;
+const EXECUTION_TIMEOUT_BLOCKS: u64 = 10;
 
 /// Maximum number of times a timed-out transaction can be retried.
 const MAX_RETRIES: u32 = 3;
 
 /// How many blocks to retain tombstones in the mempool (gossip deduplication).
-const TOMBSTONE_RETENTION_BLOCKS: u64 = 1000;
+const TOMBSTONE_RETENTION_BLOCKS: u64 = 500;
 
 /// Maximum age for speculative execution results before cleanup.
 const SPECULATIVE_MAX_AGE: Duration = Duration::from_secs(30);

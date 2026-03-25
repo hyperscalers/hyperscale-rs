@@ -31,8 +31,9 @@
 //! bootstrap_peers = []
 //!
 //! [consensus]
-//! proposal_interval_ms = 300
-//! view_change_timeout_ms = 3000
+//! proposal_interval_ms = 1000
+//! min_block_interval_ms = 800
+//! view_change_timeout_ms = 5000
 //!
 //! [threads]
 //! crypto_threads = 4
@@ -288,6 +289,13 @@ pub struct ConsensusConfig {
     /// Higher values reduce wasted work during instability but may reduce hit rate.
     #[serde(default = "default_view_change_cooldown_rounds")]
     pub view_change_cooldown_rounds: u64,
+
+    /// Minimum time between block proposals in milliseconds (rate limiting).
+    /// Even when a QC forms immediately, wait at least this long since the last
+    /// proposal. Slower blocks accumulate more transactions for better verkle
+    /// proof amortization.
+    #[serde(default = "default_min_block_interval_ms")]
+    pub min_block_interval_ms: u64,
 }
 
 impl Default for ConsensusConfig {
@@ -299,16 +307,17 @@ impl Default for ConsensusConfig {
             max_certificates_per_block: default_max_certificates_per_block(),
             speculative_max_txs: default_speculative_max_txs(),
             view_change_cooldown_rounds: default_view_change_cooldown_rounds(),
+            min_block_interval_ms: default_min_block_interval_ms(),
         }
     }
 }
 
 fn default_proposal_interval_ms() -> u64 {
-    300
+    1000
 }
 
 fn default_view_change_timeout_ms() -> u64 {
-    3000
+    5000
 }
 
 fn default_max_transactions_per_block() -> usize {
@@ -316,7 +325,7 @@ fn default_max_transactions_per_block() -> usize {
 }
 
 fn default_max_certificates_per_block() -> usize {
-    4096
+    8192
 }
 
 fn default_speculative_max_txs() -> usize {
@@ -325,6 +334,10 @@ fn default_speculative_max_txs() -> usize {
 
 fn default_view_change_cooldown_rounds() -> u64 {
     3 // Matches hyperscale_execution::DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS
+}
+
+fn default_min_block_interval_ms() -> u64 {
+    800
 }
 
 /// Thread pool configuration.
@@ -914,6 +927,7 @@ fn build_bft_config(config: &ConsensusConfig) -> BftConfig {
         .with_proposal_interval(Duration::from_millis(config.proposal_interval_ms))
         .with_view_change_timeout(Duration::from_millis(config.view_change_timeout_ms))
         .with_max_transactions(config.max_transactions_per_block)
+        .with_min_block_interval(Duration::from_millis(config.min_block_interval_ms))
 }
 
 /// Build network configuration from TOML config.

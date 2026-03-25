@@ -54,17 +54,22 @@ gossipsub_heartbeat_ms = 100
 [consensus]
 # Block proposal interval (milliseconds)
 # Lower = faster finality, higher network load
-proposal_interval_ms = 300
+# Slower intervals accumulate more transactions per block, improving verkle proof amortization
+proposal_interval_ms = 1000
+
+# Minimum time between block proposals (milliseconds)
+# Rate limits rapid block production even when QC forms immediately
+min_block_interval_ms = 800
 
 # View change timeout (milliseconds)
 # How long to wait before triggering leader rotation
-view_change_timeout_ms = 3000
+view_change_timeout_ms = 5000
 
 # Maximum transactions per block
 max_transactions_per_block = 4096
 
 # Maximum certificates per block
-max_certificates_per_block = 4096
+max_certificates_per_block = 8192
 
 # Maximum transactions in mempool before rejecting RPC submissions (backpressure)
 # When the pool reaches this size, new RPC submissions return 503 Service Unavailable.
@@ -143,19 +148,19 @@ jmt_history_length = 256
 # Maximum transactions allowed in-flight (soft limit).
 # When at this limit, new transactions without provisions are delayed.
 # Cross-shard TXs WITH provisions can still be proposed.
-max_in_flight = 512
+max_in_flight = 2048
 
 # Hard limit on transactions in-flight.
 # When at this limit, NO new transactions are proposed (even cross-shard TXs
 # with provisions). This prevents unbounded growth and controls execution/crypto
 # pressure. RPC submissions are also rejected when this limit is reached.
-max_in_flight_hard_limit = 1024
+max_in_flight_hard_limit = 4096
 
 # Maximum pending transactions before RPC backpressure kicks in.
 # When the number of Pending transactions exceeds this limit, new RPC submissions
 # are rejected. This prevents unbounded mempool growth when arrival rate exceeds
 # processing capacity. Set to approximately a few blocks worth of transactions.
-max_pending = 2048
+max_pending = 8192
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Metrics Configuration
