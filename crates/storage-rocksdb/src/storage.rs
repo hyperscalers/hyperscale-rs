@@ -99,6 +99,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         opts.set_max_write_buffer_number(config.max_write_buffer_number);
         opts.set_write_buffer_size(config.write_buffer_size);
 
+        // Allow WAL write and memtable insertion to overlap. Safe because
+        // all block commits use a single WriteBatch (already atomic).
+        opts.set_enable_pipelined_write(true);
+
         // Compression
         opts.set_compression_type(config.compression.to_rocksdb());
 
@@ -119,18 +123,54 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
         opts.set_block_based_table_factory(&block_opts);
 
-        // Column families — apply the same block cache, bloom filter, write
-        // buffer, and compression settings so all CFs share the bounded
-        // block cache and have consistent memory behavior.
+        // Column families — all share the bounded block cache but get
+        // per-CF tuning for write buffers and compression.
+        //
+        // Hot-write CFs (state, jmt_nodes, versioned_substates,
+        // associated_state_tree_values) use larger write buffers and tiered
+        // compression: no compression at L0-L1 (fast flushes), LZ4 at
+        // mid-levels, Zstd at the bottom level (best ratio for cold data).
+        //
+        // Cold/low-volume CFs use smaller write buffers (16MB) to free
+        // memory for the hot CFs and block cache.
+        let hot_write_cfs: &[&str] = &[
+            STATE_CF,
+            JMT_NODES_CF,
+            VERSIONED_SUBSTATES_CF,
+            ASSOCIATED_STATE_TREE_VALUES_CF,
+        ];
+
+        // Tiered compression: L0-L1 uncompressed (fast flushes, data gets
+        // compacted away quickly), L2-L4 LZ4, L5+ Zstd.
+        let tiered_compression = &[
+            rocksdb::DBCompressionType::None, // L0
+            rocksdb::DBCompressionType::None, // L1
+            rocksdb::DBCompressionType::Lz4,  // L2
+            rocksdb::DBCompressionType::Lz4,  // L3
+            rocksdb::DBCompressionType::Lz4,  // L4
+            rocksdb::DBCompressionType::Zstd, // L5
+            rocksdb::DBCompressionType::Zstd, // L6
+        ];
+
+        let cold_write_buffer_size: usize = 16 * 1024 * 1024; // 16MB
+
         let cf_descriptors: Vec<_> = config
             .column_families
             .into_iter()
             .map(|name| {
                 let mut cf_opts = Options::default();
-                cf_opts.set_compression_type(config.compression.to_rocksdb());
-                cf_opts.set_write_buffer_size(config.write_buffer_size);
-                cf_opts.set_max_write_buffer_number(config.max_write_buffer_number);
                 cf_opts.set_block_based_table_factory(&block_opts);
+                cf_opts.set_max_write_buffer_number(config.max_write_buffer_number);
+
+                let is_hot = hot_write_cfs.iter().any(|&cf| cf == name);
+                if is_hot {
+                    cf_opts.set_write_buffer_size(config.write_buffer_size);
+                    cf_opts.set_compression_per_level(tiered_compression);
+                } else {
+                    cf_opts.set_write_buffer_size(cold_write_buffer_size);
+                    cf_opts.set_compression_type(config.compression.to_rocksdb());
+                }
+
                 ColumnFamilyDescriptor::new(name, cf_opts)
             })
             .collect();
@@ -623,6 +663,9 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
 
         let versioned_cf = self.db.cf_handle(VERSIONED_SUBSTATES_CF);
 
+        // Reusable buffer for versioned keys — avoids a Vec allocation per substate write.
+        let mut vkey_buf: Vec<u8> = Vec::with_capacity(256);
+
         for (node_key, node_updates) in &updates.node_updates {
             for (partition_num, partition_updates) in &node_updates.partition_updates {
                 let partition_key = DbPartitionKey {
@@ -638,20 +681,20 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
                                 DatabaseUpdate::Set(value) => {
                                     batch.put_cf(state_cf, &key, value);
                                     if let (Some(ver), Some(vcf)) = (version, versioned_cf) {
-                                        let mut vkey = Vec::with_capacity(key.len() + 8);
-                                        vkey.extend_from_slice(&key);
-                                        vkey.extend_from_slice(&ver.to_be_bytes());
-                                        batch.put_cf(vcf, &vkey, value);
+                                        vkey_buf.clear();
+                                        vkey_buf.extend_from_slice(&key);
+                                        vkey_buf.extend_from_slice(&ver.to_be_bytes());
+                                        batch.put_cf(vcf, &vkey_buf, value);
                                     }
                                 }
                                 DatabaseUpdate::Delete => {
                                     batch.delete_cf(state_cf, &key);
                                     if let (Some(ver), Some(vcf)) = (version, versioned_cf) {
-                                        let mut vkey = Vec::with_capacity(key.len() + 8);
-                                        vkey.extend_from_slice(&key);
-                                        vkey.extend_from_slice(&ver.to_be_bytes());
+                                        vkey_buf.clear();
+                                        vkey_buf.extend_from_slice(&key);
+                                        vkey_buf.extend_from_slice(&ver.to_be_bytes());
                                         // Empty value = tombstone
-                                        batch.put_cf(vcf, &vkey, []);
+                                        batch.put_cf(vcf, &vkey_buf, []);
                                     }
                                 }
                             }
@@ -676,10 +719,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
                                 batch.delete_cf(state_cf, key);
                                 old_keys_for_partition.push(key.to_vec());
                                 if let (Some(ver), Some(vcf)) = (version, versioned_cf) {
-                                    let mut vkey = Vec::with_capacity(key.len() + 8);
-                                    vkey.extend_from_slice(key);
-                                    vkey.extend_from_slice(&ver.to_be_bytes());
-                                    batch.put_cf(vcf, &vkey, []); // tombstone
+                                    vkey_buf.clear();
+                                    vkey_buf.extend_from_slice(key);
+                                    vkey_buf.extend_from_slice(&ver.to_be_bytes());
+                                    batch.put_cf(vcf, &vkey_buf, []); // tombstone
                                 }
                                 iter.next();
                             } else {
@@ -696,10 +739,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
                             let key = keys::to_storage_key(&partition_key, sort_key);
                             batch.put_cf(state_cf, &key, value);
                             if let (Some(ver), Some(vcf)) = (version, versioned_cf) {
-                                let mut vkey = Vec::with_capacity(key.len() + 8);
-                                vkey.extend_from_slice(&key);
-                                vkey.extend_from_slice(&ver.to_be_bytes());
-                                batch.put_cf(vcf, &vkey, value);
+                                vkey_buf.clear();
+                                vkey_buf.extend_from_slice(&key);
+                                vkey_buf.extend_from_slice(&ver.to_be_bytes());
+                                batch.put_cf(vcf, &vkey_buf, value);
                             }
                         }
                     }
