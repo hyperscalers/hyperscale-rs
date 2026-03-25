@@ -76,7 +76,6 @@ pub use radix_substate_store_interface::interface::{
 /// These are implementation details needed by `storage-memory` and `storage-rocksdb`.
 /// They are not part of the abstract storage interface.
 pub mod jmt {
-    pub use hyperscale_state_tree::list_leaves_with_prefix;
     pub use hyperscale_state_tree::put_at_version;
     pub use hyperscale_state_tree::put_at_version_and_apply;
     pub use hyperscale_state_tree::tree_store::{

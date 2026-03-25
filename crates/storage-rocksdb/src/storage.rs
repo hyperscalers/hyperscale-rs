@@ -741,39 +741,20 @@ impl<D: Dispatch + 'static> SubstateStore for RocksDbStorage<D> {
         node_id: &NodeId,
         block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
-        use radix_substate_store_interface::db_key_mapper::{
-            DatabaseKeyMapper, SpreadPrefixKeyMapper,
-        };
+        // With hashed JVT keys, tree walks can't enumerate by entity prefix.
+        // Use the data store's prefix scan instead.
+        //
+        // This returns current state, which is correct when block_height == current
+        // (proactive provision path: proposer just committed this block).
+        //
+        // TODO: For true historical reads (fallback provision path), implement
+        // MVCC versioned data store.
+        let (current_version, _) = self.read_jmt_metadata();
+        if block_height > current_version {
+            return None;
+        }
 
-        // Compute the db_node_key (entity key) as prefix for tree walk
-        let radix_node_id = radix_common::types::NodeId(node_id.0);
-        let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
-
-        // Walk the verkle tree at the historical version, collecting all leaves
-        // whose key starts with this entity's db_node_key.
-        let snapshot_store = SnapshotTreeStore::new(&self.db);
-        let leaves = hyperscale_storage::jmt::list_leaves_with_prefix(
-            &snapshot_store,
-            block_height,
-            &db_node_key,
-        )?;
-
-        // Parse each leaf key back into (partition_num, sort_key) and return with value.
-        // Key format: db_node_key || partition_num || sort_key_bytes
-        let prefix_len = db_node_key.len();
-        let results = leaves
-            .into_iter()
-            .filter_map(|(key, value)| {
-                if key.len() <= prefix_len {
-                    return None; // Key too short
-                }
-                let partition_num = key[prefix_len];
-                let sort_key = DbSortKey(key[prefix_len + 1..].to_vec());
-                Some((partition_num, sort_key, value))
-            })
-            .collect();
-
-        Some(results)
+        Some(self.list_substates_for_node(node_id).collect())
     }
 
     fn generate_merkle_proofs(

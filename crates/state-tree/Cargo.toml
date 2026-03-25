@@ -10,6 +10,7 @@ hyperscale-dispatch.workspace = true
 jellyfish-verkle-tree.workspace = true
 ark-ec.workspace = true
 ark-ed-on-bls12-381-bandersnatch.workspace = true
+ark-ff.workspace = true
 ark-serialize.workspace = true
 blake3.workspace = true
 sbor.workspace = true

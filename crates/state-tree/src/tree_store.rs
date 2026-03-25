@@ -38,7 +38,7 @@ impl StoredNodeKey {
     pub fn from_jvt(node_key: &jvt::NodeKey) -> Self {
         Self {
             version: node_key.version,
-            full_path: node_key.byte_path.clone(),
+            full_path: node_key.byte_path().to_vec(),
         }
     }
 
@@ -120,13 +120,17 @@ pub struct StoredChildEntry {
     pub index: u8,
     pub version: u64,
     pub commitment: Vec<u8>,
+    /// Pre-computed `commitment_to_field` result. Stored to avoid expensive
+    /// EC field inversion on every read.
+    pub field: Vec<u8>,
 }
 
 /// Extension-and-Suffix (EaS) node.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, BasicCategorize, BasicEncode, BasicDecode)]
 pub struct StoredEaSNode {
     pub stem: Vec<u8>,
-    /// Sparse (suffix, value) pairs, sorted by suffix.
+    /// Sparse (suffix, field_element_bytes) pairs, sorted by suffix.
+    /// Values are pre-hashed field elements (32 bytes each), not raw substate bytes.
     pub values: Vec<(u8, Vec<u8>)>,
     pub c1: Vec<u8>,
     pub c2: Vec<u8>,
@@ -165,6 +169,22 @@ fn bytes_to_commitment(bytes: &[u8]) -> jvt::Commitment {
     )
 }
 
+/// Serialize a field element to 32 bytes.
+fn field_element_to_bytes(fe: jvt::commitment::FieldElement) -> Vec<u8> {
+    use ark_serialize::CanonicalSerialize;
+    let mut buf = vec![0u8; 32];
+    fe.0.serialize_compressed(&mut buf[..])
+        .expect("field element serialization should never fail");
+    buf
+}
+
+/// Deserialize a field element from 32 bytes.
+fn bytes_to_field_element(bytes: &[u8]) -> jvt::commitment::FieldElement {
+    use ark_ed_on_bls12_381_bandersnatch::Fr;
+    use ark_ff::PrimeField;
+    jvt::commitment::FieldElement(Fr::from_le_bytes_mod_order(bytes))
+}
+
 /// Convert a JVT commitment to a hyperscale Hash (for state root, value hashes).
 ///
 /// Uses compressed serialization (32 bytes) for the consensus-visible identity.
@@ -191,6 +211,7 @@ impl StoredNode {
                         index: idx,
                         version: child.version,
                         commitment: commitment_to_bytes(child.commitment),
+                        field: field_element_to_bytes(child.field),
                     })
                     .collect();
                 children.sort_by_key(|c| c.index);
@@ -203,7 +224,7 @@ impl StoredNode {
                 let mut values: Vec<(u8, Vec<u8>)> = eas
                     .values
                     .iter()
-                    .map(|(&suffix, val)| (suffix, val.clone()))
+                    .map(|(&suffix, val)| (suffix, field_element_to_bytes(*val)))
                     .collect();
                 values.sort_by_key(|(k, _)| *k);
                 StoredNode::EaS(StoredEaSNode {
@@ -219,8 +240,9 @@ impl StoredNode {
 
     /// Convert back to a JVT node.
     ///
-    /// Constructs nodes directly from stored commitments — does NOT recompute
-    /// Pedersen commitments, which would be very expensive (EC scalar mults).
+    /// Constructs nodes directly from stored commitments and cached field elements.
+    /// No `commitment_to_field` calls for internal node children — the field values
+    /// are pre-stored.
     pub fn to_jvt(&self) -> jvt::Node {
         match self {
             StoredNode::Internal(internal) => {
@@ -229,27 +251,26 @@ impl StoredNode {
                     .iter()
                     .map(|entry| {
                         let commitment = bytes_to_commitment(&entry.commitment);
+                        let field = bytes_to_field_element(&entry.field);
                         (
                             entry.index,
-                            jvt::Child {
-                                version: entry.version,
-                                commitment,
-                                field: commitment_to_field(commitment),
-                            },
+                            jvt::Child::new_with_field(entry.version, commitment, field),
                         )
                     })
                     .collect();
-                // Construct directly with stored commitment — skip recomputation
                 jvt::Node::Internal(jvt::InternalNode {
                     children,
                     commitment: bytes_to_commitment(&internal.commitment),
                 })
             }
             StoredNode::EaS(eas) => {
-                let values: HashMap<u8, jvt::Value> = eas.values.iter().cloned().collect();
+                let values: HashMap<u8, jvt::Value> = eas
+                    .values
+                    .iter()
+                    .map(|(suffix, fe_bytes)| (*suffix, bytes_to_field_element(fe_bytes)))
+                    .collect();
                 let c1 = bytes_to_commitment(&eas.c1);
                 let c2 = bytes_to_commitment(&eas.c2);
-                // Construct directly with stored commitments — skip recomputation
                 jvt::Node::EaS(Box::new(jvt::EaSNode {
                     stem: eas.stem.clone(),
                     values,

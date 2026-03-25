@@ -407,24 +407,25 @@ impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
             return None;
         }
 
-        // Walk the verkle tree at the given version with the entity key as prefix.
-        // Leaf keys are: entity_key(50) || partition_num(1) || sort_key(var)
-        // Values are raw substate bytes stored directly in the tree.
-        let leaves = hyperscale_storage::jmt::list_leaves_with_prefix(
-            &s.tree_store,
-            block_height,
-            &entity_key,
-        )?;
-
+        // Prefix-scan the data store for substates under this entity.
+        // Key format: entity_key(50) || partition_num(1) || sort_key(var)
+        //
+        // With hashed JVT keys, tree walks can't enumerate by entity prefix.
+        // Instead, scan the OrdMap data store directly. This returns current
+        // state (not historical), which is correct when block_height == current.
+        //
+        // TODO: For true historical reads at block_height < current, implement
+        // MVCC versioned data store.
+        let end_key = keys::next_prefix(&entity_key)?;
         let entity_len = entity_key.len();
         let mut results = Vec::new();
-        for (leaf_key, value) in leaves {
-            if leaf_key.len() < entity_len + 1 {
-                continue; // malformed key
+        for (key, value) in s.data.range(entity_key.clone()..end_key) {
+            if key.len() <= entity_len {
+                continue;
             }
-            let partition_num = leaf_key[entity_len];
-            let sort_key = DbSortKey(leaf_key[entity_len + 1..].to_vec());
-            results.push((partition_num, sort_key, value));
+            let partition_num = key[entity_len];
+            let sort_key = DbSortKey(key[entity_len + 1..].to_vec());
+            results.push((partition_num, sort_key, value.clone()));
         }
         Some(results)
     }

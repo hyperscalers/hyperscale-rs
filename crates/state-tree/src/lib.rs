@@ -1,19 +1,16 @@
 //! Verkle-based state tree — flat single-tree design.
 //!
 //! All substates across all entities and partitions live in a single JVT tree.
-//! Storage keys are used directly as variable-length JVT keys (no hashing).
-//! This preserves entity locality — substates under the same entity share
-//! a common tree prefix and cluster together.
+//! Storage keys are BLAKE3-hashed to 32-byte JVT keys for optimal tree depth.
 //!
 //! # Key mapping
 //!
-//! `jvt_key = entity_key || partition_num || sort_key` (raw concatenation)
+//! `jvt_key = BLAKE3(entity_key || partition_num || sort_key)` → `[u8; 32]`
 //!
 //! # Value encoding
 //!
-//! JVT values store the raw substate bytes directly. This enables historical
-//! value retrieval via the versioned tree — walking an old root gives you
-//! the old values without needing a separate association table.
+//! JVT values are field elements (`value_to_field(raw_bytes)`). Raw substate
+//! bytes are stored separately in the versioned data store (MVCC), not in the tree.
 
 pub mod proofs;
 pub mod tree_store;
@@ -28,24 +25,16 @@ use jellyfish_verkle_tree as jvt;
 use jvt::TreeReader as _;
 use tree_store::*;
 
-/// Convert a storage key to a JVT key (direct passthrough).
+/// Hash a storage key to a 32-byte JVT key.
 ///
-/// Storage keys and JVT keys use the same format:
-/// `entity_key || partition_num || sort_key`
-pub fn storage_key_to_jvt_key(storage_key: &[u8]) -> jvt::Key {
-    storage_key.to_vec()
+/// Storage keys are variable-length (`entity_key || partition_num || sort_key`).
+/// BLAKE3 hashing produces a fixed 32-byte key for optimal JVT tree depth (~4 levels).
+pub fn hash_storage_key(storage_key: &[u8]) -> jvt::Key {
+    blake3::hash(storage_key).into()
 }
 
-/// Build a prefix for enumerating all substates in a partition.
-fn make_partition_prefix(entity_key: &[u8], partition_num: u8) -> Vec<u8> {
-    let mut prefix = Vec::with_capacity(entity_key.len() + 1);
-    prefix.extend_from_slice(entity_key);
-    prefix.push(partition_num);
-    prefix
-}
-
-/// Build a JVT key from entity_key + partition_num + sort_key.
-fn make_jvt_key(entity_key: &[u8], partition_num: u8, sort_key: &[u8]) -> jvt::Key {
+/// Build a storage key from entity_key + partition_num + sort_key.
+fn make_storage_key(entity_key: &[u8], partition_num: u8, sort_key: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(entity_key.len() + 1 + sort_key.len());
     key.extend_from_slice(entity_key);
     key.push(partition_num);
@@ -100,8 +89,8 @@ pub fn put_at_version<S: ReadableTreeStore + Sync, D: Dispatch>(
     let adapter = StoreAdapter { store: tree_store };
 
     // Flatten all database updates into JVT key-value pairs.
-    // Key: entity_key || partition_num || sort_key (raw concatenation)
-    // Value: raw substate bytes (JVT stores them directly; hashes internally for >31 bytes)
+    // Key: BLAKE3(storage_key) → [u8; 32]
+    // Value: value_to_field(raw_bytes) → FieldElement
     let mut updates: BTreeMap<jvt::Key, Option<jvt::Value>> = BTreeMap::new();
 
     for (entity_key, node_updates) in &database_updates.node_updates {
@@ -111,10 +100,11 @@ pub fn put_at_version<S: ReadableTreeStore + Sync, D: Dispatch>(
                     substate_updates,
                 } => {
                     for (sort_key, update) in substate_updates {
-                        let jvt_key = make_jvt_key(entity_key, partition_num, &sort_key.0);
+                        let storage_key = make_storage_key(entity_key, partition_num, &sort_key.0);
+                        let jvt_key = hash_storage_key(&storage_key);
                         let jvt_value = match update {
                             radix_common::prelude::DatabaseUpdate::Set(value) => {
-                                Some(value.clone())
+                                Some(jvt::commitment::value_to_field(value))
                             }
                             radix_common::prelude::DatabaseUpdate::Delete => None,
                         };
@@ -125,22 +115,18 @@ pub fn put_at_version<S: ReadableTreeStore + Sync, D: Dispatch>(
                     new_substate_values,
                 } => {
                     // Reset = delete all existing substates in this partition,
-                    // then insert the new values. We enumerate existing leaves
-                    // under the partition prefix and mark them as deletes.
-                    if let Some(parent_ver) = parent_version {
-                        let prefix = make_partition_prefix(entity_key, partition_num);
-                        if let Some(existing) =
-                            list_leaves_with_prefix(tree_store, parent_ver, &prefix)
-                        {
-                            for (existing_key, _) in existing {
-                                updates.insert(existing_key, None);
-                            }
-                        }
-                    }
-                    // Insert the new values (overwrites any deletes for keys that reappear)
+                    // then insert the new values.
+                    //
+                    // With hashed keys we cannot enumerate existing keys from the tree.
+                    // The caller must provide the old keys via the MVCC data store.
+                    // For now, only insert the new values — partition resets that need
+                    // to delete old entries will be handled when the MVCC store is integrated.
+                    //
+                    // TODO: Accept old partition keys from caller for delete generation.
                     for (sort_key, value) in new_substate_values {
-                        let jvt_key = make_jvt_key(entity_key, partition_num, &sort_key.0);
-                        updates.insert(jvt_key, Some(value.clone()));
+                        let storage_key = make_storage_key(entity_key, partition_num, &sort_key.0);
+                        let jvt_key = hash_storage_key(&storage_key);
+                        updates.insert(jvt_key, Some(jvt::commitment::value_to_field(value)));
                     }
                 }
             };
@@ -216,99 +202,6 @@ pub fn put_at_version_and_apply<S: ReadableTreeStore + WriteableTreeStore + Sync
     );
     collected.apply_to(tree_store);
     root
-}
-
-/// List all leaf (key, value) pairs in the tree at a given version whose keys
-/// start with `prefix`.
-///
-/// Uses JVT's versioned tree walk — reads historical state as long as the
-/// nodes haven't been garbage-collected.
-///
-/// Returns `None` if the version's root doesn't exist (GC'd or not committed).
-pub fn list_leaves_with_prefix<S: ReadableTreeStore>(
-    tree_store: &S,
-    version: Version,
-    prefix: &[u8],
-) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
-    let adapter = StoreAdapter { store: tree_store };
-    let root_key = jvt::NodeKey::root(version);
-
-    // Check the root exists
-    adapter.get_node(&root_key)?;
-
-    // iter_leaves is on TreeIterator, which MemoryStore implements but our
-    // adapter doesn't. Use the collect_leaves approach via get_value for each
-    // matching key. Actually, we need to walk the tree.
-    //
-    // For now, use a simple approach: walk the tree recursively.
-    let mut results = Vec::new();
-    collect_prefix_leaves(&adapter, &root_key, &[], prefix, &mut results);
-    Some(results)
-}
-
-/// Recursively collect leaves whose full key starts with `prefix`.
-fn collect_prefix_leaves<S: jvt::TreeReader>(
-    store: &S,
-    node_key: &jvt::NodeKey,
-    path_prefix: &[u8],
-    target_prefix: &[u8],
-    results: &mut Vec<(Vec<u8>, Vec<u8>)>,
-) {
-    let node = match store.get_node(node_key) {
-        Some(n) => n,
-        None => return,
-    };
-
-    match &*node {
-        jvt::Node::Internal(internal) => {
-            let depth = path_prefix.len();
-            let mut child_indices: Vec<u8> = internal.children.keys().copied().collect();
-            child_indices.sort();
-
-            for &child_idx in &child_indices {
-                // If we're still within the prefix, only follow matching children
-                if depth < target_prefix.len() && child_idx != target_prefix[depth] {
-                    continue;
-                }
-
-                let child = &internal.children[&child_idx];
-                let mut child_path = path_prefix.to_vec();
-                child_path.push(child_idx);
-                let child_key = jvt::NodeKey::new(child.version, child_path.clone());
-                collect_prefix_leaves(store, &child_key, &child_path, target_prefix, results);
-            }
-        }
-        jvt::Node::EaS(eas) => {
-            // Check if this EaS node's keys could match the prefix
-            // Full key = path_prefix || stem || suffix_byte
-            // We need: path_prefix || stem || suffix starts with target_prefix
-            let node_prefix = {
-                let mut p = path_prefix.to_vec();
-                p.extend_from_slice(&eas.stem);
-                p
-            };
-
-            // If the node's prefix diverges from target before we've consumed target, skip
-            let common = node_prefix.len().min(target_prefix.len());
-            if node_prefix[..common] != target_prefix[..common] {
-                return;
-            }
-
-            let mut suffix_keys: Vec<u8> = eas.values.keys().copied().collect();
-            suffix_keys.sort();
-
-            for suffix in suffix_keys {
-                let mut full_key = node_prefix.clone();
-                full_key.push(suffix);
-
-                if full_key.len() >= target_prefix.len()
-                    && full_key[..target_prefix.len()] == *target_prefix
-                {
-                    results.push((full_key, eas.values[&suffix].clone()));
-                }
-            }
-        }
-    }
 }
 
 /// Writes collected during state tree computation, to be applied atomically.

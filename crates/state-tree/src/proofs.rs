@@ -45,22 +45,20 @@ pub fn serialize_verkle_proof(proof: &jvt::verkle_proof::VerkleProof) -> Vec<u8>
     // Key data
     write_u32(&mut buf, proof.key_data.len() as u32);
     for kd in &proof.key_data {
-        write_u16(&mut buf, kd.key.len() as u16);
-        buf.extend_from_slice(&kd.key);
-        write_u16(&mut buf, kd.eas_stem.len() as u16);
+        buf.extend_from_slice(&kd.key); // fixed 32 bytes
+        buf.push(kd.eas_stem.len() as u8);
         buf.extend_from_slice(&kd.eas_stem);
         match &kd.value {
             Some(v) => {
                 buf.push(1);
-                write_u32(&mut buf, v.len() as u32);
-                buf.extend_from_slice(v);
+                write_scalar(&mut buf, &v.0);
             }
             None => buf.push(0),
         }
         buf.push(kd.depth as u8);
-        write_u32(&mut buf, kd.query_path.len() as u32);
+        buf.push(kd.query_path.len() as u8);
         for &idx in &kd.query_path {
-            write_u32(&mut buf, idx as u32);
+            buf.push(idx as u8);
         }
         match &kd.termination {
             jvt::verkle_proof::TerminationKind::FoundEaS => buf.push(0),
@@ -110,22 +108,24 @@ pub fn deserialize_verkle_proof(
     let num_keys = cursor.read_u32()? as usize;
     let mut key_data = Vec::with_capacity(num_keys);
     for _ in 0..num_keys {
-        let key_len = cursor.read_u16()? as usize;
-        let key = cursor.read_bytes(key_len)?;
-        let stem_len = cursor.read_u16()? as usize;
+        let key_bytes = cursor.read_bytes(32)?; // fixed 32 bytes
+        let key: [u8; 32] = key_bytes
+            .try_into()
+            .map_err(|_| ProofDeserializeError::InvalidData)?;
+        let stem_len = cursor.read_u8()? as usize;
         let eas_stem = cursor.read_bytes(stem_len)?;
         let has_value = cursor.read_u8()?;
         let value = if has_value == 1 {
-            let value_len = cursor.read_u32()? as usize;
-            Some(cursor.read_bytes(value_len)?)
+            let scalar = cursor.read_scalar()?;
+            Some(jvt::commitment::FieldElement(scalar))
         } else {
             None
         };
         let depth = cursor.read_u8()? as usize;
-        let num_path = cursor.read_u32()? as usize;
+        let num_path = cursor.read_u8()? as usize;
         let mut query_path = Vec::with_capacity(num_path);
         for _ in 0..num_path {
-            query_path.push(cursor.read_u32()? as usize);
+            query_path.push(cursor.read_u8()? as usize);
         }
         let termination_tag = cursor.read_u8()?;
         let termination = match termination_tag {
@@ -183,7 +183,7 @@ pub fn generate_proof<S: ReadableTreeStore>(
 
     let jvt_keys: Vec<jvt::Key> = storage_keys
         .iter()
-        .map(|sk| crate::storage_key_to_jvt_key(sk))
+        .map(|sk| crate::hash_storage_key(sk))
         .collect();
 
     let proof = jvt::verkle_proof::prove(&adapter, &root_key, &jvt_keys)?;
@@ -218,14 +218,16 @@ pub fn verify_proof(
         None => return false,
     };
 
-    // Build expected keys and values for verification.
+    // Hash keys and convert values to field elements for verification.
     let keys: Vec<jvt::Key> = entries
         .iter()
-        .map(|e| crate::storage_key_to_jvt_key(storage_key_for_entry(e)))
+        .map(|e| crate::hash_storage_key(storage_key_for_entry(e)))
         .collect();
 
-    // Values are stored directly in the tree (raw bytes, not hashes)
-    let values: Vec<Option<jvt::Value>> = entries.iter().map(|e| e.value.clone()).collect();
+    let values: Vec<Option<jvt::Value>> = entries
+        .iter()
+        .map(|e| e.value.as_ref().map(|v| jvt::commitment::value_to_field(v)))
+        .collect();
 
     jvt::verkle_proof::verify(&jvt_proof, state_root_commitment, &keys, &values)
 }
@@ -235,10 +237,6 @@ pub fn verify_proof(
 fn bytes_to_commitment_safe(bytes: &[u8]) -> Option<jvt::Commitment> {
     let point = EdwardsAffine::deserialize_compressed(bytes).ok()?;
     Some(jvt::Commitment(point))
-}
-
-fn write_u16(buf: &mut Vec<u8>, v: u16) {
-    buf.extend_from_slice(&v.to_le_bytes());
 }
 
 fn write_u32(buf: &mut Vec<u8>, v: u32) {
@@ -287,11 +285,6 @@ impl<'a> Cursor<'a> {
         let v = self.data[self.pos];
         self.pos += 1;
         Ok(v)
-    }
-
-    fn read_u16(&mut self) -> Result<u16, ProofDeserializeError> {
-        let bytes = self.read_bytes(2)?;
-        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
     fn read_u32(&mut self) -> Result<u32, ProofDeserializeError> {
