@@ -294,6 +294,12 @@ impl StoredNode {
 /// Read-only access to stored tree nodes.
 pub trait ReadableTreeStore {
     fn get_node(&self, key: &StoredNodeKey) -> Option<StoredNode>;
+
+    /// Batch-fetch multiple nodes at once. Default falls back to individual gets.
+    /// Override this for storage backends that support batch reads (e.g. RocksDB multi_get).
+    fn get_nodes_batch(&self, keys: &[StoredNodeKey]) -> Vec<Option<StoredNode>> {
+        keys.iter().map(|k| self.get_node(k)).collect()
+    }
 }
 
 /// Write access to stored tree nodes.

@@ -13,8 +13,6 @@ use hyperscale_types::{Hash, SubstateInclusionProof, VerkleInclusionProof};
 use jellyfish_verkle_tree as jvt;
 
 use crate::tree_store::ReadableTreeStore;
-use crate::StoreAdapter;
-use jvt::TreeReader as _;
 
 // ============================================================================
 // JVT VerkleProof serialization
@@ -175,18 +173,19 @@ pub fn generate_proof<S: ReadableTreeStore>(
     storage_keys: &[Vec<u8>],
     block_height: u64,
 ) -> Option<SubstateInclusionProof> {
-    let adapter = StoreAdapter { store: tree_store };
     let root_key = jvt::NodeKey::root(block_height);
-
-    // Check root exists before attempting proof generation
-    adapter.get_node(&root_key)?;
 
     let jvt_keys: Vec<jvt::Key> = storage_keys
         .iter()
         .map(|sk| crate::hash_storage_key(sk))
         .collect();
 
-    let proof = jvt::verkle_proof::prove(&adapter, &root_key, &jvt_keys)?;
+    // Prefetch all tree nodes needed for the proof via batch reads.
+    // This turns ~5N individual RocksDB gets into ~5 batch multi_gets
+    // (one per tree level), then prove() runs entirely from cache.
+    let cached = crate::CachingAdapter::prefetch(tree_store, &root_key, &jvt_keys);
+
+    let proof = jvt::verkle_proof::prove(&cached, &root_key, &jvt_keys)?;
 
     Some(VerkleInclusionProof::new(serialize_verkle_proof(&proof)))
 }

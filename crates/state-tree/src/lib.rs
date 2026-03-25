@@ -66,6 +66,112 @@ impl<S: ReadableTreeStore> jvt::TreeReader for StoreAdapter<'_, S> {
     }
 }
 
+/// A caching adapter that batch-prefetches tree nodes from storage, then
+/// serves JVT `prove()` entirely from an in-memory HashMap.
+///
+/// Pre-walks each key's path from root to leaf one level at a time,
+/// batch-fetching each level's children via `get_nodes_batch()` (maps to
+/// RocksDB `multi_get_cf`). After prefetch, `prove()` does zero storage I/O.
+struct CachingAdapter {
+    cache: HashMap<jvt::NodeKey, Arc<jvt::Node>>,
+}
+
+impl CachingAdapter {
+    /// Build a caching adapter by prefetching all nodes needed for a proof.
+    ///
+    /// Level-by-level BFS: fetch root, then for all keys determine which
+    /// children are needed at depth 1, batch-fetch those, repeat until all
+    /// paths reach a leaf (EaS) or empty slot.
+    fn prefetch<S: ReadableTreeStore>(
+        store: &S,
+        root_key: &jvt::NodeKey,
+        jvt_keys: &[jvt::Key],
+    ) -> Self {
+        let mut cache: HashMap<jvt::NodeKey, Arc<jvt::Node>> = HashMap::new();
+
+        // Fetch root
+        let stored_root = StoredNodeKey::from_jvt(root_key);
+        let root_node = match store.get_node(&stored_root) {
+            Some(sn) => Arc::new(sn.to_jvt()),
+            None => return Self { cache },
+        };
+        cache.insert(root_key.clone(), Arc::clone(&root_node));
+
+        // BFS level-by-level: at each depth, collect all child keys needed
+        // across all proof keys, batch-fetch, and advance.
+        // Track (jvt_key_index, current_node_key) for keys still traversing.
+        let mut active: Vec<(usize, jvt::NodeKey)> =
+            (0..jvt_keys.len()).map(|i| (i, root_key.clone())).collect();
+
+        for depth in 0..31 {
+            if active.is_empty() {
+                break;
+            }
+
+            // Collect unique child keys needed at this depth
+            let mut needed: HashMap<jvt::NodeKey, StoredNodeKey> = HashMap::new();
+            let mut next_active: Vec<(usize, jvt::NodeKey)> = Vec::new();
+
+            for &(key_idx, ref current_key) in &active {
+                let node = match cache.get(current_key) {
+                    Some(n) => n,
+                    None => continue, // Node wasn't found — path is dead
+                };
+
+                match node.as_ref() {
+                    jvt::Node::Internal(internal) => {
+                        let byte = jvt_keys[key_idx][depth];
+                        if let Some(child_info) = internal.children.get(&byte) {
+                            let child_key = current_key.child(child_info.version, byte);
+                            if !cache.contains_key(&child_key) {
+                                let stored = StoredNodeKey::from_jvt(&child_key);
+                                needed.entry(child_key.clone()).or_insert(stored);
+                            }
+                            next_active.push((key_idx, child_key));
+                        }
+                        // else: empty child slot, key not in tree — stop traversal
+                    }
+                    jvt::Node::EaS(_) => {
+                        // Reached leaf — no more children to fetch
+                    }
+                }
+            }
+
+            // Batch-fetch all needed children for this level
+            if !needed.is_empty() {
+                let fetch_keys: Vec<jvt::NodeKey> = needed.keys().cloned().collect();
+                let stored_keys: Vec<StoredNodeKey> =
+                    fetch_keys.iter().map(|k| needed[k].clone()).collect();
+                let results = store.get_nodes_batch(&stored_keys);
+                for (jvt_key, result) in fetch_keys.into_iter().zip(results) {
+                    if let Some(sn) = result {
+                        cache.insert(jvt_key, Arc::new(sn.to_jvt()));
+                    }
+                }
+            }
+
+            active = next_active;
+        }
+
+        Self { cache }
+    }
+}
+
+impl jvt::TreeReader for CachingAdapter {
+    fn get_node(&self, key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
+        self.cache.get(key).cloned()
+    }
+
+    fn get_root_key(&self, version: u64) -> Option<jvt::NodeKey> {
+        let root = jvt::NodeKey::root(version);
+        if self.cache.contains_key(&root) {
+            Some(root)
+        } else {
+            None
+        }
+    }
+}
+
 /// Computes new state tree nodes for the given database updates, returning
 /// the new root hash and all collected writes.
 ///

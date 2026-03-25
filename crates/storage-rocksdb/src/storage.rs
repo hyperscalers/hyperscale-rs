@@ -499,6 +499,28 @@ impl ReadableTreeStore for SnapshotTreeStore<'_> {
                     .into_latest()
             })
     }
+
+    fn get_nodes_batch(&self, keys: &[StoredNodeKey]) -> Vec<Option<StoredNode>> {
+        let cf = match self.db.cf_handle(JMT_NODES_CF) {
+            Some(cf) => cf,
+            None => return keys.iter().map(|_| None).collect(),
+        };
+        let encoded_keys: Vec<Vec<u8>> = keys.iter().map(encode_jmt_key).collect();
+        let cf_keys: Vec<_> = encoded_keys.iter().map(|k| (cf, k.as_slice())).collect();
+        self.snapshot
+            .multi_get_cf(cf_keys)
+            .into_iter()
+            .map(|result| {
+                result
+                    .expect("RocksDB snapshot batch read failure on jmt_nodes CF")
+                    .map(|bytes| {
+                        sbor::basic_decode::<VersionedStoredNode>(&bytes)
+                            .unwrap_or_else(|e| panic!("JMT node corruption detected: {e:?}"))
+                            .into_latest()
+                    })
+            })
+            .collect()
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
