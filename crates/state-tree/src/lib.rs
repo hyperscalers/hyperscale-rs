@@ -15,7 +15,7 @@
 pub mod proofs;
 pub mod tree_store;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use hyperscale_dispatch::Dispatch;
@@ -74,12 +74,18 @@ impl<S: ReadableTreeStore> jvt::TreeReader for StoreAdapter<'_, S> {
 ///
 /// `parent_version` is the version of the existing root (`None` for initial state).
 /// `new_version` is the version to stamp on new nodes (typically block height).
+///
+/// `reset_old_keys` provides the storage keys that existed in Reset partitions
+/// before the reset. These are needed to generate JVT deletes because hashed keys
+/// prevent tree-based enumeration. The caller obtains these from the data store
+/// (OrdMap prefix scan or RocksDB range scan) before calling this function.
 pub fn put_at_version<S: ReadableTreeStore + Sync, D: Dispatch>(
     tree_store: &S,
     parent_version: Option<Version>,
     new_version: Version,
     database_updates: &radix_substate_store_interface::interface::DatabaseUpdates,
     _dispatch: &D,
+    reset_old_keys: &HashMap<(Vec<u8>, u8), Vec<Vec<u8>>>,
 ) -> (Hash, CollectedWrites) {
     assert!(
         parent_version.is_none_or(|pv| new_version > pv),
@@ -114,15 +120,15 @@ pub fn put_at_version<S: ReadableTreeStore + Sync, D: Dispatch>(
                 radix_substate_store_interface::interface::PartitionDatabaseUpdates::Reset {
                     new_substate_values,
                 } => {
-                    // Reset = delete all existing substates in this partition,
-                    // then insert the new values.
-                    //
-                    // With hashed keys we cannot enumerate existing keys from the tree.
-                    // The caller must provide the old keys via the MVCC data store.
-                    // For now, only insert the new values — partition resets that need
-                    // to delete old entries will be handled when the MVCC store is integrated.
-                    //
-                    // TODO: Accept old partition keys from caller for delete generation.
+                    // Delete all existing substates in this partition via caller-provided keys.
+                    if let Some(old_keys) = reset_old_keys.get(&(entity_key.clone(), partition_num))
+                    {
+                        for old_sk in old_keys {
+                            let jvt_key = hash_storage_key(old_sk);
+                            updates.insert(jvt_key, None);
+                        }
+                    }
+                    // Insert the new values (overwrites any deletes for keys that reappear).
                     for (sort_key, value) in new_substate_values {
                         let storage_key = make_storage_key(entity_key, partition_num, &sort_key.0);
                         let jvt_key = hash_storage_key(&storage_key);
@@ -192,6 +198,7 @@ pub fn put_at_version_and_apply<S: ReadableTreeStore + WriteableTreeStore + Sync
     new_version: Version,
     database_updates: &radix_substate_store_interface::interface::DatabaseUpdates,
     dispatch: &D,
+    reset_old_keys: &HashMap<(Vec<u8>, u8), Vec<Vec<u8>>>,
 ) -> Hash {
     let (root, collected) = put_at_version(
         tree_store,
@@ -199,6 +206,7 @@ pub fn put_at_version_and_apply<S: ReadableTreeStore + WriteableTreeStore + Sync
         new_version,
         database_updates,
         dispatch,
+        reset_old_keys,
     );
     collected.apply_to(tree_store);
     root

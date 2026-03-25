@@ -376,6 +376,15 @@ const ASSOCIATED_STATE_TREE_VALUES_CF: &str = "associated_state_tree_values";
 /// A background GC process deletes these after the retention window expires.
 const STALE_STATE_HASH_TREE_PARTS_CF: &str = "stale_state_hash_tree_parts";
 
+/// Column family for MVCC versioned substates.
+/// Key: `storage_key_bytes ++ version_BE_8B`, Value: SBOR-encoded substate bytes.
+/// Enables historical reads via prefix scan + version filtering.
+const VERSIONED_SUBSTATES_CF: &str = "versioned_substates";
+
+/// Old storage keys deleted by partition Reset operations, keyed by `(entity_key, partition_num)`.
+/// Passed to `put_at_version` so the JVT can generate deletes for the hashed keys.
+type ResetOldKeys = std::collections::HashMap<(Vec<u8>, u8), Vec<Vec<u8>>>;
+
 impl<D: Dispatch + 'static> ReadableTreeStore for RocksDbStorage<D> {
     fn get_node(&self, key: &StoredNodeKey) -> Option<StoredNode> {
         let cf = self.db.cf_handle(JMT_NODES_CF)?;
@@ -521,7 +530,6 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         let _commit_guard = self.commit_lock.lock().unwrap();
 
         let start = Instant::now();
-        let mut batch = self.build_substate_write_batch(updates);
 
         // Compute JMT updates using a snapshot-based store for isolation
         let snapshot_store = SnapshotTreeStore::new(&self.db);
@@ -531,12 +539,17 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         // Only treat as "no parent" when the JMT is truly empty.
         let parent_version = hyperscale_storage::jmt_parent_height(base_version, base_root);
         let new_version = base_version + 1;
+
+        let (mut batch, reset_old_keys) =
+            self.build_substate_write_batch(updates, Some(new_version));
+
         let (new_root, collected) = hyperscale_storage::jmt::put_at_version(
             &snapshot_store,
             parent_version,
             new_version,
             updates,
             &self.dispatch,
+            &reset_old_keys,
         );
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
@@ -566,13 +579,27 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
 
 impl<D: Dispatch + 'static> RocksDbStorage<D> {
     /// Build a `WriteBatch` containing all substate puts/deletes from `updates`.
-    fn build_substate_write_batch(&self, updates: &DatabaseUpdates) -> WriteBatch {
+    ///
+    /// When `version` is `Some`, also writes to the `versioned_substates` CF for
+    /// MVCC historical reads. Deletes are written as empty values (tombstones).
+    ///
+    /// Returns `(batch, reset_old_keys)` where `reset_old_keys` maps
+    /// `(entity_key, partition_num)` to the old storage keys that were deleted
+    /// by Reset partitions (needed for JVT delete generation).
+    fn build_substate_write_batch(
+        &self,
+        updates: &DatabaseUpdates,
+        version: Option<u64>,
+    ) -> (WriteBatch, ResetOldKeys) {
         let mut batch = WriteBatch::default();
+        let mut reset_old_keys = ResetOldKeys::new();
 
         let state_cf = self
             .db
             .cf_handle(STATE_CF)
             .expect("state column family must exist");
+
+        let versioned_cf = self.db.cf_handle(VERSIONED_SUBSTATES_CF);
 
         for (node_key, node_updates) in &updates.node_updates {
             for (partition_num, partition_updates) in &node_updates.partition_updates {
@@ -588,9 +615,22 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
                             match update {
                                 DatabaseUpdate::Set(value) => {
                                     batch.put_cf(state_cf, &key, value);
+                                    if let (Some(ver), Some(vcf)) = (version, versioned_cf) {
+                                        let mut vkey = Vec::with_capacity(key.len() + 8);
+                                        vkey.extend_from_slice(&key);
+                                        vkey.extend_from_slice(&ver.to_be_bytes());
+                                        batch.put_cf(vcf, &vkey, value);
+                                    }
                                 }
                                 DatabaseUpdate::Delete => {
                                     batch.delete_cf(state_cf, &key);
+                                    if let (Some(ver), Some(vcf)) = (version, versioned_cf) {
+                                        let mut vkey = Vec::with_capacity(key.len() + 8);
+                                        vkey.extend_from_slice(&key);
+                                        vkey.extend_from_slice(&ver.to_be_bytes());
+                                        // Empty value = tombstone
+                                        batch.put_cf(vcf, &vkey, []);
+                                    }
                                 }
                             }
                         }
@@ -603,6 +643,8 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
 
                         let snap = self.db.snapshot();
                         let mut iter = snap.raw_iterator_cf(state_cf);
+                        let mut old_keys_for_partition = Vec::new();
+
                         iter.seek(&prefix);
                         while iter.valid() {
                             if let Some(key) = iter.key() {
@@ -610,22 +652,40 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
                                     break;
                                 }
                                 batch.delete_cf(state_cf, key);
+                                old_keys_for_partition.push(key.to_vec());
+                                if let (Some(ver), Some(vcf)) = (version, versioned_cf) {
+                                    let mut vkey = Vec::with_capacity(key.len() + 8);
+                                    vkey.extend_from_slice(key);
+                                    vkey.extend_from_slice(&ver.to_be_bytes());
+                                    batch.put_cf(vcf, &vkey, []); // tombstone
+                                }
                                 iter.next();
                             } else {
                                 break;
                             }
                         }
 
+                        if !old_keys_for_partition.is_empty() {
+                            reset_old_keys
+                                .insert((node_key.clone(), *partition_num), old_keys_for_partition);
+                        }
+
                         for (sort_key, value) in new_substate_values {
                             let key = keys::to_storage_key(&partition_key, sort_key);
                             batch.put_cf(state_cf, &key, value);
+                            if let (Some(ver), Some(vcf)) = (version, versioned_cf) {
+                                let mut vkey = Vec::with_capacity(key.len() + 8);
+                                vkey.extend_from_slice(&key);
+                                vkey.extend_from_slice(&ver.to_be_bytes());
+                                batch.put_cf(vcf, &vkey, value);
+                            }
                         }
                     }
                 }
             }
         }
 
-        batch
+        (batch, reset_old_keys)
     }
 
     /// Write only substate data (no JMT computation).
@@ -635,7 +695,8 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
     /// After all genesis commits complete, [`finalize_genesis_jmt`] computes the
     /// JMT once at version 0.
     pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
-        let batch = self.build_substate_write_batch(updates);
+        // Genesis: version 0
+        let (batch, _) = self.build_substate_write_batch(updates, Some(0));
 
         // Write substates only — no JMT, no sync (genesis isn't durability-critical).
         self.db
@@ -670,6 +731,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             0,
             merged,
             &self.dispatch,
+            &Default::default(),
         );
         let jmt_snapshot =
             JmtSnapshot::from_collected_writes(collected, StateRootHash::ZERO, 0, root, 0);
@@ -741,20 +803,84 @@ impl<D: Dispatch + 'static> SubstateStore for RocksDbStorage<D> {
         node_id: &NodeId,
         block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
-        // With hashed JVT keys, tree walks can't enumerate by entity prefix.
-        // Use the data store's prefix scan instead.
-        //
-        // This returns current state, which is correct when block_height == current
-        // (proactive provision path: proposer just committed this block).
-        //
-        // TODO: For true historical reads (fallback provision path), implement
-        // MVCC versioned data store.
         let (current_version, _) = self.read_jmt_metadata();
         if block_height > current_version {
             return None;
         }
 
-        Some(self.list_substates_for_node(node_id).collect())
+        let versioned_cf = self.db.cf_handle(VERSIONED_SUBSTATES_CF)?;
+        let entity_prefix = keys::node_entity_key(node_id);
+        let entity_len = entity_prefix.len();
+        let end_prefix = keys::next_prefix(&entity_prefix)?;
+
+        // MVCC scan: iterate versioned_substates for this entity prefix.
+        // Keys are storage_key ++ version_BE, sorted lexicographically.
+        // For each unique storage_key, take the latest version <= block_height.
+        let snap = self.db.snapshot();
+        let mut iter = snap.raw_iterator_cf(versioned_cf);
+        iter.seek(&entity_prefix);
+
+        let mut results = Vec::new();
+        let mut current_sk: Option<Vec<u8>> = None;
+        let mut current_best: Option<Vec<u8>> = None;
+
+        while iter.valid() {
+            let full_key = match iter.key() {
+                Some(k) => k,
+                None => break,
+            };
+
+            // Check we're still in the entity prefix (compare storage_key portion).
+            if full_key.len() < 8 {
+                iter.next();
+                continue;
+            }
+            let storage_key = &full_key[..full_key.len() - 8];
+            if !storage_key.starts_with(&entity_prefix) {
+                // Past the end prefix — check against the incremented prefix.
+                if storage_key >= end_prefix.as_slice() {
+                    break;
+                }
+            }
+
+            let version = u64::from_be_bytes(full_key[full_key.len() - 8..].try_into().unwrap());
+
+            // Storage key changed — flush previous group.
+            if current_sk.as_deref() != Some(storage_key) {
+                if let (Some(ref sk), Some(val)) = (&current_sk, current_best.take()) {
+                    if sk.len() > entity_len {
+                        let partition_num = sk[entity_len];
+                        let sort_key = DbSortKey(sk[entity_len + 1..].to_vec());
+                        results.push((partition_num, sort_key, val));
+                    }
+                }
+                current_sk = Some(storage_key.to_vec());
+                current_best = None;
+            }
+
+            // Ascending version order: overwrite with each version <= height.
+            if version <= block_height {
+                let val = iter.value().unwrap_or_default();
+                if val.is_empty() {
+                    current_best = None; // tombstone
+                } else {
+                    current_best = Some(val.to_vec());
+                }
+            }
+
+            iter.next();
+        }
+
+        // Flush last group.
+        if let (Some(ref sk), Some(val)) = (&current_sk, current_best) {
+            if sk.len() > entity_len {
+                let partition_num = sk[entity_len];
+                let sort_key = DbSortKey(sk[entity_len + 1..].to_vec());
+                results.push((partition_num, sort_key, val.clone()));
+            }
+        }
+
+        Some(results)
     }
 
     fn generate_merkle_proofs(
@@ -827,6 +953,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             block_height,
             &merged,
             &self.dispatch,
+            &Default::default(),
         );
 
         let snapshot = JmtSnapshot::from_collected_writes(
@@ -2229,8 +2356,9 @@ impl Default for RocksDbConfig {
                 "jmt_nodes".to_string(), // JMT tree nodes for state commitment
                 "associated_state_tree_values".to_string(), // Historical substate values (leaf key -> value)
                 "stale_state_hash_tree_parts".to_string(),  // Deferred GC queue for stale JMT nodes
-                "ledger_receipts".to_string(),              // Ledger receipts keyed by tx hash
-                "local_executions".to_string(), // Local execution details keyed by tx hash
+                "versioned_substates".to_string(), // MVCC versioned substates for historical reads
+                "ledger_receipts".to_string(),     // Ledger receipts keyed by tx hash
+                "local_executions".to_string(),    // Local execution details keyed by tx hash
             ],
             jmt_history_length: 256,
         }
@@ -2273,7 +2401,8 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
         );
 
         // Pre-build substate writes into a WriteBatch for efficient commit.
-        let write_batch = self.build_substate_write_batch(merged_updates);
+        let (write_batch, _reset_old_keys) =
+            self.build_substate_write_batch(merged_updates, Some(block_height));
 
         let prepared = RocksDbPreparedCommit {
             write_batch,
@@ -2345,7 +2474,8 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
         );
 
         // Build a WriteBatch for certificates + substate writes.
-        let mut batch = self.build_substate_write_batch(merged_updates);
+        let (mut batch, reset_old_keys) =
+            self.build_substate_write_batch(merged_updates, Some(block_height));
 
         // Store certificates to the certificate CF.
         if !certificates.is_empty() {
@@ -2368,6 +2498,7 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
             block_height,
             merged_updates,
             &self.dispatch,
+            &reset_old_keys,
         );
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
