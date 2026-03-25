@@ -268,6 +268,7 @@ impl<D: Dispatch + 'static> SimStorage<D> {
             updates,
             &self.dispatch,
             &Default::default(),
+            None,
         );
 
         collected.apply_to(&s.tree_store);
@@ -318,6 +319,7 @@ impl<D: Dispatch + 'static> SimStorage<D> {
             merged,
             &self.dispatch,
             &Default::default(),
+            None,
         );
 
         collected.apply_to(&s.tree_store);
@@ -489,7 +491,7 @@ impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
         block_height: u64,
     ) -> Option<hyperscale_types::SubstateInclusionProof> {
         let s = self.state.read().unwrap();
-        hyperscale_storage::proofs::generate_proof(&s.tree_store, storage_keys, block_height)
+        hyperscale_storage::proofs::generate_proof(&s.tree_store, storage_keys, block_height, None)
     }
 }
 
@@ -650,6 +652,7 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             merged_updates,
             &self.dispatch,
             &Default::default(),
+            None,
         );
 
         let snapshot = JmtSnapshot::from_collected_writes(
@@ -774,6 +777,7 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             merged_updates,
             &self.dispatch,
             &Default::default(),
+            None,
         );
 
         collected.apply_to(&s.tree_store);

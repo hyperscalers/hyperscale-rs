@@ -190,6 +190,7 @@ pub fn generate_proof<S: ReadableTreeStore>(
     tree_store: &S,
     storage_keys: &[Vec<u8>],
     block_height: u64,
+    node_cache: Option<&crate::NodeCache>,
 ) -> Option<SubstateInclusionProof> {
     let root_key = jvt::NodeKey::root(block_height);
 
@@ -199,9 +200,9 @@ pub fn generate_proof<S: ReadableTreeStore>(
         .collect();
 
     // Prefetch all tree nodes needed for the proof via batch reads.
-    // This turns ~5N individual RocksDB gets into ~5 batch multi_gets
-    // (one per tree level), then prove() runs entirely from cache.
-    let cached = crate::CachingAdapter::prefetch(tree_store, &root_key, &jvt_keys);
+    // When a NodeCache is provided, hydrated nodes are served from the
+    // persistent cache — avoiding RocksDB I/O and to_jvt() entirely.
+    let cached = crate::CachingAdapter::prefetch(tree_store, &root_key, &jvt_keys, node_cache);
 
     let proof = jvt::verkle_proof::prove(&cached, &root_key, &jvt_keys)?;
 

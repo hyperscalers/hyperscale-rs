@@ -25,6 +25,40 @@ use jellyfish_verkle_tree as jvt;
 use jvt::TreeReader as _;
 use tree_store::*;
 
+/// Persistent cache of hydrated JVT nodes keyed by `(version, path)`.
+///
+/// Eliminates the expensive `StoredNode::to_jvt()` conversion (commitment
+/// deserialization, `commitment_to_field`, HashMap construction) on repeated
+/// proof generations. Nodes are cached on first read and eagerly populated
+/// during `put_at_version` (write-through).
+///
+/// Thread-safe (`Send + Sync`) — safe to share across proof generation and
+/// commit threads.
+pub struct NodeCache {
+    inner: quick_cache::sync::Cache<jvt::NodeKey, Arc<jvt::Node>>,
+}
+
+impl NodeCache {
+    /// Create a new node cache with the given capacity.
+    ///
+    /// 50,000 entries covers a typical live tree (~100MB at ~2KB/node).
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: quick_cache::sync::Cache::new(capacity),
+        }
+    }
+
+    /// Get a cached node.
+    pub fn get(&self, key: &jvt::NodeKey) -> Option<Arc<jvt::Node>> {
+        self.inner.get(key)
+    }
+
+    /// Insert a node into the cache.
+    pub fn insert(&self, key: jvt::NodeKey, node: Arc<jvt::Node>) {
+        self.inner.insert(key, node);
+    }
+}
+
 /// Hash a storage key to a 32-byte JVT key.
 ///
 /// Storage keys are variable-length (`entity_key || partition_num || sort_key`).
@@ -82,17 +116,42 @@ impl CachingAdapter {
     /// Level-by-level BFS: fetch root, then for all keys determine which
     /// children are needed at depth 1, batch-fetch those, repeat until all
     /// paths reach a leaf (EaS) or empty slot.
+    ///
+    /// When a `NodeCache` is provided, hydrated nodes are served from the
+    /// persistent cache (avoiding `to_jvt()` entirely). Misses are fetched
+    /// from storage, converted once, and inserted into the persistent cache
+    /// for future proofs.
     fn prefetch<S: ReadableTreeStore>(
         store: &S,
         root_key: &jvt::NodeKey,
         jvt_keys: &[jvt::Key],
+        node_cache: Option<&NodeCache>,
     ) -> Self {
         let mut cache: HashMap<jvt::NodeKey, Arc<jvt::Node>> = HashMap::new();
 
+        /// Resolve a node: check persistent cache first, then storage + to_jvt().
+        /// Inserts into persistent cache on miss.
+        fn resolve<S: ReadableTreeStore>(
+            jvt_key: &jvt::NodeKey,
+            store: &S,
+            node_cache: Option<&NodeCache>,
+        ) -> Option<Arc<jvt::Node>> {
+            if let Some(nc) = node_cache {
+                if let Some(node) = nc.get(jvt_key) {
+                    return Some(node);
+                }
+            }
+            let stored_key = StoredNodeKey::from_jvt(jvt_key);
+            let node = Arc::new(store.get_node(&stored_key)?.to_jvt());
+            if let Some(nc) = node_cache {
+                nc.insert(jvt_key.clone(), Arc::clone(&node));
+            }
+            Some(node)
+        }
+
         // Fetch root
-        let stored_root = StoredNodeKey::from_jvt(root_key);
-        let root_node = match store.get_node(&stored_root) {
-            Some(sn) => Arc::new(sn.to_jvt()),
+        let root_node = match resolve(root_key, store, node_cache) {
+            Some(n) => n,
             None => return Self { cache },
         };
         cache.insert(root_key.clone(), Arc::clone(&root_node));
@@ -124,6 +183,14 @@ impl CachingAdapter {
                         if let Some(child_info) = internal.children.get(&byte) {
                             let child_key = current_key.child(child_info.version, byte);
                             if !cache.contains_key(&child_key) {
+                                // Check persistent cache before adding to batch-fetch list
+                                if let Some(nc) = node_cache {
+                                    if let Some(node) = nc.get(&child_key) {
+                                        cache.insert(child_key.clone(), node);
+                                        next_active.push((key_idx, child_key));
+                                        continue;
+                                    }
+                                }
                                 let stored = StoredNodeKey::from_jvt(&child_key);
                                 needed.entry(child_key.clone()).or_insert(stored);
                             }
@@ -145,7 +212,11 @@ impl CachingAdapter {
                 let results = store.get_nodes_batch(&stored_keys);
                 for (jvt_key, result) in fetch_keys.into_iter().zip(results) {
                     if let Some(sn) = result {
-                        cache.insert(jvt_key, Arc::new(sn.to_jvt()));
+                        let node = Arc::new(sn.to_jvt());
+                        if let Some(nc) = node_cache {
+                            nc.insert(jvt_key.clone(), Arc::clone(&node));
+                        }
+                        cache.insert(jvt_key, node);
                     }
                 }
             }
@@ -192,6 +263,7 @@ pub fn put_at_version<S: ReadableTreeStore + Sync, D: Dispatch>(
     database_updates: &radix_substate_store_interface::interface::DatabaseUpdates,
     _dispatch: &D,
     reset_old_keys: &HashMap<(Vec<u8>, u8), Vec<Vec<u8>>>,
+    node_cache: Option<&NodeCache>,
 ) -> (Hash, CollectedWrites) {
     assert!(
         parent_version.is_none_or(|pv| new_version > pv),
@@ -277,13 +349,16 @@ pub fn put_at_version<S: ReadableTreeStore + Sync, D: Dispatch>(
         commitment_to_hash(result.root_commitment)
     };
 
-    // Collect writes
+    // Collect writes and populate node cache with hydrated nodes
     let mut collected = CollectedWrites::default();
     for (node_key, node) in &result.batch.new_nodes {
         collected.nodes.push((
             StoredNodeKey::from_jvt(node_key),
             StoredNode::from_jvt(node),
         ));
+        if let Some(nc) = node_cache {
+            nc.insert(node_key.clone(), Arc::new(node.clone()));
+        }
     }
     for stale in &result.batch.stale_nodes {
         collected
@@ -305,6 +380,7 @@ pub fn put_at_version_and_apply<S: ReadableTreeStore + WriteableTreeStore + Sync
     database_updates: &radix_substate_store_interface::interface::DatabaseUpdates,
     dispatch: &D,
     reset_old_keys: &HashMap<(Vec<u8>, u8), Vec<Vec<u8>>>,
+    node_cache: Option<&NodeCache>,
 ) -> Hash {
     let (root, collected) = put_at_version(
         tree_store,
@@ -313,6 +389,7 @@ pub fn put_at_version_and_apply<S: ReadableTreeStore + WriteableTreeStore + Sync
         database_updates,
         dispatch,
         reset_old_keys,
+        node_cache,
     );
     collected.apply_to(tree_store);
     root

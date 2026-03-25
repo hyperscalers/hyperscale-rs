@@ -61,6 +61,12 @@ pub struct RocksDbStorage<D: Dispatch + 'static> {
 
     /// Dispatch implementation for parallel JMT computation.
     dispatch: D,
+
+    /// Persistent cache of hydrated JVT tree nodes. Eliminates the expensive
+    /// `StoredNode::to_jvt()` conversion on repeated proof generations.
+    /// Populated eagerly during `put_at_version` (commit path) and lazily
+    /// during proof prefetch (read path).
+    node_cache: hyperscale_storage::jmt::NodeCache,
 }
 
 /// Error type for storage operations.
@@ -182,6 +188,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             db: Arc::new(db),
             commit_lock: Mutex::new(()),
             jmt_history_length: config.jmt_history_length,
+            node_cache: hyperscale_storage::jmt::NodeCache::new(50_000),
             dispatch,
         })
     }
@@ -612,6 +619,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             updates,
             &self.dispatch,
             &reset_old_keys,
+            Some(&self.node_cache),
         );
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,
@@ -797,6 +805,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             merged,
             &self.dispatch,
             &Default::default(),
+            Some(&self.node_cache),
         );
         let jmt_snapshot =
             JmtSnapshot::from_collected_writes(collected, StateRootHash::ZERO, 0, root, 0);
@@ -956,7 +965,12 @@ impl<D: Dispatch + 'static> SubstateStore for RocksDbStorage<D> {
         // Use a RocksDB snapshot for all reads so concurrent JMT GC cannot
         // delete nodes mid-proof-generation.
         let snapshot_store = SnapshotTreeStore::new(&self.db);
-        hyperscale_storage::proofs::generate_proof(&snapshot_store, storage_keys, block_height)
+        hyperscale_storage::proofs::generate_proof(
+            &snapshot_store,
+            storage_keys,
+            block_height,
+            Some(&self.node_cache),
+        )
     }
 }
 
@@ -1019,6 +1033,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             &merged,
             &self.dispatch,
             &Default::default(),
+            Some(&self.node_cache),
         );
 
         let snapshot = JmtSnapshot::from_collected_writes(
@@ -2566,6 +2581,7 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
             merged_updates,
             &self.dispatch,
             &reset_old_keys,
+            Some(&self.node_cache),
         );
         let jmt_snapshot = JmtSnapshot::from_collected_writes(
             collected,

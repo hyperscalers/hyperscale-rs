@@ -15,8 +15,14 @@ pub fn generate_proof<S: ReadableTreeStore>(
     tree_store: &S,
     storage_keys: &[Vec<u8>],
     block_height: u64,
+    node_cache: Option<&hyperscale_state_tree::NodeCache>,
 ) -> Option<SubstateInclusionProof> {
-    hyperscale_state_tree::proofs::generate_proof(tree_store, storage_keys, block_height)
+    hyperscale_state_tree::proofs::generate_proof(
+        tree_store,
+        storage_keys,
+        block_height,
+        node_cache,
+    )
 }
 
 /// Verify an aggregated verkle proof against a state root.

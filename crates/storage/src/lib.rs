@@ -83,4 +83,5 @@ pub mod jmt {
         TypedInMemoryTreeStore, Version, VersionedStoredNode, WriteableTreeStore,
     };
     pub use hyperscale_state_tree::CollectedWrites;
+    pub use hyperscale_state_tree::NodeCache;
 }

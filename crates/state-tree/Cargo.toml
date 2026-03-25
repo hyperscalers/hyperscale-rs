@@ -17,6 +17,7 @@ radix-common.workspace = true
 radix-substate-store-interface.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
+quick_cache.workspace = true
 
 [dev-dependencies]
 hyperscale-dispatch-sync.workspace = true
