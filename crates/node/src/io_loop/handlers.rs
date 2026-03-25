@@ -58,13 +58,99 @@ where
             });
 
         // ── provision.request → provision fetch protocol ─────────────
+        //
+        // Dedup + cache: the proof for (block_height, target_shard) is
+        // deterministic. Multiple validators request the same provisions,
+        // and retries can send the same request many times. Without dedup,
+        // each request regenerates the verkle proof (~30ms), and under load
+        // 40+ redundant proof generations per height cause CPU thrashing.
+        //
+        // The cache stores completed responses. The in-flight map tracks
+        // requests currently being computed — subsequent requests for the
+        // same key wait on a shared condvar instead of computing again.
 
         let storage = Arc::clone(&self.storage);
         let topology = self.topology.clone();
+
+        use std::collections::HashMap;
+
+        type ProvisionResponse = hyperscale_messages::response::GetProvisionsResponse;
+        type ProvisionWaiter = Arc<(
+            std::sync::Mutex<Option<ProvisionResponse>>,
+            std::sync::Condvar,
+        )>;
+
+        struct ProvisionRequestDedup {
+            cache: HashMap<(u64, u64), ProvisionResponse>,
+            in_flight: HashMap<(u64, u64), ProvisionWaiter>,
+        }
+
+        let dedup: Arc<std::sync::Mutex<ProvisionRequestDedup>> =
+            Arc::new(std::sync::Mutex::new(ProvisionRequestDedup {
+                cache: HashMap::new(),
+                in_flight: HashMap::new(),
+            }));
+
         self.network
-            .register_request_handler::<GetProvisionsRequest>(move |req| {
+            .register_request_handler::<GetProvisionsRequest>(move |req: GetProvisionsRequest| {
+                let cache_key = (req.block_height.0, req.target_shard.0);
+
+                // Fast path: check cache
+                {
+                    let guard = dedup.lock().unwrap();
+                    if let Some(cached) = guard.cache.get(&cache_key) {
+                        return cached.clone();
+                    }
+                    // Check if another thread is already computing this
+                    if let Some(waiter) = guard.in_flight.get(&cache_key).cloned() {
+                        drop(guard); // release lock while waiting
+                        let (lock, cvar) = &*waiter;
+                        let mut result = lock.lock().unwrap();
+                        while result.is_none() {
+                            result = cvar.wait(result).unwrap();
+                        }
+                        return result.clone().unwrap();
+                    }
+                }
+
+                // We're the first — register as in-flight
+                let waiter = Arc::new((
+                    std::sync::Mutex::new(
+                        None::<hyperscale_messages::response::GetProvisionsResponse>,
+                    ),
+                    std::sync::Condvar::new(),
+                ));
+                dedup
+                    .lock()
+                    .unwrap()
+                    .in_flight
+                    .insert(cache_key, Arc::clone(&waiter));
+
+                // Compute
                 let topo = topology.load();
-                serve_provision_request(&*storage, topo.local_shard(), topo.num_shards(), req)
+                let response =
+                    serve_provision_request(&*storage, topo.local_shard(), topo.num_shards(), req);
+
+                // Store in cache, notify waiters, remove in-flight
+                {
+                    let mut guard = dedup.lock().unwrap();
+                    if response.provisions.is_some() {
+                        guard.cache.insert(cache_key, response.clone());
+                        // Evict old entries (keep last 256)
+                        if guard.cache.len() > 256 {
+                            let min_key = *guard.cache.keys().min().unwrap();
+                            guard.cache.remove(&min_key);
+                        }
+                    }
+                    guard.in_flight.remove(&cache_key);
+                }
+
+                // Wake all waiters
+                let (lock, cvar) = &*waiter;
+                *lock.lock().unwrap() = Some(response.clone());
+                cvar.notify_all();
+
+                response
             });
     }
 

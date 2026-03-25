@@ -352,10 +352,10 @@ pub fn serve_provision_request(
     num_shards: u64,
     req: GetProvisionsRequest,
 ) -> GetProvisionsResponse {
-    trace!(
-        block_height = req.block_height.0,
-        target_shard = req.target_shard.0,
-        "Handling provision request"
+    let serve_start = std::time::Instant::now();
+    eprintln!(
+        "[FALLBACK SERVE] START height={} target_shard={}",
+        req.block_height.0, req.target_shard.0
     );
 
     let (block, _qc) = match storage.get_block(req.block_height) {
@@ -462,11 +462,11 @@ pub fn serve_provision_request(
         });
     }
 
-    debug!(
-        block_height = req.block_height.0,
-        target_shard = req.target_shard.0,
-        provision_count = provisions.len(),
-        "Responding to provision request"
+    eprintln!(
+        "[FALLBACK SERVE] DONE height={} provisions={} serve_ms={}",
+        req.block_height.0,
+        provisions.len(),
+        serve_start.elapsed().as_millis()
     );
 
     GetProvisionsResponse {

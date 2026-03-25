@@ -186,22 +186,9 @@ pub fn generate_proof<S: ReadableTreeStore>(
         .map(|sk| crate::hash_storage_key(sk))
         .collect();
 
-    let t0 = std::time::Instant::now();
     let proof = jvt::verkle_proof::prove(&adapter, &root_key, &jvt_keys)?;
-    let prove_ms = t0.elapsed().as_millis();
-    let t1 = std::time::Instant::now();
-    let serialized = serialize_verkle_proof(&proof);
-    let ser_ms = t1.elapsed().as_millis();
-    eprintln!(
-        "[PROOF TIMING] keys={} prove={}ms serialize={}ms total={}ms bytes={}",
-        jvt_keys.len(),
-        prove_ms,
-        ser_ms,
-        prove_ms + ser_ms,
-        serialized.len()
-    );
 
-    Some(VerkleInclusionProof::new(serialized))
+    Some(VerkleInclusionProof::new(serialize_verkle_proof(&proof)))
 }
 
 // ============================================================================
@@ -223,44 +210,13 @@ pub fn verify_proof(
 
     let jvt_proof = match deserialize_verkle_proof(proof.as_bytes()) {
         Ok(p) => p,
-        Err(e) => {
-            eprintln!("Verkle proof deserialization failed: {e:?}");
-            return false;
-        }
+        Err(_) => return false,
     };
 
     let state_root_commitment = match bytes_to_commitment_safe(state_root.as_bytes()) {
         Some(c) => c,
-        None => {
-            eprintln!("State root commitment deserialization failed");
-            return false;
-        }
+        None => return false,
     };
-
-    // Debug: check if the reconstructed commitment matches the proof's first query
-    if let Some(kd) = jvt_proof.key_data.first() {
-        if let Some(&first_idx) = kd.query_path.first() {
-            if first_idx < jvt_proof.verifier_queries.len() {
-                let proof_root = jvt::Commitment(jvt_proof.verifier_queries[first_idx].0);
-                let roots_match = proof_root == state_root_commitment;
-                if !roots_match {
-                    // Serialize both to compare bytes
-                    let mut proof_root_bytes = [0u8; 32];
-                    let mut header_root_bytes = [0u8; 32];
-                    use ark_serialize::CanonicalSerialize;
-                    let _ = proof_root.0.serialize_compressed(&mut proof_root_bytes[..]);
-                    let _ = state_root_commitment
-                        .0
-                        .serialize_compressed(&mut header_root_bytes[..]);
-                    eprintln!(
-                        "[PROOF DEBUG] ROOT MISMATCH: proof_root={:?} header_root={:?}",
-                        &proof_root_bytes[..8],
-                        &header_root_bytes[..8]
-                    );
-                }
-            }
-        }
-    }
 
     // Hash keys and convert values to field elements for verification.
     let keys: Vec<jvt::Key> = entries
@@ -273,39 +229,7 @@ pub fn verify_proof(
         .map(|e| e.value.as_ref().map(|v| jvt::commitment::value_to_field(v)))
         .collect();
 
-    // Debug: compare proof key_data vs verifier-computed keys/values
-    if jvt_proof.key_data.len() != keys.len() {
-        eprintln!(
-            "[PROOF DEBUG] key count mismatch: proof={} verifier={}",
-            jvt_proof.key_data.len(),
-            keys.len()
-        );
-        return false;
-    }
-    for (i, kd) in jvt_proof.key_data.iter().enumerate() {
-        if kd.key != keys[i] {
-            eprintln!(
-                "[PROOF DEBUG] key mismatch at {i}: proof={:?} verifier={:?}",
-                &kd.key[..4],
-                &keys[i][..4]
-            );
-        }
-        if kd.value.as_ref() != values[i].as_ref() {
-            eprintln!("[PROOF DEBUG] value mismatch at {i}");
-        }
-    }
-
-    let result = jvt::verkle_proof::verify(&jvt_proof, state_root_commitment, &keys, &values);
-    if !result {
-        eprintln!(
-            "[PROOF DEBUG] verification false: entries={} proof_keys={} queries={} root={:?}",
-            entries.len(),
-            jvt_proof.key_data.len(),
-            jvt_proof.verifier_queries.len(),
-            &state_root.as_bytes()[..8]
-        );
-    }
-    result
+    jvt::verkle_proof::verify(&jvt_proof, state_root_commitment, &keys, &values)
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────

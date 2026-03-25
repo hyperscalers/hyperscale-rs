@@ -65,12 +65,17 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 
         // General crypto
         Action::AggregateExecutionCertificate { .. } => Some(DispatchPool::Crypto),
-        Action::VerifyStateProvisions { .. } => Some(DispatchPool::Crypto),
+
+        // Provision work: both prove and verify do IPA math. Runs on the
+        // execution pool to avoid starving AggregateExecutionCertificate on
+        // the crypto pool. The execution pool is larger and provision work
+        // is not latency-critical for consensus.
+        Action::VerifyStateProvisions { .. } => Some(DispatchPool::Execution),
+        Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Execution),
 
         // Execution
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
         Action::SpeculativeExecute { .. } => Some(DispatchPool::Execution),
-        Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Execution),
         _ => None,
     }
 }
@@ -378,6 +383,12 @@ pub(crate) fn handle_delegated_action<
                 qc_start.elapsed().as_secs_f64(),
             );
 
+            eprintln!(
+                "[VERIFY] START provisions={} qc_ms={}",
+                provisions.len(),
+                qc_start.elapsed().as_millis()
+            );
+
             // Verify merkle proofs against the verified header's state root.
             // All provisions from the same block share a single batched proof,
             // so we collect all entries and verify once instead of N times.
@@ -401,6 +412,12 @@ pub(crate) fn handle_delegated_action<
                     header.header.state_root,
                 )
             });
+            eprintln!(
+                "[VERIFY] DONE valid={} verify_ms={} provisions={}",
+                all_valid,
+                merkle_start.elapsed().as_millis(),
+                provisions.len()
+            );
             let results: Vec<ProvisionVerificationResult> = provisions
                 .into_iter()
                 .map(|provision| ProvisionVerificationResult {
@@ -536,6 +553,14 @@ pub(crate) fn handle_delegated_action<
             use hyperscale_types::StateProvision;
             use std::collections::HashMap;
 
+            let proactive_start = std::time::Instant::now();
+            eprintln!(
+                "[PROACTIVE] START height={} requests={} shard={}",
+                block_height.0,
+                requests.len(),
+                source_shard.0
+            );
+
             // Phase 1: Fetch state entries for all transactions.
             let mut per_tx: Vec<(
                 Hash,
@@ -544,6 +569,7 @@ pub(crate) fn handle_delegated_action<
             )> = Vec::with_capacity(requests.len());
             let mut all_storage_keys: Vec<Vec<u8>> = Vec::new();
 
+            let fetch_start = std::time::Instant::now();
             for req in &requests {
                 let entries =
                     match ctx
@@ -552,11 +578,9 @@ pub(crate) fn handle_delegated_action<
                     {
                         Some(entries) => entries,
                         None => {
-                            tracing::warn!(
-                                block_height = block_height.0,
-                                tx_hash = ?req.tx_hash,
-                                "Proactive provision: JMT version unavailable, \
-                                 skipping (target shard will use fallback recovery)"
+                            eprintln!(
+                                "[PROACTIVE] fetch_state_entries FAILED height={} tx={:?}",
+                                block_height.0, req.tx_hash
                             );
                             continue;
                         }
@@ -566,8 +590,17 @@ pub(crate) fn handle_delegated_action<
                 }
                 per_tx.push((req.tx_hash, req.target_shards.clone(), Arc::new(entries)));
             }
+            let fetch_ms = fetch_start.elapsed().as_millis();
+            eprintln!(
+                "[PROACTIVE] phase1 fetch done: height={} txs={} keys={} fetch_ms={}",
+                block_height.0,
+                per_tx.len(),
+                all_storage_keys.len(),
+                fetch_ms
+            );
 
             if per_tx.is_empty() {
+                eprintln!("[PROACTIVE] no entries, returning empty");
                 return Some(DelegatedResult {
                     events: vec![NodeInput::ProvisionsReady { batches: vec![] }],
                     prepared_commit: None,
@@ -577,16 +610,16 @@ pub(crate) fn handle_delegated_action<
             // Phase 2: Generate ONE batched proof covering all entries across all transactions.
             all_storage_keys.sort();
             all_storage_keys.dedup();
+            let proof_start = std::time::Instant::now();
             let proof = match ctx
                 .storage
                 .generate_merkle_proofs(&all_storage_keys, block_height.0)
             {
                 Some(p) => Arc::new(p),
                 None => {
-                    tracing::warn!(
-                        block_height = block_height.0,
-                        "Proactive provision: batched proof generation failed, \
-                         skipping all (target shards will use fallback recovery)"
+                    eprintln!(
+                        "[PROACTIVE] proof generation FAILED height={}",
+                        block_height.0
                     );
                     return Some(DelegatedResult {
                         events: vec![NodeInput::ProvisionsReady { batches: vec![] }],
@@ -594,6 +627,14 @@ pub(crate) fn handle_delegated_action<
                     });
                 }
             };
+            let proof_ms = proof_start.elapsed().as_millis();
+            eprintln!(
+                "[PROACTIVE] phase2 proof done: height={} unique_keys={} proof_ms={} total_ms={}",
+                block_height.0,
+                all_storage_keys.len(),
+                proof_ms,
+                proactive_start.elapsed().as_millis()
+            );
 
             // Phase 3: Build provisions sharing the single proof.
             let mut batches: HashMap<ShardGroupId, Vec<StateProvision>> = HashMap::new();

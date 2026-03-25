@@ -661,7 +661,16 @@ where
         let prepared_commits = Arc::clone(&self.prepared_commits);
         let event_tx = self.event_sender.clone();
 
+        let dispatch_time = std::time::Instant::now();
+        let action_name = action.type_name().to_string();
         let spawn_fn = move || {
+            let queue_ms = dispatch_time.elapsed().as_millis();
+            if queue_ms > 50 {
+                eprintln!(
+                    "[DISPATCH] {} waited {}ms in queue before starting",
+                    action_name, queue_ms
+                );
+            }
             let start = std::time::Instant::now();
             let ctx = ActionContext {
                 storage: &*storage,
