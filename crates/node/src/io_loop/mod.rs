@@ -788,14 +788,6 @@ where
                         self.validator_id,
                         sig,
                     );
-                    eprintln!(
-                        "[BROADCAST] height={} shard={} provisions={} recipients={} proof_bytes={}",
-                        block_height.0,
-                        shard.0,
-                        notification.provisions.len(),
-                        recipients.len(),
-                        notification.proof.as_bytes().len(),
-                    );
                     self.network.notify(&recipients, &notification);
                 }
             }

@@ -354,12 +354,6 @@ pub(crate) fn handle_delegated_action<
                 qc_start.elapsed().as_secs_f64(),
             );
 
-            eprintln!(
-                "[VERIFY] START provisions={} qc_ms={}",
-                batch.transactions.len(),
-                qc_start.elapsed().as_millis()
-            );
-
             // Verify merkle proofs against the verified header's state root.
             let merkle_start = std::time::Instant::now();
             let all_valid = verified_header.as_ref().is_some_and(|header| {
@@ -373,12 +367,6 @@ pub(crate) fn handle_delegated_action<
                     header.header.state_root,
                 )
             });
-            eprintln!(
-                "[VERIFY] DONE valid={} verify_ms={} txs={}",
-                all_valid,
-                merkle_start.elapsed().as_millis(),
-                batch.transactions.len()
-            );
             metrics::record_signature_verification_latency(
                 "inclusion_proof",
                 merkle_start.elapsed().as_secs_f64(),
@@ -506,12 +494,6 @@ pub(crate) fn handle_delegated_action<
             use std::collections::HashMap;
 
             let proactive_start = std::time::Instant::now();
-            eprintln!(
-                "[PROACTIVE] START height={} requests={} shard={}",
-                block_height.0,
-                requests.len(),
-                source_shard.0
-            );
 
             // Phase 1: Fetch state entries for all transactions.
             let mut per_tx: Vec<(
@@ -521,7 +503,6 @@ pub(crate) fn handle_delegated_action<
             )> = Vec::with_capacity(requests.len());
             let mut all_storage_keys: Vec<Vec<u8>> = Vec::new();
 
-            let fetch_start = std::time::Instant::now();
             for req in &requests {
                 let entries =
                     match ctx
@@ -530,10 +511,6 @@ pub(crate) fn handle_delegated_action<
                     {
                         Some(entries) => entries,
                         None => {
-                            eprintln!(
-                                "[PROACTIVE] fetch_state_entries FAILED height={} tx={:?}",
-                                block_height.0, req.tx_hash
-                            );
                             continue;
                         }
                     };
@@ -542,17 +519,7 @@ pub(crate) fn handle_delegated_action<
                 }
                 per_tx.push((req.tx_hash, req.target_shards.clone(), Arc::new(entries)));
             }
-            let fetch_ms = fetch_start.elapsed().as_millis();
-            eprintln!(
-                "[PROACTIVE] phase1 fetch done: height={} txs={} keys={} fetch_ms={}",
-                block_height.0,
-                per_tx.len(),
-                all_storage_keys.len(),
-                fetch_ms
-            );
-
             if per_tx.is_empty() {
-                eprintln!("[PROACTIVE] no entries, returning empty");
                 return Some(DelegatedResult {
                     events: vec![NodeInput::ProvisionsReady { batches: vec![] }],
                     prepared_commit: None,
@@ -563,10 +530,6 @@ pub(crate) fn handle_delegated_action<
             // would arrive stale and the target shard will use fallback anyway.
             let queued_ms = proactive_start.elapsed().as_millis();
             if queued_ms > 5000 {
-                eprintln!(
-                    "[PROACTIVE] SKIPPING height={} — queued {}ms, too stale",
-                    block_height.0, queued_ms
-                );
                 return Some(DelegatedResult {
                     events: vec![NodeInput::ProvisionsReady { batches: vec![] }],
                     prepared_commit: None,
@@ -576,32 +539,18 @@ pub(crate) fn handle_delegated_action<
             // Phase 2: Generate ONE batched proof covering all entries across all transactions.
             all_storage_keys.sort();
             all_storage_keys.dedup();
-            let proof_start = std::time::Instant::now();
             let proof = match ctx
                 .storage
                 .generate_merkle_proofs(&all_storage_keys, block_height.0)
             {
                 Some(p) => Arc::new(p),
                 None => {
-                    eprintln!(
-                        "[PROACTIVE] proof generation FAILED height={}",
-                        block_height.0
-                    );
                     return Some(DelegatedResult {
                         events: vec![NodeInput::ProvisionsReady { batches: vec![] }],
                         prepared_commit: None,
                     });
                 }
             };
-            let proof_ms = proof_start.elapsed().as_millis();
-            eprintln!(
-                "[PROACTIVE] phase2 proof done: height={} unique_keys={} proof_ms={} total_ms={}",
-                block_height.0,
-                all_storage_keys.len(),
-                proof_ms,
-                proactive_start.elapsed().as_millis()
-            );
-
             // Phase 3: Build provisions sharing the single proof.
             // Group entries per target shard.
             let mut shard_tx_entries: HashMap<ShardGroupId, Vec<TxEntries>> = HashMap::new();
