@@ -493,8 +493,6 @@ pub(crate) fn handle_delegated_action<
         } => {
             use std::collections::HashMap;
 
-            let proactive_start = std::time::Instant::now();
-
             // Phase 1: Fetch state entries for all transactions.
             let mut per_tx: Vec<(
                 Hash,
@@ -520,16 +518,6 @@ pub(crate) fn handle_delegated_action<
                 per_tx.push((req.tx_hash, req.target_shards.clone(), Arc::new(entries)));
             }
             if per_tx.is_empty() {
-                return Some(DelegatedResult {
-                    events: vec![NodeInput::ProvisionsReady { batches: vec![] }],
-                    prepared_commit: None,
-                });
-            }
-
-            // Skip proof generation if we've been queued too long — the provisions
-            // would arrive stale and the target shard will use fallback anyway.
-            let queued_ms = proactive_start.elapsed().as_millis();
-            if queued_ms > 5000 {
                 return Some(DelegatedResult {
                     events: vec![NodeInput::ProvisionsReady { batches: vec![] }],
                     prepared_commit: None,
