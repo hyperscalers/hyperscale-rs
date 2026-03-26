@@ -292,16 +292,13 @@ where
                         request,
                         Box::new(move |result| match result {
                             Ok(response) => {
-                                if let (Some(proof), Some(leaf_hash)) =
-                                    (response.proof, response.leaf_hash)
-                                {
+                                if let Some(proof) = response.proof {
                                     let _ = sender.send(NodeInput::InclusionProofFetchReceived {
                                         winner_tx_hash,
                                         loser_tx_hash,
                                         source_shard,
                                         source_block_height: block_height,
                                         proof,
-                                        leaf_hash,
                                     });
                                 } else {
                                     let _ = sender.send(NodeInput::InclusionProofFetchFailed {
@@ -322,7 +319,6 @@ where
                     source_shard,
                     source_block_height,
                     proof,
-                    leaf_hash,
                 } => {
                     let actions = self.state.on_inclusion_proof_received(
                         winner_tx_hash,
@@ -330,7 +326,6 @@ where
                         source_shard,
                         source_block_height,
                         proof,
-                        leaf_hash,
                     );
                     for action in actions {
                         self.process_action(action);

@@ -139,7 +139,6 @@ pub enum NodeInput {
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
         proof: TransactionInclusionProof,
-        leaf_hash: Hash,
     },
 
     /// Transaction inclusion proof fetch failed (network error or peer returned None).

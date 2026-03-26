@@ -708,13 +708,11 @@ impl NodeStateMachine {
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
         proof: hyperscale_types::TransactionInclusionProof,
-        leaf_hash: Hash,
     ) -> Vec<Action> {
         self.livelock.on_inclusion_proof_received(
             winner_tx_hash,
             loser_tx_hash,
             proof,
-            leaf_hash,
             source_shard,
             source_block_height,
         );

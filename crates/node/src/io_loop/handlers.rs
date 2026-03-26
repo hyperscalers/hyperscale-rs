@@ -69,22 +69,13 @@ where
                     let (block, _qc) = match storage.get_block(req.block_height) {
                         Some(pair) => pair,
                         None => {
-                            return GetTxInclusionProofResponse {
-                                proof: None,
-                                leaf_hash: None,
-                            };
+                            return GetTxInclusionProofResponse { proof: None };
                         }
                     };
 
                     match tx_inclusion_proof(&block, &req.tx_hash) {
-                        Some((proof, leaf_hash)) => GetTxInclusionProofResponse {
-                            proof: Some(proof),
-                            leaf_hash: Some(leaf_hash),
-                        },
-                        None => GetTxInclusionProofResponse {
-                            proof: None,
-                            leaf_hash: None,
-                        },
+                        Some(proof) => GetTxInclusionProofResponse { proof: Some(proof) },
+                        None => GetTxInclusionProofResponse { proof: None },
                     }
                 },
             );

@@ -673,7 +673,6 @@ where
                 source_shard,
                 source_block_height,
                 proof,
-                leaf_hash,
             } => {
                 let outputs = self.inclusion_proof_fetch_protocol.handle(
                     InclusionProofFetchInput::Received {
@@ -682,7 +681,6 @@ where
                         source_shard,
                         source_block_height,
                         proof,
-                        leaf_hash,
                     },
                 );
                 self.process_inclusion_proof_fetch_outputs(outputs);

@@ -1,6 +1,6 @@
 //! Transaction inclusion proof response for livelock deferral verification.
 
-use hyperscale_types::{Hash, MessagePriority, NetworkMessage, TransactionInclusionProof};
+use hyperscale_types::{MessagePriority, NetworkMessage, TransactionInclusionProof};
 use sbor::prelude::BasicSbor;
 
 /// Response containing a merkle inclusion proof for a transaction.
@@ -12,8 +12,6 @@ use sbor::prelude::BasicSbor;
 pub struct GetTxInclusionProofResponse {
     /// Merkle inclusion proof, if the transaction was found in the block.
     pub proof: Option<TransactionInclusionProof>,
-    /// Tagged leaf hash: `hash(TAG || tx_hash)`.
-    pub leaf_hash: Option<Hash>,
 }
 
 impl NetworkMessage for GetTxInclusionProofResponse {
@@ -29,6 +27,7 @@ impl NetworkMessage for GetTxInclusionProofResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hyperscale_types::Hash;
 
     #[test]
     fn test_sbor_roundtrip_some() {
@@ -36,8 +35,8 @@ mod tests {
             proof: Some(TransactionInclusionProof {
                 siblings: vec![Hash::from_bytes(b"sib1"), Hash::from_bytes(b"sib2")],
                 leaf_index: 3,
+                leaf_hash: Hash::from_bytes(b"leaf"),
             }),
-            leaf_hash: Some(Hash::from_bytes(b"leaf")),
         };
 
         let encoded = sbor::basic_encode(&response).unwrap();
@@ -47,10 +46,7 @@ mod tests {
 
     #[test]
     fn test_sbor_roundtrip_none() {
-        let response = GetTxInclusionProofResponse {
-            proof: None,
-            leaf_hash: None,
-        };
+        let response = GetTxInclusionProofResponse { proof: None };
 
         let encoded = sbor::basic_encode(&response).unwrap();
         let decoded: GetTxInclusionProofResponse = sbor::basic_decode(&encoded).unwrap();

@@ -77,10 +77,7 @@ pub fn compute_transaction_root(
 /// merkle inclusion proof plus the tagged leaf hash.
 ///
 /// Returns `None` if the transaction is not in the block.
-pub fn tx_inclusion_proof(
-    block: &Block,
-    tx_hash: &Hash,
-) -> Option<(TransactionInclusionProof, Hash)> {
+pub fn tx_inclusion_proof(block: &Block, tx_hash: &Hash) -> Option<TransactionInclusionProof> {
     let total_count = block.retry_transactions.len()
         + block.priority_transactions.len()
         + block.transactions.len();
@@ -111,9 +108,8 @@ pub fn tx_inclusion_proof(
         *leaf == target_retry || *leaf == target_priority || *leaf == target_normal
     })?;
 
-    let leaf_hash = leaves[index];
     let (_root, proof) = compute_merkle_root_with_proof(&leaves, index);
-    Some((proof, leaf_hash))
+    Some(proof)
 }
 
 /// Block header containing consensus metadata.

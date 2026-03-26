@@ -423,10 +423,6 @@ pub struct TransactionDefer {
     /// Merkle inclusion proof for the winner transaction in the source block.
     /// Verified against the source block header's `transaction_root`.
     pub tx_inclusion_proof: TransactionInclusionProof,
-
-    /// Tagged leaf hash: `hash(TAG || winner_tx_hash)`.
-    /// Included so the verifier doesn't need to try all three tags.
-    pub leaf_hash: Hash,
 }
 
 /// Reason a transaction was aborted.

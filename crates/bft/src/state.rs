@@ -2008,7 +2008,8 @@ impl BftState {
                 let valid_leaf = [b"RETRY" as &[u8], b"PRIORITY", b"NORMAL"]
                     .iter()
                     .any(|tag| {
-                        Hash::from_parts(&[tag, winner_tx_hash.as_bytes()]) == deferral.leaf_hash
+                        Hash::from_parts(&[tag, winner_tx_hash.as_bytes()])
+                            == deferral.tx_inclusion_proof.leaf_hash
                     });
                 if !valid_leaf {
                     return Err(format!(
@@ -2019,7 +2020,6 @@ impl BftState {
 
                 if !verify_merkle_inclusion(
                     committed_header.header.transaction_root,
-                    deferral.leaf_hash,
                     &deferral.tx_inclusion_proof,
                 ) {
                     return Err(format!(
@@ -5480,8 +5480,8 @@ mod tests {
             tx_inclusion_proof: TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
+                leaf_hash: Hash::ZERO,
             },
-            leaf_hash: Hash::ZERO,
         }
     }
 
@@ -5535,8 +5535,8 @@ mod tests {
             tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
+                leaf_hash: Hash::ZERO,
             },
-            leaf_hash: Hash::ZERO,
         };
         let block = make_test_block(5, vec![valid_deferral], vec![], vec![]);
         assert!(state.validate_deferrals_and_aborts(&block).is_ok());
@@ -5553,8 +5553,8 @@ mod tests {
             tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
+                leaf_hash: Hash::ZERO,
             },
-            leaf_hash: Hash::ZERO,
         };
         let block = make_test_block(5, vec![invalid_deferral], vec![], vec![]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -5591,8 +5591,8 @@ mod tests {
             tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
+                leaf_hash: Hash::ZERO,
             },
-            leaf_hash: Hash::ZERO,
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![winner_cert]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -5629,8 +5629,8 @@ mod tests {
             tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
+                leaf_hash: Hash::ZERO,
             },
-            leaf_hash: Hash::ZERO,
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![loser_cert]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -5660,8 +5660,8 @@ mod tests {
             tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
+                leaf_hash: Hash::ZERO,
             },
-            leaf_hash: Hash::ZERO,
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![]);
         // Structural validation should pass (merkle proof verification against

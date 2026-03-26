@@ -2129,8 +2129,8 @@ mod tests {
             tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
+                leaf_hash: Hash::ZERO,
             },
-            leaf_hash: Hash::ZERO,
         }
     }
 

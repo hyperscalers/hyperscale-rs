@@ -49,7 +49,6 @@ pub enum InclusionProofFetchInput {
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
         proof: TransactionInclusionProof,
-        leaf_hash: Hash,
     },
     /// A fetch attempt failed.
     Failed { winner_tx_hash: Hash },
@@ -80,7 +79,6 @@ pub enum InclusionProofFetchOutput {
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
         proof: TransactionInclusionProof,
-        leaf_hash: Hash,
     },
 }
 
@@ -138,14 +136,12 @@ impl InclusionProofFetchProtocol {
                 source_shard,
                 source_block_height,
                 proof,
-                leaf_hash,
             } => self.handle_received(
                 winner_tx_hash,
                 loser_tx_hash,
                 source_shard,
                 source_block_height,
                 proof,
-                leaf_hash,
             ),
             InclusionProofFetchInput::Failed { winner_tx_hash } => {
                 self.handle_failed(winner_tx_hash)
@@ -222,7 +218,6 @@ impl InclusionProofFetchProtocol {
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
         proof: TransactionInclusionProof,
-        leaf_hash: Hash,
     ) -> Vec<InclusionProofFetchOutput> {
         if self.pending.remove(&winner_tx_hash).is_some() {
             debug!(
@@ -235,7 +230,6 @@ impl InclusionProofFetchProtocol {
                 source_shard,
                 source_block_height,
                 proof,
-                leaf_hash,
             }]
         } else {
             trace!(
@@ -387,6 +381,7 @@ mod tests {
         TransactionInclusionProof {
             siblings: vec![],
             leaf_index: 0,
+            leaf_hash: Hash::ZERO,
         }
     }
 
@@ -533,7 +528,6 @@ mod tests {
             source_shard: shard(1),
             source_block_height: height(10),
             proof: dummy_proof(),
-            leaf_hash: Hash::ZERO,
         });
 
         assert_eq!(outputs.len(), 1);
@@ -582,7 +576,6 @@ mod tests {
             source_shard: shard(1),
             source_block_height: height(10),
             proof: dummy_proof(),
-            leaf_hash: Hash::ZERO,
         });
         assert!(outputs.is_empty());
     }

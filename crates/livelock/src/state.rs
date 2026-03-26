@@ -361,7 +361,6 @@ impl LivelockState {
         winner_tx_hash: Hash,
         loser_tx_hash: Hash,
         proof: TransactionInclusionProof,
-        leaf_hash: Hash,
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
     ) {
@@ -372,7 +371,6 @@ impl LivelockState {
             source_shard,
             source_block_height,
             proof,
-            leaf_hash,
         );
     }
 
@@ -387,7 +385,6 @@ impl LivelockState {
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
         proof: TransactionInclusionProof,
-        leaf_hash: Hash,
     ) {
         // Check if already queued
         if self.pending_deferral_hashes.contains(&loser_tx) {
@@ -404,7 +401,6 @@ impl LivelockState {
             source_shard,
             source_block_height,
             tx_inclusion_proof: proof,
-            leaf_hash,
         };
 
         debug!(
@@ -603,6 +599,7 @@ mod tests {
         TransactionInclusionProof {
             siblings: vec![],
             leaf_index: 0,
+            leaf_hash: Hash::ZERO,
         }
     }
 
@@ -630,7 +627,6 @@ mod tests {
                         *winner_tx_hash,
                         *loser_tx_hash,
                         dummy_proof(),
-                        Hash::ZERO,
                         *source_shard,
                         *source_block_height,
                     );
@@ -650,7 +646,6 @@ mod tests {
             source_shard: ShardGroupId(1),
             source_block_height: BlockHeight(1),
             tx_inclusion_proof: dummy_proof(),
-            leaf_hash: Hash::ZERO,
         }
     }
 
@@ -694,7 +689,6 @@ mod tests {
             remote_tx,
             local_tx,
             dummy_proof(),
-            Hash::ZERO,
             ShardGroupId(1),
             BlockHeight(1),
         );
