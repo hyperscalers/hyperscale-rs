@@ -65,6 +65,54 @@ where
             Action::BroadcastExecutionVote { shard, vote } => {
                 self.accumulate_broadcast_vote(shard, vote);
             }
+            Action::SignAndBroadcastWaveVote {
+                block_hash,
+                block_height,
+                wave_id,
+                wave_receipt_root,
+                tx_count,
+                tx_outcomes: _,          // TODO: stash for later cert aggregation
+                participating_shards: _, // TODO: stash for later cert broadcast
+            } => {
+                // Sign the wave vote inline (BLS signing is fast, ~1ms)
+                let msg = hyperscale_types::exec_wave_vote_message(
+                    &block_hash,
+                    block_height,
+                    &wave_id,
+                    self.local_shard,
+                    &wave_receipt_root,
+                    tx_count,
+                );
+                let sig = self.signing_key.sign_v1(&msg);
+                let vote = hyperscale_types::ExecutionWaveVote {
+                    block_hash,
+                    block_height,
+                    wave_id,
+                    shard_group_id: self.local_shard,
+                    wave_receipt_root,
+                    tx_count,
+                    validator: self.validator_id,
+                    signature: sig,
+                };
+
+                // Send immediately — wave is the batch, no accumulator needed
+                let batch_msg = hyperscale_types::exec_wave_vote_batch_message(
+                    self.local_shard,
+                    std::slice::from_ref(&vote),
+                );
+                let batch_sig = self.signing_key.sign_v1(&batch_msg);
+                let batch = hyperscale_messages::ExecutionWaveVotesNotification::new(
+                    vec![vote.clone()],
+                    self.validator_id,
+                    batch_sig,
+                );
+                self.network.notify(&self.cached_local_peers, &batch);
+
+                // Also feed our own wave vote back to the state machine for tracking
+                let _ = self.event_sender.send(hyperscale_core::NodeInput::Protocol(
+                    hyperscale_core::ProtocolEvent::ExecutionWaveVoteReceived { vote },
+                ));
+            }
             Action::BroadcastExecutionWaveVote { shard, vote } => {
                 // Wave votes are already batched by wave — send immediately, no accumulator.
                 let msg = hyperscale_types::exec_wave_vote_batch_message(

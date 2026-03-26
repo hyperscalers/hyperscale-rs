@@ -17,6 +17,9 @@ mod state;
 mod trackers;
 
 pub use execution_cache::ExecutionCache;
-pub use state::{ExecutionState, DEFAULT_SPECULATIVE_MAX_TXS, DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS};
+pub use state::{
+    ExecutionState, WaveCompletionData, DEFAULT_SPECULATIVE_MAX_TXS,
+    DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS,
+};
 pub use trackers::WaveVoteTracker;
 pub use wave_accumulator::WaveAccumulator;

@@ -105,10 +105,26 @@ pub enum Action {
         recipients: Vec<ValidatorId>,
     },
 
-    /// Broadcast an execution wave vote to the local shard.
+    /// Sign and broadcast an execution wave vote to the local shard.
     ///
-    /// Wave votes cover all transactions in a deterministic wave partition
-    /// of the block, replacing per-transaction execution votes.
+    /// Emitted by the state machine when a wave completes (all txs executed).
+    /// The io_loop signs the vote (it owns the signing key) and broadcasts.
+    /// Wave votes are sent immediately — no batch accumulator needed.
+    SignAndBroadcastWaveVote {
+        block_hash: Hash,
+        block_height: u64,
+        wave_id: WaveId,
+        wave_receipt_root: Hash,
+        tx_count: u32,
+        /// Per-tx outcomes (needed later for cert aggregation).
+        tx_outcomes: Vec<WaveTxOutcome>,
+        /// All participating shards (for cert broadcast recipients).
+        participating_shards: Vec<ShardGroupId>,
+    },
+
+    /// Broadcast an already-signed execution wave vote to the local shard.
+    ///
+    /// Used when re-broadcasting a received wave vote.
     BroadcastExecutionWaveVote {
         shard: ShardGroupId,
         vote: ExecutionWaveVote,
@@ -829,6 +845,7 @@ impl Action {
                 | Action::BroadcastTransaction { .. }
                 | Action::BroadcastExecutionVote { .. }
                 | Action::BroadcastExecutionCertificate { .. }
+                | Action::SignAndBroadcastWaveVote { .. }
                 | Action::BroadcastExecutionWaveVote { .. }
                 | Action::BroadcastExecutionWaveCertificate { .. }
                 | Action::BroadcastCommittedBlockHeader { .. }
@@ -885,6 +902,7 @@ impl Action {
             // Network - Execution Layer (batchable)
             Action::BroadcastExecutionVote { .. } => "BroadcastExecutionVote",
             Action::BroadcastExecutionCertificate { .. } => "BroadcastExecutionCertificate",
+            Action::SignAndBroadcastWaveVote { .. } => "SignAndBroadcastWaveVote",
             Action::BroadcastExecutionWaveVote { .. } => "BroadcastExecutionWaveVote",
             Action::BroadcastExecutionWaveCertificate { .. } => "BroadcastExecutionWaveCertificate",
             Action::BroadcastCommittedBlockHeader { .. } => "BroadcastCommittedBlockHeader",

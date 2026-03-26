@@ -1016,7 +1016,32 @@ impl StateMachine for NodeStateMachine {
 
             // ── Execution ────────────────────────────────────────────────
             ProtocolEvent::ExecutionVoteReceived { vote } => {
-                self.execution.on_vote(self.topology.snapshot(), vote)
+                let mut actions = self
+                    .execution
+                    .on_vote(self.topology.snapshot(), vote.clone());
+
+                // If this is our own vote (from cross-shard execution), also
+                // record into wave accumulator for wave vote signing.
+                if vote.validator == self.topology.snapshot().local_validator_id() {
+                    if let Some(completion) = self.execution.record_wave_result(
+                        vote.transaction_hash,
+                        vote.receipt_hash,
+                        vote.success,
+                        vote.write_nodes,
+                    ) {
+                        actions.push(Action::SignAndBroadcastWaveVote {
+                            block_hash: completion.block_hash,
+                            block_height: completion.block_height,
+                            wave_id: completion.wave_id,
+                            wave_receipt_root: completion.wave_receipt_root,
+                            tx_count: completion.tx_outcomes.len() as u32,
+                            tx_outcomes: completion.tx_outcomes,
+                            participating_shards: completion.participating_shards,
+                        });
+                    }
+                }
+
+                actions
             }
             ProtocolEvent::ExecutionBatchCompleted {
                 votes,
@@ -1079,10 +1104,34 @@ impl StateMachine for NodeStateMachine {
                     );
                 }
 
-                // Process votes through VoteTracker
-                for vote in votes {
-                    actions.extend(self.execution.on_vote(self.topology.snapshot(), vote));
+                // Process votes through VoteTracker (existing per-tx path)
+                for vote in &votes {
+                    actions.extend(
+                        self.execution
+                            .on_vote(self.topology.snapshot(), vote.clone()),
+                    );
                 }
+
+                // Record results into wave accumulators (new wave path)
+                for vote in &votes {
+                    if let Some(completion) = self.execution.record_wave_result(
+                        vote.transaction_hash,
+                        vote.receipt_hash,
+                        vote.success,
+                        vote.write_nodes.clone(),
+                    ) {
+                        actions.push(Action::SignAndBroadcastWaveVote {
+                            block_hash: completion.block_hash,
+                            block_height: completion.block_height,
+                            wave_id: completion.wave_id,
+                            wave_receipt_root: completion.wave_receipt_root,
+                            tx_count: completion.tx_outcomes.len() as u32,
+                            tx_outcomes: completion.tx_outcomes,
+                            participating_shards: completion.participating_shards,
+                        });
+                    }
+                }
+
                 actions
             }
             ProtocolEvent::ExecutionCertificateReceived { cert } => self
@@ -1114,28 +1163,34 @@ impl StateMachine for NodeStateMachine {
                 .execution
                 .on_speculative_execution_complete(block_hash, tx_hashes),
 
-            // ── Wave Execution (new wave-based voting) ───────────────────
-            // TODO(wave-voting): Wire to ExecutionState wave handlers once Phase 5 is complete.
-            ProtocolEvent::ExecutionWaveVoteReceived { vote: _ } => {
-                tracing::trace!("ExecutionWaveVoteReceived (not yet wired)");
-                vec![]
+            // ── Wave Execution (wave-based voting) ────────────────────────
+            ProtocolEvent::ExecutionWaveVoteReceived { vote } => {
+                self.execution.on_wave_vote(self.topology.snapshot(), vote)
             }
-            ProtocolEvent::ExecutionWaveVotesVerifiedAndAggregated { .. } => {
-                tracing::trace!("ExecutionWaveVotesVerifiedAndAggregated (not yet wired)");
-                vec![]
-            }
-            ProtocolEvent::ExecutionWaveCertificateAggregated { .. } => {
-                tracing::trace!("ExecutionWaveCertificateAggregated (not yet wired)");
-                vec![]
-            }
-            ProtocolEvent::ExecutionWaveCertificateReceived { .. } => {
-                tracing::trace!("ExecutionWaveCertificateReceived (not yet wired)");
-                vec![]
-            }
-            ProtocolEvent::ExecutionWaveCertificateSignatureVerified { .. } => {
-                tracing::trace!("ExecutionWaveCertificateSignatureVerified (not yet wired)");
-                vec![]
-            }
+            ProtocolEvent::ExecutionWaveVotesVerifiedAndAggregated {
+                wave_id,
+                block_hash,
+                verified_votes,
+            } => self.execution.on_wave_votes_verified(
+                self.topology.snapshot(),
+                wave_id,
+                block_hash,
+                verified_votes,
+            ),
+            ProtocolEvent::ExecutionWaveCertificateAggregated {
+                wave_id,
+                certificate,
+            } => self.execution.on_wave_certificate_aggregated(
+                self.topology.snapshot(),
+                wave_id,
+                certificate,
+            ),
+            ProtocolEvent::ExecutionWaveCertificateReceived { cert } => self
+                .execution
+                .on_wave_certificate(self.topology.snapshot(), cert),
+            ProtocolEvent::ExecutionWaveCertificateSignatureVerified { certificate, valid } => self
+                .execution
+                .on_wave_certificate_verified(self.topology.snapshot(), certificate, valid),
 
             // ── Transactions ─────────────────────────────────────────────
             ProtocolEvent::TransactionExecuted { tx_hash, accepted } => {
