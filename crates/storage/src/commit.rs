@@ -8,11 +8,11 @@ use hyperscale_types::{BlockHeight, Hash, QuorumCertificate, TransactionCertific
 use radix_substate_store_interface::interface::DatabaseUpdates;
 use std::sync::Arc;
 
-/// Consensus metadata to be committed atomically with JMT + substate writes.
+/// Consensus metadata to be committed atomically with JVT + substate writes.
 ///
 /// When provided, the storage backend folds this into the same atomic write
-/// as the JMT and substate data, preventing crash-recovery inconsistencies
-/// where JMT advances to height H but consensus metadata is still at H-1.
+/// as the JVT and substate data, preventing crash-recovery inconsistencies
+/// where JVT advances to height H but consensus metadata is still at H-1.
 pub struct ConsensusCommitData {
     /// The committed block height.
     pub height: BlockHeight,
@@ -35,17 +35,17 @@ pub struct ConsensusCommitData {
 pub trait CommitStore: Send + Sync {
     /// Opaque handle carrying precomputed commit work.
     ///
-    /// For RocksDB this contains a `WriteBatch` + `JmtSnapshot`.
-    /// For SimStorage this contains a `JmtSnapshot` + pre-applied state.
+    /// For RocksDB this contains a `WriteBatch` + `JvtSnapshot`.
+    /// For SimStorage this contains a `JvtSnapshot` + pre-applied state.
     type PreparedCommit: Send + 'static;
 
     /// Compute speculative state root and return precomputed commit work.
     ///
     /// Receives pre-merged `DatabaseUpdates` (already filtered to local shard)
-    /// and computes the speculative JMT root. The caller is responsible for
+    /// and computes the speculative JVT root. The caller is responsible for
     /// sourcing the writes (from execution cache or receipt storage) and merging.
     ///
-    /// `block_height` is the height of the block being prepared (used as JMT version).
+    /// `block_height` is the height of the block being prepared (used as JVT version).
     ///
     /// Returns `(computed_state_root, prepared_commit_handle)`.
     fn prepare_block_commit(
@@ -57,14 +57,14 @@ pub trait CommitStore: Send + Sync {
 
     /// Commit a block using precomputed work from `prepare_block_commit`.
     ///
-    /// This is the fast path: applies the cached `WriteBatch`/`JmtSnapshot`
+    /// This is the fast path: applies the cached `WriteBatch`/`JvtSnapshot`
     /// directly. Falls back to per-certificate recompute if the prepared
     /// data is stale (base root/version mismatch).
     ///
     /// `certificates` are stored to the certificate column family for querying.
     ///
     /// When `consensus` is provided, the consensus metadata is written
-    /// atomically in the same batch as the JMT + substate data.
+    /// atomically in the same batch as the JVT + substate data.
     fn commit_prepared_block(
         &self,
         prepared: Self::PreparedCommit,
@@ -77,10 +77,10 @@ pub trait CommitStore: Send + Sync {
     /// Used when no `PreparedCommit` is available (e.g., sync blocks,
     /// cache eviction, or proposer fast-path not applicable).
     ///
-    /// `block_height` is the height of the block being committed (used as JMT version).
+    /// `block_height` is the height of the block being committed (used as JVT version).
     ///
     /// When `consensus` is provided, the consensus metadata is written
-    /// atomically in the same batch as the JMT + substate data.
+    /// atomically in the same batch as the JVT + substate data.
     fn commit_block(
         &self,
         merged_updates: &DatabaseUpdates,

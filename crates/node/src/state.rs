@@ -1,19 +1,17 @@
 //! Node state machine.
 
 use hyperscale_bft::{BftConfig, BftState, RecoveredState};
-use hyperscale_core::{Action, ProtocolEvent, ProvisionVerificationResult, StateMachine, TimerId};
+use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_execution::ExecutionState;
 use hyperscale_livelock::LivelockState;
 use hyperscale_mempool::{MempoolConfig, MempoolState};
 use hyperscale_provisions::ProvisionCoordinator;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommitmentProof,
-    CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, ReceiptBundle,
-    RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate,
-    TransactionDefer,
+    Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommittedBlockHeader,
+    Hash, ProvisionBatch, QuorumCertificate, ReadyTransactions, ReceiptBundle, RoutableTransaction,
+    ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
@@ -25,13 +23,13 @@ pub type NodeIndex = u32;
 // ─── Constants ──────────────────────────────────────────────────────────
 
 /// How many blocks a cross-shard transaction can wait before being aborted.
-const EXECUTION_TIMEOUT_BLOCKS: u64 = 30;
+const EXECUTION_TIMEOUT_BLOCKS: u64 = 10;
 
 /// Maximum number of times a timed-out transaction can be retried.
 const MAX_RETRIES: u32 = 3;
 
 /// How many blocks to retain tombstones in the mempool (gossip deduplication).
-const TOMBSTONE_RETENTION_BLOCKS: u64 = 1000;
+const TOMBSTONE_RETENTION_BLOCKS: u64 = 500;
 
 /// Maximum age for speculative execution results before cleanup.
 const SPECULATIVE_MAX_AGE: Duration = Duration::from_secs(30);
@@ -65,14 +63,14 @@ pub struct NodeStateMachine {
     /// Livelock prevention state (cycle detection for cross-shard TXs).
     livelock: LivelockState,
 
-    /// Last committed JMT root hash.
+    /// Last committed JVT root hash.
     ///
     /// Updated when `StateCommitComplete` is received from the runner.
-    /// Used by BftState (via StateCommitComplete) to track when JMT is ready
+    /// Used by BftState (via StateCommitComplete) to track when JVT is ready
     /// for state root verification.
     ///
-    /// The JMT version always equals block height.
-    last_committed_jmt_root: Hash,
+    /// The JVT version always equals block height.
+    last_committed_jvt_root: Hash,
 
     /// Current time.
     now: Duration,
@@ -95,10 +93,10 @@ impl std::fmt::Debug for NodeStateMachine {
 /// to avoid duplicating the ready-transaction gathering logic.
 struct ProposalInputs {
     ready_txs: ReadyTransactions,
-    commitment_proofs: HashMap<Hash, CommitmentProof>,
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
     certificates: Vec<Arc<TransactionCertificate>>,
+    priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
 }
 
 impl NodeStateMachine {
@@ -147,9 +145,9 @@ impl NodeStateMachine {
         let bft_signing_key =
             Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
 
-        // Initialize last_committed_jmt_root from recovered JMT state.
+        // Initialize last_committed_jvt_root from recovered JVT state.
         // This ensures we use actual persisted state, not genesis defaults.
-        let jmt_root = recovered.jmt_root.unwrap_or(Hash::ZERO);
+        let jvt_root = recovered.jvt_root.unwrap_or(Hash::ZERO);
 
         Self {
             node_index,
@@ -168,8 +166,8 @@ impl NodeStateMachine {
             provisions: ProvisionCoordinator::new(),
             livelock: LivelockState::new(),
             topology,
-            // Use recovered JMT root - critical for correct state root computation
-            last_committed_jmt_root: jmt_root,
+            // Use recovered JVT root - critical for correct state root computation
+            last_committed_jvt_root: jvt_root,
             now: Duration::ZERO,
         }
     }
@@ -221,9 +219,9 @@ impl NodeStateMachine {
         &self.provisions
     }
 
-    /// Get the last committed JMT root hash.
-    pub fn last_committed_jmt_root(&self) -> Hash {
-        self.last_committed_jmt_root
+    /// Get the last committed JVT root hash.
+    pub fn last_committed_jvt_root(&self) -> Hash {
+        self.last_committed_jvt_root
     }
 
     /// Initialize the node with a genesis block.
@@ -238,41 +236,21 @@ impl NodeStateMachine {
 
     // ─── Shared Helpers ─────────────────────────────────────────────────
 
-    /// Build commitment proofs for priority transactions.
+    /// Build source attestations and commitment entries for priority transactions.
     ///
-    /// Returns a HashMap mapping transaction hash to CommitmentProof for all
-    /// priority transactions (cross-shard with verified provisions). This is included
-    /// in the block to make it self-contained for validation.
-    ///
-    /// Only priority transactions need proofs - they are already classified by the
-    /// mempool as having verified provisions.
-    fn build_commitment_proofs(
-        &self,
-        ready_txs: &ReadyTransactions,
-    ) -> HashMap<Hash, CommitmentProof> {
-        let mut proofs = HashMap::new();
-
-        // Only priority transactions have verified provisions
-        for tx in &ready_txs.priority {
-            let tx_hash = tx.hash();
-            if let Some(proof) = self.provisions.build_commitment_proof(&tx_hash) {
-                proofs.insert(tx_hash, proof);
-            }
-        }
-
-        proofs
-    }
-
     /// Gather all inputs needed for a block proposal.
     ///
     /// Used by both `on_proposal_timer` and `on_qc_formed` to avoid duplicating
     /// the ready-transaction + deferred + aborted + certificates gathering logic.
-    fn gather_proposal_inputs(&self, pending_txs: usize, pending_certs: usize) -> ProposalInputs {
+    fn gather_proposal_inputs(
+        &mut self,
+        pending_txs: usize,
+        pending_certs: usize,
+    ) -> ProposalInputs {
         let max_txs = self.bft.config().max_transactions_per_block;
         let ready_txs = self
             .mempool
             .ready_transactions(max_txs, pending_txs, pending_certs);
-        let commitment_proofs = self.build_commitment_proofs(&ready_txs);
         let deferred = self.livelock.get_pending_deferrals().to_vec();
         let current_height = BlockHeight(self.bft.committed_height() + 1);
         let aborted = self.mempool.get_timed_out_transactions(
@@ -282,12 +260,23 @@ impl NodeStateMachine {
         );
         let certificates = self.execution.get_finalized_certificates();
 
+        // Under backpressure: collect cached inclusion proofs for priority txs.
+        let priority_inclusions = if self.mempool.at_in_flight_limit() {
+            ready_txs
+                .priority
+                .iter()
+                .filter_map(|tx| self.provisions.take_cached_inclusion_proof(&tx.hash()))
+                .collect()
+        } else {
+            vec![]
+        };
+
         ProposalInputs {
             ready_txs,
-            commitment_proofs,
             deferred,
             aborted,
             certificates,
+            priority_inclusions,
         }
     }
 
@@ -373,7 +362,6 @@ impl NodeStateMachine {
             pending_txs,               // txs in uncommitted pipeline blocks
             pending_certs + new_certs, // certs in pipeline + certs we're proposing
         );
-        let commitment_proofs = self.build_commitment_proofs(&ready_txs);
         let deferred = self.livelock.get_pending_deferrals().to_vec();
         let current_height = BlockHeight(self.bft.committed_height() + 1);
         let aborted = self.mempool.get_timed_out_transactions(
@@ -401,7 +389,7 @@ impl NodeStateMachine {
             deferred,
             aborted,
             certificates,
-            commitment_proofs,
+            vec![],
             collect_updates,
         )
     }
@@ -531,27 +519,27 @@ impl NodeStateMachine {
             inputs.deferred,
             inputs.aborted,
             inputs.certificates,
-            inputs.commitment_proofs,
+            inputs.priority_inclusions,
             collect_updates,
         )
     }
 
-    /// Handle JMT state commit completion — update tracked state and notify BFT.
+    /// Handle JVT state commit completion — update tracked state and notify BFT.
     fn on_state_commit_complete(&mut self, height: u64, state_root: Hash) -> Vec<Action> {
         let prev_height = self.bft.committed_height();
 
         // Update if this is the current or a newer height. Use `>=` because
         // the BFT state machine advances `committed_height` in
-        // `commit_block_and_buffered` *before* the IO loop commits the JMT
+        // `commit_block_and_buffered` *before* the IO loop commits the JVT
         // and sends `StateCommitComplete`. With `>` the root update for the
         // current height would be silently dropped.
         if height >= prev_height {
-            self.last_committed_jmt_root = state_root;
+            self.last_committed_jvt_root = state_root;
 
             tracing::debug!(
                 height,
                 state_root = ?state_root,
-                "JMT state commit complete"
+                "JVT state commit complete"
             );
         }
 
@@ -701,25 +689,97 @@ impl NodeStateMachine {
         }
         actions.extend(provision_actions);
 
+        // Request priority inclusion proofs under backpressure if likely next proposer.
+        // This is best-effort: if proofs arrive before proposal time, priority txs get
+        // promoted with proofs. If not, they stay in the normal section — no correctness impact.
+        if self.mempool.at_in_flight_limit() {
+            let topology = self.topology.snapshot();
+            let next_height = self.bft.committed_height() + 1;
+            if topology.proposer_for(next_height, 0) == topology.local_validator_id() {
+                for (tx_hash, source_shard, source_block_height) in
+                    self.provisions.txs_needing_inclusion_proofs()
+                {
+                    let peers = topology.committee_for_shard(source_shard).to_vec();
+                    actions.push(Action::RequestTxInclusionProof {
+                        source_shard,
+                        source_block_height,
+                        winner_tx_hash: tx_hash,
+                        reason: hyperscale_core::InclusionProofFetchReason::Priority,
+                        peers,
+                    });
+                }
+            }
+        }
+
         actions
     }
 
     /// Handle state provisions verified — notify mempool and coordinator.
     fn on_state_provisions_verified(
         &mut self,
-        results: Vec<ProvisionVerificationResult>,
+        batch: ProvisionBatch,
         committed_header: Option<CommittedBlockHeader>,
+        valid: bool,
     ) -> Vec<Action> {
-        for result in &results {
-            if result.valid {
-                self.mempool.on_provision_verified(result.tx_hash);
+        if valid {
+            // Share verified header with BFT for deferral merkle proof verification
+            if let Some(ref header) = committed_header {
+                self.bft.update_remote_header(header.clone());
+            }
+            for tx in &batch.transactions {
+                self.mempool.on_provision_verified(tx.tx_hash);
             }
         }
         self.provisions.on_state_provisions_verified(
             self.topology.snapshot(),
-            results,
+            batch,
             committed_header,
+            valid,
         )
+    }
+
+    /// Handle an inclusion proof received from a source shard (livelock deferral).
+    ///
+    /// Called by the I/O loop when a `GetTxInclusionProofResponse` is received.
+    /// Forwards to the livelock state machine to finalize the deferral.
+    pub(crate) fn on_inclusion_proof_received(
+        &mut self,
+        winner_tx_hash: Hash,
+        loser_tx_hash: Hash,
+        source_shard: ShardGroupId,
+        source_block_height: BlockHeight,
+        proof: hyperscale_types::TransactionInclusionProof,
+    ) -> Vec<Action> {
+        self.livelock.on_inclusion_proof_received(
+            winner_tx_hash,
+            loser_tx_hash,
+            proof,
+            source_shard,
+            source_block_height,
+        );
+        vec![]
+    }
+
+    /// Handle a priority inclusion proof received from a source shard.
+    ///
+    /// Caches the proof in the provision coordinator for use at proposal time.
+    pub(crate) fn on_priority_inclusion_proof_received(
+        &mut self,
+        tx_hash: Hash,
+        source_shard: ShardGroupId,
+        source_block_height: BlockHeight,
+        proof: hyperscale_types::TransactionInclusionProof,
+    ) -> Vec<Action> {
+        self.provisions.cache_inclusion_proof(
+            tx_hash,
+            hyperscale_types::PriorityInclusion {
+                tx_hash,
+                source_shard,
+                source_block_height,
+                proof,
+            },
+        );
+        vec![]
     }
 
     /// Handle transaction executed — notify mempool and check pending blocks.
@@ -826,11 +886,15 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::RemoteBlockCommitted {
                 committed_header,
                 sender,
-            } => self.provisions.on_remote_block_committed(
-                self.topology.snapshot(),
-                committed_header,
-                sender,
-            ),
+            } => {
+                // Share remote header with BFT for deferral merkle proof verification
+                self.bft.update_remote_header(committed_header.clone());
+                self.provisions.on_remote_block_committed(
+                    self.topology.snapshot(),
+                    committed_header,
+                    sender,
+                )
+            }
             ProtocolEvent::BlockVoteReceived { vote } => {
                 self.bft.on_block_vote(self.topology.snapshot(), vote)
             }
@@ -847,16 +911,6 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::QcSignatureVerified { block_hash, valid } => self
                 .bft
                 .on_qc_signature_verified(self.topology.snapshot(), block_hash, valid),
-            ProtocolEvent::CommitmentProofVerified {
-                block_hash,
-                deferral_index,
-                valid,
-            } => self.bft.on_commitment_proof_verified(
-                self.topology.snapshot(),
-                block_hash,
-                deferral_index,
-                valid,
-            ),
             ProtocolEvent::StateRootVerified { block_hash, valid } => self
                 .bft
                 .on_state_root_verified(self.topology.snapshot(), block_hash, valid),
@@ -892,13 +946,14 @@ impl StateMachine for NodeStateMachine {
             } => self.on_block_committed(block_hash, height, block),
 
             // ── Provisions ───────────────────────────────────────────────
-            ProtocolEvent::StateProvisionsReceived { provisions } => self
+            ProtocolEvent::StateProvisionsReceived { batch } => self
                 .provisions
-                .on_state_provisions_received(self.topology.snapshot(), provisions),
+                .on_state_provisions_received(self.topology.snapshot(), batch),
             ProtocolEvent::StateProvisionsVerified {
-                results,
+                batch,
                 committed_header,
-            } => self.on_state_provisions_verified(results, committed_header),
+                valid,
+            } => self.on_state_provisions_verified(batch, committed_header, valid),
             ProtocolEvent::CrossShardTxRegistered {
                 tx_hash,
                 required_shards,
@@ -913,11 +968,42 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ProvisionAccepted {
                 tx_hash,
                 source_shard,
-                commitment_proof,
+                source_block_height,
+                entries,
             } => {
-                self.livelock
-                    .on_provision_accepted(tx_hash, source_shard, &commitment_proof);
-                vec![]
+                let outputs = self.livelock.on_provision_accepted(
+                    tx_hash,
+                    source_shard,
+                    source_block_height,
+                    &entries,
+                );
+                let mut actions = Vec::new();
+                for output in outputs {
+                    match output {
+                        hyperscale_livelock::LivelockOutput::FetchInclusionProof {
+                            source_shard,
+                            source_block_height,
+                            winner_tx_hash,
+                            loser_tx_hash,
+                        } => {
+                            let peers = self
+                                .topology
+                                .snapshot()
+                                .committee_for_shard(source_shard)
+                                .to_vec();
+                            actions.push(Action::RequestTxInclusionProof {
+                                source_shard,
+                                source_block_height,
+                                winner_tx_hash,
+                                reason: hyperscale_core::InclusionProofFetchReason::Deferral {
+                                    loser_tx_hash,
+                                },
+                                peers,
+                            });
+                        }
+                    }
+                }
+                actions
             }
             ProtocolEvent::ProvisioningComplete {
                 tx_hash,

@@ -58,10 +58,13 @@ pub use epoch::{
     EpochConfig, EpochId, GlobalConsensusConfig, GlobalValidatorInfo, ShardCommitteeConfig,
     ValidatorRating, ValidatorShardState, DEFAULT_EPOCH_LENGTH,
 };
-pub use hash::{compute_merkle_root, Hash};
+pub use hash::{
+    compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root,
+    verify_merkle_inclusion, Hash, TransactionInclusionProof,
+};
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
 pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
-pub use proofs::{CommitmentProof, MerkleInclusionProof, SubstateInclusionProof};
+pub use proofs::{ProvisionBatch, SubstateInclusionProof, TxEntries, VerkleInclusionProof};
 pub use signing::{
     block_header_message, block_vote_message, committed_block_header_message,
     exec_cert_batch_message, exec_vote_batch_message, exec_vote_message,
@@ -71,8 +74,8 @@ pub use signing::{
 };
 
 pub use block::{
-    compute_receipt_root, compute_transaction_root, Block, BlockHeader, BlockManifest,
-    BlockMetadata, CommittedBlockHeader,
+    compute_receipt_root, compute_transaction_root, tx_inclusion_proof, Block, BlockHeader,
+    BlockManifest, BlockMetadata, CommittedBlockHeader, PriorityInclusion,
 };
 pub use quorum_certificate::QuorumCertificate;
 pub use receipt::{

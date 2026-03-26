@@ -1,7 +1,9 @@
 //! StateProvisionsNotification message for cross-shard provisions.
 
 use crate::trace_context::TraceContext;
-use hyperscale_types::{Bls12381G2Signature, MessagePriority, NetworkMessage, ValidatorId};
+use hyperscale_types::{
+    Bls12381G2Signature, MessagePriority, NetworkMessage, SubstateInclusionProof, ValidatorId,
+};
 use sbor::prelude::BasicSbor;
 
 /// Batched state provisions for cross-shard transactions.
@@ -9,10 +11,16 @@ use sbor::prelude::BasicSbor;
 /// Only the block proposer sends these. The sender signature authenticates
 /// the batch, allowing receivers to reject forged provisions before doing
 /// expensive merkle proof verification.
+///
+/// The aggregated verkle proof is stored once at the batch level rather than
+/// per-provision, avoiding redundant serialization of the (potentially large)
+/// proof across N provisions.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct StateProvisionsNotification {
     /// The state provisions being sent.
     pub provisions: Vec<hyperscale_types::StateProvision>,
+    /// Aggregated verkle proof covering all entries across all provisions.
+    pub proof: SubstateInclusionProof,
     /// The validator who sent this batch.
     pub sender: ValidatorId,
     /// BLS signature over the domain-separated signing message, by the sender.
@@ -25,11 +33,13 @@ impl StateProvisionsNotification {
     /// Create a new signed state provision batch.
     pub fn new(
         provisions: Vec<hyperscale_types::StateProvision>,
+        proof: SubstateInclusionProof,
         sender: ValidatorId,
         sender_signature: Bls12381G2Signature,
     ) -> Self {
         Self {
             provisions,
+            proof,
             sender,
             sender_signature,
             trace_context: TraceContext::default(),
@@ -54,9 +64,14 @@ impl StateProvisionsNotification {
         &self.provisions
     }
 
-    /// Consume and return the provisions.
-    pub fn into_provisions(self) -> Vec<hyperscale_types::StateProvision> {
-        self.provisions
+    /// Consume and return the provisions and their shared proof.
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<hyperscale_types::StateProvision>,
+        SubstateInclusionProof,
+    ) {
+        (self.provisions, self.proof)
     }
 
     /// Get the trace context.

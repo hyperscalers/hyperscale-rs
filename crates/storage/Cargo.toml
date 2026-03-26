@@ -7,7 +7,7 @@ description = "Storage traits and shared types"
 [dependencies]
 # Internal crates
 hyperscale-types.workspace = true
-hyperscale-jmt.workspace = true
+hyperscale-state-tree.workspace = true
 
 # Radix dependencies (for SubstateDatabase, DatabaseUpdates, etc.)
 radix-common.workspace = true

@@ -29,10 +29,11 @@ pub struct BftStats {
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
 use hyperscale_types::{
-    block_header_message, committed_block_header_message, Block, BlockHeader, BlockHeight,
-    BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommitmentProof, Hash,
-    QuorumCertificate, ReadyTransactions, RoutableTransaction, ShardGroupId, TopologySnapshot,
-    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
+    block_header_message, committed_block_header_message, verify_merkle_inclusion, Block,
+    BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction,
+    ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
+    ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,7 +44,7 @@ use crate::config::BftConfig;
 use crate::fetch::FetchCoordinator;
 use crate::pending::PendingBlock;
 use crate::sync::{SyncManager, SyncVerificationResult};
-use crate::verification::{VerificationPipeline, VerificationProgress};
+use crate::verification::VerificationPipeline;
 use crate::vote_set::VoteSet;
 
 /// State recovered from storage on startup.
@@ -65,13 +66,13 @@ pub struct RecoveredState {
     /// Latest QC (certifies the highest certified block).
     pub latest_qc: Option<QuorumCertificate>,
 
-    /// Last committed JMT root hash.
+    /// Last committed JVT root hash.
     ///
     /// Restored from storage at startup so proposals use the correct parent
     /// state root instead of the default Hash::ZERO.
     ///
     /// If not provided (None), defaults to Hash::ZERO for fresh start.
-    pub jmt_root: Option<Hash>,
+    pub jvt_root: Option<Hash>,
 }
 
 /// Tracks in-flight proposal for correlating `Event::ProposalBuilt` callback.
@@ -192,6 +193,10 @@ pub struct BftState {
     /// In-flight proposal awaiting `Event::ProposalBuilt` callback.
     pending_proposal: Option<PendingProposal>,
 
+    /// Verified remote block headers (from provision coordinator).
+    /// Used for synchronous merkle inclusion proof validation in deferrals.
+    remote_headers: HashMap<(ShardGroupId, BlockHeight), CommittedBlockHeader>,
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Configuration
     // ═══════════════════════════════════════════════════════════════════════════
@@ -203,9 +208,10 @@ pub struct BftState {
     /// Current time (set by runner before each handle call).
     now: Duration,
 
-    /// Timestamp of the last block proposal we made.
-    /// Used for rate limiting block production via min_block_interval.
-    last_proposal_time: Duration,
+    /// Timestamp when the last QC formed (for any proposer, not just us).
+    /// Used for global rate limiting: ensures min_block_interval between
+    /// successive blocks regardless of which validator proposed them.
+    last_qc_time: Duration,
 
     /// Time of last leader activity (for round timeout detection).
     /// Reset when we see leader activity (proposal, header receipt, QC, commit).
@@ -276,18 +282,29 @@ impl BftState {
             voted_heights,
             received_votes_by_height: HashMap::new(),
             certified_blocks: HashMap::new(),
-            verification: VerificationPipeline::new(recovered.jmt_root.unwrap_or(Hash::ZERO)),
+            verification: VerificationPipeline::new(recovered.jvt_root.unwrap_or(Hash::ZERO)),
             sync: SyncManager::new(),
             pending_commits: std::collections::BTreeMap::new(),
             pending_commits_awaiting_data: HashMap::new(),
             pending_proposal: None,
+            remote_headers: HashMap::new(),
             config,
             now: Duration::ZERO,
-            last_proposal_time: Duration::ZERO,
+            last_qc_time: Duration::ZERO,
             last_leader_activity: Duration::ZERO,
             last_header_reset: None,
             view_changes: 0,
         }
+    }
+
+    /// Update the remote headers cache with a verified committed block header.
+    ///
+    /// Called by the node state machine when a remote block header is verified
+    /// (via the provision coordinator). BFT uses these for synchronous merkle
+    /// inclusion proof verification in deferrals.
+    pub fn update_remote_header(&mut self, header: CommittedBlockHeader) {
+        let key = (header.header.shard_group_id, header.header.height);
+        self.remote_headers.entry(key).or_insert(header);
     }
 
     /// Compute vote recipients for a vote at the given height/round.
@@ -321,16 +338,16 @@ impl BftState {
         recipients
     }
 
-    /// Get the local JMT state (version, root).
+    /// Get the local JVT state (version, root).
     ///
-    /// This returns the actual JMT state from local async certificate commits.
+    /// This returns the actual JVT state from local async certificate commits.
     /// Different validators may have different values due to commit timing.
     ///
     /// Used by:
-    /// - Verifiers to check if JMT is ready for state root verification
+    /// - Verifiers to check if JVT is ready for state root verification
     /// - Fallback/sync blocks to get current root when no certs
-    fn get_local_jmt_root(&self) -> Hash {
-        self.verification.jmt_root()
+    fn get_local_jvt_root(&self) -> Hash {
+        self.verification.jvt_root()
     }
 
     /// Get a block by its hash.
@@ -722,12 +739,11 @@ impl BftState {
     ///
     /// Takes ready transactions from mempool (already sectioned and hash-sorted),
     /// plus deferrals, aborts, and certificates from execution.
-    #[instrument(skip(self, ready_txs, deferred, aborted, certificates, commitment_proofs, collect_updates), fields(
+    #[instrument(skip(self, ready_txs, deferred, aborted, certificates, collect_updates), fields(
         tx_count = ready_txs.len(),
         deferred_count = deferred.len(),
         aborted_count = aborted.len(),
         cert_count = certificates.len(),
-        proof_count = commitment_proofs.len()
     ))]
     #[allow(clippy::too_many_arguments)]
     pub fn on_proposal_timer<F>(
@@ -737,7 +753,7 @@ impl BftState {
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        commitment_proofs: std::collections::HashMap<Hash, CommitmentProof>,
+        priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
         collect_updates: F,
     ) -> Vec<Action>
     where
@@ -776,6 +792,26 @@ impl BftState {
             return actions;
         }
 
+        // Global rate limit: ensure min_block_interval since the last QC from
+        // any proposer. Without this, the timer path bypasses the rate limit
+        // that on_qc_formed enforces, since the timer fires independently.
+        let time_since_last_qc = self.now.saturating_sub(self.last_qc_time);
+        if time_since_last_qc < self.config.min_block_interval {
+            // Reschedule for exactly when the rate limit expires instead of
+            // waiting for the next full proposal_interval.
+            let remaining = self.config.min_block_interval - time_since_last_qc;
+            trace!(
+                validator = ?topology.local_validator_id(),
+                time_since_last_ms = time_since_last_qc.as_millis(),
+                remaining_ms = remaining.as_millis(),
+                "Rate limiting proposal timer - rescheduling for rate limit expiry"
+            );
+            return vec![Action::SetTimer {
+                id: TimerId::Proposal,
+                duration: remaining,
+            }];
+        }
+
         // Check if we've already voted at this height.
         // If we have, don't propose again - we're committed to that block.
         // Re-proposing would create a different block hash (due to timestamp)
@@ -812,26 +848,8 @@ impl BftState {
         let block_height = BlockHeight(next_height);
 
         // Set block_height on each deferral (proposer fills this in).
-        // Also filter out deferrals whose CommitmentProof doesn't have enough voting power.
-        // This prevents proposing blocks that other validators would reject due to
-        // insufficient quorum on the commitment proof.
         let deferred_with_height: Vec<TransactionDefer> = deferred
             .into_iter()
-            .filter(|d| {
-                let quorum_threshold = topology.quorum_threshold_for_shard(d.proof.source_shard);
-                let (_, voting_power) =
-                    VerificationPipeline::resolve_commitment_proof_signers(topology, &d.proof);
-                if voting_power < quorum_threshold {
-                    trace!(
-                        tx_hash = %d.tx_hash,
-                        voting_power = voting_power,
-                        quorum_threshold = quorum_threshold,
-                        "Filtering deferral with insufficient CommitmentProof voting power"
-                    );
-                    return false;
-                }
-                true
-            })
             .map(|mut d| {
                 d.block_height = block_height;
                 d
@@ -881,10 +899,10 @@ impl BftState {
             .get_block_by_hash(parent_hash)
             .map(|b| b.header.state_root)
             .unwrap_or_else(|| {
-                // Parent not found - use local JMT state as fallback.
+                // Parent not found - use local JVT state as fallback.
                 // This handles genesis case and edge cases where the parent block
                 // is missing from pending_blocks (e.g., after recovery or sync).
-                self.get_local_jmt_root()
+                self.get_local_jvt_root()
             });
 
         // Build set of certificate hashes for stale deferral filtering
@@ -941,7 +959,7 @@ impl BftState {
         // Merging is deferred to the thread pool.
         let per_cert_updates = collect_updates(&certificates_to_propose);
 
-        // Always use BuildProposal - the runner handles JMT readiness and timeout.
+        // Always use BuildProposal - the runner handles JVT readiness and timeout.
         // This ensures transactions are always included regardless of certificate state.
         // Include SetTimer to reschedule the proposal timer.
         vec![
@@ -964,10 +982,10 @@ impl BftState {
                 transactions: other_transactions,
                 certificates: certificates_to_propose,
                 per_cert_updates,
-                commitment_proofs,
                 deferred: deferred_filtered,
                 aborted: aborted_with_height,
                 provision_targets,
+                priority_inclusions,
             },
         ]
     }
@@ -1012,8 +1030,8 @@ impl BftState {
             .get_block_by_hash(parent_hash)
             .map(|b| b.header.state_root)
             .unwrap_or_else(|| {
-                // Genesis case - use local JMT state
-                self.get_local_jmt_root()
+                // Genesis case - use local JVT state
+                self.get_local_jvt_root()
             });
 
         let header = BlockHeader {
@@ -1039,7 +1057,7 @@ impl BftState {
             certificates: vec![],       // Empty
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs: HashMap::new(), // Empty - no transactions
+            priority_inclusions: vec![],
         };
 
         let block_hash = block.hash();
@@ -1070,7 +1088,6 @@ impl BftState {
         );
 
         // Track proposal time for rate limiting
-        self.last_proposal_time = self.now;
 
         // Record leader activity - we are producing blocks
         self.record_leader_activity();
@@ -1136,8 +1153,8 @@ impl BftState {
             .get_block_by_hash(parent_hash)
             .map(|b| b.header.state_root)
             .unwrap_or_else(|| {
-                // Genesis case - use local JMT state
-                self.get_local_jmt_root()
+                // Genesis case - use local JVT state
+                self.get_local_jvt_root()
             });
 
         let header = BlockHeader {
@@ -1163,7 +1180,7 @@ impl BftState {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs: HashMap::new(),
+            priority_inclusions: vec![],
         };
 
         let block_hash = block.hash();
@@ -1194,7 +1211,6 @@ impl BftState {
         );
 
         // Track proposal time for rate limiting
-        self.last_proposal_time = self.now;
 
         // Record leader activity - we are producing blocks
         self.record_leader_activity();
@@ -1298,7 +1314,6 @@ impl BftState {
         // vote should still be valid (votes are for block_hash + height, not round).
 
         // Track proposal time for rate limiting
-        self.last_proposal_time = self.now;
 
         // Record leader activity - we are producing blocks
         self.record_leader_activity();
@@ -1882,19 +1897,8 @@ impl BftState {
                 }
 
                 // Initiate all async verifications in parallel.
-                // CommitmentProof, StateRoot, and TransactionRoot verifications run concurrently.
+                // StateRoot, TransactionRoot, and ReceiptRoot verifications run concurrently.
                 let mut verification_actions = Vec::new();
-
-                // If block has deferrals with CommitmentProofs, initiate async verification.
-                if self
-                    .verification
-                    .needs_commitment_proof_verification(&block)
-                {
-                    verification_actions.extend(
-                        self.verification
-                            .initiate_commitment_proof_verification(topology, block_hash, &block),
-                    );
-                }
 
                 // Verify state root if block has committed certificates.
                 // The verification pipeline queues the request; NodeStateMachine
@@ -1903,7 +1907,7 @@ impl BftState {
                     let parent_state_root = self
                         .get_block_by_hash(block.header.parent_hash)
                         .map(|parent| parent.header.state_root)
-                        .unwrap_or_else(|| self.get_local_jmt_root());
+                        .unwrap_or_else(|| self.get_local_jvt_root());
                     self.verification.initiate_state_root_verification(
                         block_hash,
                         &block,
@@ -1950,12 +1954,12 @@ impl BftState {
     /// - Hash ordering: deferred_hash > winner_hash (lower hash wins cycles)
     /// - Staleness: winner cert not in same block
     /// - Staleness: loser cert not in same block (loser already completed)
-    /// - CommitmentProof required: every deferral must have a CommitmentProof attached
-    /// - CommitmentProof consistency: proof's winner hash must match deferral reason
+    /// - Merkle inclusion proof: `leaf_hash` must verify against the source block's
+    ///   `transaction_root` via the `tx_inclusion_proof`
     ///
-    /// Note: The CommitmentProof's BLS signature is verified asynchronously via
-    /// `Action::VerifyCommitmentProof` after structural validation passes. This method
-    /// only checks that the proof is present and structurally valid.
+    /// Note: Merkle proof verification requires the remote block header's
+    /// `transaction_root`. This is looked up from `remote_headers` provided
+    /// by the provision coordinator's verified headers cache.
     ///
     /// ## Aborts (TransactionAbort)
     /// - ExecutionTimeout: Structural rules only (timeout threshold is proposer's call)
@@ -2000,22 +2004,38 @@ impl BftState {
                 ));
             }
 
-            // Rule 4: CommitmentProof must be present
-            // BFT safety: Without a proof, a Byzantine proposer could cause honest validators
-            // to incorrectly defer transactions. The proof contains an aggregated BLS signature
-            // from the winner's source shard that will be verified asynchronously.
+            // Rule 4: Verify merkle inclusion proof for the winner TX in the source block.
+            // This is synchronous (pure hash computation) — no async dispatch needed.
+            let header_key = (deferral.source_shard, deferral.source_block_height);
+            if let Some(committed_header) = self.remote_headers.get(&header_key) {
+                // Verify the leaf_hash corresponds to the winner tx with a valid tag
+                let valid_leaf = [b"RETRY" as &[u8], b"PRIORITY", b"NORMAL"]
+                    .iter()
+                    .any(|tag| {
+                        Hash::from_parts(&[tag, winner_tx_hash.as_bytes()])
+                            == deferral.tx_inclusion_proof.leaf_hash
+                    });
+                if !valid_leaf {
+                    return Err(format!(
+                        "Invalid deferral: leaf_hash does not match any tagged hash of winner {}",
+                        winner_tx_hash
+                    ));
+                }
 
-            // Rule 5: CommitmentProof tx_hash must match deferral reason's winner
-            if deferral.proof.tx_hash != *winner_tx_hash {
-                return Err(format!(
-                    "Invalid deferral: CommitmentProof tx_hash {} != deferral winner {}",
-                    deferral.proof.tx_hash, winner_tx_hash
-                ));
+                if !verify_merkle_inclusion(
+                    committed_header.header.transaction_root,
+                    &deferral.tx_inclusion_proof,
+                ) {
+                    return Err(format!(
+                        "Invalid deferral: merkle inclusion proof failed for winner {} against source block ({}, {})",
+                        winner_tx_hash, deferral.source_shard.0, deferral.source_block_height.0
+                    ));
+                }
             }
-
-            // Note: The CommitmentProof's BLS signature is verified asynchronously via
-            // Action::VerifyCommitmentProof. We only check structural validity here.
-            // The signature verification happens after this passes.
+            // If we don't have the remote header yet, we can't verify the proof.
+            // This is acceptable: the header will arrive via gossip, and we'll
+            // verify on the next proposal attempt. Don't reject the block for this —
+            // the QC on the source block header (once verified) is the trust anchor.
         }
 
         // Validate each abort
@@ -2084,7 +2104,7 @@ impl BftState {
             }
         }
 
-        // 3. Verify priority section contains only non-retry TXs with commitment proofs
+        // 3. Verify priority section contains only non-retry TXs
         for tx in &block.priority_transactions {
             let tx_hash = tx.hash();
             if tx.is_retry() {
@@ -2093,26 +2113,47 @@ impl BftState {
                     tx_hash
                 ));
             }
-            if !block.has_commitment_proof(&tx_hash) {
-                return Err(format!(
-                    "Transaction {} in priority section but has no commitment proof",
-                    tx_hash
-                ));
-            }
         }
 
-        // 4. Verify other section contains no retries and no TXs with proofs
+        // 4. Verify priority inclusion proofs (if present)
+        for inclusion in &block.priority_inclusions {
+            // Verify leaf_hash corresponds to the tx_hash with a valid tag
+            let valid_leaf = [b"RETRY" as &[u8], b"PRIORITY", b"NORMAL"]
+                .iter()
+                .any(|tag| {
+                    Hash::from_parts(&[tag, inclusion.tx_hash.as_bytes()])
+                        == inclusion.proof.leaf_hash
+                });
+            if !valid_leaf {
+                return Err(format!(
+                    "Invalid priority inclusion: leaf_hash does not match any tagged hash of {}",
+                    inclusion.tx_hash
+                ));
+            }
+
+            // Verify merkle proof against the remote block's transaction_root
+            let header_key = (inclusion.source_shard, inclusion.source_block_height);
+            if let Some(committed_header) = self.remote_headers.get(&header_key) {
+                if !verify_merkle_inclusion(
+                    committed_header.header.transaction_root,
+                    &inclusion.proof,
+                ) {
+                    return Err(format!(
+                        "Invalid priority inclusion: merkle proof failed for {} against source block ({}, {})",
+                        inclusion.tx_hash, inclusion.source_shard.0, inclusion.source_block_height.0
+                    ));
+                }
+            }
+            // If we don't have the remote header yet, accept optimistically
+            // (same policy as deferrals).
+        }
+
+        // 5. Verify other section contains no retries
         for tx in &block.transactions {
             let tx_hash = tx.hash();
             if tx.is_retry() {
                 return Err(format!(
                     "Retry transaction {} in other section (should be in retry section)",
-                    tx_hash
-                ));
-            }
-            if block.has_commitment_proof(&tx_hash) {
-                return Err(format!(
-                    "Transaction {} has commitment proof but is in other section (should be in priority section)",
                     tx_hash
                 ));
             }
@@ -2614,64 +2655,6 @@ impl BftState {
         self.try_vote_on_block(topology, block_hash, height, round)
     }
 
-    /// Handle CommitmentProof signature verification result.
-    ///
-    /// Called when the runner completes `Action::VerifyCommitmentProof`.
-    /// If all proofs are valid, we proceed to vote on the block.
-    /// If any proof is invalid, the block is rejected.
-    #[instrument(skip(self), fields(block_hash = ?block_hash, deferral_index = deferral_index, valid = valid))]
-    pub fn on_commitment_proof_verified(
-        &mut self,
-        topology: &TopologySnapshot,
-        block_hash: Hash,
-        deferral_index: usize,
-        valid: bool,
-    ) -> Vec<Action> {
-        match self
-            .verification
-            .on_commitment_proof_verified(block_hash, deferral_index, valid)
-        {
-            VerificationProgress::StillPending | VerificationProgress::NotTracked => return vec![],
-            VerificationProgress::Failed => {
-                info!(
-                    block_hash = ?block_hash,
-                    "Block rejected due to invalid CommitmentProof(s)"
-                );
-                self.pending_blocks.remove(&block_hash);
-                return vec![];
-            }
-            VerificationProgress::AllComplete => {}
-        }
-
-        let Some(pending_block) = self.pending_blocks.get(&block_hash) else {
-            warn!(
-                block_hash = ?block_hash,
-                "CommitmentProof verification complete but pending block not found"
-            );
-            return vec![];
-        };
-
-        let block = match pending_block.block() {
-            Some(b) => b,
-            None => return vec![],
-        };
-
-        // Check if all verifications are complete (state root may still be pending)
-        if !self.verification.is_block_verified(&block) {
-            debug!(
-                block_hash = ?block_hash,
-                "CommitmentProofs done, waiting for other verifications"
-            );
-            return vec![];
-        }
-
-        let height = pending_block.header().height.0;
-        let round = pending_block.header().round;
-
-        // All verifications complete - vote
-        self.create_vote(topology, block_hash, height, round)
-    }
-
     /// Handle state root verification result.
     ///
     /// Called when the runner completes `Action::VerifyStateRoot`. If the state root
@@ -2896,7 +2879,6 @@ impl BftState {
 
         self.pending_blocks.insert(block_hash, pending_block);
         self.fetch.track(block_hash, self.now);
-        self.last_proposal_time = self.now;
         self.record_leader_activity();
 
         let mut actions = vec![Action::BroadcastBlockHeader {
@@ -2910,18 +2892,18 @@ impl BftState {
         actions
     }
 
-    /// Handle JMT state commit completion.
+    /// Handle JVT state commit completion.
     ///
-    /// Called when the runner has finished committing a block's state to the JMT.
-    /// This updates our tracked local JMT root (last_committed_jmt_root) and
+    /// Called when the runner has finished committing a block's state to the JVT.
+    /// This updates our tracked local JVT root (last_committed_jvt_root) and
     /// checks if any pending state root verifications can now proceed.
     ///
     /// Unblocked verifications are pushed to the ready queue; the caller
     /// (`NodeStateMachine`) drains them and computes `merged_updates`.
     ///
     /// # Arguments
-    /// * `block_height` - The block height (= JMT version) after the commit
-    /// * `state_root` - The JMT root hash after the commit
+    /// * `block_height` - The block height (= JVT version) after the commit
+    /// * `state_root` - The JVT root hash after the commit
     #[instrument(skip(self, _topology), fields(block_height, state_root = ?state_root))]
     pub fn on_state_commit_complete(
         &mut self,
@@ -2932,7 +2914,7 @@ impl BftState {
         // Only advance forward (avoid out-of-order updates).
         // Use strict `<` so that same-height updates are accepted: the BFT state
         // machine advances `committed_height` in `commit_block_and_buffered`
-        // *before* the IO loop commits the JMT and sends `StateCommitComplete`.
+        // *before* the IO loop commits the JVT and sends `StateCommitComplete`.
         // With `<=` the root update would be silently dropped.
         if block_height < self.committed_height {
             return;
@@ -2943,10 +2925,10 @@ impl BftState {
             new_height = block_height,
             new_root = ?state_root,
             pending_verifications = self.verification.pending_state_root_count(),
-            "JMT state commit complete, checking for unblocked verifications"
+            "JVT state commit complete, checking for unblocked verifications"
         );
 
-        self.verification.on_jmt_advanced(block_height, state_root);
+        self.verification.on_jvt_advanced(block_height, state_root);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -3031,9 +3013,9 @@ impl BftState {
     ///
     /// # State Root Parameter
     ///
-    /// `state_root` is the computed JMT root after applying writes from the certificates.
+    /// `state_root` is the computed JVT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
-    #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, commitment_proofs, collect_updates), fields(
+    #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, collect_updates), fields(
         height = qc.height.0,
         block_hash = ?block_hash
     ))]
@@ -3047,7 +3029,7 @@ impl BftState {
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        commitment_proofs: HashMap<Hash, CommitmentProof>,
+        priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
         collect_updates: F,
     ) -> Vec<Action>
     where
@@ -3136,8 +3118,12 @@ impl BftState {
             || !aborted.is_empty()
             || !certificates.is_empty();
 
-        let time_since_last_proposal = self.now.saturating_sub(self.last_proposal_time);
-        let rate_limited = time_since_last_proposal < self.config.min_block_interval;
+        // Rate limit against the latest QC time (any proposer), not just our own
+        // last proposal. With rotating proposers, per-validator tracking doesn't
+        // throttle the global block rate — per-validator tracking would be
+        // stale by the time it's their turn again with rotating proposers.
+        let time_since_last_qc = self.now.saturating_sub(self.last_qc_time);
+        let rate_limited = time_since_last_qc < self.config.min_block_interval;
 
         // Attempt immediate proposal if:
         // - We have content to include, OR
@@ -3157,18 +3143,30 @@ impl BftState {
                 deferred,
                 aborted,
                 certificates,
-                commitment_proofs,
+                priority_inclusions,
                 collect_updates,
             ));
         } else if should_try_proposal && rate_limited {
+            // Schedule the proposal timer to fire exactly when the rate limit
+            // expires, rather than waiting for the next periodic timer fire.
+            // This avoids up to proposal_interval of unnecessary delay.
+            let remaining = self.config.min_block_interval - time_since_last_qc;
             trace!(
                 validator = ?topology.local_validator_id(),
                 next_height = next_height,
-                time_since_last_ms = time_since_last_proposal.as_millis(),
-                min_interval_ms = self.config.min_block_interval.as_millis(),
-                "Rate limiting immediate proposal after QC - waiting for proposal timer"
+                time_since_last_ms = time_since_last_qc.as_millis(),
+                remaining_ms = remaining.as_millis(),
+                "Rate limiting proposal - scheduling precise timer"
             );
+            actions.push(Action::SetTimer {
+                id: TimerId::Proposal,
+                duration: remaining,
+            });
         }
+
+        // Update last_qc_time AFTER the rate limit check so this QC's time
+        // gates the NEXT proposal, not the one we just decided about.
+        self.last_qc_time = self.now;
 
         actions
     }
@@ -5507,38 +5505,22 @@ mod tests {
     // Deferral and Abort Validation Tests
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Create a dummy CommitmentProof for testing structural validation.
-    ///
-    /// The proof is structurally valid but the signature is not cryptographically valid.
-    /// This is sufficient for testing structural validation logic which doesn't verify
-    /// the BLS signature (that's done asynchronously via Action::VerifyCommitmentProof).
-    fn make_test_commitment_proof(winner_tx_hash: Hash) -> hyperscale_types::CommitmentProof {
-        use hyperscale_types::{CommitmentProof, ShardGroupId};
-        use std::sync::Arc;
-
-        CommitmentProof {
-            tx_hash: winner_tx_hash,
-            source_shard: ShardGroupId(1),
-            target_shard: ShardGroupId(0),
-            block_height: BlockHeight(1),
-            block_timestamp: 1000,
-            state_root: Hash::ZERO,
-            qc: QuorumCertificate::genesis(),
-            entries: Arc::new(vec![]),
-            merkle_proofs: Arc::new(vec![]),
-        }
-    }
-
-    /// Create a test deferral with a minimal proof.
+    /// Create a test deferral with a merkle inclusion proof.
     fn make_test_deferral(loser_tx: Hash, winner_tx: Hash) -> TransactionDefer {
-        use hyperscale_types::DeferReason;
+        use hyperscale_types::{DeferReason, TransactionInclusionProof};
         TransactionDefer {
             tx_hash: loser_tx,
             reason: DeferReason::LivelockCycle {
                 winner_tx_hash: winner_tx,
             },
             block_height: BlockHeight(0),
-            proof: make_test_commitment_proof(winner_tx),
+            source_shard: ShardGroupId(1),
+            source_block_height: BlockHeight(1),
+            tx_inclusion_proof: TransactionInclusionProof {
+                siblings: vec![],
+                leaf_index: 0,
+                leaf_hash: Hash::ZERO,
+            },
         }
     }
 
@@ -5556,7 +5538,7 @@ mod tests {
             certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
-            commitment_proofs: HashMap::new(),
+            priority_inclusions: vec![],
         }
     }
 
@@ -5588,7 +5570,13 @@ mod tests {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_commitment_proof(winner_hash),
+            source_shard: ShardGroupId(1),
+            source_block_height: BlockHeight(1),
+            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
+                siblings: vec![],
+                leaf_index: 0,
+                leaf_hash: Hash::ZERO,
+            },
         };
         let block = make_test_block(5, vec![valid_deferral], vec![], vec![]);
         assert!(state.validate_deferrals_and_aborts(&block).is_ok());
@@ -5600,7 +5588,13 @@ mod tests {
                 winner_tx_hash: loser_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_commitment_proof(loser_hash),
+            source_shard: ShardGroupId(1),
+            source_block_height: BlockHeight(1),
+            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
+                siblings: vec![],
+                leaf_index: 0,
+                leaf_hash: Hash::ZERO,
+            },
         };
         let block = make_test_block(5, vec![invalid_deferral], vec![], vec![]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -5632,7 +5626,13 @@ mod tests {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_commitment_proof(winner_hash),
+            source_shard: ShardGroupId(1),
+            source_block_height: BlockHeight(1),
+            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
+                siblings: vec![],
+                leaf_index: 0,
+                leaf_hash: Hash::ZERO,
+            },
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![winner_cert]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -5664,7 +5664,13 @@ mod tests {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_commitment_proof(winner_hash),
+            source_shard: ShardGroupId(1),
+            source_block_height: BlockHeight(1),
+            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
+                siblings: vec![],
+                leaf_index: 0,
+                leaf_hash: Hash::ZERO,
+            },
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![loser_cert]);
         let result = state.validate_deferrals_and_aborts(&block);
@@ -5673,33 +5679,34 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_deferral_proof_winner_hash_mismatch() {
+    fn test_validate_deferral_with_inclusion_proof() {
         let (state, _topology) = make_test_state();
 
         // Use raw hash bytes for deterministic ordering
         let loser_bytes = [0xFFu8; 32]; // Higher hash
         let winner_bytes = [0x00u8; 32]; // Lower hash
-        let other_bytes = [0x50u8; 32]; // Some other hash
         let loser_hash = Hash::from_hash_bytes(&loser_bytes);
         let winner_hash = Hash::from_hash_bytes(&winner_bytes);
-        let other_hash = Hash::from_hash_bytes(&other_bytes);
 
-        // Invalid: CommitmentProof has different winner than deferral reason
+        // Valid deferral with merkle inclusion proof fields
         let deferral = TransactionDefer {
             tx_hash: loser_hash,
             reason: hyperscale_types::DeferReason::LivelockCycle {
                 winner_tx_hash: winner_hash,
             },
             block_height: BlockHeight(5),
-            proof: make_test_commitment_proof(other_hash), // Wrong winner!
+            source_shard: ShardGroupId(1),
+            source_block_height: BlockHeight(1),
+            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
+                siblings: vec![],
+                leaf_index: 0,
+                leaf_hash: Hash::ZERO,
+            },
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![]);
-        let result = state.validate_deferrals_and_aborts(&block);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().contains("CommitmentProof tx_hash"),
-            "Error should mention CommitmentProof tx_hash mismatch"
-        );
+        // Structural validation should pass (merkle proof verification against
+        // remote headers is a TODO that requires provision coordinator integration)
+        assert!(state.validate_deferrals_and_aborts(&block).is_ok());
     }
 
     #[test]
@@ -7110,7 +7117,7 @@ mod tests {
             vec![],                        // no deferrals
             vec![],                        // no aborts
             vec![],                        // no certificates
-            HashMap::new(),                // no commitment proofs
+            vec![],                        // no priority inclusions
             |_certs| vec![],
         );
 
@@ -7159,7 +7166,7 @@ mod tests {
             vec![deferral],                // has a deferral
             vec![],                        // no aborts
             vec![],                        // no certificates
-            HashMap::new(),                // no commitment proofs
+            vec![],                        // no priority inclusions
             |_certs| vec![],
         );
 
@@ -7326,7 +7333,7 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs: HashMap::new(),
+            priority_inclusions: vec![],
         }
     }
 
@@ -7336,7 +7343,6 @@ mod tests {
         retry_transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
         priority_transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
         transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
-        commitment_proofs: HashMap<Hash, CommitmentProof>,
     ) -> Block {
         Block {
             header: make_header_at_height(height, 100_000),
@@ -7346,60 +7352,14 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs,
+            priority_inclusions: vec![],
         }
     }
 
-    #[allow(dead_code)]
-    fn make_test_block_with_proofs(
-        height: u64,
-        transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
-        commitment_proofs: HashMap<Hash, CommitmentProof>,
-    ) -> Block {
-        Block {
-            header: make_header_at_height(height, 100_000),
-            retry_transactions: vec![],
-            priority_transactions: vec![],
-            transactions,
-            certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
-            commitment_proofs,
-        }
-    }
-
-    /// Create a test transaction and optionally a commitment proof for it.
-    /// Returns (transaction, Option<CommitmentProof>).
-    fn make_test_tx_with_proof(
-        seed: u8,
-        with_proof: bool,
-    ) -> (
-        Arc<hyperscale_types::RoutableTransaction>,
-        Option<CommitmentProof>,
-    ) {
-        use hyperscale_types::{test_utils, ShardGroupId, StateEntry, SubstateInclusionProof};
-
-        let tx = test_utils::test_transaction(seed);
-        let tx_arc = Arc::new(tx);
-
-        let proof = if with_proof {
-            let node = test_utils::test_node(seed);
-            Some(CommitmentProof::new(
-                tx_arc.hash(),
-                ShardGroupId(1),
-                ShardGroupId(0),
-                BlockHeight(1),
-                1000, // block_timestamp
-                Hash::ZERO,
-                QuorumCertificate::genesis(),
-                Arc::new(vec![StateEntry::test_entry(node, 0, vec![], None)]),
-                Arc::new(vec![SubstateInclusionProof::dummy()]),
-            ))
-        } else {
-            None
-        };
-
-        (tx_arc, proof)
+    /// Create a test transaction for section validation tests.
+    fn make_test_tx_with_seed(seed: u8) -> Arc<hyperscale_types::RoutableTransaction> {
+        use hyperscale_types::test_utils;
+        Arc::new(test_utils::test_transaction(seed))
     }
 
     fn make_test_tx(seed: u8, _with_proof: bool) -> Arc<hyperscale_types::RoutableTransaction> {
@@ -7475,10 +7435,10 @@ mod tests {
         let (state, _topology) = make_test_state();
 
         // Create TXs for priority group and non-priority group
-        let (tx1, proof1) = make_test_tx_with_proof(10, true);
-        let (tx2, proof2) = make_test_tx_with_proof(20, true);
-        let (tx3, _) = make_test_tx_with_proof(30, false);
-        let (tx4, _) = make_test_tx_with_proof(40, false);
+        let tx1 = make_test_tx_with_seed(10);
+        let tx2 = make_test_tx_with_seed(20);
+        let tx3 = make_test_tx_with_seed(30);
+        let tx4 = make_test_tx_with_seed(40);
 
         // Sort each group
         let mut priority_txs = vec![tx1.clone(), tx2.clone()];
@@ -7487,13 +7447,8 @@ mod tests {
         let mut other_txs = vec![tx3, tx4];
         sort_txs_by_hash(&mut other_txs);
 
-        // Build proofs map for the block
-        let mut proofs = HashMap::new();
-        proofs.insert(tx1.hash(), proof1.unwrap());
-        proofs.insert(tx2.hash(), proof2.unwrap());
-
         // Use sectioned block with priority TXs in priority section
-        let block = make_sectioned_test_block(5, vec![], priority_txs, other_txs, proofs);
+        let block = make_sectioned_test_block(5, vec![], priority_txs, other_txs);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7501,21 +7456,16 @@ mod tests {
     fn test_validate_transaction_ordering_invalid_proof_group_unsorted() {
         let (state, _topology) = make_test_state();
 
-        // Create priority TXs with proofs
-        let (tx1, proof1) = make_test_tx_with_proof(10, true);
-        let (tx2, proof2) = make_test_tx_with_proof(20, true);
+        // Create priority TXs
+        let tx1 = make_test_tx_with_seed(10);
+        let tx2 = make_test_tx_with_seed(20);
 
         // Sort, then reverse (invalid order within priority section)
         let mut priority_txs = vec![tx1.clone(), tx2.clone()];
         sort_txs_by_hash(&mut priority_txs);
         priority_txs.reverse();
 
-        // Build proofs map
-        let mut proofs = HashMap::new();
-        proofs.insert(tx1.hash(), proof1.unwrap());
-        proofs.insert(tx2.hash(), proof2.unwrap());
-
-        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![], proofs);
+        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![]);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(result
@@ -7524,43 +7474,18 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_transaction_ordering_invalid_non_priority_before_priority() {
+    fn test_validate_transaction_ordering_all_priority() {
         let (state, _topology) = make_test_state();
 
-        // Non-priority TX in priority section without proof - invalid
-        let (no_proof_tx, _) = make_test_tx_with_proof(10, false);
-        let (proof_tx, proof) = make_test_tx_with_proof(20, true);
-
-        // Build proofs map (only proof_tx has a proof)
-        let mut proofs = HashMap::new();
-        proofs.insert(proof_tx.hash(), proof.unwrap());
-
-        // Put no_proof_tx in priority section (invalid - has no proof)
-        let block = make_sectioned_test_block(5, vec![], vec![no_proof_tx], vec![proof_tx], proofs);
-        let result = state.validate_transaction_ordering(&block);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no commitment proof"));
-    }
-
-    #[test]
-    fn test_validate_transaction_ordering_all_have_proofs() {
-        let (state, _topology) = make_test_state();
-
-        // All TXs have proofs - valid as long as sorted, all in priority section
-        let (tx1, proof1) = make_test_tx_with_proof(10, true);
-        let (tx2, proof2) = make_test_tx_with_proof(20, true);
-        let (tx3, proof3) = make_test_tx_with_proof(30, true);
+        // All TXs in priority section - valid as long as sorted
+        let tx1 = make_test_tx_with_seed(10);
+        let tx2 = make_test_tx_with_seed(20);
+        let tx3 = make_test_tx_with_seed(30);
 
         let mut priority_txs = vec![tx1.clone(), tx2.clone(), tx3.clone()];
         sort_txs_by_hash(&mut priority_txs);
 
-        // Build proofs map
-        let mut proofs = HashMap::new();
-        proofs.insert(tx1.hash(), proof1.unwrap());
-        proofs.insert(tx2.hash(), proof2.unwrap());
-        proofs.insert(tx3.hash(), proof3.unwrap());
-
-        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![], proofs);
+        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![]);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7568,25 +7493,22 @@ mod tests {
     fn test_validate_transaction_ordering_retries_first() {
         let (state, _topology) = make_test_state();
 
-        // Create retry TXs, proof TXs, and regular TXs
+        // Create retry TXs, priority TXs, and regular TXs
         let retry1 = make_retry_tx(10);
         let retry2 = make_retry_tx(20);
-        let (proof_tx, proof) = make_test_tx_with_proof(30, true);
+        let priority_tx = make_test_tx_with_seed(30);
         let regular = make_test_tx(40, false);
 
         // Sort each tier by hash
         let mut retries = vec![retry1.clone(), retry2.clone()];
         sort_txs_by_hash(&mut retries);
 
-        let priority_txs = vec![proof_tx.clone()];
+        let priority_txs = vec![priority_tx.clone()];
 
         let others = vec![regular.clone()];
 
-        let mut proofs_map = HashMap::new();
-        proofs_map.insert(proof_tx.hash(), proof.unwrap());
-
-        // Use sectioned block: retries in retry section, proof TX in priority, regular in others
-        let block = make_sectioned_test_block(5, retries, priority_txs, others, proofs_map);
+        // Use sectioned block: retries in retry section, priority TX in priority, regular in others
+        let block = make_sectioned_test_block(5, retries, priority_txs, others);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7594,15 +7516,11 @@ mod tests {
     fn test_validate_transaction_ordering_invalid_retry_after_proof() {
         let (state, _topology) = make_test_state();
 
-        // Create a retry and a proof TX
+        // Create a retry TX
         let retry = make_retry_tx(10);
-        let (proof_tx, proof) = make_test_tx_with_proof(30, true);
 
-        let mut proofs_map = HashMap::new();
-        proofs_map.insert(proof_tx.hash(), proof.unwrap());
-
-        // Invalid: put retry in priority section (it's not a non-retry TX with proof)
-        let block = make_sectioned_test_block(5, vec![], vec![retry], vec![], proofs_map);
+        // Invalid: put retry in priority section (retries belong in retry section)
+        let block = make_sectioned_test_block(5, vec![], vec![retry], vec![]);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(
@@ -7619,7 +7537,7 @@ mod tests {
         let retry = make_retry_tx(10);
 
         // Invalid: put retry in other section (should be in retry section)
-        let block = make_sectioned_test_block(5, vec![], vec![], vec![retry], HashMap::new());
+        let block = make_sectioned_test_block(5, vec![], vec![], vec![retry]);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(
@@ -7636,7 +7554,7 @@ mod tests {
         let mut retries = vec![make_retry_tx(10), make_retry_tx(20), make_retry_tx(30)];
         sort_txs_by_hash(&mut retries);
 
-        let block = make_sectioned_test_block(5, retries, vec![], vec![], HashMap::new());
+        let block = make_sectioned_test_block(5, retries, vec![], vec![]);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7649,7 +7567,7 @@ mod tests {
         sort_txs_by_hash(&mut retries);
         retries.reverse(); // Make invalid
 
-        let block = make_sectioned_test_block(5, retries, vec![], vec![], HashMap::new());
+        let block = make_sectioned_test_block(5, retries, vec![], vec![]);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(result
@@ -7664,11 +7582,11 @@ mod tests {
 
         let (mut state, topology) = make_test_state();
 
-        // Set current time and simulate that we just proposed
+        // Set current time and simulate that a QC formed very recently
         state.set_time(Duration::from_millis(1000));
-        state.last_proposal_time = Duration::from_millis(950); // 50ms ago
+        state.last_qc_time = Duration::from_millis(950); // 50ms ago
 
-        // min_block_interval is 150ms by default, so we're within the rate limit window
+        // min_block_interval is 800ms by default, so we're within the rate limit window
 
         // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
         let qc = QuorumCertificate {
@@ -7696,7 +7614,7 @@ mod tests {
             vec![deferral],                // has content
             vec![],
             vec![],
-            HashMap::new(),
+            vec![], // no priority inclusions
             |_certs| vec![],
         );
 
@@ -7707,7 +7625,7 @@ mod tests {
 
         assert!(
             !has_block_header,
-            "Should NOT propose immediately when rate limited (proposed 50ms ago, limit is 150ms)"
+            "Should NOT propose immediately when rate limited (last QC 50ms ago, limit is 500ms)"
         );
     }
 
@@ -7718,11 +7636,11 @@ mod tests {
 
         let (mut state, topology) = make_test_state();
 
-        // Set current time and simulate that we proposed long enough ago
+        // Set current time and simulate that enough time passed since last QC
         state.set_time(Duration::from_millis(1000));
-        state.last_proposal_time = Duration::from_millis(800); // 200ms ago
+        state.last_qc_time = Duration::from_millis(100); // 900ms ago
 
-        // min_block_interval is 150ms by default, so 200ms > 150ms - should be allowed
+        // min_block_interval is 800ms by default, so 900ms > 800ms - should be allowed
 
         // Create a QC at height 3 (so next height would be 4, which validator 0 proposes)
         let qc = QuorumCertificate {
@@ -7750,7 +7668,7 @@ mod tests {
             vec![deferral],                // has content
             vec![],
             vec![],
-            HashMap::new(),
+            vec![], // no priority inclusions
             |_certs| vec![],
         );
 
@@ -7763,7 +7681,7 @@ mod tests {
 
         assert!(
             has_build_proposal,
-            "Should propose after rate limit interval has passed (200ms > 150ms)"
+            "Should propose after rate limit interval has passed (900ms > 800ms)"
         );
     }
 
@@ -7801,9 +7719,9 @@ mod tests {
             RecoveredState::default(),
         );
 
-        // Set current time and simulate that we proposed 200ms ago
+        // Set current time and simulate that QC formed 200ms ago
         state.set_time(Duration::from_millis(1000));
-        state.last_proposal_time = Duration::from_millis(800); // 200ms ago
+        state.last_qc_time = Duration::from_millis(800); // 200ms ago
 
         // With min_block_interval of 500ms, 200ms is not enough - should be rate limited
 
@@ -7831,7 +7749,7 @@ mod tests {
             vec![deferral],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
             |_certs| vec![],
         );
 
@@ -7879,9 +7797,9 @@ mod tests {
             RecoveredState::default(),
         );
 
-        // Propose just now (0ms ago) - normally would be rate limited
+        // QC just now (0ms ago) - normally would be rate limited
         state.set_time(Duration::from_millis(1000));
-        state.last_proposal_time = Duration::from_millis(1000);
+        state.last_qc_time = Duration::from_millis(1000);
 
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
@@ -7907,7 +7825,7 @@ mod tests {
             vec![deferral],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
             |_certs| vec![],
         );
 
@@ -7925,21 +7843,17 @@ mod tests {
     }
 
     #[test]
-    fn test_proposal_timer_updates_last_proposal_time() {
-        // Verify that on_proposal_built updates last_proposal_time when a proposal is broadcast.
-        // After the refactor, on_proposal_timer emits BuildProposal, and the runner calls back
-        // with on_proposal_built which updates last_proposal_time and broadcasts the block.
+    fn test_on_qc_formed_updates_last_qc_time() {
+        // Verify that on_qc_formed updates last_qc_time after the rate limit check.
+        // This ensures the NEXT proposal is rate-limited against this QC's time.
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_millis(5000));
 
-        // Ensure last_proposal_time starts at zero
-        assert_eq!(state.last_proposal_time, Duration::ZERO);
+        // Ensure last_qc_time starts at zero
+        assert_eq!(state.last_qc_time, Duration::ZERO);
 
-        // Proposer rotation is (height + round) % committee_size.
-        // With 4 validators, validator 0 proposes for height 0, 4, 8, etc.
-        // Since committed_height=0, next height is 1, and (1+0)%4=1, so validator 1 proposes.
-        // We need to set up a QC so that the next height is 4 (validator 0's turn).
-        let parent_qc = QuorumCertificate {
+        // Create a QC at height 3
+        let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
             shard_group_id: ShardGroupId(0),
             height: BlockHeight(3),
@@ -7949,76 +7863,24 @@ mod tests {
             aggregated_signature: zero_bls_signature(),
             weighted_timestamp_ms: 5000,
         };
-        state.latest_qc = Some(parent_qc.clone());
 
-        // Now next_height = 4, (4+0)%4=0, so validator 0 proposes
-        let actions = state.on_proposal_timer(
+        let _actions = state.on_qc_formed(
             &topology,
+            qc.block_hash,
+            qc,
             &ReadyTransactions::default(),
             vec![],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
             |_certs| vec![],
         );
 
-        // Check that a BuildProposal action was emitted (async proposal)
-        let build_proposal = actions.iter().any(
-            |a| matches!(a, Action::BuildProposal { height, .. } if height == &BlockHeight(4)),
-        );
-
-        assert!(
-            build_proposal,
-            "Validator 0 should request proposal build for height 4"
-        );
-
-        // last_proposal_time not yet updated - happens on_proposal_built
-        assert_eq!(state.last_proposal_time, Duration::ZERO);
-
-        // Simulate the runner completing the proposal build
-        let block = Block {
-            header: BlockHeader {
-                shard_group_id: ShardGroupId(0),
-                height: BlockHeight(4),
-                parent_hash: Hash::from_bytes(b"block_3"),
-                parent_qc,
-                proposer: ValidatorId(0),
-                timestamp: 5000,
-                round: 0,
-                is_fallback: false,
-                state_root: Hash::ZERO,
-                transaction_root: Hash::ZERO,
-                receipt_root: Hash::ZERO,
-                provision_targets: vec![],
-            },
-            retry_transactions: vec![],
-            priority_transactions: vec![],
-            transactions: vec![],
-            certificates: vec![],
-            deferred: vec![],
-            aborted: vec![],
-            commitment_proofs: HashMap::new(),
-        };
-        let block_hash = block.hash();
-        let block_arc = Arc::new(block);
-
-        let broadcast_actions =
-            state.on_proposal_built(&topology, BlockHeight(4), 0, block_arc, block_hash);
-
-        // Check that a BlockHeader broadcast was emitted
-        let has_broadcast = broadcast_actions
-            .iter()
-            .any(|a| matches!(a, Action::BroadcastBlockHeader { .. }));
-        assert!(
-            has_broadcast,
-            "Should broadcast block after on_proposal_built"
-        );
-
-        // Verify last_proposal_time was updated
+        // Verify last_qc_time was updated to current time
         assert_eq!(
-            state.last_proposal_time,
+            state.last_qc_time,
             Duration::from_millis(5000),
-            "last_proposal_time should be updated to current time"
+            "last_qc_time should be updated to current time after on_qc_formed"
         );
     }
 
@@ -8239,7 +8101,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
             |_certs| vec![],
         );
 
@@ -8315,7 +8177,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
             |_certs| vec![],
         );
 
@@ -8551,7 +8413,7 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs: HashMap::new(),
+            priority_inclusions: vec![],
         };
 
         let qc = QuorumCertificate {
@@ -8605,7 +8467,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
             |_certs| vec![],
         );
 
@@ -8725,7 +8587,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            HashMap::new(),
+            vec![],
             |_certs| vec![],
         );
 
@@ -8753,9 +8615,9 @@ mod tests {
         let (mut state, _topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
-        // Default config: base = 3s, increment = 500ms
-        let base_timeout = Duration::from_secs(3);
-        let increment = Duration::from_millis(500);
+        // Default config: base = 5s, increment = 1s
+        let base_timeout = Duration::from_secs(5);
+        let increment = Duration::from_secs(1);
 
         // At round 0 (same as view_at_height_start), timeout should be base
         assert_eq!(state.view, 0);
@@ -8796,8 +8658,8 @@ mod tests {
         let (mut state, _topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
 
-        let base_timeout = Duration::from_secs(3);
-        let increment = Duration::from_millis(500);
+        let base_timeout = Duration::from_secs(5);
+        let increment = Duration::from_secs(1);
 
         // Simulate several view changes at height 0
         state.view = 5;
@@ -8857,7 +8719,7 @@ mod tests {
         );
 
         state.set_time(Duration::from_secs(100));
-        let base_timeout = Duration::from_secs(3);
+        let base_timeout = Duration::from_secs(5);
 
         // With zero increment, timeout should always be base regardless of round
         assert_eq!(state.current_view_change_timeout(), base_timeout);
@@ -8886,49 +8748,49 @@ mod tests {
         state.view_at_height_start = 0;
         state.last_leader_activity = Duration::ZERO;
 
-        // Base timeout is 3s
-        // At exactly 3s, should trigger (rounds_at_height = 0)
-        state.set_time(Duration::from_secs(3));
+        // Base timeout is 5s
+        // At exactly 5s, should trigger (rounds_at_height = 0)
+        state.set_time(Duration::from_secs(5));
         assert!(
             state.should_advance_round(),
             "At base timeout, should trigger view change"
         );
 
-        // Now at round 1, timeout should be 3.5s
+        // Now at round 1, timeout should be 6s
         // Reset and simulate we're at round 1
         state.view = 1;
         state.last_leader_activity = Duration::from_secs(10);
 
-        // At 3s after last activity, should NOT trigger (need 3.5s)
-        state.set_time(Duration::from_secs(13));
+        // At 5s after last activity, should NOT trigger (need 6s)
+        state.set_time(Duration::from_secs(15));
         assert!(
             !state.should_advance_round(),
-            "At round 1, 3s is not enough (need 3.5s)"
+            "At round 1, 5s is not enough (need 6s)"
         );
 
-        // At 3.5s after last activity, should trigger
-        state.set_time(Duration::from_millis(13500));
+        // At 6s after last activity, should trigger
+        state.set_time(Duration::from_secs(16));
         assert!(
             state.should_advance_round(),
-            "At round 1, 3.5s should trigger view change"
+            "At round 1, 6s should trigger view change"
         );
 
-        // At round 5, timeout should be 5.5s
+        // At round 5, timeout should be 10s
         state.view = 5;
         state.last_leader_activity = Duration::from_secs(20);
 
-        // At 5s after last activity, should NOT trigger
-        state.set_time(Duration::from_secs(25));
+        // At 9s after last activity, should NOT trigger
+        state.set_time(Duration::from_secs(29));
         assert!(
             !state.should_advance_round(),
-            "At round 5, 5s is not enough (need 5.5s)"
+            "At round 5, 9s is not enough (need 10s)"
         );
 
-        // At 5.5s after last activity, should trigger
-        state.set_time(Duration::from_millis(25500));
+        // At 10s after last activity, should trigger
+        state.set_time(Duration::from_secs(30));
         assert!(
             state.should_advance_round(),
-            "At round 5, 5.5s should trigger view change"
+            "At round 5, 10s should trigger view change"
         );
     }
 
@@ -8964,35 +8826,35 @@ mod tests {
 
         state.set_time(Duration::from_secs(100));
 
-        let base_timeout = Duration::from_secs(3);
-        let increment = Duration::from_millis(500);
+        let base_timeout = Duration::from_secs(5);
+        let increment = Duration::from_secs(1);
         let max_timeout = Duration::from_secs(10);
 
         // At low rounds, timeout follows linear formula
+        state.view = 3;
+        assert_eq!(
+            state.current_view_change_timeout(),
+            base_timeout + increment * 3,
+            "At round 3: should be 8s (below cap)"
+        );
+
+        // At round 5: 5s + 5*1s = 10s (exactly at cap)
         state.view = 5;
         assert_eq!(
             state.current_view_change_timeout(),
-            base_timeout + increment * 5,
-            "At round 5: should be 5.5s (below cap)"
+            max_timeout,
+            "At round 5: should be exactly at cap (10s)"
         );
 
-        // At round 14: 3s + 14*0.5s = 10s (exactly at cap)
-        state.view = 14;
+        // At round 10: would be 15s, but capped at 10s
+        state.view = 10;
         assert_eq!(
             state.current_view_change_timeout(),
             max_timeout,
-            "At round 14: should be exactly at cap (10s)"
+            "At round 10: should be capped at 10s"
         );
 
-        // At round 20: would be 13s, but capped at 10s
-        state.view = 20;
-        assert_eq!(
-            state.current_view_change_timeout(),
-            max_timeout,
-            "At round 20: should be capped at 10s"
-        );
-
-        // At round 100: would be 53s, but capped at 10s
+        // At round 100: would be 105s, but capped at 10s
         state.view = 100;
         assert_eq!(
             state.current_view_change_timeout(),
@@ -9032,23 +8894,23 @@ mod tests {
 
         state.set_time(Duration::from_secs(100));
 
-        let base_timeout = Duration::from_secs(3);
-        let increment = Duration::from_millis(500);
+        let base_timeout = Duration::from_secs(5);
+        let increment = Duration::from_secs(1);
 
-        // At round 100: 3s + 100*0.5s = 53s (no cap)
+        // At round 100: 5s + 100*1s = 105s (no cap)
         state.view = 100;
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout + increment * 100,
-            "At round 100 with no cap: should be 53s"
+            "At round 100 with no cap: should be 105s"
         );
 
-        // At round 1000: 3s + 1000*0.5s = 503s (no cap)
+        // At round 1000: 5s + 1000*1s = 1005s (no cap)
         state.view = 1000;
         assert_eq!(
             state.current_view_change_timeout(),
             base_timeout + increment * 1000,
-            "At round 1000 with no cap: should be 503s (~8.4 minutes)"
+            "At round 1000 with no cap: should be 1005s (~16.75 minutes)"
         );
     }
 

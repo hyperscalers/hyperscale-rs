@@ -6,11 +6,11 @@
 //! snapshots without copying the entire dataset. This is critical for parallel
 //! transaction execution where each transaction needs an isolated view.
 //!
-//! # JMT Integration
+//! # JVT Integration
 //!
-//! Uses `TypedInMemoryTreeStore` for Jellyfish Merkle Tree tracking, providing
-//! `jmt_version()` and `state_root_hash()` for state commitment. This ensures
-//! simulation has identical JMT behavior to production.
+//! Uses `TypedInMemoryTreeStore` for Jellyfish Verkle Tree tracking, providing
+//! `jvt_version()` and `state_root_hash()` for state commitment. This ensures
+//! simulation has identical JVT behavior to production.
 
 mod storage;
 

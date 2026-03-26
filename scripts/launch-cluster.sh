@@ -39,12 +39,12 @@ NODE_HOSTNAME="${NODE_HOSTNAME:-localhost}"     # Hostname for spammer endpoints
 TCP_FALLBACK_ENABLED="${TCP_FALLBACK_ENABLED:-false}" # Enable TCP fallback transport (default: false)
 NETWORK_LATENCY_MS=""                           # Network latency in milliseconds (empty = disabled)
 PACKET_LOSS_PERCENT=""                          # Packet loss percentage (empty = disabled)
-JMT_HISTORY_LENGTH=256                          # Number of block heights of JMT history to retain (default: 256)
+JVT_HISTORY_LENGTH=256                          # Number of block heights of JVT history to retain (default: 256)
 
 # Mempool configuration
-MEMPOOL_MAX_IN_FLIGHT=512                       # Soft limit on in-flight transactions
-MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT=1024           # Hard limit on in-flight transactions
-MEMPOOL_MAX_PENDING=2048                        # Max pending before RPC backpressure
+MEMPOOL_MAX_IN_FLIGHT=2048                      # Soft limit on in-flight transactions
+MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT=4096           # Hard limit on in-flight transactions
+MEMPOOL_MAX_PENDING=8192                        # Max pending before RPC backpressure
 
 # Define explicit port ranges for Docker and firewall whitelisting
 # let's give a range of 500 ports which should be ok for local testing
@@ -127,7 +127,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --state-history-length)
-            JMT_HISTORY_LENGTH="$2"
+            JVT_HISTORY_LENGTH="$2"
             shift 2
             ;;
         --help|-h)
@@ -149,9 +149,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --tcp-fallback           Enable TCP fallback transport (QUIC only)"
             echo "  --latency MS             Add network latency between validators (requires sudo)"
             echo "  --packet-loss PERCENT    Add packet loss between validators (requires sudo)"
-            echo "  --mempool-max-in-flight N          Soft limit on in-flight transactions (default: 512)"
-            echo "  --mempool-max-in-flight-hard-limit N  Hard limit on in-flight transactions (default: 1024)"
-            echo "  --mempool-max-pending N  Max pending transactions before RPC backpressure (default: 2048)"
+            echo "  --mempool-max-in-flight N          Soft limit on in-flight transactions (default: 2048)"
+            echo "  --mempool-max-in-flight-hard-limit N  Hard limit on in-flight transactions (default: 4096)"
+            echo "  --mempool-max-pending N  Max pending transactions before RPC backpressure (default: 8192)"
             echo "  --state-history-length N Number of state versions to retain (default: 60000)"
             echo ""
             echo "Environment Variables:"
@@ -430,10 +430,11 @@ max_message_size = 10485760
 gossipsub_heartbeat_ms = 100
 
 [consensus]
-proposal_interval_ms = 300
-view_change_timeout_ms = 3000
-max_transactions_per_block = 1024
-max_certificates_per_block = 4096
+proposal_interval_ms = 1000
+min_block_interval_ms = 800
+view_change_timeout_ms = 5000
+max_transactions_per_block = 4096
+max_certificates_per_block = 8192
 rpc_mempool_limit = 16384
 
 [threads]
@@ -441,6 +442,7 @@ consensus_crypto_threads = 0
 crypto_threads = 0
 tx_validation_threads = 0
 execution_threads = 0
+provisions_threads = 0
 io_threads = 0
 pin_cores = false
 
@@ -448,7 +450,7 @@ pin_cores = false
 max_background_jobs = 2
 write_buffer_mb = 64
 block_cache_mb = 256
-jmt_history_length = $JMT_HISTORY_LENGTH
+jvt_history_length = $JVT_HISTORY_LENGTH
 
 [mempool]
 max_in_flight = $MEMPOOL_MAX_IN_FLIGHT

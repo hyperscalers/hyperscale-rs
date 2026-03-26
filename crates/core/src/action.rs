@@ -3,15 +3,27 @@
 use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
-    Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentProof,
-    CommittedBlockHeader, DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate,
-    ExecutionVote, Hash, NodeId, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    SignerBitfield, StateProvision, TopologySnapshot, TransactionAbort, TransactionCertificate,
-    TransactionDefer, ValidatorId, VotePower,
+    Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
+    DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId,
+    ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield,
+    StateProvision, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
+    ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Why a transaction inclusion proof is being fetched.
+#[derive(Debug, Clone)]
+pub enum InclusionProofFetchReason {
+    /// Livelock deferral — deliver proof to livelock state machine.
+    Deferral {
+        /// The transaction being deferred (loser in cycle detection).
+        loser_tx_hash: Hash,
+    },
+    /// Priority tx — cache proof for proposal under backpressure.
+    Priority,
+}
 
 /// A request to execute a cross-shard transaction with its provisions.
 #[derive(Debug, Clone)]
@@ -172,17 +184,16 @@ pub enum Action {
         total_voting_power: u64,
     },
 
-    /// Verify a batch of state provisions' QC and merkle inclusion proofs.
+    /// Verify a provision batch's QC and verkle inclusion proofs.
     ///
-    /// The QC signature is verified once across candidate headers. Merkle
-    /// inclusion proofs are checked per provision against the verified
-    /// header's state root.
+    /// The QC signature is verified once for the batch's attestation. Verkle
+    /// proofs are checked against the verified state root.
     ///
     /// Delegated to a thread pool in production, instant in simulation.
     /// Returns `ProtocolEvent::StateProvisionsVerified` when complete.
-    VerifyStateProvisions {
-        /// The state provisions to verify (all from the same block).
-        provisions: Vec<StateProvision>,
+    VerifyProvisionBatch {
+        /// The provision batch to verify (all from the same source block).
+        batch: ProvisionBatch,
         /// Candidate committed block headers to try.
         /// In normal operation there is one; with byzantine validators
         /// there may be multiple (one per sender for the same (shard, height)).
@@ -266,39 +277,35 @@ pub enum Action {
         block_hash: Hash,
     },
 
-    /// Verify a CommitmentProof's aggregated BLS signature.
+    /// Request a transaction inclusion proof from a source shard for livelock deferral.
     ///
-    /// This is CRITICAL for BFT safety: we must verify that the CommitmentProof
-    /// has a valid aggregated signature from the claimed signers on the source shard.
-    /// Without this check, a Byzantine proposer could include deferrals with forged
-    /// proofs, causing honest validators to incorrectly defer transactions.
+    /// Request a transaction inclusion proof from a source shard.
     ///
-    /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::CommitmentProofVerified` when complete.
-    VerifyCommitmentProof {
-        /// Block hash containing this deferral (for correlation).
-        block_hash: Hash,
-        /// Index of deferral in block's deferred list.
-        deferral_index: usize,
-        /// The CommitmentProof to verify.
-        commitment_proof: CommitmentProof,
-        /// Public keys of signers (resolved from SignerBitfield).
-        public_keys: Vec<Bls12381G1PublicKey>,
-        /// Total voting power of the signers (resolved from SignerBitfield + topology).
-        voting_power: u64,
-        /// Quorum threshold for source shard.
-        quorum_threshold: u64,
+    /// Used for both livelock deferrals and priority tx proofs under backpressure.
+    /// The I/O loop sends this as a network request; the response is delivered
+    /// back as `NodeInput::InclusionProofFetchReceived`.
+    RequestTxInclusionProof {
+        /// Source shard to fetch the proof from.
+        source_shard: ShardGroupId,
+        /// Block height on the source shard.
+        source_block_height: BlockHeight,
+        /// Transaction hash to prove inclusion for.
+        winner_tx_hash: Hash,
+        /// Why this proof is being fetched.
+        reason: InclusionProofFetchReason,
+        /// Peers in the source shard to send the request to.
+        peers: Vec<ValidatorId>,
     },
 
-    /// Verify a block's state root against the JMT.
+    /// Verify a block's state root against the JVT.
     ///
-    /// Applies the block's shard-local state changes to the JMT and compares the
+    /// Applies the block's shard-local state changes to the JVT and compares the
     /// resulting root against the header's `state_root`.
     /// Returns `ProtocolEvent::StateRootVerified`.
     ///
     /// The verification flow:
-    /// 1. Runner checks if local JMT root matches `parent_state_root`
-    /// 2. Applies per-certificate updates to compute new JMT root
+    /// 1. Runner checks if local JVT root matches `parent_state_root`
+    /// 2. Applies per-certificate updates to compute new JVT root
     /// 3. Compares computed root against `expected_root`
     /// 4. If valid, builds and caches a WriteBatch for efficient commit later
     ///
@@ -306,14 +313,14 @@ pub enum Action {
     /// execution cache, filtering to local shard, and merging.
     VerifyStateRoot {
         block_hash: Hash,
-        /// Base state root to verify from (must match local JMT before computing).
+        /// Base state root to verify from (must match local JVT before computing).
         parent_state_root: Hash,
         /// Expected state root after applying writes.
         expected_root: Hash,
         /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
         /// Merged on the thread pool before verification.
         per_cert_updates: Vec<Arc<DatabaseUpdates>>,
-        /// Block height (used as JMT version).
+        /// Block height (used as JVT version).
         block_height: u64,
     },
 
@@ -323,7 +330,7 @@ pub enum Action {
     /// and compares against the block header's claimed transaction_root.
     /// Returns `ProtocolEvent::TransactionRootVerified`.
     ///
-    /// This is a pure CPU operation (no JMT dependency) so it can be verified
+    /// This is a pure CPU operation (no JVT dependency) so it can be verified
     /// in parallel with state root verification.
     VerifyTransactionRoot {
         block_hash: Hash,
@@ -370,7 +377,7 @@ pub enum Action {
         parent_qc: QuorumCertificate,
         timestamp: u64,
         is_fallback: bool,
-        /// Parent's state root. Certs included only if local JMT matches this.
+        /// Parent's state root. Certs included only if local JVT matches this.
         parent_state_root: Hash,
         retry_transactions: Vec<Arc<RoutableTransaction>>,
         priority_transactions: Vec<Arc<RoutableTransaction>>,
@@ -379,11 +386,12 @@ pub enum Action {
         /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
         /// Merged on the thread pool before proposal building.
         per_cert_updates: Vec<Arc<DatabaseUpdates>>,
-        commitment_proofs: HashMap<Hash, CommitmentProof>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         /// Shard groups that need provisions from this block's transactions.
         provision_targets: Vec<ShardGroupId>,
+        /// Inclusion proofs for priority transactions (populated under backpressure).
+        priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
     },
 
     /// Execute a batch of single-shard transactions.
@@ -433,7 +441,7 @@ pub enum Action {
     /// Emit a committed block for external observers.
     ///
     /// Carries the certifying QC so the runner can persist committed metadata
-    /// (`set_committed_state`) after JMT state has been applied, not at
+    /// (`set_committed_state`) after JVT state has been applied, not at
     /// certification time.
     EmitCommittedBlock {
         block: Block,
@@ -476,8 +484,8 @@ pub enum Action {
     ///
     /// This stores the block data only — it does NOT update committed metadata.
     /// Committed metadata (`set_committed_state`) is persisted by the runner
-    /// after JMT state has been applied, to prevent committed_height from
-    /// getting ahead of actual JMT state on crash recovery.
+    /// after JVT state has been applied, to prevent committed_height from
+    /// getting ahead of actual JVT state on crash recovery.
     PersistBlock {
         block: Block,
         /// The QC that certified this block (stored alongside block data).
@@ -759,6 +767,7 @@ impl Action {
                 | Action::PersistTransactionCertificate { .. }
                 | Action::RequestMissingProvisions { .. }
                 | Action::CancelProvisionFetch { .. }
+                | Action::RequestTxInclusionProof { .. }
         )
     }
 
@@ -767,12 +776,11 @@ impl Action {
         matches!(
             self,
             Action::VerifyAndBuildQuorumCertificate { .. }
-                | Action::VerifyStateProvisions { .. }
+                | Action::VerifyProvisionBatch { .. }
                 | Action::AggregateExecutionCertificate { .. }
                 | Action::VerifyAndAggregateExecutionVotes { .. }
                 | Action::VerifyExecutionCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
-                | Action::VerifyCommitmentProof { .. }
                 | Action::VerifyStateRoot { .. }
                 | Action::VerifyTransactionRoot { .. }
                 | Action::VerifyReceiptRoot { .. }
@@ -815,14 +823,13 @@ impl Action {
 
             // Delegated Work - Crypto Verification
             Action::VerifyAndBuildQuorumCertificate { .. } => "VerifyAndBuildQuorumCertificate",
-            Action::VerifyStateProvisions { .. } => "VerifyStateProvisions",
+            Action::VerifyProvisionBatch { .. } => "VerifyProvisionBatch",
             Action::AggregateExecutionCertificate { .. } => "AggregateExecutionCertificate",
             Action::VerifyAndAggregateExecutionVotes { .. } => "VerifyAndAggregateExecutionVotes",
             Action::VerifyExecutionCertificateSignature { .. } => {
                 "VerifyExecutionCertificateSignature"
             }
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
-            Action::VerifyCommitmentProof { .. } => "VerifyCommitmentProof",
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
             Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
             Action::VerifyReceiptRoot { .. } => "VerifyReceiptRoot",
@@ -870,6 +877,7 @@ impl Action {
             Action::CancelFetch { .. } => "CancelFetch",
             Action::RequestMissingProvisions { .. } => "RequestMissingProvisions",
             Action::CancelProvisionFetch { .. } => "CancelProvisionFetch",
+            Action::RequestTxInclusionProof { .. } => "RequestTxInclusionProof",
         }
     }
 }

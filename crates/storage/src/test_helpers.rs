@@ -123,7 +123,7 @@ pub fn make_test_block(height: u64) -> Block {
         certificates: vec![],
         deferred: vec![],
         aborted: vec![],
-        commitment_proofs: std::collections::HashMap::new(),
+        priority_inclusions: vec![],
     }
 }
 

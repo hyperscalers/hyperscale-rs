@@ -1,12 +1,11 @@
 //! Block and BlockHeader types for consensus.
 
 use crate::{
-    compute_merkle_root, BlockHeight, CommitmentProof, Hash, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, TransactionAbort, TransactionCertificate, TransactionDefer,
-    ValidatorId,
+    compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root, BlockHeight,
+    Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TransactionAbort,
+    TransactionCertificate, TransactionDefer, TransactionInclusionProof, ValidatorId,
 };
 use sbor::prelude::*;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Tag prefixes for transaction slot provability in merkle tree.
@@ -66,7 +65,72 @@ pub fn compute_transaction_root(
         leaves.push(Hash::from_parts(&[NORMAL_TAG, tx.hash().as_bytes()]));
     }
 
-    compute_merkle_root(&leaves)
+    // Use padded merkle root (power-of-2 padding with Hash::ZERO) so that
+    // merkle inclusion proofs can be generated and verified for any leaf.
+    compute_padded_merkle_root(&leaves)
+}
+
+/// Compute a transaction inclusion proof for a specific transaction in a block.
+///
+/// Reconstructs the tagged leaf list in the same order as `compute_transaction_root`
+/// (retry, priority, normal), finds the leaf matching `tx_hash`, and returns a
+/// merkle inclusion proof plus the tagged leaf hash.
+///
+/// Returns `None` if the transaction is not in the block.
+pub fn tx_inclusion_proof(block: &Block, tx_hash: &Hash) -> Option<TransactionInclusionProof> {
+    let total_count = block.retry_transactions.len()
+        + block.priority_transactions.len()
+        + block.transactions.len();
+
+    if total_count == 0 {
+        return None;
+    }
+
+    // Build tagged leaves in the same order as compute_transaction_root
+    let mut leaves = Vec::with_capacity(total_count);
+
+    for tx in &block.retry_transactions {
+        leaves.push(Hash::from_parts(&[RETRY_TAG, tx.hash().as_bytes()]));
+    }
+    for tx in &block.priority_transactions {
+        leaves.push(Hash::from_parts(&[PRIORITY_TAG, tx.hash().as_bytes()]));
+    }
+    for tx in &block.transactions {
+        leaves.push(Hash::from_parts(&[NORMAL_TAG, tx.hash().as_bytes()]));
+    }
+
+    // Find which leaf matches tx_hash (check all tag variants)
+    let target_retry = Hash::from_parts(&[RETRY_TAG, tx_hash.as_bytes()]);
+    let target_priority = Hash::from_parts(&[PRIORITY_TAG, tx_hash.as_bytes()]);
+    let target_normal = Hash::from_parts(&[NORMAL_TAG, tx_hash.as_bytes()]);
+
+    let index = leaves.iter().position(|leaf| {
+        *leaf == target_retry || *leaf == target_priority || *leaf == target_normal
+    })?;
+
+    let (_root, proof) = compute_merkle_root_with_proof(&leaves, index);
+    Some(proof)
+}
+
+// ============================================================================
+// PriorityInclusion
+// ============================================================================
+
+/// Proof that a priority transaction was committed on a remote shard.
+///
+/// Lightweight: ~400 bytes per tx (merkle proof against transaction_root).
+/// Verified by validators against the QC-attested `CommittedBlockHeader`
+/// from the source shard.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct PriorityInclusion {
+    /// Hash of the priority transaction.
+    pub tx_hash: Hash,
+    /// Remote shard where this transaction was committed.
+    pub source_shard: ShardGroupId,
+    /// Block height on the remote shard.
+    pub source_block_height: BlockHeight,
+    /// Merkle inclusion proof against the remote block's transaction_root.
+    pub proof: TransactionInclusionProof,
 }
 
 /// Block header containing consensus metadata.
@@ -75,7 +139,7 @@ pub fn compute_transaction_root(
 /// - Chain position (height, parent hash)
 /// - Proposer identity
 /// - Proof of parent commitment (parent QC)
-/// - State commitment (JMT root after applying committed certificates)
+/// - State commitment (JVT root after applying committed certificates)
 /// - Transaction commitment (merkle root of all transactions in the block)
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct BlockHeader {
@@ -106,7 +170,7 @@ pub struct BlockHeader {
     /// Whether this block was created as a fallback when leader timed out.
     pub is_fallback: bool,
 
-    /// JMT state root hash after applying all certificates in this block.
+    /// JVT state root hash after applying all certificates in this block.
     pub state_root: Hash,
 
     /// Merkle root of all transactions in this block.
@@ -147,7 +211,7 @@ pub struct BlockHeader {
 }
 
 impl BlockHeader {
-    /// Create a genesis block header (height 0) with the given proposer and JMT state.
+    /// Create a genesis block header (height 0) with the given proposer and JVT state.
     pub fn genesis(shard_group_id: ShardGroupId, proposer: ValidatorId, state_root: Hash) -> Self {
         Self {
             shard_group_id,
@@ -186,7 +250,7 @@ impl BlockHeader {
 ///
 /// Blocks contain transactions in three priority sections:
 /// 1. **retry_transactions**: Retry transactions (highest priority, critical for liveness)
-/// 2. **priority_transactions**: Cross-shard transactions with commitment proofs
+/// 2. **priority_transactions**: Cross-shard transactions with verified provisions
 /// 3. **transactions**: All other transactions
 ///
 /// Additional block contents:
@@ -238,11 +302,12 @@ pub struct Block {
     /// or for transactions that explicitly failed during execution.
     pub aborted: Vec<TransactionAbort>,
 
-    /// Commitment proofs for priority transaction ordering.
+    /// Inclusion proofs for priority transactions.
     ///
-    /// Maps transaction hash to its CommitmentProof. These proofs justify
-    /// why transactions are in the priority section.
-    pub commitment_proofs: HashMap<Hash, CommitmentProof>,
+    /// Each entry proves that the corresponding priority transaction was
+    /// committed on the source shard, verified against the QC-attested
+    /// `transaction_root` from `CommittedBlockHeader`.
+    pub priority_inclusions: Vec<PriorityInclusion>,
 }
 
 // Manual PartialEq - compare transaction/certificate content, not Arc pointers
@@ -264,7 +329,7 @@ impl PartialEq for Block {
                 .all(|(a, b)| a.as_ref() == b.as_ref())
             && self.deferred == other.deferred
             && self.aborted == other.aborted
-            && self.commitment_proofs == other.commitment_proofs
+            && self.priority_inclusions == other.priority_inclusions
     }
 }
 
@@ -312,18 +377,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         }
         encoder.encode(&self.deferred)?;
         encoder.encode(&self.aborted)?;
-        // Commitment proofs (HashMap<Hash, CommitmentProof>)
-        // Encode as array of (key, value) pairs for determinism
-        encoder.write_value_kind(sbor::ValueKind::Array)?;
-        encoder.write_value_kind(sbor::ValueKind::Tuple)?;
-        encoder.write_size(self.commitment_proofs.len())?;
-        // Sort by hash for deterministic encoding
-        let mut proofs: Vec<_> = self.commitment_proofs.iter().collect();
-        proofs.sort_by_key(|(k, _)| *k);
-        for (tx_hash, proof) in proofs {
-            encoder.encode(tx_hash)?;
-            encoder.encode(proof)?;
-        }
+        encoder.encode(&self.priority_inclusions)?;
         Ok(())
     }
 }
@@ -400,23 +454,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
 
         let deferred: Vec<TransactionDefer> = decoder.decode()?;
         let aborted: Vec<TransactionAbort> = decoder.decode()?;
-
-        // Commitment proofs (array of (Hash, CommitmentProof) pairs)
-        decoder.read_and_check_value_kind(sbor::ValueKind::Array)?;
-        decoder.read_and_check_value_kind(sbor::ValueKind::Tuple)?;
-        let proof_count = decoder.read_size()?;
-        if proof_count > MAX_SBOR_COLLECTION_SIZE {
-            return Err(sbor::DecodeError::UnexpectedSize {
-                expected: MAX_SBOR_COLLECTION_SIZE,
-                actual: proof_count,
-            });
-        }
-        let mut commitment_proofs = HashMap::with_capacity(proof_count);
-        for _ in 0..proof_count {
-            let tx_hash: Hash = decoder.decode()?;
-            let proof: CommitmentProof = decoder.decode()?;
-            commitment_proofs.insert(tx_hash, proof);
-        }
+        let priority_inclusions: Vec<PriorityInclusion> = decoder.decode()?;
 
         Ok(Self {
             header,
@@ -426,7 +464,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             certificates,
             deferred,
             aborted,
-            commitment_proofs,
+            priority_inclusions,
         })
     }
 }
@@ -446,7 +484,7 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for Block {
 }
 
 impl Block {
-    /// Create an empty genesis block with the given proposer and JMT state.
+    /// Create an empty genesis block with the given proposer and JVT state.
     pub fn genesis(shard_group_id: ShardGroupId, proposer: ValidatorId, state_root: Hash) -> Self {
         Self {
             header: BlockHeader::genesis(shard_group_id, proposer, state_root),
@@ -456,7 +494,7 @@ impl Block {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs: HashMap::new(),
+            priority_inclusions: vec![],
         }
     }
 
@@ -514,16 +552,6 @@ impl Block {
     /// Check if this is the genesis block.
     pub fn is_genesis(&self) -> bool {
         self.header.is_genesis()
-    }
-
-    /// Check if a transaction has a commitment proof in this block.
-    pub fn has_commitment_proof(&self, tx_hash: &Hash) -> bool {
-        self.commitment_proofs.contains_key(tx_hash)
-    }
-
-    /// Get the commitment proof for a transaction, if present.
-    pub fn get_commitment_proof(&self, tx_hash: &Hash) -> Option<&CommitmentProof> {
-        self.commitment_proofs.get(tx_hash)
     }
 
     /// Get number of committed certificates in this block.
@@ -587,11 +615,11 @@ impl Block {
 // ============================================================================
 
 /// Hash-level description of a block's contents (transactions, certificates,
-/// deferrals, aborts, and commitment proofs).
+/// deferrals, and aborts).
 ///
 /// This is the common denominator shared by `BlockHeaderNotification`, `BlockMetadata`,
 /// and `ProtocolEvent::BlockHeaderReceived`. Extracting it into a standalone type
-/// eliminates copy-paste of 7 fields across those three sites.
+/// eliminates copy-paste across those sites.
 #[derive(Debug, Clone, Default, PartialEq, Eq, BasicSbor)]
 pub struct BlockManifest {
     /// Retry transaction hashes (highest priority section).
@@ -612,8 +640,8 @@ pub struct BlockManifest {
     /// Aborted transactions (small, stored inline).
     pub aborted: Vec<TransactionAbort>,
 
-    /// Commitment proofs for priority ordering (stored inline).
-    pub commitment_proofs: HashMap<Hash, CommitmentProof>,
+    /// Inclusion proofs for priority transactions.
+    pub priority_inclusions: Vec<PriorityInclusion>,
 }
 
 impl BlockManifest {
@@ -651,7 +679,7 @@ impl BlockManifest {
                 .collect(),
             deferred: block.deferred.clone(),
             aborted: block.aborted.clone(),
-            commitment_proofs: block.commitment_proofs.clone(),
+            priority_inclusions: block.priority_inclusions.clone(),
         }
     }
 }

@@ -2,6 +2,7 @@
 
 use super::{IoLoop, TimerOp};
 use crate::protocol::fetch::FetchOutput;
+use crate::protocol::inclusion_proof_fetch::InclusionProofFetchOutput;
 use crate::protocol::provision_fetch::ProvisionFetchOutput;
 use crate::protocol::sync::SyncOutput;
 use hyperscale_core::{NodeInput, ProtocolEvent, TimerId};
@@ -214,22 +215,26 @@ where
                         request,
                         Box::new(move |result| match result {
                             Ok(response) => match response.provisions {
-                                Some(provisions) if !provisions.is_empty() => {
-                                    let _ = sender.send(NodeInput::ProvisionFetchReceived {
+                                Some(provisions) => {
+                                    // Build a ProvisionBatch from the response.
+                                    let proof = response.proof.unwrap_or_else(
+                                        hyperscale_types::SubstateInclusionProof::dummy,
+                                    );
+                                    let transactions: Vec<hyperscale_types::TxEntries> = provisions
+                                        .into_iter()
+                                        .map(|p| hyperscale_types::TxEntries {
+                                            tx_hash: p.transaction_hash,
+                                            entries: (*p.entries).clone(),
+                                        })
+                                        .collect();
+                                    let batch = hyperscale_types::ProvisionBatch {
                                         source_shard,
                                         block_height,
-                                        provisions,
-                                    });
-                                }
-                                Some(_) => {
-                                    // Empty provisions — no matching transactions for
-                                    // our shard at this block height. Treat as success
-                                    // (removes the pending entry).
-                                    let _ = sender.send(NodeInput::ProvisionFetchReceived {
-                                        source_shard,
-                                        block_height,
-                                        provisions: vec![],
-                                    });
+                                        proof,
+                                        transactions,
+                                    };
+                                    let _ =
+                                        sender.send(NodeInput::ProvisionFetchReceived { batch });
                                 }
                                 None => {
                                     // Peer cannot serve (state version GC'd) → fail
@@ -249,9 +254,94 @@ where
                         }),
                     );
                 }
-                ProvisionFetchOutput::Deliver { provisions } => {
-                    if !provisions.is_empty() {
-                        self.feed_event(ProtocolEvent::StateProvisionsReceived { provisions });
+                ProvisionFetchOutput::Deliver { batch } => {
+                    if !batch.transactions.is_empty() {
+                        self.feed_event(ProtocolEvent::StateProvisionsReceived { batch });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Process InclusionProofFetchProtocol outputs.
+    ///
+    /// `Fetch` uses the Network trait to send a single-peer request.
+    /// `Deliver` forwards the proof to the state machine for livelock processing.
+    pub(super) fn process_inclusion_proof_fetch_outputs(
+        &mut self,
+        outputs: Vec<InclusionProofFetchOutput>,
+    ) {
+        for output in outputs {
+            match output {
+                InclusionProofFetchOutput::Fetch {
+                    source_shard,
+                    block_height,
+                    winner_tx_hash,
+                    reason,
+                    peer,
+                } => {
+                    use hyperscale_messages::request::GetTxInclusionProofRequest;
+                    let request = GetTxInclusionProofRequest {
+                        block_height,
+                        tx_hash: winner_tx_hash,
+                    };
+                    let sender = self.event_sender.clone();
+                    self.network.request(
+                        &[peer],
+                        None,
+                        request,
+                        Box::new(move |result| match result {
+                            Ok(response) => {
+                                if let Some(proof) = response.proof {
+                                    let _ = sender.send(NodeInput::InclusionProofFetchReceived {
+                                        winner_tx_hash,
+                                        reason,
+                                        source_shard,
+                                        source_block_height: block_height,
+                                        proof,
+                                    });
+                                } else {
+                                    let _ = sender.send(NodeInput::InclusionProofFetchFailed {
+                                        winner_tx_hash,
+                                    });
+                                }
+                            }
+                            Err(_) => {
+                                let _ = sender
+                                    .send(NodeInput::InclusionProofFetchFailed { winner_tx_hash });
+                            }
+                        }),
+                    );
+                }
+                InclusionProofFetchOutput::Deliver {
+                    winner_tx_hash,
+                    reason,
+                    source_shard,
+                    source_block_height,
+                    proof,
+                } => {
+                    use hyperscale_core::InclusionProofFetchReason;
+                    let actions = match reason {
+                        InclusionProofFetchReason::Deferral { loser_tx_hash } => {
+                            self.state.on_inclusion_proof_received(
+                                winner_tx_hash,
+                                loser_tx_hash,
+                                source_shard,
+                                source_block_height,
+                                proof,
+                            )
+                        }
+                        InclusionProofFetchReason::Priority => {
+                            self.state.on_priority_inclusion_proof_received(
+                                winner_tx_hash,
+                                source_shard,
+                                source_block_height,
+                                proof,
+                            )
+                        }
+                    };
+                    for action in actions {
+                        self.process_action(action);
                     }
                 }
             }
@@ -267,7 +357,8 @@ where
         let status = self.fetch_protocol.status();
         let has_fetch_work = status.pending_tx_blocks > 0 || status.pending_cert_blocks > 0;
         let has_provision_work = self.provision_fetch_protocol.has_pending();
-        if has_fetch_work || has_provision_work {
+        let has_inclusion_proof_work = self.inclusion_proof_fetch_protocol.has_pending();
+        if has_fetch_work || has_provision_work || has_inclusion_proof_work {
             self.pending_timer_ops.push(TimerOp::Set {
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,

@@ -1,9 +1,9 @@
 //! Genesis bootstrap wrapper.
 //!
 //! During genesis, the Radix Engine calls `commit()` multiple times. Each call
-//! writes substates only (no JMT computation). After bootstrap completes, the
+//! writes substates only (no JVT computation). After bootstrap completes, the
 //! accumulated updates are available as a single merged `DatabaseUpdates` for
-//! a one-shot JMT computation at version 0.
+//! a one-shot JVT computation at version 0.
 
 use crate::writes::merge_into;
 use radix_common::prelude::DbSubstateValue;
@@ -12,14 +12,14 @@ use radix_substate_store_interface::interface::{
     SubstateDatabase,
 };
 
-/// Storage backends that can write substates without JMT computation.
+/// Storage backends that can write substates without JVT computation.
 pub trait SubstatesOnlyCommit {
-    /// Persist substate data without updating the JMT.
+    /// Persist substate data without updating the JVT.
     fn commit_substates_only(&self, updates: &DatabaseUpdates);
 }
 
-/// Wrapper for genesis bootstrap that writes substates only (no JMT) and
-/// merges updates incrementally for a single JMT computation afterwards.
+/// Wrapper for genesis bootstrap that writes substates only (no JVT) and
+/// merges updates incrementally for a single JVT computation afterwards.
 pub struct GenesisWrapper<'a, S> {
     storage: &'a S,
     merged: DatabaseUpdates,

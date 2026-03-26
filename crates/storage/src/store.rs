@@ -5,15 +5,15 @@
 use hyperscale_types::{Hash, NodeId, SubstateInclusionProof};
 use radix_substate_store_interface::interface::{DbSortKey, SubstateDatabase};
 
-/// Extension trait for substate storage with snapshots, node listing, and JMT state roots.
+/// Extension trait for substate storage with snapshots, node listing, and JVT state roots.
 ///
 /// This trait extends Radix's `SubstateDatabase` with additional methods needed
 /// for deterministic simulation and state commitment:
 /// - `snapshot()` - Create isolated views for parallel execution
 /// - `list_substates_for_node()` - Enumerate substates for cross-shard provisioning
-/// - `jmt_version()` / `state_root_hash()` - JMT state commitment
+/// - `jvt_version()` / `state_root_hash()` - JVT state commitment
 ///
-/// All implementations use Jellyfish Merkle Tree (JMT) internally to maintain
+/// All implementations use Jellyfish Verkle Tree (JVT) internally to maintain
 /// cryptographic state roots, updated on each `commit_block()`.
 ///
 /// Runner storage types (`SimStorage`, `RocksDbStorage`) implement this trait
@@ -44,24 +44,24 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync {
         node_id: &NodeId,
     ) -> Box<dyn Iterator<Item = (u8, DbSortKey, Vec<u8>)> + '_>;
 
-    /// Returns the block height of the last committed JMT state.
+    /// Returns the block height of the last committed JVT state.
     ///
-    /// This equals the block height because JMT version = block height.
+    /// This equals the block height because JVT version = block height.
     /// Returns 0 for fresh/genesis state.
-    fn jmt_version(&self) -> u64;
+    fn jvt_version(&self) -> u64;
 
-    /// Current JMT state root hash.
+    /// Current JVT state root hash.
     ///
-    /// Returns the Merkle root of all substates at the current version.
+    /// Returns the Verkle root of all substates at the current version.
     /// This hash cryptographically commits to the entire state and can be used
     /// for state sync, light client proofs, and cross-validator consistency checks.
     ///
     /// Returns a zero hash if no commits have occurred.
     fn state_root_hash(&self) -> Hash;
 
-    /// List all substates for a node at a specific historical block height (= JMT version).
+    /// List all substates for a node at a specific historical block height (= JVT version).
     ///
-    /// Traverses the 3-tier JMT at the given height and looks up raw substate
+    /// Traverses the 3-tier JVT at the given height and looks up raw substate
     /// values from the leaf association table.
     ///
     /// Returns `Some(entries)` on success (may be empty if the node has no
@@ -76,16 +76,11 @@ pub trait SubstateStore: SubstateDatabase + Send + Sync {
         block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>>;
 
-    /// Generate 3-tier JMT inclusion proofs for the given storage keys.
-    fn generate_merkle_proofs(
+    /// Generate an aggregated verkle inclusion proof for the given storage keys.
+    /// Returns `None` if the requested version is unavailable (GC'd or not committed).
+    fn generate_verkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Vec<SubstateInclusionProof>;
+    ) -> Option<SubstateInclusionProof>;
 }
-
-/// Prefix for all Radix Engine data in storage.
-///
-/// All Radix substates are stored with this prefix to allow other data
-/// (consensus metadata, etc.) to coexist in the same storage backend.
-pub const RADIX_PREFIX: &[u8] = b"radix:";

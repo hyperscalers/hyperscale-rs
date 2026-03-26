@@ -6,25 +6,12 @@
 //! boundary between protocol logic and I/O orchestration.
 
 use hyperscale_types::{
-    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommitmentProof,
-    CommittedBlockHeader, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash,
-    QuorumCertificate, RoutableTransaction, ShardGroupId, StateProvision, TransactionCertificate,
+    Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader, EpochConfig,
+    EpochId, ExecutionCertificate, ExecutionVote, Hash, ProvisionBatch, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, StateEntry, StateProvision, TransactionCertificate,
     ValidatorId,
 };
 use std::sync::Arc;
-
-/// Result of verifying a single provision within a batch.
-#[derive(Debug, Clone)]
-pub struct ProvisionVerificationResult {
-    /// Transaction hash for correlation.
-    pub tx_hash: Hash,
-    /// Source shard the provision is from.
-    pub source_shard: ShardGroupId,
-    /// Whether the merkle inclusion proof verified against the committed state root.
-    pub valid: bool,
-    /// The provision that was verified.
-    pub provision: StateProvision,
-}
 
 /// Events that the state machine processes.
 ///
@@ -101,13 +88,6 @@ pub enum ProtocolEvent {
     /// QC signature verification completed.
     QcSignatureVerified { block_hash: Hash, valid: bool },
 
-    /// CommitmentProof signature verification completed.
-    CommitmentProofVerified {
-        block_hash: Hash,
-        deferral_index: usize,
-        valid: bool,
-    },
-
     /// State root verification completed.
     StateRootVerified { block_hash: Hash, valid: bool },
 
@@ -128,8 +108,8 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // State Commit
     // ═══════════════════════════════════════════════════════════════════════
-    /// JMT state commit completed for a block.
-    /// The JMT version always equals the block height.
+    /// JVT state commit completed for a block.
+    /// The JVT version always equals the block height.
     StateCommitComplete { height: u64, state_root: Hash },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -146,7 +126,8 @@ pub enum ProtocolEvent {
     ProvisionAccepted {
         tx_hash: Hash,
         source_shard: ShardGroupId,
-        commitment_proof: CommitmentProof,
+        source_block_height: BlockHeight,
+        entries: Vec<StateEntry>,
     },
 
     /// All required shards have reached provision quorum - ready for execution.
@@ -155,22 +136,25 @@ pub enum ProtocolEvent {
         provisions: Vec<StateProvision>,
     },
 
-    /// Received a batch of state provisions from a source shard (light-client path).
+    /// Received a provision batch from a source shard (light-client path).
     ///
     /// All provisions in a batch share the same `(source_shard, block_height)`
     /// because they originate from a single `FetchAndBroadcastProvisions` action.
-    StateProvisionsReceived { provisions: Vec<StateProvision> },
+    StateProvisionsReceived { batch: ProvisionBatch },
 
-    /// Batch state provision QC + merkle proof verification completed.
+    /// Batch-level provision verification completed.
     ///
-    /// The QC is verified once across all candidates; merkle proofs are checked
-    /// per provision. The verified header is returned so the state machine can
-    /// promote it without re-lookup.
+    /// The QC is verified once for the batch's attestation; verkle proofs are
+    /// checked against the verified state root. The committed header is returned
+    /// so the state machine can promote it without re-lookup.
     StateProvisionsVerified {
-        results: Vec<ProvisionVerificationResult>,
+        /// The verified provision batch.
+        batch: ProvisionBatch,
         /// The committed header whose QC passed verification.
         /// `None` if no candidate header passed QC verification.
         committed_header: Option<CommittedBlockHeader>,
+        /// Whether the batch passed verification.
+        valid: bool,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -370,7 +354,6 @@ impl ProtocolEvent {
             ProtocolEvent::BlockCommitted { .. } => "BlockCommitted",
             ProtocolEvent::QuorumCertificateResult { .. } => "QuorumCertificateResult",
             ProtocolEvent::QcSignatureVerified { .. } => "QcSignatureVerified",
-            ProtocolEvent::CommitmentProofVerified { .. } => "CommitmentProofVerified",
             ProtocolEvent::StateRootVerified { .. } => "StateRootVerified",
             ProtocolEvent::TransactionRootVerified { .. } => "TransactionRootVerified",
             ProtocolEvent::ReceiptRootVerified { .. } => "ReceiptRootVerified",

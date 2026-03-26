@@ -1,16 +1,12 @@
 //! Helper functions for key encoding/decoding used by storage implementations.
 
-use crate::RADIX_PREFIX;
 use hyperscale_types::NodeId;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 use radix_substate_store_interface::interface::{DbPartitionKey, DbSortKey};
 
 /// Convert Radix partition key + sort key to storage key.
 pub fn to_storage_key(partition_key: &DbPartitionKey, sort_key: &DbSortKey) -> Vec<u8> {
-    let mut key = Vec::with_capacity(
-        RADIX_PREFIX.len() + partition_key.node_key.len() + 1 + sort_key.0.len(),
-    );
-    key.extend_from_slice(RADIX_PREFIX);
+    let mut key = Vec::with_capacity(partition_key.node_key.len() + 1 + sort_key.0.len());
     key.extend_from_slice(&partition_key.node_key);
     key.push(partition_key.partition_num);
     key.extend_from_slice(&sort_key.0);
@@ -19,8 +15,7 @@ pub fn to_storage_key(partition_key: &DbPartitionKey, sort_key: &DbSortKey) -> V
 
 /// Build storage key prefix for a partition.
 pub fn partition_prefix(partition_key: &DbPartitionKey) -> Vec<u8> {
-    let mut prefix = Vec::with_capacity(RADIX_PREFIX.len() + partition_key.node_key.len() + 1);
-    prefix.extend_from_slice(RADIX_PREFIX);
+    let mut prefix = Vec::with_capacity(partition_key.node_key.len() + 1);
     prefix.extend_from_slice(&partition_key.node_key);
     prefix.push(partition_key.partition_num);
     prefix
@@ -70,31 +65,28 @@ pub fn storage_key_from_write(
 /// Entity key length in storage keys: 20 bytes hash prefix + 30 bytes NodeId.
 const ENTITY_KEY_LEN: usize = 50;
 
-/// Decompose a storage key into its three JMT-tier components.
+/// Decompose a storage key into its three components.
 ///
-/// Storage key layout: `RADIX_PREFIX(6) + entity_key(50) + partition_num(1) + sort_key(var)`
+/// Storage key layout: `entity_key(50) + partition_num(1) + sort_key(var)`
 ///
 /// Returns `(entity_key, partition_num, sort_key)` or `None` if the key is malformed.
 pub fn decompose_storage_key(storage_key: &[u8]) -> Option<(&[u8], u8, &[u8])> {
-    let prefix_len = RADIX_PREFIX.len();
-    let min_len = prefix_len + ENTITY_KEY_LEN + 1; // prefix + entity_key + partition_num
+    let min_len = ENTITY_KEY_LEN + 1; // entity_key + partition_num
 
-    if storage_key.len() < min_len || &storage_key[..prefix_len] != RADIX_PREFIX {
+    if storage_key.len() < min_len {
         return None;
     }
 
-    let entity_key = &storage_key[prefix_len..prefix_len + ENTITY_KEY_LEN];
-    let partition_num = storage_key[prefix_len + ENTITY_KEY_LEN];
+    let entity_key = &storage_key[..ENTITY_KEY_LEN];
+    let partition_num = storage_key[ENTITY_KEY_LEN];
     let sort_key = &storage_key[min_len..];
 
     Some((entity_key, partition_num, sort_key))
 }
 
-/// Get the JMT entity key (db_node_key) for a NodeId.
+/// Get the JVT entity key (db_node_key) for a NodeId.
 ///
-/// This is the key used in the JMT entity tier — the hash-spread 50-byte
-/// representation of the NodeId. Unlike `node_prefix`, this does NOT
-/// include the `RADIX_PREFIX`.
+/// This is the hash-spread 50-byte representation of the NodeId.
 pub fn node_entity_key(node_id: &NodeId) -> Vec<u8> {
     let radix_node_id = radix_common::types::NodeId(node_id.0);
     SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id)
@@ -103,11 +95,7 @@ pub fn node_entity_key(node_id: &NodeId) -> Vec<u8> {
 /// Build the storage key prefix for a given NodeId.
 pub fn node_prefix(node_id: &NodeId) -> Vec<u8> {
     let radix_node_id = radix_common::types::NodeId(node_id.0);
-    let db_node_key = SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id);
-    let mut prefix = Vec::with_capacity(RADIX_PREFIX.len() + db_node_key.len());
-    prefix.extend_from_slice(RADIX_PREFIX);
-    prefix.extend_from_slice(&db_node_key);
-    prefix
+    SpreadPrefixKeyMapper::to_db_node_key(&radix_node_id)
 }
 
 /// Extract the NodeId from a SpreadPrefixKeyMapper db_node_key.
@@ -143,9 +131,8 @@ mod tests {
         let sk = DbSortKey(vec![10, 20]);
         let key = to_storage_key(&pk, &sk);
 
-        // Key = RADIX_PREFIX + node_key + partition_num + sort_key
+        // Key = node_key + partition_num + sort_key
         let mut expected = Vec::new();
-        expected.extend_from_slice(RADIX_PREFIX);
         expected.extend_from_slice(&[1, 2, 3]);
         expected.push(5);
         expected.extend_from_slice(&[10, 20]);
@@ -159,7 +146,6 @@ mod tests {
         let key = to_storage_key(&pk, &sk);
 
         let mut expected = Vec::new();
-        expected.extend_from_slice(RADIX_PREFIX);
         expected.extend_from_slice(&[1, 2, 3]);
         expected.push(0);
         assert_eq!(key, expected);
@@ -171,7 +157,6 @@ mod tests {
         let prefix = partition_prefix(&pk);
 
         let mut expected = Vec::new();
-        expected.extend_from_slice(RADIX_PREFIX);
         expected.extend_from_slice(&[10, 20]);
         expected.push(7);
         assert_eq!(prefix, expected);
@@ -225,8 +210,6 @@ mod tests {
         let sort_key = vec![10, 20];
         let key = storage_key_from_write(&node_id, &partition, &sort_key);
 
-        // Must start with RADIX_PREFIX
-        assert!(key.starts_with(RADIX_PREFIX));
         // Must end with sort key
         assert!(key.ends_with(&sort_key));
         // The byte just before the sort key must be the partition number's
@@ -264,8 +247,6 @@ mod tests {
         let node_id = NodeId([2; 30]);
         let prefix = node_prefix(&node_id);
 
-        // Must start with RADIX_PREFIX
-        assert!(prefix.starts_with(RADIX_PREFIX));
         // Should be deterministic
         let prefix2 = node_prefix(&node_id);
         assert_eq!(prefix, prefix2);

@@ -14,7 +14,7 @@
 use hyperscale_messages::request::GetProvisionsRequest;
 use hyperscale_messages::response::GetProvisionsResponse;
 use hyperscale_storage::{ConsensusStore, SubstateStore};
-use hyperscale_types::{BlockHeight, ShardGroupId, StateProvision, ValidatorId};
+use hyperscale_types::{BlockHeight, ProvisionBatch, ShardGroupId, StateProvision, ValidatorId};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
@@ -52,7 +52,7 @@ pub enum ProvisionFetchInput {
     Received {
         source_shard: ShardGroupId,
         block_height: BlockHeight,
-        provisions: Vec<StateProvision>,
+        batch: ProvisionBatch,
     },
     /// A fetch attempt failed (network error or peer returned None).
     Failed {
@@ -79,7 +79,7 @@ pub enum ProvisionFetchOutput {
         peer: ValidatorId,
     },
     /// Deliver fetched provisions to the state machine.
-    Deliver { provisions: Vec<StateProvision> },
+    Deliver { batch: ProvisionBatch },
 }
 
 /// State for a single pending provision fetch.
@@ -128,8 +128,8 @@ impl ProvisionFetchProtocol {
             ProvisionFetchInput::Received {
                 source_shard,
                 block_height,
-                provisions,
-            } => self.handle_received(source_shard, block_height, provisions),
+                batch,
+            } => self.handle_received(source_shard, block_height, batch),
             ProvisionFetchInput::Failed {
                 source_shard,
                 block_height,
@@ -199,17 +199,17 @@ impl ProvisionFetchProtocol {
         &mut self,
         source_shard: ShardGroupId,
         block_height: BlockHeight,
-        provisions: Vec<StateProvision>,
+        batch: ProvisionBatch,
     ) -> Vec<ProvisionFetchOutput> {
         let key = (source_shard, block_height);
         if self.pending.remove(&key).is_some() {
             debug!(
                 source_shard = source_shard.0,
                 block_height = block_height.0,
-                count = provisions.len(),
+                count = batch.transactions.len(),
                 "Provision fetch complete"
             );
-            vec![ProvisionFetchOutput::Deliver { provisions }]
+            vec![ProvisionFetchOutput::Deliver { batch }]
         } else {
             trace!(
                 source_shard = source_shard.0,
@@ -352,12 +352,6 @@ pub fn serve_provision_request(
     num_shards: u64,
     req: GetProvisionsRequest,
 ) -> GetProvisionsResponse {
-    trace!(
-        block_height = req.block_height.0,
-        target_shard = req.target_shard.0,
-        "Handling provision request"
-    );
-
     let (block, _qc) = match storage.get_block(req.block_height) {
         Some(pair) => pair,
         None => {
@@ -365,18 +359,27 @@ pub fn serve_provision_request(
                 block_height = req.block_height.0,
                 "Provision request: block not found"
             );
-            return GetProvisionsResponse { provisions: None };
+            return GetProvisionsResponse {
+                provisions: None,
+                proof: None,
+            };
         }
     };
 
-    let jmt_version = block.header.height.0;
-    let mut provisions = Vec::new();
+    let jvt_version = block.header.height.0;
 
     let all_txs = block
         .retry_transactions
         .iter()
         .chain(block.priority_transactions.iter())
         .chain(block.transactions.iter());
+
+    // Phase 1: Fetch state entries for all matching transactions.
+    let mut per_tx: Vec<(
+        hyperscale_types::Hash,
+        Arc<Vec<hyperscale_types::StateEntry>>,
+    )> = Vec::new();
+    let mut all_storage_keys: Vec<Vec<u8>> = Vec::new();
 
     for tx in all_txs {
         // Check if this transaction involves the requesting target shard
@@ -406,39 +409,65 @@ pub fn serve_provision_request(
         }
 
         let entries =
-            match hyperscale_engine::fetch_state_entries(storage, &owned_nodes, jmt_version) {
+            match hyperscale_engine::fetch_state_entries(storage, &owned_nodes, jvt_version) {
                 Some(entries) => entries,
                 None => {
                     warn!(
                         block_height = req.block_height.0,
-                        jmt_version, "Provision request: historical JMT version unavailable"
+                        jvt_version, "Provision request: historical JVT version unavailable"
                     );
-                    return GetProvisionsResponse { provisions: None };
+                    return GetProvisionsResponse {
+                        provisions: None,
+                        proof: None,
+                    };
                 }
             };
-        let storage_keys: Vec<Vec<u8>> = entries.iter().map(|e| e.storage_key.clone()).collect();
-        let merkle_proofs = storage.generate_merkle_proofs(&storage_keys, jmt_version);
+        for e in &entries {
+            all_storage_keys.push(e.storage_key.clone());
+        }
+        per_tx.push((tx.hash(), Arc::new(entries)));
+    }
 
+    if per_tx.is_empty() {
+        return GetProvisionsResponse {
+            provisions: Some(vec![]),
+            proof: None,
+        };
+    }
+
+    // Phase 2: Generate ONE batched proof covering all entries.
+    all_storage_keys.sort();
+    all_storage_keys.dedup();
+    let proof = match storage.generate_verkle_proofs(&all_storage_keys, jvt_version) {
+        Some(p) => Arc::new(p),
+        None => {
+            tracing::warn!(
+                block_height = req.block_height.0,
+                "Fallback provision: batched proof generation failed (version unavailable)"
+            );
+            return GetProvisionsResponse {
+                provisions: None,
+                proof: None,
+            };
+        }
+    };
+
+    // Phase 3: Build provisions sharing the single proof.
+    let mut provisions = Vec::with_capacity(per_tx.len());
+    for (tx_hash, entries) in per_tx {
         provisions.push(StateProvision {
-            transaction_hash: tx.hash(),
+            transaction_hash: tx_hash,
             target_shard: req.target_shard,
             source_shard: local_shard,
             block_height: req.block_height,
             block_timestamp: block.header.timestamp,
-            entries: Arc::new(entries),
-            merkle_proofs: Arc::new(merkle_proofs),
+            entries,
         });
     }
 
-    debug!(
-        block_height = req.block_height.0,
-        target_shard = req.target_shard.0,
-        provision_count = provisions.len(),
-        "Responding to provision request"
-    );
-
     GetProvisionsResponse {
         provisions: Some(provisions),
+        proof: Some((*proof).clone()),
     }
 }
 
@@ -634,13 +663,13 @@ mod tests {
         let outputs = protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(1),
             block_height: height(10),
-            provisions: vec![], // empty but valid
+            batch: ProvisionBatch::dummy(shard(1), height(10)),
         });
 
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
             &outputs[0],
-            ProvisionFetchOutput::Deliver { provisions } if provisions.is_empty()
+            ProvisionFetchOutput::Deliver { batch } if batch.transactions.is_empty()
         ));
         assert!(!protocol.has_pending());
     }
@@ -713,7 +742,7 @@ mod tests {
         let outputs = protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(99),
             block_height: height(999),
-            provisions: vec![],
+            batch: ProvisionBatch::dummy(shard(99), height(999)),
         });
         assert!(outputs.is_empty());
     }

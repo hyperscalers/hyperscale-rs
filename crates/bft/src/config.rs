@@ -75,18 +75,18 @@ pub struct BftConfig {
 impl Default for BftConfig {
     fn default() -> Self {
         Self {
-            proposal_interval: Duration::from_millis(300),
-            view_change_timeout: Duration::from_secs(3),
-            view_change_timeout_increment: Duration::from_millis(500),
+            proposal_interval: Duration::from_millis(1000),
+            view_change_timeout: Duration::from_secs(5),
+            view_change_timeout_increment: Duration::from_millis(1000),
             view_change_timeout_max: Some(Duration::from_secs(30)),
-            max_transactions_per_block: 1024,
-            max_certificates_per_block: 4096,
+            max_transactions_per_block: 4096,
+            max_certificates_per_block: 8192,
             max_timestamp_delay_ms: 30_000,
             max_timestamp_rush_ms: 2_000,
-            transaction_fetch_timeout: Duration::from_millis(50),
+            transaction_fetch_timeout: Duration::from_millis(150),
             certificate_fetch_timeout: Duration::from_millis(500),
             cleanup_interval: Duration::from_secs(1),
-            min_block_interval: Duration::from_millis(150),
+            min_block_interval: Duration::from_millis(800),
         }
     }
 }

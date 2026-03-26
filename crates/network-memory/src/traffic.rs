@@ -472,14 +472,14 @@ impl BandwidthReport {
 
         println!("================ BANDWIDTH BY MESSAGE TYPE ====================");
         println!(
-            "{:<24} {:>10} {:>7} {:>12} {:>7} {:>10}",
+            "{:<32} {:>10} {:>7} {:>12} {:>7} {:>10}",
             "Message Type", "Count", "Msg%", "Bytes", "BW%", "Avg Size"
         );
-        println!("{}", "-".repeat(74));
+        println!("{}", "-".repeat(82));
 
         for report in &self.by_message_type {
             println!(
-                "{:<24} {:>10} {:>6.1}% {:>12} {:>6.1}% {:>10}",
+                "{:<32} {:>10} {:>6.1}% {:>12} {:>6.1}% {:>10}",
                 report.msg_type,
                 report.count,
                 report.pct_of_messages,

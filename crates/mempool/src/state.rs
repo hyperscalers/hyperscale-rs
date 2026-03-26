@@ -14,7 +14,7 @@ use tracing::instrument;
 /// Number of blocks to retain evicted transactions for peer fetch requests.
 /// This allows slow validators to catch up and fetch transactions from peers
 /// even after the transaction has been evicted from the active pool.
-const TRANSACTION_RETENTION_BLOCKS: u64 = 100;
+const TRANSACTION_RETENTION_BLOCKS: u64 = 50;
 
 /// Default backpressure limit (soft limit).
 ///
@@ -22,22 +22,22 @@ const TRANSACTION_RETENTION_BLOCKS: u64 = 100;
 /// When at this limit, new transactions without provisions are delayed.
 /// Cross-shard TXs WITH provisions (committed on another shard) can still be proposed,
 /// ensuring we don't block transactions that other shards are waiting on.
-pub const DEFAULT_IN_FLIGHT_LIMIT: usize = 512;
+pub const DEFAULT_IN_FLIGHT_LIMIT: usize = 2048;
 
 /// Default hard limit on transactions in-flight.
 ///
 /// This is an absolute cap on transactions holding state locks. When at this limit,
 /// NO new transactions are proposed (even cross-shard TXs with provisions). This prevents
 /// unbounded growth and controls execution/crypto verification pressure.
-pub const DEFAULT_IN_FLIGHT_HARD_LIMIT: usize = 1024;
+pub const DEFAULT_IN_FLIGHT_HARD_LIMIT: usize = 4096;
 
 /// Default limit on pending transactions for RPC backpressure.
 ///
 /// When the number of Pending transactions exceeds this limit, new RPC submissions
-/// are rejected. This is approximately 2 blocks worth of transactions (at 1024 TXs/block),
+/// are rejected. This is approximately 2 blocks worth of transactions (at 4096 TXs/block),
 /// preventing the mempool from growing unboundedly when transaction arrival rate
 /// exceeds processing capacity.
-pub const DEFAULT_MAX_PENDING: usize = 2048;
+pub const DEFAULT_MAX_PENDING: usize = 8192;
 
 /// Mempool configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -2106,7 +2106,7 @@ mod tests {
             certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
-            commitment_proofs: std::collections::HashMap::new(),
+            priority_inclusions: vec![],
         }
     }
 
@@ -2119,27 +2119,19 @@ mod tests {
     }
 
     fn make_test_deferral(loser_tx: Hash, winner_tx: Hash, height: u64) -> TransactionDefer {
-        use hyperscale_types::CommitmentProof;
-
-        let proof = CommitmentProof::new(
-            winner_tx,
-            ShardGroupId(1),
-            ShardGroupId(0),
-            BlockHeight(1),
-            1000,
-            Hash::ZERO,
-            QuorumCertificate::genesis(),
-            Arc::new(vec![]),
-            Arc::new(vec![]),
-        );
-
         TransactionDefer {
             tx_hash: loser_tx,
             reason: DeferReason::LivelockCycle {
                 winner_tx_hash: winner_tx,
             },
             block_height: BlockHeight(height),
-            proof,
+            source_shard: ShardGroupId(1),
+            source_block_height: BlockHeight(1),
+            tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
+                siblings: vec![],
+                leaf_index: 0,
+                leaf_hash: Hash::ZERO,
+            },
         }
     }
 

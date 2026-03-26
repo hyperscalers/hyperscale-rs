@@ -8,11 +8,10 @@ use hyperscale_storage::{CommitStore, DatabaseUpdates, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_receipt_root, compute_transaction_root,
     verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
-    Bls12381G2Signature, CommitmentProof, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, SignerBitfield, TransactionAbort, TransactionCertificate, TransactionDefer,
-    ValidatorId, VotePower,
+    Bls12381G2Signature, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    SignerBitfield, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId,
+    VotePower,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Result of QC verification and assembly.
@@ -187,39 +186,6 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
     }
 }
 
-/// Verify a commitment proof's QC signature and quorum threshold.
-///
-/// Verifies the QC's aggregated BLS signature using the provided public keys,
-/// and checks that the signers' voting power meets the quorum threshold.
-///
-/// `voting_power` is the pre-computed total voting power of the signers
-/// (derived from the QC's signer bitfield and the topology).
-pub fn verify_commitment_proof(
-    proof: &CommitmentProof,
-    public_keys: &[Bls12381G1PublicKey],
-    voting_power: u64,
-    quorum_threshold: u64,
-) -> bool {
-    if public_keys.is_empty() {
-        return false;
-    }
-
-    // Verify the QC's aggregated BLS signature
-    let qc_valid = verify_qc_signature(&proof.qc, public_keys);
-
-    // Verify voting power meets quorum threshold
-    if !qc_valid || voting_power < quorum_threshold {
-        return false;
-    }
-
-    // Verify individual merkle inclusion proofs against proof.state_root
-    hyperscale_storage::proofs::verify_all_merkle_proofs(
-        &proof.entries,
-        &proof.merkle_proofs,
-        proof.state_root,
-    )
-}
-
 /// Verify that the computed transaction merkle root matches the expected root.
 ///
 /// Pure computation over the three transaction sections (retry, priority, normal).
@@ -314,10 +280,10 @@ pub struct ProposalResult<P: Send> {
     pub prepared_commit: Option<P>,
 }
 
-/// Build a proposal block, computing the state root if the JMT is ready.
+/// Build a proposal block, computing the state root if the JVT is ready.
 ///
 /// Algorithm:
-/// 1. Check JMT ready: `storage.state_root_hash() == parent_state_root`
+/// 1. Check JVT ready: `storage.state_root_hash() == parent_state_root`
 /// 2. If ready + certs non-empty: `prepare_block_commit()` for certs, get state_root + handle
 /// 3. Else: inherit parent_state_root, empty certs, no handle
 /// 4. Compute tx root: `compute_transaction_root(retry, priority, normal)`
@@ -339,26 +305,26 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<TransactionCertificate>>,
     merged_updates: DatabaseUpdates,
-    commitment_proofs: HashMap<Hash, CommitmentProof>,
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
+    priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
     local_shard: ShardGroupId,
     provision_targets: Vec<ShardGroupId>,
 ) -> ProposalResult<S::PreparedCommit> {
-    // Check if JMT is at parent_state_root (no waiting - instant check)
+    // Check if JVT is at parent_state_root (no waiting - instant check)
     let current_root = storage.state_root_hash();
-    let jmt_ready = current_root == parent_state_root;
+    let jvt_ready = current_root == parent_state_root;
 
-    // Can include certificates only if JMT is ready
-    let include_certs = jmt_ready && !certificates.is_empty();
+    // Can include certificates only if JVT is ready
+    let include_certs = jvt_ready && !certificates.is_empty();
 
     let (state_root, certs_to_include, prepared) = if include_certs {
-        // JMT ready - compute speculative root and get prepared commit handle
+        // JVT ready - compute speculative root and get prepared commit handle
         let (root, prepared) =
             storage.prepare_block_commit(parent_state_root, &merged_updates, height.0);
         (root, certificates, Some(prepared))
     } else {
-        // Either no certificates, or JMT not ready - inherit parent state
+        // Either no certificates, or JVT not ready - inherit parent state
         if !certificates.is_empty() {
             tracing::debug!(
                 height = height.0,
@@ -366,7 +332,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
                 skipped_certs = certificates.len(),
                 ?current_root,
                 ?parent_state_root,
-                "JMT not ready - proposing without certificates"
+                "JVT not ready - proposing without certificates"
             );
         }
         (parent_state_root, vec![], None)
@@ -403,7 +369,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         certificates: certs_to_include,
         deferred,
         aborted,
-        commitment_proofs,
+        priority_inclusions,
     };
 
     let block_hash = block.hash();

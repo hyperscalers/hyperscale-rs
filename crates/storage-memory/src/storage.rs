@@ -6,17 +6,17 @@
 //! snapshots without copying the entire dataset. This is critical for parallel
 //! transaction execution where each transaction needs an isolated view.
 //!
-//! # JMT Integration
+//! # JVT Integration
 //!
-//! Uses `TypedInMemoryTreeStore` for Jellyfish Merkle Tree tracking, providing
-//! `jmt_version()` and `state_root_hash()` for state commitment. This ensures
-//! simulation has identical JMT behavior to production.
+//! Uses `TypedInMemoryTreeStore` for Jellyfish Verkle Tree tracking, providing
+//! `jvt_version()` and `state_root_hash()` for state commitment. This ensures
+//! simulation has identical JVT behavior to production.
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_storage::{
-    jmt::{EntityTier, StoredTreeNodeKey, TypedInMemoryTreeStore, WriteableTreeStore},
+    jmt::{StoredNodeKey, TypedInMemoryTreeStore, WriteableTreeStore},
     keys, CommitStore, ConsensusStore, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    DbSubstateValue, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry, StateRootHash,
+    DbSubstateValue, JvtSnapshot, PartitionDatabaseUpdates, PartitionEntry, StateRootHash,
     SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{
@@ -28,16 +28,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 // ═══════════════════════════════════════════════════════════════════════
-// Shared substate + JMT state (single RwLock)
+// Shared substate + JVT state (single RwLock)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Substate data and JMT state protected by a single RwLock.
+/// Substate data and JVT state protected by a single RwLock.
 ///
 /// A single lock ensures association resolution can read substate data
 /// atomically, avoiding deadlock.
 ///
 /// Using RwLock (instead of Mutex) allows concurrent read access: speculative
-/// JMT computations from `prepare_block_commit` take a read lock and can run
+/// JVT computations from `prepare_block_commit` take a read lock and can run
 /// concurrently with other readers, while commits take a write lock.
 pub(crate) struct SharedState {
     /// Radix substate data. `im::OrdMap` for O(1) structural-sharing clones.
@@ -46,20 +46,25 @@ pub(crate) struct SharedState {
     pub current_block_height: u64,
     pub current_root_hash: StateRootHash,
     /// Leaf-key → substate-value associations for historical queries.
-    pub associations: HashMap<StoredTreeNodeKey, Vec<u8>>,
+    pub associations: HashMap<StoredNodeKey, Vec<u8>>,
+    /// MVCC versioned substate store: `(storage_key, version) → Option<value>`.
+    /// BTreeMap ordering gives prefix scans and version ordering for free.
+    /// A `None` value is a tombstone (deleted substate).
+    pub versioned_substates: VersionedSubstateStore,
 }
 
 impl SharedState {
     fn new() -> Self {
         Self {
             data: OrdMap::new(),
-            // Pruning disabled: historical substate reads traverse the JMT at
+            // Pruning disabled: historical substate reads traverse the JVT at
             // past heights and need old nodes to still exist. In production,
-            // RocksDB GC respects `jmt_history_length` (default 256).
+            // RocksDB GC respects `jvt_history_length` (default 256).
             // In simulation, tests are short-lived so retaining all nodes is fine.
             tree_store: TypedInMemoryTreeStore::new(),
             current_block_height: 0,
             current_root_hash: Hash::ZERO,
+            versioned_substates: BTreeMap::new(),
             associations: HashMap::new(),
         }
     }
@@ -142,21 +147,21 @@ impl ConsensusState {
 /// and snapshots are cheap regardless of data size.
 ///
 /// Implements Radix's `SubstateDatabase` directly, plus our `SubstateStore` extension
-/// for snapshots, node listing, and JMT state roots.
+/// for snapshots, node listing, and JVT state roots.
 ///
 /// # Locking Strategy
 ///
 /// Two RwLocks with independent lifetimes — no ordering constraint:
-/// - `state`: Substate data + JMT tree store + version/root/associations.
-///   Read lock for substate reads, JMT lookups, and speculative computation.
-///   Write lock for commits (substate writes + JMT updates in one acquisition).
+/// - `state`: Substate data + JVT tree store + version/root/associations.
+///   Read lock for substate reads, JVT lookups, and speculative computation.
+///   Write lock for commits (substate writes + JVT updates in one acquisition).
 /// - `consensus`: Block metadata, certificates, votes, committed state.
-///   Separate because consensus metadata is independent of substate/JMT state.
+///   Separate because consensus metadata is independent of substate/JVT state.
 pub struct SimStorage<D: Dispatch + 'static> {
-    /// Substate data + JMT state (single RwLock).
+    /// Substate data + JVT state (single RwLock).
     state: Arc<RwLock<SharedState>>,
 
-    /// Dispatch implementation for parallel JMT computation.
+    /// Dispatch implementation for parallel JVT computation.
     dispatch: D,
 
     /// Consensus metadata (single RwLock).
@@ -173,8 +178,8 @@ impl<D: Dispatch + 'static> SimStorage<D> {
         }
     }
 
-    /// Get the current JMT version.
-    pub fn current_jmt_version(&self) -> u64 {
+    /// Get the current JVT version.
+    pub fn current_jvt_version(&self) -> u64 {
         self.state.read().unwrap().current_block_height
     }
 
@@ -206,7 +211,7 @@ impl<D: Dispatch + 'static> SimStorage<D> {
     /// Atomically commit a certificate and its state writes.
     ///
     /// Applies database updates and stores certificate metadata.
-    /// JMT is deferred to block commit — this mirrors the production
+    /// JVT is deferred to block commit — this mirrors the production
     /// `RocksDbStorage::commit_certificate_with_writes()` to ensure DST
     /// catches timing bugs where code incorrectly assumes state is available
     /// before certificate persistence.
@@ -218,7 +223,13 @@ impl<D: Dispatch + 'static> SimStorage<D> {
     ) {
         {
             let mut s = self.state.write().unwrap();
-            apply_updates_to_ordmap(&mut s.data, &updates);
+            let ver = s.current_block_height;
+            let SharedState {
+                ref mut data,
+                ref mut versioned_substates,
+                ..
+            } = *s;
+            apply_updates_to_ordmap(data, &updates, Some((ver, versioned_substates)));
         }
         self.consensus
             .write()
@@ -227,87 +238,94 @@ impl<D: Dispatch + 'static> SimStorage<D> {
             .insert(certificate.transaction_hash, certificate.clone());
     }
 
-    /// Test helper: commits database updates with auto-incrementing JMT version.
+    /// Test helper: commits database updates with auto-incrementing JVT version.
     /// Not used in production (use commit_block instead).
     ///
-    /// Computes JMT updates and applies them to the tree store, resolving
+    /// Computes JVT updates and applies them to the tree store, resolving
     /// leaf-substate associations for historical reads.
     #[cfg(test)]
     pub fn commit_shared(&self, updates: &DatabaseUpdates) {
         let mut s = self.state.write().unwrap();
 
+        let new_version = s.current_block_height + 1;
+
         // Apply substate updates first (visible for association resolution below).
-        apply_updates_to_ordmap(&mut s.data, updates);
+        {
+            let SharedState {
+                ref mut data,
+                ref mut versioned_substates,
+                ..
+            } = *s;
+            apply_updates_to_ordmap(data, updates, Some((new_version, versioned_substates)));
+        }
 
         let parent_version =
-            hyperscale_storage::jmt_parent_height(s.current_block_height, s.current_root_hash);
-
-        let new_version = s.current_block_height + 1;
+            hyperscale_storage::jvt_parent_height(s.current_block_height, s.current_root_hash);
         let (new_root, collected) = hyperscale_storage::jmt::put_at_version(
             &s.tree_store,
             parent_version,
             new_version,
             updates,
             &self.dispatch,
+            &Default::default(),
+            None,
         );
 
-        let associations = collected.apply_to(&s.tree_store);
+        collected.apply_to(&s.tree_store);
 
         s.current_block_height = new_version;
         s.current_root_hash = new_root;
-
-        // Resolve and store associations for historical queries.
-        // Because data and JMT are in the same struct under one lock,
-        // we can read substates directly without a second lock.
-        for a in associations {
-            if let Some((key, value)) = a.resolve(|pk, sk| ordmap_lookup(&s.data, pk, sk)) {
-                s.associations.insert(key, value);
-            }
-        }
     }
 
-    /// Write only substate data (no JMT computation).
+    /// Write only substate data (no JVT computation).
     ///
     /// Used during genesis bootstrap so each intermediate `commit()` call from the
-    /// Radix Engine writes substates without computing a JMT version.
-    /// After all genesis commits complete, [`finalize_genesis_jmt`] computes the
-    /// JMT once at version 0.
+    /// Radix Engine writes substates without computing a JVT version.
+    /// After all genesis commits complete, [`finalize_genesis_jvt`] computes the
+    /// JVT once at version 0.
     pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         let mut s = self.state.write().unwrap();
-        apply_updates_to_ordmap(&mut s.data, updates);
+        // Genesis: no version tracking, write at version 0.
+        let SharedState {
+            ref mut data,
+            ref mut versioned_substates,
+            ..
+        } = *s;
+        apply_updates_to_ordmap(data, updates, Some((0, versioned_substates)));
     }
 
-    /// Compute the JMT once at version 0 from the merged genesis updates.
+    /// Compute the JVT once at version 0 from the merged genesis updates.
     ///
     /// Called after all genesis bootstrap commits are complete. This avoids
-    /// computing intermediate JMT versions during genesis (which would collide
+    /// computing intermediate JVT versions during genesis (which would collide
     /// with block 1's version).
     ///
     /// # Returns
-    /// The genesis state root hash (JMT root at version 0).
-    pub fn finalize_genesis_jmt(&self, merged: &DatabaseUpdates) -> Hash {
+    /// The genesis state root hash (JVT root at version 0).
+    pub fn finalize_genesis_jvt(&self, merged: &DatabaseUpdates) -> Hash {
         let mut s = self.state.write().unwrap();
 
-        // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JMT.
+        // Guard: finalize_genesis_jvt must only be called once, on an uninitialized JVT.
         assert!(
             s.current_block_height == 0 && s.current_root_hash == Hash::ZERO,
-            "finalize_genesis_jmt called but JMT already initialized"
+            "finalize_genesis_jvt called but JVT already initialized"
         );
 
-        // parent=None, version=0: genesis is the first JMT state.
-        let (root, collected) =
-            hyperscale_storage::jmt::put_at_version(&s.tree_store, None, 0, merged, &self.dispatch);
+        // parent=None, version=0: genesis is the first JVT state.
+        let (root, collected) = hyperscale_storage::jmt::put_at_version(
+            &s.tree_store,
+            None,
+            0,
+            merged,
+            &self.dispatch,
+            &Default::default(),
+            None,
+        );
 
-        let associations = collected.apply_to(&s.tree_store);
+        collected.apply_to(&s.tree_store);
 
         s.current_block_height = 0;
         s.current_root_hash = root;
-
-        for a in associations {
-            if let Some((key, value)) = a.resolve(|pk, sk| ordmap_lookup(&s.data, pk, sk)) {
-                s.associations.insert(key, value);
-            }
-        }
 
         root
     }
@@ -317,15 +335,6 @@ impl<D: Dispatch + 'static> SimStorage<D> {
 ///
 /// This avoids going through the `SubstateDatabase` trait (and its lock)
 /// when we already hold a reference to the data.
-fn ordmap_lookup(
-    data: &OrdMap<Vec<u8>, Vec<u8>>,
-    partition_key: &DbPartitionKey,
-    sort_key: &DbSortKey,
-) -> Option<Vec<u8>> {
-    let key = keys::to_storage_key(partition_key, sort_key);
-    data.get(&key).cloned()
-}
-
 impl<D: Dispatch + 'static> hyperscale_storage::SubstatesOnlyCommit for SimStorage<D> {
     fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         SimStorage::commit_substates_only(self, updates);
@@ -411,7 +420,7 @@ impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
         }))
     }
 
-    fn jmt_version(&self) -> u64 {
+    fn jvt_version(&self) -> u64 {
         self.state.read().unwrap().current_block_height
     }
 
@@ -425,52 +434,77 @@ impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
         block_height: u64,
     ) -> Option<Vec<(u8, DbSortKey, Vec<u8>)>> {
         let entity_key = keys::node_entity_key(node_id);
-
         let s = self.state.read().unwrap();
 
         if block_height > s.current_block_height {
             return None;
         }
 
-        let entity_tier = EntityTier::new(&s.tree_store, Some(block_height));
-        let partition_tier = entity_tier.get_entity_partition_tier(entity_key);
+        // MVCC prefix scan: iterate the versioned store for entries under this
+        // entity, taking the latest version <= block_height for each storage key.
+        // Key ordering: (storage_key, version) — ascending on both.
+        let entity_len = entity_key.len();
+        let end_key = keys::next_prefix(&entity_key).unwrap_or_default();
         let mut results = Vec::new();
+        let mut current_sk: Option<&Vec<u8>> = None;
+        let mut current_best: Option<&Vec<u8>> = None;
 
-        for substate_tier in partition_tier.into_iter_partition_substate_tiers_from(None) {
-            let partition_num = substate_tier.partition_key().partition_num;
-            for summary in substate_tier.into_iter_substate_summaries_from(None) {
-                if let Some(value) = s.associations.get(&summary.state_tree_leaf_key) {
-                    results.push((partition_num, summary.sort_key, value.clone()));
+        let range_start = (entity_key.clone(), 0u64);
+        let range_end = (end_key, 0u64);
+
+        for ((sk, ver), value) in s.versioned_substates.range(range_start..range_end) {
+            // Storage key changed — flush previous group.
+            if current_sk != Some(sk) {
+                if let (Some(prev_sk), Some(val)) = (current_sk, current_best) {
+                    if prev_sk.len() > entity_len {
+                        let partition_num = prev_sk[entity_len];
+                        let sort_key = DbSortKey(prev_sk[entity_len + 1..].to_vec());
+                        results.push((partition_num, sort_key, val.clone()));
+                    }
+                }
+                current_sk = Some(sk);
+                current_best = None;
+            }
+            // Ascending version order: overwrite candidate with each version <= height.
+            if *ver <= block_height {
+                match value {
+                    Some(v) => current_best = Some(v),
+                    None => current_best = None, // tombstone: substate deleted
                 }
             }
         }
+        // Flush last group.
+        if let (Some(prev_sk), Some(val)) = (current_sk, current_best) {
+            if prev_sk.len() > entity_len {
+                let partition_num = prev_sk[entity_len];
+                let sort_key = DbSortKey(prev_sk[entity_len + 1..].to_vec());
+                results.push((partition_num, sort_key, val.clone()));
+            }
+        }
+
         Some(results)
     }
 
-    fn generate_merkle_proofs(
+    fn generate_verkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
-    ) -> Vec<hyperscale_types::SubstateInclusionProof> {
+    ) -> Option<hyperscale_types::SubstateInclusionProof> {
         let s = self.state.read().unwrap();
-        hyperscale_storage::proofs::generate_merkle_proofs(
-            &s.tree_store,
-            storage_keys,
-            block_height,
-        )
+        hyperscale_storage::proofs::generate_proof(&s.tree_store, storage_keys, block_height, None)
     }
 }
 
 impl<D: Dispatch + 'static> SimStorage<D> {
-    /// Apply a JMT snapshot directly, inserting precomputed nodes.
+    /// Apply a JVT snapshot directly, inserting precomputed nodes.
     ///
     /// This is the fast path for block commit when we have a cached snapshot
     /// from verification. Also stores leaf-to-substate associations for
     /// historical queries.
-    fn apply_jmt_snapshot(s: &mut SharedState, snapshot: JmtSnapshot) {
+    fn apply_jvt_snapshot(s: &mut SharedState, snapshot: JvtSnapshot) {
         if s.current_root_hash != snapshot.base_root {
             panic!(
-                "JMT snapshot base ROOT mismatch: expected {:?}, got {:?}.",
+                "JVT snapshot base ROOT mismatch: expected {:?}, got {:?}.",
                 snapshot.base_root, s.current_root_hash
             );
         }
@@ -478,7 +512,7 @@ impl<D: Dispatch + 'static> SimStorage<D> {
             tracing::debug!(
                 expected_version = snapshot.base_version,
                 actual_version = s.current_block_height,
-                "JMT snapshot base VERSION mismatch (root matches) - proceeding. \
+                "JVT snapshot base VERSION mismatch (root matches) - proceeding. \
                  This is expected when empty commits advance the version counter."
             );
         }
@@ -502,11 +536,19 @@ impl<D: Dispatch + 'static> SimStorage<D> {
 // CommitStore implementation
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Apply database updates to a bare `OrdMap`, mutating it in place.
+/// MVCC versioned substate store type: `(storage_key, version) → Option<value>`.
+type VersionedSubstateStore = BTreeMap<(Vec<u8>, u64), Option<Vec<u8>>>;
+
+/// Apply database updates to the data OrdMap and optionally the MVCC versioned store.
 ///
-/// This is the core write-application logic shared by both prepare-time
-/// (building the pre-applied OrdMap) and `commit_data_only`.
-fn apply_updates_to_ordmap(data: &mut OrdMap<Vec<u8>, Vec<u8>>, updates: &DatabaseUpdates) {
+/// When `versioned` is `Some((version, btree))`, also writes each update to the
+/// versioned store keyed by `(storage_key, version)`. Deletes are written as
+/// `None` (tombstone).
+fn apply_updates_to_ordmap(
+    data: &mut OrdMap<Vec<u8>, Vec<u8>>,
+    updates: &DatabaseUpdates,
+    mut versioned: Option<(u64, &mut VersionedSubstateStore)>,
+) {
     for (node_key, node_updates) in &updates.node_updates {
         for (partition_num, partition_updates) in &node_updates.partition_updates {
             let partition_key = DbPartitionKey {
@@ -520,10 +562,16 @@ fn apply_updates_to_ordmap(data: &mut OrdMap<Vec<u8>, Vec<u8>>, updates: &Databa
                         let key = keys::to_storage_key(&partition_key, sort_key);
                         match update {
                             DatabaseUpdate::Set(value) => {
-                                data.insert(key, value.clone());
+                                data.insert(key.clone(), value.clone());
+                                if let Some((ver, vs)) = &mut versioned {
+                                    vs.insert((key, *ver), Some(value.clone()));
+                                }
                             }
                             DatabaseUpdate::Delete => {
                                 data.remove(&key);
+                                if let Some((ver, vs)) = &mut versioned {
+                                    vs.insert((key, *ver), None);
+                                }
                             }
                         }
                     }
@@ -540,12 +588,18 @@ fn apply_updates_to_ordmap(data: &mut OrdMap<Vec<u8>, Vec<u8>>, updates: &Databa
 
                     for key in existing_keys {
                         data.remove(&key);
+                        if let Some((ver, vs)) = &mut versioned {
+                            vs.insert((key, *ver), None);
+                        }
                     }
 
                     // Insert new values
                     for (sort_key, value) in new_substate_values {
                         let key = keys::to_storage_key(&partition_key, sort_key);
-                        data.insert(key, value.clone());
+                        data.insert(key.clone(), value.clone());
+                        if let Some((ver, vs)) = &mut versioned {
+                            vs.insert((key, *ver), Some(value.clone()));
+                        }
                     }
                 }
             }
@@ -555,12 +609,12 @@ fn apply_updates_to_ordmap(data: &mut OrdMap<Vec<u8>, Vec<u8>>, updates: &Databa
 
 /// Precomputed commit work for a SimStorage block commit.
 ///
-/// Contains a `JmtSnapshot` (precomputed Merkle tree nodes), a pre-built
+/// Contains a `JvtSnapshot` (precomputed verkle tree nodes), a pre-built
 /// `OrdMap` with all certificate substate writes already applied (for O(1)
 /// swap at commit time), plus the certificates and shard needed for
 /// `store_certificate` calls and fallback recompute.
 pub struct SimPreparedCommit {
-    snapshot: JmtSnapshot,
+    snapshot: JvtSnapshot,
     /// Pre-built OrdMap with all certificate substate writes already applied.
     /// O(1) clone from base at prepare time; O(1) swap at commit time.
     resulting_data: OrdMap<Vec<u8>, Vec<u8>>,
@@ -576,7 +630,7 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
         merged_updates: &DatabaseUpdates,
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit) {
-        // Read lock: clone data + compute speculative JMT root concurrently.
+        // Read lock: clone data + compute speculative JVT root concurrently.
         let s = self.state.read().unwrap();
         let base_data = s.data.clone();
         let base_root = s.current_root_hash;
@@ -586,37 +640,35 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             tracing::warn!(
                 ?base_root,
                 ?parent_state_root,
-                "JMT root mismatch - verification will likely fail"
+                "JVT root mismatch - verification will likely fail"
             );
         }
 
-        let parent_version = hyperscale_storage::jmt_parent_height(base_version, base_root);
+        let parent_version = hyperscale_storage::jvt_parent_height(base_version, base_root);
         let (result_root, collected) = hyperscale_storage::jmt::put_at_version(
             &s.tree_store,
             parent_version,
             block_height,
             merged_updates,
             &self.dispatch,
+            &Default::default(),
+            None,
         );
 
-        let data_snapshot = SimSnapshot {
-            data: base_data.clone(),
-        };
-        let lookup = hyperscale_storage::SubstateDbLookup(&data_snapshot);
-        let snapshot = JmtSnapshot::from_collected_writes(
+        let snapshot = JvtSnapshot::from_collected_writes(
             collected,
             base_root,
             base_version,
             result_root,
             block_height,
-            Some(&lookup),
         );
 
         drop(s); // Release read lock
 
         // Pre-apply all substate writes to a cloned OrdMap (O(1) clone).
+        // No MVCC writes here — those happen at commit time.
         let mut resulting_data = base_data;
-        apply_updates_to_ordmap(&mut resulting_data, merged_updates);
+        apply_updates_to_ordmap(&mut resulting_data, merged_updates, None);
 
         let prepared = SimPreparedCommit {
             snapshot,
@@ -641,9 +693,21 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             let use_fast_path = s.current_root_hash == prepared.snapshot.base_root;
 
             if use_fast_path {
-                // Fast path: apply precomputed JMT snapshot + swap OrdMap
-                Self::apply_jmt_snapshot(&mut s, prepared.snapshot);
+                // Fast path: apply precomputed JVT snapshot + swap OrdMap.
+                // Write MVCC entries from the merged updates.
+                Self::apply_jvt_snapshot(&mut s, prepared.snapshot);
                 s.data = prepared.resulting_data;
+                // The OrdMap was pre-built, but we still need MVCC entries.
+                // Use a throwaway OrdMap since data is already applied.
+                let mut throwaway = OrdMap::new();
+                {
+                    let vs = &mut s.versioned_substates;
+                    apply_updates_to_ordmap(
+                        &mut throwaway,
+                        &prepared.merged_updates,
+                        Some((block_height, vs)),
+                    );
+                }
                 drop(s);
 
                 // Store certificates + consensus metadata atomically in consensus lock.
@@ -663,7 +727,7 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             }
         }
 
-        // Stale cache: fall back to full block commit which recomputes JMT.
+        // Stale cache: fall back to full block commit which recomputes JVT.
         // Use the stored merged_updates to ensure substate writes aren't lost.
         self.commit_block(
             &prepared.merged_updates,
@@ -689,11 +753,22 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             s.current_block_height
         );
 
-        // Apply substate writes to OrdMap.
-        apply_updates_to_ordmap(&mut s.data, merged_updates);
+        // Apply substate writes to OrdMap + MVCC versioned store.
+        {
+            let SharedState {
+                ref mut data,
+                ref mut versioned_substates,
+                ..
+            } = *s;
+            apply_updates_to_ordmap(
+                data,
+                merged_updates,
+                Some((block_height, versioned_substates)),
+            );
+        }
 
         let parent_version =
-            hyperscale_storage::jmt_parent_height(s.current_block_height, s.current_root_hash);
+            hyperscale_storage::jvt_parent_height(s.current_block_height, s.current_root_hash);
 
         let (new_root, collected) = hyperscale_storage::jmt::put_at_version(
             &s.tree_store,
@@ -701,19 +776,14 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             block_height,
             merged_updates,
             &self.dispatch,
+            &Default::default(),
+            None,
         );
 
-        let associations = collected.apply_to(&s.tree_store);
+        collected.apply_to(&s.tree_store);
 
         s.current_block_height = block_height;
         s.current_root_hash = new_root;
-
-        // Resolve associations directly from the OrdMap (same lock).
-        for a in associations {
-            if let Some((key, value)) = a.resolve(|pk, sk| ordmap_lookup(&s.data, pk, sk)) {
-                s.associations.insert(key, value);
-            }
-        }
 
         drop(s);
 
@@ -1064,9 +1134,10 @@ mod tests {
 
     #[test]
     fn test_snapshot_structural_sharing_performance() {
-        let mut storage = SimStorage::new(SyncDispatch::new());
+        let storage = SimStorage::new(SyncDispatch::new());
 
-        // Insert 10,000 items
+        // Insert 10,000 items via substates-only (no JVT computation).
+        // This test measures OrdMap snapshot performance, not tree commit speed.
         for i in 0..10_000u32 {
             let partition_key = DbPartitionKey {
                 node_key: i.to_be_bytes().to_vec(),
@@ -1090,7 +1161,7 @@ mod tests {
                     .collect(),
                 },
             );
-            storage.commit(&updates);
+            storage.commit_substates_only(&updates);
         }
 
         // Snapshot should be nearly instant (O(1), not O(n))
@@ -1324,13 +1395,13 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // JMT state tracking
+    // JVT state tracking
     // ═══════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_initial_jmt_version_is_zero() {
+    fn test_initial_jvt_version_is_zero() {
         let storage = SimStorage::new(SyncDispatch::new());
-        assert_eq!(storage.jmt_version(), 0);
+        assert_eq!(storage.jvt_version(), 0);
     }
 
     #[test]
@@ -1340,15 +1411,15 @@ mod tests {
     }
 
     #[test]
-    fn test_jmt_version_increments_on_commit() {
+    fn test_jvt_version_increments_on_commit() {
         let storage = SimStorage::new(SyncDispatch::new());
-        assert_eq!(storage.jmt_version(), 0);
+        assert_eq!(storage.jvt_version(), 0);
 
         storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
-        assert_eq!(storage.jmt_version(), 1);
+        assert_eq!(storage.jvt_version(), 1);
 
         storage.commit_shared(&make_database_update(vec![4, 5, 6], 0, vec![20], vec![2]));
-        assert_eq!(storage.jmt_version(), 2);
+        assert_eq!(storage.jvt_version(), 2);
     }
 
     #[test]
@@ -1376,7 +1447,7 @@ mod tests {
         s2.commit_shared(&updates);
 
         assert_eq!(s1.state_root_hash(), s2.state_root_hash());
-        assert_eq!(s1.jmt_version(), s2.jmt_version());
+        assert_eq!(s1.jvt_version(), s2.jvt_version());
     }
 
     #[test]
@@ -1395,7 +1466,7 @@ mod tests {
         let storage = SimStorage::new(SyncDispatch::new());
         let updates = DatabaseUpdates::default();
         storage.commit_shared(&updates);
-        assert_eq!(storage.jmt_version(), 1);
+        assert_eq!(storage.jvt_version(), 1);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1424,7 +1495,7 @@ mod tests {
         let cert2 = Arc::new(make_test_certificate(2, shard));
 
         let result = storage.commit_block(&merged, &[cert1, cert2], 1, None);
-        // Certificate merging: all certs applied as single JMT version = block_height
+        // Certificate merging: all certs applied as single JVT version = block_height
         assert_ne!(result, Hash::ZERO);
     }
 
@@ -1432,8 +1503,8 @@ mod tests {
     fn test_commit_block_empty_certs() {
         let storage = SimStorage::new(SyncDispatch::new());
         storage.commit_block(&DatabaseUpdates::default(), &[], 1, None);
-        // Empty block: JMT version still advances to block_height
-        assert_eq!(storage.jmt_version(), 1);
+        // Empty block: JVT version still advances to block_height
+        assert_eq!(storage.jvt_version(), 1);
     }
 
     #[test]
@@ -1487,8 +1558,8 @@ mod tests {
         storage.commit_certificate_with_writes(&cert, &updates);
 
         // Individual cert commits persist substate data + certificate metadata,
-        // but JMT is deferred to block commit.
-        assert_eq!(storage.jmt_version(), 0);
+        // but JVT is deferred to block commit.
+        assert_eq!(storage.jvt_version(), 0);
         assert_eq!(storage.state_root_hash(), Hash::ZERO);
         // Certificate should be stored
         assert!(storage.get_certificate(&cert.transaction_hash).is_some());
@@ -1518,12 +1589,12 @@ mod tests {
         storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
         let hash = Hash::from_bytes(&[1; 32]);
         storage.put_own_vote(10, 0, hash);
-        assert!(storage.jmt_version() > 0);
+        assert!(storage.jvt_version() > 0);
         assert!(!storage.is_empty());
 
         storage.clear();
 
-        assert_eq!(storage.jmt_version(), 0);
+        assert_eq!(storage.jvt_version(), 0);
         assert_eq!(storage.state_root_hash(), Hash::ZERO);
         assert!(storage.is_empty());
         assert!(storage.get_own_vote(10).is_none());

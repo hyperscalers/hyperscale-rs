@@ -46,9 +46,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{instrument, Level};
 
-/// Fetch state entries for the given nodes from storage at a specific block height (= JMT version).
+/// Fetch state entries for the given nodes from storage at a specific block height (= JVT version).
 ///
-/// Reads substates at the given `block_height` using historical JMT traversal
+/// Reads substates at the given `block_height` using historical JVT traversal
 /// and the leaf association table. Both data and proofs must come from the same
 /// version to pass verification against the block header's `state_root`.
 ///
@@ -60,7 +60,6 @@ pub fn fetch_state_entries<S: SubstateStore>(
     nodes: &[NodeId],
     block_height: u64,
 ) -> Option<Vec<StateEntry>> {
-    use hyperscale_storage::RADIX_PREFIX;
     use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
 
     let mut entries = Vec::new();
@@ -73,11 +72,8 @@ pub fn fetch_state_entries<S: SubstateStore>(
         let substates = storage.list_substates_for_node_at_height(node, block_height)?;
 
         for (partition_num, db_sort_key, value) in substates {
-            // Build full storage key
-            let mut storage_key = Vec::with_capacity(
-                RADIX_PREFIX.len() + db_node_key.len() + 1 + db_sort_key.0.len(),
-            );
-            storage_key.extend_from_slice(RADIX_PREFIX);
+            // Build storage key: db_node_key || partition_num || sort_key
+            let mut storage_key = Vec::with_capacity(db_node_key.len() + 1 + db_sort_key.0.len());
             storage_key.extend_from_slice(&db_node_key);
             storage_key.push(partition_num);
             storage_key.extend_from_slice(&db_sort_key.0);
@@ -328,9 +324,9 @@ impl RadixExecutor {
         }
     }
 
-    /// Fetch state entries for the given nodes from storage at a specific block height (= JMT version).
+    /// Fetch state entries for the given nodes from storage at a specific block height (= JVT version).
     ///
-    /// Reads substates at the given `block_height` using historical JMT traversal.
+    /// Reads substates at the given `block_height` using historical JVT traversal.
     /// Both data and proofs must come from the same version.
     /// Returns `None` if the version is unavailable (GC'd or not yet committed).
     pub fn fetch_state_entries<S: SubstateStore>(

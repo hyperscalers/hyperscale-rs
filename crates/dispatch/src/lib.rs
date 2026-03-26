@@ -57,6 +57,12 @@ pub trait Dispatch: Send + Sync + Clone {
     /// Spawn an execution task (Radix Engine).
     fn spawn_execution(&self, f: impl FnOnce() + Send + 'static);
 
+    /// Spawn a provision task (IPA proof generation/verification).
+    ///
+    /// Isolated from execution to prevent transaction floods from starving
+    /// time-sensitive provision proof generation.
+    fn spawn_provisions(&self, f: impl FnOnce() + Send + 'static);
+
     /// Current consensus crypto pool queue depth.
     fn consensus_crypto_queue_depth(&self) -> usize;
 
@@ -68,6 +74,9 @@ pub trait Dispatch: Send + Sync + Clone {
 
     /// Current execution pool queue depth.
     fn execution_queue_depth(&self) -> usize;
+
+    /// Current provisions pool queue depth.
+    fn provisions_queue_depth(&self) -> usize;
 
     /// Map a function over items in parallel on the current pool.
     ///

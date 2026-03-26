@@ -1,18 +1,23 @@
 [package]
-name = "hyperscale-jmt"
+name = "hyperscale-state-tree"
 version.workspace = true
 edition.workspace = true
-description = "Jellyfish Merkle Tree (JMT) implementation using Blake3"
+description = "Verkle-based state tree with 3-tier entity/partition/substate structure"
 
 [dependencies]
 hyperscale-types.workspace = true
 hyperscale-dispatch.workspace = true
+jellyfish-verkle-tree.workspace = true
+ark-ec.workspace = true
+ark-ed-on-bls12-381-bandersnatch.workspace = true
+ark-serialize.workspace = true
 blake3.workspace = true
 sbor.workspace = true
 radix-common.workspace = true
 radix-substate-store-interface.workspace = true
 indexmap.workspace = true
 itertools.workspace = true
+quick_cache.workspace = true
 
 [dev-dependencies]
 hyperscale-dispatch-sync.workspace = true

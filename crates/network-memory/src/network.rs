@@ -3,6 +3,7 @@
 use crate::sim_network::{
     BroadcastTarget, OutboxEntry, PendingNotification, PendingRequest, SimNetworkAdapter,
 };
+use crate::traffic::NetworkTrafficAnalyzer;
 use crate::NodeIndex;
 use hyperscale_network::{HandlerRegistry, RequestError};
 use hyperscale_types::{ShardGroupId, ValidatorId};
@@ -53,6 +54,7 @@ pub struct FulfillmentStats {
     pub messages_sent: u64,
     pub messages_dropped_partition: u64,
     pub messages_dropped_loss: u64,
+    pub messages_deduplicated: u64,
 }
 
 /// A gossip delivery scheduled for future delivery via the internal latency queue.
@@ -173,6 +175,11 @@ pub struct SimulatedNetwork {
     pending_responses: BinaryHeap<Reverse<ScheduledResponse>>,
     /// Monotonic sequence counter for deterministic response ordering.
     response_sequence: u64,
+    /// Optional traffic analyzer for bandwidth metrics.
+    traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
+    /// Per-node gossip dedup: tracks message IDs already delivered to each node.
+    /// Matches production gossipsub's content-based deduplication (hash of data + topic).
+    gossip_seen: Vec<HashSet<u64>>,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -205,7 +212,14 @@ impl SimulatedNetwork {
             notification_sequence: 0,
             pending_responses: BinaryHeap::new(),
             response_sequence: 0,
+            traffic_analyzer: None,
+            gossip_seen: (0..num_nodes).map(|_| HashSet::new()).collect(),
         }
+    }
+
+    /// Set the traffic analyzer for bandwidth metrics recording.
+    pub fn set_traffic_analyzer(&mut self, analyzer: Arc<NetworkTrafficAnalyzer>) {
+        self.traffic_analyzer = Some(analyzer);
     }
 
     /// Create a [`SimNetworkAdapter`] for a node, sharing its handler registry.
@@ -444,6 +458,17 @@ impl SimulatedNetwork {
 
             stats.messages_sent += 2; // request + response
 
+            if let Some(ref analyzer) = self.traffic_analyzer {
+                // Record request message (requester → peer)
+                analyzer.record_message(
+                    type_id,
+                    request_bytes.len(),
+                    request_bytes.len(),
+                    requester,
+                    peer,
+                );
+            }
+
             // Look up the per-type request handler from the peer's registry.
             let handler = match self
                 .registries
@@ -473,6 +498,18 @@ impl SimulatedNetwork {
             let request_latency = self.sample_latency(requester, peer, rng);
             let response_latency = self.sample_latency(peer, requester, rng);
             let round_trip = request_latency + response_latency;
+
+            if let Some(ref analyzer) = self.traffic_analyzer {
+                // Record response message (peer → requester)
+                let response_type = format!("{}.response", type_id);
+                analyzer.record_message(
+                    &response_type,
+                    response_bytes.len(),
+                    response_bytes.len(),
+                    peer,
+                    requester,
+                );
+            }
 
             self.response_sequence += 1;
             self.pending_responses.push(Reverse(ScheduledResponse {
@@ -538,6 +575,9 @@ impl SimulatedNetwork {
                     }
                     Some(latency) => {
                         stats.messages_sent += 1;
+                        if let Some(ref analyzer) = self.traffic_analyzer {
+                            analyzer.record_message(type_id, payload.len(), data.len(), sender, to);
+                        }
                         self.notification_sequence += 1;
                         self.pending_notifications
                             .push(Reverse(ScheduledNotification {
@@ -596,8 +636,26 @@ impl SimulatedNetwork {
 
         let message_type = entry.message_type;
 
+        // Compute content-based message ID for dedup, matching production
+        // gossipsub's message_id_fn: hash(data || topic).
+        // Wire bytes (compressed) are used as the data, message_type as the topic.
+        let msg_id = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            entry.data.hash(&mut hasher);
+            message_type.hash(&mut hasher);
+            hasher.finish()
+        };
+
         for to in peers {
             if to == from {
+                continue;
+            }
+
+            // Gossipsub dedup: each node receives a given message at most once,
+            // regardless of how many validators broadcast it.
+            if !self.gossip_seen[to as usize].insert(msg_id) {
+                stats.messages_deduplicated += 1;
                 continue;
             }
 
@@ -611,6 +669,15 @@ impl SimulatedNetwork {
                 }
                 Some(latency) => {
                     stats.messages_sent += 1;
+                    if let Some(ref analyzer) = self.traffic_analyzer {
+                        analyzer.record_message(
+                            message_type,
+                            payload.len(),
+                            entry.data.len(),
+                            from,
+                            to,
+                        );
+                    }
                     self.gossip_sequence += 1;
                     self.pending_gossip.push(Reverse(ScheduledGossip {
                         delivery_time: now + latency,
@@ -658,6 +725,13 @@ impl SimulatedNetwork {
     /// Earliest pending gossip delivery time (for event loop scheduling).
     pub fn next_gossip_delivery_time(&self) -> Option<Duration> {
         self.pending_gossip.peek().map(|Reverse(s)| s.delivery_time)
+    }
+
+    /// Clear gossip dedup caches. Call periodically to prevent unbounded memory growth.
+    pub fn prune_gossip_dedup(&mut self) {
+        for seen in &mut self.gossip_seen {
+            seen.clear();
+        }
     }
 
     // ─── Notification Latency Queue ───

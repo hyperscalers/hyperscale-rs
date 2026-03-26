@@ -119,7 +119,7 @@ impl Drop for ProdTimerManager {
 /// Default metrics collection interval.
 const METRICS_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Default JMT garbage collection interval.
+/// Default JVT garbage collection interval.
 const GC_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Fallback timeout when no batch deadlines are pending.
@@ -191,7 +191,7 @@ fn update_rpc_state(config: &PinnedLoopConfig, snapshot: &NodeStatusSnapshot) {
 /// 5. Processes the event via `IoLoop::step()`
 /// 6. Writes emitted statuses to tx_status_cache and records RPC latency
 /// 7. Flushes expired batches
-/// 8. Periodic metrics collection and JMT garbage collection
+/// 8. Periodic metrics collection and JVT garbage collection
 pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
     info!("Pinned event loop starting");
 
@@ -278,12 +278,12 @@ pub fn run_pinned_loop(mut io_loop: ProdIoLoop, mut config: PinnedLoopConfig) {
             update_rpc_state(&config, &io_loop.status_snapshot());
         }
 
-        // ── Periodic JMT GC ──
+        // ── Periodic JVT GC ──
         if last_gc.elapsed() >= GC_INTERVAL {
             last_gc = Instant::now();
-            let deleted = io_loop.storage().run_jmt_gc();
+            let deleted = io_loop.storage().run_jvt_gc();
             if deleted > 0 {
-                debug!(deleted, "JMT garbage collection completed");
+                debug!(deleted, "JVT garbage collection completed");
             }
         }
     }

@@ -16,20 +16,17 @@ use std::sync::Arc;
 /// This type stores the pre-computed storage key that can be used directly for
 /// database lookups without any key transformation at the receiving shard.
 ///
-/// The storage key format is: `RADIX_PREFIX + db_node_key + partition_num + sort_key`
+/// The storage key format is: `db_node_key(50) + partition_num(1) + sort_key(var)`
 /// where `db_node_key` is the SpreadPrefixKeyMapper hash (expensive to compute).
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct StateEntry {
     /// Pre-computed full storage key (ready for direct DB lookup).
-    /// Format: RADIX_PREFIX (6 bytes) + db_node_key (50 bytes) + partition (1 byte) + sort_key
+    /// Format: db_node_key (50 bytes) + partition (1 byte) + sort_key
     pub storage_key: Vec<u8>,
 
     /// SBOR-encoded substate value (None if deleted/doesn't exist).
     pub value: Option<Vec<u8>>,
 }
-
-/// RADIX_PREFIX length (b"radix:" = 6 bytes)
-const RADIX_PREFIX_LEN: usize = 6;
 
 /// Hash prefix length in db_node_key (SpreadPrefixKeyMapper adds 20-byte hash)
 const HASH_PREFIX_LEN: usize = 20;
@@ -43,14 +40,13 @@ impl StateEntry {
     /// Extract the NodeId from the storage key.
     ///
     /// The storage key format is:
-    /// - RADIX_PREFIX (6 bytes)
     /// - db_node_key (50 bytes: 20-byte hash prefix + 30-byte node_id)
     /// - partition_num (1 byte)
     /// - sort_key (variable)
     ///
-    /// The NodeId is at bytes [26..56] (after RADIX_PREFIX and hash prefix).
+    /// The NodeId is at bytes [20..50] (after hash prefix).
     pub fn node_id(&self) -> Option<NodeId> {
-        let start = RADIX_PREFIX_LEN + HASH_PREFIX_LEN;
+        let start = HASH_PREFIX_LEN;
         let end = start + 30;
         if self.storage_key.len() >= end {
             let mut id = [0u8; 30];
@@ -91,9 +87,8 @@ impl StateEntry {
         sort_key: Vec<u8>,
         value: Option<Vec<u8>>,
     ) -> Self {
-        // Format: RADIX_PREFIX (6) + hash_prefix (20) + node_id (30) + partition (1) + sort_key
-        let mut storage_key = Vec::with_capacity(6 + 20 + 30 + 1 + sort_key.len());
-        storage_key.extend_from_slice(b"radix:"); // RADIX_PREFIX
+        // Format: hash_prefix (20) + node_id (30) + partition (1) + sort_key
+        let mut storage_key = Vec::with_capacity(20 + 30 + 1 + sort_key.len());
         storage_key.extend_from_slice(&[0u8; 20]); // Dummy hash prefix
         storage_key.extend_from_slice(&node_id.0); // Node ID
         storage_key.push(partition); // Partition number
@@ -262,9 +257,11 @@ impl ExecutionCertificate {
 
 /// State provision from a source shard to a target shard.
 ///
-/// Only the block proposer sends these. Each provision contains merkle
-/// inclusion proofs that verify against the QC-committed state root,
-/// making the provision self-authenticating via the 2f+1 QC signature.
+/// Only the block proposer sends these. Provisions are always transported
+/// in a batch (per block) alongside a single aggregated verkle proof that
+/// covers all entries across all provisions in that batch. The proof lives
+/// at the batch level (e.g. `StateProvisionsNotification`) to avoid
+/// duplicating it per provision during serialization.
 #[derive(Debug, Clone)]
 pub struct StateProvision {
     /// Hash of the transaction this provision is for.
@@ -276,7 +273,7 @@ pub struct StateProvision {
     /// Source shard (the shard providing the state).
     pub source_shard: ShardGroupId,
 
-    /// Block height when this provision was created (= JMT version for merkle proofs).
+    /// Block height when this provision was created (= JVT version for verkle proofs).
     pub block_height: BlockHeight,
 
     /// Unix timestamp (milliseconds) of the block that triggered this provision.
@@ -285,10 +282,6 @@ pub struct StateProvision {
     /// The state entries with pre-computed storage keys.
     /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
     pub entries: Arc<Vec<StateEntry>>,
-
-    /// Merkle inclusion proofs, one per entry.
-    /// Wrapped in Arc for efficient sharing when broadcasting to multiple shards.
-    pub merkle_proofs: Arc<Vec<crate::SubstateInclusionProof>>,
 }
 
 // Manual PartialEq (compare Arc contents, not pointer identity)
@@ -300,7 +293,6 @@ impl PartialEq for StateProvision {
             && self.block_height == other.block_height
             && self.block_timestamp == other.block_timestamp
             && *self.entries == *other.entries
-            && *self.merkle_proofs == *other.merkle_proofs
     }
 }
 
@@ -315,14 +307,13 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(7)?;
+        encoder.write_size(6)?;
         encoder.encode(&self.transaction_hash)?;
         encoder.encode(&self.target_shard)?;
         encoder.encode(&self.source_shard)?;
         encoder.encode(&self.block_height)?;
         encoder.encode(&self.block_timestamp)?;
         encoder.encode(self.entries.as_ref())?;
-        encoder.encode(self.merkle_proofs.as_ref())?;
         Ok(())
     }
 }
@@ -337,9 +328,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 7 {
+        if length != 6 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 7,
+                expected: 6,
                 actual: length,
             });
         }
@@ -350,7 +341,6 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         let block_height: BlockHeight = decoder.decode()?;
         let block_timestamp: u64 = decoder.decode()?;
         let entries: Vec<StateEntry> = decoder.decode()?;
-        let merkle_proofs: Vec<crate::SubstateInclusionProof> = decoder.decode()?;
 
         Ok(Self {
             transaction_hash,
@@ -359,7 +349,6 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             block_height,
             block_timestamp,
             entries: Arc::new(entries),
-            merkle_proofs: Arc::new(merkle_proofs),
         })
     }
 }

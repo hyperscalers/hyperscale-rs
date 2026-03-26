@@ -40,6 +40,10 @@ impl Dispatch for SyncDispatch {
         f();
     }
 
+    fn spawn_provisions(&self, f: impl FnOnce() + Send + 'static) {
+        f();
+    }
+
     fn consensus_crypto_queue_depth(&self) -> usize {
         0
     }
@@ -53,6 +57,10 @@ impl Dispatch for SyncDispatch {
     }
 
     fn execution_queue_depth(&self) -> usize {
+        0
+    }
+
+    fn provisions_queue_depth(&self) -> usize {
         0
     }
 

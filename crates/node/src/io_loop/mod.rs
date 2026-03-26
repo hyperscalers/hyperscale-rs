@@ -27,6 +27,9 @@ mod verify;
 use crate::batch_accumulator::{BatchAccumulator, ShardedBatchAccumulator};
 use crate::config::NodeConfig;
 use crate::protocol::fetch::{FetchInput, FetchKind, FetchProtocol};
+use crate::protocol::inclusion_proof_fetch::{
+    InclusionProofFetchInput, InclusionProofFetchProtocol,
+};
 use crate::protocol::provision_fetch::{ProvisionFetchInput, ProvisionFetchProtocol};
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use crate::NodeStateMachine;
@@ -181,6 +184,9 @@ where
     // Provision fetch protocol (cross-shard provision fetching with peer rotation)
     provision_fetch_protocol: ProvisionFetchProtocol,
 
+    // Inclusion proof fetch protocol (livelock tx inclusion proof fetching with peer rotation)
+    inclusion_proof_fetch_protocol: InclusionProofFetchProtocol,
+
     // Transaction validation
     tx_validator: Arc<TransactionValidation>,
     pending_validation: HashSet<Hash>,
@@ -199,7 +205,7 @@ where
 
     // Block commit accumulator — collects EmitCommittedBlock actions within a
     // single feed_event/handle_actions batch, then spawns a single closure on
-    // the execution pool to commit them sequentially. This keeps JMT writes
+    // the execution pool to commit them sequentially. This keeps JVT writes
     // off the pinned IoLoop thread while preserving commit ordering.
     pending_block_commits: Vec<(Block, QuorumCertificate)>,
 
@@ -263,6 +269,8 @@ where
         let sync_protocol = SyncProtocol::new(config.sync.clone());
         let fetch_protocol = FetchProtocol::new(config.fetch.clone());
         let provision_fetch_protocol = ProvisionFetchProtocol::new(config.provision_fetch.clone());
+        let inclusion_proof_fetch_protocol =
+            InclusionProofFetchProtocol::new(config.inclusion_proof_fetch.clone());
         Self {
             state,
             storage: Arc::new(storage),
@@ -284,6 +292,7 @@ where
             sync_protocol,
             fetch_protocol,
             provision_fetch_protocol,
+            inclusion_proof_fetch_protocol,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             cross_shard_batch: BatchAccumulator::new(b.cross_shard_max, b.cross_shard_window),
             execution_vote_batch: BatchAccumulator::new(
@@ -634,23 +643,60 @@ where
                     .provision_fetch_protocol
                     .handle(ProvisionFetchInput::Tick);
                 self.process_provision_fetch_outputs(prov_outputs);
+                // Also tick the inclusion proof fetch protocol.
+                let proof_outputs = self
+                    .inclusion_proof_fetch_protocol
+                    .handle(InclusionProofFetchInput::Tick);
+                self.process_inclusion_proof_fetch_outputs(proof_outputs);
                 self.update_fetch_tick_timer();
             }
 
             // ── Provision fetch protocol ──────────────────────────────
-            NodeInput::ProvisionFetchReceived {
-                source_shard,
-                block_height,
-                provisions,
-            } => {
+            NodeInput::ProvisionFetchReceived { batch } => {
+                let source_shard = batch.source_shard;
+                let block_height = batch.block_height;
                 let outputs = self
                     .provision_fetch_protocol
                     .handle(ProvisionFetchInput::Received {
                         source_shard,
                         block_height,
-                        provisions,
+                        batch,
                     });
                 self.process_provision_fetch_outputs(outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            // ── Inclusion proof fetch protocol (livelock) ─────────────
+            NodeInput::InclusionProofFetchReceived {
+                winner_tx_hash,
+                reason,
+                source_shard,
+                source_block_height,
+                proof,
+            } => {
+                let outputs = self.inclusion_proof_fetch_protocol.handle(
+                    InclusionProofFetchInput::Received {
+                        winner_tx_hash,
+                        reason,
+                        source_shard,
+                        source_block_height,
+                        proof,
+                    },
+                );
+                self.process_inclusion_proof_fetch_outputs(outputs);
+                self.update_fetch_tick_timer();
+            }
+
+            NodeInput::InclusionProofFetchFailed { winner_tx_hash } => {
+                let outputs = self
+                    .inclusion_proof_fetch_protocol
+                    .handle(InclusionProofFetchInput::Failed { winner_tx_hash });
+                self.process_inclusion_proof_fetch_outputs(outputs);
+                // Tick to retry immediately.
+                let tick_outputs = self
+                    .inclusion_proof_fetch_protocol
+                    .handle(InclusionProofFetchInput::Tick);
+                self.process_inclusion_proof_fetch_outputs(tick_outputs);
                 self.update_fetch_tick_timer();
             }
 
@@ -705,21 +751,44 @@ where
             //
             // The FetchAndBroadcastProvisions delegated action built provisions
             // grouped by target shard. Broadcast one batch per shard.
-            NodeInput::ProvisionsReady { batches } => {
-                for (shard, provisions, recipients) in batches {
+            NodeInput::ProvisionsReady {
+                batches,
+                block_timestamp,
+            } => {
+                for (shard, batch, recipients) in batches {
+                    // Convert ProvisionBatch back to Vec<StateProvision> for the notification.
+                    let block_height = batch.block_height;
+                    let source_shard = batch.source_shard;
+                    let proof = batch.proof.clone();
+                    let provisions: Vec<hyperscale_types::StateProvision> = batch
+                        .transactions
+                        .into_iter()
+                        .map(|tx| hyperscale_types::StateProvision {
+                            transaction_hash: tx.tx_hash,
+                            target_shard: shard,
+                            source_shard,
+                            block_height,
+                            block_timestamp,
+                            entries: std::sync::Arc::new(tx.entries),
+                        })
+                        .collect();
+                    if provisions.is_empty() {
+                        continue;
+                    }
                     let msg = hyperscale_types::state_provision_batch_message(
                         self.local_shard,
                         shard,
-                        provisions[0].block_height,
+                        block_height,
                         &provisions,
                     );
                     let sig = self.signing_key.sign_v1(&msg);
-                    let batch = hyperscale_messages::StateProvisionsNotification::new(
+                    let notification = hyperscale_messages::StateProvisionsNotification::new(
                         provisions,
+                        proof,
                         self.validator_id,
                         sig,
                     );
-                    self.network.notify(&recipients, &batch);
+                    self.network.notify(&recipients, &notification);
                 }
             }
 
@@ -882,7 +951,7 @@ where
 
     /// Capture a snapshot of node state for external status APIs.
     pub fn status_snapshot(&self) -> NodeStatusSnapshot {
-        let state_root = self.state.last_committed_jmt_root();
+        let state_root = self.state.last_committed_jvt_root();
         let mempool = self.state.mempool();
         let contention = mempool.lock_contention_stats();
 

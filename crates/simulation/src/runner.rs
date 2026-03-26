@@ -79,6 +79,9 @@ pub struct SimulationRunner {
 
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
+
+    /// Last time gossip dedup caches were pruned.
+    last_gossip_dedup_prune: Duration,
 }
 
 /// Statistics collected during simulation.
@@ -253,20 +256,25 @@ impl SimulationRunner {
             stats: SimulationStats::default(),
             genesis_executed: vec![false; num_nodes],
             traffic_analyzer: None,
+            last_gossip_dedup_prune: Duration::ZERO,
         }
     }
 
     /// Create a new simulation runner with traffic analysis enabled.
     pub fn with_traffic_analysis(network_config: NetworkConfig, seed: u64) -> Self {
         let mut runner = Self::new(network_config, seed);
-        runner.traffic_analyzer = Some(Arc::new(NetworkTrafficAnalyzer::new()));
+        let analyzer = Arc::new(NetworkTrafficAnalyzer::new());
+        runner.network.set_traffic_analyzer(Arc::clone(&analyzer));
+        runner.traffic_analyzer = Some(analyzer);
         runner
     }
 
     /// Enable traffic analysis on an existing runner.
     pub fn enable_traffic_analysis(&mut self) {
         if self.traffic_analyzer.is_none() {
-            self.traffic_analyzer = Some(Arc::new(NetworkTrafficAnalyzer::new()));
+            let analyzer = Arc::new(NetworkTrafficAnalyzer::new());
+            self.network.set_traffic_analyzer(Arc::clone(&analyzer));
+            self.traffic_analyzer = Some(analyzer);
         }
     }
 
@@ -368,8 +376,8 @@ impl SimulationRunner {
     /// Initialize all nodes with genesis blocks and start consensus.
     pub fn initialize_genesis(&mut self) {
         // Run Radix Engine genesis on each node's storage.
-        // SimGenesisWrapper writes substates only (no JMT) during bootstrap,
-        // then computes JMT once at version 0 to avoid collisions with block 1.
+        // SimGenesisWrapper writes substates only (no JVT) during bootstrap,
+        // then computes JVT once at version 0 to avoid collisions with block 1.
         for node_idx in 0..self.io_loops.len() {
             if !self.genesis_executed[node_idx] {
                 self.io_loops[node_idx].with_storage_and_executor(|storage, executor| {
@@ -379,7 +387,7 @@ impl SimulationRunner {
                         return;
                     }
                     let merged = wrapper.into_merged();
-                    storage.finalize_genesis_jmt(&merged);
+                    storage.finalize_genesis_jvt(&merged);
                 });
                 self.genesis_executed[node_idx] = true;
             }
@@ -403,8 +411,8 @@ impl SimulationRunner {
         use hyperscale_engine::GenesisConfig;
 
         // Run Radix Engine genesis on each node's storage with balances.
-        // SimGenesisWrapper writes substates only (no JMT) during bootstrap,
-        // then computes JMT once at version 0 to avoid collisions with block 1.
+        // SimGenesisWrapper writes substates only (no JVT) during bootstrap,
+        // then computes JVT once at version 0 to avoid collisions with block 1.
         for node_idx in 0..self.io_loops.len() {
             if !self.genesis_executed[node_idx] {
                 let balances = balances.clone();
@@ -419,7 +427,7 @@ impl SimulationRunner {
                         return;
                     }
                     let merged = wrapper.into_merged();
-                    storage.finalize_genesis_jmt(&merged);
+                    storage.finalize_genesis_jvt(&merged);
                 });
                 self.genesis_executed[node_idx] = true;
             }
@@ -448,19 +456,19 @@ impl SimulationRunner {
         for shard_id in 0..num_shards {
             let shard_start = shard_id * validators_per_shard;
             let first_node_storage = self.io_loops[shard_start as usize].storage();
-            let genesis_jmt_root = first_node_storage.state_root_hash();
+            let genesis_jvt_root = first_node_storage.state_root_hash();
 
             info!(
                 shard = shard_id,
-                genesis_jmt_root = ?genesis_jmt_root,
-                "JMT state after genesis bootstrap"
+                genesis_jvt_root = ?genesis_jvt_root,
+                "JVT state after genesis bootstrap"
             );
 
             let proposer = ValidatorId((shard_id * validators_per_shard) as u64);
             let genesis_block = Block::genesis(
                 hyperscale_types::ShardGroupId(shard_id as u64),
                 proposer,
-                genesis_jmt_root,
+                genesis_jvt_root,
             );
 
             let shard_end = shard_start + validators_per_shard;
@@ -477,11 +485,11 @@ impl SimulationRunner {
                 self.drain_node_io(node_index);
                 self.process_step_output(node_index, output);
 
-                // Sync state machine with actual JMT state after genesis bootstrap
+                // Sync state machine with actual JVT state after genesis bootstrap
                 let genesis_commit_event =
                     NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
                         height: 0,
-                        state_root: genesis_jmt_root,
+                        state_root: genesis_jvt_root,
                     });
                 self.schedule_event(node_index, self.now, genesis_commit_event);
             }
@@ -526,6 +534,16 @@ impl SimulationRunner {
             }
 
             self.now = next_time;
+
+            // Prune gossip dedup caches every 5 simulated seconds.
+            // Dedup only needs to cover the window in which duplicate broadcasts
+            // arrive (~cross-shard latency), so 5s is very conservative.
+            const GOSSIP_DEDUP_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
+            if self.now.saturating_sub(self.last_gossip_dedup_prune) >= GOSSIP_DEDUP_PRUNE_INTERVAL
+            {
+                self.network.prune_gossip_dedup();
+                self.last_gossip_dedup_prune = self.now;
+            }
 
             // Flush all delivery queues that are due — handlers/callbacks push
             // events into crossbeam channels.
@@ -604,6 +622,7 @@ impl SimulationRunner {
             self.stats.messages_sent += stats.messages_sent;
             self.stats.messages_dropped_partition += stats.messages_dropped_partition;
             self.stats.messages_dropped_loss += stats.messages_dropped_loss;
+            self.stats.messages_deduplicated += stats.messages_deduplicated;
         }
 
         // Accept pending requests: handler invoked now, response callback

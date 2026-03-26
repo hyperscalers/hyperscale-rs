@@ -8,15 +8,17 @@
 //! Batched work (execution votes, execution certs, cross-shard execution) and block
 //! commits are handled inline by the I/O loop's flush closures.
 
-use hyperscale_core::{Action, NodeInput, ProtocolEvent, ProvisionVerificationResult};
+use hyperscale_core::{Action, NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ShardGroupId, ValidatorId,
+    Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ProvisionBatch, ShardGroupId,
+    TxEntries, ValidatorId,
 };
 use std::sync::Arc;
+use tracing::warn;
 
 /// Context for executing delegated actions.
 pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore + ConsensusStore, D: Dispatch> {
@@ -42,10 +44,12 @@ pub(crate) struct DelegatedResult<P: Send> {
 pub(crate) enum DispatchPool {
     /// Liveness-critical consensus crypto (QC, state root, proposal).
     ConsensusCrypto,
-    /// General crypto verification (cert aggregation, provisions).
+    /// General crypto verification (cert aggregation).
     Crypto,
     /// Transaction execution (single-shard, merkle).
     Execution,
+    /// Provision proof generation and verification (IPA math).
+    Provisions,
 }
 
 /// Map a delegated action to its execution pool.
@@ -57,7 +61,6 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         // Consensus-critical crypto
         Action::VerifyAndBuildQuorumCertificate { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyQcSignature { .. } => Some(DispatchPool::ConsensusCrypto),
-        Action::VerifyCommitmentProof { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
@@ -65,12 +68,15 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 
         // General crypto
         Action::AggregateExecutionCertificate { .. } => Some(DispatchPool::Crypto),
-        Action::VerifyStateProvisions { .. } => Some(DispatchPool::Crypto),
+
+        // Provision work: IPA proof generation and verification.
+        // Dedicated pool to avoid starving execution and crypto work.
+        Action::VerifyProvisionBatch { .. } => Some(DispatchPool::Provisions),
+        Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Provisions),
 
         // Execution
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
         Action::SpeculativeExecute { .. } => Some(DispatchPool::Execution),
-        Action::FetchAndBroadcastProvisions { .. } => Some(DispatchPool::Execution),
         _ => None,
     }
 }
@@ -141,37 +147,6 @@ pub(crate) fn handle_delegated_action<
                     block_hash,
                     valid,
                 })],
-                prepared_commit: None,
-            })
-        }
-
-        Action::VerifyCommitmentProof {
-            block_hash,
-            deferral_index,
-            commitment_proof,
-            public_keys,
-            voting_power,
-            quorum_threshold,
-        } => {
-            let start = std::time::Instant::now();
-            let valid = hyperscale_bft::handlers::verify_commitment_proof(
-                &commitment_proof,
-                &public_keys,
-                voting_power,
-                quorum_threshold,
-            );
-            metrics::record_signature_verification_latency(
-                "commitment_proof",
-                start.elapsed().as_secs_f64(),
-            );
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::CommitmentProofVerified {
-                        block_hash,
-                        deferral_index,
-                        valid,
-                    },
-                )],
                 prepared_commit: None,
             })
         }
@@ -270,9 +245,9 @@ pub(crate) fn handle_delegated_action<
             transactions,
             certificates,
             per_cert_updates,
-            commitment_proofs,
             deferred,
             aborted,
+            priority_inclusions,
             provision_targets,
         } => {
             let merged_updates =
@@ -292,9 +267,9 @@ pub(crate) fn handle_delegated_action<
                 transactions,
                 certificates,
                 merged_updates,
-                commitment_proofs,
                 deferred,
                 aborted,
+                priority_inclusions,
                 shard_group_id,
                 provision_targets,
             );
@@ -343,8 +318,8 @@ pub(crate) fn handle_delegated_action<
         }
 
         // --- State Provision Batch Verification ---
-        Action::VerifyStateProvisions {
-            provisions,
+        Action::VerifyProvisionBatch {
+            batch,
             committed_headers,
             committee_public_keys,
             committee_voting_power,
@@ -378,27 +353,19 @@ pub(crate) fn handle_delegated_action<
                 qc_start.elapsed().as_secs_f64(),
             );
 
-            // Check merkle proofs per provision against the verified header's state root.
+            // Verify merkle proofs against the verified header's state root.
             let merkle_start = std::time::Instant::now();
-            let valid_flags: Vec<bool> = ctx.dispatch.map_local(&provisions, |provision| {
-                verified_header.as_ref().is_some_and(|header| {
-                    hyperscale_storage::proofs::verify_all_merkle_proofs(
-                        &provision.entries,
-                        &provision.merkle_proofs,
-                        header.header.state_root,
-                    )
-                })
+            let all_valid = verified_header.as_ref().is_some_and(|header| {
+                let all_entries = batch.all_entries_deduped();
+                if all_entries.is_empty() {
+                    return true;
+                }
+                hyperscale_storage::proofs::verify_all_verkle_proofs(
+                    &all_entries,
+                    &batch.proof,
+                    header.header.state_root,
+                )
             });
-            let results: Vec<ProvisionVerificationResult> = provisions
-                .into_iter()
-                .zip(valid_flags)
-                .map(|(provision, valid)| ProvisionVerificationResult {
-                    tx_hash: provision.transaction_hash,
-                    source_shard: provision.source_shard,
-                    valid,
-                    provision,
-                })
-                .collect();
             metrics::record_signature_verification_latency(
                 "inclusion_proof",
                 merkle_start.elapsed().as_secs_f64(),
@@ -407,8 +374,9 @@ pub(crate) fn handle_delegated_action<
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
                     ProtocolEvent::StateProvisionsVerified {
-                        results,
+                        batch,
                         committed_header: verified_header,
+                        valid: all_valid,
                     },
                 )],
                 prepared_commit: None,
@@ -522,17 +490,17 @@ pub(crate) fn handle_delegated_action<
             block_timestamp,
             shard_recipients,
         } => {
-            use hyperscale_types::StateProvision;
             use std::collections::HashMap;
 
-            let mut batches: HashMap<ShardGroupId, Vec<StateProvision>> = HashMap::new();
+            // Phase 1: Fetch state entries for all transactions.
+            let mut per_tx: Vec<(
+                Hash,
+                Vec<ShardGroupId>,
+                Arc<Vec<hyperscale_types::StateEntry>>,
+            )> = Vec::with_capacity(requests.len());
+            let mut all_storage_keys: Vec<Vec<u8>> = Vec::new();
 
-            for req in requests {
-                // Fetch state entries from storage at the block's height (= JMT version).
-                // This is the proactive path — the proposer just committed this
-                // block, so the version should still be available. If it was
-                // garbage-collected (aggressive GC + slow dispatch), skip this
-                // request — the target shard will recover via fallback.
+            for req in &requests {
                 let entries =
                     match ctx
                         .executor
@@ -540,55 +508,94 @@ pub(crate) fn handle_delegated_action<
                     {
                         Some(entries) => entries,
                         None => {
-                            tracing::warn!(
+                            warn!(
+                                source_shard = source_shard.0,
                                 block_height = block_height.0,
-                                tx_hash = ?req.tx_hash,
-                                "Proactive provision: JMT version unavailable, \
-                                 skipping (target shard will use fallback recovery)"
+                                tx_hash = %req.tx_hash,
+                                node_count = req.nodes.len(),
+                                "fetch_state_entries returned None — JVT version unavailable"
                             );
                             continue;
                         }
                     };
-                let storage_keys: Vec<Vec<u8>> =
-                    entries.iter().map(|e| e.storage_key.clone()).collect();
-                let merkle_proofs = ctx
-                    .storage
-                    .generate_merkle_proofs(&storage_keys, block_height.0);
-
-                assert_eq!(
-                    entries.len(),
-                    merkle_proofs.len(),
-                    "entries and merkle_proofs must have the same length"
+                for e in &entries {
+                    all_storage_keys.push(e.storage_key.clone());
+                }
+                per_tx.push((req.tx_hash, req.target_shards.clone(), Arc::new(entries)));
+            }
+            if per_tx.is_empty() {
+                warn!(
+                    source_shard = source_shard.0,
+                    block_height = block_height.0,
+                    request_count = requests.len(),
+                    "All fetch_state_entries failed — no provisions to broadcast"
                 );
+                return Some(DelegatedResult {
+                    events: vec![NodeInput::ProvisionsReady {
+                        batches: vec![],
+                        block_timestamp: 0,
+                    }],
+                    prepared_commit: None,
+                });
+            }
 
-                // Wrap in Arc for efficient sharing across target shards
-                let entries = Arc::new(entries);
-                let merkle_proofs = Arc::new(merkle_proofs);
-
-                // Build a provision per target shard
-                for &target_shard in &req.target_shards {
-                    let provision = StateProvision {
-                        transaction_hash: req.tx_hash,
-                        target_shard,
-                        source_shard,
-                        block_height,
-                        block_timestamp,
-                        entries: Arc::clone(&entries),
-                        merkle_proofs: Arc::clone(&merkle_proofs),
-                    };
-                    batches.entry(target_shard).or_default().push(provision);
+            // Phase 2: Generate ONE batched proof covering all entries across all transactions.
+            all_storage_keys.sort();
+            all_storage_keys.dedup();
+            let proof = match ctx
+                .storage
+                .generate_verkle_proofs(&all_storage_keys, block_height.0)
+            {
+                Some(p) => Arc::new(p),
+                None => {
+                    warn!(
+                        source_shard = source_shard.0,
+                        block_height = block_height.0,
+                        key_count = all_storage_keys.len(),
+                        "generate_verkle_proofs returned None — JVT version unavailable"
+                    );
+                    return Some(DelegatedResult {
+                        events: vec![NodeInput::ProvisionsReady {
+                            batches: vec![],
+                            block_timestamp: 0,
+                        }],
+                        prepared_commit: None,
+                    });
+                }
+            };
+            // Phase 3: Build provisions sharing the single proof.
+            // Group entries per target shard.
+            let mut shard_tx_entries: HashMap<ShardGroupId, Vec<TxEntries>> = HashMap::new();
+            for (tx_hash, target_shards, entries) in per_tx {
+                for &target_shard in &target_shards {
+                    shard_tx_entries
+                        .entry(target_shard)
+                        .or_default()
+                        .push(TxEntries {
+                            tx_hash,
+                            entries: (*entries).clone(),
+                        });
                 }
             }
 
-            let batches: Vec<_> = batches
+            let batches: Vec<_> = shard_tx_entries
                 .into_iter()
-                .map(|(shard, provisions)| {
+                .map(|(shard, transactions)| {
                     let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
-                    (shard, provisions, recipients)
+                    let batch = ProvisionBatch {
+                        source_shard,
+                        block_height,
+                        proof: (*proof).clone(),
+                        transactions,
+                    };
+                    (shard, batch, recipients)
                 })
                 .collect();
             Some(DelegatedResult {
-                events: vec![NodeInput::ProvisionsReady { batches }],
+                events: vec![NodeInput::ProvisionsReady {
+                    batches,
+                    block_timestamp,
+                }],
                 prepared_commit: None,
             })
         }

@@ -185,7 +185,7 @@ pub fn extract_state_changes(db_updates: &DatabaseUpdates) -> Vec<SubstateChange
 /// Reconstruct `DatabaseUpdates` from a ledger receipt's state changes.
 ///
 /// This converts the receipt's `SubstateChange` entries into the `DatabaseUpdates`
-/// format used by the JMT commit path. Used by syncing nodes that receive receipts
+/// format used by the JVT commit path. Used by syncing nodes that receive receipts
 /// from peers instead of executing transactions locally.
 ///
 /// The resulting `DatabaseUpdates` contain ALL nodes (not filtered to any shard).

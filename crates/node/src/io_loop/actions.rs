@@ -109,13 +109,12 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::VerifyAndBuildQuorumCertificate { .. }
             | Action::VerifyQcSignature { .. }
-            | Action::VerifyCommitmentProof { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyTransactionRoot { .. }
             | Action::VerifyReceiptRoot { .. }
             | Action::BuildProposal { .. }
             | Action::AggregateExecutionCertificate { .. }
-            | Action::VerifyStateProvisions { .. }
+            | Action::VerifyProvisionBatch { .. }
             | Action::ExecuteTransactions { .. }
             | Action::SpeculativeExecute { .. }
             | Action::FetchAndBroadcastProvisions { .. } => {
@@ -176,7 +175,8 @@ where
             | Action::FetchCertificates { .. }
             | Action::CancelFetch { .. }
             | Action::RequestMissingProvisions { .. }
-            | Action::CancelProvisionFetch { .. } => {
+            | Action::CancelProvisionFetch { .. }
+            | Action::RequestTxInclusionProof { .. } => {
                 self.process_sync_fetch_action(action);
             }
 
@@ -276,7 +276,7 @@ where
 
     /// Accumulate a block commit for batched dispatch. Records metrics
     /// immediately (on the pinned thread) and feeds the sync protocol, then
-    /// defers the heavy JMT/metadata writes to [`flush_block_commits`].
+    /// defers the heavy JVT/metadata writes to [`flush_block_commits`].
     fn accumulate_block_commit(
         &mut self,
         block: hyperscale_types::Block,
@@ -291,7 +291,7 @@ where
         let commit_latency_secs = (now_ms.saturating_sub(block.header.timestamp)) as f64 / 1000.0;
         metrics::record_block_committed(height.0, commit_latency_secs);
         metrics::set_block_height(height.0);
-        metrics::set_txs_with_commitment_proof(block.commitment_proofs.len());
+        metrics::set_txs_with_commitment_proof(block.priority_transactions.len());
 
         // Livelock metrics for deferrals in this block.
         for _deferral in &block.deferred {
@@ -301,7 +301,7 @@ where
         metrics::set_livelock_deferred_count(self.state.livelock().stats().pending_deferrals);
 
         // Feed committed height to sync protocol (just tracks progress,
-        // doesn't need JMT state).
+        // doesn't need JVT state).
         let outputs = self
             .sync_protocol
             .handle(SyncInput::BlockCommitted { height: height.0 });
@@ -348,7 +348,7 @@ where
 
         if !has_non_empty {
             // All empty blocks — synchronous fast path.
-            // Still advance JMT version so it matches block height.
+            // Still advance JVT version so it matches block height.
             if !pending_receipts.is_empty() {
                 self.storage.store_receipt_bundles(&pending_receipts);
             }
@@ -402,7 +402,7 @@ where
         // BuildProposal complete on the crypto pool *after* the block they
         // prepared has already been committed via the sync/receipt-
         // reconstruction path. Without this prune, one orphaned
-        // PreparedCommit (WriteBatch + JmtSnapshot + DatabaseUpdates) leaks
+        // PreparedCommit (WriteBatch + JvtSnapshot + DatabaseUpdates) leaks
         // per block whenever the crypto pool is slower than commit dispatch.
         let max_committed_height = commits
             .iter()
@@ -450,7 +450,7 @@ where
                     qc: qc.clone(),
                 };
 
-                // Always commit — even empty blocks advance the JMT version
+                // Always commit — even empty blocks advance the JVT version
                 // to match block height, so provision lookups succeed.
                 // Consensus metadata is folded into the same atomic write.
                 let prepared = prepared_map[i].take();
@@ -632,6 +632,33 @@ where
                         block_height,
                     });
             }
+            Action::RequestTxInclusionProof {
+                source_shard,
+                source_block_height,
+                winner_tx_hash,
+                reason,
+                peers,
+            } => {
+                use crate::protocol::inclusion_proof_fetch::InclusionProofFetchInput;
+                let preferred_peer = peers.first().copied().unwrap_or(ValidatorId(0));
+                let outputs =
+                    self.inclusion_proof_fetch_protocol
+                        .handle(InclusionProofFetchInput::Request {
+                            source_shard,
+                            source_block_height,
+                            winner_tx_hash,
+                            reason,
+                            peers,
+                            preferred_peer,
+                        });
+                self.process_inclusion_proof_fetch_outputs(outputs);
+                // Tick immediately to start the fetch.
+                let tick_outputs = self
+                    .inclusion_proof_fetch_protocol
+                    .handle(InclusionProofFetchInput::Tick);
+                self.process_inclusion_proof_fetch_outputs(tick_outputs);
+                self.update_fetch_tick_timer();
+            }
             _ => unreachable!(),
         }
     }
@@ -697,6 +724,7 @@ where
             DispatchPool::ConsensusCrypto => self.dispatch.spawn_consensus_crypto(spawn_fn),
             DispatchPool::Crypto => self.dispatch.spawn_crypto(spawn_fn),
             DispatchPool::Execution => self.dispatch.spawn_execution(spawn_fn),
+            DispatchPool::Provisions => self.dispatch.spawn_provisions(spawn_fn),
         }
     }
 

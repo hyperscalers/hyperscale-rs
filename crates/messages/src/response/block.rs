@@ -109,7 +109,7 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            commitment_proofs: std::collections::HashMap::new(),
+            priority_inclusions: vec![],
         }
     }
 

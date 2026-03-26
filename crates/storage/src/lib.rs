@@ -18,21 +18,21 @@
 //!
 //! Rather than having our own `Storage` trait that we adapt to Radix's `SubstateDatabase`,
 //! runner storage types implement `SubstateDatabase` directly, plus our `SubstateStore`
-//! extension trait for snapshots, node listing, and JMT state roots.
+//! extension trait for snapshots, node listing, and JVT state roots.
 //!
-//! # Jellyfish Merkle Tree (JMT)
+//! # Jellyfish Verkle Tree (JVT)
 //!
-//! All `SubstateStore` implementations use JMT internally to maintain a cryptographic
+//! All `SubstateStore` implementations use JVT internally to maintain a cryptographic
 //! commitment to the entire state. This provides:
-//! - `jmt_version()` - Block height of last committed JMT state
-//! - `state_root_hash()` - Merkle root of all substates at current version
+//! - `jvt_version()` - Block height of last committed JVT state
+//! - `state_root_hash()` - Verkle root of all substates at current version
 
 #![warn(missing_docs)]
 
 mod commit;
 mod consensus;
 mod genesis;
-mod jmt_snapshot;
+mod jvt_snapshot;
 pub mod keys;
 mod overlay;
 pub mod proofs;
@@ -45,17 +45,17 @@ pub mod test_helpers;
 pub use commit::{CommitStore, ConsensusCommitData};
 pub use consensus::ConsensusStore;
 pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
-pub use jmt_snapshot::{JmtSnapshot, LeafSubstateKeyAssociation};
+pub use jvt_snapshot::{JvtSnapshot, LeafSubstateKeyAssociation};
 pub use overlay::{SubstateDbLookup, SubstateLookup};
-pub use store::{SubstateStore, RADIX_PREFIX};
+pub use store::SubstateStore;
 pub use writes::{
     extract_state_changes, filter_updates_to_shard, merge_database_updates,
     merge_database_updates_from_arcs, merge_into, receipt_to_database_updates,
 };
 
-/// Returns `None` when the JMT is truly empty (height 0 with zero root),
+/// Returns `None` when the JVT is truly empty (height 0 with zero root),
 /// indicating no parent node exists. Otherwise returns `Some(block_height)`.
-pub fn jmt_parent_height(block_height: u64, root: StateRootHash) -> Option<u64> {
+pub fn jvt_parent_height(block_height: u64, root: StateRootHash) -> Option<u64> {
     if block_height == 0 && root == StateRootHash::ZERO {
         None
     } else {
@@ -71,28 +71,17 @@ pub use radix_substate_store_interface::interface::{
     PartitionDatabaseUpdates, PartitionEntry, SubstateDatabase,
 };
 
-/// JMT implementation types re-exported for storage backends.
+/// State tree implementation types re-exported for storage backends.
 ///
 /// These are implementation details needed by `storage-memory` and `storage-rocksdb`.
 /// They are not part of the abstract storage interface.
 pub mod jmt {
-    pub use hyperscale_jmt::put_at_version;
-    pub use hyperscale_jmt::put_at_version_and_apply;
-    pub use hyperscale_jmt::tier_framework::TierCollectedWrites;
-    pub use hyperscale_jmt::tree_store::{
-        encode_key, ReadableTreeStore, StaleTreePart, StoredTreeNodeKey, TreeNode,
-        TypedInMemoryTreeStore, Version, VersionedTreeNode, WriteableTreeStore,
+    pub use hyperscale_state_tree::put_at_version;
+    pub use hyperscale_state_tree::put_at_version_and_apply;
+    pub use hyperscale_state_tree::tree_store::{
+        encode_key, ReadableTreeStore, StaleTreePart, StoredNode, StoredNodeKey,
+        TypedInMemoryTreeStore, Version, VersionedStoredNode, WriteableTreeStore,
     };
-
-    // Re-export types needed for proof generation and verification
-    pub use hyperscale_jmt::types::{
-        IteratedLeafKey, LeafKey, SparseMerkleLeafNode, SparseMerkleProof, INTERNAL_HASH_DOMAIN,
-        LEAF_HASH_DOMAIN,
-    };
-
-    // Re-export tier types for proof generation and historical reads
-    pub use hyperscale_jmt::entity_tier::EntityTier;
-    pub use hyperscale_jmt::partition_tier::PartitionTier;
-    pub use hyperscale_jmt::substate_tier::{SubstateSummary, SubstateTier};
-    pub use hyperscale_jmt::tier_framework::ReadableTier;
+    pub use hyperscale_state_tree::CollectedWrites;
+    pub use hyperscale_state_tree::NodeCache;
 }
