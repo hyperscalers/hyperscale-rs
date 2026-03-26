@@ -3,6 +3,7 @@
 use crate::sim_network::{
     BroadcastTarget, OutboxEntry, PendingNotification, PendingRequest, SimNetworkAdapter,
 };
+use crate::traffic::NetworkTrafficAnalyzer;
 use crate::NodeIndex;
 use hyperscale_network::{HandlerRegistry, RequestError};
 use hyperscale_types::{ShardGroupId, ValidatorId};
@@ -173,6 +174,8 @@ pub struct SimulatedNetwork {
     pending_responses: BinaryHeap<Reverse<ScheduledResponse>>,
     /// Monotonic sequence counter for deterministic response ordering.
     response_sequence: u64,
+    /// Optional traffic analyzer for bandwidth metrics.
+    traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -205,7 +208,13 @@ impl SimulatedNetwork {
             notification_sequence: 0,
             pending_responses: BinaryHeap::new(),
             response_sequence: 0,
+            traffic_analyzer: None,
         }
+    }
+
+    /// Set the traffic analyzer for bandwidth metrics recording.
+    pub fn set_traffic_analyzer(&mut self, analyzer: Arc<NetworkTrafficAnalyzer>) {
+        self.traffic_analyzer = Some(analyzer);
     }
 
     /// Create a [`SimNetworkAdapter`] for a node, sharing its handler registry.
@@ -444,6 +453,17 @@ impl SimulatedNetwork {
 
             stats.messages_sent += 2; // request + response
 
+            if let Some(ref analyzer) = self.traffic_analyzer {
+                // Record request message (requester → peer)
+                analyzer.record_message(
+                    type_id,
+                    request_bytes.len(),
+                    request_bytes.len(),
+                    requester,
+                    peer,
+                );
+            }
+
             // Look up the per-type request handler from the peer's registry.
             let handler = match self
                 .registries
@@ -473,6 +493,18 @@ impl SimulatedNetwork {
             let request_latency = self.sample_latency(requester, peer, rng);
             let response_latency = self.sample_latency(peer, requester, rng);
             let round_trip = request_latency + response_latency;
+
+            if let Some(ref analyzer) = self.traffic_analyzer {
+                // Record response message (peer → requester)
+                let response_type = format!("{}.response", type_id);
+                analyzer.record_message(
+                    &response_type,
+                    response_bytes.len(),
+                    response_bytes.len(),
+                    peer,
+                    requester,
+                );
+            }
 
             self.response_sequence += 1;
             self.pending_responses.push(Reverse(ScheduledResponse {
@@ -538,6 +570,9 @@ impl SimulatedNetwork {
                     }
                     Some(latency) => {
                         stats.messages_sent += 1;
+                        if let Some(ref analyzer) = self.traffic_analyzer {
+                            analyzer.record_message(type_id, payload.len(), data.len(), sender, to);
+                        }
                         self.notification_sequence += 1;
                         self.pending_notifications
                             .push(Reverse(ScheduledNotification {
@@ -611,6 +646,15 @@ impl SimulatedNetwork {
                 }
                 Some(latency) => {
                     stats.messages_sent += 1;
+                    if let Some(ref analyzer) = self.traffic_analyzer {
+                        analyzer.record_message(
+                            message_type,
+                            payload.len(),
+                            entry.data.len(),
+                            from,
+                            to,
+                        );
+                    }
                     self.gossip_sequence += 1;
                     self.pending_gossip.push(Reverse(ScheduledGossip {
                         delivery_time: now + latency,

@@ -259,14 +259,18 @@ impl SimulationRunner {
     /// Create a new simulation runner with traffic analysis enabled.
     pub fn with_traffic_analysis(network_config: NetworkConfig, seed: u64) -> Self {
         let mut runner = Self::new(network_config, seed);
-        runner.traffic_analyzer = Some(Arc::new(NetworkTrafficAnalyzer::new()));
+        let analyzer = Arc::new(NetworkTrafficAnalyzer::new());
+        runner.network.set_traffic_analyzer(Arc::clone(&analyzer));
+        runner.traffic_analyzer = Some(analyzer);
         runner
     }
 
     /// Enable traffic analysis on an existing runner.
     pub fn enable_traffic_analysis(&mut self) {
         if self.traffic_analyzer.is_none() {
-            self.traffic_analyzer = Some(Arc::new(NetworkTrafficAnalyzer::new()));
+            let analyzer = Arc::new(NetworkTrafficAnalyzer::new());
+            self.network.set_traffic_analyzer(Arc::clone(&analyzer));
+            self.traffic_analyzer = Some(analyzer);
         }
     }
 
