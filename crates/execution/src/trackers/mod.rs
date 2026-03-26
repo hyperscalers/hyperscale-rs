@@ -5,6 +5,8 @@
 
 mod certificate;
 mod vote;
+mod wave_vote;
 
 pub use certificate::CertificateTracker;
 pub use vote::VoteTracker;
+pub use wave_vote::WaveVoteTracker;
