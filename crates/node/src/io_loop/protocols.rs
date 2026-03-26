@@ -277,7 +277,7 @@ where
                     source_shard,
                     block_height,
                     winner_tx_hash,
-                    loser_tx_hash,
+                    reason,
                     peer,
                 } => {
                     use hyperscale_messages::request::GetTxInclusionProofRequest;
@@ -295,7 +295,7 @@ where
                                 if let Some(proof) = response.proof {
                                     let _ = sender.send(NodeInput::InclusionProofFetchReceived {
                                         winner_tx_hash,
-                                        loser_tx_hash,
+                                        reason,
                                         source_shard,
                                         source_block_height: block_height,
                                         proof,
@@ -315,18 +315,31 @@ where
                 }
                 InclusionProofFetchOutput::Deliver {
                     winner_tx_hash,
-                    loser_tx_hash,
+                    reason,
                     source_shard,
                     source_block_height,
                     proof,
                 } => {
-                    let actions = self.state.on_inclusion_proof_received(
-                        winner_tx_hash,
-                        loser_tx_hash,
-                        source_shard,
-                        source_block_height,
-                        proof,
-                    );
+                    use hyperscale_core::InclusionProofFetchReason;
+                    let actions = match reason {
+                        InclusionProofFetchReason::Deferral { loser_tx_hash } => {
+                            self.state.on_inclusion_proof_received(
+                                winner_tx_hash,
+                                loser_tx_hash,
+                                source_shard,
+                                source_block_height,
+                                proof,
+                            )
+                        }
+                        InclusionProofFetchReason::Priority => {
+                            self.state.on_priority_inclusion_proof_received(
+                                winner_tx_hash,
+                                source_shard,
+                                source_block_height,
+                                proof,
+                            )
+                        }
+                    };
                     for action in actions {
                         self.process_action(action);
                     }

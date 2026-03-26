@@ -11,6 +11,7 @@
 //! Runner ──► InclusionProofFetchProtocol::handle(Input) ──► Vec<Output>
 //! ```
 
+use hyperscale_core::InclusionProofFetchReason;
 use hyperscale_types::{BlockHeight, Hash, ShardGroupId, TransactionInclusionProof, ValidatorId};
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, trace, warn};
@@ -33,28 +34,26 @@ impl Default for InclusionProofFetchConfig {
 /// Inputs to the inclusion proof fetch protocol state machine.
 #[derive(Debug)]
 pub enum InclusionProofFetchInput {
-    /// A new fetch request from the livelock system.
+    /// A new fetch request (livelock deferral or priority tx proof).
     Request {
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
         winner_tx_hash: Hash,
-        loser_tx_hash: Hash,
+        reason: InclusionProofFetchReason,
         peers: Vec<ValidatorId>,
         preferred_peer: ValidatorId,
     },
     /// Proof was successfully received.
     Received {
         winner_tx_hash: Hash,
-        loser_tx_hash: Hash,
+        reason: InclusionProofFetchReason,
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
         proof: TransactionInclusionProof,
     },
     /// A fetch attempt failed.
     Failed { winner_tx_hash: Hash },
-    /// Cancel a pending fetch (e.g. loser tx completed before proof arrived).
-    /// TODO: Wire up cancellation when loser tx completes (certificate/abort)
-    /// before the inclusion proof arrives, to avoid wasted network requests.
+    /// Cancel a pending fetch.
     #[allow(dead_code)]
     Cancel { winner_tx_hash: Hash },
     /// Periodic tick — spawn pending fetch operations.
@@ -69,13 +68,13 @@ pub enum InclusionProofFetchOutput {
         source_shard: ShardGroupId,
         block_height: BlockHeight,
         winner_tx_hash: Hash,
-        loser_tx_hash: Hash,
+        reason: InclusionProofFetchReason,
         peer: ValidatorId,
     },
     /// Deliver the proof to the state machine.
     Deliver {
         winner_tx_hash: Hash,
-        loser_tx_hash: Hash,
+        reason: InclusionProofFetchReason,
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
         proof: TransactionInclusionProof,
@@ -87,7 +86,7 @@ pub enum InclusionProofFetchOutput {
 struct PendingInclusionProofFetch {
     source_shard: ShardGroupId,
     source_block_height: BlockHeight,
-    loser_tx_hash: Hash,
+    reason: InclusionProofFetchReason,
     peers: Vec<ValidatorId>,
     preferred_peer: ValidatorId,
     tried: HashSet<ValidatorId>,
@@ -119,26 +118,26 @@ impl InclusionProofFetchProtocol {
                 source_shard,
                 source_block_height,
                 winner_tx_hash,
-                loser_tx_hash,
+                reason,
                 peers,
                 preferred_peer,
             } => self.handle_request(
                 source_shard,
                 source_block_height,
                 winner_tx_hash,
-                loser_tx_hash,
+                reason,
                 peers,
                 preferred_peer,
             ),
             InclusionProofFetchInput::Received {
                 winner_tx_hash,
-                loser_tx_hash,
+                reason,
                 source_shard,
                 source_block_height,
                 proof,
             } => self.handle_received(
                 winner_tx_hash,
-                loser_tx_hash,
+                reason,
                 source_shard,
                 source_block_height,
                 proof,
@@ -167,7 +166,7 @@ impl InclusionProofFetchProtocol {
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
         winner_tx_hash: Hash,
-        loser_tx_hash: Hash,
+        reason: InclusionProofFetchReason,
         peers: Vec<ValidatorId>,
         preferred_peer: ValidatorId,
     ) -> Vec<InclusionProofFetchOutput> {
@@ -187,7 +186,6 @@ impl InclusionProofFetchProtocol {
 
         debug!(
             winner_tx = %winner_tx_hash,
-            loser_tx = %loser_tx_hash,
             source_shard = source_shard.0,
             block_height = source_block_height.0,
             peer_count = peers.len(),
@@ -199,7 +197,7 @@ impl InclusionProofFetchProtocol {
             PendingInclusionProofFetch {
                 source_shard,
                 source_block_height,
-                loser_tx_hash,
+                reason,
                 peers,
                 preferred_peer,
                 tried: HashSet::new(),
@@ -214,7 +212,7 @@ impl InclusionProofFetchProtocol {
     fn handle_received(
         &mut self,
         winner_tx_hash: Hash,
-        loser_tx_hash: Hash,
+        reason: InclusionProofFetchReason,
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
         proof: TransactionInclusionProof,
@@ -226,7 +224,7 @@ impl InclusionProofFetchProtocol {
             );
             vec![InclusionProofFetchOutput::Deliver {
                 winner_tx_hash,
-                loser_tx_hash,
+                reason,
                 source_shard,
                 source_block_height,
                 proof,
@@ -297,7 +295,7 @@ impl InclusionProofFetchProtocol {
                     source_shard: state.source_shard,
                     block_height: state.source_block_height,
                     winner_tx_hash,
-                    loser_tx_hash: state.loser_tx_hash,
+                    reason: state.reason.clone(),
                     peer,
                 });
                 continue;
@@ -328,7 +326,7 @@ impl InclusionProofFetchProtocol {
                         source_shard: state.source_shard,
                         block_height: state.source_block_height,
                         winner_tx_hash,
-                        loser_tx_hash: state.loser_tx_hash,
+                        reason: state.reason.clone(),
                         peer,
                     });
                 }
@@ -399,7 +397,9 @@ mod tests {
             source_shard: shard(1),
             source_block_height: height(10),
             winner_tx_hash: tx_hash(1),
-            loser_tx_hash: tx_hash(2),
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(2),
+            },
             peers: vec![vid(1), vid(2), vid(3)],
             preferred_peer: vid(1),
         });
@@ -437,7 +437,9 @@ mod tests {
             source_shard: shard(1),
             source_block_height: height(10),
             winner_tx_hash: tx_hash(1),
-            loser_tx_hash: tx_hash(2),
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(2),
+            },
             peers: vec![vid(1), vid(2)],
             preferred_peer: vid(1),
         });
@@ -484,7 +486,9 @@ mod tests {
             source_shard: shard(1),
             source_block_height: height(10),
             winner_tx_hash: tx_hash(1),
-            loser_tx_hash: tx_hash(2),
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(2),
+            },
             peers: vec![vid(1), vid(2)],
             preferred_peer: vid(1),
         });
@@ -515,7 +519,9 @@ mod tests {
             source_shard: shard(1),
             source_block_height: height(10),
             winner_tx_hash: tx_hash(1),
-            loser_tx_hash: tx_hash(2),
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(2),
+            },
             peers: vec![vid(1)],
             preferred_peer: vid(1),
         });
@@ -524,7 +530,9 @@ mod tests {
 
         let outputs = protocol.handle(InclusionProofFetchInput::Received {
             winner_tx_hash: tx_hash(1),
-            loser_tx_hash: tx_hash(2),
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(2),
+            },
             source_shard: shard(1),
             source_block_height: height(10),
             proof: dummy_proof(),
@@ -546,7 +554,9 @@ mod tests {
             source_shard: shard(1),
             source_block_height: height(10),
             winner_tx_hash: tx_hash(1),
-            loser_tx_hash: tx_hash(2),
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(2),
+            },
             peers: vec![vid(1)],
             preferred_peer: vid(1),
         });
@@ -572,7 +582,9 @@ mod tests {
         let mut protocol = InclusionProofFetchProtocol::new(default_config());
         let outputs = protocol.handle(InclusionProofFetchInput::Received {
             winner_tx_hash: tx_hash(99),
-            loser_tx_hash: tx_hash(100),
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(100),
+            },
             source_shard: shard(1),
             source_block_height: height(10),
             proof: dummy_proof(),
@@ -588,7 +600,9 @@ mod tests {
             source_shard: shard(1),
             source_block_height: height(10),
             winner_tx_hash: tx_hash(1),
-            loser_tx_hash: tx_hash(2),
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(2),
+            },
             peers: vec![vid(1), vid(2)],
             preferred_peer: vid(1),
         });
@@ -609,7 +623,9 @@ mod tests {
             source_shard: shard(1),
             source_block_height: height(10),
             winner_tx_hash: tx_hash(1),
-            loser_tx_hash: tx_hash(2),
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(2),
+            },
             peers: vec![vid(1)],
             preferred_peer: vid(1),
         });
@@ -619,7 +635,9 @@ mod tests {
             source_shard: shard(1),
             source_block_height: height(10),
             winner_tx_hash: tx_hash(1),
-            loser_tx_hash: tx_hash(2),
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(2),
+            },
             peers: vec![vid(1), vid(2), vid(3)],
             preferred_peer: vid(2),
         });

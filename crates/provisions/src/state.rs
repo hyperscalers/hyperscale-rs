@@ -144,6 +144,17 @@ pub struct ProvisionCoordinator {
     completed_tombstones: HashMap<Hash, BlockHeight>,
 
     // ═══════════════════════════════════════════════════════════════════
+    // Priority Inclusion Proof Cache
+    // ═══════════════════════════════════════════════════════════════════
+    /// Source block info for verified provisions: tx_hash → (source_shard, block_height).
+    /// Populated in `on_state_provisions_verified`, cleaned up in `cleanup_tx`.
+    provision_source_blocks: HashMap<Hash, (ShardGroupId, BlockHeight)>,
+
+    /// Cached inclusion proofs for priority transactions, fetched on demand.
+    /// Consumed at proposal time by `take_cached_inclusion_proof`.
+    inclusion_proof_cache: HashMap<Hash, hyperscale_types::PriorityInclusion>,
+
+    // ═══════════════════════════════════════════════════════════════════
     // Time
     // ═══════════════════════════════════════════════════════════════════
     /// Current time.
@@ -186,6 +197,8 @@ impl ProvisionCoordinator {
             local_committed_height: BlockHeight(0),
             expected_provisions: HashMap::new(),
             completed_tombstones: HashMap::new(),
+            provision_source_blocks: HashMap::new(),
+            inclusion_proof_cache: HashMap::new(),
             now: Duration::ZERO,
         }
     }
@@ -668,6 +681,11 @@ impl ProvisionCoordinator {
                 .or_default()
                 .insert(source_shard, tx_entries.entries.clone());
 
+            // Track source block for priority inclusion proof fetching
+            self.provision_source_blocks
+                .entry(tx_hash)
+                .or_insert((source_shard, batch.block_height));
+
             // Update reverse index for cycle detection
             self.txs_by_source_shard
                 .entry(source_shard)
@@ -832,6 +850,42 @@ impl ProvisionCoordinator {
             batches.retain(|batch| !batch.transactions.is_empty());
             !batches.is_empty()
         });
+
+        // Remove priority proof cache entries
+        self.provision_source_blocks.remove(tx_hash);
+        self.inclusion_proof_cache.remove(tx_hash);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Priority Inclusion Proof Cache
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Get txs that have verified provisions but no cached inclusion proof.
+    ///
+    /// Returns `(tx_hash, source_shard, source_block_height)` for each.
+    pub fn txs_needing_inclusion_proofs(&self) -> Vec<(Hash, ShardGroupId, BlockHeight)> {
+        self.provision_source_blocks
+            .iter()
+            .filter(|(tx_hash, _)| !self.inclusion_proof_cache.contains_key(tx_hash))
+            .map(|(&tx_hash, &(shard, height))| (tx_hash, shard, height))
+            .collect()
+    }
+
+    /// Cache an inclusion proof for a priority tx.
+    pub fn cache_inclusion_proof(
+        &mut self,
+        tx_hash: Hash,
+        inclusion: hyperscale_types::PriorityInclusion,
+    ) {
+        self.inclusion_proof_cache.insert(tx_hash, inclusion);
+    }
+
+    /// Take (consume) a cached inclusion proof for proposal.
+    pub fn take_cached_inclusion_proof(
+        &mut self,
+        tx_hash: &Hash,
+    ) -> Option<hyperscale_types::PriorityInclusion> {
+        self.inclusion_proof_cache.remove(tx_hash)
     }
 }
 

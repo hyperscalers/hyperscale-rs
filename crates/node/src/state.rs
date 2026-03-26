@@ -96,6 +96,7 @@ struct ProposalInputs {
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
     certificates: Vec<Arc<TransactionCertificate>>,
+    priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
 }
 
 impl NodeStateMachine {
@@ -241,7 +242,11 @@ impl NodeStateMachine {
     ///
     /// Used by both `on_proposal_timer` and `on_qc_formed` to avoid duplicating
     /// the ready-transaction + deferred + aborted + certificates gathering logic.
-    fn gather_proposal_inputs(&self, pending_txs: usize, pending_certs: usize) -> ProposalInputs {
+    fn gather_proposal_inputs(
+        &mut self,
+        pending_txs: usize,
+        pending_certs: usize,
+    ) -> ProposalInputs {
         let max_txs = self.bft.config().max_transactions_per_block;
         let ready_txs = self
             .mempool
@@ -255,11 +260,23 @@ impl NodeStateMachine {
         );
         let certificates = self.execution.get_finalized_certificates();
 
+        // Under backpressure: collect cached inclusion proofs for priority txs.
+        let priority_inclusions = if self.mempool.at_in_flight_limit() {
+            ready_txs
+                .priority
+                .iter()
+                .filter_map(|tx| self.provisions.take_cached_inclusion_proof(&tx.hash()))
+                .collect()
+        } else {
+            vec![]
+        };
+
         ProposalInputs {
             ready_txs,
             deferred,
             aborted,
             certificates,
+            priority_inclusions,
         }
     }
 
@@ -372,6 +389,7 @@ impl NodeStateMachine {
             deferred,
             aborted,
             certificates,
+            vec![],
             collect_updates,
         )
     }
@@ -501,6 +519,7 @@ impl NodeStateMachine {
             inputs.deferred,
             inputs.aborted,
             inputs.certificates,
+            inputs.priority_inclusions,
             collect_updates,
         )
     }
@@ -670,6 +689,28 @@ impl NodeStateMachine {
         }
         actions.extend(provision_actions);
 
+        // Request priority inclusion proofs under backpressure if likely next proposer.
+        // This is best-effort: if proofs arrive before proposal time, priority txs get
+        // promoted with proofs. If not, they stay in the normal section — no correctness impact.
+        if self.mempool.at_in_flight_limit() {
+            let topology = self.topology.snapshot();
+            let next_height = self.bft.committed_height() + 1;
+            if topology.proposer_for(next_height, 0) == topology.local_validator_id() {
+                for (tx_hash, source_shard, source_block_height) in
+                    self.provisions.txs_needing_inclusion_proofs()
+                {
+                    let peers = topology.committee_for_shard(source_shard).to_vec();
+                    actions.push(Action::RequestTxInclusionProof {
+                        source_shard,
+                        source_block_height,
+                        winner_tx_hash: tx_hash,
+                        reason: hyperscale_core::InclusionProofFetchReason::Priority,
+                        peers,
+                    });
+                }
+            }
+        }
+
         actions
     }
 
@@ -715,6 +756,28 @@ impl NodeStateMachine {
             proof,
             source_shard,
             source_block_height,
+        );
+        vec![]
+    }
+
+    /// Handle a priority inclusion proof received from a source shard.
+    ///
+    /// Caches the proof in the provision coordinator for use at proposal time.
+    pub(crate) fn on_priority_inclusion_proof_received(
+        &mut self,
+        tx_hash: Hash,
+        source_shard: ShardGroupId,
+        source_block_height: BlockHeight,
+        proof: hyperscale_types::TransactionInclusionProof,
+    ) -> Vec<Action> {
+        self.provisions.cache_inclusion_proof(
+            tx_hash,
+            hyperscale_types::PriorityInclusion {
+                tx_hash,
+                source_shard,
+                source_block_height,
+                proof,
+            },
         );
         vec![]
     }
@@ -932,7 +995,9 @@ impl StateMachine for NodeStateMachine {
                                 source_shard,
                                 source_block_height,
                                 winner_tx_hash,
-                                loser_tx_hash,
+                                reason: hyperscale_core::InclusionProofFetchReason::Deferral {
+                                    loser_tx_hash,
+                                },
                                 peers,
                             });
                         }

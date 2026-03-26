@@ -753,6 +753,7 @@ impl BftState {
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
+        priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
         collect_updates: F,
     ) -> Vec<Action>
     where
@@ -984,6 +985,7 @@ impl BftState {
                 deferred: deferred_filtered,
                 aborted: aborted_with_height,
                 provision_targets,
+                priority_inclusions,
             },
         ]
     }
@@ -3027,6 +3029,7 @@ impl BftState {
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
+        priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
         collect_updates: F,
     ) -> Vec<Action>
     where
@@ -3140,6 +3143,7 @@ impl BftState {
                 deferred,
                 aborted,
                 certificates,
+                priority_inclusions,
                 collect_updates,
             ));
         } else if should_try_proposal && rate_limited {
@@ -7113,6 +7117,7 @@ mod tests {
             vec![],                        // no deferrals
             vec![],                        // no aborts
             vec![],                        // no certificates
+            vec![],                        // no priority inclusions
             |_certs| vec![],
         );
 
@@ -7161,6 +7166,7 @@ mod tests {
             vec![deferral],                // has a deferral
             vec![],                        // no aborts
             vec![],                        // no certificates
+            vec![],                        // no priority inclusions
             |_certs| vec![],
         );
 
@@ -7608,6 +7614,7 @@ mod tests {
             vec![deferral],                // has content
             vec![],
             vec![],
+            vec![], // no priority inclusions
             |_certs| vec![],
         );
 
@@ -7661,6 +7668,7 @@ mod tests {
             vec![deferral],                // has content
             vec![],
             vec![],
+            vec![], // no priority inclusions
             |_certs| vec![],
         );
 
@@ -7741,6 +7749,7 @@ mod tests {
             vec![deferral],
             vec![],
             vec![],
+            vec![],
             |_certs| vec![],
         );
 
@@ -7816,6 +7825,7 @@ mod tests {
             vec![deferral],
             vec![],
             vec![],
+            vec![],
             |_certs| vec![],
         );
 
@@ -7859,6 +7869,7 @@ mod tests {
             qc.block_hash,
             qc,
             &ReadyTransactions::default(),
+            vec![],
             vec![],
             vec![],
             vec![],
@@ -8090,6 +8101,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
             |_certs| vec![],
         );
 
@@ -8162,6 +8174,7 @@ mod tests {
         let actions = state.on_proposal_timer(
             &topology,
             &ReadyTransactions::default(),
+            vec![],
             vec![],
             vec![],
             vec![],
@@ -8454,6 +8467,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
             |_certs| vec![],
         );
 
@@ -8570,6 +8584,7 @@ mod tests {
         let actions1 = state.on_proposal_timer(
             &topology,
             &ReadyTransactions::default(),
+            vec![],
             vec![],
             vec![],
             vec![],

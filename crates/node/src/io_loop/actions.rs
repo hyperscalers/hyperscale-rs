@@ -636,7 +636,7 @@ where
                 source_shard,
                 source_block_height,
                 winner_tx_hash,
-                loser_tx_hash,
+                reason,
                 peers,
             } => {
                 use crate::protocol::inclusion_proof_fetch::InclusionProofFetchInput;
@@ -647,7 +647,7 @@ where
                             source_shard,
                             source_block_height,
                             winner_tx_hash,
-                            loser_tx_hash,
+                            reason,
                             peers,
                             preferred_peer,
                         });

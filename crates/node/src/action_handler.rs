@@ -246,6 +246,7 @@ pub(crate) fn handle_delegated_action<
             per_cert_updates,
             deferred,
             aborted,
+            priority_inclusions,
             provision_targets,
         } => {
             let merged_updates =
@@ -267,6 +268,7 @@ pub(crate) fn handle_delegated_action<
                 merged_updates,
                 deferred,
                 aborted,
+                priority_inclusions,
                 shard_group_id,
                 provision_targets,
             );

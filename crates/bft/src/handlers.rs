@@ -307,6 +307,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     merged_updates: DatabaseUpdates,
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
+    priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
     local_shard: ShardGroupId,
     provision_targets: Vec<ShardGroupId>,
 ) -> ProposalResult<S::PreparedCommit> {
@@ -368,7 +369,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         certificates: certs_to_include,
         deferred,
         aborted,
-        priority_inclusions: vec![],
+        priority_inclusions,
     };
 
     let block_hash = block.hash();

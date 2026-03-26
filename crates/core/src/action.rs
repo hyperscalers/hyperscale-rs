@@ -13,6 +13,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Why a transaction inclusion proof is being fetched.
+#[derive(Debug, Clone)]
+pub enum InclusionProofFetchReason {
+    /// Livelock deferral — deliver proof to livelock state machine.
+    Deferral {
+        /// The transaction being deferred (loser in cycle detection).
+        loser_tx_hash: Hash,
+    },
+    /// Priority tx — cache proof for proposal under backpressure.
+    Priority,
+}
+
 /// A request to execute a cross-shard transaction with its provisions.
 #[derive(Debug, Clone)]
 pub struct CrossShardExecutionRequest {
@@ -267,19 +279,20 @@ pub enum Action {
 
     /// Request a transaction inclusion proof from a source shard for livelock deferral.
     ///
-    /// When a cycle is detected, the livelock state machine emits
-    /// `LivelockOutput::FetchInclusionProof`. The state machine converts that
-    /// into this action, which the I/O loop sends as a network request.
-    /// The response is delivered back as `NodeInput::InclusionProofFetchReceived`.
+    /// Request a transaction inclusion proof from a source shard.
+    ///
+    /// Used for both livelock deferrals and priority tx proofs under backpressure.
+    /// The I/O loop sends this as a network request; the response is delivered
+    /// back as `NodeInput::InclusionProofFetchReceived`.
     RequestTxInclusionProof {
         /// Source shard to fetch the proof from.
         source_shard: ShardGroupId,
         /// Block height on the source shard.
         source_block_height: BlockHeight,
-        /// Winner transaction hash (the one we need the proof for).
+        /// Transaction hash to prove inclusion for.
         winner_tx_hash: Hash,
-        /// Loser transaction hash (the one being deferred).
-        loser_tx_hash: Hash,
+        /// Why this proof is being fetched.
+        reason: InclusionProofFetchReason,
         /// Peers in the source shard to send the request to.
         peers: Vec<ValidatorId>,
     },
@@ -377,6 +390,8 @@ pub enum Action {
         aborted: Vec<TransactionAbort>,
         /// Shard groups that need provisions from this block's transactions.
         provision_targets: Vec<ShardGroupId>,
+        /// Inclusion proofs for priority transactions (populated under backpressure).
+        priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
     },
 
     /// Execute a batch of single-shard transactions.

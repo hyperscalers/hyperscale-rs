@@ -669,7 +669,7 @@ where
             // ── Inclusion proof fetch protocol (livelock) ─────────────
             NodeInput::InclusionProofFetchReceived {
                 winner_tx_hash,
-                loser_tx_hash,
+                reason,
                 source_shard,
                 source_block_height,
                 proof,
@@ -677,7 +677,7 @@ where
                 let outputs = self.inclusion_proof_fetch_protocol.handle(
                     InclusionProofFetchInput::Received {
                         winner_tx_hash,
-                        loser_tx_hash,
+                        reason,
                         source_shard,
                         source_block_height,
                         proof,

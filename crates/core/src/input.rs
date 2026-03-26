@@ -135,7 +135,7 @@ pub enum NodeInput {
     /// Transaction inclusion proof fetched successfully from a source shard.
     InclusionProofFetchReceived {
         winner_tx_hash: Hash,
-        loser_tx_hash: Hash,
+        reason: crate::InclusionProofFetchReason,
         source_shard: ShardGroupId,
         source_block_height: BlockHeight,
         proof: TransactionInclusionProof,

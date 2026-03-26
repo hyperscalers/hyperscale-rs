@@ -34,7 +34,10 @@ mod protocol_event;
 mod timer;
 mod traits;
 
-pub use action::{Action, CrossShardExecutionRequest, ProvisionRequest, TransactionStatus};
+pub use action::{
+    Action, CrossShardExecutionRequest, InclusionProofFetchReason, ProvisionRequest,
+    TransactionStatus,
+};
 pub use input::{EventPriority, NodeInput};
 pub use protocol_event::ProtocolEvent;
 pub use timer::{TimerId, TimerScheduler};
