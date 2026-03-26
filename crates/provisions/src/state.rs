@@ -13,17 +13,16 @@
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    BlockHeight, CommittedBlockHeader, Hash, NodeId, ProvisionBatch, ShardGroupId,
-    SourceBlockAttestation, StateEntry, StateProvision, TopologySnapshot, ValidatorId,
+    BlockHeight, CommittedBlockHeader, Hash, NodeId, ProvisionBatch, ShardGroupId, StateEntry,
+    StateProvision, TopologySnapshot, ValidatorId,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, trace, warn};
 
-/// Map of verified provisions: tx_hash → source_shard → (entries, attestation).
-type VerifiedProvisionMap =
-    HashMap<Hash, HashMap<ShardGroupId, (Vec<StateEntry>, Arc<SourceBlockAttestation>)>>;
+/// Map of verified provisions: tx_hash → source_shard → entries.
+type VerifiedProvisionMap = HashMap<Hash, HashMap<ShardGroupId, Vec<StateEntry>>>;
 
 /// Number of block heights to retain remote headers below each shard's tip.
 /// When a new header arrives, headers from the same shard older than
@@ -120,8 +119,7 @@ pub struct ProvisionCoordinator {
     /// Keyed by (source_shard, block_height) since that's how we match to headers.
     pending_provisions: HashMap<(ShardGroupId, BlockHeight), Vec<ProvisionBatch>>,
 
-    /// Verified provisions with their source block attestations.
-    /// Keyed by tx_hash -> (source_shard -> (entries, attestation)).
+    /// Verified provisions keyed by tx_hash -> (source_shard -> entries).
     verified_provisions: VerifiedProvisionMap,
 
     // ═══════════════════════════════════════════════════════════════════
@@ -425,7 +423,7 @@ impl ProvisionCoordinator {
     /// Handle a provision batch received from a source shard proposer.
     ///
     /// All transactions in a batch share the same `(source_shard, block_height)`
-    /// via the batch's attestation.
+    /// via the batch's proof.
     /// Joins with the corresponding remote block header:
     /// - If a verified header exists: use it directly (single candidate)
     /// - If unverified headers exist: send all candidates for verification
@@ -439,8 +437,8 @@ impl ProvisionCoordinator {
             return vec![];
         }
 
-        let source_shard = batch.source_shard();
-        let block_height = batch.block_height();
+        let source_shard = batch.source_shard;
+        let block_height = batch.block_height;
 
         debug!(
             source_shard = source_shard.0,
@@ -503,7 +501,9 @@ impl ProvisionCoordinator {
 
         // Rebuild a filtered batch with only the transactions that need verification
         let filtered_batch = ProvisionBatch {
-            attestation: Arc::clone(&batch.attestation),
+            source_shard: batch.source_shard,
+            block_height: batch.block_height,
+            proof: batch.proof.clone(),
             transactions: to_verify,
         };
 
@@ -564,7 +564,7 @@ impl ProvisionCoordinator {
         committed_headers: Vec<CommittedBlockHeader>,
         topology: &TopologySnapshot,
     ) -> Vec<Action> {
-        let source_shard = batch.source_shard();
+        let source_shard = batch.source_shard;
 
         // Resolve ALL committee public keys in order for QC verification.
         // verify_qc_signature filters internally by the signer bitfield,
@@ -599,7 +599,7 @@ impl ProvisionCoordinator {
 
     /// Handle batch-level provision verification result.
     ///
-    /// If valid: build `SourceBlockAttestation`, store per-tx entries, emit events.
+    /// If valid: store per-tx entries, emit events.
     /// Uses the verified header returned by the action handler directly (no re-lookup).
     pub fn on_state_provisions_verified(
         &mut self,
@@ -609,7 +609,7 @@ impl ProvisionCoordinator {
         valid: bool,
     ) -> Vec<Action> {
         let mut actions = vec![];
-        let source_shard = batch.source_shard();
+        let source_shard = batch.source_shard;
 
         // Promote the verified header if we have one
         if let Some(ref header) = committed_header {
@@ -652,16 +652,6 @@ impl ProvisionCoordinator {
             return actions;
         };
 
-        // Build the attestation from the batch's attestation + verified header.
-        let attestation = Arc::new(SourceBlockAttestation {
-            source_shard,
-            block_height: batch.block_height(),
-            block_timestamp: batch.attestation.block_timestamp,
-            state_root: header.state_root(),
-            qc: header.qc.clone(),
-            proof: batch.attestation.proof.clone(),
-        });
-
         for tx_entries in &batch.transactions {
             let tx_hash = tx_entries.tx_hash;
 
@@ -672,11 +662,11 @@ impl ProvisionCoordinator {
                 "State provision verified successfully"
             );
 
-            // Store per-tx entries for execution, but full entries for attestation verification
-            self.verified_provisions.entry(tx_hash).or_default().insert(
-                source_shard,
-                (tx_entries.entries.clone(), Arc::clone(&attestation)),
-            );
+            // Store per-tx entries for execution
+            self.verified_provisions
+                .entry(tx_hash)
+                .or_default()
+                .insert(source_shard, tx_entries.entries.clone());
 
             // Update reverse index for cycle detection
             self.txs_by_source_shard
@@ -689,7 +679,7 @@ impl ProvisionCoordinator {
             actions.push(Action::Continuation(ProtocolEvent::ProvisionAccepted {
                 tx_hash,
                 source_shard,
-                source_block_height: batch.block_height(),
+                source_block_height: batch.block_height,
                 entries: tx_entries.entries.clone(),
             }));
 
@@ -701,12 +691,12 @@ impl ProvisionCoordinator {
                     .map(|by_shard| {
                         by_shard
                             .iter()
-                            .map(|(&shard, (entries, _))| StateProvision {
+                            .map(|(&shard, entries)| StateProvision {
                                 transaction_hash: tx_hash,
                                 target_shard: _topology.local_shard(),
                                 source_shard: shard,
-                                block_height: batch.block_height(),
-                                block_timestamp: batch.attestation.block_timestamp,
+                                block_height: batch.block_height,
+                                block_timestamp: header.header.timestamp,
                                 entries: Arc::new(entries.clone()),
                             })
                             .collect()
@@ -751,7 +741,7 @@ impl ProvisionCoordinator {
     ///
     /// Used by livelock to check for actual node-level overlap.
     pub fn provision_nodes(&self, tx_hash: Hash, shard: ShardGroupId) -> HashSet<NodeId> {
-        if let Some((entries, _)) = self
+        if let Some(entries) = self
             .verified_provisions
             .get(&tx_hash)
             .and_then(|by_shard| by_shard.get(&shard))
@@ -769,34 +759,6 @@ impl ProvisionCoordinator {
     /// Get the registration for a transaction.
     pub fn get_registration(&self, tx_hash: &Hash) -> Option<&TxRegistration> {
         self.registered_txs.get(tx_hash)
-    }
-
-    /// Get the attestation for a transaction that has verified provisions.
-    ///
-    /// Returns the first available attestation from verified provisions.
-    /// This is sufficient for backpressure purposes - it proves another shard committed.
-    pub fn get_attestation(&self, tx_hash: &Hash) -> Option<Arc<SourceBlockAttestation>> {
-        self.verified_provisions.get(tx_hash).and_then(|by_shard| {
-            by_shard
-                .values()
-                .next()
-                .map(|(_, attestation)| Arc::clone(attestation))
-        })
-    }
-
-    /// Get the attestation and entries for a transaction that has verified provisions.
-    ///
-    /// Returns the first available (entries, attestation) pair from verified provisions.
-    pub fn get_attestation_and_entries(
-        &self,
-        tx_hash: &Hash,
-    ) -> Option<(Vec<StateEntry>, Arc<SourceBlockAttestation>)> {
-        self.verified_provisions.get(tx_hash).and_then(|by_shard| {
-            by_shard
-                .values()
-                .next()
-                .map(|(entries, attestation)| (entries.clone(), Arc::clone(attestation)))
-        })
     }
 
     /// Look up a verified remote committed block header by shard and height.
@@ -878,9 +840,8 @@ mod tests {
     use super::*;
     use hyperscale_types::{
         bls_keypair_from_seed, BlockHeader, Bls12381G1PrivateKey, QuorumCertificate,
-        TopologySnapshot, TxEntries, ValidatorInfo, ValidatorSet,
+        SubstateInclusionProof, TopologySnapshot, TxEntries, ValidatorInfo, ValidatorSet,
     };
-    use std::sync::Arc;
 
     fn make_test_topology(local_shard: ShardGroupId) -> TopologySnapshot {
         // Create deterministic BLS keypairs for 6 validators (2 shards × 3 validators)
@@ -916,14 +877,6 @@ mod tests {
             required_shards: required_shards.into_iter().collect(),
             registered_at: BlockHeight(1),
         }
-    }
-
-    #[test]
-    fn test_get_attestation_returns_none_without_provisions() {
-        let coordinator = ProvisionCoordinator::new();
-
-        let tx_hash = Hash::from_bytes(b"test_tx");
-        assert!(coordinator.get_attestation(&tx_hash).is_none());
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1131,10 +1084,6 @@ mod tests {
         source_shard: ShardGroupId,
         height: u64,
     ) -> ProvisionBatch {
-        let attestation = Arc::new(SourceBlockAttestation::dummy(
-            source_shard,
-            BlockHeight(height),
-        ));
         let transactions = tx_hashes
             .into_iter()
             .map(|tx_hash| TxEntries {
@@ -1143,7 +1092,9 @@ mod tests {
             })
             .collect();
         ProvisionBatch {
-            attestation,
+            source_shard,
+            block_height: BlockHeight(height),
+            proof: SubstateInclusionProof::dummy(),
             transactions,
         }
     }
@@ -1256,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn test_provision_verified_stores_attestation() {
+    fn test_provision_verified_stores_entries() {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
@@ -1283,10 +1234,8 @@ mod tests {
             }) if *h == tx_hash && *s == source_shard
         )));
 
-        // Should have an attestation
+        // Should have verified provisions
         assert!(coordinator.has_any_verified_provisions(&tx_hash));
-        let attestation = coordinator.get_attestation(&tx_hash).unwrap();
-        assert_eq!(attestation.source_shard, source_shard);
     }
 
     #[test]
@@ -1371,9 +1320,10 @@ mod tests {
         storage_key.push(0); // sort_key
 
         let entry = hyperscale_types::StateEntry::new(storage_key, Some(vec![1, 2, 3]));
-        let attestation = Arc::new(SourceBlockAttestation::dummy(source_shard, BlockHeight(10)));
         let batch = ProvisionBatch {
-            attestation,
+            source_shard,
+            block_height: BlockHeight(10),
+            proof: SubstateInclusionProof::dummy(),
             transactions: vec![TxEntries {
                 tx_hash,
                 entries: vec![entry],

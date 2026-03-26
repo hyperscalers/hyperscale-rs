@@ -663,13 +663,7 @@ mod tests {
         let outputs = protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(1),
             block_height: height(10),
-            batch: ProvisionBatch {
-                attestation: std::sync::Arc::new(hyperscale_types::SourceBlockAttestation::dummy(
-                    shard(1),
-                    height(10),
-                )),
-                transactions: vec![],
-            },
+            batch: ProvisionBatch::dummy(shard(1), height(10)),
         });
 
         assert_eq!(outputs.len(), 1);
@@ -748,13 +742,7 @@ mod tests {
         let outputs = protocol.handle(ProvisionFetchInput::Received {
             source_shard: shard(99),
             block_height: height(999),
-            batch: ProvisionBatch {
-                attestation: std::sync::Arc::new(hyperscale_types::SourceBlockAttestation::dummy(
-                    shard(99),
-                    height(999),
-                )),
-                transactions: vec![],
-            },
+            batch: ProvisionBatch::dummy(shard(99), height(999)),
         });
         assert!(outputs.is_empty());
     }

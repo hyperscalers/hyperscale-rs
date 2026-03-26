@@ -324,16 +324,8 @@ where
                     if provisions.is_empty() {
                         return;
                     }
-                    let first = &provisions[0];
-                    let attestation =
-                        std::sync::Arc::new(hyperscale_types::SourceBlockAttestation {
-                            source_shard: first.source_shard,
-                            block_height: first.block_height,
-                            block_timestamp: first.block_timestamp,
-                            state_root: hyperscale_types::Hash::ZERO,
-                            qc: hyperscale_types::QuorumCertificate::genesis(),
-                            proof,
-                        });
+                    let source_shard = provisions[0].source_shard;
+                    let block_height = provisions[0].block_height;
                     let transactions: Vec<hyperscale_types::TxEntries> = provisions
                         .into_iter()
                         .map(|p| hyperscale_types::TxEntries {
@@ -342,7 +334,9 @@ where
                         })
                         .collect();
                     let batch = hyperscale_types::ProvisionBatch {
-                        attestation,
+                        source_shard,
+                        block_height,
+                        proof,
                         transactions,
                     };
                     let _ = tx.send(NodeInput::Protocol(

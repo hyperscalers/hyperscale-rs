@@ -16,10 +16,9 @@
 //! of work. This eliminates the N× proof duplication that occurs when the
 //! proof is flattened into each per-transaction struct.
 
-use crate::{BlockHeight, Hash, NodeId, QuorumCertificate, ShardGroupId, StateEntry};
+use crate::{BlockHeight, Hash, NodeId, ShardGroupId, StateEntry};
 use sbor::prelude::*;
 use std::collections::HashSet;
-use std::sync::Arc;
 
 // ============================================================================
 // VerkleInclusionProof
@@ -61,55 +60,6 @@ impl VerkleInclusionProof {
 pub type SubstateInclusionProof = VerkleInclusionProof;
 
 // ============================================================================
-// SourceBlockAttestation
-// ============================================================================
-
-/// Attestation that a source block committed specific state.
-///
-/// Contains everything needed to independently verify that entries were part
-/// of a committed block's state:
-/// 1. QC proves 2f+1 validators agreed on block header (which contains state_root)
-/// 2. Verkle proof proves each entry's inclusion against that state_root
-///
-/// Shared across all transactions from the same (source_shard, block_height).
-/// Serialized once per source block, not per transaction.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct SourceBlockAttestation {
-    /// Source shard that committed this block.
-    pub source_shard: ShardGroupId,
-
-    /// Block height at which the state was committed.
-    pub block_height: BlockHeight,
-
-    /// Unix timestamp (milliseconds) of the source block.
-    pub block_timestamp: u64,
-
-    /// State root from the committed block header (verified via QC).
-    pub state_root: Hash,
-
-    /// Quorum Certificate proving the state_root is correct.
-    pub qc: QuorumCertificate,
-
-    /// Aggregated verkle proof covering all entries for this block.
-    pub proof: SubstateInclusionProof,
-}
-
-impl SourceBlockAttestation {
-    /// Create a dummy attestation for testing.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn dummy(source_shard: ShardGroupId, block_height: BlockHeight) -> Self {
-        Self {
-            source_shard,
-            block_height,
-            block_timestamp: 1000 + block_height.0,
-            state_root: Hash::ZERO,
-            qc: QuorumCertificate::genesis(),
-            proof: SubstateInclusionProof::dummy(),
-        }
-    }
-}
-
-// ============================================================================
 // TxEntries
 // ============================================================================
 
@@ -139,28 +89,26 @@ impl TxEntries {
 
 /// A batch of provisions from a single source block.
 ///
-/// This is the natural unit of work. The attestation (including the verkle
-/// proof) is shared via `Arc` across all transactions in the batch — and
-/// across multiple target shards when broadcasting.
+/// Identifies the source block (for joining with `CommittedBlockHeader`)
+/// and carries the verkle proof plus per-transaction state entries.
+/// The QC and state_root are obtained from `CommittedBlockHeader` received
+/// via gossip — they don't travel with the provision batch.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ProvisionBatch {
-    /// Block-level attestation (QC + proof + state_root), shared.
-    pub attestation: Arc<SourceBlockAttestation>,
+    /// Source shard that committed this block.
+    pub source_shard: ShardGroupId,
+
+    /// Block height at which the state was committed.
+    pub block_height: BlockHeight,
+
+    /// Aggregated verkle proof covering all entries for this block.
+    pub proof: SubstateInclusionProof,
 
     /// Per-transaction entries.
     pub transactions: Vec<TxEntries>,
 }
 
 impl ProvisionBatch {
-    /// Source shard for this batch.
-    pub fn source_shard(&self) -> ShardGroupId {
-        self.attestation.source_shard
-    }
-
-    /// Block height for this batch.
-    pub fn block_height(&self) -> BlockHeight {
-        self.attestation.block_height
-    }
-
     /// Get all node IDs across all transactions.
     pub fn all_node_ids(&self) -> HashSet<NodeId> {
         self.transactions
@@ -185,88 +133,16 @@ impl ProvisionBatch {
     pub fn tx_hashes(&self) -> Vec<Hash> {
         self.transactions.iter().map(|tx| tx.tx_hash).collect()
     }
-}
 
-impl std::fmt::Debug for ProvisionBatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ProvisionBatch")
-            .field("source_shard", &self.attestation.source_shard)
-            .field("block_height", &self.attestation.block_height)
-            .field("transactions", &self.transactions.len())
-            .finish()
-    }
-}
-
-impl Clone for ProvisionBatch {
-    fn clone(&self) -> Self {
+    /// Create a dummy batch for testing.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn dummy(source_shard: ShardGroupId, block_height: BlockHeight) -> Self {
         Self {
-            attestation: Arc::clone(&self.attestation),
-            transactions: self.transactions.clone(),
+            source_shard,
+            block_height,
+            proof: SubstateInclusionProof::dummy(),
+            transactions: vec![],
         }
-    }
-}
-
-impl PartialEq for ProvisionBatch {
-    fn eq(&self, other: &Self) -> bool {
-        *self.attestation == *other.attestation && self.transactions == other.transactions
-    }
-}
-
-impl Eq for ProvisionBatch {}
-
-// Manual SBOR for ProvisionBatch (Arc field)
-impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValueKind, E>
-    for ProvisionBatch
-{
-    fn encode_value_kind(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_value_kind(sbor::ValueKind::Tuple)
-    }
-
-    fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(2)?;
-        encoder.encode(self.attestation.as_ref())?;
-        encoder.encode(&self.transactions)?;
-        Ok(())
-    }
-}
-
-impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValueKind, D>
-    for ProvisionBatch
-{
-    fn decode_body_with_value_kind(
-        decoder: &mut D,
-        value_kind: sbor::ValueKind<sbor::NoCustomValueKind>,
-    ) -> Result<Self, sbor::DecodeError> {
-        decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
-        let length = decoder.read_size()?;
-        if length != 2 {
-            return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 2,
-                actual: length,
-            });
-        }
-
-        let attestation: SourceBlockAttestation = decoder.decode()?;
-        let transactions: Vec<TxEntries> = decoder.decode()?;
-
-        Ok(Self {
-            attestation: Arc::new(attestation),
-            transactions,
-        })
-    }
-}
-
-impl sbor::Categorize<sbor::NoCustomValueKind> for ProvisionBatch {
-    fn value_kind() -> sbor::ValueKind<sbor::NoCustomValueKind> {
-        sbor::ValueKind::Tuple
-    }
-}
-
-impl sbor::Describe<sbor::NoCustomTypeKind> for ProvisionBatch {
-    const TYPE_ID: sbor::RustTypeId = sbor::RustTypeId::novel_with_code("ProvisionBatch", &[], &[]);
-
-    fn type_data() -> sbor::TypeData<sbor::NoCustomTypeKind, sbor::RustTypeId> {
-        sbor::TypeData::unnamed(sbor::TypeKind::Any)
     }
 }
 
@@ -284,18 +160,16 @@ mod tests {
     }
 
     #[test]
-    fn test_source_block_attestation_roundtrip() {
-        let original = SourceBlockAttestation {
+    fn test_provision_batch_fields_roundtrip() {
+        let original = ProvisionBatch {
             source_shard: ShardGroupId(1),
             block_height: BlockHeight(42),
-            block_timestamp: 1000,
-            state_root: Hash::from_bytes(b"state_root"),
-            qc: QuorumCertificate::genesis(),
             proof: VerkleInclusionProof::new(vec![1, 2, 3]),
+            transactions: vec![],
         };
 
         let bytes = sbor::basic_encode(&original).unwrap();
-        let decoded: SourceBlockAttestation = sbor::basic_decode(&bytes).unwrap();
+        let decoded: ProvisionBatch = sbor::basic_decode(&bytes).unwrap();
         assert_eq!(original, decoded);
     }
 
@@ -313,14 +187,11 @@ mod tests {
 
     #[test]
     fn test_provision_batch_roundtrip() {
-        let attestation = SourceBlockAttestation::dummy(ShardGroupId(0), BlockHeight(10));
-        let batch = ProvisionBatch {
-            attestation: Arc::new(attestation),
-            transactions: vec![TxEntries {
-                tx_hash: Hash::from_bytes(b"tx1"),
-                entries: vec![test_entry(1)],
-            }],
-        };
+        let mut batch = ProvisionBatch::dummy(ShardGroupId(0), BlockHeight(10));
+        batch.transactions = vec![TxEntries {
+            tx_hash: Hash::from_bytes(b"tx1"),
+            entries: vec![test_entry(1)],
+        }];
 
         let bytes = sbor::basic_encode(&batch).unwrap();
         let decoded: ProvisionBatch = sbor::basic_decode(&bytes).unwrap();
@@ -329,21 +200,18 @@ mod tests {
 
     #[test]
     fn test_provision_batch_all_entries_deduped() {
-        let attestation = SourceBlockAttestation::dummy(ShardGroupId(0), BlockHeight(10));
         let entry = test_entry(1);
-        let batch = ProvisionBatch {
-            attestation: Arc::new(attestation),
-            transactions: vec![
-                TxEntries {
-                    tx_hash: Hash::from_bytes(b"tx1"),
-                    entries: vec![entry.clone()],
-                },
-                TxEntries {
-                    tx_hash: Hash::from_bytes(b"tx2"),
-                    entries: vec![entry, test_entry(2)],
-                },
-            ],
-        };
+        let mut batch = ProvisionBatch::dummy(ShardGroupId(0), BlockHeight(10));
+        batch.transactions = vec![
+            TxEntries {
+                tx_hash: Hash::from_bytes(b"tx1"),
+                entries: vec![entry.clone()],
+            },
+            TxEntries {
+                tx_hash: Hash::from_bytes(b"tx2"),
+                entries: vec![entry, test_entry(2)],
+            },
+        ];
 
         let deduped = batch.all_entries_deduped();
         assert_eq!(deduped.len(), 2);

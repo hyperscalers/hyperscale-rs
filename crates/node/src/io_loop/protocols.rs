@@ -220,18 +220,6 @@ where
                                     let proof = response.proof.unwrap_or_else(
                                         hyperscale_types::SubstateInclusionProof::dummy,
                                     );
-                                    let attestation = std::sync::Arc::new(
-                                        hyperscale_types::SourceBlockAttestation {
-                                            source_shard,
-                                            block_height,
-                                            block_timestamp: provisions
-                                                .first()
-                                                .map_or(0, |p| p.block_timestamp),
-                                            state_root: hyperscale_types::Hash::ZERO,
-                                            qc: hyperscale_types::QuorumCertificate::genesis(),
-                                            proof,
-                                        },
-                                    );
                                     let transactions: Vec<hyperscale_types::TxEntries> = provisions
                                         .into_iter()
                                         .map(|p| hyperscale_types::TxEntries {
@@ -240,7 +228,9 @@ where
                                         })
                                         .collect();
                                     let batch = hyperscale_types::ProvisionBatch {
-                                        attestation,
+                                        source_shard,
+                                        block_height,
+                                        proof,
                                         transactions,
                                     };
                                     let _ =

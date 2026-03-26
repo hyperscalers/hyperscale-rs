@@ -14,8 +14,8 @@ use hyperscale_engine::RadixExecutor;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
-    Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ProvisionBatch, QuorumCertificate,
-    ShardGroupId, SourceBlockAttestation, TxEntries, ValidatorId,
+    Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ProvisionBatch, ShardGroupId,
+    TxEntries, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -359,7 +359,7 @@ pub(crate) fn handle_delegated_action<
                 }
                 hyperscale_storage::proofs::verify_all_verkle_proofs(
                     &all_entries,
-                    &batch.attestation.proof,
+                    &batch.proof,
                     header.header.state_root,
                 )
             });
@@ -515,7 +515,10 @@ pub(crate) fn handle_delegated_action<
             }
             if per_tx.is_empty() {
                 return Some(DelegatedResult {
-                    events: vec![NodeInput::ProvisionsReady { batches: vec![] }],
+                    events: vec![NodeInput::ProvisionsReady {
+                        batches: vec![],
+                        block_timestamp: 0,
+                    }],
                     prepared_commit: None,
                 });
             }
@@ -530,7 +533,10 @@ pub(crate) fn handle_delegated_action<
                 Some(p) => Arc::new(p),
                 None => {
                     return Some(DelegatedResult {
-                        events: vec![NodeInput::ProvisionsReady { batches: vec![] }],
+                        events: vec![NodeInput::ProvisionsReady {
+                            batches: vec![],
+                            block_timestamp: 0,
+                        }],
                         prepared_commit: None,
                     });
                 }
@@ -550,28 +556,24 @@ pub(crate) fn handle_delegated_action<
                 }
             }
 
-            let attestation = Arc::new(SourceBlockAttestation {
-                source_shard,
-                block_height,
-                block_timestamp,
-                state_root: Hash::ZERO, // Filled by verifier from committed header
-                qc: QuorumCertificate::genesis(), // Filled by verifier from committed header
-                proof: (*proof).clone(),
-            });
-
             let batches: Vec<_> = shard_tx_entries
                 .into_iter()
                 .map(|(shard, transactions)| {
                     let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
                     let batch = ProvisionBatch {
-                        attestation: Arc::clone(&attestation),
+                        source_shard,
+                        block_height,
+                        proof: (*proof).clone(),
                         transactions,
                     };
                     (shard, batch, recipients)
                 })
                 .collect();
             Some(DelegatedResult {
-                events: vec![NodeInput::ProvisionsReady { batches }],
+                events: vec![NodeInput::ProvisionsReady {
+                    batches,
+                    block_timestamp,
+                }],
                 prepared_commit: None,
             })
         }

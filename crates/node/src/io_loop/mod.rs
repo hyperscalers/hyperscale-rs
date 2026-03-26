@@ -653,8 +653,8 @@ where
 
             // ── Provision fetch protocol ──────────────────────────────
             NodeInput::ProvisionFetchReceived { batch } => {
-                let source_shard = batch.source_shard();
-                let block_height = batch.block_height();
+                let source_shard = batch.source_shard;
+                let block_height = batch.block_height;
                 let outputs = self
                     .provision_fetch_protocol
                     .handle(ProvisionFetchInput::Received {
@@ -753,13 +753,15 @@ where
             //
             // The FetchAndBroadcastProvisions delegated action built provisions
             // grouped by target shard. Broadcast one batch per shard.
-            NodeInput::ProvisionsReady { batches } => {
+            NodeInput::ProvisionsReady {
+                batches,
+                block_timestamp,
+            } => {
                 for (shard, batch, recipients) in batches {
                     // Convert ProvisionBatch back to Vec<StateProvision> for the notification.
-                    let block_height = batch.block_height();
-                    let source_shard = batch.source_shard();
-                    let block_timestamp = batch.attestation.block_timestamp;
-                    let proof = batch.attestation.proof.clone();
+                    let block_height = batch.block_height;
+                    let source_shard = batch.source_shard;
+                    let proof = batch.proof.clone();
                     let provisions: Vec<hyperscale_types::StateProvision> = batch
                         .transactions
                         .into_iter()
