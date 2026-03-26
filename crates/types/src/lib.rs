@@ -19,6 +19,7 @@ mod identifiers;
 mod network;
 mod proofs;
 mod signing;
+mod wave;
 
 // Consensus types
 mod block;
@@ -68,9 +69,11 @@ pub use proofs::{ProvisionBatch, SubstateInclusionProof, TxEntries, VerkleInclus
 pub use signing::{
     block_header_message, block_vote_message, committed_block_header_message,
     exec_cert_batch_message, exec_vote_batch_message, exec_vote_message,
+    exec_wave_cert_batch_message, exec_wave_vote_batch_message, exec_wave_vote_message,
     state_provision_batch_message, validator_bind_message, DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE,
     DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH, DOMAIN_EXEC_VOTE,
-    DOMAIN_EXEC_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND,
+    DOMAIN_EXEC_VOTE_BATCH, DOMAIN_EXEC_WAVE_CERT_BATCH, DOMAIN_EXEC_WAVE_VOTE,
+    DOMAIN_EXEC_WAVE_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND,
 };
 
 pub use block::{
@@ -93,6 +96,11 @@ pub use transaction::{
     TransactionStatusParseError,
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
+pub use wave::{
+    compute_wave_receipt_root, compute_wave_receipt_root_with_proof, extract_tx_wave_proof,
+    verify_tx_wave_proof, wave_outcome_leaf, ExecutionWaveCertificate, ExecutionWaveVote,
+    TxWaveProof, WaveId, WaveTxOutcome,
+};
 
 // Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)
 pub use radix_substate_store_interface::interface::DatabaseUpdates;

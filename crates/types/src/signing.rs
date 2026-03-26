@@ -22,7 +22,7 @@
 //! `signing_message()` method pattern. The signing message is constructed
 //! by prepending the domain tag to the serialized content.
 
-use crate::{BlockHeight, Hash, ShardGroupId, StateProvision};
+use crate::{BlockHeight, Hash, ShardGroupId, StateProvision, WaveId};
 
 /// Domain tag for BFT block votes.
 ///
@@ -229,6 +229,91 @@ pub fn validator_bind_message(peer_id_bytes: &[u8]) -> Vec<u8> {
     let mut message = Vec::with_capacity(DOMAIN_VALIDATOR_BIND.len() + peer_id_bytes.len());
     message.extend_from_slice(DOMAIN_VALIDATOR_BIND);
     message.extend_from_slice(peer_id_bytes);
+    message
+}
+
+/// Domain tag for execution wave votes.
+///
+/// Format: `EXEC_WAVE_VOTE` || block_hash || block_height || wave_id_len || wave_id_shards... || shard_group || wave_receipt_root || tx_count
+///
+/// Used for both individual `ExecutionWaveVote` signatures and
+/// `ExecutionWaveCertificate` aggregated signature verification.
+pub const DOMAIN_EXEC_WAVE_VOTE: &[u8] = b"EXEC_WAVE_VOTE";
+
+/// Domain tag for execution wave vote batch gossip.
+///
+/// Format: `EXEC_WAVE_VOTE_BATCH` || shard_group_id || H(wave_receipt_roots)
+pub const DOMAIN_EXEC_WAVE_VOTE_BATCH: &[u8] = b"EXEC_WAVE_VOTE_BATCH";
+
+/// Domain tag for execution wave certificate batch gossip.
+///
+/// Format: `EXEC_WAVE_CERT_BATCH` || shard_group_id || H(wave_receipt_roots)
+pub const DOMAIN_EXEC_WAVE_CERT_BATCH: &[u8] = b"EXEC_WAVE_CERT_BATCH";
+
+/// Build the signing message for an execution wave vote.
+///
+/// This is used for:
+/// - Individual `ExecutionWaveVote` signatures
+/// - `ExecutionWaveCertificate` aggregated signature verification
+///
+/// The wave_id is serialized as length-prefixed sorted shard IDs, making
+/// the message deterministic regardless of construction order.
+pub fn exec_wave_vote_message(
+    block_hash: &Hash,
+    block_height: u64,
+    wave_id: &WaveId,
+    shard_group: ShardGroupId,
+    wave_receipt_root: &Hash,
+    tx_count: u32,
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(128);
+    message.extend_from_slice(DOMAIN_EXEC_WAVE_VOTE);
+    message.extend_from_slice(block_hash.as_bytes());
+    message.extend_from_slice(&block_height.to_le_bytes());
+    // Serialize wave_id: length + sorted shard IDs
+    message.extend_from_slice(&(wave_id.0.len() as u32).to_le_bytes());
+    for shard in &wave_id.0 {
+        message.extend_from_slice(&shard.0.to_le_bytes());
+    }
+    message.extend_from_slice(&shard_group.0.to_le_bytes());
+    message.extend_from_slice(wave_receipt_root.as_bytes());
+    message.extend_from_slice(&tx_count.to_le_bytes());
+    message
+}
+
+/// Build the signing message for an execution wave vote batch gossip.
+pub fn exec_wave_vote_batch_message(
+    shard_group: ShardGroupId,
+    votes: &[crate::ExecutionWaveVote],
+) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new();
+    for v in votes {
+        hasher.update(v.wave_receipt_root.as_bytes());
+    }
+    let digest = hasher.finalize();
+
+    let mut message = Vec::with_capacity(64);
+    message.extend_from_slice(DOMAIN_EXEC_WAVE_VOTE_BATCH);
+    message.extend_from_slice(&shard_group.0.to_le_bytes());
+    message.extend_from_slice(digest.as_bytes());
+    message
+}
+
+/// Build the signing message for an execution wave certificate batch gossip.
+pub fn exec_wave_cert_batch_message(
+    shard_group: ShardGroupId,
+    certificates: &[crate::ExecutionWaveCertificate],
+) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new();
+    for c in certificates {
+        hasher.update(c.wave_receipt_root.as_bytes());
+    }
+    let digest = hasher.finalize();
+
+    let mut message = Vec::with_capacity(64);
+    message.extend_from_slice(DOMAIN_EXEC_WAVE_CERT_BATCH);
+    message.extend_from_slice(&shard_group.0.to_le_bytes());
+    message.extend_from_slice(digest.as_bytes());
     message
 }
 
