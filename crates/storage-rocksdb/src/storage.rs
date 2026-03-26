@@ -1454,8 +1454,6 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             certificates,
             deferred: metadata.manifest.deferred,
             aborted: metadata.manifest.aborted,
-            source_attestations: metadata.manifest.source_attestations,
-            commitment_entries: metadata.manifest.commitment_entries,
         };
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -1565,8 +1563,6 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             certificates,
             deferred: metadata.manifest.deferred,
             aborted: metadata.manifest.aborted,
-            source_attestations: metadata.manifest.source_attestations,
-            commitment_entries: metadata.manifest.commitment_entries,
         };
 
         let elapsed = start.elapsed().as_secs_f64();

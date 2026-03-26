@@ -15,10 +15,6 @@
 //! [`ProvisionBatch`] bundles level 1 + level 2 together as the natural unit
 //! of work. This eliminates the N× proof duplication that occurs when the
 //! proof is flattened into each per-transaction struct.
-//!
-//! For blocks, [`CommitmentEntry`] references a [`SourceBlockAttestation`] by
-//! index, avoiding duplication when many transactions reference the same
-//! source block.
 
 use crate::{BlockHeight, Hash, NodeId, QuorumCertificate, ShardGroupId, StateEntry};
 use sbor::prelude::*;
@@ -274,37 +270,6 @@ impl sbor::Describe<sbor::NoCustomTypeKind> for ProvisionBatch {
     }
 }
 
-// ============================================================================
-// CommitmentEntry
-// ============================================================================
-
-/// Per-transaction commitment data within a block.
-///
-/// References a [`SourceBlockAttestation`] by index into the block's
-/// `source_attestations` array, avoiding duplication when multiple
-/// transactions reference the same source block.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct CommitmentEntry {
-    /// Hash of the committed transaction.
-    pub tx_hash: Hash,
-
-    /// Index into the block's `source_attestations` array.
-    pub attestation_index: u16,
-
-    /// Target shard that received the provisions (prevents cross-shard replay).
-    pub target_shard: ShardGroupId,
-
-    /// The state entries proving this transaction's state on the source shard.
-    pub entries: Vec<StateEntry>,
-}
-
-impl CommitmentEntry {
-    /// Get the node IDs referenced by this entry.
-    pub fn node_ids(&self) -> HashSet<NodeId> {
-        self.entries.iter().filter_map(|e| e.node_id()).collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,20 +347,6 @@ mod tests {
 
         let deduped = batch.all_entries_deduped();
         assert_eq!(deduped.len(), 2);
-    }
-
-    #[test]
-    fn test_commitment_entry_roundtrip() {
-        let entry = CommitmentEntry {
-            tx_hash: Hash::from_bytes(b"tx"),
-            attestation_index: 0,
-            target_shard: ShardGroupId(1),
-            entries: vec![test_entry(1)],
-        };
-
-        let bytes = sbor::basic_encode(&entry).unwrap();
-        let decoded: CommitmentEntry = sbor::basic_decode(&bytes).unwrap();
-        assert_eq!(entry, decoded);
     }
 
     #[test]

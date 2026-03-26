@@ -2106,8 +2106,6 @@ mod tests {
             certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
-            source_attestations: vec![],
-            commitment_entries: vec![],
         }
     }
 

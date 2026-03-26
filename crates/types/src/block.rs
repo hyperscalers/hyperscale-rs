@@ -2,9 +2,8 @@
 
 use crate::{
     compute_merkle_root, compute_merkle_root_with_proof, compute_padded_merkle_root, BlockHeight,
-    CommitmentEntry, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    SourceBlockAttestation, TransactionAbort, TransactionCertificate, TransactionDefer,
-    TransactionInclusionProof, ValidatorId,
+    Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TransactionAbort,
+    TransactionCertificate, TransactionDefer, TransactionInclusionProof, ValidatorId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -234,7 +233,7 @@ impl BlockHeader {
 ///
 /// Blocks contain transactions in three priority sections:
 /// 1. **retry_transactions**: Retry transactions (highest priority, critical for liveness)
-/// 2. **priority_transactions**: Cross-shard transactions with commitment proofs
+/// 2. **priority_transactions**: Cross-shard transactions with verified provisions
 /// 3. **transactions**: All other transactions
 ///
 /// Additional block contents:
@@ -285,19 +284,6 @@ pub struct Block {
     /// used for N-way cycles that cannot be resolved via simple deferral,
     /// or for transactions that explicitly failed during execution.
     pub aborted: Vec<TransactionAbort>,
-
-    /// Source block attestations referenced by commitment entries and deferrals.
-    ///
-    /// Deduplicated: if multiple transactions reference the same source block,
-    /// the attestation (QC + proof + state_root) is stored once here and
-    /// referenced by index from [`CommitmentEntry`] and [`TransactionDefer`].
-    pub source_attestations: Vec<SourceBlockAttestation>,
-
-    /// Per-transaction commitment data for priority transaction ordering.
-    ///
-    /// Each entry references a `source_attestations` element by index and
-    /// contains the transaction-specific state entries.
-    pub commitment_entries: Vec<CommitmentEntry>,
 }
 
 // Manual PartialEq - compare transaction/certificate content, not Arc pointers
@@ -319,8 +305,6 @@ impl PartialEq for Block {
                 .all(|(a, b)| a.as_ref() == b.as_ref())
             && self.deferred == other.deferred
             && self.aborted == other.aborted
-            && self.source_attestations == other.source_attestations
-            && self.commitment_entries == other.commitment_entries
     }
 }
 
@@ -351,7 +335,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(9)?;
+        encoder.write_size(7)?;
         encoder.encode(&self.header)?;
         // Retry transactions
         encode_tx_vec(encoder, &self.retry_transactions)?;
@@ -368,8 +352,6 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         }
         encoder.encode(&self.deferred)?;
         encoder.encode(&self.aborted)?;
-        encoder.encode(&self.source_attestations)?;
-        encoder.encode(&self.commitment_entries)?;
         Ok(())
     }
 }
@@ -413,9 +395,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 9 {
+        if length != 7 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 9,
+                expected: 7,
                 actual: length,
             });
         }
@@ -446,8 +428,6 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
 
         let deferred: Vec<TransactionDefer> = decoder.decode()?;
         let aborted: Vec<TransactionAbort> = decoder.decode()?;
-        let source_attestations: Vec<SourceBlockAttestation> = decoder.decode()?;
-        let commitment_entries: Vec<CommitmentEntry> = decoder.decode()?;
 
         Ok(Self {
             header,
@@ -457,8 +437,6 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             certificates,
             deferred,
             aborted,
-            source_attestations,
-            commitment_entries,
         })
     }
 }
@@ -488,8 +466,6 @@ impl Block {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            source_attestations: vec![],
-            commitment_entries: vec![],
         }
     }
 
@@ -547,28 +523,6 @@ impl Block {
     /// Check if this is the genesis block.
     pub fn is_genesis(&self) -> bool {
         self.header.is_genesis()
-    }
-
-    /// Check if a transaction has a commitment entry in this block.
-    pub fn has_commitment_entry(&self, tx_hash: &Hash) -> bool {
-        self.commitment_entries
-            .iter()
-            .any(|e| e.tx_hash == *tx_hash)
-    }
-
-    /// Get the commitment entry and its source attestation for a transaction.
-    pub fn commitment_for_tx(
-        &self,
-        tx_hash: &Hash,
-    ) -> Option<(&SourceBlockAttestation, &CommitmentEntry)> {
-        self.commitment_entries
-            .iter()
-            .find(|e| e.tx_hash == *tx_hash)
-            .and_then(|entry| {
-                self.source_attestations
-                    .get(entry.attestation_index as usize)
-                    .map(|att| (att, entry))
-            })
     }
 
     /// Get number of committed certificates in this block.
@@ -632,11 +586,11 @@ impl Block {
 // ============================================================================
 
 /// Hash-level description of a block's contents (transactions, certificates,
-/// deferrals, aborts, and commitment proofs).
+/// deferrals, and aborts).
 ///
 /// This is the common denominator shared by `BlockHeaderNotification`, `BlockMetadata`,
 /// and `ProtocolEvent::BlockHeaderReceived`. Extracting it into a standalone type
-/// eliminates copy-paste of 7 fields across those three sites.
+/// eliminates copy-paste across those sites.
 #[derive(Debug, Clone, Default, PartialEq, Eq, BasicSbor)]
 pub struct BlockManifest {
     /// Retry transaction hashes (highest priority section).
@@ -656,12 +610,6 @@ pub struct BlockManifest {
 
     /// Aborted transactions (small, stored inline).
     pub aborted: Vec<TransactionAbort>,
-
-    /// Source block attestations (deduplicated).
-    pub source_attestations: Vec<SourceBlockAttestation>,
-
-    /// Per-transaction commitment entries.
-    pub commitment_entries: Vec<CommitmentEntry>,
 }
 
 impl BlockManifest {
@@ -699,8 +647,6 @@ impl BlockManifest {
                 .collect(),
             deferred: block.deferred.clone(),
             aborted: block.aborted.clone(),
-            source_attestations: block.source_attestations.clone(),
-            commitment_entries: block.commitment_entries.clone(),
         }
     }
 }

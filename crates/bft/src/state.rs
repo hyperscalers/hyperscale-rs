@@ -31,9 +31,9 @@ pub type NodeIndex = u32;
 use hyperscale_types::{
     block_header_message, committed_block_header_message, verify_merkle_inclusion, Block,
     BlockHeader, BlockHeight, BlockManifest, BlockVote, Bls12381G1PrivateKey, Bls12381G1PublicKey,
-    CommitmentEntry, CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions,
-    RoutableTransaction, ShardGroupId, SourceBlockAttestation, TopologySnapshot, TransactionAbort,
-    TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
+    CommittedBlockHeader, Hash, QuorumCertificate, ReadyTransactions, RoutableTransaction,
+    ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
+    ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -739,7 +739,7 @@ impl BftState {
     ///
     /// Takes ready transactions from mempool (already sectioned and hash-sorted),
     /// plus deferrals, aborts, and certificates from execution.
-    #[instrument(skip(self, ready_txs, deferred, aborted, certificates, source_attestations, commitment_entries, collect_updates), fields(
+    #[instrument(skip(self, ready_txs, deferred, aborted, certificates, collect_updates), fields(
         tx_count = ready_txs.len(),
         deferred_count = deferred.len(),
         aborted_count = aborted.len(),
@@ -753,8 +753,6 @@ impl BftState {
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        source_attestations: Vec<SourceBlockAttestation>,
-        commitment_entries: Vec<CommitmentEntry>,
         collect_updates: F,
     ) -> Vec<Action>
     where
@@ -983,8 +981,6 @@ impl BftState {
                 transactions: other_transactions,
                 certificates: certificates_to_propose,
                 per_cert_updates,
-                source_attestations,
-                commitment_entries,
                 deferred: deferred_filtered,
                 aborted: aborted_with_height,
                 provision_targets,
@@ -1059,8 +1055,6 @@ impl BftState {
             certificates: vec![],       // Empty
             deferred: vec![],
             aborted: vec![],
-            source_attestations: vec![],
-            commitment_entries: vec![],
         };
 
         let block_hash = block.hash();
@@ -1183,8 +1177,6 @@ impl BftState {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            source_attestations: vec![],
-            commitment_entries: vec![],
         };
 
         let block_hash = block.hash();
@@ -2117,26 +2109,14 @@ impl BftState {
                     tx_hash
                 ));
             }
-            if !block.has_commitment_entry(&tx_hash) {
-                return Err(format!(
-                    "Transaction {} in priority section but has no commitment proof",
-                    tx_hash
-                ));
-            }
         }
 
-        // 4. Verify other section contains no retries and no TXs with proofs
+        // 4. Verify other section contains no retries
         for tx in &block.transactions {
             let tx_hash = tx.hash();
             if tx.is_retry() {
                 return Err(format!(
                     "Retry transaction {} in other section (should be in retry section)",
-                    tx_hash
-                ));
-            }
-            if block.has_commitment_entry(&tx_hash) {
-                return Err(format!(
-                    "Transaction {} has commitment proof but is in other section (should be in priority section)",
                     tx_hash
                 ));
             }
@@ -2998,7 +2978,7 @@ impl BftState {
     ///
     /// `state_root` is the computed JVT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
-    #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, source_attestations, commitment_entries, collect_updates), fields(
+    #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, collect_updates), fields(
         height = qc.height.0,
         block_hash = ?block_hash
     ))]
@@ -3012,8 +2992,6 @@ impl BftState {
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        source_attestations: Vec<SourceBlockAttestation>,
-        commitment_entries: Vec<CommitmentEntry>,
         collect_updates: F,
     ) -> Vec<Action>
     where
@@ -3127,8 +3105,6 @@ impl BftState {
                 deferred,
                 aborted,
                 certificates,
-                source_attestations,
-                commitment_entries,
                 collect_updates,
             ));
         } else if should_try_proposal && rate_limited {
@@ -5523,8 +5499,6 @@ mod tests {
             certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
-            source_attestations: vec![],
-            commitment_entries: vec![],
         }
     }
 
@@ -7103,8 +7077,6 @@ mod tests {
             vec![],                        // no deferrals
             vec![],                        // no aborts
             vec![],                        // no certificates
-            vec![],                        // no source attestations
-            vec![],                        // no commitment entries
             |_certs| vec![],
         );
 
@@ -7153,8 +7125,6 @@ mod tests {
             vec![deferral],                // has a deferral
             vec![],                        // no aborts
             vec![],                        // no certificates
-            vec![],                        // no source attestations
-            vec![],                        // no commitment entries
             |_certs| vec![],
         );
 
@@ -7321,8 +7291,6 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            source_attestations: vec![],
-            commitment_entries: vec![],
         }
     }
 
@@ -7332,18 +7300,7 @@ mod tests {
         retry_transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
         priority_transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
         transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
-        commitment_entries: Vec<CommitmentEntry>,
     ) -> Block {
-        // Build source_attestations from the commitment entries' attestation indices.
-        // For tests, we create one dummy attestation if there are any entries.
-        let source_attestations = if commitment_entries.is_empty() {
-            vec![]
-        } else {
-            vec![SourceBlockAttestation::dummy(
-                hyperscale_types::ShardGroupId(1),
-                BlockHeight(1),
-            )]
-        };
         Block {
             header: make_header_at_height(height, 100_000),
             retry_transactions,
@@ -7352,38 +7309,13 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            source_attestations,
-            commitment_entries,
         }
     }
 
-    /// Create a test transaction and optionally a commitment entry for it.
-    /// Returns (transaction, Option<CommitmentEntry>).
-    /// All entries reference attestation_index 0 (a single shared attestation).
-    fn make_test_tx_with_proof(
-        seed: u8,
-        with_proof: bool,
-    ) -> (
-        Arc<hyperscale_types::RoutableTransaction>,
-        Option<CommitmentEntry>,
-    ) {
+    /// Create a test transaction for section validation tests.
+    fn make_test_tx_with_seed(seed: u8) -> Arc<hyperscale_types::RoutableTransaction> {
         use hyperscale_types::test_utils;
-
-        let tx = test_utils::test_transaction(seed);
-        let tx_arc = Arc::new(tx);
-
-        let entry = if with_proof {
-            Some(CommitmentEntry {
-                tx_hash: tx_arc.hash(),
-                attestation_index: 0,
-                target_shard: hyperscale_types::ShardGroupId(0),
-                entries: vec![hyperscale_types::StateEntry::new(vec![0; 50], None)],
-            })
-        } else {
-            None
-        };
-
-        (tx_arc, entry)
+        Arc::new(test_utils::test_transaction(seed))
     }
 
     fn make_test_tx(seed: u8, _with_proof: bool) -> Arc<hyperscale_types::RoutableTransaction> {
@@ -7459,10 +7391,10 @@ mod tests {
         let (state, _topology) = make_test_state();
 
         // Create TXs for priority group and non-priority group
-        let (tx1, proof1) = make_test_tx_with_proof(10, true);
-        let (tx2, proof2) = make_test_tx_with_proof(20, true);
-        let (tx3, _) = make_test_tx_with_proof(30, false);
-        let (tx4, _) = make_test_tx_with_proof(40, false);
+        let tx1 = make_test_tx_with_seed(10);
+        let tx2 = make_test_tx_with_seed(20);
+        let tx3 = make_test_tx_with_seed(30);
+        let tx4 = make_test_tx_with_seed(40);
 
         // Sort each group
         let mut priority_txs = vec![tx1.clone(), tx2.clone()];
@@ -7471,11 +7403,8 @@ mod tests {
         let mut other_txs = vec![tx3, tx4];
         sort_txs_by_hash(&mut other_txs);
 
-        // Build commitment entries for the block
-        let entries = vec![proof1.unwrap(), proof2.unwrap()];
-
         // Use sectioned block with priority TXs in priority section
-        let block = make_sectioned_test_block(5, vec![], priority_txs, other_txs, entries);
+        let block = make_sectioned_test_block(5, vec![], priority_txs, other_txs);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7483,19 +7412,16 @@ mod tests {
     fn test_validate_transaction_ordering_invalid_proof_group_unsorted() {
         let (state, _topology) = make_test_state();
 
-        // Create priority TXs with proofs
-        let (tx1, proof1) = make_test_tx_with_proof(10, true);
-        let (tx2, proof2) = make_test_tx_with_proof(20, true);
+        // Create priority TXs
+        let tx1 = make_test_tx_with_seed(10);
+        let tx2 = make_test_tx_with_seed(20);
 
         // Sort, then reverse (invalid order within priority section)
         let mut priority_txs = vec![tx1.clone(), tx2.clone()];
         sort_txs_by_hash(&mut priority_txs);
         priority_txs.reverse();
 
-        // Build commitment entries
-        let entries = vec![proof1.unwrap(), proof2.unwrap()];
-
-        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![], entries);
+        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![]);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(result
@@ -7504,40 +7430,18 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_transaction_ordering_invalid_non_priority_before_priority() {
+    fn test_validate_transaction_ordering_all_priority() {
         let (state, _topology) = make_test_state();
 
-        // Non-priority TX in priority section without proof - invalid
-        let (no_proof_tx, _) = make_test_tx_with_proof(10, false);
-        let (proof_tx, proof) = make_test_tx_with_proof(20, true);
-
-        // Build commitment entries (only proof_tx has an entry)
-        let entries = vec![proof.unwrap()];
-
-        // Put no_proof_tx in priority section (invalid - has no commitment entry)
-        let block =
-            make_sectioned_test_block(5, vec![], vec![no_proof_tx], vec![proof_tx], entries);
-        let result = state.validate_transaction_ordering(&block);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no commitment"));
-    }
-
-    #[test]
-    fn test_validate_transaction_ordering_all_have_proofs() {
-        let (state, _topology) = make_test_state();
-
-        // All TXs have proofs - valid as long as sorted, all in priority section
-        let (tx1, proof1) = make_test_tx_with_proof(10, true);
-        let (tx2, proof2) = make_test_tx_with_proof(20, true);
-        let (tx3, proof3) = make_test_tx_with_proof(30, true);
+        // All TXs in priority section - valid as long as sorted
+        let tx1 = make_test_tx_with_seed(10);
+        let tx2 = make_test_tx_with_seed(20);
+        let tx3 = make_test_tx_with_seed(30);
 
         let mut priority_txs = vec![tx1.clone(), tx2.clone(), tx3.clone()];
         sort_txs_by_hash(&mut priority_txs);
 
-        // Build commitment entries
-        let entries = vec![proof1.unwrap(), proof2.unwrap(), proof3.unwrap()];
-
-        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![], entries);
+        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![]);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7545,24 +7449,22 @@ mod tests {
     fn test_validate_transaction_ordering_retries_first() {
         let (state, _topology) = make_test_state();
 
-        // Create retry TXs, proof TXs, and regular TXs
+        // Create retry TXs, priority TXs, and regular TXs
         let retry1 = make_retry_tx(10);
         let retry2 = make_retry_tx(20);
-        let (proof_tx, proof) = make_test_tx_with_proof(30, true);
+        let priority_tx = make_test_tx_with_seed(30);
         let regular = make_test_tx(40, false);
 
         // Sort each tier by hash
         let mut retries = vec![retry1.clone(), retry2.clone()];
         sort_txs_by_hash(&mut retries);
 
-        let priority_txs = vec![proof_tx.clone()];
+        let priority_txs = vec![priority_tx.clone()];
 
         let others = vec![regular.clone()];
 
-        let entries = vec![proof.unwrap()];
-
-        // Use sectioned block: retries in retry section, proof TX in priority, regular in others
-        let block = make_sectioned_test_block(5, retries, priority_txs, others, entries);
+        // Use sectioned block: retries in retry section, priority TX in priority, regular in others
+        let block = make_sectioned_test_block(5, retries, priority_txs, others);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7570,14 +7472,11 @@ mod tests {
     fn test_validate_transaction_ordering_invalid_retry_after_proof() {
         let (state, _topology) = make_test_state();
 
-        // Create a retry and a proof TX
+        // Create a retry TX
         let retry = make_retry_tx(10);
-        let (_proof_tx, proof) = make_test_tx_with_proof(30, true);
 
-        let entries = vec![proof.unwrap()];
-
-        // Invalid: put retry in priority section (it's not a non-retry TX with proof)
-        let block = make_sectioned_test_block(5, vec![], vec![retry], vec![], entries);
+        // Invalid: put retry in priority section (retries belong in retry section)
+        let block = make_sectioned_test_block(5, vec![], vec![retry], vec![]);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(
@@ -7594,7 +7493,7 @@ mod tests {
         let retry = make_retry_tx(10);
 
         // Invalid: put retry in other section (should be in retry section)
-        let block = make_sectioned_test_block(5, vec![], vec![], vec![retry], vec![]);
+        let block = make_sectioned_test_block(5, vec![], vec![], vec![retry]);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(
@@ -7611,7 +7510,7 @@ mod tests {
         let mut retries = vec![make_retry_tx(10), make_retry_tx(20), make_retry_tx(30)];
         sort_txs_by_hash(&mut retries);
 
-        let block = make_sectioned_test_block(5, retries, vec![], vec![], vec![]);
+        let block = make_sectioned_test_block(5, retries, vec![], vec![]);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
@@ -7624,7 +7523,7 @@ mod tests {
         sort_txs_by_hash(&mut retries);
         retries.reverse(); // Make invalid
 
-        let block = make_sectioned_test_block(5, retries, vec![], vec![], vec![]);
+        let block = make_sectioned_test_block(5, retries, vec![], vec![]);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
         assert!(result
@@ -7669,8 +7568,6 @@ mod tests {
             qc,
             &ReadyTransactions::default(), // empty mempool
             vec![deferral],                // has content
-            vec![],
-            vec![],
             vec![],
             vec![],
             |_certs| vec![],
@@ -7724,8 +7621,6 @@ mod tests {
             qc,
             &ReadyTransactions::default(), // empty mempool
             vec![deferral],                // has content
-            vec![],
-            vec![],
             vec![],
             vec![],
             |_certs| vec![],
@@ -7808,8 +7703,6 @@ mod tests {
             vec![deferral],
             vec![],
             vec![],
-            vec![],
-            vec![],
             |_certs| vec![],
         );
 
@@ -7885,8 +7778,6 @@ mod tests {
             vec![deferral],
             vec![],
             vec![],
-            vec![],
-            vec![],
             |_certs| vec![],
         );
 
@@ -7930,8 +7821,6 @@ mod tests {
             qc.block_hash,
             qc,
             &ReadyTransactions::default(),
-            vec![],
-            vec![],
             vec![],
             vec![],
             vec![],
@@ -8163,8 +8052,6 @@ mod tests {
             vec![],
             vec![],
             vec![],
-            vec![],
-            vec![],
             |_certs| vec![],
         );
 
@@ -8237,8 +8124,6 @@ mod tests {
         let actions = state.on_proposal_timer(
             &topology,
             &ReadyTransactions::default(),
-            vec![],
-            vec![],
             vec![],
             vec![],
             vec![],
@@ -8477,8 +8362,6 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            source_attestations: vec![],
-            commitment_entries: vec![],
         };
 
         let qc = QuorumCertificate {
@@ -8529,8 +8412,6 @@ mod tests {
         let _actions = state.on_proposal_timer(
             &topology,
             &ReadyTransactions::default(),
-            vec![],
-            vec![],
             vec![],
             vec![],
             vec![],
@@ -8650,8 +8531,6 @@ mod tests {
         let actions1 = state.on_proposal_timer(
             &topology,
             &ReadyTransactions::default(),
-            vec![],
-            vec![],
             vec![],
             vec![],
             vec![],

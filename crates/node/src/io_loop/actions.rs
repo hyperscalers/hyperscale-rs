@@ -291,7 +291,7 @@ where
         let commit_latency_secs = (now_ms.saturating_sub(block.header.timestamp)) as f64 / 1000.0;
         metrics::record_block_committed(height.0, commit_latency_secs);
         metrics::set_block_height(height.0);
-        metrics::set_txs_with_commitment_proof(block.commitment_entries.len());
+        metrics::set_txs_with_commitment_proof(block.priority_transactions.len());
 
         // Livelock metrics for deferrals in this block.
         for _deferral in &block.deferred {

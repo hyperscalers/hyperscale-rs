@@ -3,11 +3,11 @@
 use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
-    Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommitmentEntry,
-    CommittedBlockHeader, DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate,
-    ExecutionVote, Hash, NodeId, ProvisionBatch, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, SignerBitfield, SourceBlockAttestation, StateProvision, TopologySnapshot,
-    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower,
+    Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
+    DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId,
+    ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield,
+    StateProvision, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
+    ValidatorId, VotePower,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -373,8 +373,6 @@ pub enum Action {
         /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
         /// Merged on the thread pool before proposal building.
         per_cert_updates: Vec<Arc<DatabaseUpdates>>,
-        source_attestations: Vec<SourceBlockAttestation>,
-        commitment_entries: Vec<CommitmentEntry>,
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         /// Shard groups that need provisions from this block's transactions.

@@ -65,8 +65,7 @@ pub use hash::{
 pub use identifiers::{BlockHeight, NodeId, PartitionNumber, ShardGroupId, ValidatorId, VotePower};
 pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
 pub use proofs::{
-    CommitmentEntry, ProvisionBatch, SourceBlockAttestation, SubstateInclusionProof, TxEntries,
-    VerkleInclusionProof,
+    ProvisionBatch, SourceBlockAttestation, SubstateInclusionProof, TxEntries, VerkleInclusionProof,
 };
 pub use signing::{
     block_header_message, block_vote_message, committed_block_header_message,

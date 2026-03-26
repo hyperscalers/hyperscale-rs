@@ -10,8 +10,7 @@ use hyperscale_topology::TopologyState;
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, Bls12381G1PrivateKey, CommittedBlockHeader,
     Hash, ProvisionBatch, QuorumCertificate, ReadyTransactions, ReceiptBundle, RoutableTransaction,
-    ShardGroupId, SourceBlockAttestation, TopologySnapshot, TransactionAbort,
-    TransactionCertificate, TransactionDefer,
+    ShardGroupId, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -94,8 +93,6 @@ impl std::fmt::Debug for NodeStateMachine {
 /// to avoid duplicating the ready-transaction gathering logic.
 struct ProposalInputs {
     ready_txs: ReadyTransactions,
-    source_attestations: Vec<SourceBlockAttestation>,
-    commitment_entries: Vec<hyperscale_types::CommitmentEntry>,
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
     certificates: Vec<Arc<TransactionCertificate>>,
@@ -240,51 +237,6 @@ impl NodeStateMachine {
 
     /// Build source attestations and commitment entries for priority transactions.
     ///
-    /// Returns `(source_attestations, commitment_entries)` for inclusion in the block.
-    /// Each unique `SourceBlockAttestation` is deduplicated; `CommitmentEntry` references
-    /// the attestation by index.
-    fn build_block_attestation_data(
-        &self,
-        ready_txs: &ReadyTransactions,
-    ) -> (
-        Vec<SourceBlockAttestation>,
-        Vec<hyperscale_types::CommitmentEntry>,
-    ) {
-        let mut attestations: Vec<SourceBlockAttestation> = Vec::new();
-        let mut entries: Vec<hyperscale_types::CommitmentEntry> = Vec::new();
-
-        // Only priority transactions have verified provisions
-        for tx in &ready_txs.priority {
-            let tx_hash = tx.hash();
-            if let Some((state_entries, attestation)) =
-                self.provisions.get_attestation_and_entries(&tx_hash)
-            {
-                // Find or insert the attestation, deduplicating by (source_shard, block_height).
-                let att_index = attestations
-                    .iter()
-                    .position(|a| {
-                        a.source_shard == attestation.source_shard
-                            && a.block_height == attestation.block_height
-                    })
-                    .unwrap_or_else(|| {
-                        let idx = attestations.len();
-                        attestations.push((*attestation).clone());
-                        idx
-                    });
-                // Determine the target shard for this transaction.
-                let target_shard = self.topology.snapshot().local_shard();
-                entries.push(hyperscale_types::CommitmentEntry {
-                    tx_hash,
-                    attestation_index: att_index as u16,
-                    target_shard,
-                    entries: state_entries,
-                });
-            }
-        }
-
-        (attestations, entries)
-    }
-
     /// Gather all inputs needed for a block proposal.
     ///
     /// Used by both `on_proposal_timer` and `on_qc_formed` to avoid duplicating
@@ -294,8 +246,6 @@ impl NodeStateMachine {
         let ready_txs = self
             .mempool
             .ready_transactions(max_txs, pending_txs, pending_certs);
-        let (source_attestations, commitment_entries) =
-            self.build_block_attestation_data(&ready_txs);
         let deferred = self.livelock.get_pending_deferrals().to_vec();
         let current_height = BlockHeight(self.bft.committed_height() + 1);
         let aborted = self.mempool.get_timed_out_transactions(
@@ -307,8 +257,6 @@ impl NodeStateMachine {
 
         ProposalInputs {
             ready_txs,
-            source_attestations,
-            commitment_entries,
             deferred,
             aborted,
             certificates,
@@ -397,8 +345,6 @@ impl NodeStateMachine {
             pending_txs,               // txs in uncommitted pipeline blocks
             pending_certs + new_certs, // certs in pipeline + certs we're proposing
         );
-        let (source_attestations, commitment_entries) =
-            self.build_block_attestation_data(&ready_txs);
         let deferred = self.livelock.get_pending_deferrals().to_vec();
         let current_height = BlockHeight(self.bft.committed_height() + 1);
         let aborted = self.mempool.get_timed_out_transactions(
@@ -426,8 +372,6 @@ impl NodeStateMachine {
             deferred,
             aborted,
             certificates,
-            source_attestations,
-            commitment_entries,
             collect_updates,
         )
     }
@@ -557,8 +501,6 @@ impl NodeStateMachine {
             inputs.deferred,
             inputs.aborted,
             inputs.certificates,
-            inputs.source_attestations,
-            inputs.commitment_entries,
             collect_updates,
         )
     }

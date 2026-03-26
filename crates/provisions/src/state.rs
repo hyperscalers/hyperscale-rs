@@ -1677,15 +1677,15 @@ mod tests {
         let header = make_committed_header_with_targets(ShardGroupId(1), 10, vec![ShardGroupId(0)]);
         coordinator.on_remote_block_committed(&topology, header, ValidatorId(3));
 
-        // Advance blocks — should not emit before the timeout threshold
-        for h in 1..=29 {
+        // Advance blocks — should not emit before the timeout threshold (10 blocks)
+        for h in 1..=9 {
             let block = make_block(h);
             let actions = coordinator.on_block_committed(&topology, &block);
             assert!(actions.is_empty(), "Should not emit request at height {h}");
         }
 
-        // At height 30, age = 30 - 0 = 30 >= PROVISION_FALLBACK_TIMEOUT_BLOCKS → fires
-        let block = make_block(30);
+        // At height 10, age = 10 - 0 = 10 >= PROVISION_FALLBACK_TIMEOUT_BLOCKS → fires
+        let block = make_block(10);
         let actions = coordinator.on_block_committed(&topology, &block);
         assert_eq!(actions.len(), 1);
         assert!(matches!(

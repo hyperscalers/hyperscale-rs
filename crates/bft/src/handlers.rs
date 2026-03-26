@@ -8,9 +8,9 @@ use hyperscale_storage::{CommitStore, DatabaseUpdates, SubstateStore};
 use hyperscale_types::{
     batch_verify_bls_same_message, compute_receipt_root, compute_transaction_root,
     verify_bls12381_v1, Block, BlockHeader, BlockHeight, BlockVote, Bls12381G1PublicKey,
-    Bls12381G2Signature, CommitmentEntry, Hash, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, SignerBitfield, SourceBlockAttestation, TransactionAbort, TransactionCertificate,
-    TransactionDefer, ValidatorId, VotePower,
+    Bls12381G2Signature, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId,
+    SignerBitfield, TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId,
+    VotePower,
 };
 use std::sync::Arc;
 
@@ -305,8 +305,6 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<TransactionCertificate>>,
     merged_updates: DatabaseUpdates,
-    source_attestations: Vec<SourceBlockAttestation>,
-    commitment_entries: Vec<CommitmentEntry>,
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
     local_shard: ShardGroupId,
@@ -370,8 +368,6 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         certificates: certs_to_include,
         deferred,
         aborted,
-        source_attestations,
-        commitment_entries,
     };
 
     let block_hash = block.hash();

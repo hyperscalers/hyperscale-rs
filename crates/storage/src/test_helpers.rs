@@ -123,8 +123,6 @@ pub fn make_test_block(height: u64) -> Block {
         certificates: vec![],
         deferred: vec![],
         aborted: vec![],
-        source_attestations: vec![],
-        commitment_entries: vec![],
     }
 }
 

@@ -224,8 +224,6 @@ impl PendingBlock {
 
         let deferred = self.manifest.deferred.clone();
         let aborted = self.manifest.aborted.clone();
-        let source_attestations = self.manifest.source_attestations.clone();
-        let commitment_entries = self.manifest.commitment_entries.clone();
 
         let block = Arc::new(Block {
             header: self.header.clone(),
@@ -235,8 +233,6 @@ impl PendingBlock {
             certificates,
             deferred,
             aborted,
-            source_attestations,
-            commitment_entries,
         });
 
         self.constructed_block = Some(Arc::clone(&block));
