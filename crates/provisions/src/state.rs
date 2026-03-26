@@ -367,26 +367,34 @@ impl ProvisionCoordinator {
         // Track expected provisions: if this block's provision_targets includes
         // our shard, we expect provisions to arrive. If they don't arrive within
         // the timeout, we'll request them via fallback.
+        //
+        // Skip if we already have a verified header for this (shard, height) —
+        // that means provisions were already received and verified (possibly from
+        // an earlier committed header gossip from a different validator). Without
+        // this guard, late-arriving duplicate headers re-register the expectation
+        // after it was already cleared by verification, causing spurious timeouts.
         if committed_header
             .header
             .provision_targets
             .contains(&topology.local_shard())
         {
             let key = (shard, height);
-            let proposer = committed_header.header.proposer;
-            self.expected_provisions.entry(key).or_insert_with(|| {
-                debug!(
-                    shard = shard.0,
-                    height = height.0,
-                    proposer = proposer.0,
-                    "Tracking expected provision (remote block targets our shard)"
-                );
-                ExpectedProvision {
-                    discovered_at: self.local_committed_height,
-                    requested: false,
-                    proposer,
-                }
-            });
+            if !self.verified_remote_headers.contains_key(&key) {
+                let proposer = committed_header.header.proposer;
+                self.expected_provisions.entry(key).or_insert_with(|| {
+                    debug!(
+                        shard = shard.0,
+                        height = height.0,
+                        proposer = proposer.0,
+                        "Tracking expected provision (remote block targets our shard)"
+                    );
+                    ExpectedProvision {
+                        discovered_at: self.local_committed_height,
+                        requested: false,
+                        proposer,
+                    }
+                });
+            }
         }
 
         // Check if we have any buffered provision batches waiting for this header
@@ -502,7 +510,6 @@ impl ProvisionCoordinator {
         // Look for matching remote headers — check VERIFIED FIRST (skip QC
         // re-verification), then collect ALL unverified candidates.
         let key = (source_shard, block_height);
-
         if let Some(verified_header) = self.verified_remote_headers.get(&key).cloned() {
             // Header already promoted by prior verification — single candidate
             return self.emit_provision_verification(
