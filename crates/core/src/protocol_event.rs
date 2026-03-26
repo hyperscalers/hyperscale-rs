@@ -7,8 +7,8 @@
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader, EpochConfig,
-    EpochId, ExecutionCertificate, ExecutionVote, ExecutionWaveCertificate, ExecutionWaveVote,
-    Hash, ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, StateEntry,
+    EpochId, ExecutionCertificate, ExecutionWaveCertificate, ExecutionWaveVote, Hash,
+    ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, StateEntry,
     StateProvision, TransactionCertificate, ValidatorId, WaveId, WaveTxOutcome,
 };
 use std::sync::Arc;
@@ -160,23 +160,17 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // Execution
     // ═══════════════════════════════════════════════════════════════════════
-    /// Received an execution vote for cross-shard execution.
-    ExecutionVoteReceived { vote: ExecutionVote },
-
     /// Batch of execution results from a single ExecuteTransactions or SpeculativeExecute dispatch.
     ///
-    /// Votes are lightweight (receipt_hash + write_nodes) — suitable for network gossip.
     /// Results carry the full execution output (DatabaseUpdates, receipts) — stays local.
     ///
     /// The state machine uses results to:
     /// 1. Populate ExecutionCache (in-memory, for block commit fast path)
     /// 2. Dispatch StoreReceiptBundles action (for both speculative and canonical)
     ExecutionBatchCompleted {
-        votes: Vec<ExecutionVote>,
         results: Vec<hyperscale_types::ExecutionResult>,
         /// Wave-ready per-tx results extracted on the handler thread.
         /// Used by wave accumulators for wave vote signing.
-        /// Decoupled from `votes` so wave path doesn't depend on per-tx signing.
         wave_results: Vec<WaveTxOutcome>,
         /// True when this batch came from speculative execution.
         /// Receipt bundles are persisted for both speculative and canonical execution
@@ -184,25 +178,10 @@ pub enum ProtocolEvent {
         speculative: bool,
     },
 
-    /// Received an execution certificate for cross-shard execution.
-    ExecutionCertificateReceived { cert: ExecutionCertificate },
-
-    /// Batch execution vote verification completed.
-    ExecutionVotesVerifiedAndAggregated {
-        tx_hash: Hash,
-        verified_votes: Vec<(ExecutionVote, u64)>,
-    },
-
     /// Execution certificate signature verification completed.
     ExecutionCertificateSignatureVerified {
         certificate: ExecutionCertificate,
         valid: bool,
-    },
-
-    /// Execution certificate aggregation completed.
-    ExecutionCertificateAggregated {
-        tx_hash: Hash,
-        certificate: ExecutionCertificate,
     },
 
     /// Received an execution wave vote from another validator.
@@ -399,17 +378,9 @@ impl ProtocolEvent {
             ProtocolEvent::StateProvisionsVerified { .. } => "StateProvisionsVerified",
 
             // Execution
-            ProtocolEvent::ExecutionVoteReceived { .. } => "ExecutionVoteReceived",
             ProtocolEvent::ExecutionBatchCompleted { .. } => "ExecutionBatchCompleted",
-            ProtocolEvent::ExecutionCertificateReceived { .. } => "ExecutionCertificateReceived",
-            ProtocolEvent::ExecutionVotesVerifiedAndAggregated { .. } => {
-                "ExecutionVotesVerifiedAndAggregated"
-            }
             ProtocolEvent::ExecutionCertificateSignatureVerified { .. } => {
                 "ExecutionCertificateSignatureVerified"
-            }
-            ProtocolEvent::ExecutionCertificateAggregated { .. } => {
-                "ExecutionCertificateAggregated"
             }
             ProtocolEvent::ExecutionWaveVoteReceived { .. } => "ExecutionWaveVoteReceived",
             ProtocolEvent::ExecutionWaveVotesVerifiedAndAggregated { .. } => {

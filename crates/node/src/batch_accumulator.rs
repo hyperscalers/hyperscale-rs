@@ -74,6 +74,7 @@ impl<T> BatchAccumulator<T> {
 ///
 /// Items are collected into per-shard `Vec`s. The batch flushes when the total
 /// count across all shards reaches `max_count` or the time window expires.
+#[allow(dead_code)]
 pub(crate) struct ShardedBatchAccumulator<T> {
     by_shard: HashMap<ShardGroupId, Vec<T>>,
     total: usize,
@@ -82,6 +83,7 @@ pub(crate) struct ShardedBatchAccumulator<T> {
     deadline: Option<Duration>,
 }
 
+#[allow(dead_code)]
 impl<T> ShardedBatchAccumulator<T> {
     /// Create a new sharded accumulator.
     pub fn new(max_count: usize, window: Duration) -> Self {

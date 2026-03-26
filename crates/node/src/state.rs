@@ -1032,11 +1032,7 @@ impl StateMachine for NodeStateMachine {
             ),
 
             // ── Execution ────────────────────────────────────────────────
-            ProtocolEvent::ExecutionVoteReceived { vote } => {
-                self.execution.on_vote(self.topology.snapshot(), vote)
-            }
             ProtocolEvent::ExecutionBatchCompleted {
-                votes,
                 results,
                 wave_results,
                 speculative,
@@ -1097,15 +1093,7 @@ impl StateMachine for NodeStateMachine {
                     );
                 }
 
-                // Process votes through VoteTracker (existing per-tx path)
-                for vote in &votes {
-                    actions.extend(
-                        self.execution
-                            .on_vote(self.topology.snapshot(), vote.clone()),
-                    );
-                }
-
-                // Record results into wave accumulators (new wave path).
+                // Record results into wave accumulators.
                 // wave_results were extracted on the handler thread — no data
                 // munging needed here on the main thread.
                 for wr in wave_results {
@@ -1129,28 +1117,9 @@ impl StateMachine for NodeStateMachine {
 
                 actions
             }
-            ProtocolEvent::ExecutionCertificateReceived { cert } => self
-                .execution
-                .on_certificate(self.topology.snapshot(), cert),
-            ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
-                tx_hash,
-                verified_votes,
-            } => self.execution.on_execution_votes_verified(
-                self.topology.snapshot(),
-                tx_hash,
-                verified_votes,
-            ),
             ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => self
                 .execution
                 .on_certificate_verified(self.topology.snapshot(), certificate, valid),
-            ProtocolEvent::ExecutionCertificateAggregated {
-                tx_hash,
-                certificate,
-            } => self.execution.on_execution_certificate_aggregated(
-                self.topology.snapshot(),
-                tx_hash,
-                certificate,
-            ),
             ProtocolEvent::SpeculativeExecutionComplete {
                 block_hash,
                 tx_hashes,

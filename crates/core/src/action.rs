@@ -4,11 +4,10 @@ use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
-    DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote,
-    ExecutionWaveCertificate, ExecutionWaveVote, Hash, NodeId, ProvisionBatch, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision, TopologySnapshot,
-    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower, WaveId,
-    WaveTxOutcome,
+    DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate, ExecutionWaveCertificate,
+    ExecutionWaveVote, Hash, NodeId, ProvisionBatch, QuorumCertificate, RoutableTransaction,
+    ShardGroupId, SignerBitfield, StateProvision, TopologySnapshot, TransactionAbort,
+    TransactionCertificate, TransactionDefer, ValidatorId, VotePower, WaveId, WaveTxOutcome,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -83,28 +82,6 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Network: Execution Layer (domain-specific, batchable by runner)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Broadcast an execution vote to the local shard.
-    ///
-    /// The runner may batch multiple votes into a single network message
-    /// for efficiency. State machines emit individual votes.
-    BroadcastExecutionVote {
-        shard: ShardGroupId,
-        vote: ExecutionVote,
-    },
-
-    /// Broadcast an execution certificate to a remote participating shard.
-    ///
-    /// Only emitted for remote shards — local shard peers independently form
-    /// the same certificate from the same execution votes.
-    /// The runner may batch multiple certificates into a single network message
-    /// for efficiency. State machines emit individual certificates.
-    BroadcastExecutionCertificate {
-        shard: ShardGroupId,
-        certificate: Arc<ExecutionCertificate>,
-        /// Target shard peers (excluding self) for the broadcast.
-        recipients: Vec<ValidatorId>,
-    },
-
     /// Sign and broadcast an execution wave vote to the local shard.
     ///
     /// Emitted by the state machine when a wave completes (all txs executed).
@@ -242,47 +219,6 @@ pub enum Action {
         committee_voting_power: Vec<u64>,
         /// Quorum threshold for the source shard.
         quorum_threshold: u64,
-    },
-
-    /// Aggregate execution votes into an ExecutionCertificate (vote quorum reached).
-    ///
-    /// Performs BLS signature aggregation which is compute-intensive.
-    /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::ExecutionCertificateAggregated` when complete.
-    AggregateExecutionCertificate {
-        /// Transaction hash for correlation.
-        tx_hash: Hash,
-        /// Shard group that executed.
-        shard: ShardGroupId,
-        /// Hash of the ConsensusReceipt (outcome + event_root).
-        receipt_hash: Hash,
-        /// Votes to aggregate (with quorum).
-        votes: Vec<ExecutionVote>,
-        /// Read nodes (for certificate).
-        read_nodes: Vec<NodeId>,
-        /// Write nodes touched by this transaction's execution.
-        write_nodes: Vec<NodeId>,
-        /// Ordered committee for the shard (for SignerBitfield index mapping).
-        committee: Vec<ValidatorId>,
-    },
-
-    /// Batch verify execution votes and aggregate valid ones (cross-shard Phase 4).
-    ///
-    /// Defers verification until we have enough votes to possibly reach quorum.
-    /// This avoids wasting CPU on votes that will never be used.
-    ///
-    /// The runner:
-    /// 1. Batch-verifies all vote signatures (faster than individual verification)
-    /// 2. Reports which votes passed verification with their voting power
-    ///
-    /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::ExecutionVotesVerifiedAndAggregated` when complete.
-    VerifyAndAggregateExecutionVotes {
-        /// Transaction hash for correlation.
-        tx_hash: Hash,
-        /// Votes to verify with their public keys and voting power.
-        /// Each tuple is (vote, public_key, voting_power).
-        votes: Vec<(ExecutionVote, Bls12381G1PublicKey, u64)>,
     },
 
     /// Verify an execution certificate's aggregated signature (cross-shard Phase 5).
@@ -843,8 +779,6 @@ impl Action {
             Action::BroadcastBlockHeader { .. }
                 | Action::BroadcastBlockVote { .. }
                 | Action::BroadcastTransaction { .. }
-                | Action::BroadcastExecutionVote { .. }
-                | Action::BroadcastExecutionCertificate { .. }
                 | Action::SignAndBroadcastWaveVote { .. }
                 | Action::BroadcastExecutionWaveVote { .. }
                 | Action::BroadcastExecutionWaveCertificate { .. }
@@ -864,8 +798,6 @@ impl Action {
             self,
             Action::VerifyAndBuildQuorumCertificate { .. }
                 | Action::VerifyProvisionBatch { .. }
-                | Action::AggregateExecutionCertificate { .. }
-                | Action::VerifyAndAggregateExecutionVotes { .. }
                 | Action::VerifyExecutionCertificateSignature { .. }
                 | Action::AggregateExecutionWaveCertificate { .. }
                 | Action::VerifyAndAggregateExecutionWaveVotes { .. }
@@ -900,8 +832,6 @@ impl Action {
             Action::BroadcastTransaction { .. } => "BroadcastTransaction",
 
             // Network - Execution Layer (batchable)
-            Action::BroadcastExecutionVote { .. } => "BroadcastExecutionVote",
-            Action::BroadcastExecutionCertificate { .. } => "BroadcastExecutionCertificate",
             Action::SignAndBroadcastWaveVote { .. } => "SignAndBroadcastWaveVote",
             Action::BroadcastExecutionWaveVote { .. } => "BroadcastExecutionWaveVote",
             Action::BroadcastExecutionWaveCertificate { .. } => "BroadcastExecutionWaveCertificate",
@@ -917,8 +847,6 @@ impl Action {
             // Delegated Work - Crypto Verification
             Action::VerifyAndBuildQuorumCertificate { .. } => "VerifyAndBuildQuorumCertificate",
             Action::VerifyProvisionBatch { .. } => "VerifyProvisionBatch",
-            Action::AggregateExecutionCertificate { .. } => "AggregateExecutionCertificate",
-            Action::VerifyAndAggregateExecutionVotes { .. } => "VerifyAndAggregateExecutionVotes",
             Action::VerifyExecutionCertificateSignature { .. } => {
                 "VerifyExecutionCertificateSignature"
             }

@@ -163,8 +163,6 @@ impl NodeInput {
                 ProtocolEvent::BlockHeaderReceived { .. }
                 | ProtocolEvent::RemoteBlockCommitted { .. }
                 | ProtocolEvent::BlockVoteReceived { .. }
-                | ProtocolEvent::ExecutionVoteReceived { .. }
-                | ProtocolEvent::ExecutionCertificateReceived { .. }
                 | ProtocolEvent::TransactionGossipReceived { .. }
                 | ProtocolEvent::GlobalBlockReceived { .. }
                 | ProtocolEvent::GlobalBlockVoteReceived { .. }

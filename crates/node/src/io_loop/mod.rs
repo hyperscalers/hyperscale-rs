@@ -24,7 +24,7 @@ mod handlers;
 mod protocols;
 mod verify;
 
-use crate::batch_accumulator::{BatchAccumulator, ShardedBatchAccumulator};
+use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
 use crate::protocol::fetch::{FetchInput, FetchKind, FetchProtocol};
 use crate::protocol::inclusion_proof_fetch::{
@@ -45,7 +45,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
     Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
-    ExecutionVote, Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot,
+    Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot,
     TransactionCertificate, ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
@@ -66,11 +66,6 @@ const DEFAULT_CERT_CACHE_SIZE: usize = 10_000;
 const DEFAULT_TX_CACHE_SIZE: usize = 50_000;
 /// Default transaction status cache capacity.
 const DEFAULT_TX_STATUS_CACHE_SIZE: usize = 100_000;
-use hyperscale_execution::handlers::UnverifiedExecutionVote;
-
-/// A single execution-vote verification item: tx_hash with its unverified votes.
-type ExecutionVoteVerificationItem = (Hash, Vec<UnverifiedExecutionVote>);
-
 /// A committed header pending sender-signature verification.
 type CommittedHeaderVerificationItem = (
     CommittedBlockHeader,
@@ -195,12 +190,7 @@ where
     // Batch accumulators
     validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
     cross_shard_batch: BatchAccumulator<CrossShardExecutionRequest>,
-    execution_vote_batch: BatchAccumulator<ExecutionVoteVerificationItem>,
     execution_certificate_batch: BatchAccumulator<(ExecutionCertificate, Vec<Bls12381G1PublicKey>)>,
-    broadcast_vote_batch: ShardedBatchAccumulator<ExecutionVote>,
-    broadcast_cert_batch: ShardedBatchAccumulator<Arc<ExecutionCertificate>>,
-    /// Recipients per shard for cert broadcast batching, populated from Action data.
-    cert_broadcast_recipients: HashMap<ShardGroupId, Vec<ValidatorId>>,
     committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
 
     // Block commit accumulator — collects EmitCommittedBlock actions within a
@@ -295,23 +285,10 @@ where
             inclusion_proof_fetch_protocol,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             cross_shard_batch: BatchAccumulator::new(b.cross_shard_max, b.cross_shard_window),
-            execution_vote_batch: BatchAccumulator::new(
-                b.execution_vote_max,
-                b.execution_vote_window,
-            ),
             execution_certificate_batch: BatchAccumulator::new(
                 b.execution_certificate_max,
                 b.execution_certificate_window,
             ),
-            broadcast_vote_batch: ShardedBatchAccumulator::new(
-                b.broadcast_vote_max,
-                b.broadcast_vote_window,
-            ),
-            broadcast_cert_batch: ShardedBatchAccumulator::new(
-                b.broadcast_cert_max,
-                b.broadcast_cert_window,
-            ),
-            cert_broadcast_recipients: HashMap::new(),
             committed_header_batch: BatchAccumulator::new(
                 b.committed_header_max,
                 b.committed_header_window,
@@ -794,24 +771,6 @@ where
 
             // ── Protocol events → state machine ────────────────────────
             NodeInput::Protocol(pe) => {
-                // Broadcast self-generated execution votes returning from dispatch.
-                // Votes from peers arrive via network gossip.
-                match &pe {
-                    ProtocolEvent::ExecutionVoteReceived { ref vote } => {
-                        if vote.validator == self.validator_id {
-                            self.accumulate_broadcast_vote(self.local_shard, vote.clone());
-                        }
-                    }
-                    ProtocolEvent::ExecutionBatchCompleted { ref votes, .. } => {
-                        for vote in votes {
-                            if vote.validator == self.validator_id {
-                                self.accumulate_broadcast_vote(self.local_shard, vote.clone());
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-
                 self.feed_event(pe);
             }
         }
@@ -855,17 +814,8 @@ where
         if self.cross_shard_batch.is_expired(now) {
             self.flush_cross_shard_executions();
         }
-        if self.execution_vote_batch.is_expired(now) {
-            self.flush_execution_vote_verifications();
-        }
         if self.execution_certificate_batch.is_expired(now) {
             self.flush_execution_certificate_verifications();
-        }
-        if self.broadcast_vote_batch.is_expired(now) {
-            self.flush_broadcast_votes();
-        }
-        if self.broadcast_cert_batch.is_expired(now) {
-            self.flush_broadcast_certs();
         }
         if self.committed_header_batch.is_expired(now) {
             self.flush_committed_header_verifications();
@@ -880,10 +830,7 @@ where
         [
             self.validation_batch.deadline(),
             self.cross_shard_batch.deadline(),
-            self.execution_vote_batch.deadline(),
             self.execution_certificate_batch.deadline(),
-            self.broadcast_vote_batch.deadline(),
-            self.broadcast_cert_batch.deadline(),
             self.committed_header_batch.deadline(),
         ]
         .into_iter()
@@ -982,10 +929,7 @@ where
 
         self.flush_validation_batch();
         self.flush_cross_shard_executions();
-        self.flush_execution_vote_verifications();
         self.flush_execution_certificate_verifications();
-        self.flush_broadcast_votes();
-        self.flush_broadcast_certs();
         self.flush_committed_header_verifications();
     }
 }

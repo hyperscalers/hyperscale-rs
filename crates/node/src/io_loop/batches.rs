@@ -1,16 +1,14 @@
 //! Batch accumulation and flushing for verification and broadcast.
 
 use super::verify::verify_bls_with_metrics;
-use super::{ExecutionVoteVerificationItem, IoLoop};
+use super::IoLoop;
 use hyperscale_core::{CrossShardExecutionRequest, NodeInput, ProtocolEvent, StateMachine};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_messages::{ExecutionCertificatesNotification, ExecutionVotesNotification};
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
-    Bls12381G1PublicKey, ExecutionCertificate, ExecutionResult, ExecutionVote, Hash,
-    RoutableTransaction, ShardGroupId,
+    Bls12381G1PublicKey, ExecutionCertificate, ExecutionResult, Hash, RoutableTransaction,
 };
 use std::sync::Arc;
 
@@ -77,39 +75,30 @@ where
 
         let storage = Arc::clone(&self.storage);
         let executor = self.executor.clone();
-        let signing_key = Arc::clone(&self.signing_key);
         let dispatch = self.dispatch.clone();
         let local_shard = self.local_shard;
         let num_shards = self.num_shards;
-        let validator_id = self.validator_id;
         let event_tx = self.event_sender.clone();
 
         self.dispatch.spawn_execution(move || {
             let start = std::time::Instant::now();
-            let pairs: Vec<_> = dispatch.map_local(&requests, |req| {
-                hyperscale_execution::handlers::execute_and_sign_cross_shard(
+            let raw_results: Vec<_> = dispatch.map_local(&requests, |req| {
+                hyperscale_execution::handlers::execute_cross_shard(
                     &executor,
                     &*storage,
                     req.tx_hash,
                     &req.transaction,
                     &req.provisions,
-                    &signing_key,
-                    local_shard,
-                    validator_id,
                 )
             });
             metrics::record_execution_latency(start.elapsed().as_secs_f64());
 
-            // Separate votes and results, converting SingleTxResult → ExecutionResult
-            // and filtering database_updates to the local shard (matching the single-shard
-            // path in action_handler.rs).
-            let (votes, results): (Vec<ExecutionVote>, Vec<_>) = pairs.into_iter().unzip();
             // Extract wave-ready data on handler thread (before consuming results)
-            let wave_results: Vec<_> = results
+            let wave_results: Vec<_> = raw_results
                 .iter()
                 .map(hyperscale_execution::handlers::extract_wave_result)
                 .collect();
-            let results = results
+            let results = raw_results
                 .into_iter()
                 .map(|r| {
                     let mut result = ExecutionResult::from(r);
@@ -129,42 +118,11 @@ where
             // and stores receipts (enabling serve_block_request for sync).
             let _ = event_tx.send(NodeInput::Protocol(
                 ProtocolEvent::ExecutionBatchCompleted {
-                    votes,
                     results,
                     wave_results,
                     speculative: false,
                 },
             ));
-        });
-    }
-
-    /// Flush accumulated execution vote verifications as a single batch.
-    ///
-    /// Spawns one closure on the crypto pool that uses cross-transaction BLS
-    /// batch verification (~2 pairings) instead of N individual dispatches.
-    pub(super) fn flush_execution_vote_verifications(&mut self) {
-        let items = self.execution_vote_batch.take();
-        if items.is_empty() {
-            return;
-        }
-
-        let event_tx = self.event_sender.clone();
-        self.dispatch.spawn_crypto(move || {
-            let start = std::time::Instant::now();
-            for (tx_hash, verified_votes) in
-                hyperscale_execution::handlers::batch_verify_and_aggregate_execution_votes(items)
-            {
-                let _ = event_tx.send(NodeInput::Protocol(
-                    ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
-                        tx_hash,
-                        verified_votes,
-                    },
-                ));
-            }
-            metrics::record_signature_verification_latency(
-                "bls_execution_vote",
-                start.elapsed().as_secs_f64(),
-            );
         });
     }
 
@@ -215,19 +173,6 @@ where
         }
     }
 
-    pub(super) fn accumulate_execution_vote_verification(
-        &mut self,
-        item: ExecutionVoteVerificationItem,
-    ) {
-        let weight = item.1.len();
-        if self
-            .execution_vote_batch
-            .push_weighted(item, weight, self.state.now())
-        {
-            self.flush_execution_vote_verifications();
-        }
-    }
-
     pub(super) fn accumulate_execution_certificate_verification(
         &mut self,
         certificate: ExecutionCertificate,
@@ -239,64 +184,6 @@ where
         {
             self.flush_execution_certificate_verifications();
         }
-    }
-
-    pub(super) fn accumulate_broadcast_vote(&mut self, shard: ShardGroupId, vote: ExecutionVote) {
-        if self
-            .broadcast_vote_batch
-            .push(shard, vote, self.state.now())
-        {
-            self.flush_broadcast_votes();
-        }
-    }
-
-    pub(super) fn accumulate_broadcast_cert(
-        &mut self,
-        shard: ShardGroupId,
-        cert: Arc<ExecutionCertificate>,
-    ) {
-        if self
-            .broadcast_cert_batch
-            .push(shard, cert, self.state.now())
-        {
-            self.flush_broadcast_certs();
-        }
-    }
-
-    // ─── Batch Flushing ─────────────────────────────────────────────────
-
-    pub(super) fn flush_broadcast_votes(&mut self) {
-        for (shard, votes) in self.broadcast_vote_batch.take() {
-            if !votes.is_empty() {
-                let msg = hyperscale_types::exec_vote_batch_message(shard, &votes);
-                let sig = self.signing_key.sign_v1(&msg);
-                let batch = ExecutionVotesNotification::new(votes, self.validator_id, sig);
-                self.network.notify(&self.cached_local_peers, &batch);
-            }
-        }
-    }
-
-    pub(super) fn flush_broadcast_certs(&mut self) {
-        for (shard, certs) in self.broadcast_cert_batch.take() {
-            if !certs.is_empty() {
-                let owned: Vec<ExecutionCertificate> =
-                    certs.into_iter().map(Arc::unwrap_or_clone).collect();
-                let msg = hyperscale_types::exec_cert_batch_message(shard, &owned);
-                let sig = self.signing_key.sign_v1(&msg);
-                let batch = ExecutionCertificatesNotification::new(owned, self.validator_id, sig);
-                if let Some(recipients) = self.cert_broadcast_recipients.remove(&shard) {
-                    self.network.notify(&recipients, &batch);
-                } else {
-                    tracing::warn!(
-                        shard = shard.0,
-                        cert_count = batch.certificates.len(),
-                        "Dropping execution certificate broadcast: no recipients recorded for shard"
-                    );
-                }
-            }
-        }
-        // Clear any stale entries for shards that had no certs to flush.
-        self.cert_broadcast_recipients.clear();
     }
 
     /// Flush accumulated committed header sender-signature verifications.

@@ -9,8 +9,7 @@ mod trace_context;
 // Re-export commonly used types
 pub use gossip::{CommittedBlockHeaderGossip, TransactionGossip};
 pub use notification::{
-    BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
-    ExecutionVotesNotification, ExecutionWaveCertificatesNotification,
+    BlockHeaderNotification, BlockVoteNotification, ExecutionWaveCertificatesNotification,
     ExecutionWaveVotesNotification, StateProvisionsNotification,
 };
 pub use trace_context::TraceContext;

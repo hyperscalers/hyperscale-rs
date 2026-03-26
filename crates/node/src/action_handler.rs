@@ -13,10 +13,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
-use hyperscale_types::{
-    Bls12381G1PrivateKey, ExecutionResult, ExecutionVote, Hash, ProvisionBatch, ShardGroupId,
-    TxEntries, ValidatorId,
-};
+use hyperscale_types::{ExecutionResult, Hash, ProvisionBatch, ShardGroupId, TxEntries};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -24,10 +21,8 @@ use tracing::warn;
 pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore + ConsensusStore, D: Dispatch> {
     pub storage: &'a S,
     pub executor: &'a RadixExecutor,
-    pub signing_key: &'a Bls12381G1PrivateKey,
     pub local_shard: ShardGroupId,
     pub num_shards: u64,
-    pub validator_id: ValidatorId,
     pub dispatch: &'a D,
 }
 
@@ -67,7 +62,6 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
 
         // General crypto
-        Action::AggregateExecutionCertificate { .. } => Some(DispatchPool::Crypto),
         Action::AggregateExecutionWaveCertificate { .. } => Some(DispatchPool::Crypto),
         Action::VerifyAndAggregateExecutionWaveVotes { .. } => Some(DispatchPool::Crypto),
         Action::VerifyExecutionWaveCertificateSignature { .. } => Some(DispatchPool::Crypto),
@@ -290,36 +284,6 @@ pub(crate) fn handle_delegated_action<
             })
         }
 
-        // --- Execution aggregation and verification ---
-        Action::AggregateExecutionCertificate {
-            tx_hash,
-            shard,
-            receipt_hash,
-            votes,
-            read_nodes,
-            write_nodes,
-            committee,
-        } => {
-            let certificate = hyperscale_execution::handlers::aggregate_execution_certificate(
-                tx_hash,
-                shard,
-                receipt_hash,
-                &votes,
-                read_nodes,
-                write_nodes,
-                &committee,
-            );
-            Some(DelegatedResult {
-                events: vec![NodeInput::Protocol(
-                    ProtocolEvent::ExecutionCertificateAggregated {
-                        tx_hash,
-                        certificate,
-                    },
-                )],
-                prepared_commit: None,
-            })
-        }
-
         // --- Wave Execution Aggregation and Verification ---
         Action::AggregateExecutionWaveCertificate {
             wave_id,
@@ -462,24 +426,16 @@ pub(crate) fn handle_delegated_action<
         } => {
             let local_shard = ctx.local_shard;
             let num_shards = ctx.num_shards;
-            let pairs = ctx.dispatch.map_local(&transactions, |tx| {
-                hyperscale_execution::handlers::execute_and_sign_single_shard(
-                    ctx.executor,
-                    ctx.storage,
-                    tx,
-                    ctx.signing_key,
-                    ctx.local_shard,
-                    ctx.validator_id,
-                )
+            let raw_results = ctx.dispatch.map_local(&transactions, |tx| {
+                hyperscale_execution::handlers::execute_single_shard(ctx.executor, ctx.storage, tx)
             });
 
-            let (votes, results): (Vec<ExecutionVote>, Vec<_>) = pairs.into_iter().unzip();
             // Extract wave-ready data on handler thread (before consuming results)
-            let wave_results: Vec<_> = results
+            let wave_results: Vec<_> = raw_results
                 .iter()
                 .map(hyperscale_execution::handlers::extract_wave_result)
                 .collect();
-            let results = results
+            let results = raw_results
                 .into_iter()
                 .map(|r| {
                     let mut result = ExecutionResult::from(r);
@@ -497,7 +453,6 @@ pub(crate) fn handle_delegated_action<
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
                     ProtocolEvent::ExecutionBatchCompleted {
-                        votes,
                         results,
                         wave_results,
                         speculative: false,
@@ -513,24 +468,17 @@ pub(crate) fn handle_delegated_action<
         } => {
             let local_shard = ctx.local_shard;
             let num_shards = ctx.num_shards;
-            let pairs = ctx.dispatch.map_local(&transactions, |tx| {
-                hyperscale_execution::handlers::execute_and_sign_single_shard(
-                    ctx.executor,
-                    ctx.storage,
-                    tx,
-                    ctx.signing_key,
-                    ctx.local_shard,
-                    ctx.validator_id,
-                )
+            let raw_results = ctx.dispatch.map_local(&transactions, |tx| {
+                hyperscale_execution::handlers::execute_single_shard(ctx.executor, ctx.storage, tx)
             });
 
-            let (votes, results): (Vec<ExecutionVote>, Vec<_>) = pairs.into_iter().unzip();
             // Extract wave-ready data on handler thread
-            let wave_results: Vec<_> = results
+            let wave_results: Vec<_> = raw_results
                 .iter()
                 .map(hyperscale_execution::handlers::extract_wave_result)
                 .collect();
-            let results = results
+            let tx_hashes: Vec<Hash> = raw_results.iter().map(|r| r.tx_hash).collect();
+            let results = raw_results
                 .into_iter()
                 .map(|r| {
                     let mut result = ExecutionResult::from(r);
@@ -544,12 +492,10 @@ pub(crate) fn handle_delegated_action<
                     result
                 })
                 .collect();
-            let tx_hashes: Vec<Hash> = votes.iter().map(|v| v.transaction_hash).collect();
 
             Some(DelegatedResult {
                 events: vec![
                     NodeInput::Protocol(ProtocolEvent::ExecutionBatchCompleted {
-                        votes,
                         results,
                         wave_results,
                         speculative: true,
