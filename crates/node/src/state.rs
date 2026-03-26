@@ -575,6 +575,23 @@ impl NodeStateMachine {
         // Livelock: process deferrals/aborts/certs, add tombstones, cleanup tracking
         self.livelock.on_block_committed(&block);
 
+        // Notify wave accumulators about deferrals BEFORE cleanup removes
+        // the wave assignment. A deferred tx counts as "resolved" in its wave —
+        // if it was the last unresolved tx, this triggers wave vote signing.
+        for deferral in &block.deferred {
+            if let Some(completion) = self.execution.record_wave_deferral(deferral.tx_hash) {
+                actions.push(Action::SignAndBroadcastWaveVote {
+                    block_hash: completion.block_hash,
+                    block_height: completion.block_height,
+                    wave_id: completion.wave_id,
+                    wave_receipt_root: completion.wave_receipt_root,
+                    tx_count: completion.tx_outcomes.len() as u32,
+                    tx_outcomes: completion.tx_outcomes,
+                    participating_shards: completion.participating_shards,
+                });
+            }
+        }
+
         // Cleanup execution state for deferred transactions.
         // This must happen BEFORE passing new transactions to execution,
         // so that retries can be processed fresh.
@@ -1016,36 +1033,12 @@ impl StateMachine for NodeStateMachine {
 
             // ── Execution ────────────────────────────────────────────────
             ProtocolEvent::ExecutionVoteReceived { vote } => {
-                let mut actions = self
-                    .execution
-                    .on_vote(self.topology.snapshot(), vote.clone());
-
-                // If this is our own vote (from cross-shard execution), also
-                // record into wave accumulator for wave vote signing.
-                if vote.validator == self.topology.snapshot().local_validator_id() {
-                    if let Some(completion) = self.execution.record_wave_result(
-                        vote.transaction_hash,
-                        vote.receipt_hash,
-                        vote.success,
-                        vote.write_nodes,
-                    ) {
-                        actions.push(Action::SignAndBroadcastWaveVote {
-                            block_hash: completion.block_hash,
-                            block_height: completion.block_height,
-                            wave_id: completion.wave_id,
-                            wave_receipt_root: completion.wave_receipt_root,
-                            tx_count: completion.tx_outcomes.len() as u32,
-                            tx_outcomes: completion.tx_outcomes,
-                            participating_shards: completion.participating_shards,
-                        });
-                    }
-                }
-
-                actions
+                self.execution.on_vote(self.topology.snapshot(), vote)
             }
             ProtocolEvent::ExecutionBatchCompleted {
                 votes,
                 results,
+                wave_results,
                 speculative,
             } => {
                 // Single pass: populate execution cache and build receipt bundles.
@@ -1112,13 +1105,15 @@ impl StateMachine for NodeStateMachine {
                     );
                 }
 
-                // Record results into wave accumulators (new wave path)
-                for vote in &votes {
+                // Record results into wave accumulators (new wave path).
+                // wave_results were extracted on the handler thread — no data
+                // munging needed here on the main thread.
+                for wr in wave_results {
                     if let Some(completion) = self.execution.record_wave_result(
-                        vote.transaction_hash,
-                        vote.receipt_hash,
-                        vote.success,
-                        vote.write_nodes.clone(),
+                        wr.tx_hash,
+                        wr.receipt_hash,
+                        wr.success,
+                        wr.write_nodes,
                     ) {
                         actions.push(Action::SignAndBroadcastWaveVote {
                             block_hash: completion.block_hash,

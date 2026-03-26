@@ -450,6 +450,21 @@ fn filter_to_declared_writes(
     filtered
 }
 
+/// Extract wave-ready result data from a SingleTxResult.
+///
+/// Called on the handler thread (after execution, before returning to state machine)
+/// so that write_nodes extraction and success determination happen off the main thread.
+/// The returned `WaveTxOutcome` is fed into the wave accumulator by the state machine.
+pub fn extract_wave_result(result: &hyperscale_engine::SingleTxResult) -> WaveTxOutcome {
+    let write_nodes = extract_write_nodes(&result.database_updates);
+    WaveTxOutcome {
+        tx_hash: result.tx_hash,
+        receipt_hash: result.receipt_hash,
+        success: result.success,
+        write_nodes,
+    }
+}
+
 /// Extract deduplicated, deterministically-ordered NodeIds from DatabaseUpdates.
 ///
 /// Uses BTreeSet to ensure all validators within a shard produce identical

@@ -423,15 +423,19 @@ impl ExecutionState {
     ///
     /// Creates a `WaveAccumulator` and `WaveVoteTracker` per wave, and records
     /// the tx → wave mapping for later result routing.
+    ///
+    /// Returns any early wave votes that arrived before tracking was set up,
+    /// so the caller can replay them through `on_wave_vote()`.
     fn setup_wave_tracking(
         &mut self,
         topology: &TopologySnapshot,
         block_hash: Hash,
         block_height: u64,
         transactions: &[Arc<RoutableTransaction>],
-    ) {
+    ) -> Vec<ExecutionWaveVote> {
         let waves = self.assign_waves(topology, transactions);
         let quorum = topology.local_quorum_threshold();
+        let mut votes_to_replay = Vec::new();
 
         for (wave_id, txs) in waves {
             let key = (block_hash, wave_id.clone());
@@ -450,16 +454,15 @@ impl ExecutionState {
             let tracker = WaveVoteTracker::new(wave_id, block_hash, quorum);
             self.wave_vote_trackers.insert(key.clone(), tracker);
 
-            // Replay any early wave votes
+            // Collect early wave votes for caller to replay through on_wave_vote()
             if let Some(early_votes) = self.early_wave_votes.remove(&key) {
                 tracing::debug!(
                     block_hash = ?block_hash,
                     wave = ?key.1,
                     count = early_votes.len(),
-                    "Replaying early wave votes"
+                    "Collected early wave votes for replay"
                 );
-                // TODO: Process early wave votes through on_wave_vote()
-                // once that method is implemented
+                votes_to_replay.extend(early_votes);
             }
         }
 
@@ -470,6 +473,8 @@ impl ExecutionState {
                 .count(),
             "Wave tracking set up for block"
         );
+
+        votes_to_replay
     }
 
     /// Record a transaction execution result into the appropriate wave accumulator.
@@ -519,6 +524,16 @@ impl ExecutionState {
             tx_outcomes,
             participating_shards,
         })
+    }
+
+    /// Record a transaction deferral into the appropriate wave accumulator.
+    ///
+    /// Deferrals are terminal — the tx won't execute on this block. The wave
+    /// accumulator records it with a zeroed receipt_hash and success=false.
+    /// If this was the last unresolved tx in the wave, returns completion data
+    /// for wave vote signing.
+    pub fn record_wave_deferral(&mut self, tx_hash: Hash) -> Option<WaveCompletionData> {
+        self.record_wave_result(tx_hash, Hash::ZERO, false, vec![])
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -983,8 +998,12 @@ impl ExecutionState {
             self.executed_txs.insert(tx.hash(), height);
         }
 
-        // Set up wave tracking for this block's transactions
-        self.setup_wave_tracking(topology, block_hash, height, &new_txs);
+        // Set up wave tracking for this block's transactions.
+        // Returns any early wave votes that arrived before tracking was ready.
+        let early_wave_votes = self.setup_wave_tracking(topology, block_hash, height, &new_txs);
+        for vote in early_wave_votes {
+            actions.extend(self.on_wave_vote(topology, vote));
+        }
 
         // Prune old entries to prevent unbounded growth
         self.prune_executed_txs();

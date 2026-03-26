@@ -474,6 +474,11 @@ pub(crate) fn handle_delegated_action<
             });
 
             let (votes, results): (Vec<ExecutionVote>, Vec<_>) = pairs.into_iter().unzip();
+            // Extract wave-ready data on handler thread (before consuming results)
+            let wave_results: Vec<_> = results
+                .iter()
+                .map(hyperscale_execution::handlers::extract_wave_result)
+                .collect();
             let results = results
                 .into_iter()
                 .map(|r| {
@@ -494,6 +499,7 @@ pub(crate) fn handle_delegated_action<
                     ProtocolEvent::ExecutionBatchCompleted {
                         votes,
                         results,
+                        wave_results,
                         speculative: false,
                     },
                 )],
@@ -519,6 +525,11 @@ pub(crate) fn handle_delegated_action<
             });
 
             let (votes, results): (Vec<ExecutionVote>, Vec<_>) = pairs.into_iter().unzip();
+            // Extract wave-ready data on handler thread
+            let wave_results: Vec<_> = results
+                .iter()
+                .map(hyperscale_execution::handlers::extract_wave_result)
+                .collect();
             let results = results
                 .into_iter()
                 .map(|r| {
@@ -540,6 +551,7 @@ pub(crate) fn handle_delegated_action<
                     NodeInput::Protocol(ProtocolEvent::ExecutionBatchCompleted {
                         votes,
                         results,
+                        wave_results,
                         speculative: true,
                     }),
                     NodeInput::Protocol(ProtocolEvent::SpeculativeExecutionComplete {

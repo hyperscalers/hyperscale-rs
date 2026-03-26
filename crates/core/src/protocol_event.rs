@@ -9,7 +9,7 @@ use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader, EpochConfig,
     EpochId, ExecutionCertificate, ExecutionVote, ExecutionWaveCertificate, ExecutionWaveVote,
     Hash, ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, StateEntry,
-    StateProvision, TransactionCertificate, ValidatorId, WaveId,
+    StateProvision, TransactionCertificate, ValidatorId, WaveId, WaveTxOutcome,
 };
 use std::sync::Arc;
 
@@ -174,6 +174,10 @@ pub enum ProtocolEvent {
     ExecutionBatchCompleted {
         votes: Vec<ExecutionVote>,
         results: Vec<hyperscale_types::ExecutionResult>,
+        /// Wave-ready per-tx results extracted on the handler thread.
+        /// Used by wave accumulators for wave vote signing.
+        /// Decoupled from `votes` so wave path doesn't depend on per-tx signing.
+        wave_results: Vec<WaveTxOutcome>,
         /// True when this batch came from speculative execution.
         /// Receipt bundles are persisted for both speculative and canonical execution
         /// so that the sync protocol can always serve complete blocks.
