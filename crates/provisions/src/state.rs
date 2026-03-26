@@ -19,7 +19,7 @@ use hyperscale_types::{
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 /// Map of verified provisions: tx_hash → source_shard → entries.
 type VerifiedProvisionMap = HashMap<Hash, HashMap<ShardGroupId, Vec<StateEntry>>>;
@@ -465,22 +465,9 @@ impl ProvisionCoordinator {
             return vec![];
         }
 
-        // Filter: auto-register unknown txs, skip already-verified provisions
-        let mut to_verify = Vec::with_capacity(batch.transactions.len());
-        for tx_entries in batch.transactions {
+        // Auto-register unknown txs for cycle detection
+        for tx_entries in &batch.transactions {
             let tx_hash = tx_entries.tx_hash;
-
-            // Skip provisions for transactions that have already completed
-            if self.completed_tombstones.contains_key(&tx_hash) {
-                trace!(
-                    tx_hash = %tx_hash,
-                    source_shard = source_shard.0,
-                    "Ignoring provision (transaction already completed — tombstone present)"
-                );
-                continue;
-            }
-
-            // Auto-register if not already registered (for remote TXs / cycle detection)
             self.registered_txs.entry(tx_hash).or_insert_with(|| {
                 let mut required_shards = BTreeSet::new();
                 required_shards.insert(source_shard);
@@ -489,53 +476,20 @@ impl ProvisionCoordinator {
                     registered_at: BlockHeight(0),
                 }
             });
-
-            // Skip if already verified for this (tx, shard)
-            if self
-                .verified_provisions
-                .get(&tx_hash)
-                .and_then(|by_shard| by_shard.get(&source_shard))
-                .is_some()
-            {
-                trace!(
-                    tx_hash = %tx_hash,
-                    source_shard = source_shard.0,
-                    "Ignoring provision (already verified for this shard)"
-                );
-                continue;
-            }
-
-            to_verify.push(tx_entries);
         }
-
-        if to_verify.is_empty() {
-            return vec![];
-        }
-
-        // Rebuild a filtered batch with only the transactions that need verification
-        let filtered_batch = ProvisionBatch {
-            source_shard: batch.source_shard,
-            block_height: batch.block_height,
-            proof: batch.proof.clone(),
-            transactions: to_verify,
-        };
 
         // Look for matching remote headers — check VERIFIED FIRST (skip QC
         // re-verification), then collect ALL unverified candidates.
         let key = (source_shard, block_height);
         if let Some(verified_header) = self.verified_remote_headers.get(&key).cloned() {
             // Header already promoted by prior verification — single candidate
-            return self.emit_provision_verification(
-                filtered_batch,
-                vec![verified_header],
-                topology,
-            );
+            return self.emit_provision_verification(batch, vec![verified_header], topology);
         }
 
         if let Some(by_sender) = self.unverified_remote_headers.get(&key) {
             // Collect ALL unverified candidates (one per validator sender)
             let candidates: Vec<CommittedBlockHeader> = by_sender.values().cloned().collect();
-            return self.emit_provision_verification(filtered_batch, candidates, topology);
+            return self.emit_provision_verification(batch, candidates, topology);
         }
 
         // Header already pruned — provision can never be verified.
@@ -546,7 +500,7 @@ impl ProvisionCoordinator {
                     source_shard = source_shard.0,
                     block_height = block_height.0,
                     tip = tip.0,
-                    count = filtered_batch.transactions.len(),
+                    count = batch.transactions.len(),
                     "Discarding provisions (header already pruned)"
                 );
                 return vec![];
@@ -557,13 +511,10 @@ impl ProvisionCoordinator {
         debug!(
             source_shard = source_shard.0,
             block_height = block_height.0,
-            count = filtered_batch.transactions.len(),
+            count = batch.transactions.len(),
             "Buffering provision batch (waiting for remote header)"
         );
-        self.pending_provisions
-            .entry(key)
-            .or_default()
-            .push(filtered_batch);
+        self.pending_provisions.entry(key).or_default().push(batch);
         vec![]
     }
 
@@ -667,6 +618,11 @@ impl ProvisionCoordinator {
 
         for tx_entries in &batch.transactions {
             let tx_hash = tx_entries.tx_hash;
+
+            // Skip transactions that already completed
+            if self.completed_tombstones.contains_key(&tx_hash) {
+                continue;
+            }
 
             debug!(
                 tx_hash = %tx_hash,
@@ -1254,10 +1210,14 @@ mod tests {
         // Simulate successful verification
         coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
 
-        // Second batch for same (tx, shard) should be ignored
+        // Second batch for same (tx, shard) goes through verification again
+        // (proof must be verified as a whole — no per-tx pre-filtering).
+        // Duplicate entries are harmlessly re-inserted by on_state_provisions_verified.
         let batch2 = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
         let actions = coordinator.on_state_provisions_received(&topology, batch2);
-        assert!(actions.is_empty());
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::VerifyProvisionBatch { .. })));
     }
 
     #[test]

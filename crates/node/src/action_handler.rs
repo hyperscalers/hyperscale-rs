@@ -18,6 +18,7 @@ use hyperscale_types::{
     TxEntries, ValidatorId,
 };
 use std::sync::Arc;
+use tracing::warn;
 
 /// Context for executing delegated actions.
 pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore + ConsensusStore, D: Dispatch> {
@@ -507,6 +508,13 @@ pub(crate) fn handle_delegated_action<
                     {
                         Some(entries) => entries,
                         None => {
+                            warn!(
+                                source_shard = source_shard.0,
+                                block_height = block_height.0,
+                                tx_hash = %req.tx_hash,
+                                node_count = req.nodes.len(),
+                                "fetch_state_entries returned None — JVT version unavailable"
+                            );
                             continue;
                         }
                     };
@@ -516,6 +524,12 @@ pub(crate) fn handle_delegated_action<
                 per_tx.push((req.tx_hash, req.target_shards.clone(), Arc::new(entries)));
             }
             if per_tx.is_empty() {
+                warn!(
+                    source_shard = source_shard.0,
+                    block_height = block_height.0,
+                    request_count = requests.len(),
+                    "All fetch_state_entries failed — no provisions to broadcast"
+                );
                 return Some(DelegatedResult {
                     events: vec![NodeInput::ProvisionsReady {
                         batches: vec![],
@@ -534,6 +548,12 @@ pub(crate) fn handle_delegated_action<
             {
                 Some(p) => Arc::new(p),
                 None => {
+                    warn!(
+                        source_shard = source_shard.0,
+                        block_height = block_height.0,
+                        key_count = all_storage_keys.len(),
+                        "generate_verkle_proofs returned None — JVT version unavailable"
+                    );
                     return Some(DelegatedResult {
                         events: vec![NodeInput::ProvisionsReady {
                             batches: vec![],

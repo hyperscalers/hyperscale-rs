@@ -351,7 +351,78 @@ impl ExecutionState {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
-        // Filter out already-executed transactions (dedup)
+        // ── Provision broadcasting (proposer only) ─────────────────────
+        //
+        // This runs on the FULL transaction list, before dedup filtering.
+        // Provisioning is a block-level proposer duty: the proposer must
+        // broadcast state entries for all cross-shard transactions in the
+        // committed block, regardless of local execution state. The dedup
+        // filter below controls re-execution, not provisioning.
+        let local_shard = topology.local_shard();
+        let is_proposer = topology.local_validator_id() == proposer;
+
+        if is_proposer {
+            let mut provision_requests = Vec::new();
+            for tx in &transactions {
+                if topology.is_single_shard_transaction(tx) {
+                    continue;
+                }
+                let mut owned_nodes: Vec<_> = tx
+                    .declared_reads
+                    .iter()
+                    .chain(tx.declared_writes.iter())
+                    .filter(|&node_id| topology.shard_for_node_id(node_id) == local_shard)
+                    .copied()
+                    .collect();
+                owned_nodes.sort();
+                owned_nodes.dedup();
+
+                if !owned_nodes.is_empty() {
+                    let target_shards: Vec<_> = topology
+                        .all_shards_for_transaction(tx)
+                        .into_iter()
+                        .filter(|&s| s != local_shard)
+                        .collect();
+
+                    if !target_shards.is_empty() {
+                        provision_requests.push(ProvisionRequest {
+                            tx_hash: tx.hash(),
+                            nodes: owned_nodes,
+                            target_shards,
+                        });
+                    }
+                }
+            }
+
+            if !provision_requests.is_empty() {
+                let local_vid = topology.local_validator_id();
+                let mut shard_recipients = HashMap::new();
+                for req in &provision_requests {
+                    for &target_shard in &req.target_shards {
+                        shard_recipients.entry(target_shard).or_insert_with(|| {
+                            topology
+                                .committee_for_shard(target_shard)
+                                .iter()
+                                .copied()
+                                .filter(|&v| v != local_vid)
+                                .collect()
+                        });
+                    }
+                }
+                actions.push(Action::FetchAndBroadcastProvisions {
+                    requests: provision_requests,
+                    source_shard: local_shard,
+                    block_height: BlockHeight(height),
+                    block_timestamp,
+                    shard_recipients,
+                });
+            }
+        }
+
+        // ── Execution (dedup-filtered) ─────────────────────────────────
+        //
+        // Filter out already-executed transactions so we don't re-execute
+        // or re-vote for transactions seen in earlier blocks.
         let new_txs: Vec<_> = transactions
             .into_iter()
             .filter(|tx| !self.executed_txs.contains_key(&tx.hash()))
@@ -446,68 +517,9 @@ impl ExecutionState {
             });
         }
 
-        // Handle cross-shard transactions
-        let mut provision_requests = Vec::new();
-        let local_shard = topology.local_shard();
-        let is_proposer = topology.local_validator_id() == proposer;
-
+        // Handle cross-shard execution tracking (dedup-filtered — don't re-track)
         for tx in cross_shard {
-            // Collect provision requests (proposer only)
-            if is_proposer {
-                let mut owned_nodes: Vec<_> = tx
-                    .declared_reads
-                    .iter()
-                    .chain(tx.declared_writes.iter())
-                    .filter(|&node_id| topology.shard_for_node_id(node_id) == local_shard)
-                    .copied()
-                    .collect();
-                owned_nodes.sort();
-                owned_nodes.dedup();
-
-                if !owned_nodes.is_empty() {
-                    let target_shards: Vec<_> = topology
-                        .all_shards_for_transaction(&tx)
-                        .into_iter()
-                        .filter(|&s| s != local_shard)
-                        .collect();
-
-                    if !target_shards.is_empty() {
-                        provision_requests.push(ProvisionRequest {
-                            tx_hash: tx.hash(),
-                            nodes: owned_nodes,
-                            target_shards,
-                        });
-                    }
-                }
-            }
-
             actions.extend(self.start_cross_shard_execution(topology, tx, height));
-        }
-
-        // Emit a single action for all provision fetches + broadcasts
-        if !provision_requests.is_empty() {
-            // Build recipients for each target shard.
-            let local_vid = topology.local_validator_id();
-            let mut shard_recipients = HashMap::new();
-            for req in &provision_requests {
-                for &target_shard in &req.target_shards {
-                    shard_recipients.entry(target_shard).or_insert_with(|| {
-                        topology
-                            .committee_for_shard(target_shard)
-                            .iter()
-                            .copied()
-                            .filter(|&v| v != local_vid)
-                            .collect()
-                    });
-                }
-            }
-            actions.push(Action::FetchAndBroadcastProvisions {
-                requests: provision_requests,
-                source_shard: local_shard,
-                block_height: BlockHeight(height),
-                block_timestamp,
-                shard_recipients,
-            });
         }
 
         actions
