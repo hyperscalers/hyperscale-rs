@@ -7,122 +7,19 @@
 //! Each execution function is the single-transaction unit of work. Production
 //! wraps calls in `rayon::par_iter()` for parallelism; simulation calls sequentially.
 //!
-//! The `batch_verify_*` functions use [`batch_verify_bls_different_messages`] to
-//! verify accumulated signatures across multiple transactions in ~2 pairing
+//! The `batch_verify_*` functions use BLS batch verification to verify
+//! accumulated signatures across multiple transactions in ~2 pairing
 //! operations. These are called from the I/O loop's time-windowed batch flush.
 
 use hyperscale_engine::{RadixExecutor, SingleTxResult};
 use hyperscale_storage::SubstateStore;
 use hyperscale_types::{
-    batch_verify_bls_different_messages, batch_verify_bls_same_message, exec_wave_vote_message,
-    verify_bls12381_v1, zero_bls_signature, Bls12381G1PublicKey, Bls12381G2Signature,
-    ExecutionCertificate, ExecutionWaveCertificate, ExecutionWaveVote, Hash, NodeId,
-    RoutableTransaction, ShardGroupId, SignerBitfield, ValidatorId, WaveId, WaveTxOutcome,
+    batch_verify_bls_same_message, exec_wave_vote_message, verify_bls12381_v1, zero_bls_signature,
+    Bls12381G1PublicKey, Bls12381G2Signature, ExecutionWaveCertificate, ExecutionWaveVote, Hash,
+    NodeId, RoutableTransaction, ShardGroupId, SignerBitfield, ValidatorId, WaveId, WaveTxOutcome,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-
-/// Verify an execution certificate's aggregated BLS signature.
-///
-/// Filters public keys by the certificate's signer bitfield, aggregates the
-/// filtered keys, and verifies the aggregated signature. Handles the zero
-/// signature case (single-shard / no signers).
-pub fn verify_execution_certificate_signature(
-    certificate: &ExecutionCertificate,
-    public_keys: &[Bls12381G1PublicKey],
-) -> bool {
-    let msg = certificate.signing_message();
-
-    // Get the public keys of actual signers based on the bitfield
-    let signer_keys: Vec<_> = public_keys
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| certificate.signers.is_set(*i))
-        .map(|(_, pk)| *pk)
-        .collect();
-
-    if signer_keys.is_empty() {
-        // No signers - valid only if it's a zero signature (single-shard case)
-        certificate.aggregated_signature == zero_bls_signature()
-    } else {
-        // Aggregate the public keys and verify (skip PK validation - trusted topology)
-        match Bls12381G1PublicKey::aggregate(&signer_keys, false) {
-            Ok(aggregated_pk) => {
-                verify_bls12381_v1(&msg, &aggregated_pk, &certificate.aggregated_signature)
-            }
-            Err(_) => false,
-        }
-    }
-}
-
-/// Batch verify execution certificate signatures.
-///
-/// Pre-aggregates signer public keys per certificate (cheap), then verifies
-/// all aggregated signatures in ~2 pairing operations via
-/// [`batch_verify_bls_different_messages`]. Falls back to individual
-/// verification when the batch check fails.
-///
-/// Certificates with no signers are handled inline (zero-signature check).
-pub fn batch_verify_execution_certificate_signatures(
-    items: &[(ExecutionCertificate, Vec<Bls12381G1PublicKey>)],
-) -> Vec<bool> {
-    if items.is_empty() {
-        return Vec::new();
-    }
-
-    if items.len() == 1 {
-        return vec![verify_execution_certificate_signature(
-            &items[0].0,
-            &items[0].1,
-        )];
-    }
-
-    let mut results = vec![false; items.len()];
-
-    // Pre-process: aggregate signer keys per cert, collect for batch verify.
-    let mut messages = Vec::with_capacity(items.len());
-    let mut signatures = Vec::with_capacity(items.len());
-    let mut agg_pubkeys = Vec::with_capacity(items.len());
-    let mut batch_indices = Vec::with_capacity(items.len());
-
-    for (i, (cert, public_keys)) in items.iter().enumerate() {
-        let signer_keys: Vec<_> = public_keys
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| cert.signers.is_set(*j))
-            .map(|(_, pk)| *pk)
-            .collect();
-
-        if signer_keys.is_empty() {
-            // No signers — valid only if zero signature (single-shard case).
-            results[i] = cert.aggregated_signature == zero_bls_signature();
-            continue;
-        }
-
-        match Bls12381G1PublicKey::aggregate(&signer_keys, false) {
-            Ok(agg_pk) => {
-                messages.push(cert.signing_message());
-                signatures.push(cert.aggregated_signature);
-                agg_pubkeys.push(agg_pk);
-                batch_indices.push(i);
-            }
-            Err(_) => {
-                results[i] = false;
-            }
-        }
-    }
-
-    if !messages.is_empty() {
-        let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
-        let batch_results =
-            batch_verify_bls_different_messages(&msg_refs, &signatures, &agg_pubkeys);
-        for (valid, &orig_idx) in batch_results.into_iter().zip(&batch_indices) {
-            results[orig_idx] = valid;
-        }
-    }
-
-    results
-}
 
 /// Execute a single-shard transaction.
 ///
@@ -371,7 +268,7 @@ pub fn batch_verify_execution_wave_votes(
 
 /// Verify an execution wave certificate's aggregated signature.
 ///
-/// Same pattern as `verify_execution_certificate_signature` but for wave certs.
+/// Verifies an execution wave certificate's aggregated BLS signature.
 pub fn verify_execution_wave_certificate_signature(
     certificate: &ExecutionWaveCertificate,
     public_keys: &[Bls12381G1PublicKey],

@@ -33,10 +33,6 @@ pub struct BatchConfig {
     pub execution_vote_max: usize,
     pub execution_vote_window: Duration,
 
-    /// Execution certificate verification batch.
-    pub execution_certificate_max: usize,
-    pub execution_certificate_window: Duration,
-
     /// Broadcast execution vote batch.
     pub broadcast_vote_max: usize,
     pub broadcast_vote_window: Duration,
@@ -62,9 +58,6 @@ impl Default for BatchConfig {
 
             execution_vote_max: 64,
             execution_vote_window: Duration::from_millis(20),
-
-            execution_certificate_max: 64,
-            execution_certificate_window: Duration::from_millis(15),
 
             broadcast_vote_max: 64,
             broadcast_vote_window: Duration::from_millis(15),

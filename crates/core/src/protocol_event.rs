@@ -7,9 +7,9 @@
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader, EpochConfig,
-    EpochId, ExecutionCertificate, ExecutionWaveCertificate, ExecutionWaveVote, Hash,
-    ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, StateEntry,
-    StateProvision, TransactionCertificate, ValidatorId, WaveId, WaveTxOutcome,
+    EpochId, ExecutionWaveCertificate, ExecutionWaveVote, Hash, ProvisionBatch, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, StateEntry, StateProvision, ValidatorId, WaveId,
+    WaveTxOutcome,
 };
 use std::sync::Arc;
 
@@ -178,12 +178,6 @@ pub enum ProtocolEvent {
         speculative: bool,
     },
 
-    /// Execution certificate signature verification completed.
-    ExecutionCertificateSignatureVerified {
-        certificate: ExecutionCertificate,
-        valid: bool,
-    },
-
     /// Received an execution wave vote from another validator.
     ExecutionWaveVoteReceived { vote: ExecutionWaveVote },
 
@@ -234,18 +228,6 @@ pub enum ProtocolEvent {
     TransactionFetchDelivered {
         block_hash: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
-    },
-
-    /// Fetched certificates delivered to state machine.
-    CertificateFetchDelivered {
-        block_hash: Hash,
-        certificates: Vec<TransactionCertificate>,
-    },
-
-    /// A fetched certificate has been verified.
-    FetchedCertificateVerified {
-        block_hash: Hash,
-        certificate: TransactionCertificate,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -379,9 +361,6 @@ impl ProtocolEvent {
 
             // Execution
             ProtocolEvent::ExecutionBatchCompleted { .. } => "ExecutionBatchCompleted",
-            ProtocolEvent::ExecutionCertificateSignatureVerified { .. } => {
-                "ExecutionCertificateSignatureVerified"
-            }
             ProtocolEvent::ExecutionWaveVoteReceived { .. } => "ExecutionWaveVoteReceived",
             ProtocolEvent::ExecutionWaveVotesVerifiedAndAggregated { .. } => {
                 "ExecutionWaveVotesVerifiedAndAggregated"
@@ -403,8 +382,6 @@ impl ProtocolEvent {
 
             // Fetch Delivery
             ProtocolEvent::TransactionFetchDelivered { .. } => "TransactionFetchDelivered",
-            ProtocolEvent::CertificateFetchDelivered { .. } => "CertificateFetchDelivered",
-            ProtocolEvent::FetchedCertificateVerified { .. } => "FetchedCertificateVerified",
 
             // Storage Callbacks
             ProtocolEvent::BlockFetched { .. } => "BlockFetched",

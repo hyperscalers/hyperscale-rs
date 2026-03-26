@@ -4,7 +4,7 @@ use crate::ProtocolEvent;
 use hyperscale_types::{
     Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, Hash,
     LedgerReceiptEntry, ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TransactionCertificate, TransactionInclusionProof, ValidatorId,
+    TransactionInclusionProof, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -67,21 +67,10 @@ pub enum NodeInput {
     /// Fetch transactions failed from network callback.
     FetchTransactionsFailed { block_hash: Hash, hashes: Vec<Hash> },
 
-    /// Fetch certificates failed from network callback.
-    FetchCertificatesFailed { block_hash: Hash, hashes: Vec<Hash> },
-
     /// Received transactions from a fetch request (raw, before protocol processing).
     TransactionReceived {
         block_hash: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
-    },
-
-    /// Received certificates from a fetch request (raw, before protocol processing).
-    CertificateReceived {
-        block_hash: Hash,
-        certificates: Vec<TransactionCertificate>,
-        /// Ledger receipts for the certificates (from fetch peer).
-        ledger_receipts: Vec<LedgerReceiptEntry>,
     },
 
     /// Transaction validated by the validation pipeline.
@@ -178,9 +167,7 @@ impl NodeInput {
             NodeInput::SyncBlockFetchFailed { .. } => EventPriority::Internal,
             NodeInput::FetchTick => EventPriority::Timer,
             NodeInput::FetchTransactionsFailed { .. } => EventPriority::Internal,
-            NodeInput::FetchCertificatesFailed { .. } => EventPriority::Internal,
             NodeInput::TransactionReceived { .. } => EventPriority::Network,
-            NodeInput::CertificateReceived { .. } => EventPriority::Network,
             NodeInput::TransactionValidated { .. } => EventPriority::Internal,
             NodeInput::TransactionValidationsFailed { .. } => EventPriority::Internal,
             NodeInput::CommittedHeaderValidated { .. } => EventPriority::Internal,
@@ -217,9 +204,7 @@ impl NodeInput {
             NodeInput::SyncBlockFetchFailed { .. } => "SyncBlockFetchFailed",
             NodeInput::FetchTick => "FetchTick",
             NodeInput::FetchTransactionsFailed { .. } => "FetchTransactionsFailed",
-            NodeInput::FetchCertificatesFailed { .. } => "FetchCertificatesFailed",
             NodeInput::TransactionReceived { .. } => "TransactionReceived",
-            NodeInput::CertificateReceived { .. } => "CertificateReceived",
             NodeInput::TransactionValidated { .. } => "TransactionValidated",
             NodeInput::TransactionValidationsFailed { .. } => "TransactionValidationsFailed",
             NodeInput::CommittedHeaderValidated { .. } => "CommittedHeaderValidated",

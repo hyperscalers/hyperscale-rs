@@ -44,9 +44,9 @@ use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
 use hyperscale_types::{
-    Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, ExecutionCertificate,
-    Hash, QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot,
-    TransactionCertificate, ValidatorId,
+    Block, Bls12381G1PrivateKey, Bls12381G1PublicKey, CommittedBlockHeader, Hash,
+    QuorumCertificate, RoutableTransaction, ShardGroupId, TopologySnapshot, TransactionCertificate,
+    ValidatorId,
 };
 use quick_cache::sync::Cache as QuickCache;
 use std::collections::{HashMap, HashSet};
@@ -190,7 +190,6 @@ where
     // Batch accumulators
     validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
     cross_shard_batch: BatchAccumulator<CrossShardExecutionRequest>,
-    execution_certificate_batch: BatchAccumulator<(ExecutionCertificate, Vec<Bls12381G1PublicKey>)>,
     committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
 
     // Block commit accumulator — collects EmitCommittedBlock actions within a
@@ -285,10 +284,6 @@ where
             inclusion_proof_fetch_protocol,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
             cross_shard_batch: BatchAccumulator::new(b.cross_shard_max, b.cross_shard_window),
-            execution_certificate_batch: BatchAccumulator::new(
-                b.execution_certificate_max,
-                b.execution_certificate_window,
-            ),
             committed_header_batch: BatchAccumulator::new(
                 b.committed_header_max,
                 b.committed_header_window,
@@ -560,33 +555,6 @@ where
                 self.process_fetch_outputs(outputs);
             }
 
-            NodeInput::CertificateReceived {
-                block_hash,
-                certificates,
-                ledger_receipts,
-            } => {
-                // Store receipts from fetch peer. Syncing nodes didn't execute
-                // locally, so local_execution is None.
-                // state_changes already populated by remote peer.
-                let bundles: Vec<hyperscale_types::ReceiptBundle> = ledger_receipts
-                    .iter()
-                    .map(|entry| hyperscale_types::ReceiptBundle {
-                        tx_hash: entry.tx_hash,
-                        ledger_receipt: std::sync::Arc::new(entry.receipt.clone()),
-                        local_execution: None,
-                        database_updates: None,
-                    })
-                    .collect();
-                self.pending_receipt_bundles.extend(bundles);
-                let outputs = self
-                    .fetch_protocol
-                    .handle(FetchInput::CertificatesReceived {
-                        block_hash,
-                        certificates,
-                    });
-                self.process_fetch_outputs(outputs);
-            }
-
             NodeInput::FetchTransactionsFailed { block_hash, hashes } => {
                 let outputs = self.fetch_protocol.handle(FetchInput::FetchFailed {
                     block_hash,
@@ -597,19 +565,6 @@ where
                 // Tick to retry pending fetches.
                 let tick_outputs = self.fetch_protocol.handle(FetchInput::Tick);
                 self.process_fetch_outputs(tick_outputs);
-            }
-
-            NodeInput::FetchCertificatesFailed { block_hash, hashes } => {
-                let outputs = self.fetch_protocol.handle(FetchInput::FetchFailed {
-                    block_hash,
-                    kind: FetchKind::Certificate,
-                    hashes,
-                });
-                self.process_fetch_outputs(outputs);
-                // Tick to retry pending fetches.
-                let tick_outputs = self.fetch_protocol.handle(FetchInput::Tick);
-                self.process_fetch_outputs(tick_outputs);
-                self.update_fetch_tick_timer();
             }
 
             NodeInput::FetchTick => {
@@ -814,9 +769,6 @@ where
         if self.cross_shard_batch.is_expired(now) {
             self.flush_cross_shard_executions();
         }
-        if self.execution_certificate_batch.is_expired(now) {
-            self.flush_execution_certificate_verifications();
-        }
         if self.committed_header_batch.is_expired(now) {
             self.flush_committed_header_verifications();
         }
@@ -830,7 +782,6 @@ where
         [
             self.validation_batch.deadline(),
             self.cross_shard_batch.deadline(),
-            self.execution_certificate_batch.deadline(),
             self.committed_header_batch.deadline(),
         ]
         .into_iter()
@@ -929,7 +880,6 @@ where
 
         self.flush_validation_batch();
         self.flush_cross_shard_executions();
-        self.flush_execution_certificate_verifications();
         self.flush_committed_header_verifications();
     }
 }

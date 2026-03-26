@@ -12,7 +12,6 @@ pub mod execution_cache;
 pub mod handlers;
 pub mod wave_accumulator;
 
-mod pending;
 mod state;
 mod trackers;
 

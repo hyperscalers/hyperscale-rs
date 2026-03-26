@@ -42,7 +42,6 @@ use std::time::Duration;
 use tracing::instrument;
 
 use crate::execution_cache::ExecutionCache;
-use crate::pending::{PendingCertificateVerification, PendingFetchedCertificateVerification};
 use crate::trackers::{CertificateTracker, WaveVoteTracker};
 use crate::wave_accumulator::WaveAccumulator;
 
@@ -74,16 +73,6 @@ pub struct WaveCompletionData {
     pub tx_outcomes: Vec<hyperscale_types::WaveTxOutcome>,
     /// All participating shards (union across all txs in wave).
     pub participating_shards: Vec<ShardGroupId>,
-}
-
-/// Key type for the pending verifications reverse index.
-/// Identifies which type of verification and the secondary key (validator or shard).
-/// Note: Provision verification is handled by ProvisionCoordinator.
-/// Note: Vote verification is handled by VoteTracker with deferred batch verification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PendingVerificationKey {
-    /// Pending certificate verification for a shard.
-    Certificate(ShardGroupId),
 }
 
 /// Cached entry for speculative execution.
@@ -171,24 +160,6 @@ pub struct ExecutionState {
     /// Certificates that arrived before tracking started.
     /// Tracks (certificates, first_arrival_height) for cleanup of stale entries.
     early_certificates: HashMap<Hash, (Vec<ExecutionCertificate>, u64)>,
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Pending signature verifications
-    // ═══════════════════════════════════════════════════════════════════════
-    /// Note: Provision verification (QC + merkle proofs) is delegated via VerifyStateProvisions action.
-    /// Note: Vote signature verification is handled by VoteTracker with deferred batch verification.
-
-    /// Certificates awaiting signature verification.
-    /// Maps (tx_hash, shard_id) -> PendingCertificateVerification
-    pending_cert_verifications: HashMap<(Hash, ShardGroupId), PendingCertificateVerification>,
-
-    /// Fetched TransactionCertificates awaiting verification of all embedded ExecutionCertificates.
-    /// Maps tx_hash -> PendingFetchedCertificateVerification
-    pending_fetched_cert_verifications: HashMap<Hash, PendingFetchedCertificateVerification>,
-
-    /// Reverse index: tx_hash -> set of pending verification keys.
-    /// Enables O(k) cleanup instead of O(n) where k = verifications for this tx, n = total.
-    pending_verifications_by_tx: HashMap<Hash, HashSet<PendingVerificationKey>>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Speculative Execution State
@@ -288,9 +259,6 @@ impl ExecutionState {
             certificate_trackers: HashMap::new(),
             early_provisioning_complete: HashMap::new(),
             early_certificates: HashMap::new(),
-            pending_cert_verifications: HashMap::new(),
-            pending_fetched_cert_verifications: HashMap::new(),
-            pending_verifications_by_tx: HashMap::new(),
             speculative_results: HashMap::new(),
             speculative_in_flight_txs: HashSet::new(),
             speculative_reads_index: HashMap::new(),
@@ -1211,182 +1179,6 @@ impl ExecutionState {
     // Phase 5: Finalization
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Handle execution certificate signature verification result.
-    #[instrument(skip(self, certificate), fields(
-        tx_hash = ?certificate.transaction_hash,
-        shard = certificate.shard_group_id.0,
-        valid = valid
-    ))]
-    pub fn on_certificate_verified(
-        &mut self,
-        topology: &TopologySnapshot,
-        certificate: ExecutionCertificate,
-        valid: bool,
-    ) -> Vec<Action> {
-        let tx_hash = certificate.transaction_hash;
-        let shard = certificate.shard_group_id;
-
-        // Check if this is a fetched certificate verification
-        if self
-            .pending_fetched_cert_verifications
-            .contains_key(&tx_hash)
-        {
-            return self.handle_fetched_cert_verified(tx_hash, shard, valid);
-        }
-
-        // Otherwise, it's a gossiped certificate for cross-shard execution flow
-        self.pending_cert_verifications.remove(&(tx_hash, shard));
-        // Update reverse index
-        if let Some(keys) = self.pending_verifications_by_tx.get_mut(&tx_hash) {
-            keys.remove(&PendingVerificationKey::Certificate(shard));
-        }
-
-        if !valid {
-            tracing::warn!(
-                tx_hash = ?tx_hash,
-                shard = shard.0,
-                "Invalid execution certificate signature"
-            );
-            return vec![];
-        }
-
-        self.handle_certificate_internal(topology, Arc::new(certificate))
-    }
-
-    /// Handle verification result for a fetched certificate's ExecutionCertificate.
-    fn handle_fetched_cert_verified(
-        &mut self,
-        tx_hash: Hash,
-        shard: ShardGroupId,
-        valid: bool,
-    ) -> Vec<Action> {
-        let Some(pending) = self.pending_fetched_cert_verifications.get_mut(&tx_hash) else {
-            return vec![];
-        };
-
-        // Remove this shard from pending
-        pending.pending_shards.remove(&shard);
-
-        if !valid {
-            tracing::warn!(
-                tx_hash = ?tx_hash,
-                shard = shard.0,
-                "Invalid fetched certificate - ExecutionCertificate signature verification failed"
-            );
-            pending.has_failed = true;
-        }
-
-        // Check if all shards are verified
-        if !pending.pending_shards.is_empty() {
-            // Still waiting for more verifications
-            return vec![];
-        }
-
-        // All shards verified - remove from pending and emit result
-        let pending = self
-            .pending_fetched_cert_verifications
-            .remove(&tx_hash)
-            .unwrap();
-
-        if pending.has_failed {
-            tracing::warn!(
-                tx_hash = ?tx_hash,
-                block_hash = ?pending.block_hash,
-                "Fetched certificate failed verification - not adding to pending block"
-            );
-            return vec![];
-        }
-
-        tracing::debug!(
-            tx_hash = ?tx_hash,
-            block_hash = ?pending.block_hash,
-            "Fetched certificate verified successfully"
-        );
-
-        // Emit event so NodeStateMachine can route to BFT
-        vec![Action::Continuation(
-            ProtocolEvent::FetchedCertificateVerified {
-                block_hash: pending.block_hash,
-                certificate: pending.certificate,
-            },
-        )]
-    }
-
-    /// Verify a fetched TransactionCertificate by checking all embedded ExecutionCertificates.
-    ///
-    /// Each ExecutionCertificate is verified against its shard's committee public keys.
-    /// When all verify successfully, a FetchedCertificateVerified event is emitted.
-    pub fn verify_fetched_certificate(
-        &mut self,
-        topology: &TopologySnapshot,
-        block_hash: Hash,
-        certificate: TransactionCertificate,
-    ) -> Vec<Action> {
-        let tx_hash = certificate.transaction_hash;
-        let mut actions = Vec::new();
-
-        // Collect all shards that need verification
-        let pending_shards: HashSet<ShardGroupId> =
-            certificate.shard_proofs.keys().copied().collect();
-
-        if pending_shards.is_empty() {
-            // No proofs to verify (empty certificate) - accept it directly
-            tracing::debug!(
-                tx_hash = ?tx_hash,
-                block_hash = ?block_hash,
-                "Fetched certificate has no shard proofs - accepting directly"
-            );
-            return vec![Action::Continuation(
-                ProtocolEvent::FetchedCertificateVerified {
-                    block_hash,
-                    certificate,
-                },
-            )];
-        }
-
-        // Track the pending verification
-        self.pending_fetched_cert_verifications.insert(
-            tx_hash,
-            PendingFetchedCertificateVerification {
-                certificate: certificate.clone(),
-                block_hash,
-                pending_shards: pending_shards.clone(),
-                has_failed: false,
-            },
-        );
-
-        // Emit verification action for each embedded ExecutionCertificate
-        for (shard_id, execution_cert) in &certificate.shard_proofs {
-            // Get public keys for this shard's committee
-            let committee = topology.committee_for_shard(*shard_id);
-            let public_keys: Vec<Bls12381G1PublicKey> = committee
-                .iter()
-                .filter_map(|&vid| topology.public_key(vid))
-                .collect();
-
-            if public_keys.len() != committee.len() {
-                tracing::warn!(
-                    tx_hash = ?tx_hash,
-                    shard = shard_id.0,
-                    "Could not resolve all public keys for fetched certificate verification"
-                );
-                // Mark as failed but continue - other verifications may still succeed
-                if let Some(pending) = self.pending_fetched_cert_verifications.get_mut(&tx_hash) {
-                    pending.has_failed = true;
-                    pending.pending_shards.remove(shard_id);
-                }
-                continue;
-            }
-
-            actions.push(Action::VerifyExecutionCertificateSignature {
-                certificate: execution_cert.clone(),
-                public_keys,
-            });
-        }
-
-        actions
-    }
-
     /// Internal certificate handling (assumes tracking is active).
     #[instrument(level = "debug", skip(self, cert), fields(
         tx_hash = %cert.transaction_hash,
@@ -1509,18 +1301,6 @@ impl ExecutionState {
         self.certificate_trackers.remove(tx_hash);
         self.early_provisioning_complete.remove(tx_hash);
         self.early_certificates.remove(tx_hash);
-
-        // Pending verifications cleanup using reverse index for O(k) instead of O(n)
-        if let Some(keys) = self.pending_verifications_by_tx.remove(tx_hash) {
-            for key in keys {
-                match key {
-                    PendingVerificationKey::Certificate(shard) => {
-                        self.pending_cert_verifications.remove(&(*tx_hash, shard));
-                    }
-                }
-            }
-        }
-        self.pending_fetched_cert_verifications.remove(tx_hash);
     }
 
     /// Check if a transaction has been executed.
@@ -1647,59 +1427,10 @@ impl ExecutionState {
         self.early_provisioning_complete.remove(tx_hash);
         self.early_certificates.remove(tx_hash);
 
-        // Pending verifications cleanup using reverse index for O(k) instead of O(n)
-        // Note: Provision verification (QC + merkle proofs) is delegated via VerifyStateProvisions action
-        if let Some(keys) = self.pending_verifications_by_tx.remove(tx_hash) {
-            for key in keys {
-                match key {
-                    PendingVerificationKey::Certificate(shard) => {
-                        self.pending_cert_verifications.remove(&(*tx_hash, shard));
-                    }
-                }
-            }
-        }
-
         tracing::debug!(
             tx_hash = %tx_hash,
             "Cleaned up execution state for deferred/aborted transaction"
         );
-    }
-
-    /// Cancel local certificate building for a transaction.
-    ///
-    /// Called when we receive a verified certificate from another node (via fetch or gossip)
-    /// instead of building our own. This cleans up all local certificate building state:
-    /// certificate tracking, vote aggregation, our own ExecutionCertificate, and pending verifications.
-    ///
-    /// Note: This keeps `executed_txs` for deduplication.
-    pub fn cancel_certificate_building(&mut self, tx_hash: &Hash) {
-        let had_tracker = self.certificate_trackers.remove(tx_hash).is_some();
-        let had_early = self.early_certificates.remove(tx_hash).is_some();
-
-        // Clean up pending fetched certificate verifications for this tx
-        self.pending_fetched_cert_verifications.remove(tx_hash);
-
-        // Clean up pending verifications using reverse index
-        let mut removed_cert_count = 0;
-        if let Some(keys) = self.pending_verifications_by_tx.remove(tx_hash) {
-            for key in keys {
-                match key {
-                    PendingVerificationKey::Certificate(shard) => {
-                        self.pending_cert_verifications.remove(&(*tx_hash, shard));
-                        removed_cert_count += 1;
-                    }
-                }
-            }
-        }
-
-        if had_tracker || had_early || removed_cert_count > 0 {
-            tracing::debug!(
-                tx_hash = %tx_hash,
-                had_cert_tracker = had_tracker,
-                removed_cert_verifications = removed_cert_count,
-                "Cancelled local certificate building - using external certificate"
-            );
-        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

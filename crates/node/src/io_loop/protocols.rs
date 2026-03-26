@@ -97,8 +97,8 @@ where
 
     /// Process FetchProtocol outputs.
     ///
-    /// FetchTransactions/FetchCertificates use the Network trait to make requests.
-    /// DeliverTransactions/DeliverCertificates feed events directly to the state machine.
+    /// FetchTransactions uses the Network trait to make requests.
+    /// DeliverTransactions feeds events directly to the state machine.
     pub(super) fn process_fetch_outputs(&mut self, outputs: Vec<FetchOutput>) {
         for output in outputs {
             match output {
@@ -132,38 +132,6 @@ where
                         }),
                     );
                 }
-                FetchOutput::FetchCertificates {
-                    block_hash,
-                    proposer,
-                    cert_hashes,
-                } => {
-                    use hyperscale_messages::request::GetCertificatesRequest;
-                    let es = self.event_sender.clone();
-                    let bh = block_hash;
-                    let hs = cert_hashes.clone();
-                    let peers = self.local_peers();
-                    self.network.request(
-                        peers,
-                        Some(proposer),
-                        GetCertificatesRequest::new(block_hash, cert_hashes),
-                        Box::new(move |result| match result {
-                            Ok(resp) => {
-                                let (certificates, ledger_receipts) = resp.into_parts();
-                                let _ = es.send(NodeInput::CertificateReceived {
-                                    block_hash: bh,
-                                    certificates,
-                                    ledger_receipts,
-                                });
-                            }
-                            Err(_) => {
-                                let _ = es.send(NodeInput::FetchCertificatesFailed {
-                                    block_hash: bh,
-                                    hashes: hs,
-                                });
-                            }
-                        }),
-                    );
-                }
                 FetchOutput::DeliverTransactions {
                     block_hash,
                     transactions,
@@ -171,19 +139,6 @@ where
                     self.feed_event(ProtocolEvent::TransactionFetchDelivered {
                         block_hash,
                         transactions,
-                    });
-                }
-                FetchOutput::DeliverCertificates {
-                    block_hash,
-                    certificates,
-                } => {
-                    // Persist fetched certificates to storage so they survive restarts.
-                    for cert in &certificates {
-                        self.storage.store_certificate(cert);
-                    }
-                    self.feed_event(ProtocolEvent::CertificateFetchDelivered {
-                        block_hash,
-                        certificates,
                     });
                 }
             }
@@ -355,7 +310,7 @@ where
     /// When all fetches are complete, the timer is cancelled.
     pub(super) fn update_fetch_tick_timer(&mut self) {
         let status = self.fetch_protocol.status();
-        let has_fetch_work = status.pending_tx_blocks > 0 || status.pending_cert_blocks > 0;
+        let has_fetch_work = status.pending_tx_blocks > 0;
         let has_provision_work = self.provision_fetch_protocol.has_pending();
         let has_inclusion_proof_work = self.inclusion_proof_fetch_protocol.has_pending();
         if has_fetch_work || has_provision_work || has_inclusion_proof_work {
