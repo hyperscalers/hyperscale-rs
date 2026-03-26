@@ -62,9 +62,6 @@ where
             // ═══════════════════════════════════════════════════════════
             // Network broadcasts — batched
             // ═══════════════════════════════════════════════════════════
-            Action::BroadcastExecutionVote { shard, vote } => {
-                self.accumulate_broadcast_vote(shard, vote);
-            }
             Action::SignAndBroadcastWaveVote {
                 block_hash,
                 block_height,
@@ -146,31 +143,9 @@ where
                 );
                 self.network.notify(&recipients, &batch);
             }
-            Action::BroadcastExecutionCertificate {
-                shard,
-                certificate,
-                recipients,
-            } => {
-                // Use the first recipients list for each shard within a batch window.
-                // All certificates for the same shard should target the same committee,
-                // so subsequent entries are expected to be identical.
-                debug_assert!(
-                    !self.cert_broadcast_recipients.contains_key(&shard)
-                        || self.cert_broadcast_recipients[&shard] == recipients,
-                    "BroadcastExecutionCertificate recipients changed within batch for shard {}",
-                    shard.0
-                );
-                self.cert_broadcast_recipients
-                    .entry(shard)
-                    .or_insert(recipients);
-                self.accumulate_broadcast_cert(shard, certificate);
-            }
             // ═══════════════════════════════════════════════════════════
             // Delegated work — batched (accumulated for batch dispatch)
             // ═══════════════════════════════════════════════════════════
-            Action::VerifyAndAggregateExecutionVotes { tx_hash, votes } => {
-                self.accumulate_execution_vote_verification((tx_hash, votes));
-            }
             Action::VerifyExecutionCertificateSignature {
                 certificate,
                 public_keys,
@@ -200,7 +175,6 @@ where
             | Action::VerifyTransactionRoot { .. }
             | Action::VerifyReceiptRoot { .. }
             | Action::BuildProposal { .. }
-            | Action::AggregateExecutionCertificate { .. }
             | Action::VerifyProvisionBatch { .. }
             | Action::ExecuteTransactions { .. }
             | Action::SpeculativeExecute { .. }
@@ -767,11 +741,9 @@ where
         // Clone cheap shared state for the 'static spawn closure.
         let storage = Arc::clone(&self.storage);
         let executor = self.executor.clone();
-        let signing_key = Arc::clone(&self.signing_key);
         let dispatch = self.dispatch.clone();
         let local_shard = self.local_shard;
         let num_shards = self.num_shards;
-        let validator_id = self.validator_id;
         let prepared_commits = Arc::clone(&self.prepared_commits);
         let event_tx = self.event_sender.clone();
 
@@ -780,10 +752,8 @@ where
             let ctx = ActionContext {
                 storage: &*storage,
                 executor: &executor,
-                signing_key: &signing_key,
                 local_shard,
                 num_shards,
-                validator_id,
                 dispatch: &dispatch,
             };
             if let Some(result) = action_handler::handle_delegated_action(action, &ctx) {

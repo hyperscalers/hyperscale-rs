@@ -5,8 +5,7 @@ use super::IoLoop;
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_messages::{
-    BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
-    ExecutionVotesNotification, ExecutionWaveCertificatesNotification,
+    BlockHeaderNotification, BlockVoteNotification, ExecutionWaveCertificatesNotification,
     ExecutionWaveVotesNotification, TransactionGossip,
 };
 use hyperscale_network::Network;
@@ -334,91 +333,6 @@ where
                     let _ = tx.send(NodeInput::Protocol(
                         ProtocolEvent::StateProvisionsReceived { batch },
                     ));
-                },
-            );
-
-        // ── execution.vote.batch → verify sender sig, then ProtocolEvent::ExecutionVoteReceived ─
-
-        let tx = self.event_sender.clone();
-        let topology = self.topology.clone();
-        self.network
-            .register_notification_handler::<ExecutionVotesNotification>(
-                move |batch: ExecutionVotesNotification| {
-                    if batch.votes.is_empty() {
-                        return;
-                    }
-
-                    let topo = topology.load();
-                    let local_shard = topo.local_shard();
-                    let sender = batch.sender;
-                    let msg = batch.signing_message(local_shard);
-                    if !verify_sender_signature(
-                        &topo,
-                        sender,
-                        local_shard,
-                        &msg,
-                        &batch.sender_signature,
-                        "exec_vote_batch",
-                        "execution vote batch",
-                    ) {
-                        return;
-                    }
-
-                    for vote in batch.into_votes() {
-                        let _ =
-                            tx.send(NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived {
-                                vote,
-                            }));
-                    }
-                },
-            );
-
-        // ── execution.certificate.batch → verify sender sig, then ProtocolEvent::ExecutionCertificateReceived ─
-
-        let tx = self.event_sender.clone();
-        let topology = self.topology.clone();
-        self.network
-            .register_notification_handler::<ExecutionCertificatesNotification>(
-                move |batch: ExecutionCertificatesNotification| {
-                    if batch.certificates.is_empty() {
-                        return;
-                    }
-
-                    let topo = topology.load();
-                    let local_shard = topo.local_shard();
-                    let sender = batch.sender;
-                    // The sender is from the shard that produced the certificates,
-                    // which may differ from the local shard in cross-shard transactions.
-                    let source_shard = batch.certificates[0].shard_group_id;
-                    if batch
-                        .certificates
-                        .iter()
-                        .any(|c| c.shard_group_id != source_shard)
-                    {
-                        warn!(
-                            sender = sender.0,
-                            "Execution certificate batch contains mixed shard_group_ids — dropping"
-                        );
-                        return;
-                    }
-                    let msg = batch.signing_message(local_shard);
-                    if !verify_sender_signature(
-                        &topo,
-                        sender,
-                        source_shard,
-                        &msg,
-                        &batch.sender_signature,
-                        "exec_cert_batch",
-                        "execution certificate batch",
-                    ) {
-                        return;
-                    }
-
-                    for cert in batch.into_certificates() {
-                        let _ = tx.send(NodeInput::Protocol(
-                            ProtocolEvent::ExecutionCertificateReceived { cert },
-                        ));
-                    }
                 },
             );
 

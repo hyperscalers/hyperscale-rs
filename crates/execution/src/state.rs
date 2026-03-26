@@ -32,9 +32,9 @@
 
 use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionVote, ExecutionWaveVote, Hash,
-    NodeId, RoutableTransaction, ShardGroupId, StateProvision, TopologySnapshot,
-    TransactionCertificate, TransactionDecision, ValidatorId, WaveId,
+    BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionWaveVote, Hash, NodeId,
+    RoutableTransaction, ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate,
+    TransactionDecision, ValidatorId, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -42,11 +42,8 @@ use std::time::Duration;
 use tracing::instrument;
 
 use crate::execution_cache::ExecutionCache;
-use crate::pending::{
-    PendingCertificateAggregation, PendingCertificateVerification,
-    PendingFetchedCertificateVerification,
-};
-use crate::trackers::{CertificateTracker, VoteTracker, WaveVoteTracker};
+use crate::pending::{PendingCertificateVerification, PendingFetchedCertificateVerification};
+use crate::trackers::{CertificateTracker, WaveVoteTracker};
 use crate::wave_accumulator::WaveAccumulator;
 
 /// Number of blocks to retain executed transaction hashes for deduplication.
@@ -58,10 +55,6 @@ const EXECUTED_TX_RETENTION_BLOCKS: u64 = 50;
 /// If an early arrival hasn't been processed within this many blocks, it's
 /// likely stale and should be removed to prevent unbounded memory growth.
 const EARLY_ARRIVAL_RETENTION_BLOCKS: u64 = 500;
-
-/// Number of blocks to retain verified vote cache entries.
-/// Votes older than this are cleaned up regardless of finalization status.
-const VERIFIED_VOTE_RETENTION_BLOCKS: u64 = 100;
 
 /// Data returned when a wave completes (all txs executed).
 ///
@@ -142,22 +135,7 @@ pub struct ExecutionState {
     pending_provisioning: HashMap<Hash, (Arc<RoutableTransaction>, u64)>,
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Cross-shard state (Phase 3-4: Voting)
-    // ═══════════════════════════════════════════════════════════════════════
-    /// Vote trackers for cross-shard transactions.
-    /// Maps tx_hash -> VoteTracker
-    vote_trackers: HashMap<Hash, VoteTracker>,
-
-    /// Execution certificates from vote aggregation (local shard's certificate).
-    /// Maps tx_hash -> ExecutionCertificate
-    execution_certificates: HashMap<Hash, Arc<ExecutionCertificate>>,
-
-    /// Pending certificate aggregations waiting for BLS aggregation callback.
-    /// Maps tx_hash -> PendingCertificateAggregation
-    pending_cert_aggregations: HashMap<Hash, PendingCertificateAggregation>,
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Wave-based voting state (replaces per-tx voting when active)
+    // Wave-based voting state
     // ═══════════════════════════════════════════════════════════════════════
     /// Wave accumulators: collect per-tx execution results within each wave.
     /// Keyed by (block_hash, wave_id) to handle multiple blocks in flight.
@@ -190,11 +168,6 @@ pub struct ExecutionState {
     /// Maps tx_hash -> (provisions, first_arrival_height) for cleanup of stale entries.
     early_provisioning_complete: HashMap<Hash, (Vec<StateProvision>, u64)>,
 
-    /// Votes that arrived before tracking started.
-    /// Uses HashSet for O(1) deduplication instead of O(n) Vec::contains.
-    /// Tracks (votes, first_arrival_height) for cleanup of stale entries.
-    early_votes: HashMap<Hash, (HashSet<ExecutionVote>, u64)>,
-
     /// Certificates that arrived before tracking started.
     /// Tracks (certificates, first_arrival_height) for cleanup of stale entries.
     early_certificates: HashMap<Hash, (Vec<ExecutionCertificate>, u64)>,
@@ -216,17 +189,6 @@ pub struct ExecutionState {
     /// Reverse index: tx_hash -> set of pending verification keys.
     /// Enables O(k) cleanup instead of O(n) where k = verifications for this tx, n = total.
     pending_verifications_by_tx: HashMap<Hash, HashSet<PendingVerificationKey>>,
-
-    /// Cache of already-verified execution vote signatures.
-    /// Maps (tx_hash, validator_id) -> height when verified.
-    /// When we see the same vote again (e.g., during gossiping or retries),
-    /// we can skip re-verification and proceed directly to vote aggregation.
-    /// The height is stored to enable cleanup of old entries after finalization.
-    verified_execution_votes: HashMap<(Hash, ValidatorId), u64>,
-
-    /// Reverse index: tx_hash -> set of validator IDs with verified votes.
-    /// Enables O(k) cleanup instead of O(n) where k = verified votes for this tx.
-    verified_votes_by_tx: HashMap<Hash, HashSet<ValidatorId>>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Speculative Execution State
@@ -319,22 +281,16 @@ impl ExecutionState {
             finalized_certificates: BTreeMap::new(),
             committed_height: 0,
             pending_provisioning: HashMap::new(),
-            vote_trackers: HashMap::new(),
-            execution_certificates: HashMap::new(),
-            pending_cert_aggregations: HashMap::new(),
             wave_accumulators: HashMap::new(),
             wave_vote_trackers: HashMap::new(),
             wave_assignments: HashMap::new(),
             early_wave_votes: HashMap::new(),
             certificate_trackers: HashMap::new(),
             early_provisioning_complete: HashMap::new(),
-            early_votes: HashMap::new(),
             early_certificates: HashMap::new(),
             pending_cert_verifications: HashMap::new(),
             pending_fetched_cert_verifications: HashMap::new(),
             pending_verifications_by_tx: HashMap::new(),
-            verified_execution_votes: HashMap::new(),
-            verified_votes_by_tx: HashMap::new(),
             speculative_results: HashMap::new(),
             speculative_in_flight_txs: HashSet::new(),
             speculative_reads_index: HashMap::new(),
@@ -1008,7 +964,6 @@ impl ExecutionState {
         // Prune old entries to prevent unbounded growth
         self.prune_executed_txs();
         self.prune_early_arrivals();
-        self.prune_verified_votes();
 
         // Separate single-shard and cross-shard transactions
         let (single_shard, cross_shard): (Vec<_>, Vec<_>) = new_txs
@@ -1029,23 +984,21 @@ impl ExecutionState {
             let tx_hash = tx.hash();
 
             if self.take_speculative_result(&tx_hash).is_some() {
-                // Speculation completed - votes already signed and sent
+                // Speculation completed - results already cached
                 self.speculative_in_flight_txs.remove(&tx_hash);
                 tracing::debug!(
                     tx_hash = ?tx_hash,
-                    "SPECULATIVE HIT: Votes already sent, skipping execution"
+                    "SPECULATIVE HIT: Results already cached, skipping execution"
                 );
-                // Just start tracking (vote trackers, etc.) - votes will arrive via ExecutionVoteReceived
                 actions.extend(self.start_single_shard_execution(topology, tx.clone()));
             } else if self.speculative_in_flight_txs.contains(&tx_hash) {
-                // Speculation in-flight - votes will be sent when it completes
+                // Speculation in-flight - results will arrive when it completes
                 // This counts as a hit since we're skipping re-execution
                 self.speculative_cache_hit_count += 1;
                 tracing::debug!(
                     tx_hash = ?tx_hash,
-                    "SPECULATIVE IN-FLIGHT: Votes will arrive soon, skipping execution"
+                    "SPECULATIVE IN-FLIGHT: Results will arrive soon, skipping execution"
                 );
-                // Just start tracking - votes will arrive via ExecutionVoteReceived
                 actions.extend(self.start_single_shard_execution(topology, tx.clone()));
             } else {
                 // No speculation at all - execute normally
@@ -1082,15 +1035,10 @@ impl ExecutionState {
         actions
     }
 
-    /// Start single-shard execution with proper voting.
+    /// Start single-shard execution tracking.
     ///
-    /// Single-shard transactions use the same voting pattern as cross-shard transactions:
-    /// 1. Execute locally without provisioning (no cross-shard state needed)
-    /// 2. Create a signed vote on the execution result
-    /// 3. Broadcast vote within the shard
-    /// 4. Vote aggregator collects votes and creates certificate when quorum reached
-    ///
-    /// This requires BLS signature aggregation for all transactions, not just cross-shard ones.
+    /// Sets up certificate tracking for finalization. Voting is handled by
+    /// the wave path — no per-tx vote tracking needed.
     fn start_single_shard_execution(
         &mut self,
         topology: &TopologySnapshot,
@@ -1103,42 +1051,15 @@ impl ExecutionState {
         tracing::debug!(
             tx_hash = ?tx_hash,
             shard = local_shard.0,
-            "Starting single-shard execution with voting"
+            "Starting single-shard execution tracking"
         );
 
-        // Step 1: Start tracking votes (same as cross-shard)
-        let quorum = topology.local_quorum_threshold();
-        let vote_tracker = VoteTracker::new(
-            tx_hash,
-            vec![local_shard], // Only our shard participates
-            tx.declared_reads.clone(),
-            quorum,
-        );
-        self.vote_trackers.insert(tx_hash, vote_tracker);
-
-        // Step 2: Start tracking certificates for finalization (single shard only)
+        // Start tracking certificates for finalization (single shard only)
         let participating_shards: BTreeSet<_> = [local_shard].into_iter().collect();
         let cert_tracker = CertificateTracker::new(tx_hash, participating_shards);
         self.certificate_trackers.insert(tx_hash, cert_tracker);
 
-        // Step 3: Replay any early votes that arrived before tracking started.
-        // IMPORTANT: We must go through on_vote() to ensure proper signature verification.
-        // Early votes were buffered without verification, so they need to be verified now.
-        if let Some((early_votes, _arrival_height)) = self.early_votes.remove(&tx_hash) {
-            tracing::debug!(
-                tx_hash = ?tx_hash,
-                count = early_votes.len(),
-                "Replaying early votes for single-shard tx"
-            );
-            for vote in early_votes {
-                // Use on_vote() to ensure signature verification happens
-                actions.extend(self.on_vote(topology, vote));
-            }
-        }
-
-        // Step 4: Replay any early certificates (shouldn't happen often for single-shard).
-        // IMPORTANT: We must go through on_certificate() to ensure proper signature verification.
-        // Early certificates were buffered without verification, so they need to be verified now.
+        // Replay any early certificates that arrived before tracking started.
         if let Some((early_certs, _arrival_height)) = self.early_certificates.remove(&tx_hash) {
             tracing::debug!(
                 tx_hash = ?tx_hash,
@@ -1146,8 +1067,7 @@ impl ExecutionState {
                 "Replaying early certificates for single-shard tx"
             );
             for cert in early_certs {
-                // Use on_certificate() to ensure signature verification happens
-                actions.extend(self.on_certificate(topology, cert));
+                actions.extend(self.handle_certificate_internal(topology, Arc::new(cert)));
             }
         }
 
@@ -1221,39 +1141,15 @@ impl ExecutionState {
             }
         }
 
-        // Phase 3-4: Start tracking votes
-        let quorum = topology.local_quorum_threshold();
-        let vote_tracker = VoteTracker::new(
-            tx_hash,
-            participating_shards.iter().copied().collect(),
-            tx.declared_reads.clone(),
-            quorum,
-        );
-        self.vote_trackers.insert(tx_hash, vote_tracker);
-
-        // Phase 5: Start tracking certificates for finalization
+        // Start tracking certificates for finalization
         let cert_tracker = CertificateTracker::new(tx_hash, participating_shards.clone());
         self.certificate_trackers.insert(tx_hash, cert_tracker);
 
-        // Replay any early votes.
-        // IMPORTANT: We must go through on_vote() to ensure proper signature verification.
-        // Early votes were buffered without verification, so they need to be verified now.
-        if let Some((early_votes, _arrival_height)) = self.early_votes.remove(&tx_hash) {
-            tracing::debug!(tx_hash = ?tx_hash, count = early_votes.len(), "Replaying early votes");
-            for vote in early_votes {
-                // Use on_vote() to ensure signature verification happens
-                actions.extend(self.on_vote(topology, vote));
-            }
-        }
-
-        // Replay any early certificates.
-        // IMPORTANT: We must go through on_certificate() to ensure proper signature verification.
-        // Early certificates were buffered without verification, so they need to be verified now.
+        // Replay any early certificates that arrived before tracking started.
         if let Some((early_certs, _arrival_height)) = self.early_certificates.remove(&tx_hash) {
             tracing::debug!(tx_hash = ?tx_hash, count = early_certs.len(), "Replaying early certificates");
             for cert in early_certs {
-                // Use on_certificate() to ensure signature verification happens
-                actions.extend(self.on_certificate(topology, cert));
+                actions.extend(self.handle_certificate_internal(topology, Arc::new(cert)));
             }
         }
 
@@ -1312,416 +1208,8 @@ impl ExecutionState {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Phase 3: Vote Aggregation
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Handle an execution vote received from another validator.
-    ///
-    /// Uses deferred verification: votes are buffered until we have enough
-    /// voting power to possibly reach quorum. Only then do we batch-verify
-    /// all buffered votes, avoiding wasted CPU on votes we'll never use.
-    ///
-    /// Sender identity comes from vote.validator_id.
-    #[instrument(skip(self, vote), fields(
-        tx_hash = ?vote.transaction_hash,
-        validator = ?vote.validator,
-        success = vote.success
-    ))]
-    pub fn on_vote(&mut self, topology: &TopologySnapshot, vote: ExecutionVote) -> Vec<Action> {
-        let tx_hash = vote.transaction_hash;
-        let validator_id = vote.validator;
-
-        // Check if we're tracking this transaction
-        if !self.vote_trackers.contains_key(&tx_hash) {
-            // Not tracking - check if certificate already exists
-            if self.execution_certificates.contains_key(&tx_hash) {
-                return vec![];
-            }
-            // Buffer for later (HashSet provides O(1) deduplication)
-            // Track arrival height for cleanup of stale entries
-            let current_height = self.committed_height;
-            self.early_votes
-                .entry(tx_hash)
-                .or_insert_with(|| (HashSet::new(), current_height))
-                .0
-                .insert(vote);
-            return vec![];
-        }
-
-        // Skip verification for our own vote - we just signed it, so we trust it.
-        // This can happen when our vote is gossiped back to us via the network.
-        if validator_id == topology.local_validator_id() {
-            tracing::trace!(
-                tx_hash = ?tx_hash,
-                "Skipping verification for own vote"
-            );
-            return self.handle_verified_vote(topology, vote);
-        }
-
-        // Check if we've already verified this exact vote (by tx_hash + validator).
-        // This happens when votes are gossiped multiple times or during retries.
-        if self
-            .verified_execution_votes
-            .contains_key(&(tx_hash, validator_id))
-        {
-            tracing::trace!(
-                tx_hash = ?tx_hash,
-                validator = validator_id.0,
-                "Execution vote already verified, skipping re-verification"
-            );
-            return self.handle_verified_vote(topology, vote);
-        }
-
-        // Get public key for signature verification
-        let Some(public_key) = topology.public_key(validator_id) else {
-            tracing::warn!(
-                tx_hash = ?tx_hash,
-                validator = validator_id.0,
-                "Unknown validator for execution vote"
-            );
-            return vec![];
-        };
-
-        // Get voting power
-        let voting_power = topology.voting_power(validator_id).unwrap_or(0);
-
-        // Get the tracker and buffer the vote
-        let tracker = self.vote_trackers.get_mut(&tx_hash).unwrap();
-
-        // Check if already seen (dedup within tracker)
-        if tracker.has_seen_validator(validator_id) {
-            return vec![];
-        }
-
-        // Buffer the unverified vote
-        tracker.buffer_unverified_vote(vote, public_key, voting_power);
-
-        // Check if we should trigger batch verification
-        self.maybe_trigger_execution_vote_verification(tx_hash)
-    }
-
-    /// Check if we have enough buffered votes to trigger verification.
-    fn maybe_trigger_execution_vote_verification(&mut self, tx_hash: Hash) -> Vec<Action> {
-        let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
-            return vec![];
-        };
-
-        if !tracker.should_trigger_verification() {
-            return vec![];
-        }
-
-        // Take the unverified votes for batch verification
-        let votes = tracker.take_unverified_votes();
-
-        if votes.is_empty() {
-            return vec![];
-        }
-
-        tracing::debug!(
-            tx_hash = ?tx_hash,
-            vote_count = votes.len(),
-            "Triggering batch execution vote verification (have enough for quorum)"
-        );
-
-        vec![Action::VerifyAndAggregateExecutionVotes { tx_hash, votes }]
-    }
-
-    /// Handle batch execution vote verification result.
-    ///
-    /// Callback from `Action::VerifyAndAggregateExecutionVotes`.
-    #[instrument(skip(self, verified_votes), fields(
-        tx_hash = ?tx_hash,
-        verified_count = verified_votes.len()
-    ))]
-    pub fn on_execution_votes_verified(
-        &mut self,
-        topology: &TopologySnapshot,
-        tx_hash: Hash,
-        verified_votes: Vec<(ExecutionVote, u64)>,
-    ) -> Vec<Action> {
-        let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
-            tracing::debug!(
-                tx_hash = ?tx_hash,
-                "Execution votes verified but no tracker found (tx cleaned up)"
-            );
-            return vec![];
-        };
-
-        // Clear the pending verification flag
-        tracker.on_verification_complete();
-
-        if verified_votes.is_empty() {
-            tracing::warn!(
-                tx_hash = ?tx_hash,
-                "All execution votes in batch failed verification"
-            );
-            // Check if more votes arrived while we were verifying
-            return self.maybe_trigger_execution_vote_verification(tx_hash);
-        }
-
-        tracing::debug!(
-            tx_hash = ?tx_hash,
-            verified_count = verified_votes.len(),
-            "Batch execution vote verification complete"
-        );
-
-        // Add all verified votes to the tracker and cache them
-        let mut actions = Vec::new();
-        for (vote, voting_power) in verified_votes {
-            let validator_id = vote.validator;
-
-            // Cache the verified vote
-            self.verified_execution_votes
-                .insert((tx_hash, validator_id), 0);
-            self.verified_votes_by_tx
-                .entry(tx_hash)
-                .or_default()
-                .insert(validator_id);
-
-            // Add to tracker as verified
-            if let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) {
-                tracker.add_verified_vote(vote, voting_power);
-            }
-        }
-
-        // Check for quorum after adding all verified votes
-        actions.extend(self.check_vote_quorum(topology, tx_hash));
-
-        // Check if more votes arrived while we were verifying
-        actions.extend(self.maybe_trigger_execution_vote_verification(tx_hash));
-
-        actions
-    }
-
-    /// Handle a verified vote (own vote or already-verified vote).
-    ///
-    /// Adds the vote to the tracker and checks for quorum.
-    fn handle_verified_vote(
-        &mut self,
-        topology: &TopologySnapshot,
-        vote: ExecutionVote,
-    ) -> Vec<Action> {
-        let tx_hash = vote.transaction_hash;
-        let voting_power = topology.voting_power(vote.validator).unwrap_or(0);
-
-        let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
-            return vec![];
-        };
-
-        // Mark as seen to prevent re-buffering if vote arrives again
-        let validator_id = vote.validator;
-        if !tracker.has_seen_validator(validator_id) {
-            // Record in verified_execution_votes to prevent re-buffering on duplicate arrival
-            self.verified_execution_votes
-                .insert((tx_hash, validator_id), 0);
-            self.verified_votes_by_tx
-                .entry(tx_hash)
-                .or_default()
-                .insert(validator_id);
-        }
-
-        tracker.add_verified_vote(vote, voting_power);
-
-        self.check_vote_quorum(topology, tx_hash)
-    }
-
-    /// Check if quorum is reached for a transaction's votes.
-    ///
-    /// If quorum is reached, triggers BLS signature aggregation.
-    fn check_vote_quorum(&mut self, topology: &TopologySnapshot, tx_hash: Hash) -> Vec<Action> {
-        let local_shard = topology.local_shard();
-
-        let Some(tracker) = self.vote_trackers.get_mut(&tx_hash) else {
-            return vec![];
-        };
-
-        // Check for quorum
-        let Some((receipt_hash, total_power)) = tracker.check_quorum() else {
-            return vec![];
-        };
-
-        // Extract data from tracker - use take_votes_for_receipt_hash to avoid cloning
-        let votes = tracker.take_votes_for_receipt_hash(&receipt_hash);
-        let read_nodes = tracker.read_nodes().to_vec();
-        let participating_shards = tracker.participating_shards().to_vec();
-
-        // Take write_nodes from the first vote — all votes within a shard have
-        // identical write_nodes (deterministic execution), so any vote suffices.
-        let write_nodes = votes
-            .first()
-            .map(|v| v.write_nodes.clone())
-            .unwrap_or_default();
-
-        tracing::debug!(
-            tx_hash = ?tx_hash,
-            shard = local_shard.0,
-            receipt_hash = ?receipt_hash,
-            votes = votes.len(),
-            power = total_power,
-            "Vote quorum reached - delegating BLS aggregation"
-        );
-
-        // Store pending aggregation state for callback
-        self.pending_cert_aggregations.insert(
-            tx_hash,
-            PendingCertificateAggregation {
-                participating_shards,
-            },
-        );
-
-        // Delegate BLS signature aggregation to crypto pool
-        let committee = topology.local_committee().to_vec();
-
-        // Remove vote tracker (we've extracted what we need)
-        self.vote_trackers.remove(&tx_hash);
-
-        vec![Action::AggregateExecutionCertificate {
-            tx_hash,
-            shard: local_shard,
-            receipt_hash,
-            votes,
-            read_nodes,
-            write_nodes,
-            committee,
-        }]
-    }
-
-    /// Handle execution certificate aggregation completed.
-    ///
-    /// Callback from `Action::AggregateExecutionCertificate`. The crypto pool has
-    /// finished BLS signature aggregation and produced the certificate.
-    #[instrument(skip(self, certificate), fields(
-        tx_hash = ?tx_hash,
-        shard = certificate.shard_group_id.0,
-        success = certificate.success
-    ))]
-    pub fn on_execution_certificate_aggregated(
-        &mut self,
-        topology: &TopologySnapshot,
-        tx_hash: Hash,
-        certificate: ExecutionCertificate,
-    ) -> Vec<Action> {
-        let mut actions = Vec::new();
-
-        // Get pending aggregation state
-        let Some(pending) = self.pending_cert_aggregations.remove(&tx_hash) else {
-            tracing::warn!(
-                tx_hash = ?tx_hash,
-                "Received certificate aggregation callback but no pending aggregation found"
-            );
-            return actions;
-        };
-
-        tracing::debug!(
-            tx_hash = ?tx_hash,
-            shard = certificate.shard_group_id.0,
-            participating_shards = pending.participating_shards.len(),
-            "Execution certificate aggregation complete"
-        );
-
-        let certificate = Arc::new(certificate);
-        self.execution_certificates
-            .insert(tx_hash, Arc::clone(&certificate));
-
-        // Broadcast certificate to remote participating shards only.
-        // Local shard peers independently form the same certificate from the
-        // same execution votes, so sending it intra-shard is redundant.
-        let local_shard = topology.local_shard();
-        let local_vid = topology.local_validator_id();
-        for target_shard in pending.participating_shards {
-            if target_shard == local_shard {
-                continue;
-            }
-            let recipients: Vec<ValidatorId> = topology
-                .committee_for_shard(target_shard)
-                .iter()
-                .copied()
-                .filter(|&v| v != local_vid)
-                .collect();
-            actions.push(Action::BroadcastExecutionCertificate {
-                shard: target_shard,
-                certificate: Arc::clone(&certificate),
-                recipients,
-            });
-        }
-
-        // Handle our own certificate
-        actions.extend(self.handle_certificate_internal(topology, certificate));
-
-        actions
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════════
     // Phase 5: Finalization
     // ═══════════════════════════════════════════════════════════════════════════
-
-    /// Handle an execution certificate received from another validator.
-    ///
-    /// Delegates signature verification to the runner before processing.
-    #[instrument(skip(self, cert), fields(
-        tx_hash = ?cert.transaction_hash,
-        shard = cert.shard_group_id.0,
-        success = cert.success
-    ))]
-    pub fn on_certificate(
-        &mut self,
-        topology: &TopologySnapshot,
-        cert: ExecutionCertificate,
-    ) -> Vec<Action> {
-        let tx_hash = cert.transaction_hash;
-        let shard = cert.shard_group_id;
-
-        // Check if we're tracking this transaction
-        if !self.certificate_trackers.contains_key(&tx_hash) {
-            // Not tracking - check if already finalized
-            if self.finalized_certificates.contains_key(&tx_hash) {
-                return vec![];
-            }
-            // Buffer for later, track arrival height for cleanup of stale entries
-            let current_height = self.committed_height;
-            self.early_certificates
-                .entry(tx_hash)
-                .or_insert_with(|| (Vec::new(), current_height))
-                .0
-                .push(cert);
-            return vec![];
-        }
-
-        // Get public keys for the signers in the certificate's source shard
-        let committee = topology.committee_for_shard(shard);
-        let public_keys: Vec<Bls12381G1PublicKey> = committee
-            .iter()
-            .filter_map(|&vid| topology.public_key(vid))
-            .collect();
-
-        if public_keys.len() != committee.len() {
-            tracing::warn!(
-                tx_hash = ?tx_hash,
-                shard = shard.0,
-                "Could not resolve all public keys for certificate verification"
-            );
-            return vec![];
-        }
-
-        // Track pending verification
-        self.pending_cert_verifications.insert(
-            (tx_hash, shard),
-            PendingCertificateVerification {
-                certificate: cert.clone(),
-            },
-        );
-        // Update reverse index for O(k) cleanup
-        self.pending_verifications_by_tx
-            .entry(tx_hash)
-            .or_default()
-            .insert(PendingVerificationKey::Certificate(shard));
-
-        // Delegate signature verification to runner
-        vec![Action::VerifyExecutionCertificateSignature {
-            certificate: cert,
-            public_keys,
-        }]
-    }
 
     /// Handle execution certificate signature verification result.
     #[instrument(skip(self, certificate), fields(
@@ -2007,13 +1495,6 @@ impl ExecutionState {
     /// Cleans up all transaction tracking state. The certificate itself is already
     /// persisted to storage by this point and can be fetched from there by peers.
     pub fn remove_finalized_certificate(&mut self, tx_hash: &Hash) {
-        // Clean up verified vote cache using reverse index for O(k) instead of O(n)
-        if let Some(validators) = self.verified_votes_by_tx.remove(tx_hash) {
-            for vid in validators {
-                self.verified_execution_votes.remove(&(*tx_hash, vid));
-            }
-        }
-
         // Remove from finalized certificates
         self.finalized_certificates.remove(tx_hash);
 
@@ -2025,11 +1506,8 @@ impl ExecutionState {
         // but we need to do it here for successful completions too.
         self.pending_provisioning.remove(tx_hash);
 
-        self.vote_trackers.remove(tx_hash);
-        self.execution_certificates.remove(tx_hash);
         self.certificate_trackers.remove(tx_hash);
         self.early_provisioning_complete.remove(tx_hash);
-        self.early_votes.remove(tx_hash);
         self.early_certificates.remove(tx_hash);
 
         // Pending verifications cleanup using reverse index for O(k) instead of O(n)
@@ -2043,7 +1521,6 @@ impl ExecutionState {
             }
         }
         self.pending_fetched_cert_verifications.remove(tx_hash);
-        self.pending_cert_aggregations.remove(tx_hash);
     }
 
     /// Check if a transaction has been executed.
@@ -2075,65 +1552,17 @@ impl ExecutionState {
             .retain(|_, (_, arrival_height)| *arrival_height > cutoff);
         let pruned_provisions = before_provisions - self.early_provisioning_complete.len();
 
-        let before_votes = self.early_votes.len();
-        self.early_votes
-            .retain(|_, (_, arrival_height)| *arrival_height > cutoff);
-        let pruned_votes = before_votes - self.early_votes.len();
-
         let before_certs = self.early_certificates.len();
         self.early_certificates
             .retain(|_, (_, arrival_height)| *arrival_height > cutoff);
         let pruned_certs = before_certs - self.early_certificates.len();
 
-        if pruned_provisions > 0 || pruned_votes > 0 || pruned_certs > 0 {
+        if pruned_provisions > 0 || pruned_certs > 0 {
             tracing::debug!(
                 pruned_provisions,
-                pruned_votes,
                 pruned_certs,
                 cutoff_height = cutoff,
                 "Pruned stale early arrivals"
-            );
-        }
-    }
-
-    /// Prune old verified vote cache entries to prevent unbounded growth.
-    ///
-    /// The verified vote cache stores signatures we've already verified to avoid
-    /// re-verification. Entries older than VERIFIED_VOTE_RETENTION_BLOCKS are
-    /// cleaned up regardless of whether the transaction has finalized.
-    fn prune_verified_votes(&mut self) {
-        let cutoff = self
-            .committed_height
-            .saturating_sub(VERIFIED_VOTE_RETENTION_BLOCKS);
-
-        // Single-pass: prune old votes directly from verified_execution_votes,
-        // then clean up verified_votes_by_tx for entries with no remaining votes.
-        let mut pruned_count = 0;
-
-        // Remove old votes from verified_execution_votes and track which tx_hashes need cleanup
-        self.verified_execution_votes
-            .retain(|(tx_hash, vid), height| {
-                if *height <= cutoff {
-                    // Vote is old, remove it. Also remove from the by_tx index.
-                    if let Some(validators) = self.verified_votes_by_tx.get_mut(tx_hash) {
-                        validators.remove(vid);
-                    }
-                    pruned_count += 1;
-                    false
-                } else {
-                    true
-                }
-            });
-
-        // Clean up empty entries in verified_votes_by_tx
-        self.verified_votes_by_tx
-            .retain(|_, validators| !validators.is_empty());
-
-        if pruned_count > 0 {
-            tracing::debug!(
-                pruned_count,
-                cutoff_height = cutoff,
-                "Pruned old verified vote cache entries"
             );
         }
     }
@@ -2150,20 +1579,8 @@ impl ExecutionState {
         self.pending_provisioning.contains_key(tx_hash)
     }
 
-    /// Check if we're tracking votes for a transaction.
-    pub fn is_tracking_votes(&self, tx_hash: &Hash) -> bool {
-        self.vote_trackers.contains_key(tx_hash)
-    }
-
-    /// Check if we have an execution certificate for a transaction.
-    pub fn has_execution_certificate(&self, tx_hash: &Hash) -> bool {
-        self.execution_certificates.contains_key(tx_hash)
-    }
-
     /// Get debug info about certificate tracking state for a transaction.
     pub fn certificate_tracking_debug(&self, tx_hash: &Hash) -> String {
-        let has_vote_tracker = self.vote_trackers.contains_key(tx_hash);
-        let has_execution_certificate = self.execution_certificates.contains_key(tx_hash);
         let has_cert_tracker = self.certificate_trackers.contains_key(tx_hash);
         let early_cert_count = self
             .early_certificates
@@ -2182,12 +1599,8 @@ impl ExecutionState {
         };
 
         format!(
-            "vote_tracker={}, execution_cert={}, cert_tracker={} ({}), early_certs={}",
-            has_vote_tracker,
-            has_execution_certificate,
-            has_cert_tracker,
-            cert_tracker_info,
-            early_cert_count
+            "cert_tracker={} ({}), early_certs={}",
+            has_cert_tracker, cert_tracker_info, early_cert_count
         )
     }
 
@@ -2218,8 +1631,6 @@ impl ExecutionState {
         self.pending_provisioning.remove(tx_hash);
 
         // Phase 3-4: Vote cleanup
-        self.vote_trackers.remove(tx_hash);
-        self.execution_certificates.remove(tx_hash);
 
         // Wave voting cleanup
         if let Some(wave_key) = self.wave_assignments.remove(tx_hash) {
@@ -2234,7 +1645,6 @@ impl ExecutionState {
 
         // Early arrivals cleanup
         self.early_provisioning_complete.remove(tx_hash);
-        self.early_votes.remove(tx_hash);
         self.early_certificates.remove(tx_hash);
 
         // Pending verifications cleanup using reverse index for O(k) instead of O(n)
@@ -2246,13 +1656,6 @@ impl ExecutionState {
                         self.pending_cert_verifications.remove(&(*tx_hash, shard));
                     }
                 }
-            }
-        }
-
-        // Verified vote cache cleanup using reverse index for O(k) instead of O(n)
-        if let Some(validators) = self.verified_votes_by_tx.remove(tx_hash) {
-            for vid in validators {
-                self.verified_execution_votes.remove(&(*tx_hash, vid));
             }
         }
 
@@ -2273,15 +1676,6 @@ impl ExecutionState {
         let had_tracker = self.certificate_trackers.remove(tx_hash).is_some();
         let had_early = self.early_certificates.remove(tx_hash).is_some();
 
-        // Clean up vote aggregation - we don't need to build our own ExecutionCertificate
-        let had_vote_tracker = self.vote_trackers.remove(tx_hash).is_some();
-        let had_aggregation = self.pending_cert_aggregations.remove(tx_hash).is_some();
-        self.early_votes.remove(tx_hash);
-
-        // Clean up our local ExecutionCertificate - peers can't request it, and the
-        // external certificate we received contains all the ExecutionCertificates we need
-        self.execution_certificates.remove(tx_hash);
-
         // Clean up pending fetched certificate verifications for this tx
         self.pending_fetched_cert_verifications.remove(tx_hash);
 
@@ -2298,20 +1692,10 @@ impl ExecutionState {
             }
         }
 
-        // Clean up verified votes cache
-        if let Some(validators) = self.verified_votes_by_tx.remove(tx_hash) {
-            for vid in validators {
-                self.verified_execution_votes.remove(&(*tx_hash, vid));
-            }
-        }
-
-        if had_tracker || had_early || had_vote_tracker || had_aggregation || removed_cert_count > 0
-        {
+        if had_tracker || had_early || removed_cert_count > 0 {
             tracing::debug!(
                 tx_hash = %tx_hash,
                 had_cert_tracker = had_tracker,
-                had_vote_tracker = had_vote_tracker,
-                had_aggregation = had_aggregation,
                 removed_cert_verifications = removed_cert_count,
                 "Cancelled local certificate building - using external certificate"
             );
@@ -2691,7 +2075,6 @@ impl std::fmt::Debug for ExecutionState {
             .field("executed_txs", &self.executed_txs.len())
             .field("finalized_certificates", &self.finalized_certificates.len())
             .field("pending_provisioning", &self.pending_provisioning.len())
-            .field("vote_trackers", &self.vote_trackers.len())
             .field("certificate_trackers", &self.certificate_trackers.len())
             .finish()
     }
@@ -2751,7 +2134,7 @@ mod tests {
             vec![Arc::new(tx.clone())],
         );
 
-        // Should request execution (single-shard path) - now also sets up vote tracking
+        // Should request execution (single-shard path) and set up wave tracking
         assert!(!actions.is_empty());
         // First action should be ExecuteTransactions
         assert!(actions
@@ -2761,44 +2144,8 @@ mod tests {
         // Transaction should be marked as executed
         assert!(state.is_executed(&tx_hash));
 
-        // Vote tracker should be set up
-        assert!(state.is_tracking_votes(&tx_hash));
-
-        // In production, the runner executes + signs + sends ExecutionVoteReceived.
-        // Simulate that by creating a vote and calling on_vote.
-        let receipt_hash = Hash::ZERO;
-        let success = true;
-        let local_shard = topology.local_shard();
-        let validator_id = topology.local_validator_id();
-
-        // Create a signed vote (simulating what the runner does)
-        let signing_key = generate_bls_keypair();
-        let message =
-            hyperscale_types::exec_vote_message(&tx_hash, &receipt_hash, local_shard, success);
-        let signature = signing_key.sign_v1(&message);
-
-        let vote = ExecutionVote {
-            transaction_hash: tx_hash,
-            shard_group_id: local_shard,
-            receipt_hash,
-            success,
-            write_nodes: vec![],
-            validator: validator_id,
-            signature,
-        };
-
-        // Simulate runner sending ExecutionVoteReceived for our own vote
-        let actions = state.on_vote(&topology, vote);
-
-        // Should not emit any broadcast action (runner handles broadcast)
-        // Our vote is handled internally - might trigger certificate aggregation if quorum reached
-
-        // With 4 validators and quorum threshold (2*4+1)/3 = 3,
-        // single validator vote won't reach quorum yet
-        // In a real test, we'd simulate receiving votes from other validators
-
-        // For now, just verify the vote was counted
-        let _ = actions; // Actions depend on quorum configuration
+        // Certificate tracker should be set up for finalization
+        assert!(state.certificate_trackers.contains_key(&tx_hash));
     }
 
     #[test]

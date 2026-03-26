@@ -97,9 +97,8 @@ pub use transaction::{
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
 pub use wave::{
-    compute_wave_receipt_root, compute_wave_receipt_root_with_proof, extract_tx_wave_proof,
-    verify_tx_wave_proof, wave_outcome_leaf, ExecutionWaveCertificate, ExecutionWaveVote,
-    TxWaveProof, WaveId, WaveTxOutcome,
+    compute_wave_receipt_root, compute_wave_receipt_root_with_proof, wave_outcome_leaf,
+    ExecutionWaveCertificate, ExecutionWaveVote, WaveId, WaveTxOutcome,
 };
 
 // Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)
