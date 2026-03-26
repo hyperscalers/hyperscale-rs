@@ -104,6 +104,11 @@ where
             // and filtering database_updates to the local shard (matching the single-shard
             // path in action_handler.rs).
             let (votes, results): (Vec<ExecutionVote>, Vec<_>) = pairs.into_iter().unzip();
+            // Extract wave-ready data on handler thread (before consuming results)
+            let wave_results: Vec<_> = results
+                .iter()
+                .map(hyperscale_execution::handlers::extract_wave_result)
+                .collect();
             let results = results
                 .into_iter()
                 .map(|r| {
@@ -126,6 +131,7 @@ where
                 ProtocolEvent::ExecutionBatchCompleted {
                     votes,
                     results,
+                    wave_results,
                     speculative: false,
                 },
             ));
