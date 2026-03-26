@@ -112,6 +112,27 @@ pub fn tx_inclusion_proof(block: &Block, tx_hash: &Hash) -> Option<TransactionIn
     Some(proof)
 }
 
+// ============================================================================
+// PriorityInclusion
+// ============================================================================
+
+/// Proof that a priority transaction was committed on a remote shard.
+///
+/// Lightweight: ~400 bytes per tx (merkle proof against transaction_root).
+/// Verified by validators against the QC-attested `CommittedBlockHeader`
+/// from the source shard.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct PriorityInclusion {
+    /// Hash of the priority transaction.
+    pub tx_hash: Hash,
+    /// Remote shard where this transaction was committed.
+    pub source_shard: ShardGroupId,
+    /// Block height on the remote shard.
+    pub source_block_height: BlockHeight,
+    /// Merkle inclusion proof against the remote block's transaction_root.
+    pub proof: TransactionInclusionProof,
+}
+
 /// Block header containing consensus metadata.
 ///
 /// The header is what validators vote on. It contains:
@@ -280,6 +301,13 @@ pub struct Block {
     /// used for N-way cycles that cannot be resolved via simple deferral,
     /// or for transactions that explicitly failed during execution.
     pub aborted: Vec<TransactionAbort>,
+
+    /// Inclusion proofs for priority transactions.
+    ///
+    /// Each entry proves that the corresponding priority transaction was
+    /// committed on the source shard, verified against the QC-attested
+    /// `transaction_root` from `CommittedBlockHeader`.
+    pub priority_inclusions: Vec<PriorityInclusion>,
 }
 
 // Manual PartialEq - compare transaction/certificate content, not Arc pointers
@@ -301,6 +329,7 @@ impl PartialEq for Block {
                 .all(|(a, b)| a.as_ref() == b.as_ref())
             && self.deferred == other.deferred
             && self.aborted == other.aborted
+            && self.priority_inclusions == other.priority_inclusions
     }
 }
 
@@ -331,7 +360,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(7)?;
+        encoder.write_size(8)?;
         encoder.encode(&self.header)?;
         // Retry transactions
         encode_tx_vec(encoder, &self.retry_transactions)?;
@@ -348,6 +377,7 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         }
         encoder.encode(&self.deferred)?;
         encoder.encode(&self.aborted)?;
+        encoder.encode(&self.priority_inclusions)?;
         Ok(())
     }
 }
@@ -391,9 +421,9 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 7 {
+        if length != 8 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 7,
+                expected: 8,
                 actual: length,
             });
         }
@@ -424,6 +454,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
 
         let deferred: Vec<TransactionDefer> = decoder.decode()?;
         let aborted: Vec<TransactionAbort> = decoder.decode()?;
+        let priority_inclusions: Vec<PriorityInclusion> = decoder.decode()?;
 
         Ok(Self {
             header,
@@ -433,6 +464,7 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
             certificates,
             deferred,
             aborted,
+            priority_inclusions,
         })
     }
 }
@@ -462,6 +494,7 @@ impl Block {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
+            priority_inclusions: vec![],
         }
     }
 
@@ -606,6 +639,9 @@ pub struct BlockManifest {
 
     /// Aborted transactions (small, stored inline).
     pub aborted: Vec<TransactionAbort>,
+
+    /// Inclusion proofs for priority transactions.
+    pub priority_inclusions: Vec<PriorityInclusion>,
 }
 
 impl BlockManifest {
@@ -643,6 +679,7 @@ impl BlockManifest {
                 .collect(),
             deferred: block.deferred.clone(),
             aborted: block.aborted.clone(),
+            priority_inclusions: block.priority_inclusions.clone(),
         }
     }
 }

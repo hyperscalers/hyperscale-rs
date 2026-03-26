@@ -109,6 +109,7 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
+            priority_inclusions: vec![],
         }
     }
 

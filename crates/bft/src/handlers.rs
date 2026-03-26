@@ -368,6 +368,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         certificates: certs_to_include,
         deferred,
         aborted,
+        priority_inclusions: vec![],
     };
 
     let block_hash = block.hash();

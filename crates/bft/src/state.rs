@@ -1055,6 +1055,7 @@ impl BftState {
             certificates: vec![],       // Empty
             deferred: vec![],
             aborted: vec![],
+            priority_inclusions: vec![],
         };
 
         let block_hash = block.hash();
@@ -1177,6 +1178,7 @@ impl BftState {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
+            priority_inclusions: vec![],
         };
 
         let block_hash = block.hash();
@@ -2100,7 +2102,7 @@ impl BftState {
             }
         }
 
-        // 3. Verify priority section contains only non-retry TXs with commitment proofs
+        // 3. Verify priority section contains only non-retry TXs
         for tx in &block.priority_transactions {
             let tx_hash = tx.hash();
             if tx.is_retry() {
@@ -2111,7 +2113,40 @@ impl BftState {
             }
         }
 
-        // 4. Verify other section contains no retries
+        // 4. Verify priority inclusion proofs (if present)
+        for inclusion in &block.priority_inclusions {
+            // Verify leaf_hash corresponds to the tx_hash with a valid tag
+            let valid_leaf = [b"RETRY" as &[u8], b"PRIORITY", b"NORMAL"]
+                .iter()
+                .any(|tag| {
+                    Hash::from_parts(&[tag, inclusion.tx_hash.as_bytes()])
+                        == inclusion.proof.leaf_hash
+                });
+            if !valid_leaf {
+                return Err(format!(
+                    "Invalid priority inclusion: leaf_hash does not match any tagged hash of {}",
+                    inclusion.tx_hash
+                ));
+            }
+
+            // Verify merkle proof against the remote block's transaction_root
+            let header_key = (inclusion.source_shard, inclusion.source_block_height);
+            if let Some(committed_header) = self.remote_headers.get(&header_key) {
+                if !verify_merkle_inclusion(
+                    committed_header.header.transaction_root,
+                    &inclusion.proof,
+                ) {
+                    return Err(format!(
+                        "Invalid priority inclusion: merkle proof failed for {} against source block ({}, {})",
+                        inclusion.tx_hash, inclusion.source_shard.0, inclusion.source_block_height.0
+                    ));
+                }
+            }
+            // If we don't have the remote header yet, accept optimistically
+            // (same policy as deferrals).
+        }
+
+        // 5. Verify other section contains no retries
         for tx in &block.transactions {
             let tx_hash = tx.hash();
             if tx.is_retry() {
@@ -5499,6 +5534,7 @@ mod tests {
             certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
+            priority_inclusions: vec![],
         }
     }
 
@@ -7291,6 +7327,7 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
+            priority_inclusions: vec![],
         }
     }
 
@@ -7309,6 +7346,7 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
+            priority_inclusions: vec![],
         }
     }
 
@@ -8362,6 +8400,7 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
+            priority_inclusions: vec![],
         };
 
         let qc = QuorumCertificate {

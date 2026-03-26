@@ -233,6 +233,7 @@ impl PendingBlock {
             certificates,
             deferred,
             aborted,
+            priority_inclusions: self.manifest.priority_inclusions.clone(),
         });
 
         self.constructed_block = Some(Arc::clone(&block));

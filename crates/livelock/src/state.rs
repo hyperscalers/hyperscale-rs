@@ -876,6 +876,7 @@ mod tests {
             certificates: vec![],
             deferred: vec![deferral],
             aborted: vec![],
+            priority_inclusions: vec![],
         };
 
         state.on_block_committed(&block);
@@ -931,6 +932,7 @@ mod tests {
             certificates: vec![std::sync::Arc::new(cert)],
             deferred: vec![],
             aborted: vec![],
+            priority_inclusions: vec![],
         };
 
         state.on_block_committed(&block);
@@ -1008,6 +1010,7 @@ mod tests {
             certificates: vec![std::sync::Arc::new(cert)],
             deferred: vec![],
             aborted: vec![],
+            priority_inclusions: vec![],
         };
 
         state.on_block_committed(&block);
@@ -1066,6 +1069,7 @@ mod tests {
             certificates: vec![],
             deferred: vec![],
             aborted: vec![abort],
+            priority_inclusions: vec![],
         };
 
         state.on_block_committed(&block);

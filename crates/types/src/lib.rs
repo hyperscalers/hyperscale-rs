@@ -75,7 +75,7 @@ pub use signing::{
 
 pub use block::{
     compute_receipt_root, compute_transaction_root, tx_inclusion_proof, Block, BlockHeader,
-    BlockManifest, BlockMetadata, CommittedBlockHeader,
+    BlockManifest, BlockMetadata, CommittedBlockHeader, PriorityInclusion,
 };
 pub use quorum_certificate::QuorumCertificate;
 pub use receipt::{
