@@ -1114,6 +1114,29 @@ impl StateMachine for NodeStateMachine {
                 .execution
                 .on_speculative_execution_complete(block_hash, tx_hashes),
 
+            // ── Wave Execution (new wave-based voting) ───────────────────
+            // TODO(wave-voting): Wire to ExecutionState wave handlers once Phase 5 is complete.
+            ProtocolEvent::ExecutionWaveVoteReceived { vote: _ } => {
+                tracing::trace!("ExecutionWaveVoteReceived (not yet wired)");
+                vec![]
+            }
+            ProtocolEvent::ExecutionWaveVotesVerifiedAndAggregated { .. } => {
+                tracing::trace!("ExecutionWaveVotesVerifiedAndAggregated (not yet wired)");
+                vec![]
+            }
+            ProtocolEvent::ExecutionWaveCertificateAggregated { .. } => {
+                tracing::trace!("ExecutionWaveCertificateAggregated (not yet wired)");
+                vec![]
+            }
+            ProtocolEvent::ExecutionWaveCertificateReceived { .. } => {
+                tracing::trace!("ExecutionWaveCertificateReceived (not yet wired)");
+                vec![]
+            }
+            ProtocolEvent::ExecutionWaveCertificateSignatureVerified { .. } => {
+                tracing::trace!("ExecutionWaveCertificateSignatureVerified (not yet wired)");
+                vec![]
+            }
+
             // ── Transactions ─────────────────────────────────────────────
             ProtocolEvent::TransactionExecuted { tx_hash, accepted } => {
                 self.on_transaction_executed(tx_hash, accepted)

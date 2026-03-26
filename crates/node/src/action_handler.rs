@@ -68,6 +68,9 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 
         // General crypto
         Action::AggregateExecutionCertificate { .. } => Some(DispatchPool::Crypto),
+        Action::AggregateExecutionWaveCertificate { .. } => Some(DispatchPool::Crypto),
+        Action::VerifyAndAggregateExecutionWaveVotes { .. } => Some(DispatchPool::Crypto),
+        Action::VerifyExecutionWaveCertificateSignature { .. } => Some(DispatchPool::Crypto),
 
         // Provision work: IPA proof generation and verification.
         // Dedicated pool to avoid starving execution and crypto work.
@@ -312,6 +315,72 @@ pub(crate) fn handle_delegated_action<
                         tx_hash,
                         certificate,
                     },
+                )],
+                prepared_commit: None,
+            })
+        }
+
+        // --- Wave Execution Aggregation and Verification ---
+        Action::AggregateExecutionWaveCertificate {
+            wave_id,
+            block_hash: _,
+            shard,
+            wave_receipt_root,
+            votes,
+            tx_outcomes,
+            committee,
+        } => {
+            // Aggregate BLS signatures from wave votes into a wave certificate.
+            let certificate = hyperscale_execution::handlers::aggregate_execution_wave_certificate(
+                &wave_id,
+                shard,
+                wave_receipt_root,
+                &votes,
+                tx_outcomes,
+                &committee,
+            );
+            Some(DelegatedResult {
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::ExecutionWaveCertificateAggregated {
+                        wave_id,
+                        certificate,
+                    },
+                )],
+                prepared_commit: None,
+            })
+        }
+
+        Action::VerifyAndAggregateExecutionWaveVotes {
+            wave_id,
+            block_hash,
+            votes,
+        } => {
+            // Batch-verify wave vote signatures.
+            let verified = hyperscale_execution::handlers::batch_verify_execution_wave_votes(votes);
+            let verified_votes: Vec<_> = verified.collect();
+            Some(DelegatedResult {
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::ExecutionWaveVotesVerifiedAndAggregated {
+                        wave_id,
+                        block_hash,
+                        verified_votes,
+                    },
+                )],
+                prepared_commit: None,
+            })
+        }
+
+        Action::VerifyExecutionWaveCertificateSignature {
+            certificate,
+            public_keys,
+        } => {
+            let valid = hyperscale_execution::handlers::verify_execution_wave_certificate_signature(
+                &certificate,
+                &public_keys,
+            );
+            Some(DelegatedResult {
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::ExecutionWaveCertificateSignatureVerified { certificate, valid },
                 )],
                 prepared_commit: None,
             })
