@@ -65,6 +65,39 @@ where
             Action::BroadcastExecutionVote { shard, vote } => {
                 self.accumulate_broadcast_vote(shard, vote);
             }
+            Action::BroadcastExecutionWaveVote { shard, vote } => {
+                // Wave votes are already batched by wave — send immediately, no accumulator.
+                let msg = hyperscale_types::exec_wave_vote_batch_message(
+                    shard,
+                    std::slice::from_ref(&vote),
+                );
+                let sig = self.signing_key.sign_v1(&msg);
+                let batch = hyperscale_messages::ExecutionWaveVotesNotification::new(
+                    vec![vote],
+                    self.validator_id,
+                    sig,
+                );
+                self.network.notify(&self.cached_local_peers, &batch);
+            }
+            Action::BroadcastExecutionWaveCertificate {
+                shard: _,
+                certificate,
+                recipients,
+            } => {
+                // Wave certs are already batched by wave — send immediately, no accumulator.
+                let cert = std::sync::Arc::unwrap_or_clone(certificate);
+                let msg = hyperscale_types::exec_wave_cert_batch_message(
+                    cert.shard_group_id,
+                    std::slice::from_ref(&cert),
+                );
+                let sig = self.signing_key.sign_v1(&msg);
+                let batch = hyperscale_messages::ExecutionWaveCertificatesNotification::new(
+                    vec![cert],
+                    self.validator_id,
+                    sig,
+                );
+                self.network.notify(&recipients, &batch);
+            }
             Action::BroadcastExecutionCertificate {
                 shard,
                 certificate,
@@ -95,6 +128,12 @@ where
                 public_keys,
             } => {
                 self.accumulate_execution_certificate_verification(certificate, public_keys);
+            }
+            // Wave delegated actions — dispatch immediately (same as AggregateExecutionCertificate)
+            Action::AggregateExecutionWaveCertificate { .. }
+            | Action::VerifyAndAggregateExecutionWaveVotes { .. }
+            | Action::VerifyExecutionWaveCertificateSignature { .. } => {
+                self.dispatch_delegated_action(action);
             }
             Action::ExecuteCrossShardTransaction {
                 tx_hash,

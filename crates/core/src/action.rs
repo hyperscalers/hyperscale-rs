@@ -4,10 +4,11 @@ use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
-    DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote, Hash, NodeId,
-    ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield,
-    StateProvision, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
-    ValidatorId, VotePower,
+    DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate, ExecutionVote,
+    ExecutionWaveCertificate, ExecutionWaveVote, Hash, NodeId, ProvisionBatch, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, SignerBitfield, StateProvision, TopologySnapshot,
+    TransactionAbort, TransactionCertificate, TransactionDefer, ValidatorId, VotePower, WaveId,
+    WaveTxOutcome,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -100,6 +101,26 @@ pub enum Action {
     BroadcastExecutionCertificate {
         shard: ShardGroupId,
         certificate: Arc<ExecutionCertificate>,
+        /// Target shard peers (excluding self) for the broadcast.
+        recipients: Vec<ValidatorId>,
+    },
+
+    /// Broadcast an execution wave vote to the local shard.
+    ///
+    /// Wave votes cover all transactions in a deterministic wave partition
+    /// of the block, replacing per-transaction execution votes.
+    BroadcastExecutionWaveVote {
+        shard: ShardGroupId,
+        vote: ExecutionWaveVote,
+    },
+
+    /// Broadcast an execution wave certificate to remote participating shards.
+    ///
+    /// Wave certificates cover all transactions in a wave. Recipients are
+    /// the union of all participating shards across all txs in the wave.
+    BroadcastExecutionWaveCertificate {
+        shard: ShardGroupId,
+        certificate: Arc<ExecutionWaveCertificate>,
         /// Target shard peers (excluding self) for the broadcast.
         recipients: Vec<ValidatorId>,
     },
@@ -256,6 +277,53 @@ pub enum Action {
         /// The certificate to verify.
         certificate: ExecutionCertificate,
         /// Public keys of the signers (in committee order, pre-resolved by state machine).
+        public_keys: Vec<Bls12381G1PublicKey>,
+    },
+
+    /// Aggregate execution wave votes into an ExecutionWaveCertificate (quorum reached).
+    ///
+    /// Performs BLS signature aggregation on wave-level votes.
+    /// Delegated to a thread pool in production, instant in simulation.
+    /// Returns `ProtocolEvent::ExecutionWaveCertificateAggregated` when complete.
+    AggregateExecutionWaveCertificate {
+        /// Wave identifier.
+        wave_id: WaveId,
+        /// Block hash for correlation.
+        block_hash: Hash,
+        /// Shard group that executed.
+        shard: ShardGroupId,
+        /// Wave receipt root (merkle root over per-tx outcome leaves).
+        wave_receipt_root: Hash,
+        /// Votes to aggregate (with quorum).
+        votes: Vec<ExecutionWaveVote>,
+        /// Per-tx outcomes in wave order (for the certificate payload).
+        tx_outcomes: Vec<WaveTxOutcome>,
+        /// Ordered committee for the shard (for SignerBitfield index mapping).
+        committee: Vec<ValidatorId>,
+    },
+
+    /// Batch verify execution wave votes (deferred verification).
+    ///
+    /// Same pattern as `VerifyAndAggregateExecutionVotes` but for wave votes.
+    /// Delegated to a thread pool in production, instant in simulation.
+    /// Returns `ProtocolEvent::ExecutionWaveVotesVerifiedAndAggregated` when complete.
+    VerifyAndAggregateExecutionWaveVotes {
+        /// Wave identifier.
+        wave_id: WaveId,
+        /// Block hash for correlation.
+        block_hash: Hash,
+        /// Votes to verify with their public keys and voting power.
+        votes: Vec<(ExecutionWaveVote, Bls12381G1PublicKey, u64)>,
+    },
+
+    /// Verify an execution wave certificate's aggregated signature.
+    ///
+    /// Delegated to a thread pool in production, instant in simulation.
+    /// Returns `ProtocolEvent::ExecutionWaveCertificateSignatureVerified` when complete.
+    VerifyExecutionWaveCertificateSignature {
+        /// The wave certificate to verify.
+        certificate: ExecutionWaveCertificate,
+        /// Public keys of the signers (in committee order).
         public_keys: Vec<Bls12381G1PublicKey>,
     },
 
@@ -761,6 +829,8 @@ impl Action {
                 | Action::BroadcastTransaction { .. }
                 | Action::BroadcastExecutionVote { .. }
                 | Action::BroadcastExecutionCertificate { .. }
+                | Action::BroadcastExecutionWaveVote { .. }
+                | Action::BroadcastExecutionWaveCertificate { .. }
                 | Action::BroadcastCommittedBlockHeader { .. }
                 | Action::PersistBlock { .. }
                 | Action::PersistAndBroadcastVote { .. }
@@ -780,6 +850,9 @@ impl Action {
                 | Action::AggregateExecutionCertificate { .. }
                 | Action::VerifyAndAggregateExecutionVotes { .. }
                 | Action::VerifyExecutionCertificateSignature { .. }
+                | Action::AggregateExecutionWaveCertificate { .. }
+                | Action::VerifyAndAggregateExecutionWaveVotes { .. }
+                | Action::VerifyExecutionWaveCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
                 | Action::VerifyStateRoot { .. }
                 | Action::VerifyTransactionRoot { .. }
@@ -812,6 +885,8 @@ impl Action {
             // Network - Execution Layer (batchable)
             Action::BroadcastExecutionVote { .. } => "BroadcastExecutionVote",
             Action::BroadcastExecutionCertificate { .. } => "BroadcastExecutionCertificate",
+            Action::BroadcastExecutionWaveVote { .. } => "BroadcastExecutionWaveVote",
+            Action::BroadcastExecutionWaveCertificate { .. } => "BroadcastExecutionWaveCertificate",
             Action::BroadcastCommittedBlockHeader { .. } => "BroadcastCommittedBlockHeader",
 
             // Timers
@@ -828,6 +903,13 @@ impl Action {
             Action::VerifyAndAggregateExecutionVotes { .. } => "VerifyAndAggregateExecutionVotes",
             Action::VerifyExecutionCertificateSignature { .. } => {
                 "VerifyExecutionCertificateSignature"
+            }
+            Action::AggregateExecutionWaveCertificate { .. } => "AggregateExecutionWaveCertificate",
+            Action::VerifyAndAggregateExecutionWaveVotes { .. } => {
+                "VerifyAndAggregateExecutionWaveVotes"
+            }
+            Action::VerifyExecutionWaveCertificateSignature { .. } => {
+                "VerifyExecutionWaveCertificateSignature"
             }
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
