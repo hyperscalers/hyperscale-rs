@@ -13,16 +13,13 @@
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    BlockHeight, CommittedBlockHeader, Hash, NodeId, ProvisionBatch, ShardGroupId, StateEntry,
-    StateProvision, TopologySnapshot, ValidatorId,
+    BlockHeight, CommittedBlockHeader, Hash, NodeId, ProvisionBatch, ShardGroupId, StateProvision,
+    TopologySnapshot, ValidatorId,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
-
-/// Map of verified provisions: tx_hash → source_shard → entries.
-type VerifiedProvisionMap = HashMap<Hash, HashMap<ShardGroupId, Vec<StateEntry>>>;
 
 /// Number of block heights to retain remote headers below each shard's tip.
 /// When a new header arrives, headers from the same shard older than
@@ -80,13 +77,6 @@ pub struct ProvisionCoordinator {
     registered_txs: HashMap<Hash, TxRegistration>,
 
     // ═══════════════════════════════════════════════════════════════════
-    // Reverse Indexes
-    // ═══════════════════════════════════════════════════════════════════
-    /// Reverse index: source_shard -> tx_hashes with verified provisions from that shard.
-    /// Used by livelock for efficient cycle detection.
-    txs_by_source_shard: HashMap<ShardGroupId, HashSet<Hash>>,
-
-    // ═══════════════════════════════════════════════════════════════════
     // Remote Block Headers
     // ═══════════════════════════════════════════════════════════════════
     /// Unverified committed block headers from remote shards.
@@ -119,8 +109,9 @@ pub struct ProvisionCoordinator {
     /// Keyed by (source_shard, block_height) since that's how we match to headers.
     pending_provisions: HashMap<(ShardGroupId, BlockHeight), Vec<ProvisionBatch>>,
 
-    /// Verified provisions keyed by tx_hash -> (source_shard -> entries).
-    verified_provisions: VerifiedProvisionMap,
+    /// Verified provision batches keyed by (source_shard, block_height).
+    /// Stored whole after proof verification — no per-tx decomposition.
+    verified_batches: HashMap<(ShardGroupId, BlockHeight), ProvisionBatch>,
 
     // ═══════════════════════════════════════════════════════════════════
     // Expected Provision Tracking (fallback detection)
@@ -135,21 +126,8 @@ pub struct ProvisionCoordinator {
     expected_provisions: HashMap<(ShardGroupId, BlockHeight), ExpectedProvision>,
 
     // ═══════════════════════════════════════════════════════════════════
-    // Completed Transaction Tombstones
-    // ═══════════════════════════════════════════════════════════════════
-    /// Tombstones for transactions that have reached terminal state
-    /// (certificate committed, aborted, or deferred). Prevents late-arriving
-    /// provisions from re-populating cleaned-up state.
-    /// Maps tx_hash -> local_committed_height when cleanup occurred.
-    completed_tombstones: HashMap<Hash, BlockHeight>,
-
-    // ═══════════════════════════════════════════════════════════════════
     // Priority Inclusion Proof Cache
     // ═══════════════════════════════════════════════════════════════════
-    /// Source block info for verified provisions: tx_hash → (source_shard, block_height).
-    /// Populated in `on_state_provisions_verified`, cleaned up in `cleanup_tx`.
-    provision_source_blocks: HashMap<Hash, (ShardGroupId, BlockHeight)>,
-
     /// Cached inclusion proofs for priority transactions, fetched on demand.
     /// Consumed at proposal time by `take_cached_inclusion_proof`.
     inclusion_proof_cache: HashMap<Hash, hyperscale_types::PriorityInclusion>,
@@ -188,16 +166,13 @@ impl ProvisionCoordinator {
     pub fn new() -> Self {
         Self {
             registered_txs: HashMap::new(),
-            txs_by_source_shard: HashMap::new(),
             unverified_remote_headers: HashMap::new(),
             verified_remote_headers: HashMap::new(),
             remote_header_tips: HashMap::new(),
             pending_provisions: HashMap::new(),
-            verified_provisions: HashMap::new(),
+            verified_batches: HashMap::new(),
             local_committed_height: BlockHeight(0),
             expected_provisions: HashMap::new(),
-            completed_tombstones: HashMap::new(),
-            provision_source_blocks: HashMap::new(),
             inclusion_proof_cache: HashMap::new(),
             now: Duration::ZERO,
         }
@@ -247,14 +222,6 @@ impl ProvisionCoordinator {
 
         // Update local committed height
         self.local_committed_height = block.header.height;
-
-        // Prune expired tombstones — provisions for blocks older than the
-        // header retention window are already discarded by the pruned-header
-        // check, so tombstones beyond that window are unnecessary.
-        let current_height = self.local_committed_height.0;
-        self.completed_tombstones.retain(|_, tombstone_height| {
-            current_height.saturating_sub(tombstone_height.0) < REMOTE_HEADER_RETENTION_BLOCKS
-        });
 
         // Check for timed-out expected provisions and emit fallback requests
         let mut actions = vec![];
@@ -616,13 +583,12 @@ impl ProvisionCoordinator {
             return actions;
         };
 
+        // Store the verified batch whole
+        let batch_key = (source_shard, batch.block_height);
+        self.verified_batches.insert(batch_key, batch.clone());
+
         for tx_entries in &batch.transactions {
             let tx_hash = tx_entries.tx_hash;
-
-            // Skip transactions that already completed
-            if self.completed_tombstones.contains_key(&tx_hash) {
-                continue;
-            }
 
             debug!(
                 tx_hash = %tx_hash,
@@ -631,25 +597,7 @@ impl ProvisionCoordinator {
                 "State provision verified successfully"
             );
 
-            // Store per-tx entries for execution
-            self.verified_provisions
-                .entry(tx_hash)
-                .or_default()
-                .insert(source_shard, tx_entries.entries.clone());
-
-            // Track source block for priority inclusion proof fetching
-            self.provision_source_blocks
-                .entry(tx_hash)
-                .or_insert((source_shard, batch.block_height));
-
-            // Update reverse index for cycle detection
-            self.txs_by_source_shard
-                .entry(source_shard)
-                .or_default()
-                .insert(tx_hash);
-
             // Emit provision accepted (used by livelock for cycle detection).
-            // Per-tx entries for node-overlap cycle detection.
             actions.push(Action::Continuation(ProtocolEvent::ProvisionAccepted {
                 tx_hash,
                 source_shard,
@@ -659,23 +607,11 @@ impl ProvisionCoordinator {
 
             // Check if ALL required shards have verified provisions
             if self.all_shards_verified(tx_hash) {
-                let all_provisions: Vec<StateProvision> = self
-                    .verified_provisions
-                    .get(&tx_hash)
-                    .map(|by_shard| {
-                        by_shard
-                            .iter()
-                            .map(|(&shard, entries)| StateProvision {
-                                transaction_hash: tx_hash,
-                                target_shard: _topology.local_shard(),
-                                source_shard: shard,
-                                block_height: batch.block_height,
-                                block_timestamp: header.header.timestamp,
-                                entries: Arc::new(entries.clone()),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let all_provisions = self.collect_provisions_for_tx(
+                    tx_hash,
+                    _topology.local_shard(),
+                    header.header.timestamp,
+                );
 
                 debug!(
                     tx_hash = %tx_hash,
@@ -701,26 +637,39 @@ impl ProvisionCoordinator {
     /// Used by backpressure: if true, another shard has committed,
     /// so we must cooperate regardless of limits.
     pub fn has_any_verified_provisions(&self, tx_hash: &Hash) -> bool {
-        self.verified_provisions.contains_key(tx_hash)
+        self.verified_batches
+            .values()
+            .any(|b| b.transactions.iter().any(|tx| tx.tx_hash == *tx_hash))
     }
 
     /// Get all tx_hashes with verified provisions from a specific shard.
-    ///
-    /// Used by livelock for cycle detection.
-    pub fn txs_with_provisions_from(&self, shard: ShardGroupId) -> Option<&HashSet<Hash>> {
-        self.txs_by_source_shard.get(&shard)
+    pub fn txs_with_provisions_from(&self, shard: ShardGroupId) -> Option<HashSet<Hash>> {
+        let txs: HashSet<Hash> = self
+            .verified_batches
+            .iter()
+            .filter(|(&(s, _), _)| s == shard)
+            .flat_map(|(_, b)| b.transactions.iter().map(|tx| tx.tx_hash))
+            .collect();
+        if txs.is_empty() {
+            None
+        } else {
+            Some(txs)
+        }
     }
 
     /// Get the nodes contained in verified provisions for a tx from a specific shard.
     ///
     /// Used by livelock to check for actual node-level overlap.
     pub fn provision_nodes(&self, tx_hash: Hash, shard: ShardGroupId) -> HashSet<NodeId> {
-        if let Some(entries) = self
-            .verified_provisions
-            .get(&tx_hash)
-            .and_then(|by_shard| by_shard.get(&shard))
-        {
-            return entries.iter().filter_map(|e| e.node_id()).collect();
+        for (&(s, _), batch) in &self.verified_batches {
+            if s != shard {
+                continue;
+            }
+            for tx in &batch.transactions {
+                if tx.tx_hash == tx_hash {
+                    return tx.entries.iter().filter_map(|e| e.node_id()).collect();
+                }
+            }
         }
         HashSet::new()
     }
@@ -767,48 +716,42 @@ impl ProvisionCoordinator {
             return false;
         };
 
-        let Some(verified) = self.verified_provisions.get(&tx_hash) else {
-            return false;
-        };
+        registration.required_shards.iter().all(|&shard| {
+            self.verified_batches.iter().any(|(&(s, _), b)| {
+                s == shard && b.transactions.iter().any(|tx| tx.tx_hash == tx_hash)
+            })
+        })
+    }
 
-        registration
-            .required_shards
+    /// Collect all verified provisions for a transaction across shards.
+    fn collect_provisions_for_tx(
+        &self,
+        tx_hash: Hash,
+        local_shard: ShardGroupId,
+        block_timestamp: u64,
+    ) -> Vec<StateProvision> {
+        self.verified_batches
             .iter()
-            .all(|shard| verified.contains_key(shard))
+            .flat_map(|(&(source_shard, block_height), batch)| {
+                batch
+                    .transactions
+                    .iter()
+                    .filter(move |tx| tx.tx_hash == tx_hash)
+                    .map(move |tx| StateProvision {
+                        transaction_hash: tx_hash,
+                        target_shard: local_shard,
+                        source_shard,
+                        block_height,
+                        block_timestamp,
+                        entries: Arc::new(tx.entries.clone()),
+                    })
+            })
+            .collect()
     }
 
     /// Clean up all state for a transaction.
     fn cleanup_tx(&mut self, tx_hash: &Hash) {
-        // Add tombstone to prevent late provisions from re-populating state
-        self.completed_tombstones
-            .insert(*tx_hash, self.local_committed_height);
-
-        // Remove registration
         self.registered_txs.remove(tx_hash);
-
-        // Remove verified provisions and update reverse index
-        if let Some(by_shard) = self.verified_provisions.remove(tx_hash) {
-            for shard in by_shard.keys() {
-                if let Some(txs) = self.txs_by_source_shard.get_mut(shard) {
-                    txs.remove(tx_hash);
-                    if txs.is_empty() {
-                        self.txs_by_source_shard.remove(shard);
-                    }
-                }
-            }
-        }
-
-        // Remove pending provision batch entries that reference this tx
-        self.pending_provisions.retain(|_, batches| {
-            for batch in batches.iter_mut() {
-                batch.transactions.retain(|tx| tx.tx_hash != *tx_hash);
-            }
-            batches.retain(|batch| !batch.transactions.is_empty());
-            !batches.is_empty()
-        });
-
-        // Remove priority proof cache entries
-        self.provision_source_blocks.remove(tx_hash);
         self.inclusion_proof_cache.remove(tx_hash);
     }
 
@@ -820,10 +763,15 @@ impl ProvisionCoordinator {
     ///
     /// Returns `(tx_hash, source_shard, source_block_height)` for each.
     pub fn txs_needing_inclusion_proofs(&self) -> Vec<(Hash, ShardGroupId, BlockHeight)> {
-        self.provision_source_blocks
+        self.verified_batches
             .iter()
-            .filter(|(tx_hash, _)| !self.inclusion_proof_cache.contains_key(tx_hash))
-            .map(|(&tx_hash, &(shard, height))| (tx_hash, shard, height))
+            .flat_map(|(&(shard, height), batch)| {
+                batch
+                    .transactions
+                    .iter()
+                    .filter(|tx| !self.inclusion_proof_cache.contains_key(&tx.tx_hash))
+                    .map(move |tx| (tx.tx_hash, shard, height))
+            })
             .collect()
     }
 
@@ -1768,11 +1716,11 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Tombstone Tests
+    // Cleanup Tests
     // ═══════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_tombstone_blocks_late_provision_after_cleanup() {
+    fn test_cleanup_removes_registration() {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
@@ -1784,13 +1732,12 @@ mod tests {
         coordinator.on_remote_block_committed(&topology, header.clone(), ValidatorId(3));
         let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
         coordinator.on_state_provisions_received(&topology, batch.clone());
-        coordinator.on_state_provisions_verified(&topology, batch, Some(header.clone()), true);
+        coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
 
-        // Verify tx is registered and has provisions
         assert!(coordinator.is_registered(&tx_hash));
         assert!(coordinator.has_any_verified_provisions(&tx_hash));
 
-        // Cleanup via block commit (simulates certificate committed)
+        // Cleanup via block commit
         let mut block = make_block(1);
         block.certificates.push(std::sync::Arc::new(
             hyperscale_types::TransactionCertificate {
@@ -1801,57 +1748,8 @@ mod tests {
         ));
         coordinator.on_block_committed(&topology, &block);
 
-        // Tx should be cleaned up
+        // Registration removed, but batch stays (pruned by header retention)
         assert!(!coordinator.is_registered(&tx_hash));
-        assert!(!coordinator.has_any_verified_provisions(&tx_hash));
-
-        // Late batch arrives — should be blocked by tombstone
-        let late_batch = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
-        let actions = coordinator.on_state_provisions_received(&topology, late_batch);
-        assert!(actions.is_empty());
-
-        // Tx should NOT be re-registered
-        assert!(
-            !coordinator.is_registered(&tx_hash),
-            "Tombstone should prevent re-registration of completed tx"
-        );
-        assert!(
-            !coordinator.has_any_verified_provisions(&tx_hash),
-            "Tombstone should prevent re-population of verified provisions"
-        );
-    }
-
-    #[test]
-    fn test_tombstones_pruned_after_retention_window() {
-        let topology = make_test_topology(ShardGroupId(0));
-        let mut coordinator = ProvisionCoordinator::new();
-
-        let tx_hash = Hash::from_bytes(b"tx1");
-
-        // Register and cleanup at height 5
-        coordinator.on_tx_registered(tx_hash, make_registration(vec![ShardGroupId(1)]));
-        let mut block = make_block(5);
-        block.certificates.push(std::sync::Arc::new(
-            hyperscale_types::TransactionCertificate {
-                transaction_hash: tx_hash,
-                decision: hyperscale_types::TransactionDecision::Accept,
-                shard_proofs: std::collections::BTreeMap::new(),
-            },
-        ));
-        coordinator.on_block_committed(&topology, &block);
-
-        // Tombstone should exist
-        assert!(coordinator.completed_tombstones.contains_key(&tx_hash));
-
-        // Advance past retention window (100 blocks)
-        let block = make_block(106);
-        coordinator.on_block_committed(&topology, &block);
-
-        // Tombstone should be pruned
-        assert!(
-            !coordinator.completed_tombstones.contains_key(&tx_hash),
-            "Tombstone should be pruned after retention window"
-        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1890,43 +1788,26 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Empty txs_by_source_shard Cleanup Tests
+    // Verified Batch Retention Tests
     // ═══════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_cleanup_removes_empty_txs_by_source_shard_entries() {
+    fn test_verified_batch_queryable_after_verification() {
         let topology = make_test_topology(ShardGroupId(0));
         let mut coordinator = ProvisionCoordinator::new();
 
         let tx_hash = Hash::from_bytes(b"tx1");
         let source_shard = ShardGroupId(1);
 
-        // Setup: header + batch + verification
         let header = make_committed_header(source_shard, 10);
         coordinator.on_remote_block_committed(&topology, header.clone(), ValidatorId(3));
         let batch = make_batch(tx_hash, source_shard, ShardGroupId(0), 10);
         coordinator.on_state_provisions_received(&topology, batch.clone());
         coordinator.on_state_provisions_verified(&topology, batch, Some(header), true);
 
-        // Reverse index should have an entry
         assert!(coordinator.txs_with_provisions_from(source_shard).is_some());
-
-        // Cleanup via block commit
-        let mut block = make_block(1);
-        block.certificates.push(std::sync::Arc::new(
-            hyperscale_types::TransactionCertificate {
-                transaction_hash: tx_hash,
-                decision: hyperscale_types::TransactionDecision::Accept,
-                shard_proofs: std::collections::BTreeMap::new(),
-            },
-        ));
-        coordinator.on_block_committed(&topology, &block);
-
-        // Empty shard entry should be removed entirely
-        assert!(
-            coordinator.txs_with_provisions_from(source_shard).is_none(),
-            "Empty txs_by_source_shard entry should be removed after cleanup"
-        );
+        let txs = coordinator.txs_with_provisions_from(source_shard).unwrap();
+        assert!(txs.contains(&tx_hash));
     }
 
     #[test]
