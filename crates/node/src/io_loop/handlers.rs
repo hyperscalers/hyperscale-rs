@@ -6,7 +6,8 @@ use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_messages::{
     BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
-    ExecutionVotesNotification, TransactionGossip,
+    ExecutionVotesNotification, ExecutionWaveCertificatesNotification,
+    ExecutionWaveVotesNotification, TransactionGossip,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
@@ -416,6 +417,88 @@ where
                     for cert in batch.into_certificates() {
                         let _ = tx.send(NodeInput::Protocol(
                             ProtocolEvent::ExecutionCertificateReceived { cert },
+                        ));
+                    }
+                },
+            );
+
+        // ── execution.wave_vote.batch → verify sender sig, then ProtocolEvent::ExecutionWaveVoteReceived ─
+
+        let tx = self.event_sender.clone();
+        let topology = self.topology.clone();
+        self.network
+            .register_notification_handler::<ExecutionWaveVotesNotification>(
+                move |batch: ExecutionWaveVotesNotification| {
+                    if batch.votes.is_empty() {
+                        return;
+                    }
+
+                    let topo = topology.load();
+                    let local_shard = topo.local_shard();
+                    let sender = batch.sender;
+                    let msg = batch.signing_message(local_shard);
+                    if !verify_sender_signature(
+                        &topo,
+                        sender,
+                        local_shard,
+                        &msg,
+                        &batch.sender_signature,
+                        "exec_wave_vote_batch",
+                        "execution wave vote batch",
+                    ) {
+                        return;
+                    }
+
+                    for vote in batch.into_votes() {
+                        let _ = tx.send(NodeInput::Protocol(
+                            ProtocolEvent::ExecutionWaveVoteReceived { vote },
+                        ));
+                    }
+                },
+            );
+
+        // ── execution.wave_cert.batch → verify sender sig, then ProtocolEvent::ExecutionWaveCertificateReceived ─
+
+        let tx = self.event_sender.clone();
+        let topology = self.topology.clone();
+        self.network
+            .register_notification_handler::<ExecutionWaveCertificatesNotification>(
+                move |batch: ExecutionWaveCertificatesNotification| {
+                    if batch.certificates.is_empty() {
+                        return;
+                    }
+
+                    let topo = topology.load();
+                    let sender = batch.sender;
+                    let source_shard = batch.certificates[0].shard_group_id;
+                    if batch
+                        .certificates
+                        .iter()
+                        .any(|c| c.shard_group_id != source_shard)
+                    {
+                        warn!(
+                            sender = sender.0,
+                            "Execution wave certificate batch contains mixed shard_group_ids — dropping"
+                        );
+                        return;
+                    }
+                    // Sender signed with source_shard (their local shard), not our local shard
+                    let msg = batch.signing_message(source_shard);
+                    if !verify_sender_signature(
+                        &topo,
+                        sender,
+                        source_shard,
+                        &msg,
+                        &batch.sender_signature,
+                        "exec_wave_cert_batch",
+                        "execution wave certificate batch",
+                    ) {
+                        return;
+                    }
+
+                    for cert in batch.into_certificates() {
+                        let _ = tx.send(NodeInput::Protocol(
+                            ProtocolEvent::ExecutionWaveCertificateReceived { cert },
                         ));
                     }
                 },
