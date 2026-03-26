@@ -79,6 +79,9 @@ pub struct SimulationRunner {
 
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
+
+    /// Last time gossip dedup caches were pruned.
+    last_gossip_dedup_prune: Duration,
 }
 
 /// Statistics collected during simulation.
@@ -253,6 +256,7 @@ impl SimulationRunner {
             stats: SimulationStats::default(),
             genesis_executed: vec![false; num_nodes],
             traffic_analyzer: None,
+            last_gossip_dedup_prune: Duration::ZERO,
         }
     }
 
@@ -531,6 +535,16 @@ impl SimulationRunner {
 
             self.now = next_time;
 
+            // Prune gossip dedup caches every 5 simulated seconds.
+            // Dedup only needs to cover the window in which duplicate broadcasts
+            // arrive (~cross-shard latency), so 5s is very conservative.
+            const GOSSIP_DEDUP_PRUNE_INTERVAL: Duration = Duration::from_secs(5);
+            if self.now.saturating_sub(self.last_gossip_dedup_prune) >= GOSSIP_DEDUP_PRUNE_INTERVAL
+            {
+                self.network.prune_gossip_dedup();
+                self.last_gossip_dedup_prune = self.now;
+            }
+
             // Flush all delivery queues that are due — handlers/callbacks push
             // events into crossbeam channels.
             let gossip_delivered = self.network.flush_gossip(self.now);
@@ -608,6 +622,7 @@ impl SimulationRunner {
             self.stats.messages_sent += stats.messages_sent;
             self.stats.messages_dropped_partition += stats.messages_dropped_partition;
             self.stats.messages_dropped_loss += stats.messages_dropped_loss;
+            self.stats.messages_deduplicated += stats.messages_deduplicated;
         }
 
         // Accept pending requests: handler invoked now, response callback

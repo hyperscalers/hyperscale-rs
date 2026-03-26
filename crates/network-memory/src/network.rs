@@ -54,6 +54,7 @@ pub struct FulfillmentStats {
     pub messages_sent: u64,
     pub messages_dropped_partition: u64,
     pub messages_dropped_loss: u64,
+    pub messages_deduplicated: u64,
 }
 
 /// A gossip delivery scheduled for future delivery via the internal latency queue.
@@ -176,6 +177,9 @@ pub struct SimulatedNetwork {
     response_sequence: u64,
     /// Optional traffic analyzer for bandwidth metrics.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
+    /// Per-node gossip dedup: tracks message IDs already delivered to each node.
+    /// Matches production gossipsub's content-based deduplication (hash of data + topic).
+    gossip_seen: Vec<HashSet<u64>>,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -209,6 +213,7 @@ impl SimulatedNetwork {
             pending_responses: BinaryHeap::new(),
             response_sequence: 0,
             traffic_analyzer: None,
+            gossip_seen: (0..num_nodes).map(|_| HashSet::new()).collect(),
         }
     }
 
@@ -631,8 +636,26 @@ impl SimulatedNetwork {
 
         let message_type = entry.message_type;
 
+        // Compute content-based message ID for dedup, matching production
+        // gossipsub's message_id_fn: hash(data || topic).
+        // Wire bytes (compressed) are used as the data, message_type as the topic.
+        let msg_id = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            entry.data.hash(&mut hasher);
+            message_type.hash(&mut hasher);
+            hasher.finish()
+        };
+
         for to in peers {
             if to == from {
+                continue;
+            }
+
+            // Gossipsub dedup: each node receives a given message at most once,
+            // regardless of how many validators broadcast it.
+            if !self.gossip_seen[to as usize].insert(msg_id) {
+                stats.messages_deduplicated += 1;
                 continue;
             }
 
@@ -702,6 +725,13 @@ impl SimulatedNetwork {
     /// Earliest pending gossip delivery time (for event loop scheduling).
     pub fn next_gossip_delivery_time(&self) -> Option<Duration> {
         self.pending_gossip.peek().map(|Reverse(s)| s.delivery_time)
+    }
+
+    /// Clear gossip dedup caches. Call periodically to prevent unbounded memory growth.
+    pub fn prune_gossip_dedup(&mut self) {
+        for seen in &mut self.gossip_seen {
+            seen.clear();
+        }
     }
 
     // ─── Notification Latency Queue ───
