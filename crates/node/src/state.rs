@@ -64,14 +64,14 @@ pub struct NodeStateMachine {
     /// Livelock prevention state (cycle detection for cross-shard TXs).
     livelock: LivelockState,
 
-    /// Last committed JMT root hash.
+    /// Last committed JVT root hash.
     ///
     /// Updated when `StateCommitComplete` is received from the runner.
-    /// Used by BftState (via StateCommitComplete) to track when JMT is ready
+    /// Used by BftState (via StateCommitComplete) to track when JVT is ready
     /// for state root verification.
     ///
-    /// The JMT version always equals block height.
-    last_committed_jmt_root: Hash,
+    /// The JVT version always equals block height.
+    last_committed_jvt_root: Hash,
 
     /// Current time.
     now: Duration,
@@ -147,9 +147,9 @@ impl NodeStateMachine {
         let bft_signing_key =
             Bls12381G1PrivateKey::from_bytes(&key_bytes).expect("valid key bytes");
 
-        // Initialize last_committed_jmt_root from recovered JMT state.
+        // Initialize last_committed_jvt_root from recovered JVT state.
         // This ensures we use actual persisted state, not genesis defaults.
-        let jmt_root = recovered.jmt_root.unwrap_or(Hash::ZERO);
+        let jvt_root = recovered.jvt_root.unwrap_or(Hash::ZERO);
 
         Self {
             node_index,
@@ -168,8 +168,8 @@ impl NodeStateMachine {
             provisions: ProvisionCoordinator::new(),
             livelock: LivelockState::new(),
             topology,
-            // Use recovered JMT root - critical for correct state root computation
-            last_committed_jmt_root: jmt_root,
+            // Use recovered JVT root - critical for correct state root computation
+            last_committed_jvt_root: jvt_root,
             now: Duration::ZERO,
         }
     }
@@ -221,9 +221,9 @@ impl NodeStateMachine {
         &self.provisions
     }
 
-    /// Get the last committed JMT root hash.
-    pub fn last_committed_jmt_root(&self) -> Hash {
-        self.last_committed_jmt_root
+    /// Get the last committed JVT root hash.
+    pub fn last_committed_jvt_root(&self) -> Hash {
+        self.last_committed_jvt_root
     }
 
     /// Initialize the node with a genesis block.
@@ -563,22 +563,22 @@ impl NodeStateMachine {
         )
     }
 
-    /// Handle JMT state commit completion — update tracked state and notify BFT.
+    /// Handle JVT state commit completion — update tracked state and notify BFT.
     fn on_state_commit_complete(&mut self, height: u64, state_root: Hash) -> Vec<Action> {
         let prev_height = self.bft.committed_height();
 
         // Update if this is the current or a newer height. Use `>=` because
         // the BFT state machine advances `committed_height` in
-        // `commit_block_and_buffered` *before* the IO loop commits the JMT
+        // `commit_block_and_buffered` *before* the IO loop commits the JVT
         // and sends `StateCommitComplete`. With `>` the root update for the
         // current height would be silently dropped.
         if height >= prev_height {
-            self.last_committed_jmt_root = state_root;
+            self.last_committed_jvt_root = state_root;
 
             tracing::debug!(
                 height,
                 state_root = ?state_root,
-                "JMT state commit complete"
+                "JVT state commit complete"
             );
         }
 

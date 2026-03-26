@@ -21,26 +21,26 @@ pub(crate) struct PendingQcVerification {
     pub header: BlockHeader,
 }
 
-/// Pending state root verification waiting for JMT to be ready.
+/// Pending state root verification waiting for JVT to be ready.
 ///
 /// When a block arrives but its parent block's state hasn't been committed to
-/// the JMT yet, we queue the verification here. Once StateCommitComplete arrives
+/// the JVT yet, we queue the verification here. Once StateCommitComplete arrives
 /// with a root matching required_root, we can proceed with verification.
 #[derive(Debug, Clone)]
 struct PendingStateRootVerification {
-    /// The state root of the parent block. Verification waits until local JMT
+    /// The state root of the parent block. Verification waits until local JVT
     /// reaches this root, ensuring proposer and verifier compute from same base.
     required_root: Hash,
     /// The state root claimed by the proposer (to verify against).
     expected_root: Hash,
     /// Transaction hashes of the certificates in the block. Used to look up
-    /// DatabaseUpdates from the execution cache when the JMT catches up.
+    /// DatabaseUpdates from the execution cache when the JVT catches up.
     cert_tx_hashes: Vec<Hash>,
-    /// Block height (used as JMT version).
+    /// Block height (used as JVT version).
     block_height: u64,
 }
 
-/// State root verification that is ready to dispatch (JMT is at the correct root).
+/// State root verification that is ready to dispatch (JVT is at the correct root).
 ///
 /// The `NodeStateMachine` drains these after each BFT call, computes the
 /// `merged_updates` from the execution cache, and emits `VerifyStateRoot` actions.
@@ -75,16 +75,16 @@ pub(crate) struct VerificationPipeline {
     /// Blocks where state root verification is currently in-flight.
     state_root_verifications_in_flight: HashSet<Hash>,
 
-    /// Blocks waiting for JMT to reach the required version before verification.
+    /// Blocks waiting for JVT to reach the required version before verification.
     pending_state_root_verifications: HashMap<Hash, PendingStateRootVerification>,
 
-    /// Last committed JMT root hash.
-    last_committed_jmt_root: Hash,
+    /// Last committed JVT root hash.
+    last_committed_jvt_root: Hash,
 
     /// Blocks with verified state roots.
     verified_state_roots: HashSet<Hash>,
 
-    /// State root verifications ready to dispatch (JMT root matches).
+    /// State root verifications ready to dispatch (JVT root matches).
     /// Drained by NodeStateMachine which computes merged_updates from execution cache.
     ready_state_root_verifications: Vec<ReadyStateRootVerification>,
 
@@ -105,13 +105,13 @@ pub(crate) struct VerificationPipeline {
 
 impl VerificationPipeline {
     /// Create a new verification pipeline.
-    pub fn new(jmt_root: Hash) -> Self {
+    pub fn new(jvt_root: Hash) -> Self {
         Self {
             pending_qc_verifications: HashMap::new(),
             verified_qcs: HashMap::new(),
             state_root_verifications_in_flight: HashSet::new(),
             pending_state_root_verifications: HashMap::new(),
-            last_committed_jmt_root: jmt_root,
+            last_committed_jvt_root: jvt_root,
             verified_state_roots: HashSet::new(),
             ready_state_root_verifications: Vec::new(),
             transaction_root_verifications_in_flight: HashSet::new(),
@@ -221,8 +221,8 @@ impl VerificationPipeline {
     /// Initiate state root verification for a block.
     ///
     /// `parent_state_root` is the state root of the parent block (base state).
-    /// If JMT is ready, pushes to the ready queue for immediate dispatch.
-    /// Otherwise, queues for later when JMT catches up.
+    /// If JVT is ready, pushes to the ready queue for immediate dispatch.
+    /// Otherwise, queues for later when JVT catches up.
     ///
     /// In both cases, the `NodeStateMachine` is responsible for draining
     /// `ready_state_root_verifications` and computing `merged_updates` from
@@ -233,7 +233,7 @@ impl VerificationPipeline {
         block: &Block,
         parent_state_root: Hash,
     ) {
-        let current_root = self.last_committed_jmt_root;
+        let current_root = self.last_committed_jvt_root;
         let cert_tx_hashes: Vec<Hash> = block
             .certificates
             .iter()
@@ -241,14 +241,14 @@ impl VerificationPipeline {
             .collect();
 
         if current_root == parent_state_root {
-            // JMT is ready - mark as ready for dispatch
+            // JVT is ready - mark as ready for dispatch
             debug!(
                 block_hash = ?block_hash,
                 certificate_count = block.certificates.len(),
                 expected_root = ?block.header.state_root,
                 parent_state_root = ?parent_state_root,
-                current_jmt_root = ?current_root,
-                "JMT ready - state root verification ready for dispatch"
+                current_jvt_root = ?current_root,
+                "JVT ready - state root verification ready for dispatch"
             );
 
             self.state_root_verifications_in_flight.insert(block_hash);
@@ -261,14 +261,14 @@ impl VerificationPipeline {
                     block_height: block.header.height.0,
                 });
         } else {
-            // JMT not ready - queue for later
+            // JVT not ready - queue for later
             debug!(
                 block_hash = ?block_hash,
                 certificate_count = block.certificates.len(),
                 expected_root = ?block.header.state_root,
                 parent_state_root = ?parent_state_root,
-                current_jmt_root = ?current_root,
-                "JMT not ready - queueing state root verification"
+                current_jvt_root = ?current_root,
+                "JVT not ready - queueing state root verification"
             );
 
             self.pending_state_root_verifications.insert(
@@ -422,22 +422,22 @@ impl VerificationPipeline {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // JMT state tracking
+    // JVT state tracking
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Get the current JMT root.
-    pub fn jmt_root(&self) -> Hash {
-        self.last_committed_jmt_root
+    /// Get the current JVT root.
+    pub fn jvt_root(&self) -> Hash {
+        self.last_committed_jvt_root
     }
 
-    /// JMT advanced — update root and unblock any waiting state root verifications.
+    /// JVT advanced — update root and unblock any waiting state root verifications.
     ///
     /// Unblocked verifications are pushed to the ready queue for
     /// `NodeStateMachine` to drain and enrich with `merged_updates`.
-    pub fn on_jmt_advanced(&mut self, block_height: u64, new_root: Hash) {
-        self.last_committed_jmt_root = new_root;
+    pub fn on_jvt_advanced(&mut self, block_height: u64, new_root: Hash) {
+        self.last_committed_jvt_root = new_root;
 
-        // Find all pending verifications where the JMT now has the required base root.
+        // Find all pending verifications where the JVT now has the required base root.
         let unblocked: Vec<Hash> = self
             .pending_state_root_verifications
             .iter()

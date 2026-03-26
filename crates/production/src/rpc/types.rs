@@ -50,7 +50,7 @@ pub struct NodeStatusResponse {
     pub uptime_secs: u64,
     /// Version string.
     pub version: String,
-    /// Current JMT state root hash (hex-encoded).
+    /// Current JVT state root hash (hex-encoded).
     pub state_root_hash: String,
     /// Mempool statistics.
     pub mempool: MempoolStatusResponse,

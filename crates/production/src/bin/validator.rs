@@ -433,16 +433,16 @@ pub struct StorageConfig {
     #[serde(default = "default_keep_log_file_num")]
     pub keep_log_file_num: usize,
 
-    /// Number of block heights of JMT history to retain before garbage collection.
+    /// Number of block heights of JVT history to retain before garbage collection.
     ///
-    /// Stale JMT nodes and their associations are kept for this many heights
+    /// Stale JVT nodes and their associations are kept for this many heights
     /// before being eligible for deletion. This enables historical queries within
     /// this window.
     ///
     /// Set to 0 for immediate deletion (no history retention).
     /// Defaults to 60,000 (matching Babylon's default).
-    #[serde(default = "default_jmt_history_length")]
-    pub jmt_history_length: u64,
+    #[serde(default = "default_jvt_history_length", alias = "jmt_history_length")]
+    pub jvt_history_length: u64,
 }
 
 impl Default for StorageConfig {
@@ -456,12 +456,12 @@ impl Default for StorageConfig {
             bloom_filter_bits: default_bloom_filter_bits(),
             bytes_per_sync_mb: default_bytes_per_sync_mb(),
             keep_log_file_num: default_keep_log_file_num(),
-            jmt_history_length: default_jmt_history_length(),
+            jvt_history_length: default_jvt_history_length(),
         }
     }
 }
 
-fn default_jmt_history_length() -> u64 {
+fn default_jvt_history_length() -> u64 {
     256
 }
 
@@ -1013,7 +1013,7 @@ fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
         bloom_filter_bits: config.bloom_filter_bits,
         bytes_per_sync: config.bytes_per_sync_mb * 1024 * 1024,
         keep_log_file_num: config.keep_log_file_num,
-        jmt_history_length: config.jmt_history_length,
+        jvt_history_length: config.jvt_history_length,
         ..RocksDbConfig::default()
     }
 }

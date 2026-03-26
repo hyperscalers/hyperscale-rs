@@ -372,8 +372,8 @@ impl SimulationRunner {
     /// Initialize all nodes with genesis blocks and start consensus.
     pub fn initialize_genesis(&mut self) {
         // Run Radix Engine genesis on each node's storage.
-        // SimGenesisWrapper writes substates only (no JMT) during bootstrap,
-        // then computes JMT once at version 0 to avoid collisions with block 1.
+        // SimGenesisWrapper writes substates only (no JVT) during bootstrap,
+        // then computes JVT once at version 0 to avoid collisions with block 1.
         for node_idx in 0..self.io_loops.len() {
             if !self.genesis_executed[node_idx] {
                 self.io_loops[node_idx].with_storage_and_executor(|storage, executor| {
@@ -383,7 +383,7 @@ impl SimulationRunner {
                         return;
                     }
                     let merged = wrapper.into_merged();
-                    storage.finalize_genesis_jmt(&merged);
+                    storage.finalize_genesis_jvt(&merged);
                 });
                 self.genesis_executed[node_idx] = true;
             }
@@ -407,8 +407,8 @@ impl SimulationRunner {
         use hyperscale_engine::GenesisConfig;
 
         // Run Radix Engine genesis on each node's storage with balances.
-        // SimGenesisWrapper writes substates only (no JMT) during bootstrap,
-        // then computes JMT once at version 0 to avoid collisions with block 1.
+        // SimGenesisWrapper writes substates only (no JVT) during bootstrap,
+        // then computes JVT once at version 0 to avoid collisions with block 1.
         for node_idx in 0..self.io_loops.len() {
             if !self.genesis_executed[node_idx] {
                 let balances = balances.clone();
@@ -423,7 +423,7 @@ impl SimulationRunner {
                         return;
                     }
                     let merged = wrapper.into_merged();
-                    storage.finalize_genesis_jmt(&merged);
+                    storage.finalize_genesis_jvt(&merged);
                 });
                 self.genesis_executed[node_idx] = true;
             }
@@ -452,19 +452,19 @@ impl SimulationRunner {
         for shard_id in 0..num_shards {
             let shard_start = shard_id * validators_per_shard;
             let first_node_storage = self.io_loops[shard_start as usize].storage();
-            let genesis_jmt_root = first_node_storage.state_root_hash();
+            let genesis_jvt_root = first_node_storage.state_root_hash();
 
             info!(
                 shard = shard_id,
-                genesis_jmt_root = ?genesis_jmt_root,
-                "JMT state after genesis bootstrap"
+                genesis_jvt_root = ?genesis_jvt_root,
+                "JVT state after genesis bootstrap"
             );
 
             let proposer = ValidatorId((shard_id * validators_per_shard) as u64);
             let genesis_block = Block::genesis(
                 hyperscale_types::ShardGroupId(shard_id as u64),
                 proposer,
-                genesis_jmt_root,
+                genesis_jvt_root,
             );
 
             let shard_end = shard_start + validators_per_shard;
@@ -481,11 +481,11 @@ impl SimulationRunner {
                 self.drain_node_io(node_index);
                 self.process_step_output(node_index, output);
 
-                // Sync state machine with actual JMT state after genesis bootstrap
+                // Sync state machine with actual JVT state after genesis bootstrap
                 let genesis_commit_event =
                     NodeInput::Protocol(ProtocolEvent::StateCommitComplete {
                         height: 0,
-                        state_root: genesis_jmt_root,
+                        state_root: genesis_jvt_root,
                     });
                 self.schedule_event(node_index, self.now, genesis_commit_event);
             }

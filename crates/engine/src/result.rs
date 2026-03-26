@@ -67,7 +67,7 @@ pub struct SingleTxResult {
     ///
     /// Kept separate from the receipt because the receipt has SubstateChange
     /// format (with Create/Update/Delete + previous values), while
-    /// DatabaseUpdates is the raw format needed for JMT application.
+    /// DatabaseUpdates is the raw format needed for JVT application.
     pub database_updates: DatabaseUpdates,
 
     /// Error message if execution failed.

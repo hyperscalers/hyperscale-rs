@@ -6,7 +6,7 @@
 //! ## Provision Flow
 //!
 //! 1. The source shard proposer broadcasts a `StateProvision` batch containing
-//!    Jellyfish Merkle Tree (JMT) inclusion proofs.
+//!    Jellyfish Verkle Tree (JVT) inclusion proofs.
 //! 2. The target shard receives the batch and associates the provisions with
 //!    the corresponding remote block headers.
 //! 3. `VerifyStateProvisions` validates the quorum certificate (QC) signature

@@ -28,7 +28,7 @@ pub fn generate_proof<S: ReadableTreeStore>(
 /// Verify an aggregated verkle proof against a state root.
 ///
 /// The proof covers ALL entries in a single multipoint verification.
-pub fn verify_all_merkle_proofs(
+pub fn verify_all_verkle_proofs(
     entries: &[hyperscale_types::StateEntry],
     proof: &SubstateInclusionProof,
     expected_state_root: Hash,

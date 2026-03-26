@@ -280,10 +280,10 @@ pub struct ProposalResult<P: Send> {
     pub prepared_commit: Option<P>,
 }
 
-/// Build a proposal block, computing the state root if the JMT is ready.
+/// Build a proposal block, computing the state root if the JVT is ready.
 ///
 /// Algorithm:
-/// 1. Check JMT ready: `storage.state_root_hash() == parent_state_root`
+/// 1. Check JVT ready: `storage.state_root_hash() == parent_state_root`
 /// 2. If ready + certs non-empty: `prepare_block_commit()` for certs, get state_root + handle
 /// 3. Else: inherit parent_state_root, empty certs, no handle
 /// 4. Compute tx root: `compute_transaction_root(retry, priority, normal)`
@@ -312,20 +312,20 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     local_shard: ShardGroupId,
     provision_targets: Vec<ShardGroupId>,
 ) -> ProposalResult<S::PreparedCommit> {
-    // Check if JMT is at parent_state_root (no waiting - instant check)
+    // Check if JVT is at parent_state_root (no waiting - instant check)
     let current_root = storage.state_root_hash();
-    let jmt_ready = current_root == parent_state_root;
+    let jvt_ready = current_root == parent_state_root;
 
-    // Can include certificates only if JMT is ready
-    let include_certs = jmt_ready && !certificates.is_empty();
+    // Can include certificates only if JVT is ready
+    let include_certs = jvt_ready && !certificates.is_empty();
 
     let (state_root, certs_to_include, prepared) = if include_certs {
-        // JMT ready - compute speculative root and get prepared commit handle
+        // JVT ready - compute speculative root and get prepared commit handle
         let (root, prepared) =
             storage.prepare_block_commit(parent_state_root, &merged_updates, height.0);
         (root, certificates, Some(prepared))
     } else {
-        // Either no certificates, or JMT not ready - inherit parent state
+        // Either no certificates, or JVT not ready - inherit parent state
         if !certificates.is_empty() {
             tracing::debug!(
                 height = height.0,
@@ -333,7 +333,7 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
                 skipped_certs = certificates.len(),
                 ?current_root,
                 ?parent_state_root,
-                "JMT not ready - proposing without certificates"
+                "JVT not ready - proposing without certificates"
             );
         }
         (parent_state_root, vec![], None)

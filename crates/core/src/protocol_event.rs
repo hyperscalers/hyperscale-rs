@@ -108,8 +108,8 @@ pub enum ProtocolEvent {
     // ═══════════════════════════════════════════════════════════════════════
     // State Commit
     // ═══════════════════════════════════════════════════════════════════════
-    /// JMT state commit completed for a block.
-    /// The JMT version always equals the block height.
+    /// JVT state commit completed for a block.
+    /// The JVT version always equals the block height.
     StateCommitComplete { height: u64, state_root: Hash },
 
     // ═══════════════════════════════════════════════════════════════════════

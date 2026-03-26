@@ -273,7 +273,7 @@ pub struct StateProvision {
     /// Source shard (the shard providing the state).
     pub source_shard: ShardGroupId,
 
-    /// Block height when this provision was created (= JMT version for merkle proofs).
+    /// Block height when this provision was created (= JVT version for verkle proofs).
     pub block_height: BlockHeight,
 
     /// Unix timestamp (milliseconds) of the block that triggered this provision.

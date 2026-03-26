@@ -1448,7 +1448,7 @@ impl ExecutionState {
         // Remove from finalized certificates
         self.finalized_certificates.remove(tx_hash);
 
-        // Evict from execution cache — writes have been applied to JMT at this point.
+        // Evict from execution cache — writes have been applied to JVT at this point.
         self.execution_cache.remove(tx_hash);
 
         // Clean up all transaction tracking state now that it's finalized.

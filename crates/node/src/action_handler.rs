@@ -361,7 +361,7 @@ pub(crate) fn handle_delegated_action<
                 if all_entries.is_empty() {
                     return true;
                 }
-                hyperscale_storage::proofs::verify_all_merkle_proofs(
+                hyperscale_storage::proofs::verify_all_verkle_proofs(
                     &all_entries,
                     &batch.attestation.proof,
                     header.header.state_root,
@@ -529,7 +529,7 @@ pub(crate) fn handle_delegated_action<
             all_storage_keys.dedup();
             let proof = match ctx
                 .storage
-                .generate_merkle_proofs(&all_storage_keys, block_height.0)
+                .generate_verkle_proofs(&all_storage_keys, block_height.0)
             {
                 Some(p) => Arc::new(p),
                 None => {

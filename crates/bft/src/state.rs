@@ -66,13 +66,13 @@ pub struct RecoveredState {
     /// Latest QC (certifies the highest certified block).
     pub latest_qc: Option<QuorumCertificate>,
 
-    /// Last committed JMT root hash.
+    /// Last committed JVT root hash.
     ///
     /// Restored from storage at startup so proposals use the correct parent
     /// state root instead of the default Hash::ZERO.
     ///
     /// If not provided (None), defaults to Hash::ZERO for fresh start.
-    pub jmt_root: Option<Hash>,
+    pub jvt_root: Option<Hash>,
 }
 
 /// Tracks in-flight proposal for correlating `Event::ProposalBuilt` callback.
@@ -282,7 +282,7 @@ impl BftState {
             voted_heights,
             received_votes_by_height: HashMap::new(),
             certified_blocks: HashMap::new(),
-            verification: VerificationPipeline::new(recovered.jmt_root.unwrap_or(Hash::ZERO)),
+            verification: VerificationPipeline::new(recovered.jvt_root.unwrap_or(Hash::ZERO)),
             sync: SyncManager::new(),
             pending_commits: std::collections::BTreeMap::new(),
             pending_commits_awaiting_data: HashMap::new(),
@@ -338,16 +338,16 @@ impl BftState {
         recipients
     }
 
-    /// Get the local JMT state (version, root).
+    /// Get the local JVT state (version, root).
     ///
-    /// This returns the actual JMT state from local async certificate commits.
+    /// This returns the actual JVT state from local async certificate commits.
     /// Different validators may have different values due to commit timing.
     ///
     /// Used by:
-    /// - Verifiers to check if JMT is ready for state root verification
+    /// - Verifiers to check if JVT is ready for state root verification
     /// - Fallback/sync blocks to get current root when no certs
-    fn get_local_jmt_root(&self) -> Hash {
-        self.verification.jmt_root()
+    fn get_local_jvt_root(&self) -> Hash {
+        self.verification.jvt_root()
     }
 
     /// Get a block by its hash.
@@ -900,10 +900,10 @@ impl BftState {
             .get_block_by_hash(parent_hash)
             .map(|b| b.header.state_root)
             .unwrap_or_else(|| {
-                // Parent not found - use local JMT state as fallback.
+                // Parent not found - use local JVT state as fallback.
                 // This handles genesis case and edge cases where the parent block
                 // is missing from pending_blocks (e.g., after recovery or sync).
-                self.get_local_jmt_root()
+                self.get_local_jvt_root()
             });
 
         // Build set of certificate hashes for stale deferral filtering
@@ -960,7 +960,7 @@ impl BftState {
         // Merging is deferred to the thread pool.
         let per_cert_updates = collect_updates(&certificates_to_propose);
 
-        // Always use BuildProposal - the runner handles JMT readiness and timeout.
+        // Always use BuildProposal - the runner handles JVT readiness and timeout.
         // This ensures transactions are always included regardless of certificate state.
         // Include SetTimer to reschedule the proposal timer.
         vec![
@@ -1032,8 +1032,8 @@ impl BftState {
             .get_block_by_hash(parent_hash)
             .map(|b| b.header.state_root)
             .unwrap_or_else(|| {
-                // Genesis case - use local JMT state
-                self.get_local_jmt_root()
+                // Genesis case - use local JVT state
+                self.get_local_jvt_root()
             });
 
         let header = BlockHeader {
@@ -1156,8 +1156,8 @@ impl BftState {
             .get_block_by_hash(parent_hash)
             .map(|b| b.header.state_root)
             .unwrap_or_else(|| {
-                // Genesis case - use local JMT state
-                self.get_local_jmt_root()
+                // Genesis case - use local JVT state
+                self.get_local_jvt_root()
             });
 
         let header = BlockHeader {
@@ -1911,7 +1911,7 @@ impl BftState {
                     let parent_state_root = self
                         .get_block_by_hash(block.header.parent_hash)
                         .map(|parent| parent.header.state_root)
-                        .unwrap_or_else(|| self.get_local_jmt_root());
+                        .unwrap_or_else(|| self.get_local_jvt_root());
                     self.verification.initiate_state_root_verification(
                         block_hash,
                         &block,
@@ -2875,18 +2875,18 @@ impl BftState {
         actions
     }
 
-    /// Handle JMT state commit completion.
+    /// Handle JVT state commit completion.
     ///
-    /// Called when the runner has finished committing a block's state to the JMT.
-    /// This updates our tracked local JMT root (last_committed_jmt_root) and
+    /// Called when the runner has finished committing a block's state to the JVT.
+    /// This updates our tracked local JVT root (last_committed_jvt_root) and
     /// checks if any pending state root verifications can now proceed.
     ///
     /// Unblocked verifications are pushed to the ready queue; the caller
     /// (`NodeStateMachine`) drains them and computes `merged_updates`.
     ///
     /// # Arguments
-    /// * `block_height` - The block height (= JMT version) after the commit
-    /// * `state_root` - The JMT root hash after the commit
+    /// * `block_height` - The block height (= JVT version) after the commit
+    /// * `state_root` - The JVT root hash after the commit
     #[instrument(skip(self, _topology), fields(block_height, state_root = ?state_root))]
     pub fn on_state_commit_complete(
         &mut self,
@@ -2897,7 +2897,7 @@ impl BftState {
         // Only advance forward (avoid out-of-order updates).
         // Use strict `<` so that same-height updates are accepted: the BFT state
         // machine advances `committed_height` in `commit_block_and_buffered`
-        // *before* the IO loop commits the JMT and sends `StateCommitComplete`.
+        // *before* the IO loop commits the JVT and sends `StateCommitComplete`.
         // With `<=` the root update would be silently dropped.
         if block_height < self.committed_height {
             return;
@@ -2908,10 +2908,10 @@ impl BftState {
             new_height = block_height,
             new_root = ?state_root,
             pending_verifications = self.verification.pending_state_root_count(),
-            "JMT state commit complete, checking for unblocked verifications"
+            "JVT state commit complete, checking for unblocked verifications"
         );
 
-        self.verification.on_jmt_advanced(block_height, state_root);
+        self.verification.on_jvt_advanced(block_height, state_root);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -2996,7 +2996,7 @@ impl BftState {
     ///
     /// # State Root Parameter
     ///
-    /// `state_root` is the computed JMT root after applying writes from the certificates.
+    /// `state_root` is the computed JVT root after applying writes from the certificates.
     /// If certificates is empty, parent state is inherited.
     #[instrument(skip(self, qc, ready_txs, deferred, aborted, certificates, source_attestations, commitment_entries, collect_updates), fields(
         height = qc.height.0,

@@ -27,7 +27,7 @@ struct CachedExecution {
 /// In-memory cache of execution write sets, keyed by transaction hash.
 ///
 /// Entries are explicitly evicted when:
-/// - The transaction is committed in a block (writes applied to JMT)
+/// - The transaction is committed in a block (writes applied to JVT)
 /// - The transaction times out / is rejected
 ///
 /// This cache does NOT persist across restarts. After restart, the node

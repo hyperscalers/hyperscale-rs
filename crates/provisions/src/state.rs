@@ -6,7 +6,7 @@
 //!
 //! ## Provision Flow
 //!
-//! The source shard proposer broadcasts a `StateProvision` batch containing JMT
+//! The source shard proposer broadcasts a `StateProvision` batch containing JVT
 //! inclusion proofs. The target shard joins with remote block headers, then
 //! dispatches `VerifyStateProvisions` to verify the QC signature once and
 //! merkle proofs per provision against the committed state root.

@@ -63,7 +63,7 @@ pub trait ExecutionBackend: Clone + Send + Sync + 'static {
         provisions: &[StateProvision],
     ) -> ExecutionOutput;
 
-    /// Fetch state entries for the given nodes at a specific block height (= JMT version).
+    /// Fetch state entries for the given nodes at a specific block height (= JVT version).
     ///
     /// Used by provisioning to collect state for remote shards.
     /// Returns `None` if the version is unavailable (GC'd or not yet committed).

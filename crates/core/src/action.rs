@@ -284,15 +284,15 @@ pub enum Action {
         peers: Vec<ValidatorId>,
     },
 
-    /// Verify a block's state root against the JMT.
+    /// Verify a block's state root against the JVT.
     ///
-    /// Applies the block's shard-local state changes to the JMT and compares the
+    /// Applies the block's shard-local state changes to the JVT and compares the
     /// resulting root against the header's `state_root`.
     /// Returns `ProtocolEvent::StateRootVerified`.
     ///
     /// The verification flow:
-    /// 1. Runner checks if local JMT root matches `parent_state_root`
-    /// 2. Applies per-certificate updates to compute new JMT root
+    /// 1. Runner checks if local JVT root matches `parent_state_root`
+    /// 2. Applies per-certificate updates to compute new JVT root
     /// 3. Compares computed root against `expected_root`
     /// 4. If valid, builds and caches a WriteBatch for efficient commit later
     ///
@@ -300,14 +300,14 @@ pub enum Action {
     /// execution cache, filtering to local shard, and merging.
     VerifyStateRoot {
         block_hash: Hash,
-        /// Base state root to verify from (must match local JMT before computing).
+        /// Base state root to verify from (must match local JVT before computing).
         parent_state_root: Hash,
         /// Expected state root after applying writes.
         expected_root: Hash,
         /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
         /// Merged on the thread pool before verification.
         per_cert_updates: Vec<Arc<DatabaseUpdates>>,
-        /// Block height (used as JMT version).
+        /// Block height (used as JVT version).
         block_height: u64,
     },
 
@@ -317,7 +317,7 @@ pub enum Action {
     /// and compares against the block header's claimed transaction_root.
     /// Returns `ProtocolEvent::TransactionRootVerified`.
     ///
-    /// This is a pure CPU operation (no JMT dependency) so it can be verified
+    /// This is a pure CPU operation (no JVT dependency) so it can be verified
     /// in parallel with state root verification.
     VerifyTransactionRoot {
         block_hash: Hash,
@@ -364,7 +364,7 @@ pub enum Action {
         parent_qc: QuorumCertificate,
         timestamp: u64,
         is_fallback: bool,
-        /// Parent's state root. Certs included only if local JMT matches this.
+        /// Parent's state root. Certs included only if local JVT matches this.
         parent_state_root: Hash,
         retry_transactions: Vec<Arc<RoutableTransaction>>,
         priority_transactions: Vec<Arc<RoutableTransaction>>,
@@ -428,7 +428,7 @@ pub enum Action {
     /// Emit a committed block for external observers.
     ///
     /// Carries the certifying QC so the runner can persist committed metadata
-    /// (`set_committed_state`) after JMT state has been applied, not at
+    /// (`set_committed_state`) after JVT state has been applied, not at
     /// certification time.
     EmitCommittedBlock {
         block: Block,
@@ -471,8 +471,8 @@ pub enum Action {
     ///
     /// This stores the block data only — it does NOT update committed metadata.
     /// Committed metadata (`set_committed_state`) is persisted by the runner
-    /// after JMT state has been applied, to prevent committed_height from
-    /// getting ahead of actual JMT state on crash recovery.
+    /// after JVT state has been applied, to prevent committed_height from
+    /// getting ahead of actual JVT state on crash recovery.
     PersistBlock {
         block: Block,
         /// The QC that certified this block (stored alongside block data).

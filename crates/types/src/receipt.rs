@@ -108,7 +108,7 @@ pub enum LogLevel {
 /// The consensus-critical subset of a transaction receipt.
 ///
 /// Only `outcome` and `event_root` are included — no state change commitment.
-/// State correctness is enforced by `state_root` in the block header (JMT root
+/// State correctness is enforced by `state_root` in the block header (JVT root
 /// commits to the entire post-block state). Per-transaction write commitments
 /// are redundant for consensus safety.
 ///

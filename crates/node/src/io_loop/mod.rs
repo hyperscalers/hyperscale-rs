@@ -205,7 +205,7 @@ where
 
     // Block commit accumulator — collects EmitCommittedBlock actions within a
     // single feed_event/handle_actions batch, then spawns a single closure on
-    // the execution pool to commit them sequentially. This keeps JMT writes
+    // the execution pool to commit them sequentially. This keeps JVT writes
     // off the pinned IoLoop thread while preserving commit ordering.
     pending_block_commits: Vec<(Block, QuorumCertificate)>,
 
@@ -951,7 +951,7 @@ where
 
     /// Capture a snapshot of node state for external status APIs.
     pub fn status_snapshot(&self) -> NodeStatusSnapshot {
-        let state_root = self.state.last_committed_jmt_root();
+        let state_root = self.state.last_committed_jvt_root();
         let mempool = self.state.mempool();
         let contention = mempool.lock_contention_stats();
 

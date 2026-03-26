@@ -18,21 +18,21 @@
 //!
 //! Rather than having our own `Storage` trait that we adapt to Radix's `SubstateDatabase`,
 //! runner storage types implement `SubstateDatabase` directly, plus our `SubstateStore`
-//! extension trait for snapshots, node listing, and JMT state roots.
+//! extension trait for snapshots, node listing, and JVT state roots.
 //!
-//! # Jellyfish Merkle Tree (JMT)
+//! # Jellyfish Verkle Tree (JVT)
 //!
-//! All `SubstateStore` implementations use JMT internally to maintain a cryptographic
+//! All `SubstateStore` implementations use JVT internally to maintain a cryptographic
 //! commitment to the entire state. This provides:
-//! - `jmt_version()` - Block height of last committed JMT state
-//! - `state_root_hash()` - Merkle root of all substates at current version
+//! - `jvt_version()` - Block height of last committed JVT state
+//! - `state_root_hash()` - Verkle root of all substates at current version
 
 #![warn(missing_docs)]
 
 mod commit;
 mod consensus;
 mod genesis;
-mod jmt_snapshot;
+mod jvt_snapshot;
 pub mod keys;
 mod overlay;
 pub mod proofs;
@@ -45,7 +45,7 @@ pub mod test_helpers;
 pub use commit::{CommitStore, ConsensusCommitData};
 pub use consensus::ConsensusStore;
 pub use genesis::{GenesisWrapper, SubstatesOnlyCommit};
-pub use jmt_snapshot::{JmtSnapshot, LeafSubstateKeyAssociation};
+pub use jvt_snapshot::{JvtSnapshot, LeafSubstateKeyAssociation};
 pub use overlay::{SubstateDbLookup, SubstateLookup};
 pub use store::SubstateStore;
 pub use writes::{
@@ -53,9 +53,9 @@ pub use writes::{
     merge_database_updates_from_arcs, merge_into, receipt_to_database_updates,
 };
 
-/// Returns `None` when the JMT is truly empty (height 0 with zero root),
+/// Returns `None` when the JVT is truly empty (height 0 with zero root),
 /// indicating no parent node exists. Otherwise returns `Some(block_height)`.
-pub fn jmt_parent_height(block_height: u64, root: StateRootHash) -> Option<u64> {
+pub fn jvt_parent_height(block_height: u64, root: StateRootHash) -> Option<u64> {
     if block_height == 0 && root == StateRootHash::ZERO {
         None
     } else {

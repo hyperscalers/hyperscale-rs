@@ -426,7 +426,7 @@ pub fn execute_and_sign_cross_shard<S: SubstateStore>(
 /// Radix Engine may touch system state (fee vaults, royalty accumulators,
 /// transaction tracker) that is not part of the transaction's declared
 /// writes. These undeclared writes must be stripped before the result
-/// enters the execution cache / JMT.
+/// enters the execution cache / JVT.
 fn filter_to_declared_writes(
     updates: &hyperscale_storage::DatabaseUpdates,
     declared_writes: &[NodeId],

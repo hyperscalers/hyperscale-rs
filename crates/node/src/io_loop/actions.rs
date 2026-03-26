@@ -276,7 +276,7 @@ where
 
     /// Accumulate a block commit for batched dispatch. Records metrics
     /// immediately (on the pinned thread) and feeds the sync protocol, then
-    /// defers the heavy JMT/metadata writes to [`flush_block_commits`].
+    /// defers the heavy JVT/metadata writes to [`flush_block_commits`].
     fn accumulate_block_commit(
         &mut self,
         block: hyperscale_types::Block,
@@ -301,7 +301,7 @@ where
         metrics::set_livelock_deferred_count(self.state.livelock().stats().pending_deferrals);
 
         // Feed committed height to sync protocol (just tracks progress,
-        // doesn't need JMT state).
+        // doesn't need JVT state).
         let outputs = self
             .sync_protocol
             .handle(SyncInput::BlockCommitted { height: height.0 });
@@ -348,7 +348,7 @@ where
 
         if !has_non_empty {
             // All empty blocks — synchronous fast path.
-            // Still advance JMT version so it matches block height.
+            // Still advance JVT version so it matches block height.
             if !pending_receipts.is_empty() {
                 self.storage.store_receipt_bundles(&pending_receipts);
             }
@@ -402,7 +402,7 @@ where
         // BuildProposal complete on the crypto pool *after* the block they
         // prepared has already been committed via the sync/receipt-
         // reconstruction path. Without this prune, one orphaned
-        // PreparedCommit (WriteBatch + JmtSnapshot + DatabaseUpdates) leaks
+        // PreparedCommit (WriteBatch + JvtSnapshot + DatabaseUpdates) leaks
         // per block whenever the crypto pool is slower than commit dispatch.
         let max_committed_height = commits
             .iter()
@@ -450,7 +450,7 @@ where
                     qc: qc.clone(),
                 };
 
-                // Always commit — even empty blocks advance the JMT version
+                // Always commit — even empty blocks advance the JVT version
                 // to match block height, so provision lookups succeed.
                 // Consensus metadata is folded into the same atomic write.
                 let prepared = prepared_map[i].take();

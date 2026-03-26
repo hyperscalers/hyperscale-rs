@@ -6,17 +6,17 @@
 //! snapshots without copying the entire dataset. This is critical for parallel
 //! transaction execution where each transaction needs an isolated view.
 //!
-//! # JMT Integration
+//! # JVT Integration
 //!
-//! Uses `TypedInMemoryTreeStore` for Jellyfish Merkle Tree tracking, providing
-//! `jmt_version()` and `state_root_hash()` for state commitment. This ensures
-//! simulation has identical JMT behavior to production.
+//! Uses `TypedInMemoryTreeStore` for Jellyfish Verkle Tree tracking, providing
+//! `jvt_version()` and `state_root_hash()` for state commitment. This ensures
+//! simulation has identical JVT behavior to production.
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_storage::{
     jmt::{StoredNodeKey, TypedInMemoryTreeStore, WriteableTreeStore},
     keys, CommitStore, ConsensusStore, DatabaseUpdate, DatabaseUpdates, DbPartitionKey, DbSortKey,
-    DbSubstateValue, JmtSnapshot, PartitionDatabaseUpdates, PartitionEntry, StateRootHash,
+    DbSubstateValue, JvtSnapshot, PartitionDatabaseUpdates, PartitionEntry, StateRootHash,
     SubstateDatabase, SubstateStore,
 };
 use hyperscale_types::{
@@ -28,16 +28,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 // ═══════════════════════════════════════════════════════════════════════
-// Shared substate + JMT state (single RwLock)
+// Shared substate + JVT state (single RwLock)
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Substate data and JMT state protected by a single RwLock.
+/// Substate data and JVT state protected by a single RwLock.
 ///
 /// A single lock ensures association resolution can read substate data
 /// atomically, avoiding deadlock.
 ///
 /// Using RwLock (instead of Mutex) allows concurrent read access: speculative
-/// JMT computations from `prepare_block_commit` take a read lock and can run
+/// JVT computations from `prepare_block_commit` take a read lock and can run
 /// concurrently with other readers, while commits take a write lock.
 pub(crate) struct SharedState {
     /// Radix substate data. `im::OrdMap` for O(1) structural-sharing clones.
@@ -57,9 +57,9 @@ impl SharedState {
     fn new() -> Self {
         Self {
             data: OrdMap::new(),
-            // Pruning disabled: historical substate reads traverse the JMT at
+            // Pruning disabled: historical substate reads traverse the JVT at
             // past heights and need old nodes to still exist. In production,
-            // RocksDB GC respects `jmt_history_length` (default 256).
+            // RocksDB GC respects `jvt_history_length` (default 256).
             // In simulation, tests are short-lived so retaining all nodes is fine.
             tree_store: TypedInMemoryTreeStore::new(),
             current_block_height: 0,
@@ -147,21 +147,21 @@ impl ConsensusState {
 /// and snapshots are cheap regardless of data size.
 ///
 /// Implements Radix's `SubstateDatabase` directly, plus our `SubstateStore` extension
-/// for snapshots, node listing, and JMT state roots.
+/// for snapshots, node listing, and JVT state roots.
 ///
 /// # Locking Strategy
 ///
 /// Two RwLocks with independent lifetimes — no ordering constraint:
-/// - `state`: Substate data + JMT tree store + version/root/associations.
-///   Read lock for substate reads, JMT lookups, and speculative computation.
-///   Write lock for commits (substate writes + JMT updates in one acquisition).
+/// - `state`: Substate data + JVT tree store + version/root/associations.
+///   Read lock for substate reads, JVT lookups, and speculative computation.
+///   Write lock for commits (substate writes + JVT updates in one acquisition).
 /// - `consensus`: Block metadata, certificates, votes, committed state.
-///   Separate because consensus metadata is independent of substate/JMT state.
+///   Separate because consensus metadata is independent of substate/JVT state.
 pub struct SimStorage<D: Dispatch + 'static> {
-    /// Substate data + JMT state (single RwLock).
+    /// Substate data + JVT state (single RwLock).
     state: Arc<RwLock<SharedState>>,
 
-    /// Dispatch implementation for parallel JMT computation.
+    /// Dispatch implementation for parallel JVT computation.
     dispatch: D,
 
     /// Consensus metadata (single RwLock).
@@ -178,8 +178,8 @@ impl<D: Dispatch + 'static> SimStorage<D> {
         }
     }
 
-    /// Get the current JMT version.
-    pub fn current_jmt_version(&self) -> u64 {
+    /// Get the current JVT version.
+    pub fn current_jvt_version(&self) -> u64 {
         self.state.read().unwrap().current_block_height
     }
 
@@ -211,7 +211,7 @@ impl<D: Dispatch + 'static> SimStorage<D> {
     /// Atomically commit a certificate and its state writes.
     ///
     /// Applies database updates and stores certificate metadata.
-    /// JMT is deferred to block commit — this mirrors the production
+    /// JVT is deferred to block commit — this mirrors the production
     /// `RocksDbStorage::commit_certificate_with_writes()` to ensure DST
     /// catches timing bugs where code incorrectly assumes state is available
     /// before certificate persistence.
@@ -238,10 +238,10 @@ impl<D: Dispatch + 'static> SimStorage<D> {
             .insert(certificate.transaction_hash, certificate.clone());
     }
 
-    /// Test helper: commits database updates with auto-incrementing JMT version.
+    /// Test helper: commits database updates with auto-incrementing JVT version.
     /// Not used in production (use commit_block instead).
     ///
-    /// Computes JMT updates and applies them to the tree store, resolving
+    /// Computes JVT updates and applies them to the tree store, resolving
     /// leaf-substate associations for historical reads.
     #[cfg(test)]
     pub fn commit_shared(&self, updates: &DatabaseUpdates) {
@@ -260,7 +260,7 @@ impl<D: Dispatch + 'static> SimStorage<D> {
         }
 
         let parent_version =
-            hyperscale_storage::jmt_parent_height(s.current_block_height, s.current_root_hash);
+            hyperscale_storage::jvt_parent_height(s.current_block_height, s.current_root_hash);
         let (new_root, collected) = hyperscale_storage::jmt::put_at_version(
             &s.tree_store,
             parent_version,
@@ -277,12 +277,12 @@ impl<D: Dispatch + 'static> SimStorage<D> {
         s.current_root_hash = new_root;
     }
 
-    /// Write only substate data (no JMT computation).
+    /// Write only substate data (no JVT computation).
     ///
     /// Used during genesis bootstrap so each intermediate `commit()` call from the
-    /// Radix Engine writes substates without computing a JMT version.
-    /// After all genesis commits complete, [`finalize_genesis_jmt`] computes the
-    /// JMT once at version 0.
+    /// Radix Engine writes substates without computing a JVT version.
+    /// After all genesis commits complete, [`finalize_genesis_jvt`] computes the
+    /// JVT once at version 0.
     pub fn commit_substates_only(&self, updates: &DatabaseUpdates) {
         let mut s = self.state.write().unwrap();
         // Genesis: no version tracking, write at version 0.
@@ -294,24 +294,24 @@ impl<D: Dispatch + 'static> SimStorage<D> {
         apply_updates_to_ordmap(data, updates, Some((0, versioned_substates)));
     }
 
-    /// Compute the JMT once at version 0 from the merged genesis updates.
+    /// Compute the JVT once at version 0 from the merged genesis updates.
     ///
     /// Called after all genesis bootstrap commits are complete. This avoids
-    /// computing intermediate JMT versions during genesis (which would collide
+    /// computing intermediate JVT versions during genesis (which would collide
     /// with block 1's version).
     ///
     /// # Returns
-    /// The genesis state root hash (JMT root at version 0).
-    pub fn finalize_genesis_jmt(&self, merged: &DatabaseUpdates) -> Hash {
+    /// The genesis state root hash (JVT root at version 0).
+    pub fn finalize_genesis_jvt(&self, merged: &DatabaseUpdates) -> Hash {
         let mut s = self.state.write().unwrap();
 
-        // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JMT.
+        // Guard: finalize_genesis_jvt must only be called once, on an uninitialized JVT.
         assert!(
             s.current_block_height == 0 && s.current_root_hash == Hash::ZERO,
-            "finalize_genesis_jmt called but JMT already initialized"
+            "finalize_genesis_jvt called but JVT already initialized"
         );
 
-        // parent=None, version=0: genesis is the first JMT state.
+        // parent=None, version=0: genesis is the first JVT state.
         let (root, collected) = hyperscale_storage::jmt::put_at_version(
             &s.tree_store,
             None,
@@ -420,7 +420,7 @@ impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
         }))
     }
 
-    fn jmt_version(&self) -> u64 {
+    fn jvt_version(&self) -> u64 {
         self.state.read().unwrap().current_block_height
     }
 
@@ -485,7 +485,7 @@ impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
         Some(results)
     }
 
-    fn generate_merkle_proofs(
+    fn generate_verkle_proofs(
         &self,
         storage_keys: &[Vec<u8>],
         block_height: u64,
@@ -496,15 +496,15 @@ impl<D: Dispatch + 'static> SubstateStore for SimStorage<D> {
 }
 
 impl<D: Dispatch + 'static> SimStorage<D> {
-    /// Apply a JMT snapshot directly, inserting precomputed nodes.
+    /// Apply a JVT snapshot directly, inserting precomputed nodes.
     ///
     /// This is the fast path for block commit when we have a cached snapshot
     /// from verification. Also stores leaf-to-substate associations for
     /// historical queries.
-    fn apply_jmt_snapshot(s: &mut SharedState, snapshot: JmtSnapshot) {
+    fn apply_jvt_snapshot(s: &mut SharedState, snapshot: JvtSnapshot) {
         if s.current_root_hash != snapshot.base_root {
             panic!(
-                "JMT snapshot base ROOT mismatch: expected {:?}, got {:?}.",
+                "JVT snapshot base ROOT mismatch: expected {:?}, got {:?}.",
                 snapshot.base_root, s.current_root_hash
             );
         }
@@ -512,7 +512,7 @@ impl<D: Dispatch + 'static> SimStorage<D> {
             tracing::debug!(
                 expected_version = snapshot.base_version,
                 actual_version = s.current_block_height,
-                "JMT snapshot base VERSION mismatch (root matches) - proceeding. \
+                "JVT snapshot base VERSION mismatch (root matches) - proceeding. \
                  This is expected when empty commits advance the version counter."
             );
         }
@@ -609,12 +609,12 @@ fn apply_updates_to_ordmap(
 
 /// Precomputed commit work for a SimStorage block commit.
 ///
-/// Contains a `JmtSnapshot` (precomputed Merkle tree nodes), a pre-built
+/// Contains a `JvtSnapshot` (precomputed verkle tree nodes), a pre-built
 /// `OrdMap` with all certificate substate writes already applied (for O(1)
 /// swap at commit time), plus the certificates and shard needed for
 /// `store_certificate` calls and fallback recompute.
 pub struct SimPreparedCommit {
-    snapshot: JmtSnapshot,
+    snapshot: JvtSnapshot,
     /// Pre-built OrdMap with all certificate substate writes already applied.
     /// O(1) clone from base at prepare time; O(1) swap at commit time.
     resulting_data: OrdMap<Vec<u8>, Vec<u8>>,
@@ -630,7 +630,7 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
         merged_updates: &DatabaseUpdates,
         block_height: u64,
     ) -> (Hash, Self::PreparedCommit) {
-        // Read lock: clone data + compute speculative JMT root concurrently.
+        // Read lock: clone data + compute speculative JVT root concurrently.
         let s = self.state.read().unwrap();
         let base_data = s.data.clone();
         let base_root = s.current_root_hash;
@@ -640,11 +640,11 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             tracing::warn!(
                 ?base_root,
                 ?parent_state_root,
-                "JMT root mismatch - verification will likely fail"
+                "JVT root mismatch - verification will likely fail"
             );
         }
 
-        let parent_version = hyperscale_storage::jmt_parent_height(base_version, base_root);
+        let parent_version = hyperscale_storage::jvt_parent_height(base_version, base_root);
         let (result_root, collected) = hyperscale_storage::jmt::put_at_version(
             &s.tree_store,
             parent_version,
@@ -655,7 +655,7 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             None,
         );
 
-        let snapshot = JmtSnapshot::from_collected_writes(
+        let snapshot = JvtSnapshot::from_collected_writes(
             collected,
             base_root,
             base_version,
@@ -693,9 +693,9 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             let use_fast_path = s.current_root_hash == prepared.snapshot.base_root;
 
             if use_fast_path {
-                // Fast path: apply precomputed JMT snapshot + swap OrdMap.
+                // Fast path: apply precomputed JVT snapshot + swap OrdMap.
                 // Write MVCC entries from the merged updates.
-                Self::apply_jmt_snapshot(&mut s, prepared.snapshot);
+                Self::apply_jvt_snapshot(&mut s, prepared.snapshot);
                 s.data = prepared.resulting_data;
                 // The OrdMap was pre-built, but we still need MVCC entries.
                 // Use a throwaway OrdMap since data is already applied.
@@ -727,7 +727,7 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
             }
         }
 
-        // Stale cache: fall back to full block commit which recomputes JMT.
+        // Stale cache: fall back to full block commit which recomputes JVT.
         // Use the stored merged_updates to ensure substate writes aren't lost.
         self.commit_block(
             &prepared.merged_updates,
@@ -768,7 +768,7 @@ impl<D: Dispatch + 'static> CommitStore for SimStorage<D> {
         }
 
         let parent_version =
-            hyperscale_storage::jmt_parent_height(s.current_block_height, s.current_root_hash);
+            hyperscale_storage::jvt_parent_height(s.current_block_height, s.current_root_hash);
 
         let (new_root, collected) = hyperscale_storage::jmt::put_at_version(
             &s.tree_store,
@@ -1395,13 +1395,13 @@ mod tests {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // JMT state tracking
+    // JVT state tracking
     // ═══════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_initial_jmt_version_is_zero() {
+    fn test_initial_jvt_version_is_zero() {
         let storage = SimStorage::new(SyncDispatch::new());
-        assert_eq!(storage.jmt_version(), 0);
+        assert_eq!(storage.jvt_version(), 0);
     }
 
     #[test]
@@ -1411,15 +1411,15 @@ mod tests {
     }
 
     #[test]
-    fn test_jmt_version_increments_on_commit() {
+    fn test_jvt_version_increments_on_commit() {
         let storage = SimStorage::new(SyncDispatch::new());
-        assert_eq!(storage.jmt_version(), 0);
+        assert_eq!(storage.jvt_version(), 0);
 
         storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
-        assert_eq!(storage.jmt_version(), 1);
+        assert_eq!(storage.jvt_version(), 1);
 
         storage.commit_shared(&make_database_update(vec![4, 5, 6], 0, vec![20], vec![2]));
-        assert_eq!(storage.jmt_version(), 2);
+        assert_eq!(storage.jvt_version(), 2);
     }
 
     #[test]
@@ -1447,7 +1447,7 @@ mod tests {
         s2.commit_shared(&updates);
 
         assert_eq!(s1.state_root_hash(), s2.state_root_hash());
-        assert_eq!(s1.jmt_version(), s2.jmt_version());
+        assert_eq!(s1.jvt_version(), s2.jvt_version());
     }
 
     #[test]
@@ -1466,7 +1466,7 @@ mod tests {
         let storage = SimStorage::new(SyncDispatch::new());
         let updates = DatabaseUpdates::default();
         storage.commit_shared(&updates);
-        assert_eq!(storage.jmt_version(), 1);
+        assert_eq!(storage.jvt_version(), 1);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1495,7 +1495,7 @@ mod tests {
         let cert2 = Arc::new(make_test_certificate(2, shard));
 
         let result = storage.commit_block(&merged, &[cert1, cert2], 1, None);
-        // Certificate merging: all certs applied as single JMT version = block_height
+        // Certificate merging: all certs applied as single JVT version = block_height
         assert_ne!(result, Hash::ZERO);
     }
 
@@ -1503,8 +1503,8 @@ mod tests {
     fn test_commit_block_empty_certs() {
         let storage = SimStorage::new(SyncDispatch::new());
         storage.commit_block(&DatabaseUpdates::default(), &[], 1, None);
-        // Empty block: JMT version still advances to block_height
-        assert_eq!(storage.jmt_version(), 1);
+        // Empty block: JVT version still advances to block_height
+        assert_eq!(storage.jvt_version(), 1);
     }
 
     #[test]
@@ -1558,8 +1558,8 @@ mod tests {
         storage.commit_certificate_with_writes(&cert, &updates);
 
         // Individual cert commits persist substate data + certificate metadata,
-        // but JMT is deferred to block commit.
-        assert_eq!(storage.jmt_version(), 0);
+        // but JVT is deferred to block commit.
+        assert_eq!(storage.jvt_version(), 0);
         assert_eq!(storage.state_root_hash(), Hash::ZERO);
         // Certificate should be stored
         assert!(storage.get_certificate(&cert.transaction_hash).is_some());
@@ -1589,12 +1589,12 @@ mod tests {
         storage.commit_shared(&make_database_update(vec![1, 2, 3], 0, vec![10], vec![1]));
         let hash = Hash::from_bytes(&[1; 32]);
         storage.put_own_vote(10, 0, hash);
-        assert!(storage.jmt_version() > 0);
+        assert!(storage.jvt_version() > 0);
         assert!(!storage.is_empty());
 
         storage.clear();
 
-        assert_eq!(storage.jmt_version(), 0);
+        assert_eq!(storage.jvt_version(), 0);
         assert_eq!(storage.state_root_hash(), Hash::ZERO);
         assert!(storage.is_empty());
         assert!(storage.get_own_vote(10).is_none());

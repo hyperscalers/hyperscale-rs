@@ -84,7 +84,7 @@ pub fn decompose_storage_key(storage_key: &[u8]) -> Option<(&[u8], u8, &[u8])> {
     Some((entity_key, partition_num, sort_key))
 }
 
-/// Get the JMT entity key (db_node_key) for a NodeId.
+/// Get the JVT entity key (db_node_key) for a NodeId.
 ///
 /// This is the hash-spread 50-byte representation of the NodeId.
 pub fn node_entity_key(node_id: &NodeId) -> Vec<u8> {
