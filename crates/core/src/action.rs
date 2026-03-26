@@ -4,10 +4,10 @@ use crate::{ProtocolEvent, TimerId};
 use hyperscale_messages::{BlockHeaderNotification, BlockVoteNotification, TransactionGossip};
 use hyperscale_types::{
     Block, BlockHeight, BlockVote, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
-    DatabaseUpdates, EpochConfig, EpochId, ExecutionCertificate, ExecutionWaveCertificate,
-    ExecutionWaveVote, Hash, NodeId, ProvisionBatch, QuorumCertificate, RoutableTransaction,
-    ShardGroupId, SignerBitfield, StateProvision, TopologySnapshot, TransactionAbort,
-    TransactionCertificate, TransactionDefer, ValidatorId, VotePower, WaveId, WaveTxOutcome,
+    DatabaseUpdates, EpochConfig, EpochId, ExecutionWaveCertificate, ExecutionWaveVote, Hash,
+    NodeId, ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId, SignerBitfield,
+    StateProvision, TopologySnapshot, TransactionAbort, TransactionCertificate, TransactionDefer,
+    ValidatorId, VotePower, WaveId, WaveTxOutcome,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -219,17 +219,6 @@ pub enum Action {
         committee_voting_power: Vec<u64>,
         /// Quorum threshold for the source shard.
         quorum_threshold: u64,
-    },
-
-    /// Verify an execution certificate's aggregated signature (cross-shard Phase 5).
-    ///
-    /// Delegated to a thread pool in production, instant in simulation.
-    /// Returns `ProtocolEvent::ExecutionCertificateSignatureVerified` when complete.
-    VerifyExecutionCertificateSignature {
-        /// The certificate to verify.
-        certificate: ExecutionCertificate,
-        /// Public keys of the signers (in committee order, pre-resolved by state machine).
-        public_keys: Vec<Bls12381G1PublicKey>,
     },
 
     /// Aggregate execution wave votes into an ExecutionWaveCertificate (quorum reached).
@@ -685,7 +674,7 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Runner I/O Requests (network fetches handled by the runner)
     // These request the runner to perform network I/O and deliver results
-    // back as NodeInputs (TransactionReceived, CertificateReceived, SyncBlockResponseReceived)
+    // back as NodeInputs (TransactionReceived, SyncBlockResponseReceived)
     // ═══════════════════════════════════════════════════════════════════════
     /// Request the runner to start syncing to a target height.
     ///
@@ -712,20 +701,6 @@ pub enum Action {
         proposer: ValidatorId,
         /// Hashes of the missing transactions.
         tx_hashes: Vec<Hash>,
-    },
-
-    /// Request the runner to fetch missing certificates for a pending block.
-    ///
-    /// Emitted when a block header arrives but certificates are missing locally.
-    /// The runner fetches from the proposer or peers and delivers results via
-    /// `ProtocolEvent::CertificateFetchDelivered`.
-    FetchCertificates {
-        /// Hash of the block that needs these certificates.
-        block_hash: Hash,
-        /// The proposer of the block (preferred fetch target).
-        proposer: ValidatorId,
-        /// Hashes of the missing certificates (transaction hashes).
-        cert_hashes: Vec<Hash>,
     },
 
     /// Cancel any pending fetch operations for a block.
@@ -798,7 +773,6 @@ impl Action {
             self,
             Action::VerifyAndBuildQuorumCertificate { .. }
                 | Action::VerifyProvisionBatch { .. }
-                | Action::VerifyExecutionCertificateSignature { .. }
                 | Action::AggregateExecutionWaveCertificate { .. }
                 | Action::VerifyAndAggregateExecutionWaveVotes { .. }
                 | Action::VerifyExecutionWaveCertificateSignature { .. }
@@ -847,9 +821,6 @@ impl Action {
             // Delegated Work - Crypto Verification
             Action::VerifyAndBuildQuorumCertificate { .. } => "VerifyAndBuildQuorumCertificate",
             Action::VerifyProvisionBatch { .. } => "VerifyProvisionBatch",
-            Action::VerifyExecutionCertificateSignature { .. } => {
-                "VerifyExecutionCertificateSignature"
-            }
             Action::AggregateExecutionWaveCertificate { .. } => "AggregateExecutionWaveCertificate",
             Action::VerifyAndAggregateExecutionWaveVotes { .. } => {
                 "VerifyAndAggregateExecutionWaveVotes"
@@ -901,7 +872,6 @@ impl Action {
             // Runner I/O Requests
             Action::StartSync { .. } => "StartSync",
             Action::FetchTransactions { .. } => "FetchTransactions",
-            Action::FetchCertificates { .. } => "FetchCertificates",
             Action::CancelFetch { .. } => "CancelFetch",
             Action::RequestMissingProvisions { .. } => "RequestMissingProvisions",
             Action::CancelProvisionFetch { .. } => "CancelProvisionFetch",

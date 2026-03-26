@@ -1,6 +1,6 @@
 //! Fetch protocol state machine.
 //!
-//! Pure synchronous state machine for transaction/certificate fetching.
+//! Pure synchronous state machine for transaction fetching.
 //! Tracks missing hashes per block and handles chunking. Does NOT handle
 //! peer selection, async dispatch, or storage persistence — those stay
 //! in the runner-specific wrapper.
@@ -11,11 +11,11 @@
 //! Runner ──► FetchProtocol::handle(FetchInput) ──► Vec<FetchOutput>
 //! ```
 
-use hyperscale_messages::request::{GetCertificatesRequest, GetTransactionsRequest};
-use hyperscale_messages::response::{GetCertificatesResponse, GetTransactionsResponse};
+use hyperscale_messages::request::GetTransactionsRequest;
+use hyperscale_messages::response::GetTransactionsResponse;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::ConsensusStore;
-use hyperscale_types::{Hash, RoutableTransaction, TransactionCertificate, ValidatorId};
+use hyperscale_types::{Hash, RoutableTransaction, ValidatorId};
 use quick_cache::sync::Cache as QuickCache;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -50,8 +50,6 @@ impl Default for FetchConfig {
 pub enum FetchKind {
     /// Fetching transactions.
     Transaction,
-    /// Fetching certificates.
-    Certificate,
 }
 
 impl FetchKind {
@@ -59,7 +57,6 @@ impl FetchKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             FetchKind::Transaction => "transaction",
-            FetchKind::Certificate => "certificate",
         }
     }
 }
@@ -69,8 +66,6 @@ impl FetchKind {
 pub struct FetchStatus {
     /// Number of blocks with pending transaction fetches.
     pub pending_tx_blocks: usize,
-    /// Number of blocks with pending certificate fetches.
-    pub pending_cert_blocks: usize,
     /// Total in-flight fetch operations.
     pub in_flight_operations: usize,
 }
@@ -84,21 +79,10 @@ pub enum FetchInput {
         proposer: ValidatorId,
         tx_hashes: Vec<Hash>,
     },
-    /// Request certificates for a pending block.
-    RequestCertificates {
-        block_hash: Hash,
-        proposer: ValidatorId,
-        cert_hashes: Vec<Hash>,
-    },
     /// Transactions were received for a block.
     TransactionsReceived {
         block_hash: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
-    },
-    /// Certificates were received for a block.
-    CertificatesReceived {
-        block_hash: Hash,
-        certificates: Vec<TransactionCertificate>,
     },
     /// A fetch operation failed.
     FetchFailed {
@@ -121,21 +105,10 @@ pub enum FetchOutput {
         proposer: ValidatorId,
         tx_hashes: Vec<Hash>,
     },
-    /// Request the runner to fetch certificates.
-    FetchCertificates {
-        block_hash: Hash,
-        proposer: ValidatorId,
-        cert_hashes: Vec<Hash>,
-    },
     /// Deliver fetched transactions to BFT.
     DeliverTransactions {
         block_hash: Hash,
         transactions: Vec<Arc<RoutableTransaction>>,
-    },
-    /// Deliver fetched certificates to BFT.
-    DeliverCertificates {
-        block_hash: Hash,
-        certificates: Vec<TransactionCertificate>,
     },
 }
 
@@ -206,7 +179,6 @@ impl BlockFetchState {
 pub struct FetchProtocol {
     config: FetchConfig,
     tx_fetches: HashMap<Hash, BlockFetchState>,
-    cert_fetches: HashMap<Hash, BlockFetchState>,
 }
 
 impl FetchProtocol {
@@ -215,7 +187,6 @@ impl FetchProtocol {
         Self {
             config,
             tx_fetches: HashMap::new(),
-            cert_fetches: HashMap::new(),
         }
     }
 
@@ -227,19 +198,10 @@ impl FetchProtocol {
                 proposer,
                 tx_hashes,
             } => self.handle_request_transactions(block_hash, proposer, tx_hashes),
-            FetchInput::RequestCertificates {
-                block_hash,
-                proposer,
-                cert_hashes,
-            } => self.handle_request_certificates(block_hash, proposer, cert_hashes),
             FetchInput::TransactionsReceived {
                 block_hash,
                 transactions,
             } => self.handle_transactions_received(block_hash, transactions),
-            FetchInput::CertificatesReceived {
-                block_hash,
-                certificates,
-            } => self.handle_certificates_received(block_hash, certificates),
             FetchInput::FetchFailed {
                 block_hash,
                 kind,
@@ -247,7 +209,6 @@ impl FetchProtocol {
             } => self.handle_fetch_failed(block_hash, kind, hashes),
             FetchInput::CancelFetch { block_hash } => {
                 self.tx_fetches.remove(&block_hash);
-                self.cert_fetches.remove(&block_hash);
                 debug!(?block_hash, "Cancelled fetch");
                 vec![]
             }
@@ -257,16 +218,10 @@ impl FetchProtocol {
 
     /// Get current fetch status.
     pub fn status(&self) -> FetchStatus {
-        let in_flight: usize = self
-            .tx_fetches
-            .values()
-            .chain(self.cert_fetches.values())
-            .map(|s| s.in_flight_count)
-            .sum();
+        let in_flight: usize = self.tx_fetches.values().map(|s| s.in_flight_count).sum();
 
         FetchStatus {
             pending_tx_blocks: self.tx_fetches.len(),
-            pending_cert_blocks: self.cert_fetches.len(),
             in_flight_operations: in_flight,
         }
     }
@@ -304,38 +259,6 @@ impl FetchProtocol {
 
         let state = BlockFetchState::new(proposer, tx_hashes);
         self.tx_fetches.insert(block_hash, state);
-        vec![]
-    }
-
-    fn handle_request_certificates(
-        &mut self,
-        block_hash: Hash,
-        proposer: ValidatorId,
-        cert_hashes: Vec<Hash>,
-    ) -> Vec<FetchOutput> {
-        if cert_hashes.is_empty() {
-            return vec![];
-        }
-
-        if let Some(state) = self.cert_fetches.get_mut(&block_hash) {
-            for hash in cert_hashes {
-                if !state.was_received(&hash) && !state.in_flight_hashes.contains(&hash) {
-                    state.missing_hashes.insert(hash);
-                }
-            }
-            return vec![];
-        }
-
-        info!(
-            ?block_hash,
-            count = cert_hashes.len(),
-            proposer = proposer.0,
-            "Starting certificate fetch"
-        );
-        metrics::record_fetch_started("certificate");
-
-        let state = BlockFetchState::new(proposer, cert_hashes);
-        self.cert_fetches.insert(block_hash, state);
         vec![]
     }
 
@@ -381,48 +304,6 @@ impl FetchProtocol {
         outputs
     }
 
-    fn handle_certificates_received(
-        &mut self,
-        block_hash: Hash,
-        certificates: Vec<TransactionCertificate>,
-    ) -> Vec<FetchOutput> {
-        let Some(state) = self.cert_fetches.get_mut(&block_hash) else {
-            trace!(?block_hash, "Certificates received for unknown fetch");
-            return vec![];
-        };
-
-        state.mark_fetch_complete();
-
-        let received_hashes: Vec<Hash> = certificates.iter().map(|c| c.transaction_hash).collect();
-        let received_count = received_hashes.len();
-        state.mark_received(received_hashes);
-        metrics::record_fetch_items_received("certificate", received_count);
-
-        info!(
-            ?block_hash,
-            received = received_count,
-            remaining = state.missing_hashes.len(),
-            "Received certificates"
-        );
-
-        let mut outputs = Vec::new();
-
-        if !certificates.is_empty() {
-            outputs.push(FetchOutput::DeliverCertificates {
-                block_hash,
-                certificates,
-            });
-        }
-
-        if state.is_complete() {
-            info!(?block_hash, "Certificate fetch complete");
-            metrics::record_fetch_completed("certificate");
-            self.cert_fetches.remove(&block_hash);
-        }
-
-        outputs
-    }
-
     fn handle_fetch_failed(
         &mut self,
         block_hash: Hash,
@@ -431,7 +312,6 @@ impl FetchProtocol {
     ) -> Vec<FetchOutput> {
         let state = match kind {
             FetchKind::Transaction => self.tx_fetches.get_mut(&block_hash),
-            FetchKind::Certificate => self.cert_fetches.get_mut(&block_hash),
         };
 
         if let Some(state) = state {
@@ -474,34 +354,6 @@ impl FetchProtocol {
             }
         }
 
-        // Certificate fetches
-        for (block_hash, state) in &mut self.cert_fetches {
-            if state.in_flight_count >= self.config.max_concurrent_per_block {
-                continue;
-            }
-
-            let hashes = state.hashes_to_fetch();
-            if hashes.is_empty() {
-                continue;
-            }
-
-            let available_slots = (self.config.max_concurrent_per_block - state.in_flight_count)
-                .min(self.config.parallel_fetches);
-
-            for chunk in hashes
-                .chunks(self.config.max_hashes_per_request)
-                .take(available_slots)
-            {
-                let chunk_vec = chunk.to_vec();
-                state.mark_in_flight(&chunk_vec);
-                outputs.push(FetchOutput::FetchCertificates {
-                    block_hash: *block_hash,
-                    proposer: state.proposer,
-                    cert_hashes: chunk_vec,
-                });
-            }
-        }
-
         outputs
     }
 }
@@ -510,7 +362,7 @@ impl FetchProtocol {
 // Inbound request serving
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Maximum items returned in a single transaction/certificate fetch response.
+/// Maximum items returned in a single transaction fetch response.
 const MAX_ITEMS_PER_RESPONSE: usize = 500;
 
 /// Serve an inbound transaction fetch request.
@@ -564,66 +416,6 @@ pub fn serve_transaction_request(
     GetTransactionsResponse::new(found)
 }
 
-/// Serve an inbound certificate fetch request.
-///
-/// Checks the in-memory cache first (for recently built but not yet
-/// persisted certificates), then falls back to storage. Includes ledger
-/// receipts for each found certificate.
-pub fn serve_certificate_request(
-    storage: &impl ConsensusStore,
-    cert_cache: &QuickCache<Hash, Arc<TransactionCertificate>>,
-    req: GetCertificatesRequest,
-) -> GetCertificatesResponse {
-    let requested_count = req.cert_hashes.len();
-    trace!(
-        block_hash = ?req.block_hash,
-        cert_count = requested_count,
-        "Handling certificate fetch request"
-    );
-
-    let hashes = if requested_count > MAX_ITEMS_PER_RESPONSE {
-        &req.cert_hashes[..MAX_ITEMS_PER_RESPONSE]
-    } else {
-        &req.cert_hashes
-    };
-
-    let mut found = Vec::with_capacity(hashes.len());
-    let mut missing = Vec::new();
-    for hash in hashes {
-        if let Some(cert) = cert_cache.get(hash) {
-            found.push((*cert).clone());
-        } else {
-            missing.push(*hash);
-        }
-    }
-    if !missing.is_empty() {
-        found.extend(storage.get_certificates_batch(&missing));
-    }
-
-    // Collect receipts for each found certificate.
-    let mut ledger_receipts = Vec::with_capacity(found.len());
-    for cert in &found {
-        let tx_hash = cert.transaction_hash;
-        if let Some(receipt) = storage.get_ledger_receipt(&tx_hash) {
-            ledger_receipts.push(hyperscale_types::LedgerReceiptEntry {
-                tx_hash,
-                receipt: (*receipt).clone(),
-            });
-        }
-    }
-
-    let found_count = found.len();
-    debug!(
-        block_hash = ?req.block_hash,
-        requested = requested_count,
-        found = found_count,
-        receipts = ledger_receipts.len(),
-        "Responding to certificate fetch request"
-    );
-    metrics::record_fetch_response_sent("certificate", found_count);
-    GetCertificatesResponse::new(found, ledger_receipts)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,6 +454,5 @@ mod tests {
     #[test]
     fn test_fetch_kind_str() {
         assert_eq!(FetchKind::Transaction.as_str(), "transaction");
-        assert_eq!(FetchKind::Certificate.as_str(), "certificate");
     }
 }

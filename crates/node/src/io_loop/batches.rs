@@ -7,9 +7,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
-use hyperscale_types::{
-    Bls12381G1PublicKey, ExecutionCertificate, ExecutionResult, Hash, RoutableTransaction,
-};
+use hyperscale_types::{ExecutionResult, Hash, RoutableTransaction};
 use std::sync::Arc;
 
 impl<S, N, D> IoLoop<S, N, D>
@@ -126,35 +124,6 @@ where
         });
     }
 
-    /// Flush accumulated execution certificate verifications as a single batch.
-    ///
-    /// Spawns one closure on the crypto pool that uses cross-certificate BLS
-    /// batch verification (~2 pairings) instead of N individual dispatches.
-    pub(super) fn flush_execution_certificate_verifications(&mut self) {
-        let items = self.execution_certificate_batch.take();
-        if items.is_empty() {
-            return;
-        }
-
-        let event_tx = self.event_sender.clone();
-        self.dispatch.spawn_crypto(move || {
-            let start = std::time::Instant::now();
-            let results =
-                hyperscale_execution::handlers::batch_verify_execution_certificate_signatures(
-                    &items,
-                );
-            for ((certificate, _), valid) in items.into_iter().zip(results) {
-                let _ = event_tx.send(NodeInput::Protocol(
-                    ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid },
-                ));
-            }
-            metrics::record_signature_verification_latency(
-                "bls_execution_cert",
-                start.elapsed().as_secs_f64(),
-            );
-        });
-    }
-
     // ─── Batch Accumulation ─────────────────────────────────────────────
 
     pub(super) fn accumulate_cross_shard_execution(
@@ -170,19 +139,6 @@ where
         };
         if self.cross_shard_batch.push(req, self.state.now()) {
             self.flush_cross_shard_executions();
-        }
-    }
-
-    pub(super) fn accumulate_execution_certificate_verification(
-        &mut self,
-        certificate: ExecutionCertificate,
-        public_keys: Vec<Bls12381G1PublicKey>,
-    ) {
-        if self
-            .execution_certificate_batch
-            .push((certificate, public_keys), self.state.now())
-        {
-            self.flush_execution_certificate_verifications();
         }
     }
 

@@ -858,26 +858,6 @@ impl NodeStateMachine {
         });
         actions
     }
-
-    /// Handle fetched certificates delivered — verify each against topology.
-    fn on_certificate_fetch_delivered(
-        &mut self,
-        block_hash: Hash,
-        certificates: Vec<TransactionCertificate>,
-    ) -> Vec<Action> {
-        // Verify each fetched certificate's embedded ExecutionCertificates against
-        // our current topology. This ensures we don't accept forged certificates
-        // from Byzantine peers.
-        let mut actions = Vec::new();
-        for cert in certificates {
-            actions.extend(self.execution.verify_fetched_certificate(
-                self.topology.snapshot(),
-                block_hash,
-                cert,
-            ));
-        }
-        actions
-    }
 }
 
 impl StateMachine for NodeStateMachine {
@@ -1117,9 +1097,6 @@ impl StateMachine for NodeStateMachine {
 
                 actions
             }
-            ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => self
-                .execution
-                .on_certificate_verified(self.topology.snapshot(), certificate, valid),
             ProtocolEvent::SpeculativeExecutionComplete {
                 block_hash,
                 tx_hashes,
@@ -1173,22 +1150,6 @@ impl StateMachine for NodeStateMachine {
                 block_hash,
                 transactions,
             ),
-            ProtocolEvent::CertificateFetchDelivered {
-                block_hash,
-                certificates,
-            } => self.on_certificate_fetch_delivered(block_hash, certificates),
-            ProtocolEvent::FetchedCertificateVerified {
-                block_hash,
-                certificate,
-            } => {
-                self.execution
-                    .cancel_certificate_building(&certificate.transaction_hash);
-                self.bft.on_certificate_fetch_received(
-                    self.topology.snapshot(),
-                    block_hash,
-                    vec![Arc::new(certificate)],
-                )
-            }
             // ── Storage / Sync ───────────────────────────────────────────
             ProtocolEvent::BlockFetched { .. } => vec![],
             ProtocolEvent::SyncBlockReadyToApply { block, qc } => self

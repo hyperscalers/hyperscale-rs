@@ -23,11 +23,11 @@ where
     /// Each handler is a closure that captures shared state and delegates to
     /// the serving function in the corresponding protocol module.
     pub(super) fn register_request_handler(&self) {
-        use crate::protocol::fetch::{serve_certificate_request, serve_transaction_request};
+        use crate::protocol::fetch::serve_transaction_request;
         use crate::protocol::provision_fetch::serve_provision_request;
         use crate::protocol::sync::serve_block_request;
         use hyperscale_messages::request::{
-            GetBlockRequest, GetCertificatesRequest, GetProvisionsRequest, GetTransactionsRequest,
+            GetBlockRequest, GetProvisionsRequest, GetTransactionsRequest,
         };
         use std::sync::Arc;
 
@@ -46,15 +46,6 @@ where
         self.network
             .register_request_handler::<GetTransactionsRequest>(move |req| {
                 serve_transaction_request(&*storage, &tx_cache, req)
-            });
-
-        // ── certificate.request → fetch protocol ─────────────────────
-
-        let storage = Arc::clone(&self.storage);
-        let cert_cache = Arc::clone(&self.cert_cache);
-        self.network
-            .register_request_handler::<GetCertificatesRequest>(move |req| {
-                serve_certificate_request(&*storage, &cert_cache, req)
             });
 
         // ── tx_inclusion_proof.request → livelock proof serving ──────

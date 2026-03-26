@@ -146,12 +146,6 @@ where
             // ═══════════════════════════════════════════════════════════
             // Delegated work — batched (accumulated for batch dispatch)
             // ═══════════════════════════════════════════════════════════
-            Action::VerifyExecutionCertificateSignature {
-                certificate,
-                public_keys,
-            } => {
-                self.accumulate_execution_certificate_verification(certificate, public_keys);
-            }
             // Wave delegated actions — dispatch immediately (same as AggregateExecutionCertificate)
             Action::AggregateExecutionWaveCertificate { .. }
             | Action::VerifyAndAggregateExecutionWaveVotes { .. }
@@ -233,7 +227,6 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::StartSync { .. }
             | Action::FetchTransactions { .. }
-            | Action::FetchCertificates { .. }
             | Action::CancelFetch { .. }
             | Action::RequestMissingProvisions { .. }
             | Action::CancelProvisionFetch { .. }
@@ -624,20 +617,6 @@ where
                     block_hash,
                     proposer,
                     tx_hashes,
-                });
-                let outputs = self.fetch_protocol.handle(FetchInput::Tick);
-                self.process_fetch_outputs(outputs);
-                self.update_fetch_tick_timer();
-            }
-            Action::FetchCertificates {
-                block_hash,
-                proposer,
-                cert_hashes,
-            } => {
-                self.fetch_protocol.handle(FetchInput::RequestCertificates {
-                    block_hash,
-                    proposer,
-                    cert_hashes,
                 });
                 let outputs = self.fetch_protocol.handle(FetchInput::Tick);
                 self.process_fetch_outputs(outputs);
