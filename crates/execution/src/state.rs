@@ -546,7 +546,9 @@ impl ExecutionState {
 
         tracker.add_verified_vote(vote, voting_power);
 
-        self.check_wave_vote_quorum(topology, key)
+        let mut actions = self.check_wave_vote_quorum(topology, key.clone());
+        actions.extend(self.maybe_trigger_wave_vote_verification(key));
+        actions
     }
 
     /// Handle batch wave vote verification completed.
