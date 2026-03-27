@@ -1,7 +1,7 @@
 //! Transaction types for consensus.
 
 use crate::{
-    BlockHeight, ExecutionCertificate, Hash, NodeId, ShardGroupId, TransactionInclusionProof,
+    BlockHeight, Hash, NodeId, ShardExecutionProof, ShardGroupId, TransactionInclusionProof,
 };
 use radix_common::data::manifest::{manifest_decode, manifest_encode};
 use radix_transactions::model::{UserTransaction, ValidatedUserTransaction};
@@ -688,7 +688,7 @@ pub enum TransactionStatus {
 
     /// Execution complete, TransactionCertificate has been created.
     ///
-    /// All ExecutionCertificates have been collected and aggregated into a
+    /// All shard execution proofs have been collected and aggregated into a
     /// TransactionCertificate with Accept or Reject decision.
     ///
     /// **Important**: State is NOT yet updated at this point. The certificate
@@ -1039,9 +1039,9 @@ pub struct TransactionCertificate {
     /// Final decision: ACCEPT if all shards succeeded, REJECT otherwise.
     pub decision: TransactionDecision,
 
-    /// Execution certificates from all participating shards, keyed by shard ID.
-    /// Each certificate contains read_nodes, write_nodes, signatures, etc.
-    pub shard_proofs: BTreeMap<ShardGroupId, ExecutionCertificate>,
+    /// Execution proofs from all participating shards, keyed by shard ID.
+    /// Each proof contains receipt_hash, success, and write_nodes.
+    pub shard_proofs: BTreeMap<ShardGroupId, ShardExecutionProof>,
 }
 
 impl TransactionCertificate {
@@ -1075,30 +1075,14 @@ impl TransactionCertificate {
         self.shard_proofs.keys().copied().collect()
     }
 
-    /// Get certificate for a specific shard.
-    pub fn certificate_for_shard(&self, shard_id: ShardGroupId) -> Option<&ExecutionCertificate> {
+    /// Get proof for a specific shard.
+    pub fn proof_for_shard(&self, shard_id: ShardGroupId) -> Option<&ShardExecutionProof> {
         self.shard_proofs.get(&shard_id)
-    }
-
-    /// Get all read nodes across all shards.
-    pub fn all_read_nodes(&self) -> Vec<NodeId> {
-        self.shard_proofs
-            .values()
-            .flat_map(|cert| cert.read_nodes.iter().copied())
-            .collect()
     }
 
     /// Check if all shards succeeded.
     pub fn all_shards_succeeded(&self) -> bool {
-        self.shard_proofs.values().all(|cert| cert.success)
-    }
-
-    /// Get total number of read nodes across all shards.
-    pub fn total_read_count(&self) -> usize {
-        self.shard_proofs
-            .values()
-            .map(|cert| cert.read_nodes.len())
-            .sum()
+        self.shard_proofs.values().all(|proof| proof.success)
     }
 
     /// Combined receipt hash across all shards.
@@ -1110,7 +1094,7 @@ impl TransactionCertificate {
         let hashes: Vec<Hash> = self
             .shard_proofs
             .values()
-            .map(|cert| cert.receipt_hash)
+            .map(|proof| proof.receipt_hash)
             .collect();
         match hashes.len() {
             0 => Hash::ZERO,

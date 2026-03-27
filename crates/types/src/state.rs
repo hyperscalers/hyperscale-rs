@@ -1,8 +1,7 @@
 //! State-related types for cross-shard execution.
 
 use crate::{
-    exec_vote_message, zero_bls_signature, BlockHeight, Bls12381G2Signature, Hash, NodeId,
-    ShardGroupId, SignerBitfield, ValidatorId,
+    exec_vote_message, BlockHeight, Bls12381G2Signature, Hash, NodeId, ShardGroupId, ValidatorId,
 };
 use sbor::prelude::*;
 use std::sync::Arc;
@@ -142,8 +141,8 @@ impl ExecutionVote {
     /// Uses the centralized `exec_vote_message` function with the
     /// `DOMAIN_EXEC_VOTE` tag for domain separation.
     ///
-    /// Note: ExecutionCertificates aggregate signatures from ExecutionVotes,
-    /// so ExecutionCertificate::signing_message() returns the same format.
+    /// Note: With wave-based voting, per-tx BLS signatures are no longer used.
+    /// This signing message is used only for ExecutionVote verification.
     pub fn signing_message(&self) -> Vec<u8> {
         exec_vote_message(
             &self.transaction_hash,
@@ -154,105 +153,20 @@ impl ExecutionVote {
     }
 }
 
-/// Certificate proving a shard agreed on execution state.
+/// Per-shard execution proof for a transaction.
+///
+/// Contains the execution outcome for a transaction on a single shard.
+/// Stored in `TransactionCertificate.shard_proofs`. With wave-based voting,
+/// BLS signatures are on the wave cert (not per-tx), so this type carries
+/// only the execution outcome data.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct ExecutionCertificate {
-    /// Hash of the transaction.
-    pub transaction_hash: Hash,
-
-    /// Shard that produced this certificate.
-    pub shard_group_id: ShardGroupId,
-
-    /// Node IDs that were READ during execution.
-    pub read_nodes: Vec<NodeId>,
-
-    /// NodeIds written during execution (from first vote — all identical within shard).
-    pub write_nodes: Vec<NodeId>,
-
+pub struct ShardExecutionProof {
     /// Hash of the ConsensusReceipt (outcome + event_root).
     pub receipt_hash: Hash,
-
     /// Whether execution succeeded.
     pub success: bool,
-
-    /// Aggregated signature.
-    pub aggregated_signature: Bls12381G2Signature,
-
-    /// Which validators signed.
-    pub signers: SignerBitfield,
-}
-
-impl ExecutionCertificate {
-    /// Get number of signers.
-    pub fn signer_count(&self) -> usize {
-        self.signers.count()
-    }
-
-    /// Get list of validator indices that signed.
-    pub fn signer_indices(&self) -> Vec<usize> {
-        self.signers.set_indices().collect()
-    }
-
-    /// Check if execution succeeded.
-    pub fn is_success(&self) -> bool {
-        self.success
-    }
-
-    /// Check if execution failed.
-    pub fn is_failure(&self) -> bool {
-        !self.success
-    }
-
-    /// Get number of state reads.
-    pub fn read_count(&self) -> usize {
-        self.read_nodes.len()
-    }
-
-    /// Get number of write nodes.
-    pub fn write_count(&self) -> usize {
-        self.write_nodes.len()
-    }
-
-    /// Check if this certificate has writes.
-    pub fn has_writes(&self) -> bool {
-        !self.write_nodes.is_empty()
-    }
-
-    /// Create a certificate for a single-shard transaction.
-    pub fn single_shard(
-        transaction_hash: Hash,
-        receipt_hash: Hash,
-        shard_group_id: ShardGroupId,
-        success: bool,
-    ) -> Self {
-        Self {
-            transaction_hash,
-            shard_group_id,
-            read_nodes: vec![],
-            write_nodes: vec![],
-            receipt_hash,
-            success,
-            aggregated_signature: zero_bls_signature(),
-            signers: SignerBitfield::empty(),
-        }
-    }
-
-    /// Create the canonical message bytes for signature verification.
-    ///
-    /// Uses the centralized `exec_vote_message` function with the
-    /// `DOMAIN_EXEC_VOTE` tag for domain separation.
-    ///
-    /// Note: This returns the same message format as ExecutionVote::signing_message()
-    /// because ExecutionCertificates aggregate signatures from ExecutionVotes. The
-    /// aggregated signature is verified against this same message.
-    pub fn signing_message(&self) -> Vec<u8> {
-        exec_vote_message(
-            &self.transaction_hash,
-            &self.receipt_hash,
-            self.shard_group_id,
-            self.success,
-        )
-    }
+    /// NodeIds written during execution.
+    pub write_nodes: Vec<NodeId>,
 }
 
 /// State provision from a source shard to a target shard.
@@ -386,15 +300,14 @@ mod tests {
     }
 
     #[test]
-    fn test_single_shard_certificate() {
-        let cert = ExecutionCertificate::single_shard(
-            Hash::from_bytes(b"tx"),
-            Hash::from_bytes(b"receipt"),
-            ShardGroupId(0),
-            true,
-        );
+    fn test_shard_execution_proof() {
+        let proof = ShardExecutionProof {
+            receipt_hash: Hash::from_bytes(b"receipt"),
+            success: true,
+            write_nodes: vec![],
+        };
 
-        assert!(cert.success);
-        assert!(cert.signers.is_empty());
+        assert!(proof.success);
+        assert!(proof.write_nodes.is_empty());
     }
 }

@@ -33,8 +33,7 @@ pub const DOMAIN_BLOCK_VOTE: &[u8] = b"BLOCK_VOTE";
 ///
 /// Format: `EXEC_VOTE` || tx_hash || receipt_hash || shard_group || success
 ///
-/// Note: ExecutionCertificates aggregate signatures from ExecutionVotes, so they
-/// use the same domain tag since they verify the same underlying message.
+/// Used for individual ExecutionVote signatures.
 pub const DOMAIN_EXEC_VOTE: &[u8] = b"EXEC_VOTE";
 
 /// Domain tag for committed block header gossip.
@@ -180,37 +179,6 @@ pub fn exec_vote_batch_message(
     message
 }
 
-/// Domain tag for execution certificate batch gossip.
-///
-/// Format: `EXEC_CERT_BATCH` || shard_group_id || H(tx_hashes)
-///
-/// Signed by the sender when broadcasting execution certificate batches.
-/// Verified by receivers to reject unauthenticated certificate spam before
-/// doing expensive aggregated BLS signature verification.
-pub const DOMAIN_EXEC_CERT_BATCH: &[u8] = b"EXEC_CERT_BATCH";
-
-/// Build the signing message for an execution certificate batch gossip.
-///
-/// The message covers the shard and a digest of the transaction hashes in
-/// the batch. Cheap to reconstruct at verification while binding the
-/// signature to the specific batch contents.
-pub fn exec_cert_batch_message(
-    shard_group: ShardGroupId,
-    certificates: &[crate::ExecutionCertificate],
-) -> Vec<u8> {
-    let mut hasher = blake3::Hasher::new();
-    for c in certificates {
-        hasher.update(c.transaction_hash.as_bytes());
-    }
-    let tx_digest = hasher.finalize();
-
-    let mut message = Vec::with_capacity(64);
-    message.extend_from_slice(DOMAIN_EXEC_CERT_BATCH);
-    message.extend_from_slice(&shard_group.0.to_le_bytes());
-    message.extend_from_slice(tx_digest.as_bytes());
-    message
-}
-
 /// Domain tag for validator-bind protocol.
 ///
 /// Format: `VALIDATOR_BIND` || peer_id_bytes
@@ -321,10 +289,7 @@ pub fn exec_wave_cert_batch_message(
 ///
 /// This is used for:
 /// - Individual ExecutionVote signatures
-/// - ExecutionCertificate aggregated signature verification
-///
-/// Note: Both use the same message format because ExecutionCertificates aggregate
-/// signatures from ExecutionVotes.
+/// - ExecutionVote signature verification
 pub fn exec_vote_message(
     tx_hash: &Hash,
     receipt_hash: &Hash,
@@ -454,28 +419,6 @@ mod tests {
 
         assert_eq!(msg1, msg2);
         assert!(msg1.starts_with(DOMAIN_EXEC_VOTE_BATCH));
-    }
-
-    #[test]
-    fn test_exec_cert_batch_message_deterministic() {
-        use crate::{ExecutionCertificate, SignerBitfield};
-
-        let certs = vec![ExecutionCertificate {
-            transaction_hash: Hash::from_bytes(b"tx1"),
-            shard_group_id: ShardGroupId(1),
-            read_nodes: vec![],
-            write_nodes: vec![],
-            receipt_hash: Hash::from_bytes(b"commit"),
-            success: true,
-            aggregated_signature: crate::zero_bls_signature(),
-            signers: SignerBitfield::new(4),
-        }];
-
-        let msg1 = exec_cert_batch_message(ShardGroupId(1), &certs);
-        let msg2 = exec_cert_batch_message(ShardGroupId(1), &certs);
-
-        assert_eq!(msg1, msg2);
-        assert!(msg1.starts_with(DOMAIN_EXEC_CERT_BATCH));
     }
 
     #[test]

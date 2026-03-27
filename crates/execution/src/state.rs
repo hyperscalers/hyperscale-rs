@@ -23,17 +23,17 @@
 //!
 //! ## Phase 4: Vote Aggregation
 //! Validators broadcast votes to their local shard. When 2f+1 voting power agrees
-//! on the same receipt hash, an ExecutionCertificate is created and broadcast to
+//! on the same receipt hash, a wave certificate is created and broadcast to
 //! remote participating shards (local peers form it independently).
 //!
 //! ## Phase 5: Finalization
-//! Validators collect ExecutionCertificates from all participating shards. When all
-//! certificates are received, a TransactionCertificate is created.
+//! Validators collect shard execution proofs from all participating shards. When all
+//! proofs are received, a TransactionCertificate is created.
 
 use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
-    BlockHeight, Bls12381G1PublicKey, ExecutionCertificate, ExecutionWaveVote, Hash, NodeId,
-    RoutableTransaction, ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate,
+    BlockHeight, Bls12381G1PublicKey, ExecutionWaveVote, Hash, NodeId, RoutableTransaction,
+    ShardExecutionProof, ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate,
     TransactionDecision, ValidatorId, WaveId,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -157,9 +157,9 @@ pub struct ExecutionState {
     /// Maps tx_hash -> (provisions, first_arrival_height) for cleanup of stale entries.
     early_provisioning_complete: HashMap<Hash, (Vec<StateProvision>, u64)>,
 
-    /// Certificates that arrived before tracking started.
-    /// Tracks (certificates, first_arrival_height) for cleanup of stale entries.
-    early_certificates: HashMap<Hash, (Vec<ExecutionCertificate>, u64)>,
+    /// Proofs that arrived before tracking started.
+    /// Tracks (shard_id, proof) pairs with first_arrival_height for cleanup of stale entries.
+    early_certificates: HashMap<Hash, (Vec<(ShardGroupId, ShardExecutionProof)>, u64)>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Speculative Execution State
@@ -672,21 +672,20 @@ impl ExecutionState {
         );
 
         // Feed each tx's outcome to per-tx CertificateTracker for finalization.
-        // Create a synthetic ExecutionCertificate per tx from the wave cert data.
-        // This bridges the wave path into the existing per-tx finalization path.
+        // Deferred/aborted txs (Hash::ZERO) are filtered by handle_certificate_internal.
         for outcome in &certificate.tx_outcomes {
-            let synthetic_cert = ExecutionCertificate {
-                transaction_hash: outcome.tx_hash,
-                shard_group_id: certificate.shard_group_id,
-                read_nodes: vec![], // Not tracked in wave certs (available from execution cache)
-                write_nodes: outcome.write_nodes.clone(),
+            let proof = ShardExecutionProof {
                 receipt_hash: outcome.receipt_hash,
                 success: outcome.success,
-                aggregated_signature: certificate.aggregated_signature,
-                signers: certificate.signers.clone(),
+                write_nodes: outcome.write_nodes.clone(),
             };
 
-            actions.extend(self.handle_certificate_internal(topology, Arc::new(synthetic_cert)));
+            actions.extend(self.handle_certificate_internal(
+                topology,
+                outcome.tx_hash,
+                certificate.shard_group_id,
+                proof,
+            ));
         }
 
         actions
@@ -694,50 +693,46 @@ impl ExecutionState {
 
     /// Handle an execution wave certificate received from a remote shard.
     ///
-    /// Delegates BLS signature verification to the crypto pool before processing.
+    /// A wave cert covers many txs. Each tx is handled independently:
+    /// - If tracker exists → needs verification, then feed proof
+    /// - If already finalized → skip
+    /// - If no tracker yet → buffer as early proof for later replay
+    ///
+    /// Delegates BLS signature verification to the crypto pool before processing
+    /// any tracked txs. Buffered txs are replayed when their block commits.
     pub fn on_wave_certificate(
         &mut self,
         topology: &TopologySnapshot,
         cert: hyperscale_types::ExecutionWaveCertificate,
     ) -> Vec<Action> {
         let shard = cert.shard_group_id;
+        let current_height = self.committed_height;
 
-        // Check if we're tracking any txs from this wave cert.
-        // If none of the cert's txs have certificate trackers, we don't need it.
-        let any_tracked = cert
-            .tx_outcomes
-            .iter()
-            .any(|o| self.certificate_trackers.contains_key(&o.tx_hash));
-
-        if !any_tracked {
-            // Check if any are already finalized
-            let any_finalized = cert
-                .tx_outcomes
-                .iter()
-                .any(|o| self.finalized_certificates.contains_key(&o.tx_hash));
-            if any_finalized {
-                return vec![];
-            }
-            // Buffer — block may not have committed yet
-            // We don't have a wave-level early buffer for remote certs, so
-            // buffer per-tx as synthetic ExecutionCertificates for compatibility
-            let current_height = self.committed_height;
-            for outcome in &cert.tx_outcomes {
+        // Buffer proofs for txs that don't have trackers yet (block not committed).
+        // Skip txs that are already finalized.
+        // If ANY tx has a tracker, we need to verify the wave cert signature.
+        let mut needs_verification = false;
+        for outcome in &cert.tx_outcomes {
+            if self.certificate_trackers.contains_key(&outcome.tx_hash) {
+                needs_verification = true;
+            } else if !self.finalized_certificates.contains_key(&outcome.tx_hash) {
+                // No tracker, not finalized — buffer for later replay
                 self.early_certificates
                     .entry(outcome.tx_hash)
                     .or_insert_with(|| (Vec::new(), current_height))
                     .0
-                    .push(ExecutionCertificate {
-                        transaction_hash: outcome.tx_hash,
-                        shard_group_id: shard,
-                        read_nodes: vec![],
-                        write_nodes: outcome.write_nodes.clone(),
-                        receipt_hash: outcome.receipt_hash,
-                        success: outcome.success,
-                        aggregated_signature: cert.aggregated_signature,
-                        signers: cert.signers.clone(),
-                    });
+                    .push((
+                        shard,
+                        ShardExecutionProof {
+                            receipt_hash: outcome.receipt_hash,
+                            success: outcome.success,
+                            write_nodes: outcome.write_nodes.clone(),
+                        },
+                    ));
             }
+        }
+
+        if !needs_verification {
             return vec![];
         }
 
@@ -766,6 +761,7 @@ impl ExecutionState {
     /// Handle execution wave certificate signature verification result.
     ///
     /// If valid, extract per-tx outcomes and feed to CertificateTrackers.
+    /// Txs without trackers are buffered as early proofs for later replay.
     pub fn on_wave_certificate_verified(
         &mut self,
         topology: &TopologySnapshot,
@@ -782,22 +778,33 @@ impl ExecutionState {
             return vec![];
         }
 
+        let shard = certificate.shard_group_id;
+        let current_height = self.committed_height;
         let mut actions = Vec::new();
 
-        // Extract per-tx outcomes and feed to CertificateTrackers
+        // Extract per-tx outcomes — feed to tracker if exists, buffer otherwise
         for outcome in &certificate.tx_outcomes {
-            let synthetic_cert = ExecutionCertificate {
-                transaction_hash: outcome.tx_hash,
-                shard_group_id: certificate.shard_group_id,
-                read_nodes: vec![],
-                write_nodes: outcome.write_nodes.clone(),
+            let proof = ShardExecutionProof {
                 receipt_hash: outcome.receipt_hash,
                 success: outcome.success,
-                aggregated_signature: certificate.aggregated_signature,
-                signers: certificate.signers.clone(),
+                write_nodes: outcome.write_nodes.clone(),
             };
 
-            actions.extend(self.handle_certificate_internal(topology, Arc::new(synthetic_cert)));
+            if self.certificate_trackers.contains_key(&outcome.tx_hash) {
+                actions.extend(self.handle_certificate_internal(
+                    topology,
+                    outcome.tx_hash,
+                    shard,
+                    proof,
+                ));
+            } else if !self.finalized_certificates.contains_key(&outcome.tx_hash) {
+                // Buffer for later replay when block commits
+                self.early_certificates
+                    .entry(outcome.tx_hash)
+                    .or_insert_with(|| (Vec::new(), current_height))
+                    .0
+                    .push((shard, proof));
+            }
         }
 
         actions
@@ -1027,15 +1034,15 @@ impl ExecutionState {
         let cert_tracker = CertificateTracker::new(tx_hash, participating_shards);
         self.certificate_trackers.insert(tx_hash, cert_tracker);
 
-        // Replay any early certificates that arrived before tracking started.
-        if let Some((early_certs, _arrival_height)) = self.early_certificates.remove(&tx_hash) {
+        // Replay any early proofs that arrived before tracking started.
+        if let Some((early_proofs, _arrival_height)) = self.early_certificates.remove(&tx_hash) {
             tracing::debug!(
                 tx_hash = ?tx_hash,
-                count = early_certs.len(),
-                "Replaying early certificates for single-shard tx"
+                count = early_proofs.len(),
+                "Replaying early proofs for single-shard tx"
             );
-            for cert in early_certs {
-                actions.extend(self.handle_certificate_internal(topology, Arc::new(cert)));
+            for (shard, proof) in early_proofs {
+                actions.extend(self.handle_certificate_internal(topology, tx_hash, shard, proof));
             }
         }
 
@@ -1113,11 +1120,11 @@ impl ExecutionState {
         let cert_tracker = CertificateTracker::new(tx_hash, participating_shards.clone());
         self.certificate_trackers.insert(tx_hash, cert_tracker);
 
-        // Replay any early certificates that arrived before tracking started.
-        if let Some((early_certs, _arrival_height)) = self.early_certificates.remove(&tx_hash) {
-            tracing::debug!(tx_hash = ?tx_hash, count = early_certs.len(), "Replaying early certificates");
-            for cert in early_certs {
-                actions.extend(self.handle_certificate_internal(topology, Arc::new(cert)));
+        // Replay any early proofs that arrived before tracking started.
+        if let Some((early_proofs, _arrival_height)) = self.early_certificates.remove(&tx_hash) {
+            tracing::debug!(tx_hash = ?tx_hash, count = early_proofs.len(), "Replaying early proofs");
+            for (shard, proof) in early_proofs {
+                actions.extend(self.handle_certificate_internal(topology, tx_hash, shard, proof));
             }
         }
 
@@ -1179,19 +1186,25 @@ impl ExecutionState {
     // Phase 5: Finalization
     // ═══════════════════════════════════════════════════════════════════════════
 
-    /// Internal certificate handling (assumes tracking is active).
-    #[instrument(level = "debug", skip(self, cert), fields(
-        tx_hash = %cert.transaction_hash,
-        cert_shard = cert.shard_group_id.0,
+    /// Internal proof handling (assumes tracking is active).
+    #[instrument(level = "debug", skip(self, proof), fields(
+        tx_hash = %tx_hash,
+        cert_shard = cert_shard.0,
     ))]
     fn handle_certificate_internal(
         &mut self,
         topology: &TopologySnapshot,
-        cert: Arc<ExecutionCertificate>,
+        tx_hash: Hash,
+        cert_shard: ShardGroupId,
+        proof: ShardExecutionProof,
     ) -> Vec<Action> {
+        // Skip deferred/aborted tx proofs (Hash::ZERO receipt).
+        // These are terminal states that don't produce TransactionCertificates.
+        if proof.receipt_hash == Hash::ZERO {
+            return vec![];
+        }
+
         let mut actions = Vec::new();
-        let tx_hash = cert.transaction_hash;
-        let cert_shard = cert.shard_group_id;
 
         let local_shard = topology.local_shard();
         let Some(tracker) = self.certificate_trackers.get_mut(&tx_hash) else {
@@ -1199,12 +1212,12 @@ impl ExecutionState {
                 tx_hash = ?tx_hash,
                 cert_shard = cert_shard.0,
                 local_shard = local_shard.0,
-                "No certificate tracker for tx, ignoring certificate"
+                "No certificate tracker for tx, ignoring proof"
             );
             return actions;
         };
 
-        let complete = tracker.add_certificate(Arc::unwrap_or_clone(cert));
+        let complete = tracker.add_proof(cert_shard, proof);
 
         if complete {
             tracing::debug!(
@@ -2063,45 +2076,19 @@ mod tests {
     }
 
     #[test]
-    fn test_execution_certificate_with_real_bls_signatures() {
-        use hyperscale_test_helpers::{fixtures, TestCommittee};
+    fn test_shard_execution_proof_basic() {
+        use hyperscale_types::ShardExecutionProof;
 
-        let committee = TestCommittee::new(4, 42);
-        let tx_hash = Hash::from_bytes(b"test_tx");
         let receipt_hash = Hash::from_bytes(b"commitment");
-        let shard = ShardGroupId(0);
-
-        // Create an execution certificate with real aggregated signatures
-        let cert = fixtures::make_signed_execution_certificate(
-            &committee,
-            &[0, 1, 2], // 3 voters
-            tx_hash,
+        let proof = ShardExecutionProof {
             receipt_hash,
-            shard,
-            true,
-        );
+            success: true,
+            write_nodes: vec![],
+        };
 
-        // Verify using the certificate's signing_message
-        let message = cert.signing_message();
-
-        // Get signer public keys based on bitfield
-        let signer_keys: Vec<_> = cert
-            .signers
-            .set_indices()
-            .map(|idx| *committee.public_key(idx))
-            .collect();
-
-        // Aggregate public keys (what the runner does)
-        let aggregated_pk =
-            Bls12381G1PublicKey::aggregate(&signer_keys, true).expect("Aggregation should succeed");
-
-        // Verify the aggregated signature
-        let valid = hyperscale_types::verify_bls12381_v1(
-            &message,
-            &aggregated_pk,
-            &cert.aggregated_signature,
-        );
-        assert!(valid, "Execution certificate signature should verify");
+        assert!(proof.success);
+        assert_eq!(proof.receipt_hash, receipt_hash);
+        assert!(proof.write_nodes.is_empty());
     }
 
     #[test]

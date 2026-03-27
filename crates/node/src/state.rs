@@ -599,6 +599,23 @@ impl NodeStateMachine {
             self.execution.cleanup_transaction(&deferral.tx_hash);
         }
 
+        // Notify wave accumulators about aborts BEFORE cleanup removes
+        // the wave assignment. Same pattern as deferrals — aborted txs are
+        // terminal and count as "resolved" in their wave.
+        for abort in &block.aborted {
+            if let Some(completion) = self.execution.record_wave_deferral(abort.tx_hash) {
+                actions.push(Action::SignAndBroadcastWaveVote {
+                    block_hash: completion.block_hash,
+                    block_height: completion.block_height,
+                    wave_id: completion.wave_id,
+                    wave_receipt_root: completion.wave_receipt_root,
+                    tx_count: completion.tx_outcomes.len() as u32,
+                    tx_outcomes: completion.tx_outcomes,
+                    participating_shards: completion.participating_shards,
+                });
+            }
+        }
+
         // Cleanup execution state for aborted transactions
         for abort in &block.aborted {
             self.execution.cleanup_transaction(&abort.tx_hash);
@@ -614,6 +631,18 @@ impl NodeStateMachine {
             // (original_hash returns self.hash() for non-retries, but retry_transactions
             // should only contain actual retries)
             if original_hash != retry_tx.hash() {
+                // Resolve in wave accumulator before cleanup
+                if let Some(completion) = self.execution.record_wave_deferral(original_hash) {
+                    actions.push(Action::SignAndBroadcastWaveVote {
+                        block_hash: completion.block_hash,
+                        block_height: completion.block_height,
+                        wave_id: completion.wave_id,
+                        wave_receipt_root: completion.wave_receipt_root,
+                        tx_count: completion.tx_outcomes.len() as u32,
+                        tx_outcomes: completion.tx_outcomes,
+                        participating_shards: completion.participating_shards,
+                    });
+                }
                 self.execution.cleanup_transaction(&original_hash);
             }
         }

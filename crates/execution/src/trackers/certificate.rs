@@ -4,7 +4,7 @@
 //! during Phase 5 of the cross-shard atomic execution protocol.
 
 use hyperscale_types::{
-    ExecutionCertificate, Hash, ShardGroupId, TransactionCertificate, TransactionDecision,
+    Hash, ShardExecutionProof, ShardGroupId, TransactionCertificate, TransactionDecision,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use tracing::instrument;
@@ -20,8 +20,8 @@ pub struct CertificateTracker {
     tx_hash: Hash,
     /// Shards we expect certificates from.
     expected_shards: BTreeSet<ShardGroupId>,
-    /// Certificates received per shard.
-    certificates: BTreeMap<ShardGroupId, ExecutionCertificate>,
+    /// Proofs received per shard.
+    certificates: BTreeMap<ShardGroupId, ShardExecutionProof>,
 }
 
 impl CertificateTracker {
@@ -49,37 +49,35 @@ impl CertificateTracker {
         self.expected_shards.len()
     }
 
-    /// Add a certificate. Returns true if all certificates are collected.
-    #[instrument(level = "debug", skip(self, cert), fields(
+    /// Add a proof for a shard. Returns true if all proofs are collected.
+    #[instrument(level = "debug", skip(self, proof), fields(
         tx_hash = %self.tx_hash,
-        shard = cert.shard_group_id.0,
+        shard = shard.0,
         collected = self.certificates.len(),
         expected = self.expected_shards.len(),
     ))]
-    pub fn add_certificate(&mut self, cert: ExecutionCertificate) -> bool {
-        let shard = cert.shard_group_id;
-
+    pub fn add_proof(&mut self, shard: ShardGroupId, proof: ShardExecutionProof) -> bool {
         if !self.expected_shards.contains(&shard) {
             tracing::debug!(
                 tx_hash = ?self.tx_hash,
                 shard = shard.0,
                 expected = ?self.expected_shards,
-                "Certificate from unexpected shard, ignoring"
+                "Proof from unexpected shard, ignoring"
             );
             return false;
         }
 
-        // Don't overwrite existing certificate
+        // Don't overwrite existing proof
         if self.certificates.contains_key(&shard) {
             tracing::debug!(
                 tx_hash = ?self.tx_hash,
                 shard = shard.0,
-                "Duplicate certificate from shard, ignoring"
+                "Duplicate proof from shard, ignoring"
             );
             return self.is_complete();
         }
 
-        self.certificates.insert(shard, cert);
+        self.certificates.insert(shard, proof);
         let complete = self.is_complete();
         tracing::debug!(
             tx_hash = ?self.tx_hash,
@@ -87,7 +85,7 @@ impl CertificateTracker {
             collected = self.certificates.len(),
             expected = self.expected_shards.len(),
             complete = complete,
-            "Added certificate from shard"
+            "Added proof from shard"
         );
         complete
     }
@@ -119,12 +117,17 @@ impl CertificateTracker {
             return None;
         }
 
-        // Verify all shards agree on receipt hash (zero-allocation iterator approach)
-        let mut receipt_hashes = self.certificates.values().map(|c| c.receipt_hash);
-        let first = receipt_hashes.next()?; // Safe: is_complete() guarantees at least one
-        if !receipt_hashes.all(|h| h == first) {
+        // Verify all shards agree on receipt hash
+        let per_shard: Vec<_> = self
+            .certificates
+            .iter()
+            .map(|(s, c)| (*s, c.receipt_hash))
+            .collect();
+        let first_hash = per_shard[0].1;
+        if !per_shard.iter().all(|(_, h)| *h == first_hash) {
             tracing::warn!(
                 tx_hash = ?self.tx_hash,
+                per_shard = ?per_shard,
                 "Receipt hash mismatch across shards - cannot create TX certificate"
             );
             return None;
@@ -158,22 +161,12 @@ impl CertificateTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::{zero_bls_signature, SignerBitfield};
 
-    fn make_certificate(
-        tx_hash: Hash,
-        shard: ShardGroupId,
-        receipt_hash: Hash,
-    ) -> ExecutionCertificate {
-        ExecutionCertificate {
-            transaction_hash: tx_hash,
-            shard_group_id: shard,
-            read_nodes: vec![],
-            write_nodes: vec![],
+    fn make_proof(receipt_hash: Hash) -> ShardExecutionProof {
+        ShardExecutionProof {
             receipt_hash,
             success: true,
-            aggregated_signature: zero_bls_signature(),
-            signers: SignerBitfield::new(4),
+            write_nodes: vec![],
         }
     }
 
@@ -189,11 +182,8 @@ mod tests {
 
         assert!(!tracker.is_complete());
 
-        let cert0 = make_certificate(tx_hash, shard0, commitment);
-        assert!(!tracker.add_certificate(cert0));
-
-        let cert1 = make_certificate(tx_hash, shard1, commitment);
-        assert!(tracker.add_certificate(cert1));
+        assert!(!tracker.add_proof(shard0, make_proof(commitment)));
+        assert!(tracker.add_proof(shard1, make_proof(commitment)));
 
         assert!(tracker.is_complete());
 
@@ -216,8 +206,8 @@ mod tests {
         let expected = [shard0, shard1].into_iter().collect();
         let mut tracker = CertificateTracker::new(tx_hash, expected);
 
-        tracker.add_certificate(make_certificate(tx_hash, shard0, root_a));
-        tracker.add_certificate(make_certificate(tx_hash, shard1, root_b));
+        tracker.add_proof(shard0, make_proof(root_a));
+        tracker.add_proof(shard1, make_proof(root_b));
 
         assert!(tracker.is_complete());
         // But can't create certificate due to mismatch
@@ -233,9 +223,8 @@ mod tests {
         let expected = [shard0].into_iter().collect();
         let mut tracker = CertificateTracker::new(tx_hash, expected);
 
-        // Certificate from unknown shard
-        let unknown_cert = make_certificate(tx_hash, ShardGroupId(99), commitment);
-        assert!(!tracker.add_certificate(unknown_cert));
+        // Proof from unknown shard
+        assert!(!tracker.add_proof(ShardGroupId(99), make_proof(commitment)));
         assert!(!tracker.is_complete());
     }
 
@@ -248,12 +237,11 @@ mod tests {
         let expected = [shard0].into_iter().collect();
         let mut tracker = CertificateTracker::new(tx_hash, expected);
 
-        let cert = make_certificate(tx_hash, shard0, commitment);
-        assert!(tracker.add_certificate(cert.clone()));
+        assert!(tracker.add_proof(shard0, make_proof(commitment)));
 
         // Duplicate should not change state
         assert_eq!(tracker.certificate_count(), 1);
-        tracker.add_certificate(cert);
+        tracker.add_proof(shard0, make_proof(commitment));
         assert_eq!(tracker.certificate_count(), 1);
     }
 }

@@ -6,8 +6,8 @@
 use crate::TestCommittee;
 use hyperscale_types::{
     block_vote_message, exec_vote_message, verify_bls12381_v1, BlockHeight, BlockVote,
-    Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote, Hash,
-    QuorumCertificate, ShardGroupId, SignerBitfield,
+    Bls12381G1PublicKey, Bls12381G2Signature, ExecutionVote, Hash, QuorumCertificate,
+    ShardExecutionProof, ShardGroupId, SignerBitfield,
 };
 
 /// Create a properly-signed block vote.
@@ -154,44 +154,14 @@ pub fn make_signed_execution_vote(
     }
 }
 
-/// Create an execution certificate from signed votes.
+/// Create a shard execution proof for testing.
 ///
-/// Aggregates BLS signatures from the specified voter indices.
-pub fn make_signed_execution_certificate(
-    committee: &TestCommittee,
-    voter_indices: &[usize],
-    tx_hash: Hash,
-    receipt_hash: Hash,
-    shard: ShardGroupId,
-    success: bool,
-) -> ExecutionCertificate {
-    let message = exec_vote_message(&tx_hash, &receipt_hash, shard, success);
-
-    // Collect individual signatures
-    let signatures: Vec<Bls12381G2Signature> = voter_indices
-        .iter()
-        .map(|&idx| committee.keypair(idx).sign_v1(&message))
-        .collect();
-
-    // Aggregate signatures
-    let aggregated_signature =
-        Bls12381G2Signature::aggregate(&signatures, true).expect("BLS aggregation should succeed");
-
-    // Build signer bitfield
-    let mut signers = SignerBitfield::new(committee.size());
-    for &idx in voter_indices {
-        signers.set(idx);
-    }
-
-    ExecutionCertificate {
-        transaction_hash: tx_hash,
-        shard_group_id: shard,
-        read_nodes: vec![],
-        write_nodes: vec![],
+/// Simple proof with no BLS signatures (wave-based voting handles signatures).
+pub fn make_shard_execution_proof(receipt_hash: Hash, success: bool) -> ShardExecutionProof {
+    ShardExecutionProof {
         receipt_hash,
         success,
-        aggregated_signature,
-        signers,
+        write_nodes: vec![],
     }
 }
 
@@ -231,31 +201,6 @@ pub fn verify_qc(qc: &QuorumCertificate, committee: &TestCommittee) -> bool {
 pub fn verify_execution_vote(vote: &ExecutionVote, public_key: &Bls12381G1PublicKey) -> bool {
     let message = vote.signing_message();
     verify_bls12381_v1(&message, public_key, &vote.signature)
-}
-
-/// Verify an execution certificate's aggregated signature.
-pub fn verify_execution_certificate(
-    cert: &ExecutionCertificate,
-    committee: &TestCommittee,
-) -> bool {
-    let message = cert.signing_message();
-
-    // Collect signer public keys
-    let signer_keys: Vec<Bls12381G1PublicKey> = cert
-        .signers
-        .set_indices()
-        .map(|idx| *committee.public_key(idx))
-        .collect();
-
-    if signer_keys.is_empty() {
-        return false;
-    }
-
-    // Aggregate and verify
-    match Bls12381G1PublicKey::aggregate(&signer_keys, true) {
-        Ok(agg_pk) => verify_bls12381_v1(&message, &agg_pk, &cert.aggregated_signature),
-        Err(_) => false,
-    }
 }
 
 #[cfg(test)]
@@ -315,22 +260,12 @@ mod tests {
     }
 
     #[test]
-    fn test_signed_execution_certificate() {
-        let committee = TestCommittee::new(4, 42);
-        let tx_hash = Hash::from_bytes(b"tx");
+    fn test_shard_execution_proof() {
         let receipt_hash = Hash::from_bytes(b"commitment");
-        let shard = ShardGroupId(0);
 
-        let cert = make_signed_execution_certificate(
-            &committee,
-            &[0, 1, 2],
-            tx_hash,
-            receipt_hash,
-            shard,
-            true,
-        );
+        let proof = make_shard_execution_proof(receipt_hash, true);
 
-        assert!(verify_execution_certificate(&cert, &committee));
-        assert_eq!(cert.signer_count(), 3);
+        assert!(proof.success);
+        assert_eq!(proof.receipt_hash, receipt_hash);
     }
 }
