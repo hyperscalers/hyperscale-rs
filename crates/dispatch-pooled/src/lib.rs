@@ -471,7 +471,7 @@ impl Dispatch for PooledDispatch {
             .fetch_add(1, Ordering::Relaxed);
         let pending = self.consensus_crypto_pending.clone();
         let pool = Arc::clone(&self.consensus_crypto_pool);
-        self.consensus_crypto_pool.spawn(move || {
+        self.consensus_crypto_pool.spawn_fifo(move || {
             pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
         });
@@ -481,7 +481,7 @@ impl Dispatch for PooledDispatch {
         self.crypto_pending.fetch_add(1, Ordering::Relaxed);
         let pending = self.crypto_pending.clone();
         let pool = Arc::clone(&self.crypto_pool);
-        self.crypto_pool.spawn(move || {
+        self.crypto_pool.spawn_fifo(move || {
             pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
         });
@@ -504,7 +504,7 @@ impl Dispatch for PooledDispatch {
         self.tx_validation_pending.fetch_add(1, Ordering::Relaxed);
         let pending = self.tx_validation_pending.clone();
         let pool = Arc::clone(&self.tx_validation_pool);
-        self.tx_validation_pool.spawn(move || {
+        self.tx_validation_pool.spawn_fifo(move || {
             pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
         });
@@ -515,7 +515,7 @@ impl Dispatch for PooledDispatch {
         self.execution_pending.fetch_add(1, Ordering::Relaxed);
         let pending = self.execution_pending.clone();
         let pool = Arc::clone(&self.execution_pool);
-        self.execution_pool.spawn(move || {
+        self.execution_pool.spawn_fifo(move || {
             pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
         });
@@ -541,7 +541,7 @@ impl Dispatch for PooledDispatch {
         self.provisions_pending.fetch_add(1, Ordering::Relaxed);
         let pending = self.provisions_pending.clone();
         let pool = Arc::clone(&self.provisions_pool);
-        self.provisions_pool.spawn(move || {
+        self.provisions_pool.spawn_fifo(move || {
             pool.install(f);
             pending.fetch_sub(1, Ordering::Relaxed);
         });
