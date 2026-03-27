@@ -9,7 +9,6 @@
 //! handled inline by the I/O loop's flush closures.
 
 use hyperscale_core::{Action, NodeInput, ProtocolEvent};
-use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::RadixExecutor;
 use hyperscale_metrics as metrics;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
@@ -18,12 +17,11 @@ use std::sync::Arc;
 use tracing::warn;
 
 /// Context for executing delegated actions.
-pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore + ConsensusStore, D: Dispatch> {
+pub(crate) struct ActionContext<'a, S: CommitStore + SubstateStore + ConsensusStore> {
     pub storage: &'a S,
     pub executor: &'a RadixExecutor,
     pub local_shard: ShardGroupId,
     pub num_shards: u64,
-    pub dispatch: &'a D,
 }
 
 /// Result of handling a delegated action.
@@ -89,12 +87,9 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// The runner is responsible for additionally broadcasting votes to shard
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
-pub(crate) fn handle_delegated_action<
-    S: CommitStore + SubstateStore + ConsensusStore,
-    D: Dispatch,
->(
+pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + ConsensusStore>(
     action: Action,
-    ctx: &ActionContext<'_, S, D>,
+    ctx: &ActionContext<'_, S>,
 ) -> Option<DelegatedResult<S::PreparedCommit>> {
     match action {
         // --- BFT crypto verification ---
@@ -427,9 +422,16 @@ pub(crate) fn handle_delegated_action<
         } => {
             let local_shard = ctx.local_shard;
             let num_shards = ctx.num_shards;
-            let raw_results = ctx.dispatch.map_local(&transactions, |tx| {
-                hyperscale_execution::handlers::execute_single_shard(ctx.executor, ctx.storage, tx)
-            });
+            let raw_results: Vec<_> = transactions
+                .iter()
+                .map(|tx| {
+                    hyperscale_execution::handlers::execute_single_shard(
+                        ctx.executor,
+                        ctx.storage,
+                        tx,
+                    )
+                })
+                .collect();
 
             // Extract wave-ready data on handler thread (before consuming results)
             let wave_results: Vec<_> = raw_results
@@ -469,9 +471,16 @@ pub(crate) fn handle_delegated_action<
         } => {
             let local_shard = ctx.local_shard;
             let num_shards = ctx.num_shards;
-            let raw_results = ctx.dispatch.map_local(&transactions, |tx| {
-                hyperscale_execution::handlers::execute_single_shard(ctx.executor, ctx.storage, tx)
-            });
+            let raw_results: Vec<_> = transactions
+                .iter()
+                .map(|tx| {
+                    hyperscale_execution::handlers::execute_single_shard(
+                        ctx.executor,
+                        ctx.storage,
+                        tx,
+                    )
+                })
+                .collect();
 
             // Extract wave-ready data on handler thread
             let wave_results: Vec<_> = raw_results
@@ -514,15 +523,18 @@ pub(crate) fn handle_delegated_action<
         Action::ExecuteCrossShardTransactions { requests } => {
             let local_shard = ctx.local_shard;
             let num_shards = ctx.num_shards;
-            let raw_results: Vec<_> = ctx.dispatch.map_local(&requests, |req| {
-                hyperscale_execution::handlers::execute_cross_shard(
-                    ctx.executor,
-                    ctx.storage,
-                    req.tx_hash,
-                    &req.transaction,
-                    &req.provisions,
-                )
-            });
+            let raw_results: Vec<_> = requests
+                .iter()
+                .map(|req| {
+                    hyperscale_execution::handlers::execute_cross_shard(
+                        ctx.executor,
+                        ctx.storage,
+                        req.tx_hash,
+                        &req.transaction,
+                        &req.provisions,
+                    )
+                })
+                .collect();
 
             let wave_results: Vec<_> = raw_results
                 .iter()

@@ -717,7 +717,6 @@ where
         // Clone cheap shared state for the 'static spawn closure.
         let storage = Arc::clone(&self.storage);
         let executor = self.executor.clone();
-        let dispatch = self.dispatch.clone();
         let local_shard = self.local_shard;
         let num_shards = self.num_shards;
         let prepared_commits = Arc::clone(&self.prepared_commits);
@@ -730,7 +729,6 @@ where
                 executor: &executor,
                 local_shard,
                 num_shards,
-                dispatch: &dispatch,
             };
             if let Some(result) = action_handler::handle_delegated_action(action, &ctx) {
                 if is_execution {
