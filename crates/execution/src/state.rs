@@ -966,6 +966,31 @@ impl ExecutionState {
                     "SPECULATIVE HIT: Results already cached, skipping execution"
                 );
                 actions.extend(self.start_single_shard_execution(topology, tx.clone()));
+
+                // Wave result recording: speculative execution completed before wave
+                // tracking was set up (ExecutionBatchCompleted arrived before BlockCommitted).
+                // The wave_results from that event were silently dropped because
+                // wave_assignments didn't exist yet. Re-extract from execution cache now.
+                if let Some(receipt_hash) = self.execution_cache.get_receipt_hash(&tx_hash) {
+                    let write_nodes = self
+                        .execution_cache
+                        .get(&tx_hash)
+                        .map(|updates| crate::handlers::extract_write_nodes(updates))
+                        .unwrap_or_default();
+                    if let Some(completion) =
+                        self.record_wave_result(tx_hash, receipt_hash, true, write_nodes)
+                    {
+                        actions.push(Action::SignAndBroadcastWaveVote {
+                            block_hash: completion.block_hash,
+                            block_height: completion.block_height,
+                            wave_id: completion.wave_id,
+                            wave_receipt_root: completion.wave_receipt_root,
+                            tx_count: completion.tx_outcomes.len() as u32,
+                            tx_outcomes: completion.tx_outcomes,
+                            participating_shards: completion.participating_shards,
+                        });
+                    }
+                }
             } else if self.speculative_in_flight_txs.contains(&tx_hash) {
                 // Speculation in-flight - results will arrive when it completes
                 // This counts as a hit since we're skipping re-execution
@@ -975,6 +1000,33 @@ impl ExecutionState {
                     "SPECULATIVE IN-FLIGHT: Results will arrive soon, skipping execution"
                 );
                 actions.extend(self.start_single_shard_execution(topology, tx.clone()));
+
+                // If the execution already completed (ExecutionBatchCompleted processed
+                // before BlockCommitted but SpeculativeExecutionComplete hasn't been
+                // processed yet), the wave results were dropped. Re-extract from cache.
+                // If execution hasn't completed yet, cache will be empty and the
+                // later ExecutionBatchCompleted will record wave results normally
+                // (wave tracking is now set up).
+                if let Some(receipt_hash) = self.execution_cache.get_receipt_hash(&tx_hash) {
+                    let write_nodes = self
+                        .execution_cache
+                        .get(&tx_hash)
+                        .map(|updates| crate::handlers::extract_write_nodes(updates))
+                        .unwrap_or_default();
+                    if let Some(completion) =
+                        self.record_wave_result(tx_hash, receipt_hash, true, write_nodes)
+                    {
+                        actions.push(Action::SignAndBroadcastWaveVote {
+                            block_hash: completion.block_hash,
+                            block_height: completion.block_height,
+                            wave_id: completion.wave_id,
+                            wave_receipt_root: completion.wave_receipt_root,
+                            tx_count: completion.tx_outcomes.len() as u32,
+                            tx_outcomes: completion.tx_outcomes,
+                            participating_shards: completion.participating_shards,
+                        });
+                    }
+                }
             } else {
                 // No speculation at all - execute normally
                 tracing::debug!(
