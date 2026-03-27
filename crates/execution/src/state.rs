@@ -939,6 +939,7 @@ impl ExecutionState {
         // Prune old entries to prevent unbounded growth
         self.prune_executed_txs();
         self.prune_early_arrivals();
+        self.prune_wave_state();
 
         // Separate single-shard and cross-shard transactions
         let (single_shard, cross_shard): (Vec<_>, Vec<_>) = new_txs
@@ -1363,6 +1364,9 @@ impl ExecutionState {
         // but we need to do it here for successful completions too.
         self.pending_provisioning.remove(tx_hash);
 
+        // Wave assignment cleanup (accumulator/tracker cleaned up by prune_wave_state)
+        self.wave_assignments.remove(tx_hash);
+
         self.certificate_trackers.remove(tx_hash);
         self.early_provisioning_complete.remove(tx_hash);
         self.early_certificates.remove(tx_hash);
@@ -1408,6 +1412,61 @@ impl ExecutionState {
                 pruned_certs,
                 cutoff_height = cutoff,
                 "Pruned stale early arrivals"
+            );
+        }
+    }
+
+    /// Prune stale wave state (accumulators, vote trackers, early votes).
+    ///
+    /// Wave accumulators and vote trackers are keyed by (block_hash, wave_id).
+    /// Once a block is old enough that all its txs must have finalized or been
+    /// cleaned up, the wave state can be removed. Uses the same retention window
+    /// as executed_txs.
+    ///
+    /// Also prunes wave_assignments for txs no longer in any active accumulator,
+    /// and early_wave_votes for waves that were never set up.
+    fn prune_wave_state(&mut self) {
+        let cutoff = self
+            .committed_height
+            .saturating_sub(EXECUTED_TX_RETENTION_BLOCKS);
+
+        // Prune accumulators by block height
+        let before_acc = self.wave_accumulators.len();
+        self.wave_accumulators
+            .retain(|_, acc| acc.block_height() > cutoff);
+        let pruned_acc = before_acc - self.wave_accumulators.len();
+
+        // Prune vote trackers — same keys as accumulators
+        let before_vt = self.wave_vote_trackers.len();
+        self.wave_vote_trackers
+            .retain(|key, _| self.wave_accumulators.contains_key(key));
+        let pruned_vt = before_vt - self.wave_vote_trackers.len();
+
+        // Prune wave_assignments that point to removed accumulators
+        let before_wa = self.wave_assignments.len();
+        self.wave_assignments
+            .retain(|_, wave_key| self.wave_accumulators.contains_key(wave_key));
+        let pruned_wa = before_wa - self.wave_assignments.len();
+
+        // Prune early wave votes — votes for waves that were never set up
+        // and are now too old to matter
+        let before_ev = self.early_wave_votes.len();
+        self.early_wave_votes.retain(|_, votes| {
+            votes
+                .first()
+                .map(|v| v.block_height > cutoff)
+                .unwrap_or(false)
+        });
+        let pruned_ev = before_ev - self.early_wave_votes.len();
+
+        if pruned_acc > 0 || pruned_vt > 0 || pruned_wa > 0 || pruned_ev > 0 {
+            tracing::debug!(
+                pruned_acc,
+                pruned_vt,
+                pruned_wa,
+                pruned_ev,
+                cutoff_height = cutoff,
+                "Pruned stale wave state"
             );
         }
     }
