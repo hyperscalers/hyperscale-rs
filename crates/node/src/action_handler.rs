@@ -60,9 +60,9 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         Action::BuildProposal { .. } => Some(DispatchPool::ConsensusCrypto),
 
         // General crypto
-        Action::AggregateExecutionWaveCertificate { .. } => Some(DispatchPool::Crypto),
-        Action::VerifyAndAggregateExecutionWaveVotes { .. } => Some(DispatchPool::Crypto),
-        Action::VerifyExecutionWaveCertificateSignature { .. } => Some(DispatchPool::Crypto),
+        Action::AggregateExecutionCertificate { .. } => Some(DispatchPool::Crypto),
+        Action::VerifyAndAggregateExecutionVotes { .. } => Some(DispatchPool::Crypto),
+        Action::VerifyExecutionCertificateSignature { .. } => Some(DispatchPool::Crypto),
 
         // Provision work: IPA proof generation and verification.
         // Dedicated pool to avoid starving execution and crypto work.
@@ -83,7 +83,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
 /// that the runner must handle directly.
 ///
 /// For execution actions (`ExecuteTransactions`, `SpeculativeExecute`), the
-/// returned events include `ProtocolEvent::ExecutionVoteReceived` for each vote.
+/// returned events include `ProtocolEvent::ExecutionBatchCompleted`.
 /// The runner is responsible for additionally broadcasting votes to shard
 /// peers (network-specific).
 #[allow(clippy::too_many_lines)]
@@ -280,28 +280,28 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             })
         }
 
-        // --- Wave Execution Aggregation and Verification ---
-        Action::AggregateExecutionWaveCertificate {
+        // --- Execution Vote Aggregation and Verification ---
+        Action::AggregateExecutionCertificate {
             wave_id,
             block_hash: _,
             shard,
-            wave_receipt_root,
+            receipt_root,
             votes,
             tx_outcomes,
             committee,
         } => {
-            // Aggregate BLS signatures from wave votes into a wave certificate.
-            let certificate = hyperscale_execution::handlers::aggregate_execution_wave_certificate(
+            // Aggregate BLS signatures from execution votes into a execution certificate.
+            let certificate = hyperscale_execution::handlers::aggregate_execution_certificate(
                 &wave_id,
                 shard,
-                wave_receipt_root,
+                receipt_root,
                 &votes,
                 tx_outcomes,
                 &committee,
             );
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
-                    ProtocolEvent::ExecutionWaveCertificateAggregated {
+                    ProtocolEvent::ExecutionCertificateAggregated {
                         wave_id,
                         certificate,
                     },
@@ -310,17 +310,17 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             })
         }
 
-        Action::VerifyAndAggregateExecutionWaveVotes {
+        Action::VerifyAndAggregateExecutionVotes {
             wave_id,
             block_hash,
             votes,
         } => {
-            // Batch-verify wave vote signatures.
-            let verified = hyperscale_execution::handlers::batch_verify_execution_wave_votes(votes);
+            // Batch-verify execution vote signatures.
+            let verified = hyperscale_execution::handlers::batch_verify_execution_votes(votes);
             let verified_votes: Vec<_> = verified.collect();
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
-                    ProtocolEvent::ExecutionWaveVotesVerifiedAndAggregated {
+                    ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
                         wave_id,
                         block_hash,
                         verified_votes,
@@ -330,17 +330,17 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             })
         }
 
-        Action::VerifyExecutionWaveCertificateSignature {
+        Action::VerifyExecutionCertificateSignature {
             certificate,
             public_keys,
         } => {
-            let valid = hyperscale_execution::handlers::verify_execution_wave_certificate_signature(
+            let valid = hyperscale_execution::handlers::verify_execution_certificate_signature(
                 &certificate,
                 &public_keys,
             );
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(
-                    ProtocolEvent::ExecutionWaveCertificateSignatureVerified { certificate, valid },
+                    ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid },
                 )],
                 prepared_commit: None,
             })
@@ -413,8 +413,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
         }
 
         // --- Transaction execution ---
-        // NOTE: The returned events include ExecutionVoteReceived for each vote.
-        // The runner must additionally broadcast votes to shard peers (network-specific).
+        // The returned event is ExecutionBatchCompleted with results and tx_outcomes.
         Action::ExecuteTransactions {
             block_hash: _,
             transactions,
@@ -433,10 +432,10 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 })
                 .collect();
 
-            // Extract wave-ready data on handler thread (before consuming results)
-            let wave_results: Vec<_> = raw_results
+            // Extract per-tx outcomes on handler thread (before consuming results)
+            let tx_outcomes: Vec<_> = raw_results
                 .iter()
-                .map(hyperscale_execution::handlers::extract_wave_result)
+                .map(hyperscale_execution::handlers::extract_execution_result)
                 .collect();
             let results = raw_results
                 .into_iter()
@@ -457,7 +456,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 events: vec![NodeInput::Protocol(
                     ProtocolEvent::ExecutionBatchCompleted {
                         results,
-                        wave_results,
+                        tx_outcomes,
                         speculative: false,
                     },
                 )],
@@ -482,10 +481,10 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 })
                 .collect();
 
-            // Extract wave-ready data on handler thread
-            let wave_results: Vec<_> = raw_results
+            // Extract per-tx outcomes on handler thread
+            let tx_outcomes: Vec<_> = raw_results
                 .iter()
-                .map(hyperscale_execution::handlers::extract_wave_result)
+                .map(hyperscale_execution::handlers::extract_execution_result)
                 .collect();
             let tx_hashes: Vec<Hash> = raw_results.iter().map(|r| r.tx_hash).collect();
             let results = raw_results
@@ -507,7 +506,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 events: vec![
                     NodeInput::Protocol(ProtocolEvent::ExecutionBatchCompleted {
                         results,
-                        wave_results,
+                        tx_outcomes,
                         speculative: true,
                     }),
                     NodeInput::Protocol(ProtocolEvent::SpeculativeExecutionComplete {
@@ -536,9 +535,9 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 })
                 .collect();
 
-            let wave_results: Vec<_> = raw_results
+            let tx_outcomes: Vec<_> = raw_results
                 .iter()
-                .map(hyperscale_execution::handlers::extract_wave_result)
+                .map(hyperscale_execution::handlers::extract_execution_result)
                 .collect();
             let results = raw_results
                 .into_iter()
@@ -559,7 +558,7 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 events: vec![NodeInput::Protocol(
                     ProtocolEvent::ExecutionBatchCompleted {
                         results,
-                        wave_results,
+                        tx_outcomes,
                         speculative: false,
                     },
                 )],

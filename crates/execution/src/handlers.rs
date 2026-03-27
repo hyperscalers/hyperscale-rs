@@ -14,9 +14,9 @@
 use hyperscale_engine::{RadixExecutor, SingleTxResult};
 use hyperscale_storage::SubstateStore;
 use hyperscale_types::{
-    batch_verify_bls_same_message, exec_wave_vote_message, verify_bls12381_v1, zero_bls_signature,
-    Bls12381G1PublicKey, Bls12381G2Signature, ExecutionWaveCertificate, ExecutionWaveVote, Hash,
-    NodeId, RoutableTransaction, ShardGroupId, SignerBitfield, ValidatorId, WaveId, WaveTxOutcome,
+    batch_verify_bls_same_message, exec_vote_message, verify_bls12381_v1, zero_bls_signature,
+    Bls12381G1PublicKey, Bls12381G2Signature, ExecutionCertificate, ExecutionVote, Hash, NodeId,
+    RoutableTransaction, ShardGroupId, SignerBitfield, TxOutcome, ValidatorId, WaveId,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -117,14 +117,14 @@ fn filter_to_declared_writes(
     filtered
 }
 
-/// Extract wave-ready result data from a SingleTxResult.
+/// Extract execution-ready result data from a SingleTxResult.
 ///
 /// Called on the handler thread (after execution, before returning to state machine)
 /// so that write_nodes extraction and success determination happen off the main thread.
-/// The returned `WaveTxOutcome` is fed into the wave accumulator by the state machine.
-pub fn extract_wave_result(result: &hyperscale_engine::SingleTxResult) -> WaveTxOutcome {
+/// The returned `TxOutcome` is fed into the execution accumulator by the state machine.
+pub fn extract_execution_result(result: &hyperscale_engine::SingleTxResult) -> TxOutcome {
     let write_nodes = extract_write_nodes(&result.database_updates);
-    WaveTxOutcome {
+    TxOutcome {
         tx_hash: result.tx_hash,
         receipt_hash: result.receipt_hash,
         success: result.success,
@@ -150,20 +150,19 @@ pub fn extract_write_nodes(updates: &hyperscale_storage::DatabaseUpdates) -> Vec
 // Wave-based execution voting handlers
 // ============================================================================
 
-/// Aggregate verified execution wave votes into an `ExecutionWaveCertificate`.
+/// Aggregate verified execution votes into an `ExecutionCertificate`.
 ///
-/// Same pattern as `aggregate_execution_certificate` but for wave-level votes.
 /// Deduplicates votes by validator, aggregates BLS signatures, and builds a
 /// signer bitfield using the committee's indices.
 #[allow(clippy::too_many_arguments)]
-pub fn aggregate_execution_wave_certificate(
+pub fn aggregate_execution_certificate(
     wave_id: &WaveId,
     shard: ShardGroupId,
-    wave_receipt_root: Hash,
-    votes: &[ExecutionWaveVote],
-    tx_outcomes: Vec<WaveTxOutcome>,
+    receipt_root: Hash,
+    votes: &[ExecutionVote],
+    tx_outcomes: Vec<TxOutcome>,
     committee: &[ValidatorId],
-) -> ExecutionWaveCertificate {
+) -> ExecutionCertificate {
     // Deduplicate votes by validator
     let mut seen_validators = HashSet::new();
     let unique_votes: Vec<_> = votes
@@ -193,48 +192,48 @@ pub fn aggregate_execution_wave_certificate(
     let block_hash = votes.first().map(|v| v.block_hash).unwrap_or(Hash::ZERO);
     let block_height = votes.first().map(|v| v.block_height).unwrap_or(0);
 
-    ExecutionWaveCertificate {
+    ExecutionCertificate {
         block_hash,
         block_height,
         wave_id: wave_id.clone(),
         shard_group_id: shard,
-        wave_receipt_root,
+        receipt_root,
         tx_outcomes,
         aggregated_signature,
         signers,
     }
 }
 
-/// Batch verify execution wave votes.
+/// Batch verify execution votes.
 ///
 /// Uses BLS same-message batch verification since all votes in a wave
-/// should sign the same message (same wave_receipt_root). Falls back to
+/// should sign the same message (same receipt_root). Falls back to
 /// individual verification on batch failure.
 ///
 /// Returns an iterator of `(vote, voting_power)` for verified votes.
-pub fn batch_verify_execution_wave_votes(
-    votes: Vec<(ExecutionWaveVote, Bls12381G1PublicKey, u64)>,
-) -> impl Iterator<Item = (ExecutionWaveVote, u64)> {
+pub fn batch_verify_execution_votes(
+    votes: Vec<(ExecutionVote, Bls12381G1PublicKey, u64)>,
+) -> impl Iterator<Item = (ExecutionVote, u64)> {
     if votes.is_empty() {
         return Vec::new().into_iter();
     }
 
     // Group by signing message (all votes for same wave should share one)
-    let mut by_message: HashMap<Vec<u8>, Vec<(ExecutionWaveVote, Bls12381G1PublicKey, u64)>> =
+    let mut by_message: HashMap<Vec<u8>, Vec<(ExecutionVote, Bls12381G1PublicKey, u64)>> =
         HashMap::new();
     for (vote, pk, power) in votes {
-        let msg = exec_wave_vote_message(
+        let msg = exec_vote_message(
             &vote.block_hash,
             vote.block_height,
             &vote.wave_id,
             vote.shard_group_id,
-            &vote.wave_receipt_root,
+            &vote.receipt_root,
             vote.tx_count,
         );
         by_message.entry(msg).or_default().push((vote, pk, power));
     }
 
-    let mut verified: Vec<(ExecutionWaveVote, u64)> = Vec::new();
+    let mut verified: Vec<(ExecutionVote, u64)> = Vec::new();
 
     for (message, group) in by_message {
         if group.len() >= 2 {
@@ -266,19 +265,19 @@ pub fn batch_verify_execution_wave_votes(
     verified.into_iter()
 }
 
-/// Verify an execution wave certificate's aggregated signature.
+/// Verify an execution certificate's aggregated signature.
 ///
-/// Verifies an execution wave certificate's aggregated BLS signature.
-pub fn verify_execution_wave_certificate_signature(
-    certificate: &ExecutionWaveCertificate,
+/// Verifies an execution certificate's aggregated BLS signature.
+pub fn verify_execution_certificate_signature(
+    certificate: &ExecutionCertificate,
     public_keys: &[Bls12381G1PublicKey],
 ) -> bool {
-    let msg = exec_wave_vote_message(
+    let msg = exec_vote_message(
         &certificate.block_hash,
         certificate.block_height,
         &certificate.wave_id,
         certificate.shard_group_id,
-        &certificate.wave_receipt_root,
+        &certificate.receipt_root,
         certificate.tx_outcomes.len() as u32,
     );
 

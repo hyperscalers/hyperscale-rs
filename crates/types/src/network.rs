@@ -49,8 +49,8 @@ pub enum MessagePriority {
     ///
     /// Includes:
     /// - `StateProvisionsNotification` - cross-shard state delivery with merkle proofs
-    /// - `ExecutionWaveVotesNotification` - execution wave votes
-    /// - `ExecutionWaveCertificatesNotification` - execution wave certificates
+    /// - `ExecutionVotesNotification` - execution votes
+    /// - `ExecutionCertificatesNotification` - execution certificates
     ///
     /// High priority but may be batched for efficiency.
     Coordination = 1,

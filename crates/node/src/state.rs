@@ -575,16 +575,16 @@ impl NodeStateMachine {
         // Livelock: process deferrals/aborts/certs, add tombstones, cleanup tracking
         self.livelock.on_block_committed(&block);
 
-        // Notify wave accumulators about deferrals BEFORE cleanup removes
+        // Notify execution accumulators about deferrals BEFORE cleanup removes
         // the wave assignment. A deferred tx counts as "resolved" in its wave —
-        // if it was the last unresolved tx, this triggers wave vote signing.
+        // if it was the last unresolved tx, this triggers execution vote signing.
         for deferral in &block.deferred {
-            if let Some(completion) = self.execution.record_wave_deferral(deferral.tx_hash) {
-                actions.push(Action::SignAndBroadcastWaveVote {
+            if let Some(completion) = self.execution.record_deferral(deferral.tx_hash) {
+                actions.push(Action::SignAndBroadcastExecutionVote {
                     block_hash: completion.block_hash,
                     block_height: completion.block_height,
                     wave_id: completion.wave_id,
-                    wave_receipt_root: completion.wave_receipt_root,
+                    receipt_root: completion.receipt_root,
                     tx_count: completion.tx_outcomes.len() as u32,
                     tx_outcomes: completion.tx_outcomes,
                     participating_shards: completion.participating_shards,
@@ -599,16 +599,16 @@ impl NodeStateMachine {
             self.execution.cleanup_transaction(&deferral.tx_hash);
         }
 
-        // Notify wave accumulators about aborts BEFORE cleanup removes
+        // Notify execution accumulators about aborts BEFORE cleanup removes
         // the wave assignment. Same pattern as deferrals — aborted txs are
         // terminal and count as "resolved" in their wave.
         for abort in &block.aborted {
-            if let Some(completion) = self.execution.record_wave_deferral(abort.tx_hash) {
-                actions.push(Action::SignAndBroadcastWaveVote {
+            if let Some(completion) = self.execution.record_deferral(abort.tx_hash) {
+                actions.push(Action::SignAndBroadcastExecutionVote {
                     block_hash: completion.block_hash,
                     block_height: completion.block_height,
                     wave_id: completion.wave_id,
-                    wave_receipt_root: completion.wave_receipt_root,
+                    receipt_root: completion.receipt_root,
                     tx_count: completion.tx_outcomes.len() as u32,
                     tx_outcomes: completion.tx_outcomes,
                     participating_shards: completion.participating_shards,
@@ -631,13 +631,13 @@ impl NodeStateMachine {
             // (original_hash returns self.hash() for non-retries, but retry_transactions
             // should only contain actual retries)
             if original_hash != retry_tx.hash() {
-                // Resolve in wave accumulator before cleanup
-                if let Some(completion) = self.execution.record_wave_deferral(original_hash) {
-                    actions.push(Action::SignAndBroadcastWaveVote {
+                // Resolve in execution accumulator before cleanup
+                if let Some(completion) = self.execution.record_deferral(original_hash) {
+                    actions.push(Action::SignAndBroadcastExecutionVote {
                         block_hash: completion.block_hash,
                         block_height: completion.block_height,
                         wave_id: completion.wave_id,
-                        wave_receipt_root: completion.wave_receipt_root,
+                        receipt_root: completion.receipt_root,
                         tx_count: completion.tx_outcomes.len() as u32,
                         tx_outcomes: completion.tx_outcomes,
                         participating_shards: completion.participating_shards,
@@ -1051,7 +1051,7 @@ impl StateMachine for NodeStateMachine {
             // ── Execution ────────────────────────────────────────────────
             ProtocolEvent::ExecutionBatchCompleted {
                 results,
-                wave_results,
+                tx_outcomes,
                 speculative,
             } => {
                 // Single pass: populate execution cache and build receipt bundles.
@@ -1113,21 +1113,21 @@ impl StateMachine for NodeStateMachine {
                     );
                 }
 
-                // Record results into wave accumulators.
-                // wave_results were extracted on the handler thread — no data
+                // Record outcomes into execution accumulators.
+                // Outcomes were extracted on the handler thread — no data
                 // munging needed here on the main thread.
-                for wr in wave_results {
-                    if let Some(completion) = self.execution.record_wave_result(
+                for wr in tx_outcomes {
+                    if let Some(completion) = self.execution.record_execution_result(
                         wr.tx_hash,
                         wr.receipt_hash,
                         wr.success,
                         wr.write_nodes,
                     ) {
-                        actions.push(Action::SignAndBroadcastWaveVote {
+                        actions.push(Action::SignAndBroadcastExecutionVote {
                             block_hash: completion.block_hash,
                             block_height: completion.block_height,
                             wave_id: completion.wave_id,
-                            wave_receipt_root: completion.wave_receipt_root,
+                            receipt_root: completion.receipt_root,
                             tx_count: completion.tx_outcomes.len() as u32,
                             tx_outcomes: completion.tx_outcomes,
                             participating_shards: completion.participating_shards,
@@ -1145,33 +1145,33 @@ impl StateMachine for NodeStateMachine {
                 .on_speculative_execution_complete(block_hash, tx_hashes),
 
             // ── Wave Execution (wave-based voting) ────────────────────────
-            ProtocolEvent::ExecutionWaveVoteReceived { vote } => {
-                self.execution.on_wave_vote(self.topology.snapshot(), vote)
-            }
-            ProtocolEvent::ExecutionWaveVotesVerifiedAndAggregated {
+            ProtocolEvent::ExecutionVoteReceived { vote } => self
+                .execution
+                .on_execution_vote(self.topology.snapshot(), vote),
+            ProtocolEvent::ExecutionVotesVerifiedAndAggregated {
                 wave_id,
                 block_hash,
                 verified_votes,
-            } => self.execution.on_wave_votes_verified(
+            } => self.execution.on_votes_verified(
                 self.topology.snapshot(),
                 wave_id,
                 block_hash,
                 verified_votes,
             ),
-            ProtocolEvent::ExecutionWaveCertificateAggregated {
+            ProtocolEvent::ExecutionCertificateAggregated {
                 wave_id,
                 certificate,
-            } => self.execution.on_wave_certificate_aggregated(
+            } => self.execution.on_certificate_aggregated(
                 self.topology.snapshot(),
                 wave_id,
                 certificate,
             ),
-            ProtocolEvent::ExecutionWaveCertificateReceived { cert } => self
+            ProtocolEvent::ExecutionCertificateReceived { cert } => self
                 .execution
                 .on_wave_certificate(self.topology.snapshot(), cert),
-            ProtocolEvent::ExecutionWaveCertificateSignatureVerified { certificate, valid } => self
+            ProtocolEvent::ExecutionCertificateSignatureVerified { certificate, valid } => self
                 .execution
-                .on_wave_certificate_verified(self.topology.snapshot(), certificate, valid),
+                .on_certificate_verified(self.topology.snapshot(), certificate, valid),
 
             // ── Transactions ─────────────────────────────────────────────
             ProtocolEvent::TransactionExecuted { tx_hash, accepted } => {

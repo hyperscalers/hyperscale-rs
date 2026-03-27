@@ -1,8 +1,6 @@
 //! State-related types for cross-shard execution.
 
-use crate::{
-    exec_vote_message, BlockHeight, Bls12381G2Signature, Hash, NodeId, ShardGroupId, ValidatorId,
-};
+use crate::{BlockHeight, Hash, NodeId, ShardGroupId};
 use sbor::prelude::*;
 use std::sync::Arc;
 
@@ -96,69 +94,11 @@ impl StateEntry {
     }
 }
 
-/// Vote on execution state from a validator.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, BasicSbor)]
-pub struct ExecutionVote {
-    /// Hash of the transaction.
-    pub transaction_hash: Hash,
-
-    /// Shard group that executed.
-    pub shard_group_id: ShardGroupId,
-
-    /// Hash of the ConsensusReceipt (outcome + event_root).
-    pub receipt_hash: Hash,
-
-    /// Whether execution succeeded.
-    pub success: bool,
-
-    /// NodeIds written during execution (for speculative invalidation).
-    ///
-    /// Deterministically ordered via BTreeSet so all validators within a
-    /// shard produce identical write_nodes vectors from identical execution.
-    pub write_nodes: Vec<NodeId>,
-
-    /// Validator that executed and voted.
-    pub validator: ValidatorId,
-
-    /// Signature from the voting validator.
-    pub signature: Bls12381G2Signature,
-}
-
-impl ExecutionVote {
-    /// Compute hash of this vote for aggregation.
-    pub fn vote_hash(&self) -> Hash {
-        let mut data = Vec::new();
-        data.extend_from_slice(self.transaction_hash.as_bytes());
-        data.extend_from_slice(&self.shard_group_id.0.to_le_bytes());
-        data.extend_from_slice(self.receipt_hash.as_bytes());
-        data.push(if self.success { 1 } else { 0 });
-
-        Hash::from_bytes(&data)
-    }
-
-    /// Create the canonical message bytes for signing.
-    ///
-    /// Uses the centralized `exec_vote_message` function with the
-    /// `DOMAIN_EXEC_VOTE` tag for domain separation.
-    ///
-    /// Note: With wave-based voting, per-tx BLS signatures are no longer used.
-    /// This signing message is used only for ExecutionVote verification.
-    pub fn signing_message(&self) -> Vec<u8> {
-        exec_vote_message(
-            &self.transaction_hash,
-            &self.receipt_hash,
-            self.shard_group_id,
-            self.success,
-        )
-    }
-}
-
 /// Per-shard execution proof for a transaction.
 ///
 /// Contains the execution outcome for a transaction on a single shard.
-/// Stored in `TransactionCertificate.shard_proofs`. With wave-based voting,
-/// BLS signatures are on the wave cert (not per-tx), so this type carries
-/// only the execution outcome data.
+/// Stored in `TransactionCertificate.shard_proofs`. BLS signatures are
+/// on the execution certificate, so this type carries only the outcome data.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct ShardExecutionProof {
     /// Hash of the ConsensusReceipt (outcome + event_root).

@@ -62,81 +62,79 @@ where
             // ═══════════════════════════════════════════════════════════
             // Network broadcasts — batched
             // ═══════════════════════════════════════════════════════════
-            Action::SignAndBroadcastWaveVote {
+            Action::SignAndBroadcastExecutionVote {
                 block_hash,
                 block_height,
                 wave_id,
-                wave_receipt_root,
+                receipt_root,
                 tx_count,
                 tx_outcomes: _,          // TODO: stash for later cert aggregation
                 participating_shards: _, // TODO: stash for later cert broadcast
             } => {
-                // Sign the wave vote inline (BLS signing is fast, ~1ms)
-                let msg = hyperscale_types::exec_wave_vote_message(
+                // Sign the execution vote inline (BLS signing is fast, ~1ms)
+                let msg = hyperscale_types::exec_vote_message(
                     &block_hash,
                     block_height,
                     &wave_id,
                     self.local_shard,
-                    &wave_receipt_root,
+                    &receipt_root,
                     tx_count,
                 );
                 let sig = self.signing_key.sign_v1(&msg);
-                let vote = hyperscale_types::ExecutionWaveVote {
+                let vote = hyperscale_types::ExecutionVote {
                     block_hash,
                     block_height,
                     wave_id,
                     shard_group_id: self.local_shard,
-                    wave_receipt_root,
+                    receipt_root,
                     tx_count,
                     validator: self.validator_id,
                     signature: sig,
                 };
 
-                // Send immediately — wave is the batch, no accumulator needed
-                let batch_msg = hyperscale_types::exec_wave_vote_batch_message(
+                // Send immediately — each vote already covers a whole wave, no accumulator needed
+                let batch_msg = hyperscale_types::exec_vote_batch_message(
                     self.local_shard,
                     std::slice::from_ref(&vote),
                 );
                 let batch_sig = self.signing_key.sign_v1(&batch_msg);
-                let batch = hyperscale_messages::ExecutionWaveVotesNotification::new(
+                let batch = hyperscale_messages::ExecutionVotesNotification::new(
                     vec![vote.clone()],
                     self.validator_id,
                     batch_sig,
                 );
                 self.network.notify(&self.cached_local_peers, &batch);
 
-                // Also feed our own wave vote back to the state machine for tracking
+                // Also feed our own execution vote back to the state machine for tracking
                 let _ = self.event_sender.send(hyperscale_core::NodeInput::Protocol(
-                    hyperscale_core::ProtocolEvent::ExecutionWaveVoteReceived { vote },
+                    hyperscale_core::ProtocolEvent::ExecutionVoteReceived { vote },
                 ));
             }
-            Action::BroadcastExecutionWaveVote { shard, vote } => {
-                // Wave votes are already batched by wave — send immediately, no accumulator.
-                let msg = hyperscale_types::exec_wave_vote_batch_message(
-                    shard,
-                    std::slice::from_ref(&vote),
-                );
+            Action::BroadcastExecutionVote { shard, vote } => {
+                // Each vote already covers a whole wave — send immediately, no accumulator.
+                let msg =
+                    hyperscale_types::exec_vote_batch_message(shard, std::slice::from_ref(&vote));
                 let sig = self.signing_key.sign_v1(&msg);
-                let batch = hyperscale_messages::ExecutionWaveVotesNotification::new(
+                let batch = hyperscale_messages::ExecutionVotesNotification::new(
                     vec![vote],
                     self.validator_id,
                     sig,
                 );
                 self.network.notify(&self.cached_local_peers, &batch);
             }
-            Action::BroadcastExecutionWaveCertificate {
+            Action::BroadcastExecutionCertificate {
                 shard: _,
                 certificate,
                 recipients,
             } => {
-                // Wave certs are already batched by wave — send immediately, no accumulator.
+                // Each cert already covers a whole wave — send immediately, no accumulator.
                 let cert = std::sync::Arc::unwrap_or_clone(certificate);
-                let msg = hyperscale_types::exec_wave_cert_batch_message(
+                let msg = hyperscale_types::exec_cert_batch_message(
                     cert.shard_group_id,
                     std::slice::from_ref(&cert),
                 );
                 let sig = self.signing_key.sign_v1(&msg);
-                let batch = hyperscale_messages::ExecutionWaveCertificatesNotification::new(
+                let batch = hyperscale_messages::ExecutionCertificatesNotification::new(
                     vec![cert],
                     self.validator_id,
                     sig,
@@ -147,9 +145,9 @@ where
             // Delegated work — batched (accumulated for batch dispatch)
             // ═══════════════════════════════════════════════════════════
             // Wave delegated actions — dispatch immediately (same as AggregateExecutionCertificate)
-            Action::AggregateExecutionWaveCertificate { .. }
-            | Action::VerifyAndAggregateExecutionWaveVotes { .. }
-            | Action::VerifyExecutionWaveCertificateSignature { .. } => {
+            Action::AggregateExecutionCertificate { .. }
+            | Action::VerifyAndAggregateExecutionVotes { .. }
+            | Action::VerifyExecutionCertificateSignature { .. } => {
                 self.dispatch_delegated_action(action);
             }
             // ═══════════════════════════════════════════════════════════
