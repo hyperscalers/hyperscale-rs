@@ -1,9 +1,10 @@
-//! Wave-based execution voting types and utilities.
+//! Execution voting types and utilities.
 //!
-//! Waves are deterministic partitions of a block's transactions by their
-//! provision dependency set (the set of remote shards they need provisions from).
-//! All validators compute identical wave assignments from block contents, enabling
-//! wave-level BLS signature aggregation instead of per-transaction signatures.
+//! Transactions in a block are partitioned into waves by their provision
+//! dependency set (the set of remote shards they need provisions from).
+//! All validators compute identical wave assignments from block contents,
+//! enabling wave-level BLS signature aggregation instead of per-transaction
+//! signatures.
 //!
 //! # Wave Assignment
 //!
@@ -69,15 +70,15 @@ impl std::fmt::Display for WaveId {
 }
 
 // ============================================================================
-// Wave Tx Outcome
+// TxOutcome
 // ============================================================================
 
 /// Per-transaction execution outcome within a wave.
 ///
-/// Carried inside wave certificates so remote shards can extract
+/// Carried inside execution certificates so remote shards can extract
 /// individual transaction results for cross-shard finalization.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct WaveTxOutcome {
+pub struct TxOutcome {
     /// Transaction hash.
     pub tx_hash: Hash,
     /// Receipt hash (hash of ConsensusReceipt).
@@ -89,17 +90,16 @@ pub struct WaveTxOutcome {
 }
 
 // ============================================================================
-// Execution Wave Vote
+// ExecutionVote
 // ============================================================================
 
-/// A validator's vote on an entire execution wave.
+/// A validator's vote on all transactions in an execution wave.
 ///
-/// Replaces per-transaction `ExecutionVote`. One wave vote covers all
-/// transactions in the wave, reducing message count from O(txs) to O(waves).
-/// The `wave_receipt_root` is a padded merkle root over per-tx leaf hashes,
+/// One vote covers all transactions sharing the same provision dependency set,
+/// with `receipt_root` being a padded merkle root over per-tx leaf hashes
 /// where each leaf = H(tx_hash || receipt_hash || success_byte).
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct ExecutionWaveVote {
+pub struct ExecutionVote {
     /// Block this wave belongs to.
     pub block_hash: Hash,
     /// Block height.
@@ -109,26 +109,25 @@ pub struct ExecutionWaveVote {
     /// Which shard produced this vote.
     pub shard_group_id: ShardGroupId,
     /// Merkle root over per-tx outcome leaves.
-    pub wave_receipt_root: Hash,
+    pub receipt_root: Hash,
     /// Number of transactions in this wave.
     pub tx_count: u32,
     /// Validator who cast this vote.
     pub validator: ValidatorId,
-    /// BLS signature over the wave vote signing message.
+    /// BLS signature over the vote signing message.
     pub signature: Bls12381G2Signature,
 }
 
 // ============================================================================
-// Execution Wave Certificate
+// ExecutionCertificate
 // ============================================================================
 
-/// Aggregated certificate for an entire execution wave.
+/// Aggregated certificate for an execution wave.
 ///
-/// Replaces per-transaction `ExecutionCertificate`. Contains the BLS
-/// aggregated signature from 2f+1 validators plus per-tx outcomes so
-/// remote shards can extract individual transaction results.
+/// Contains the BLS aggregated signature from 2f+1 validators plus per-tx
+/// outcomes so remote shards can extract individual transaction results.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct ExecutionWaveCertificate {
+pub struct ExecutionCertificate {
     /// Block this wave belongs to.
     pub block_hash: Hash,
     /// Block height.
@@ -138,9 +137,9 @@ pub struct ExecutionWaveCertificate {
     /// Which shard produced this certificate.
     pub shard_group_id: ShardGroupId,
     /// Merkle root over per-tx outcome leaves.
-    pub wave_receipt_root: Hash,
+    pub receipt_root: Hash,
     /// Per-transaction outcomes (in wave order = block order).
-    pub tx_outcomes: Vec<WaveTxOutcome>,
+    pub tx_outcomes: Vec<TxOutcome>,
     /// BLS aggregated signature from 2f+1 validators.
     pub aggregated_signature: Bls12381G2Signature,
     /// Which validators signed (bitfield indexed by committee position).
@@ -148,13 +147,13 @@ pub struct ExecutionWaveCertificate {
 }
 
 // ============================================================================
-// Wave Receipt Tree Utilities
+// Receipt Tree Utilities
 // ============================================================================
 
-/// Compute the leaf hash for a transaction outcome in the wave receipt tree.
+/// Compute the leaf hash for a transaction outcome in the receipt tree.
 ///
 /// Leaf = H(tx_hash || receipt_hash || success_byte)
-pub fn wave_outcome_leaf(tx_hash: &Hash, receipt_hash: &Hash, success: bool) -> Hash {
+pub fn tx_outcome_leaf(tx_hash: &Hash, receipt_hash: &Hash, success: bool) -> Hash {
     Hash::from_parts(&[
         tx_hash.as_bytes(),
         receipt_hash.as_bytes(),
@@ -162,34 +161,34 @@ pub fn wave_outcome_leaf(tx_hash: &Hash, receipt_hash: &Hash, success: bool) -> 
     ])
 }
 
-/// Compute the wave receipt root from a list of transaction outcomes.
+/// Compute the receipt root from a list of transaction outcomes.
 ///
 /// Uses padded merkle tree (power-of-2 padding with Hash::ZERO) so that
 /// merkle inclusion proofs have a fixed `ceil(log2(N))` siblings.
 ///
 /// Outcomes must be in wave order (= block order within the wave).
-pub fn compute_wave_receipt_root(outcomes: &[WaveTxOutcome]) -> Hash {
+pub fn compute_receipt_root(outcomes: &[TxOutcome]) -> Hash {
     let leaves: Vec<Hash> = outcomes
         .iter()
-        .map(|o| wave_outcome_leaf(&o.tx_hash, &o.receipt_hash, o.success))
+        .map(|o| tx_outcome_leaf(&o.tx_hash, &o.receipt_hash, o.success))
         .collect();
     compute_padded_merkle_root(&leaves)
 }
 
-/// Compute wave receipt root and a merkle inclusion proof for a specific tx.
+/// Compute receipt root and a merkle inclusion proof for a specific tx.
 ///
 /// Returns `(root, proof_siblings, leaf_index, leaf_hash)`.
 ///
 /// # Panics
 ///
 /// Panics if `tx_index >= outcomes.len()` or `outcomes` is empty.
-pub fn compute_wave_receipt_root_with_proof(
-    outcomes: &[WaveTxOutcome],
+pub fn compute_receipt_root_with_proof(
+    outcomes: &[TxOutcome],
     tx_index: usize,
 ) -> (Hash, Vec<Hash>, u32, Hash) {
     let leaves: Vec<Hash> = outcomes
         .iter()
-        .map(|o| wave_outcome_leaf(&o.tx_hash, &o.receipt_hash, o.success))
+        .map(|o| tx_outcome_leaf(&o.tx_hash, &o.receipt_hash, o.success))
         .collect();
 
     let (root, proof) = crate::compute_merkle_root_with_proof(&leaves, tx_index);
@@ -199,10 +198,8 @@ pub fn compute_wave_receipt_root_with_proof(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::zero_bls_signature;
-
-    fn make_outcome(seed: u8) -> WaveTxOutcome {
-        WaveTxOutcome {
+    fn make_outcome(seed: u8) -> TxOutcome {
+        TxOutcome {
             tx_hash: Hash::from_bytes(&[seed; 4]),
             receipt_hash: Hash::from_bytes(&[seed + 100; 4]),
             success: true,
@@ -231,20 +228,20 @@ mod tests {
     }
 
     #[test]
-    fn test_wave_receipt_root_deterministic() {
+    fn test_receipt_root_deterministic() {
         let outcomes = vec![make_outcome(1), make_outcome(2), make_outcome(3)];
-        let root1 = compute_wave_receipt_root(&outcomes);
-        let root2 = compute_wave_receipt_root(&outcomes);
+        let root1 = compute_receipt_root(&outcomes);
+        let root2 = compute_receipt_root(&outcomes);
         assert_eq!(root1, root2);
         assert_ne!(root1, Hash::ZERO);
     }
 
     #[test]
-    fn test_wave_receipt_root_single_tx() {
+    fn test_receipt_root_single_tx() {
         let outcomes = vec![make_outcome(1)];
-        let root = compute_wave_receipt_root(&outcomes);
+        let root = compute_receipt_root(&outcomes);
         // Single leaf: root should be the leaf hash itself
-        let expected = wave_outcome_leaf(
+        let expected = tx_outcome_leaf(
             &outcomes[0].tx_hash,
             &outcomes[0].receipt_hash,
             outcomes[0].success,
@@ -253,18 +250,18 @@ mod tests {
     }
 
     #[test]
-    fn test_wave_receipt_root_empty() {
-        let root = compute_wave_receipt_root(&[]);
+    fn test_receipt_root_empty() {
+        let root = compute_receipt_root(&[]);
         assert_eq!(root, Hash::ZERO);
     }
 
     #[test]
-    fn test_wave_receipt_root_order_matters() {
+    fn test_receipt_root_order_matters() {
         let o1 = make_outcome(1);
         let o2 = make_outcome(2);
 
-        let root_12 = compute_wave_receipt_root(&[o1.clone(), o2.clone()]);
-        let root_21 = compute_wave_receipt_root(&[o2, o1]);
+        let root_12 = compute_receipt_root(&[o1.clone(), o2.clone()]);
+        let root_21 = compute_receipt_root(&[o2, o1]);
         assert_ne!(root_12, root_21);
     }
 
@@ -278,16 +275,16 @@ mod tests {
             make_outcome(5),
         ];
 
-        let root = compute_wave_receipt_root(&outcomes);
+        let root = compute_receipt_root(&outcomes);
 
         // Verify proof for each tx
         for i in 0..outcomes.len() {
             let (proof_root, siblings, leaf_index, leaf_hash) =
-                compute_wave_receipt_root_with_proof(&outcomes, i);
+                compute_receipt_root_with_proof(&outcomes, i);
 
             assert_eq!(proof_root, root, "Root mismatch for index {i}");
 
-            let expected_leaf = wave_outcome_leaf(
+            let expected_leaf = tx_outcome_leaf(
                 &outcomes[i].tx_hash,
                 &outcomes[i].receipt_hash,
                 outcomes[i].success,
@@ -308,12 +305,12 @@ mod tests {
     }
 
     #[test]
-    fn test_wave_outcome_leaf_success_matters() {
+    fn test_tx_outcome_leaf_success_matters() {
         let tx = Hash::from_bytes(b"tx");
         let receipt = Hash::from_bytes(b"receipt");
 
-        let leaf_true = wave_outcome_leaf(&tx, &receipt, true);
-        let leaf_false = wave_outcome_leaf(&tx, &receipt, false);
+        let leaf_true = tx_outcome_leaf(&tx, &receipt, true);
+        let leaf_false = tx_outcome_leaf(&tx, &receipt, false);
         assert_ne!(leaf_true, leaf_false);
     }
 }

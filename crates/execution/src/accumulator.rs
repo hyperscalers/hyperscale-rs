@@ -1,12 +1,12 @@
-//! Wave accumulator for collecting per-tx execution results within a wave.
+//! Execution accumulator for collecting per-tx execution results within a wave.
 //!
 //! When a block is committed, transactions are partitioned into deterministic
-//! waves based on their provision dependency sets. The `WaveAccumulator` tracks
+//! waves based on their provision dependency sets. The `ExecutionAccumulator` tracks
 //! which transactions in a wave have completed execution. Once all transactions
-//! complete, the wave's receipt merkle tree can be built and a wave vote signed.
+//! complete, the receipt merkle tree can be built and an execution vote signed.
 
 use hyperscale_types::{
-    compute_wave_receipt_root, Hash, NodeId, ShardGroupId, WaveId, WaveTxOutcome,
+    compute_execution_receipt_root, Hash, NodeId, ShardGroupId, TxOutcome, WaveId,
 };
 use std::collections::HashMap;
 
@@ -16,10 +16,10 @@ use std::collections::HashMap;
 /// results as they complete (single-shard txs complete immediately, cross-shard
 /// txs complete when provisions arrive and execution finishes).
 ///
-/// When all expected txs have results, `build_wave_data()` produces the
-/// receipt merkle root and outcome list for wave vote signing.
+/// When all expected txs have results, `build_data()` produces the
+/// receipt merkle root and outcome list for execution vote signing.
 #[derive(Debug)]
-pub struct WaveAccumulator {
+pub struct ExecutionAccumulator {
     /// Wave identifier (provision dependency set).
     wave_id: WaveId,
     /// Block this wave belongs to.
@@ -41,8 +41,8 @@ struct TxResult {
     write_nodes: Vec<NodeId>,
 }
 
-impl WaveAccumulator {
-    /// Create a new wave accumulator.
+impl ExecutionAccumulator {
+    /// Create a new execution accumulator.
     ///
     /// `expected_txs` must be in wave order (= block order within the wave).
     /// Each entry is `(tx_hash, participating_shards)`.
@@ -121,24 +121,24 @@ impl WaveAccumulator {
         self.completed.contains_key(tx_hash)
     }
 
-    /// Build the wave receipt data once all transactions are complete.
+    /// Build the receipt data once all transactions are complete.
     ///
-    /// Returns `(wave_receipt_root, tx_outcomes)` where outcomes are in
+    /// Returns `(receipt_root, tx_outcomes)` where outcomes are in
     /// wave order (block order within the wave).
     ///
     /// Returns `None` if not all transactions have completed.
-    pub fn build_wave_data(&self) -> Option<(Hash, Vec<WaveTxOutcome>)> {
+    pub fn build_data(&self) -> Option<(Hash, Vec<TxOutcome>)> {
         if !self.is_complete() {
             return None;
         }
 
         // Build outcomes in wave order (same as expected_txs order)
-        let outcomes: Vec<WaveTxOutcome> = self
+        let outcomes: Vec<TxOutcome> = self
             .expected_txs
             .iter()
             .map(|(tx_hash, _)| {
                 let result = &self.completed[tx_hash];
-                WaveTxOutcome {
+                TxOutcome {
                     tx_hash: *tx_hash,
                     receipt_hash: result.receipt_hash,
                     success: result.success,
@@ -147,13 +147,13 @@ impl WaveAccumulator {
             })
             .collect();
 
-        let root = compute_wave_receipt_root(&outcomes);
+        let root = compute_execution_receipt_root(&outcomes);
         Some((root, outcomes))
     }
 
     /// Get the union of all participating shards across all txs in this wave.
     ///
-    /// Used to determine which remote shards should receive the wave certificate.
+    /// Used to determine which remote shards should receive the execution certificate.
     pub fn all_participating_shards(&self) -> Vec<ShardGroupId> {
         let mut shards: std::collections::BTreeSet<ShardGroupId> =
             std::collections::BTreeSet::new();
@@ -173,7 +173,7 @@ impl WaveAccumulator {
 mod tests {
     use super::*;
 
-    fn make_accumulator(n: usize) -> WaveAccumulator {
+    fn make_accumulator(n: usize) -> ExecutionAccumulator {
         let txs: Vec<(Hash, Vec<ShardGroupId>)> = (0..n)
             .map(|i| {
                 (
@@ -183,20 +183,20 @@ mod tests {
             })
             .collect();
 
-        WaveAccumulator::new(WaveId::zero(), Hash::from_bytes(b"block"), 10, txs)
+        ExecutionAccumulator::new(WaveId::zero(), Hash::from_bytes(b"block"), 10, txs)
     }
 
     #[test]
-    fn test_empty_wave() {
+    fn test_empty_accumulator() {
         let acc = make_accumulator(0);
         assert!(acc.is_complete());
-        let (root, outcomes) = acc.build_wave_data().unwrap();
+        let (root, outcomes) = acc.build_data().unwrap();
         assert_eq!(root, Hash::ZERO);
         assert!(outcomes.is_empty());
     }
 
     #[test]
-    fn test_single_tx_wave() {
+    fn test_single_tx() {
         let mut acc = make_accumulator(1);
         let tx_hash = Hash::from_bytes(&[0u8; 4]);
         let receipt = Hash::from_bytes(b"receipt");
@@ -205,7 +205,7 @@ mod tests {
         assert!(acc.record_result(tx_hash, receipt, true, vec![]));
         assert!(acc.is_complete());
 
-        let (root, outcomes) = acc.build_wave_data().unwrap();
+        let (root, outcomes) = acc.build_data().unwrap();
         assert_ne!(root, Hash::ZERO);
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].tx_hash, tx_hash);
@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_tx_wave_completion() {
+    fn test_multi_tx_completion() {
         let mut acc = make_accumulator(3);
 
         // Complete txs out of order
@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_wave_order_preserved() {
+    fn test_order_preserved() {
         let mut acc = make_accumulator(3);
 
         // Complete in reverse order
@@ -243,7 +243,7 @@ mod tests {
             acc.record_result(tx, receipt, true, vec![]);
         }
 
-        let (_, outcomes) = acc.build_wave_data().unwrap();
+        let (_, outcomes) = acc.build_data().unwrap();
         // Outcomes should be in wave order (0, 1, 2), not completion order (2, 1, 0)
         for i in 0..3 {
             assert_eq!(outcomes[i].tx_hash, Hash::from_bytes(&[i as u8; 4]));
@@ -258,7 +258,7 @@ mod tests {
         acc.record_result(tx, Hash::from_bytes(b"first"), true, vec![]);
         acc.record_result(tx, Hash::from_bytes(b"second"), false, vec![]);
 
-        let (_, outcomes) = acc.build_wave_data().unwrap();
+        let (_, outcomes) = acc.build_data().unwrap();
         // First result should win
         assert_eq!(outcomes[0].receipt_hash, Hash::from_bytes(b"first"));
         assert!(outcomes[0].success);
@@ -279,7 +279,7 @@ mod tests {
         let tx0 = Hash::from_bytes(&[0u8; 4]);
         acc.record_result(tx0, Hash::from_bytes(b"r"), true, vec![]);
 
-        assert!(acc.build_wave_data().is_none());
+        assert!(acc.build_data().is_none());
     }
 
     #[test]
@@ -294,7 +294,7 @@ mod tests {
                 vec![ShardGroupId(1), ShardGroupId(2)],
             ),
         ];
-        let acc = WaveAccumulator::new(WaveId::zero(), Hash::from_bytes(b"b"), 1, txs);
+        let acc = ExecutionAccumulator::new(WaveId::zero(), Hash::from_bytes(b"b"), 1, txs);
 
         let shards = acc.all_participating_shards();
         assert_eq!(

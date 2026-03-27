@@ -5,8 +5,7 @@
 
 use crate::TestCommittee;
 use hyperscale_types::{
-    block_vote_message, exec_vote_message, BlockHeight, BlockVote, Bls12381G2Signature,
-    ExecutionVote, Hash, ShardGroupId,
+    block_vote_message, BlockHeight, BlockVote, Bls12381G2Signature, Hash, ShardGroupId,
 };
 
 /// Create a block vote with an invalid signature (signed with wrong key).
@@ -65,30 +64,6 @@ pub fn make_wrong_message_block_vote(
     }
 }
 
-/// Create an execution vote with an invalid signature.
-pub fn make_wrong_key_execution_vote(
-    committee: &TestCommittee,
-    claimed_voter_idx: usize,
-    actual_signer_idx: usize,
-    tx_hash: Hash,
-    receipt_hash: Hash,
-    shard: ShardGroupId,
-    success: bool,
-) -> ExecutionVote {
-    let message = exec_vote_message(&tx_hash, &receipt_hash, shard, success);
-    let signature = committee.keypair(actual_signer_idx).sign_v1(&message);
-
-    ExecutionVote {
-        transaction_hash: tx_hash,
-        shard_group_id: shard,
-        receipt_hash,
-        success,
-        write_nodes: vec![],
-        validator: committee.validator_id(claimed_voter_idx),
-        signature,
-    }
-}
-
 /// Create a completely random/garbage signature.
 ///
 /// This tests that verification handles malformed signatures gracefully.
@@ -120,7 +95,7 @@ pub fn make_garbage_signature_vote(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fixtures::{make_signed_block_vote, verify_block_vote, verify_execution_vote};
+    use crate::fixtures::{make_signed_block_vote, verify_block_vote};
 
     #[test]
     fn test_wrong_key_vote_rejected() {
@@ -166,27 +141,6 @@ mod tests {
 
         // Should NOT verify (message mismatch)
         assert!(!verify_block_vote(&bad_vote, committee.public_key(0)));
-    }
-
-    #[test]
-    fn test_wrong_key_execution_vote_rejected() {
-        let committee = TestCommittee::new(4, 42);
-        let tx_hash = Hash::from_bytes(b"tx");
-        let receipt_hash = Hash::from_bytes(b"state");
-        let shard = ShardGroupId(0);
-
-        let bad_vote = make_wrong_key_execution_vote(
-            &committee,
-            0, // claimed
-            1, // actual signer
-            tx_hash,
-            receipt_hash,
-            shard,
-            true,
-        );
-
-        // Should NOT verify with claimed voter's key
-        assert!(!verify_execution_vote(&bad_vote, committee.public_key(0)));
     }
 
     #[test]

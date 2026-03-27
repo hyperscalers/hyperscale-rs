@@ -1,25 +1,24 @@
-//! Wave vote tracker for execution wave voting.
+//! Execution vote tracker.
 //!
-//! Tracks the collection of execution wave votes during the cross-shard
-//! atomic execution protocol. Replaces per-tx `VoteTracker` with per-wave
-//! granularity for dramatically reduced message counts.
+//! Tracks the collection of execution votes during the cross-shard
+//! atomic execution protocol.
 //!
 //! ## Deferred Verification Optimization
 //!
-//! Same approach as the per-tx VoteTracker: votes are NOT verified when
-//! received. Instead, they are buffered until we have enough voting power
-//! for quorum. This avoids wasting CPU on votes we'll never use.
+//! Votes are NOT verified when received. Instead, they are buffered until
+//! we have enough voting power for quorum. This avoids wasting CPU on votes
+//! we'll never use.
 
-use hyperscale_types::{Bls12381G1PublicKey, ExecutionWaveVote, Hash, ValidatorId, WaveId};
+use hyperscale_types::{Bls12381G1PublicKey, ExecutionVote, Hash, ValidatorId, WaveId};
 use std::collections::{BTreeMap, HashSet};
 
-/// Tracks wave votes for a specific wave within a block.
+/// Tracks execution votes for a specific wave within a block.
 ///
-/// After executing all transactions in a wave, validators create a wave vote
-/// on the wave receipt root. This tracker collects votes and determines when
-/// quorum is reached for BLS signature aggregation into a wave certificate.
+/// After executing all transactions in a wave, validators create an execution
+/// vote on the receipt root. This tracker collects votes and determines when
+/// quorum is reached for BLS signature aggregation into an execution certificate.
 #[derive(Debug)]
-pub struct WaveVoteTracker {
+pub struct VoteTracker {
     /// Wave identifier.
     wave_id: WaveId,
     /// Block hash this wave belongs to.
@@ -30,8 +29,8 @@ pub struct WaveVoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
     // Verified votes (passed signature verification)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Verified votes grouped by wave_receipt_root.
-    votes_by_receipt_root: BTreeMap<Hash, Vec<ExecutionWaveVote>>,
+    /// Verified votes grouped by receipt_root.
+    votes_by_receipt_root: BTreeMap<Hash, Vec<ExecutionVote>>,
     /// Voting power per receipt root (verified votes only).
     power_by_receipt_root: BTreeMap<Hash, u64>,
 
@@ -40,7 +39,7 @@ pub struct WaveVoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
     /// Unverified votes buffered for batch verification.
     /// Each entry is (vote, public_key, voting_power).
-    unverified_votes: Vec<(ExecutionWaveVote, Bls12381G1PublicKey, u64)>,
+    unverified_votes: Vec<(ExecutionVote, Bls12381G1PublicKey, u64)>,
     /// Total voting power of unverified votes.
     unverified_power: u64,
     /// Validators we've already seen votes from (for deduplication).
@@ -49,8 +48,8 @@ pub struct WaveVoteTracker {
     pending_verification: bool,
 }
 
-impl WaveVoteTracker {
-    /// Create a new wave vote tracker.
+impl VoteTracker {
+    /// Create a new execution vote tracker.
     pub fn new(wave_id: WaveId, block_hash: Hash, quorum: u64) -> Self {
         Self {
             wave_id,
@@ -89,7 +88,7 @@ impl WaveVoteTracker {
     /// Returns `true` if the vote was buffered, `false` if it was a duplicate.
     pub fn buffer_unverified_vote(
         &mut self,
-        vote: ExecutionWaveVote,
+        vote: ExecutionVote,
         public_key: Bls12381G1PublicKey,
         voting_power: u64,
     ) -> bool {
@@ -130,7 +129,7 @@ impl WaveVoteTracker {
     /// Take unverified votes for batch verification.
     ///
     /// Marks verification as pending. Call `on_verification_complete` when done.
-    pub fn take_unverified_votes(&mut self) -> Vec<(ExecutionWaveVote, Bls12381G1PublicKey, u64)> {
+    pub fn take_unverified_votes(&mut self) -> Vec<(ExecutionVote, Bls12381G1PublicKey, u64)> {
         self.pending_verification = true;
         self.unverified_power = 0;
         std::mem::take(&mut self.unverified_votes)
@@ -152,8 +151,8 @@ impl WaveVoteTracker {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Add a verified vote and its voting power.
-    pub fn add_verified_vote(&mut self, vote: ExecutionWaveVote, power: u64) {
-        let receipt_root = vote.wave_receipt_root;
+    pub fn add_verified_vote(&mut self, vote: ExecutionVote, power: u64) {
+        let receipt_root = vote.receipt_root;
         self.votes_by_receipt_root
             .entry(receipt_root)
             .or_default()
@@ -174,7 +173,7 @@ impl WaveVoteTracker {
     }
 
     /// Take votes for a specific receipt root (ownership transfer).
-    pub fn take_votes_for_receipt_root(&mut self, receipt_root: &Hash) -> Vec<ExecutionWaveVote> {
+    pub fn take_votes_for_receipt_root(&mut self, receipt_root: &Hash) -> Vec<ExecutionVote> {
         self.votes_by_receipt_root
             .remove(receipt_root)
             .unwrap_or_default()
@@ -182,7 +181,7 @@ impl WaveVoteTracker {
 
     /// Get votes for a specific receipt root (reference, for tests).
     #[cfg(test)]
-    pub fn votes_for_receipt_root(&self, receipt_root: &Hash) -> &[ExecutionWaveVote] {
+    pub fn votes_for_receipt_root(&self, receipt_root: &Hash) -> &[ExecutionVote] {
         self.votes_by_receipt_root
             .get(receipt_root)
             .map(|v| v.as_slice())
@@ -199,13 +198,13 @@ mod tests {
         generate_bls_keypair().public_key()
     }
 
-    fn make_wave_vote(validator: u64, receipt_root: Hash) -> ExecutionWaveVote {
-        ExecutionWaveVote {
+    fn make_vote(validator: u64, receipt_root: Hash) -> ExecutionVote {
+        ExecutionVote {
             block_hash: Hash::from_bytes(b"block"),
             block_height: 10,
             wave_id: WaveId::zero(),
             shard_group_id: ShardGroupId(0),
-            wave_receipt_root: receipt_root,
+            receipt_root: receipt_root,
             tx_count: 5,
             validator: ValidatorId(validator),
             signature: zero_bls_signature(),
@@ -213,18 +212,18 @@ mod tests {
     }
 
     #[test]
-    fn test_wave_vote_tracker_quorum() {
-        let mut tracker = WaveVoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
+    fn test_vote_tracker_quorum() {
+        let mut tracker = VoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
 
         let root = Hash::from_bytes(b"receipt_root");
 
-        tracker.add_verified_vote(make_wave_vote(0, root), 1);
+        tracker.add_verified_vote(make_vote(0, root), 1);
         assert!(tracker.check_quorum().is_none());
 
-        tracker.add_verified_vote(make_wave_vote(1, root), 1);
+        tracker.add_verified_vote(make_vote(1, root), 1);
         assert!(tracker.check_quorum().is_none());
 
-        tracker.add_verified_vote(make_wave_vote(2, root), 1);
+        tracker.add_verified_vote(make_vote(2, root), 1);
         let result = tracker.check_quorum();
         assert!(result.is_some());
         let (r, power) = result.unwrap();
@@ -234,19 +233,19 @@ mod tests {
     }
 
     #[test]
-    fn test_wave_vote_tracker_conflicting_roots() {
-        let mut tracker = WaveVoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
+    fn test_vote_tracker_conflicting_roots() {
+        let mut tracker = VoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
 
         let root_a = Hash::from_bytes(b"root_a");
         let root_b = Hash::from_bytes(b"root_b");
 
-        tracker.add_verified_vote(make_wave_vote(0, root_a), 1);
-        tracker.add_verified_vote(make_wave_vote(1, root_b), 1);
-        tracker.add_verified_vote(make_wave_vote(2, root_a), 1);
+        tracker.add_verified_vote(make_vote(0, root_a), 1);
+        tracker.add_verified_vote(make_vote(1, root_b), 1);
+        tracker.add_verified_vote(make_vote(2, root_a), 1);
         // 2 for root_a, 1 for root_b — no quorum
         assert!(tracker.check_quorum().is_none());
 
-        tracker.add_verified_vote(make_wave_vote(3, root_a), 1);
+        tracker.add_verified_vote(make_vote(3, root_a), 1);
         let result = tracker.check_quorum().unwrap();
         assert_eq!(result.0, root_a);
     }
@@ -255,15 +254,15 @@ mod tests {
     fn test_deferred_verification_flow() {
         let pk = make_test_public_key();
         let root = Hash::from_bytes(b"root");
-        let mut tracker = WaveVoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
+        let mut tracker = VoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
 
         // Buffer 2 votes — not enough for quorum
-        assert!(tracker.buffer_unverified_vote(make_wave_vote(0, root), pk, 1));
-        assert!(tracker.buffer_unverified_vote(make_wave_vote(1, root), pk, 1));
+        assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk, 1));
+        assert!(tracker.buffer_unverified_vote(make_vote(1, root), pk, 1));
         assert!(!tracker.should_trigger_verification());
 
         // Buffer 3rd — now enough
-        assert!(tracker.buffer_unverified_vote(make_wave_vote(2, root), pk, 1));
+        assert!(tracker.buffer_unverified_vote(make_vote(2, root), pk, 1));
         assert!(tracker.should_trigger_verification());
 
         // Take votes
@@ -281,24 +280,24 @@ mod tests {
     fn test_duplicate_validator_rejected() {
         let pk = make_test_public_key();
         let root = Hash::from_bytes(b"root");
-        let mut tracker = WaveVoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
+        let mut tracker = VoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
 
-        assert!(tracker.buffer_unverified_vote(make_wave_vote(0, root), pk, 1));
-        assert!(!tracker.buffer_unverified_vote(make_wave_vote(0, root), pk, 1));
+        assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk, 1));
+        assert!(!tracker.buffer_unverified_vote(make_vote(0, root), pk, 1));
     }
 
     #[test]
     fn test_combined_verified_and_unverified_power() {
         let pk = make_test_public_key();
         let root = Hash::from_bytes(b"root");
-        let mut tracker = WaveVoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
+        let mut tracker = VoteTracker::new(WaveId::zero(), Hash::from_bytes(b"block"), 3);
 
         // 1 verified + 2 unverified = 3 → should trigger
-        tracker.add_verified_vote(make_wave_vote(0, root), 1);
-        assert!(tracker.buffer_unverified_vote(make_wave_vote(1, root), pk, 1));
+        tracker.add_verified_vote(make_vote(0, root), 1);
+        assert!(tracker.buffer_unverified_vote(make_vote(1, root), pk, 1));
         assert!(!tracker.should_trigger_verification());
 
-        assert!(tracker.buffer_unverified_vote(make_wave_vote(2, root), pk, 1));
+        assert!(tracker.buffer_unverified_vote(make_vote(2, root), pk, 1));
         assert!(tracker.should_trigger_verification());
     }
 }

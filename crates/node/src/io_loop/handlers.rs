@@ -5,8 +5,8 @@ use super::IoLoop;
 use hyperscale_core::{NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_messages::{
-    BlockHeaderNotification, BlockVoteNotification, ExecutionWaveCertificatesNotification,
-    ExecutionWaveVotesNotification, TransactionGossip,
+    BlockHeaderNotification, BlockVoteNotification, ExecutionCertificatesNotification,
+    ExecutionVotesNotification, TransactionGossip,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
@@ -327,13 +327,13 @@ where
                 },
             );
 
-        // ── execution.wave_vote.batch → verify sender sig, then ProtocolEvent::ExecutionWaveVoteReceived ─
+        // ── execution.vote.batch → verify sender sig, then ProtocolEvent::ExecutionVoteReceived ─
 
         let tx = self.event_sender.clone();
         let topology = self.topology.clone();
         self.network
-            .register_notification_handler::<ExecutionWaveVotesNotification>(
-                move |batch: ExecutionWaveVotesNotification| {
+            .register_notification_handler::<ExecutionVotesNotification>(
+                move |batch: ExecutionVotesNotification| {
                     if batch.votes.is_empty() {
                         return;
                     }
@@ -348,27 +348,28 @@ where
                         local_shard,
                         &msg,
                         &batch.sender_signature,
-                        "exec_wave_vote_batch",
-                        "execution wave vote batch",
+                        "exec_vote_batch",
+                        "execution vote batch",
                     ) {
                         return;
                     }
 
                     for vote in batch.into_votes() {
-                        let _ = tx.send(NodeInput::Protocol(
-                            ProtocolEvent::ExecutionWaveVoteReceived { vote },
-                        ));
+                        let _ =
+                            tx.send(NodeInput::Protocol(ProtocolEvent::ExecutionVoteReceived {
+                                vote,
+                            }));
                     }
                 },
             );
 
-        // ── execution.wave_cert.batch → verify sender sig, then ProtocolEvent::ExecutionWaveCertificateReceived ─
+        // ── execution.cert.batch → verify sender sig, then ProtocolEvent::ExecutionCertificateReceived ─
 
         let tx = self.event_sender.clone();
         let topology = self.topology.clone();
         self.network
-            .register_notification_handler::<ExecutionWaveCertificatesNotification>(
-                move |batch: ExecutionWaveCertificatesNotification| {
+            .register_notification_handler::<ExecutionCertificatesNotification>(
+                move |batch: ExecutionCertificatesNotification| {
                     if batch.certificates.is_empty() {
                         return;
                     }
@@ -383,7 +384,7 @@ where
                     {
                         warn!(
                             sender = sender.0,
-                            "Execution wave certificate batch contains mixed shard_group_ids — dropping"
+                            "Execution certificate batch contains mixed shard_group_ids — dropping"
                         );
                         return;
                     }
@@ -395,15 +396,15 @@ where
                         source_shard,
                         &msg,
                         &batch.sender_signature,
-                        "exec_wave_cert_batch",
-                        "execution wave certificate batch",
+                        "exec_cert_batch",
+                        "execution certificate batch",
                     ) {
                         return;
                     }
 
                     for cert in batch.into_certificates() {
                         let _ = tx.send(NodeInput::Protocol(
-                            ProtocolEvent::ExecutionWaveCertificateReceived { cert },
+                            ProtocolEvent::ExecutionCertificateReceived { cert },
                         ));
                     }
                 },

@@ -8,17 +8,17 @@
 //! - State provisioning
 //! - Vote aggregation and certificate formation
 
+pub mod accumulator;
 pub mod execution_cache;
 pub mod handlers;
-pub mod wave_accumulator;
 
 mod state;
 mod trackers;
 
+pub use accumulator::ExecutionAccumulator;
 pub use execution_cache::ExecutionCache;
 pub use state::{
-    ExecutionState, WaveCompletionData, DEFAULT_SPECULATIVE_MAX_TXS,
+    CompletionData, ExecutionState, DEFAULT_SPECULATIVE_MAX_TXS,
     DEFAULT_VIEW_CHANGE_COOLDOWN_ROUNDS,
 };
-pub use trackers::WaveVoteTracker;
-pub use wave_accumulator::WaveAccumulator;
+pub use trackers::VoteTracker;

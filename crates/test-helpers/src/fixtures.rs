@@ -5,9 +5,9 @@
 
 use crate::TestCommittee;
 use hyperscale_types::{
-    block_vote_message, exec_vote_message, verify_bls12381_v1, BlockHeight, BlockVote,
-    Bls12381G1PublicKey, Bls12381G2Signature, ExecutionVote, Hash, QuorumCertificate,
-    ShardExecutionProof, ShardGroupId, SignerBitfield,
+    block_vote_message, verify_bls12381_v1, BlockHeight, BlockVote, Bls12381G1PublicKey,
+    Bls12381G2Signature, Hash, QuorumCertificate, ShardExecutionProof, ShardGroupId,
+    SignerBitfield,
 };
 
 /// Create a properly-signed block vote.
@@ -129,34 +129,9 @@ pub fn make_signed_qc(
     }
 }
 
-/// Create a properly-signed execution vote.
-///
-/// The vote is signed with the keypair at `voter_idx` in the committee.
-pub fn make_signed_execution_vote(
-    committee: &TestCommittee,
-    voter_idx: usize,
-    tx_hash: Hash,
-    receipt_hash: Hash,
-    shard: ShardGroupId,
-    success: bool,
-) -> ExecutionVote {
-    let message = exec_vote_message(&tx_hash, &receipt_hash, shard, success);
-    let signature = committee.keypair(voter_idx).sign_v1(&message);
-
-    ExecutionVote {
-        transaction_hash: tx_hash,
-        shard_group_id: shard,
-        receipt_hash,
-        success,
-        write_nodes: vec![],
-        validator: committee.validator_id(voter_idx),
-        signature,
-    }
-}
-
 /// Create a shard execution proof for testing.
 ///
-/// Simple proof with no BLS signatures (wave-based voting handles signatures).
+/// Simple proof with no BLS signatures (execution certificates handle signatures).
 pub fn make_shard_execution_proof(receipt_hash: Hash, success: bool) -> ShardExecutionProof {
     ShardExecutionProof {
         receipt_hash,
@@ -197,12 +172,6 @@ pub fn verify_qc(qc: &QuorumCertificate, committee: &TestCommittee) -> bool {
     }
 }
 
-/// Verify an execution vote signature.
-pub fn verify_execution_vote(vote: &ExecutionVote, public_key: &Bls12381G1PublicKey) -> bool {
-    let message = vote.signing_message();
-    verify_bls12381_v1(&message, public_key, &vote.signature)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,22 +210,6 @@ mod tests {
 
         assert!(verify_qc(&qc, &committee));
         assert_eq!(qc.signer_count(), 3);
-    }
-
-    #[test]
-    fn test_signed_execution_vote() {
-        let committee = TestCommittee::new(4, 42);
-        let tx_hash = Hash::from_bytes(b"tx");
-        let receipt_hash = Hash::from_bytes(b"state");
-        let shard = ShardGroupId(0);
-
-        let vote = make_signed_execution_vote(&committee, 0, tx_hash, receipt_hash, shard, true);
-
-        // Should verify with correct key
-        assert!(verify_execution_vote(&vote, committee.public_key(0)));
-
-        // Should not verify with wrong key
-        assert!(!verify_execution_vote(&vote, committee.public_key(1)));
     }
 
     #[test]

@@ -22,7 +22,7 @@
 //!      ↓
 //!      → executor.execute_single_shard(&storage, &transactions)  // READ-ONLY
 //!      ↓
-//! Runner → ProtocolEvent::ExecutionBatchCompleted { votes, results }
+//! Runner → ProtocolEvent::ExecutionBatchCompleted { results, tx_outcomes }
 //!      ↓
 //! ... voting, certificate creation, block inclusion ...
 //!      ↓

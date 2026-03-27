@@ -7,9 +7,8 @@
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, BlockManifest, BlockVote, CommittedBlockHeader, EpochConfig,
-    EpochId, ExecutionWaveCertificate, ExecutionWaveVote, Hash, ProvisionBatch, QuorumCertificate,
-    RoutableTransaction, ShardGroupId, StateEntry, StateProvision, ValidatorId, WaveId,
-    WaveTxOutcome,
+    EpochId, ExecutionCertificate, ExecutionVote, Hash, ProvisionBatch, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, StateEntry, StateProvision, TxOutcome, ValidatorId, WaveId,
 };
 use std::sync::Arc;
 
@@ -169,37 +168,36 @@ pub enum ProtocolEvent {
     /// 2. Dispatch StoreReceiptBundles action (for both speculative and canonical)
     ExecutionBatchCompleted {
         results: Vec<hyperscale_types::ExecutionResult>,
-        /// Wave-ready per-tx results extracted on the handler thread.
-        /// Used by wave accumulators for wave vote signing.
-        wave_results: Vec<WaveTxOutcome>,
+        /// Per-tx outcomes extracted on the handler thread for vote signing.
+        tx_outcomes: Vec<TxOutcome>,
         /// True when this batch came from speculative execution.
         /// Receipt bundles are persisted for both speculative and canonical execution
         /// so that the sync protocol can always serve complete blocks.
         speculative: bool,
     },
 
-    /// Received an execution wave vote from another validator.
-    ExecutionWaveVoteReceived { vote: ExecutionWaveVote },
+    /// Received an execution vote from another validator.
+    ExecutionVoteReceived { vote: ExecutionVote },
 
-    /// Batch execution wave vote verification completed.
-    ExecutionWaveVotesVerifiedAndAggregated {
+    /// Batch execution vote verification completed.
+    ExecutionVotesVerifiedAndAggregated {
         wave_id: WaveId,
         block_hash: Hash,
-        verified_votes: Vec<(ExecutionWaveVote, u64)>,
+        verified_votes: Vec<(ExecutionVote, u64)>,
     },
 
-    /// Execution wave certificate aggregation completed.
-    ExecutionWaveCertificateAggregated {
+    /// Execution certificate aggregation completed.
+    ExecutionCertificateAggregated {
         wave_id: WaveId,
-        certificate: ExecutionWaveCertificate,
+        certificate: ExecutionCertificate,
     },
 
-    /// Received an execution wave certificate from a remote shard.
-    ExecutionWaveCertificateReceived { cert: ExecutionWaveCertificate },
+    /// Received an execution certificate from a remote shard.
+    ExecutionCertificateReceived { cert: ExecutionCertificate },
 
-    /// Execution wave certificate signature verification completed.
-    ExecutionWaveCertificateSignatureVerified {
-        certificate: ExecutionWaveCertificate,
+    /// Execution certificate signature verification completed.
+    ExecutionCertificateSignatureVerified {
+        certificate: ExecutionCertificate,
         valid: bool,
     },
 
@@ -361,18 +359,16 @@ impl ProtocolEvent {
 
             // Execution
             ProtocolEvent::ExecutionBatchCompleted { .. } => "ExecutionBatchCompleted",
-            ProtocolEvent::ExecutionWaveVoteReceived { .. } => "ExecutionWaveVoteReceived",
-            ProtocolEvent::ExecutionWaveVotesVerifiedAndAggregated { .. } => {
-                "ExecutionWaveVotesVerifiedAndAggregated"
+            ProtocolEvent::ExecutionVoteReceived { .. } => "ExecutionVoteReceived",
+            ProtocolEvent::ExecutionVotesVerifiedAndAggregated { .. } => {
+                "ExecutionVotesVerifiedAndAggregated"
             }
-            ProtocolEvent::ExecutionWaveCertificateAggregated { .. } => {
-                "ExecutionWaveCertificateAggregated"
+            ProtocolEvent::ExecutionCertificateAggregated { .. } => {
+                "ExecutionCertificateAggregated"
             }
-            ProtocolEvent::ExecutionWaveCertificateReceived { .. } => {
-                "ExecutionWaveCertificateReceived"
-            }
-            ProtocolEvent::ExecutionWaveCertificateSignatureVerified { .. } => {
-                "ExecutionWaveCertificateSignatureVerified"
+            ProtocolEvent::ExecutionCertificateReceived { .. } => "ExecutionCertificateReceived",
+            ProtocolEvent::ExecutionCertificateSignatureVerified { .. } => {
+                "ExecutionCertificateSignatureVerified"
             }
             ProtocolEvent::SpeculativeExecutionComplete { .. } => "SpeculativeExecutionComplete",
 

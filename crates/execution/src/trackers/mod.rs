@@ -4,7 +4,7 @@
 //! as they progress through the cross-shard atomic execution protocol.
 
 mod certificate;
-mod wave_vote;
+mod vote;
 
 pub use certificate::CertificateTracker;
-pub use wave_vote::WaveVoteTracker;
+pub use vote::VoteTracker;

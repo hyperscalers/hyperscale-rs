@@ -14,12 +14,12 @@
 //! any other workspace crates, making it the foundation layer.
 
 mod crypto;
+mod execution_vote;
 mod hash;
 mod identifiers;
 mod network;
 mod proofs;
 mod signing;
-mod wave;
 
 // Consensus types
 mod block;
@@ -68,16 +68,19 @@ pub use network::{MessagePriority, NetworkMessage, Request, ShardMessage};
 pub use proofs::{ProvisionBatch, SubstateInclusionProof, TxEntries, VerkleInclusionProof};
 pub use signing::{
     block_header_message, block_vote_message, committed_block_header_message,
-    exec_vote_batch_message, exec_vote_message, exec_wave_cert_batch_message,
-    exec_wave_vote_batch_message, exec_wave_vote_message, state_provision_batch_message,
-    validator_bind_message, DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE, DOMAIN_COMMITTED_BLOCK_HEADER,
-    DOMAIN_EXEC_VOTE, DOMAIN_EXEC_VOTE_BATCH, DOMAIN_EXEC_WAVE_CERT_BATCH, DOMAIN_EXEC_WAVE_VOTE,
-    DOMAIN_EXEC_WAVE_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND,
+    exec_cert_batch_message, exec_vote_batch_message, exec_vote_message,
+    state_provision_batch_message, validator_bind_message, DOMAIN_BLOCK_HEADER, DOMAIN_BLOCK_VOTE,
+    DOMAIN_COMMITTED_BLOCK_HEADER, DOMAIN_EXEC_CERT_BATCH, DOMAIN_EXEC_VOTE,
+    DOMAIN_EXEC_VOTE_BATCH, DOMAIN_STATE_PROVISION_BATCH, DOMAIN_VALIDATOR_BIND,
 };
 
 pub use block::{
     compute_receipt_root, compute_transaction_root, tx_inclusion_proof, Block, BlockHeader,
     BlockManifest, BlockMetadata, CommittedBlockHeader, PriorityInclusion,
+};
+pub use execution_vote::{
+    compute_receipt_root_with_proof, tx_outcome_leaf, ExecutionCertificate, ExecutionVote,
+    TxOutcome, WaveId,
 };
 pub use quorum_certificate::QuorumCertificate;
 pub use receipt::{
@@ -86,7 +89,7 @@ pub use receipt::{
     ReceiptBundle, SubstateChange, SubstateChangeAction, SubstateRef,
 };
 pub use signer_bitfield::SignerBitfield;
-pub use state::{ExecutionVote, ShardExecutionProof, StateEntry, StateProvision};
+pub use state::{ShardExecutionProof, StateEntry, StateProvision};
 pub use topology::{node_id_hash_u64, shard_for_node, TopologySnapshot, TopologySnapshotError};
 pub use transaction::{
     sign_and_notarize, sign_and_notarize_with_options, AbortReason, DeferReason, ReadyTransactions,
@@ -95,10 +98,8 @@ pub use transaction::{
     TransactionStatusParseError,
 };
 pub use validator::{ValidatorInfo, ValidatorSet};
-pub use wave::{
-    compute_wave_receipt_root, compute_wave_receipt_root_with_proof, wave_outcome_leaf,
-    ExecutionWaveCertificate, ExecutionWaveVote, WaveId, WaveTxOutcome,
-};
+// Re-export as compute_receipt_root would conflict with block::compute_receipt_root
+pub use execution_vote::compute_receipt_root as compute_execution_receipt_root;
 
 // Re-export DatabaseUpdates from radix for cross-crate use (execution cache, block commit)
 pub use radix_substate_store_interface::interface::DatabaseUpdates;
