@@ -1034,11 +1034,19 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ProvisioningComplete {
                 tx_hash,
                 provisions,
-            } => self.execution.on_provisioning_complete(
-                self.topology.snapshot(),
-                tx_hash,
-                provisions,
-            ),
+            } => {
+                if let Some(req) = self.execution.on_provisioning_complete(
+                    self.topology.snapshot(),
+                    tx_hash,
+                    provisions,
+                ) {
+                    vec![Action::ExecuteCrossShardTransactions {
+                        requests: vec![req],
+                    }]
+                } else {
+                    vec![]
+                }
+            }
 
             // ── Execution ────────────────────────────────────────────────
             ProtocolEvent::ExecutionBatchCompleted {

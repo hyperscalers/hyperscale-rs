@@ -25,10 +25,6 @@ pub struct NodeConfig {
 /// constants.
 #[derive(Debug, Clone)]
 pub struct BatchConfig {
-    /// Cross-shard execution batch.
-    pub cross_shard_max: usize,
-    pub cross_shard_window: Duration,
-
     /// Execution vote verification batch.
     pub execution_vote_max: usize,
     pub execution_vote_window: Duration,
@@ -53,9 +49,6 @@ pub struct BatchConfig {
 impl Default for BatchConfig {
     fn default() -> Self {
         Self {
-            cross_shard_max: 256,
-            cross_shard_window: Duration::from_millis(5),
-
             execution_vote_max: 64,
             execution_vote_window: Duration::from_millis(20),
 

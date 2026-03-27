@@ -2,12 +2,11 @@
 
 use super::verify::verify_bls_with_metrics;
 use super::IoLoop;
-use hyperscale_core::{CrossShardExecutionRequest, NodeInput, ProtocolEvent, StateMachine};
+use hyperscale_core::{NodeInput, StateMachine};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_metrics as metrics;
 use hyperscale_network::Network;
 use hyperscale_storage::{CommitStore, ConsensusStore, SubstateStore};
-use hyperscale_types::{ExecutionResult, Hash, RoutableTransaction};
+use hyperscale_types::RoutableTransaction;
 use std::sync::Arc;
 
 impl<S, N, D> IoLoop<S, N, D>
@@ -62,84 +61,6 @@ where
                 });
             }
         });
-    }
-
-    /// Flush a batch of cross-shard executions to the execution pool.
-    pub(super) fn flush_cross_shard_executions(&mut self) {
-        let requests = self.cross_shard_batch.take();
-        if requests.is_empty() {
-            return;
-        }
-
-        let storage = Arc::clone(&self.storage);
-        let executor = self.executor.clone();
-        let dispatch = self.dispatch.clone();
-        let local_shard = self.local_shard;
-        let num_shards = self.num_shards;
-        let event_tx = self.event_sender.clone();
-
-        self.dispatch.spawn_execution(move || {
-            let start = std::time::Instant::now();
-            let raw_results: Vec<_> = dispatch.map_local(&requests, |req| {
-                hyperscale_execution::handlers::execute_cross_shard(
-                    &executor,
-                    &*storage,
-                    req.tx_hash,
-                    &req.transaction,
-                    &req.provisions,
-                )
-            });
-            metrics::record_execution_latency(start.elapsed().as_secs_f64());
-
-            // Extract wave-ready data on handler thread (before consuming results)
-            let wave_results: Vec<_> = raw_results
-                .iter()
-                .map(hyperscale_execution::handlers::extract_wave_result)
-                .collect();
-            let results = raw_results
-                .into_iter()
-                .map(|r| {
-                    let mut result = ExecutionResult::from(r);
-                    if num_shards > 1 {
-                        result.database_updates = hyperscale_storage::filter_updates_to_shard(
-                            &result.database_updates,
-                            local_shard,
-                            num_shards,
-                        );
-                    }
-                    result
-                })
-                .collect();
-
-            // Send results back to the state machine via the same event that single-shard
-            // execution uses. This populates the execution cache (enabling VerifyStateRoot)
-            // and stores receipts (enabling serve_block_request for sync).
-            let _ = event_tx.send(NodeInput::Protocol(
-                ProtocolEvent::ExecutionBatchCompleted {
-                    results,
-                    wave_results,
-                    speculative: false,
-                },
-            ));
-        });
-    }
-
-    // ─── Batch Accumulation ─────────────────────────────────────────────
-
-    pub(super) fn accumulate_cross_shard_execution(
-        &mut self,
-        tx_hash: Hash,
-        transaction: Arc<RoutableTransaction>,
-        provisions: Vec<hyperscale_types::StateProvision>,
-    ) {
-        let req = CrossShardExecutionRequest {
-            tx_hash,
-            transaction,
-            provisions,
-        };
-        if self.cross_shard_batch.push(req, self.state.now()) {
-            self.flush_cross_shard_executions();
-        }
     }
 
     /// Flush accumulated committed header sender-signature verifications.
