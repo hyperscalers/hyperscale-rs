@@ -55,6 +55,15 @@ const EXECUTED_TX_RETENTION_BLOCKS: u64 = 50;
 /// likely stale and should be removed to prevent unbounded memory growth.
 const EARLY_ARRIVAL_RETENTION_BLOCKS: u64 = 500;
 
+/// Number of blocks to retain stale cross-shard tracking state before cleanup.
+/// Covers finalized certificates not yet included in a block, certificate trackers
+/// for stalled transactions, pending provisioning, and orphaned execution cache entries.
+const STALE_TRACKING_RETENTION_BLOCKS: u64 = 500;
+
+/// Maximum age for speculative execution results before they're considered stale.
+/// Results older than this are pruned on each block commit to prevent unbounded growth.
+const SPECULATIVE_MAX_AGE: Duration = Duration::from_secs(30);
+
 /// Data returned when a wave completes (all txs executed).
 ///
 /// The state machine produces this; the io_loop uses it to sign the wave vote
@@ -110,7 +119,8 @@ pub struct ExecutionState {
 
     /// Finalized transaction certificates ready for block inclusion.
     /// Uses BTreeMap for deterministic iteration order.
-    finalized_certificates: BTreeMap<Hash, Arc<TransactionCertificate>>,
+    /// Stores (certificate, height_when_finalized) for stale-entry pruning.
+    finalized_certificates: BTreeMap<Hash, (Arc<TransactionCertificate>, u64)>,
 
     /// Current committed height for pruning stale entries.
     committed_height: u64,
@@ -146,8 +156,8 @@ pub struct ExecutionState {
     // Cross-shard state (Phase 5: Finalization)
     // ═══════════════════════════════════════════════════════════════════════
     /// Certificate trackers for cross-shard transactions.
-    /// Maps tx_hash -> CertificateTracker
-    certificate_trackers: HashMap<Hash, CertificateTracker>,
+    /// Maps tx_hash -> (CertificateTracker, height_when_created) for stale-entry pruning.
+    certificate_trackers: HashMap<Hash, (CertificateTracker, u64)>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Early arrivals (before tracking starts)
@@ -178,9 +188,9 @@ pub struct ExecutionState {
     speculative_reads_index: HashMap<NodeId, HashSet<Hash>>,
 
     /// Pending speculative executions waiting for callback.
-    /// Maps block_hash -> list of transactions being speculatively executed.
+    /// Maps block_hash -> (list of transactions, height) being speculatively executed.
     /// Used to retrieve declared_reads when speculative execution completes.
-    pending_speculative_executions: HashMap<Hash, Vec<Arc<RoutableTransaction>>>,
+    pending_speculative_executions: HashMap<Hash, (Vec<Arc<RoutableTransaction>>, u64)>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Speculative Execution Config
@@ -942,6 +952,12 @@ impl ExecutionState {
         self.prune_executed_txs();
         self.prune_early_arrivals();
         self.prune_wave_state();
+        self.prune_finalized_certificates();
+        self.prune_certificate_trackers();
+        self.prune_pending_provisioning();
+        self.prune_execution_cache();
+        self.prune_pending_speculative();
+        self.cleanup_stale_speculative(SPECULATIVE_MAX_AGE);
 
         // Separate single-shard and cross-shard transactions
         let (single_shard, cross_shard): (Vec<_>, Vec<_>) = new_txs
@@ -1098,7 +1114,8 @@ impl ExecutionState {
         // Start tracking certificates for finalization (single shard only)
         let participating_shards: BTreeSet<_> = [local_shard].into_iter().collect();
         let cert_tracker = CertificateTracker::new(tx_hash, participating_shards);
-        self.certificate_trackers.insert(tx_hash, cert_tracker);
+        self.certificate_trackers
+            .insert(tx_hash, (cert_tracker, self.committed_height));
 
         // Replay any early proofs that arrived before tracking started.
         if let Some((early_proofs, _arrival_height)) = self.early_certificates.remove(&tx_hash) {
@@ -1187,7 +1204,8 @@ impl ExecutionState {
 
         // Start tracking certificates for finalization
         let cert_tracker = CertificateTracker::new(tx_hash, participating_shards.clone());
-        self.certificate_trackers.insert(tx_hash, cert_tracker);
+        self.certificate_trackers
+            .insert(tx_hash, (cert_tracker, self.committed_height));
 
         // Replay any early proofs that arrived before tracking started.
         if let Some((early_proofs, _arrival_height)) = self.early_certificates.remove(&tx_hash) {
@@ -1276,7 +1294,7 @@ impl ExecutionState {
         let mut actions = Vec::new();
 
         let local_shard = topology.local_shard();
-        let Some(tracker) = self.certificate_trackers.get_mut(&tx_hash) else {
+        let Some((tracker, _)) = self.certificate_trackers.get_mut(&tx_hash) else {
             tracing::debug!(
                 tx_hash = ?tx_hash,
                 cert_shard = cert_shard.0,
@@ -1315,7 +1333,7 @@ impl ExecutionState {
                 });
 
                 self.finalized_certificates
-                    .insert(tx_hash, Arc::new(tx_cert));
+                    .insert(tx_hash, (Arc::new(tx_cert), self.committed_height));
 
                 // Notify mempool that transaction execution is complete
                 actions.push(Action::Continuation(ProtocolEvent::TransactionExecuted {
@@ -1343,7 +1361,10 @@ impl ExecutionState {
 
     /// Get finalized certificates for block inclusion.
     pub fn get_finalized_certificates(&self) -> Vec<Arc<TransactionCertificate>> {
-        self.finalized_certificates.values().cloned().collect()
+        self.finalized_certificates
+            .values()
+            .map(|(cert, _)| cert.clone())
+            .collect()
     }
 
     /// Get finalized certificates as a HashMap for block validation.
@@ -1352,7 +1373,7 @@ impl ExecutionState {
     ) -> std::collections::HashMap<Hash, Arc<TransactionCertificate>> {
         self.finalized_certificates
             .iter()
-            .map(|(h, c)| (*h, Arc::clone(c)))
+            .map(|(h, (c, _))| (*h, Arc::clone(c)))
             .collect()
     }
 
@@ -1361,7 +1382,9 @@ impl ExecutionState {
     /// Returns certificates that have been finalized but not yet committed to a block.
     /// Once committed, certificates are persisted to storage and should be fetched from there.
     pub fn get_finalized_certificate(&self, tx_hash: &Hash) -> Option<Arc<TransactionCertificate>> {
-        self.finalized_certificates.get(tx_hash).cloned()
+        self.finalized_certificates
+            .get(tx_hash)
+            .map(|(cert, _)| cert.clone())
     }
 
     /// Remove a finalized certificate (after it's been included in a block).
@@ -1487,6 +1510,133 @@ impl ExecutionState {
         }
     }
 
+    /// Prune stale finalized certificates that haven't been included in a block.
+    ///
+    /// If a certificate isn't picked up within STALE_TRACKING_RETENTION_BLOCKS,
+    /// something is wrong and it should be cleaned up to prevent unbounded growth.
+    fn prune_finalized_certificates(&mut self) {
+        let cutoff = self
+            .committed_height
+            .saturating_sub(STALE_TRACKING_RETENTION_BLOCKS);
+
+        let before = self.finalized_certificates.len();
+        self.finalized_certificates
+            .retain(|_, (_, height)| *height > cutoff);
+        let pruned = before - self.finalized_certificates.len();
+
+        if pruned > 0 {
+            tracing::warn!(
+                pruned,
+                cutoff_height = cutoff,
+                "Pruned stale finalized certificates not included in any block"
+            );
+        }
+    }
+
+    /// Prune stale certificate trackers for transactions that never completed.
+    ///
+    /// Cross-shard transactions that stall (provisions never arrive, network
+    /// partition) would otherwise leak trackers indefinitely.
+    fn prune_certificate_trackers(&mut self) {
+        let cutoff = self
+            .committed_height
+            .saturating_sub(STALE_TRACKING_RETENTION_BLOCKS);
+
+        let before = self.certificate_trackers.len();
+        let mut pruned_tx_hashes = Vec::new();
+        self.certificate_trackers.retain(|tx_hash, (_, height)| {
+            if *height > cutoff {
+                true
+            } else {
+                pruned_tx_hashes.push(*tx_hash);
+                false
+            }
+        });
+        let pruned = before - self.certificate_trackers.len();
+
+        // Also clean up associated execution cache entries for pruned trackers
+        for tx_hash in &pruned_tx_hashes {
+            self.execution_cache.remove(tx_hash);
+        }
+
+        if pruned > 0 {
+            tracing::warn!(
+                pruned,
+                cutoff_height = cutoff,
+                "Pruned stale certificate trackers for stuck transactions"
+            );
+        }
+    }
+
+    /// Prune stale pending provisioning entries for transactions whose
+    /// provisions never arrived within the retention window.
+    fn prune_pending_provisioning(&mut self) {
+        let cutoff = self
+            .committed_height
+            .saturating_sub(STALE_TRACKING_RETENTION_BLOCKS);
+
+        let before = self.pending_provisioning.len();
+        let mut pruned_tx_hashes = Vec::new();
+        self.pending_provisioning.retain(|tx_hash, (_, height)| {
+            if *height > cutoff {
+                true
+            } else {
+                pruned_tx_hashes.push(*tx_hash);
+                false
+            }
+        });
+        let pruned = before - self.pending_provisioning.len();
+
+        // Also clean up associated execution cache entries
+        for tx_hash in &pruned_tx_hashes {
+            self.execution_cache.remove(tx_hash);
+        }
+
+        if pruned > 0 {
+            tracing::warn!(
+                pruned,
+                cutoff_height = cutoff,
+                "Pruned stale pending provisioning entries"
+            );
+        }
+    }
+
+    /// Prune stale execution cache entries not associated with any active tracking.
+    fn prune_execution_cache(&mut self) {
+        let cutoff = self
+            .committed_height
+            .saturating_sub(STALE_TRACKING_RETENTION_BLOCKS);
+
+        let pruned = self.execution_cache.prune_by_height(cutoff);
+        if pruned > 0 {
+            tracing::warn!(
+                pruned,
+                cutoff_height = cutoff,
+                "Pruned stale execution cache entries"
+            );
+        }
+    }
+
+    /// Prune stale pending speculative executions whose callbacks never arrived.
+    fn prune_pending_speculative(&mut self) {
+        let cutoff = self
+            .committed_height
+            .saturating_sub(EXECUTED_TX_RETENTION_BLOCKS);
+
+        let before = self.pending_speculative_executions.len();
+        self.pending_speculative_executions
+            .retain(|_, (_, height)| *height > cutoff);
+        let pruned = before - self.pending_speculative_executions.len();
+
+        if pruned > 0 {
+            tracing::debug!(
+                pruned,
+                cutoff_height = cutoff,
+                "Pruned stale pending speculative executions"
+            );
+        }
+    }
+
     /// Check if a transaction is finalized.
     pub fn is_finalized(&self, tx_hash: &Hash) -> bool {
         self.finalized_certificates.contains_key(tx_hash)
@@ -1508,7 +1658,7 @@ impl ExecutionState {
             .map(|(v, _)| v.len())
             .unwrap_or(0);
 
-        let cert_tracker_info = if let Some(tracker) = self.certificate_trackers.get(tx_hash) {
+        let cert_tracker_info = if let Some((tracker, _)) = self.certificate_trackers.get(tx_hash) {
             format!(
                 "{}/{} certs",
                 tracker.certificate_count(),
@@ -1665,7 +1815,7 @@ impl ExecutionState {
 
         // Store transactions so we can get declared_reads when execution completes
         self.pending_speculative_executions
-            .insert(block_hash, single_shard_txs.clone());
+            .insert(block_hash, (single_shard_txs.clone(), height));
 
         // Track metrics
         self.speculative_started_count += single_shard_txs.len() as u64;
@@ -1697,6 +1847,7 @@ impl ExecutionState {
         let transactions = self
             .pending_speculative_executions
             .remove(&block_hash)
+            .map(|(txs, _)| txs)
             .unwrap_or_default();
 
         // Build a map from tx_hash to transaction for quick lookup
@@ -1930,7 +2081,7 @@ impl ExecutionState {
 
         // Phase 3-5: Vote aggregation and certificate collection
         // Cross-shard txs will have certificate_trackers with multiple shards.
-        for (tx_hash, tracker) in &self.certificate_trackers {
+        for (tx_hash, (tracker, _)) in &self.certificate_trackers {
             if tracker.expected_count() > 1 {
                 pending_txs.insert(*tx_hash);
             }

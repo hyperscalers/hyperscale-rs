@@ -1088,9 +1088,12 @@ impl StateMachine for NodeStateMachine {
                         });
                     }
 
-                    self.execution
-                        .execution_cache_mut()
-                        .insert(tx_hash, db_updates, receipt_hash);
+                    self.execution.execution_cache_mut().insert(
+                        tx_hash,
+                        db_updates,
+                        receipt_hash,
+                        self.bft.committed_height(),
+                    );
                 }
 
                 // Dispatch receipt storage (fire-and-forget, off main thread)
