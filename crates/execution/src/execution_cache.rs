@@ -22,6 +22,8 @@ struct CachedExecution {
     /// Hash of the ConsensusReceipt (outcome + event_root).
     /// Used for debug_assert cross-checks at block commit time.
     receipt_hash: Hash,
+    /// Block height when this entry was inserted, for stale-entry pruning.
+    inserted_height: u64,
 }
 
 /// In-memory cache of execution write sets, keyed by transaction hash.
@@ -44,12 +46,19 @@ impl ExecutionCache {
     }
 
     /// Insert execution results.
-    pub fn insert(&mut self, tx_hash: Hash, updates: Arc<DatabaseUpdates>, receipt_hash: Hash) {
+    pub fn insert(
+        &mut self,
+        tx_hash: Hash,
+        updates: Arc<DatabaseUpdates>,
+        receipt_hash: Hash,
+        inserted_height: u64,
+    ) {
         self.entries.insert(
             tx_hash,
             CachedExecution {
                 database_updates: updates,
                 receipt_hash,
+                inserted_height,
             },
         );
     }
@@ -90,6 +99,17 @@ impl ExecutionCache {
             .collect()
     }
 
+    /// Prune entries older than the given cutoff height.
+    ///
+    /// Removes entries that were inserted at or before the cutoff height,
+    /// preventing unbounded growth from executed-but-uncommitted transactions.
+    pub fn prune_by_height(&mut self, cutoff_height: u64) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, e| e.inserted_height > cutoff_height);
+        before - self.entries.len()
+    }
+
     /// Number of cached entries.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -126,7 +146,7 @@ mod tests {
         let updates = make_updates();
 
         assert!(cache.get(&h).is_none());
-        cache.insert(h, updates, Hash::ZERO);
+        cache.insert(h, updates, Hash::ZERO, 1);
         assert!(cache.get(&h).is_some());
         assert_eq!(cache.len(), 1);
     }
@@ -135,7 +155,7 @@ mod tests {
     fn test_remove() {
         let mut cache = ExecutionCache::new();
         let h = hash(1);
-        cache.insert(h, make_updates(), Hash::ZERO);
+        cache.insert(h, make_updates(), Hash::ZERO, 1);
 
         let removed = cache.remove(&h);
         assert!(removed.is_some());
@@ -153,7 +173,7 @@ mod tests {
     fn test_remove_batch() {
         let mut cache = ExecutionCache::new();
         for i in 0..5 {
-            cache.insert(hash(i), make_updates(), Hash::ZERO);
+            cache.insert(hash(i), make_updates(), Hash::ZERO, 1);
         }
         assert_eq!(cache.len(), 5);
 
@@ -169,11 +189,11 @@ mod tests {
     #[test]
     fn test_insert_duplicate_replaces() {
         let mut cache = ExecutionCache::new();
-        cache.insert(hash(1), make_updates(), Hash::ZERO);
-        cache.insert(hash(2), make_updates(), Hash::ZERO);
+        cache.insert(hash(1), make_updates(), Hash::ZERO, 1);
+        cache.insert(hash(2), make_updates(), Hash::ZERO, 1);
 
         // Re-inserting hash(1) should replace in-place
-        cache.insert(hash(1), make_updates(), Hash::ZERO);
+        cache.insert(hash(1), make_updates(), Hash::ZERO, 1);
         assert_eq!(cache.len(), 2);
         assert!(cache.get(&hash(1)).is_some());
         assert!(cache.get(&hash(2)).is_some());
@@ -182,8 +202,8 @@ mod tests {
     #[test]
     fn test_has_all() {
         let mut cache = ExecutionCache::new();
-        cache.insert(hash(1), make_updates(), Hash::ZERO);
-        cache.insert(hash(2), make_updates(), Hash::ZERO);
+        cache.insert(hash(1), make_updates(), Hash::ZERO, 1);
+        cache.insert(hash(2), make_updates(), Hash::ZERO, 1);
 
         assert!(cache.has_all(&[hash(1), hash(2)]));
         assert!(!cache.has_all(&[hash(1), hash(3)]));
@@ -193,8 +213,8 @@ mod tests {
     #[test]
     fn test_missing() {
         let mut cache = ExecutionCache::new();
-        cache.insert(hash(1), make_updates(), Hash::ZERO);
-        cache.insert(hash(2), make_updates(), Hash::ZERO);
+        cache.insert(hash(1), make_updates(), Hash::ZERO, 1);
+        cache.insert(hash(2), make_updates(), Hash::ZERO, 1);
 
         let missing = cache.missing(&[hash(1), hash(2), hash(3)]);
         assert_eq!(missing, vec![hash(3)]);
