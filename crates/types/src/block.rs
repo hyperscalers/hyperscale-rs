@@ -878,8 +878,7 @@ mod tests {
     #[test]
     fn test_compute_receipt_root_deterministic() {
         use crate::{
-            zero_bls_signature, ExecutionCertificate, ShardGroupId, SignerBitfield,
-            TransactionCertificate, TransactionDecision,
+            ShardExecutionProof, ShardGroupId, TransactionCertificate, TransactionDecision,
         };
         use std::collections::BTreeMap;
 
@@ -887,15 +886,10 @@ mod tests {
             let mut shard_proofs = BTreeMap::new();
             shard_proofs.insert(
                 ShardGroupId(0),
-                ExecutionCertificate {
-                    transaction_hash: Hash::from_bytes(&[seed; 32]),
-                    shard_group_id: ShardGroupId(0),
-                    read_nodes: vec![],
-                    write_nodes: vec![],
+                ShardExecutionProof {
                     receipt_hash: Hash::from_bytes(&[seed + 100; 32]),
                     success: true,
-                    aggregated_signature: zero_bls_signature(),
-                    signers: SignerBitfield::empty(),
+                    write_nodes: vec![],
                 },
             );
             Arc::new(TransactionCertificate {
@@ -915,23 +909,17 @@ mod tests {
     #[test]
     fn test_compute_receipt_root_single_cert() {
         use crate::{
-            zero_bls_signature, ExecutionCertificate, ShardGroupId, SignerBitfield,
-            TransactionCertificate, TransactionDecision,
+            ShardExecutionProof, ShardGroupId, TransactionCertificate, TransactionDecision,
         };
         use std::collections::BTreeMap;
 
         let mut shard_proofs = BTreeMap::new();
         shard_proofs.insert(
             ShardGroupId(0),
-            ExecutionCertificate {
-                transaction_hash: Hash::from_bytes(&[1; 32]),
-                shard_group_id: ShardGroupId(0),
-                read_nodes: vec![],
-                write_nodes: vec![],
+            ShardExecutionProof {
                 receipt_hash: Hash::from_bytes(b"receipt_hash_value"),
                 success: true,
-                aggregated_signature: zero_bls_signature(),
-                signers: SignerBitfield::empty(),
+                write_nodes: vec![],
             },
         );
         let cert = Arc::new(TransactionCertificate {

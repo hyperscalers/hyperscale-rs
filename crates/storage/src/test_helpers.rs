@@ -8,11 +8,11 @@ use crate::{
     ConsensusStore, DatabaseUpdates, DbSortKey, NodeDatabaseUpdates, PartitionDatabaseUpdates,
 };
 use hyperscale_types::{
-    zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, ExecutionCertificate,
-    FeeSummary, Hash, LedgerTransactionOutcome, LedgerTransactionReceipt,
-    LocalTransactionExecution, LogLevel, NodeId, PartitionNumber, QuorumCertificate, ReceiptBundle,
-    ShardGroupId, SignerBitfield, SubstateChange, SubstateChangeAction, SubstateRef,
-    TransactionCertificate, TransactionDecision, ValidatorId,
+    zero_bls_signature, ApplicationEvent, Block, BlockHeader, BlockHeight, FeeSummary, Hash,
+    LedgerTransactionOutcome, LedgerTransactionReceipt, LocalTransactionExecution, LogLevel,
+    NodeId, PartitionNumber, QuorumCertificate, ReceiptBundle, ShardExecutionProof, ShardGroupId,
+    SignerBitfield, SubstateChange, SubstateChangeAction, SubstateRef, TransactionCertificate,
+    TransactionDecision, ValidatorId,
 };
 use radix_common::prelude::DatabaseUpdate;
 use radix_substate_store_interface::db_key_mapper::{DatabaseKeyMapper, SpreadPrefixKeyMapper};
@@ -78,18 +78,13 @@ pub fn make_mapped_database_update(
 /// Build a `TransactionCertificate` with a deterministic hash derived from `tx_seed`.
 pub fn make_test_certificate(tx_seed: u8, shard: ShardGroupId) -> TransactionCertificate {
     let tx_hash = Hash::from_bytes(&[tx_seed; 32]);
-    let execution_cert = ExecutionCertificate {
-        transaction_hash: tx_hash,
-        shard_group_id: shard,
-        read_nodes: vec![],
-        write_nodes: vec![],
+    let proof = ShardExecutionProof {
         receipt_hash: Hash::from_bytes(&[0; 32]),
         success: true,
-        aggregated_signature: zero_bls_signature(),
-        signers: SignerBitfield::new(4),
+        write_nodes: vec![],
     };
     let mut shard_proofs = BTreeMap::new();
-    shard_proofs.insert(shard, execution_cert);
+    shard_proofs.insert(shard, proof);
     TransactionCertificate {
         transaction_hash: tx_hash,
         decision: TransactionDecision::Accept,
@@ -135,17 +130,12 @@ pub fn make_multi_shard_certificate(
     let tx_hash = Hash::from_bytes(&[tx_seed; 32]);
     let mut shard_proofs = BTreeMap::new();
     for shard in shards {
-        let execution_cert = ExecutionCertificate {
-            transaction_hash: tx_hash,
-            shard_group_id: shard,
-            read_nodes: vec![],
-            write_nodes: vec![],
+        let proof = ShardExecutionProof {
             receipt_hash: Hash::from_bytes(&[0; 32]),
             success: true,
-            aggregated_signature: zero_bls_signature(),
-            signers: SignerBitfield::new(4),
+            write_nodes: vec![],
         };
-        shard_proofs.insert(shard, execution_cert);
+        shard_proofs.insert(shard, proof);
     }
     TransactionCertificate {
         transaction_hash: tx_hash,
