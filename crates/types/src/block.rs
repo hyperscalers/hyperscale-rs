@@ -112,6 +112,55 @@ pub fn tx_inclusion_proof(block: &Block, tx_hash: &Hash) -> Option<TransactionIn
     Some(proof)
 }
 
+/// Batch version of [`tx_inclusion_proof`] — generates proofs for multiple
+/// transactions from the same block, building the leaf list only once.
+pub fn tx_inclusion_proofs(
+    block: &Block,
+    tx_hashes: &[Hash],
+) -> Vec<(Hash, Option<TransactionInclusionProof>)> {
+    let total_count = block.retry_transactions.len()
+        + block.priority_transactions.len()
+        + block.transactions.len();
+
+    if total_count == 0 {
+        return tx_hashes.iter().map(|h| (*h, None)).collect();
+    }
+
+    // Build tagged leaves once (same order as compute_transaction_root)
+    let mut leaves = Vec::with_capacity(total_count);
+
+    for tx in &block.retry_transactions {
+        leaves.push(Hash::from_parts(&[RETRY_TAG, tx.hash().as_bytes()]));
+    }
+    for tx in &block.priority_transactions {
+        leaves.push(Hash::from_parts(&[PRIORITY_TAG, tx.hash().as_bytes()]));
+    }
+    for tx in &block.transactions {
+        leaves.push(Hash::from_parts(&[NORMAL_TAG, tx.hash().as_bytes()]));
+    }
+
+    tx_hashes
+        .iter()
+        .map(|tx_hash| {
+            let target_retry = Hash::from_parts(&[RETRY_TAG, tx_hash.as_bytes()]);
+            let target_priority = Hash::from_parts(&[PRIORITY_TAG, tx_hash.as_bytes()]);
+            let target_normal = Hash::from_parts(&[NORMAL_TAG, tx_hash.as_bytes()]);
+
+            let index = leaves.iter().position(|leaf| {
+                *leaf == target_retry || *leaf == target_priority || *leaf == target_normal
+            });
+
+            match index {
+                Some(idx) => {
+                    let (_root, proof) = compute_merkle_root_with_proof(&leaves, idx);
+                    (*tx_hash, Some(proof))
+                }
+                None => (*tx_hash, None),
+            }
+        })
+        .collect()
+}
+
 // ============================================================================
 // PriorityInclusion
 // ============================================================================

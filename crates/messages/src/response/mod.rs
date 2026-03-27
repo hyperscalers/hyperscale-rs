@@ -10,4 +10,4 @@ mod tx_inclusion_proof;
 pub use block::GetBlockResponse;
 pub use provision::GetProvisionsResponse;
 pub use transaction::GetTransactionsResponse;
-pub use tx_inclusion_proof::GetTxInclusionProofResponse;
+pub use tx_inclusion_proof::{GetTxInclusionProofResponse, TxInclusionProofEntry};

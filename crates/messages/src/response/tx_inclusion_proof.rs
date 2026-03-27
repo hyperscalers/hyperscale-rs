@@ -1,17 +1,25 @@
 //! Transaction inclusion proof response for livelock deferral verification.
 
-use hyperscale_types::{MessagePriority, NetworkMessage, TransactionInclusionProof};
+use hyperscale_types::{Hash, MessagePriority, NetworkMessage, TransactionInclusionProof};
 use sbor::prelude::BasicSbor;
 
-/// Response containing a merkle inclusion proof for a transaction.
-///
-/// The proof can be verified against the block header's `transaction_root`
-/// (which is QC-attested). If the transaction is not in the block or the
-/// block is not available, both fields are `None`.
+/// A single entry in a batched inclusion proof response.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct GetTxInclusionProofResponse {
+pub struct TxInclusionProofEntry {
+    /// Hash of the transaction this proof is for.
+    pub tx_hash: Hash,
     /// Merkle inclusion proof, if the transaction was found in the block.
     pub proof: Option<TransactionInclusionProof>,
+}
+
+/// Response containing merkle inclusion proofs for one or more transactions.
+///
+/// Each requested transaction gets an entry. If a transaction is not in the
+/// block or the block is not available, its entry has `proof: None`.
+#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+pub struct GetTxInclusionProofResponse {
+    /// Per-transaction inclusion proofs.
+    pub proofs: Vec<TxInclusionProofEntry>,
 }
 
 impl NetworkMessage for GetTxInclusionProofResponse {
@@ -27,16 +35,24 @@ impl NetworkMessage for GetTxInclusionProofResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hyperscale_types::Hash;
 
     #[test]
-    fn test_sbor_roundtrip_some() {
+    fn test_sbor_roundtrip_batch() {
         let response = GetTxInclusionProofResponse {
-            proof: Some(TransactionInclusionProof {
-                siblings: vec![Hash::from_bytes(b"sib1"), Hash::from_bytes(b"sib2")],
-                leaf_index: 3,
-                leaf_hash: Hash::from_bytes(b"leaf"),
-            }),
+            proofs: vec![
+                TxInclusionProofEntry {
+                    tx_hash: Hash::from_bytes(b"tx1"),
+                    proof: Some(TransactionInclusionProof {
+                        siblings: vec![Hash::from_bytes(b"sib1"), Hash::from_bytes(b"sib2")],
+                        leaf_index: 3,
+                        leaf_hash: Hash::from_bytes(b"leaf1"),
+                    }),
+                },
+                TxInclusionProofEntry {
+                    tx_hash: Hash::from_bytes(b"tx2"),
+                    proof: None,
+                },
+            ],
         };
 
         let encoded = sbor::basic_encode(&response).unwrap();
@@ -45,8 +61,8 @@ mod tests {
     }
 
     #[test]
-    fn test_sbor_roundtrip_none() {
-        let response = GetTxInclusionProofResponse { proof: None };
+    fn test_sbor_roundtrip_empty() {
+        let response = GetTxInclusionProofResponse { proofs: vec![] };
 
         let encoded = sbor::basic_encode(&response).unwrap();
         let decoded: GetTxInclusionProofResponse = sbor::basic_decode(&encoded).unwrap();

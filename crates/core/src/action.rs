@@ -291,15 +291,13 @@ pub enum Action {
     /// Used for both livelock deferrals and priority tx proofs under backpressure.
     /// The I/O loop sends this as a network request; the response is delivered
     /// back as `NodeInput::InclusionProofFetchReceived`.
-    RequestTxInclusionProof {
-        /// Source shard to fetch the proof from.
+    RequestTxInclusionProofs {
+        /// Source shard to fetch proofs from.
         source_shard: ShardGroupId,
         /// Block height on the source shard.
         source_block_height: BlockHeight,
-        /// Transaction hash to prove inclusion for.
-        winner_tx_hash: Hash,
-        /// Why this proof is being fetched.
-        reason: InclusionProofFetchReason,
+        /// Transactions to prove inclusion for, with the reason for each.
+        entries: Vec<(Hash, InclusionProofFetchReason)>,
         /// Peers in the source shard to send the request to.
         peers: Vec<ValidatorId>,
     },
@@ -757,7 +755,7 @@ impl Action {
                 | Action::PersistTransactionCertificate { .. }
                 | Action::RequestMissingProvisions { .. }
                 | Action::CancelProvisionFetch { .. }
-                | Action::RequestTxInclusionProof { .. }
+                | Action::RequestTxInclusionProofs { .. }
         )
     }
 
@@ -867,7 +865,7 @@ impl Action {
             Action::CancelFetch { .. } => "CancelFetch",
             Action::RequestMissingProvisions { .. } => "RequestMissingProvisions",
             Action::CancelProvisionFetch { .. } => "CancelProvisionFetch",
-            Action::RequestTxInclusionProof { .. } => "RequestTxInclusionProof",
+            Action::RequestTxInclusionProofs { .. } => "RequestTxInclusionProof",
         }
     }
 }

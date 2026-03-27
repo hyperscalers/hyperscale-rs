@@ -4,17 +4,17 @@ use crate::response::GetTxInclusionProofResponse;
 use hyperscale_types::{BlockHeight, Hash, MessagePriority, NetworkMessage, Request};
 use sbor::prelude::BasicSbor;
 
-/// Request a merkle inclusion proof for a transaction in a committed block.
+/// Request merkle inclusion proofs for one or more transactions in a committed block.
 ///
-/// Used by the livelock system when a cycle is detected. The requesting shard
-/// needs proof that the winner transaction was included in a committed block
-/// on the source shard, verified against the block header's `transaction_root`.
+/// Used by the livelock system when cycles are detected and by the priority
+/// transaction path under backpressure. Multiple proofs from the same block
+/// are batched into a single request to reduce message overhead.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
 pub struct GetTxInclusionProofRequest {
-    /// Height of the block containing the transaction.
+    /// Height of the block containing the transactions.
     pub block_height: BlockHeight,
-    /// Hash of the transaction to prove inclusion for.
-    pub tx_hash: Hash,
+    /// Hashes of the transactions to prove inclusion for.
+    pub tx_hashes: Vec<Hash>,
 }
 
 impl NetworkMessage for GetTxInclusionProofRequest {
@@ -39,7 +39,22 @@ mod tests {
     fn test_sbor_roundtrip() {
         let request = GetTxInclusionProofRequest {
             block_height: BlockHeight(42),
-            tx_hash: Hash::from_bytes(b"winner_tx"),
+            tx_hashes: vec![
+                Hash::from_bytes(b"winner_tx_1"),
+                Hash::from_bytes(b"winner_tx_2"),
+            ],
+        };
+
+        let encoded = sbor::basic_encode(&request).unwrap();
+        let decoded: GetTxInclusionProofRequest = sbor::basic_decode(&encoded).unwrap();
+        assert_eq!(request, decoded);
+    }
+
+    #[test]
+    fn test_sbor_roundtrip_single() {
+        let request = GetTxInclusionProofRequest {
+            block_height: BlockHeight(10),
+            tx_hashes: vec![Hash::from_bytes(b"single_tx")],
         };
 
         let encoded = sbor::basic_encode(&request).unwrap();

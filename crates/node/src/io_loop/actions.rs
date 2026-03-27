@@ -221,7 +221,7 @@ where
             | Action::CancelFetch { .. }
             | Action::RequestMissingProvisions { .. }
             | Action::CancelProvisionFetch { .. }
-            | Action::RequestTxInclusionProof { .. } => {
+            | Action::RequestTxInclusionProofs { .. } => {
                 self.process_sync_fetch_action(action);
             }
 
@@ -663,27 +663,30 @@ where
                         block_height,
                     });
             }
-            Action::RequestTxInclusionProof {
+            Action::RequestTxInclusionProofs {
                 source_shard,
                 source_block_height,
-                winner_tx_hash,
-                reason,
+                entries,
                 peers,
             } => {
                 use crate::protocol::inclusion_proof_fetch::InclusionProofFetchInput;
                 let preferred_peer = peers.first().copied().unwrap_or(ValidatorId(0));
-                let outputs =
-                    self.inclusion_proof_fetch_protocol
-                        .handle(InclusionProofFetchInput::Request {
+                // Feed all entries into the protocol before ticking, so the
+                // tick can batch them into a single FetchBatch output.
+                for (winner_tx_hash, reason) in entries {
+                    let outputs = self.inclusion_proof_fetch_protocol.handle(
+                        InclusionProofFetchInput::Request {
                             source_shard,
                             source_block_height,
                             winner_tx_hash,
                             reason,
-                            peers,
+                            peers: peers.clone(),
                             preferred_peer,
-                        });
-                self.process_inclusion_proof_fetch_outputs(outputs);
-                // Tick immediately to start the fetch.
+                        },
+                    );
+                    self.process_inclusion_proof_fetch_outputs(outputs);
+                }
+                // Single tick dispatches all entries as one batch.
                 let tick_outputs = self
                     .inclusion_proof_fetch_protocol
                     .handle(InclusionProofFetchInput::Tick);

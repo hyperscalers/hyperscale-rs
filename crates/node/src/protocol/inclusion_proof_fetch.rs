@@ -2,8 +2,11 @@
 //!
 //! Pure synchronous state machine for fetching transaction inclusion proofs
 //! from source shards during livelock resolution. Sits between the livelock
-//! system's `RequestTxInclusionProof` action and the actual `network.request()`
+//! system's `RequestTxInclusionProofs` action and the actual `network.request()`
 //! call, rotating through available peers on failure before giving up.
+//!
+//! Multiple proofs for the same `(source_shard, block_height, peer)` are
+//! batched into a single `FetchBatch` output to reduce network round-trips.
 //!
 //! # Usage
 //!
@@ -63,12 +66,12 @@ pub enum InclusionProofFetchInput {
 /// Outputs from the inclusion proof fetch protocol state machine.
 #[derive(Debug)]
 pub enum InclusionProofFetchOutput {
-    /// Send a network request to a peer.
-    Fetch {
+    /// Send a batched network request to a peer for multiple proofs from the same block.
+    FetchBatch {
         source_shard: ShardGroupId,
         block_height: BlockHeight,
-        winner_tx_hash: Hash,
-        reason: InclusionProofFetchReason,
+        /// Each entry: (tx_hash, reason) — reason needed for routing the response.
+        entries: Vec<(Hash, InclusionProofFetchReason)>,
         peer: ValidatorId,
     },
     /// Deliver the proof to the state machine.
@@ -273,31 +276,24 @@ impl InclusionProofFetchProtocol {
     }
 
     /// Spawn pending fetch operations (called on Tick).
+    ///
+    /// Groups ready-to-fetch entries by `(source_shard, block_height, peer)` and
+    /// emits one `FetchBatch` output per group to reduce network round-trips.
     fn spawn_pending_fetches(&mut self) -> Vec<InclusionProofFetchOutput> {
-        let mut outputs = Vec::new();
-        let mut to_remove = Vec::new();
+        // Phase 1: determine peer for each non-in-flight pending entry.
+        // Collect (tx_hash, resolved_peer) for entries that have a peer,
+        // and tx_hashes for entries that have exhausted all peers.
+        let mut ready: Vec<(Hash, ValidatorId)> = Vec::new();
+        let mut to_remove: Vec<Hash> = Vec::new();
 
-        for (&winner_tx_hash, state) in &mut self.pending {
+        for (&winner_tx_hash, state) in &self.pending {
             if state.in_flight {
                 continue;
             }
 
             // If we have a current peer that hasn't exhausted retries, reuse it.
             if let Some(peer) = state.current_peer {
-                state.in_flight = true;
-                trace!(
-                    winner_tx = %winner_tx_hash,
-                    peer = peer.0,
-                    retry = state.retries_on_current,
-                    "Retrying inclusion proof fetch from same peer"
-                );
-                outputs.push(InclusionProofFetchOutput::Fetch {
-                    source_shard: state.source_shard,
-                    block_height: state.source_block_height,
-                    winner_tx_hash,
-                    reason: state.reason.clone(),
-                    peer,
-                });
+                ready.push((winner_tx_hash, peer));
                 continue;
             }
 
@@ -314,24 +310,9 @@ impl InclusionProofFetchProtocol {
 
             match peer {
                 Some(peer) => {
-                    state.current_peer = Some(peer);
-                    state.retries_on_current = 0;
-                    state.in_flight = true;
-                    trace!(
-                        winner_tx = %winner_tx_hash,
-                        peer = peer.0,
-                        "Fetching inclusion proof from peer"
-                    );
-                    outputs.push(InclusionProofFetchOutput::Fetch {
-                        source_shard: state.source_shard,
-                        block_height: state.source_block_height,
-                        winner_tx_hash,
-                        reason: state.reason.clone(),
-                        peer,
-                    });
+                    ready.push((winner_tx_hash, peer));
                 }
                 None => {
-                    // All peers exhausted — give up.
                     warn!(
                         winner_tx = %winner_tx_hash,
                         tried = state.tried.len(),
@@ -344,6 +325,46 @@ impl InclusionProofFetchProtocol {
 
         for key in to_remove {
             self.pending.remove(&key);
+        }
+
+        // Phase 2: group by (source_shard, block_height, peer) and build batch outputs.
+        let mut batches: HashMap<
+            (ShardGroupId, BlockHeight, ValidatorId),
+            Vec<(Hash, InclusionProofFetchReason)>,
+        > = HashMap::new();
+
+        for (winner_tx_hash, peer) in &ready {
+            let state = self.pending.get_mut(winner_tx_hash).unwrap();
+            // Update peer state (may be setting a new peer or reusing current).
+            if state.current_peer.is_none() {
+                state.current_peer = Some(*peer);
+                state.retries_on_current = 0;
+            }
+            state.in_flight = true;
+
+            let key = (state.source_shard, state.source_block_height, *peer);
+            batches
+                .entry(key)
+                .or_default()
+                .push((*winner_tx_hash, state.reason.clone()));
+        }
+
+        // Phase 3: emit one FetchBatch per group.
+        let mut outputs = Vec::with_capacity(batches.len());
+        for ((source_shard, block_height, peer), entries) in batches {
+            trace!(
+                source_shard = source_shard.0,
+                block_height = block_height.0,
+                peer = peer.0,
+                batch_size = entries.len(),
+                "Fetching inclusion proof batch from peer"
+            );
+            outputs.push(InclusionProofFetchOutput::FetchBatch {
+                source_shard,
+                block_height,
+                entries,
+                peer,
+            });
         }
 
         outputs
@@ -383,6 +404,27 @@ mod tests {
         }
     }
 
+    /// Helper: extract the single FetchBatch from outputs, panicking if not exactly one.
+    fn expect_single_fetch_batch(
+        outputs: &[InclusionProofFetchOutput],
+    ) -> (
+        &ShardGroupId,
+        &BlockHeight,
+        &[(Hash, InclusionProofFetchReason)],
+        &ValidatorId,
+    ) {
+        assert_eq!(outputs.len(), 1, "Expected exactly one FetchBatch output");
+        match &outputs[0] {
+            InclusionProofFetchOutput::FetchBatch {
+                source_shard,
+                block_height,
+                entries,
+                peer,
+            } => (source_shard, block_height, entries, peer),
+            other => panic!("Expected FetchBatch, got {:?}", other),
+        }
+    }
+
     #[test]
     fn test_config_defaults() {
         let config = InclusionProofFetchConfig::default();
@@ -406,24 +448,14 @@ mod tests {
         assert!(outputs.is_empty());
         assert!(protocol.has_pending());
 
-        // Tick should emit a Fetch with the preferred peer.
+        // Tick should emit a FetchBatch with the preferred peer.
         let outputs = protocol.handle(InclusionProofFetchInput::Tick);
-        assert_eq!(outputs.len(), 1);
-        match &outputs[0] {
-            InclusionProofFetchOutput::Fetch {
-                source_shard,
-                block_height,
-                winner_tx_hash,
-                peer,
-                ..
-            } => {
-                assert_eq!(*source_shard, shard(1));
-                assert_eq!(*block_height, height(10));
-                assert_eq!(*winner_tx_hash, tx_hash(1));
-                assert_eq!(*peer, vid(1));
-            }
-            _ => panic!("Expected Fetch output"),
-        }
+        let (src_shard, blk_height, entries, peer) = expect_single_fetch_batch(&outputs);
+        assert_eq!(*src_shard, shard(1));
+        assert_eq!(*blk_height, height(10));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, tx_hash(1));
+        assert_eq!(*peer, vid(1));
     }
 
     #[test]
@@ -446,33 +478,24 @@ mod tests {
 
         // Tick 1: preferred peer (vid(1)).
         let outputs = protocol.handle(InclusionProofFetchInput::Tick);
-        assert_eq!(outputs.len(), 1);
-        assert!(matches!(
-            &outputs[0],
-            InclusionProofFetchOutput::Fetch { peer, .. } if *peer == vid(1)
-        ));
+        let (_, _, _, peer) = expect_single_fetch_batch(&outputs);
+        assert_eq!(*peer, vid(1));
 
         // Fail once — should retry same peer (retries_on_current < 2).
         protocol.handle(InclusionProofFetchInput::Failed {
             winner_tx_hash: tx_hash(1),
         });
         let outputs = protocol.handle(InclusionProofFetchInput::Tick);
-        assert_eq!(outputs.len(), 1);
-        assert!(matches!(
-            &outputs[0],
-            InclusionProofFetchOutput::Fetch { peer, .. } if *peer == vid(1)
-        ));
+        let (_, _, _, peer) = expect_single_fetch_batch(&outputs);
+        assert_eq!(*peer, vid(1));
 
         // Fail again — now retries_on_current reaches 2, rotate to vid(2).
         protocol.handle(InclusionProofFetchInput::Failed {
             winner_tx_hash: tx_hash(1),
         });
         let outputs = protocol.handle(InclusionProofFetchInput::Tick);
-        assert_eq!(outputs.len(), 1);
-        assert!(matches!(
-            &outputs[0],
-            InclusionProofFetchOutput::Fetch { peer, .. } if *peer == vid(2)
-        ));
+        let (_, _, _, peer) = expect_single_fetch_batch(&outputs);
+        assert_eq!(*peer, vid(2));
     }
 
     #[test]
@@ -644,10 +667,150 @@ mod tests {
 
         // Should use the new preferred peer.
         let outputs = protocol.handle(InclusionProofFetchInput::Tick);
+        let (_, _, _, peer) = expect_single_fetch_batch(&outputs);
+        assert_eq!(*peer, vid(2));
+    }
+
+    #[test]
+    fn test_batching_same_block_same_peer() {
+        let mut protocol = InclusionProofFetchProtocol::new(default_config());
+
+        // Register 3 fetches for the same (shard, height) with same preferred peer.
+        for i in 1..=3u8 {
+            protocol.handle(InclusionProofFetchInput::Request {
+                source_shard: shard(1),
+                source_block_height: height(10),
+                winner_tx_hash: tx_hash(i),
+                reason: InclusionProofFetchReason::Priority,
+                peers: vec![vid(1), vid(2)],
+                preferred_peer: vid(1),
+            });
+        }
+
+        // Tick should produce a single FetchBatch with all 3 entries.
+        let outputs = protocol.handle(InclusionProofFetchInput::Tick);
+        let (src_shard, blk_height, entries, peer) = expect_single_fetch_batch(&outputs);
+        assert_eq!(*src_shard, shard(1));
+        assert_eq!(*blk_height, height(10));
+        assert_eq!(*peer, vid(1));
+        assert_eq!(entries.len(), 3);
+
+        let mut hashes: Vec<Hash> = entries.iter().map(|(h, _)| *h).collect();
+        hashes.sort();
+        let mut expected = vec![tx_hash(1), tx_hash(2), tx_hash(3)];
+        expected.sort();
+        assert_eq!(hashes, expected);
+    }
+
+    #[test]
+    fn test_batching_different_blocks_separate() {
+        let mut protocol = InclusionProofFetchProtocol::new(default_config());
+
+        // Two fetches for different block heights.
+        protocol.handle(InclusionProofFetchInput::Request {
+            source_shard: shard(1),
+            source_block_height: height(10),
+            winner_tx_hash: tx_hash(1),
+            reason: InclusionProofFetchReason::Priority,
+            peers: vec![vid(1)],
+            preferred_peer: vid(1),
+        });
+        protocol.handle(InclusionProofFetchInput::Request {
+            source_shard: shard(1),
+            source_block_height: height(20),
+            winner_tx_hash: tx_hash(2),
+            reason: InclusionProofFetchReason::Priority,
+            peers: vec![vid(1)],
+            preferred_peer: vid(1),
+        });
+
+        // Should produce two separate FetchBatch outputs.
+        let outputs = protocol.handle(InclusionProofFetchInput::Tick);
+        assert_eq!(outputs.len(), 2);
+        for output in &outputs {
+            match output {
+                InclusionProofFetchOutput::FetchBatch { entries, .. } => {
+                    assert_eq!(entries.len(), 1);
+                }
+                other => panic!("Expected FetchBatch, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_batching_different_shards_separate() {
+        let mut protocol = InclusionProofFetchProtocol::new(default_config());
+
+        // Two fetches for different source shards (same height).
+        protocol.handle(InclusionProofFetchInput::Request {
+            source_shard: shard(1),
+            source_block_height: height(10),
+            winner_tx_hash: tx_hash(1),
+            reason: InclusionProofFetchReason::Priority,
+            peers: vec![vid(1)],
+            preferred_peer: vid(1),
+        });
+        protocol.handle(InclusionProofFetchInput::Request {
+            source_shard: shard(2),
+            source_block_height: height(10),
+            winner_tx_hash: tx_hash(2),
+            reason: InclusionProofFetchReason::Priority,
+            peers: vec![vid(3)],
+            preferred_peer: vid(3),
+        });
+
+        let outputs = protocol.handle(InclusionProofFetchInput::Tick);
+        assert_eq!(outputs.len(), 2);
+    }
+
+    #[test]
+    fn test_partial_batch_failure() {
+        let mut protocol = InclusionProofFetchProtocol::new(default_config());
+
+        // Register 3 fetches that will batch together.
+        for i in 1..=3u8 {
+            protocol.handle(InclusionProofFetchInput::Request {
+                source_shard: shard(1),
+                source_block_height: height(10),
+                winner_tx_hash: tx_hash(i),
+                reason: InclusionProofFetchReason::Priority,
+                peers: vec![vid(1), vid(2)],
+                preferred_peer: vid(1),
+            });
+        }
+
+        // Tick to dispatch the batch.
+        protocol.handle(InclusionProofFetchInput::Tick);
+
+        // Receive proofs for tx 1 and 3 (success), fail tx 2.
+        let outputs = protocol.handle(InclusionProofFetchInput::Received {
+            winner_tx_hash: tx_hash(1),
+            reason: InclusionProofFetchReason::Priority,
+            source_shard: shard(1),
+            source_block_height: height(10),
+            proof: dummy_proof(),
+        });
+        assert_eq!(outputs.len(), 1); // Deliver for tx 1
+
+        let outputs = protocol.handle(InclusionProofFetchInput::Received {
+            winner_tx_hash: tx_hash(3),
+            reason: InclusionProofFetchReason::Priority,
+            source_shard: shard(1),
+            source_block_height: height(10),
+            proof: dummy_proof(),
+        });
+        assert_eq!(outputs.len(), 1); // Deliver for tx 3
+
+        protocol.handle(InclusionProofFetchInput::Failed {
+            winner_tx_hash: tx_hash(2),
+        });
+
+        // tx 2 should still be pending and retryable.
+        assert!(protocol.has_pending());
+        let outputs = protocol.handle(InclusionProofFetchInput::Tick);
         assert_eq!(outputs.len(), 1);
-        assert!(matches!(
-            &outputs[0],
-            InclusionProofFetchOutput::Fetch { peer, .. } if *peer == vid(2)
-        ));
+        let (_, _, entries, _) = expect_single_fetch_batch(&outputs);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, tx_hash(2));
     }
 }

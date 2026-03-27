@@ -54,19 +54,33 @@ where
         self.network
             .register_request_handler::<hyperscale_messages::request::GetTxInclusionProofRequest>(
                 move |req: hyperscale_messages::request::GetTxInclusionProofRequest| {
-                    use hyperscale_messages::response::GetTxInclusionProofResponse;
-                    use hyperscale_types::tx_inclusion_proof;
+                    use hyperscale_messages::response::{
+                        GetTxInclusionProofResponse, TxInclusionProofEntry,
+                    };
+                    use hyperscale_types::tx_inclusion_proofs;
 
                     let (block, _qc) = match storage.get_block(req.block_height) {
                         Some(pair) => pair,
                         None => {
-                            return GetTxInclusionProofResponse { proof: None };
+                            return GetTxInclusionProofResponse {
+                                proofs: req
+                                    .tx_hashes
+                                    .iter()
+                                    .map(|h| TxInclusionProofEntry {
+                                        tx_hash: *h,
+                                        proof: None,
+                                    })
+                                    .collect(),
+                            };
                         }
                     };
 
-                    match tx_inclusion_proof(&block, &req.tx_hash) {
-                        Some(proof) => GetTxInclusionProofResponse { proof: Some(proof) },
-                        None => GetTxInclusionProofResponse { proof: None },
+                    let results = tx_inclusion_proofs(&block, &req.tx_hashes);
+                    GetTxInclusionProofResponse {
+                        proofs: results
+                            .into_iter()
+                            .map(|(tx_hash, proof)| TxInclusionProofEntry { tx_hash, proof })
+                            .collect(),
                     }
                 },
             );

@@ -220,7 +220,7 @@ where
 
     /// Process InclusionProofFetchProtocol outputs.
     ///
-    /// `Fetch` uses the Network trait to send a single-peer request.
+    /// `FetchBatch` sends a batched network request for multiple proofs from the same block.
     /// `Deliver` forwards the proof to the state machine for livelock processing.
     pub(super) fn process_inclusion_proof_fetch_outputs(
         &mut self,
@@ -228,17 +228,17 @@ where
     ) {
         for output in outputs {
             match output {
-                InclusionProofFetchOutput::Fetch {
+                InclusionProofFetchOutput::FetchBatch {
                     source_shard,
                     block_height,
-                    winner_tx_hash,
-                    reason,
+                    entries,
                     peer,
                 } => {
                     use hyperscale_messages::request::GetTxInclusionProofRequest;
+                    let tx_hashes: Vec<_> = entries.iter().map(|(h, _)| *h).collect();
                     let request = GetTxInclusionProofRequest {
                         block_height,
-                        tx_hash: winner_tx_hash,
+                        tx_hashes,
                     };
                     let sender = self.event_sender.clone();
                     self.network.request(
@@ -247,23 +247,42 @@ where
                         request,
                         Box::new(move |result| match result {
                             Ok(response) => {
-                                if let Some(proof) = response.proof {
-                                    let _ = sender.send(NodeInput::InclusionProofFetchReceived {
-                                        winner_tx_hash,
-                                        reason,
-                                        source_shard,
-                                        source_block_height: block_height,
-                                        proof,
-                                    });
-                                } else {
+                                // Build lookup map from response.
+                                let proof_map: std::collections::HashMap<_, _> = response
+                                    .proofs
+                                    .into_iter()
+                                    .map(|e| (e.tx_hash, e.proof))
+                                    .collect();
+
+                                // Fan out per-tx events.
+                                for (winner_tx_hash, reason) in entries {
+                                    match proof_map.get(&winner_tx_hash).and_then(|p| p.clone()) {
+                                        Some(proof) => {
+                                            let _ = sender.send(
+                                                NodeInput::InclusionProofFetchReceived {
+                                                    winner_tx_hash,
+                                                    reason,
+                                                    source_shard,
+                                                    source_block_height: block_height,
+                                                    proof,
+                                                },
+                                            );
+                                        }
+                                        None => {
+                                            let _ =
+                                                sender.send(NodeInput::InclusionProofFetchFailed {
+                                                    winner_tx_hash,
+                                                });
+                                        }
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                for (winner_tx_hash, _) in entries {
                                     let _ = sender.send(NodeInput::InclusionProofFetchFailed {
                                         winner_tx_hash,
                                     });
                                 }
-                            }
-                            Err(_) => {
-                                let _ = sender
-                                    .send(NodeInput::InclusionProofFetchFailed { winner_tx_hash });
                             }
                         }),
                     );

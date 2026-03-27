@@ -742,15 +742,29 @@ impl NodeStateMachine {
             let topology = self.topology.snapshot();
             let next_height = self.bft.committed_height() + 1;
             if topology.proposer_for(next_height, 0) == topology.local_validator_id() {
+                // Group by (source_shard, block_height) so each action batches
+                // all proofs needed from the same block.
+                let mut grouped: std::collections::HashMap<
+                    (ShardGroupId, BlockHeight),
+                    Vec<(Hash, hyperscale_core::InclusionProofFetchReason)>,
+                > = std::collections::HashMap::new();
                 for (tx_hash, source_shard, source_block_height) in
                     self.provisions.txs_needing_inclusion_proofs()
                 {
+                    grouped
+                        .entry((source_shard, source_block_height))
+                        .or_default()
+                        .push((
+                            tx_hash,
+                            hyperscale_core::InclusionProofFetchReason::Priority,
+                        ));
+                }
+                for ((source_shard, source_block_height), entries) in grouped {
                     let peers = topology.committee_for_shard(source_shard).to_vec();
-                    actions.push(Action::RequestTxInclusionProof {
+                    actions.push(Action::RequestTxInclusionProofs {
                         source_shard,
                         source_block_height,
-                        winner_tx_hash: tx_hash,
-                        reason: hyperscale_core::InclusionProofFetchReason::Priority,
+                        entries,
                         peers,
                     });
                 }
@@ -1003,7 +1017,11 @@ impl StateMachine for NodeStateMachine {
                     source_block_height,
                     &entries,
                 );
-                let mut actions = Vec::new();
+                // Group deferral proof requests by (source_shard, block_height).
+                let mut grouped: std::collections::HashMap<
+                    (ShardGroupId, BlockHeight),
+                    Vec<(Hash, hyperscale_core::InclusionProofFetchReason)>,
+                > = std::collections::HashMap::new();
                 for output in outputs {
                     match output {
                         hyperscale_livelock::LivelockOutput::FetchInclusionProof {
@@ -1012,22 +1030,31 @@ impl StateMachine for NodeStateMachine {
                             winner_tx_hash,
                             loser_tx_hash,
                         } => {
-                            let peers = self
-                                .topology
-                                .snapshot()
-                                .committee_for_shard(source_shard)
-                                .to_vec();
-                            actions.push(Action::RequestTxInclusionProof {
-                                source_shard,
-                                source_block_height,
-                                winner_tx_hash,
-                                reason: hyperscale_core::InclusionProofFetchReason::Deferral {
-                                    loser_tx_hash,
-                                },
-                                peers,
-                            });
+                            grouped
+                                .entry((source_shard, source_block_height))
+                                .or_default()
+                                .push((
+                                    winner_tx_hash,
+                                    hyperscale_core::InclusionProofFetchReason::Deferral {
+                                        loser_tx_hash,
+                                    },
+                                ));
                         }
                     }
+                }
+                let mut actions = Vec::new();
+                for ((source_shard, source_block_height), entries) in grouped {
+                    let peers = self
+                        .topology
+                        .snapshot()
+                        .committee_for_shard(source_shard)
+                        .to_vec();
+                    actions.push(Action::RequestTxInclusionProofs {
+                        source_shard,
+                        source_block_height,
+                        entries,
+                        peers,
+                    });
                 }
                 actions
             }

@@ -75,8 +75,8 @@ pub use signing::{
 };
 
 pub use block::{
-    compute_receipt_root, compute_transaction_root, tx_inclusion_proof, Block, BlockHeader,
-    BlockManifest, BlockMetadata, CommittedBlockHeader, PriorityInclusion,
+    compute_receipt_root, compute_transaction_root, tx_inclusion_proof, tx_inclusion_proofs, Block,
+    BlockHeader, BlockManifest, BlockMetadata, CommittedBlockHeader, PriorityInclusion,
 };
 pub use execution_vote::{
     compute_receipt_root_with_proof, tx_outcome_leaf, ExecutionCertificate, ExecutionVote,
