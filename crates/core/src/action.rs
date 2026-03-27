@@ -430,18 +430,14 @@ pub enum Action {
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 
-    /// Execute a cross-shard transaction with provisioned state.
+    /// Execute a batch of cross-shard transactions with provisioned state.
     ///
-    /// Used after cross-shard provisioning completes. The IoLoop accumulates
-    /// these into a batch and flushes them to the execution pool as a group.
-    /// Each transaction produces an individual `ProtocolEvent::ExecutionVoteReceived`.
-    ExecuteCrossShardTransaction {
-        /// Transaction hash (for correlation).
-        tx_hash: Hash,
-        /// The transaction to execute.
-        transaction: Arc<RoutableTransaction>,
-        /// State provisions from other shards.
-        provisions: Vec<StateProvision>,
+    /// Used after cross-shard provisioning completes. The state machine batches
+    /// all ready transactions and emits a single action for parallel execution.
+    /// Returns `ProtocolEvent::ExecutionBatchCompleted` when complete.
+    ExecuteCrossShardTransactions {
+        /// The cross-shard execution requests to process.
+        requests: Vec<CrossShardExecutionRequest>,
     },
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -783,7 +779,7 @@ impl Action {
                 | Action::BuildProposal { .. }
                 | Action::ExecuteTransactions { .. }
                 | Action::SpeculativeExecute { .. }
-                | Action::ExecuteCrossShardTransaction { .. }
+                | Action::ExecuteCrossShardTransactions { .. }
                 | Action::FetchAndBroadcastProvisions { .. }
                 | Action::FetchBlock { .. }
                 | Action::FetchChainMetadata
@@ -837,7 +833,7 @@ impl Action {
             // Delegated Work - Execution
             Action::ExecuteTransactions { .. } => "ExecuteTransactions",
             Action::SpeculativeExecute { .. } => "SpeculativeExecute",
-            Action::ExecuteCrossShardTransaction { .. } => "ExecuteCrossShardTransaction",
+            Action::ExecuteCrossShardTransactions { .. } => "ExecuteCrossShardTransactions",
             Action::FetchAndBroadcastProvisions { .. } => "FetchAndBroadcastProvisions",
 
             // External Notifications

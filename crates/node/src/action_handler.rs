@@ -5,8 +5,8 @@
 //! loop's `dispatch_delegated_action` spawns closures that call this function
 //! on the appropriate thread pool.
 //!
-//! Batched work (execution votes, execution certs, cross-shard execution) and block
-//! commits are handled inline by the I/O loop's flush closures.
+//! Batched work (execution votes, execution certs) and block commits are
+//! handled inline by the I/O loop's flush closures.
 
 use hyperscale_core::{Action, NodeInput, ProtocolEvent};
 use hyperscale_dispatch::Dispatch;
@@ -74,6 +74,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         // Execution
         Action::ExecuteTransactions { .. } => Some(DispatchPool::Execution),
         Action::SpeculativeExecute { .. } => Some(DispatchPool::Execution),
+        Action::ExecuteCrossShardTransactions { .. } => Some(DispatchPool::Execution),
         _ => None,
     }
 }
@@ -505,6 +506,51 @@ pub(crate) fn handle_delegated_action<
                         tx_hashes,
                     }),
                 ],
+                prepared_commit: None,
+            })
+        }
+
+        // --- Cross-shard transaction execution ---
+        Action::ExecuteCrossShardTransactions { requests } => {
+            let local_shard = ctx.local_shard;
+            let num_shards = ctx.num_shards;
+            let raw_results: Vec<_> = ctx.dispatch.map_local(&requests, |req| {
+                hyperscale_execution::handlers::execute_cross_shard(
+                    ctx.executor,
+                    ctx.storage,
+                    req.tx_hash,
+                    &req.transaction,
+                    &req.provisions,
+                )
+            });
+
+            let wave_results: Vec<_> = raw_results
+                .iter()
+                .map(hyperscale_execution::handlers::extract_wave_result)
+                .collect();
+            let results = raw_results
+                .into_iter()
+                .map(|r| {
+                    let mut result = ExecutionResult::from(r);
+                    if num_shards > 1 {
+                        result.database_updates = hyperscale_storage::filter_updates_to_shard(
+                            &result.database_updates,
+                            local_shard,
+                            num_shards,
+                        );
+                    }
+                    result
+                })
+                .collect();
+
+            Some(DelegatedResult {
+                events: vec![NodeInput::Protocol(
+                    ProtocolEvent::ExecutionBatchCompleted {
+                        results,
+                        wave_results,
+                        speculative: false,
+                    },
+                )],
                 prepared_commit: None,
             })
         }

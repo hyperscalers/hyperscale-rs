@@ -34,9 +34,7 @@ use crate::protocol::provision_fetch::{ProvisionFetchInput, ProvisionFetchProtoc
 use crate::protocol::sync::{SyncInput, SyncProtocol, SyncStatus};
 use crate::NodeStateMachine;
 use arc_swap::ArcSwap;
-use hyperscale_core::{
-    Action, CrossShardExecutionRequest, NodeInput, ProtocolEvent, StateMachine, TimerId,
-};
+use hyperscale_core::{Action, NodeInput, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{RadixExecutor, TransactionValidation};
 use hyperscale_messages::TransactionGossip;
@@ -189,7 +187,6 @@ where
 
     // Batch accumulators
     validation_batch: BatchAccumulator<Arc<RoutableTransaction>>,
-    cross_shard_batch: BatchAccumulator<CrossShardExecutionRequest>,
     committed_header_batch: BatchAccumulator<CommittedHeaderVerificationItem>,
 
     // Block commit accumulator — collects EmitCommittedBlock actions within a
@@ -283,7 +280,6 @@ where
             provision_fetch_protocol,
             inclusion_proof_fetch_protocol,
             validation_batch: BatchAccumulator::new(b.tx_validation_max, b.tx_validation_window),
-            cross_shard_batch: BatchAccumulator::new(b.cross_shard_max, b.cross_shard_window),
             committed_header_batch: BatchAccumulator::new(
                 b.committed_header_max,
                 b.committed_header_window,
@@ -766,9 +762,6 @@ where
         if self.validation_batch.is_expired(now) {
             self.flush_validation_batch();
         }
-        if self.cross_shard_batch.is_expired(now) {
-            self.flush_cross_shard_executions();
-        }
         if self.committed_header_batch.is_expired(now) {
             self.flush_committed_header_verifications();
         }
@@ -781,7 +774,6 @@ where
     pub fn nearest_batch_deadline(&self) -> Option<Duration> {
         [
             self.validation_batch.deadline(),
-            self.cross_shard_batch.deadline(),
             self.committed_header_batch.deadline(),
         ]
         .into_iter()
@@ -879,7 +871,6 @@ where
         self.flush_pending_receipts();
 
         self.flush_validation_batch();
-        self.flush_cross_shard_executions();
         self.flush_committed_header_verifications();
     }
 }

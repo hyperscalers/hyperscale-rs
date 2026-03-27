@@ -30,7 +30,7 @@
 //! Validators collect shard execution proofs from all participating shards. When all
 //! proofs are received, a TransactionCertificate is created.
 
-use hyperscale_core::{Action, ProtocolEvent, ProvisionRequest};
+use hyperscale_core::{Action, CrossShardExecutionRequest, ProtocolEvent, ProvisionRequest};
 use hyperscale_types::{
     BlockHeight, Bls12381G1PublicKey, ExecutionWaveVote, Hash, NodeId, RoutableTransaction,
     ShardExecutionProof, ShardGroupId, StateProvision, TopologySnapshot, TransactionCertificate,
@@ -1056,8 +1056,19 @@ impl ExecutionState {
         }
 
         // Handle cross-shard execution tracking (dedup-filtered — don't re-track)
+        let mut cross_shard_requests = Vec::new();
         for tx in cross_shard {
-            actions.extend(self.start_cross_shard_execution(topology, tx, height));
+            actions.extend(self.start_cross_shard_execution(
+                topology,
+                tx,
+                height,
+                &mut cross_shard_requests,
+            ));
+        }
+        if !cross_shard_requests.is_empty() {
+            actions.push(Action::ExecuteCrossShardTransactions {
+                requests: cross_shard_requests,
+            });
         }
 
         actions
@@ -1111,6 +1122,7 @@ impl ExecutionState {
         topology: &TopologySnapshot,
         tx: Arc<RoutableTransaction>,
         height: u64,
+        cross_shard_requests: &mut Vec<CrossShardExecutionRequest>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let tx_hash = tx.hash();
@@ -1165,7 +1177,9 @@ impl ExecutionState {
                     count = provisions.len(),
                     "Replaying early ProvisioningComplete"
                 );
-                actions.extend(self.on_provisioning_complete(topology, tx_hash, provisions));
+                if let Some(req) = self.on_provisioning_complete(topology, tx_hash, provisions) {
+                    cross_shard_requests.push(req);
+                }
             }
         }
 
@@ -1196,13 +1210,14 @@ impl ExecutionState {
     ///
     /// If the block hasn't been committed yet (i.e., tx not in pending_provisioning),
     /// we buffer the provisions and replay when the block commits.
+    /// Returns `Some(request)` if execution is ready, `None` if buffered.
     #[instrument(skip(self, provisions), fields(tx_hash = ?tx_hash))]
     pub fn on_provisioning_complete(
         &mut self,
         topology: &TopologySnapshot,
         tx_hash: Hash,
         provisions: Vec<StateProvision>,
-    ) -> Vec<Action> {
+    ) -> Option<CrossShardExecutionRequest> {
         let local_shard = topology.local_shard();
 
         // Get the transaction waiting for provisions
@@ -1217,7 +1232,7 @@ impl ExecutionState {
             let current_height = self.committed_height;
             self.early_provisioning_complete
                 .insert(tx_hash, (provisions, current_height));
-            return vec![];
+            return None;
         };
 
         tracing::debug!(
@@ -1227,12 +1242,11 @@ impl ExecutionState {
             "Provisioning complete, executing cross-shard transaction"
         );
 
-        // Delegate execution to the runner (which batches for parallel execution)
-        vec![Action::ExecuteCrossShardTransaction {
+        Some(CrossShardExecutionRequest {
             tx_hash,
             transaction: tx,
             provisions,
-        }]
+        })
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

@@ -152,14 +152,6 @@ where
             | Action::VerifyExecutionWaveCertificateSignature { .. } => {
                 self.dispatch_delegated_action(action);
             }
-            Action::ExecuteCrossShardTransaction {
-                tx_hash,
-                transaction,
-                provisions,
-            } => {
-                self.accumulate_cross_shard_execution(tx_hash, transaction, provisions);
-            }
-
             // ═══════════════════════════════════════════════════════════
             // Delegated work — immediate dispatch
             // ═══════════════════════════════════════════════════════════
@@ -172,6 +164,7 @@ where
             | Action::VerifyProvisionBatch { .. }
             | Action::ExecuteTransactions { .. }
             | Action::SpeculativeExecute { .. }
+            | Action::ExecuteCrossShardTransactions { .. }
             | Action::FetchAndBroadcastProvisions { .. } => {
                 self.dispatch_delegated_action(action);
             }
@@ -713,7 +706,11 @@ where
     /// enter the channel immediately and are drained by the harness.
     fn dispatch_delegated_action(&mut self, action: Action) {
         let is_speculative = matches!(action, Action::SpeculativeExecute { .. });
-        let is_execution = is_speculative || matches!(action, Action::ExecuteTransactions { .. });
+        let is_execution = is_speculative
+            || matches!(
+                action,
+                Action::ExecuteTransactions { .. } | Action::ExecuteCrossShardTransactions { .. }
+            );
         let pool = action_handler::dispatch_pool_for(&action)
             .expect("dispatch_delegated_action called for delegated actions only");
 
