@@ -16,7 +16,7 @@ use hyperscale_network::HandlerRegistry;
 use libp2p::{PeerId, Stream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
@@ -37,6 +37,48 @@ const MAX_INBOUND_CONCURRENT: usize = 128;
 
 /// Maximum number of concurrent inbound streams from a single peer.
 const MAX_INBOUND_PER_PEER: usize = 16;
+
+/// Number of stream failures within [`FAILURE_WINDOW`] before triggering a cooldown.
+///
+/// When a peer's streams fail at high rate (e.g. the peer is crash-looping or its
+/// transport is broken), each failure still spawns a tokio task, reads from the
+/// QUIC stream, and logs a warning. At 18+ failures/sec this saturates the runtime.
+const FAILURE_THRESHOLD: u32 = 8;
+
+/// Time window for counting failures. Resets when the window elapses.
+const FAILURE_WINDOW: Duration = Duration::from_secs(10);
+
+/// Initial cooldown duration after the failure threshold is exceeded.
+const INITIAL_COOLDOWN: Duration = Duration::from_secs(1);
+
+/// Maximum cooldown duration (exponential backoff cap).
+const MAX_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Per-peer failure rate tracking state.
+///
+/// Lives inside the `per_peer_failures` DashMap and is accessed from both the
+/// accept loop (to check cooldown) and stream handler tasks (to record outcomes).
+struct PeerRateState {
+    /// Failures observed in the current window.
+    failures: u32,
+    /// When the current failure-counting window started.
+    window_start: Instant,
+    /// Streams are rejected until this time. `None` if the peer is not in cooldown.
+    cooldown_until: Option<Instant>,
+    /// Current backoff duration (doubles after each consecutive cooldown trigger).
+    backoff: Duration,
+}
+
+impl PeerRateState {
+    fn new() -> Self {
+        Self {
+            failures: 0,
+            window_start: Instant::now(),
+            cooldown_until: None,
+            backoff: INITIAL_COOLDOWN,
+        }
+    }
+}
 
 /// Handle for the inbound router tasks.
 ///
@@ -63,6 +105,8 @@ struct InboundRouter {
     global_semaphore: Arc<Semaphore>,
     /// Per-peer active stream count.
     per_peer: Arc<DashMap<PeerId, AtomicUsize>>,
+    /// Per-peer failure rate tracking for cooldown.
+    per_peer_failures: Arc<DashMap<PeerId, PeerRateState>>,
 }
 
 impl InboundRouter {
@@ -74,6 +118,7 @@ impl InboundRouter {
             registry,
             global_semaphore: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENT)),
             per_peer: Arc::new(DashMap::new()),
+            per_peer_failures: Arc::new(DashMap::new()),
         });
 
         // ── Request accept loop (REQUEST_PROTOCOL) ──
@@ -98,8 +143,12 @@ impl InboundRouter {
                             let _permit = permit;
                             let result = router_clone.handle_request_stream(peer_id, stream).await;
                             router_clone.decrement_peer_count(&peer_id);
-                            if let Err(e) = result {
-                                warn!(peer = %peer_id, error = ?e, "Request stream handling failed");
+                            match result {
+                                Ok(()) => router_clone.record_success(&peer_id),
+                                Err(ref e) => {
+                                    router_clone.record_failure(&peer_id);
+                                    debug!(peer = %peer_id, error = ?e, "Request stream handling failed");
+                                }
                             }
                         });
                     } else {
@@ -135,8 +184,12 @@ impl InboundRouter {
                                 .handle_notification_stream(peer_id, stream)
                                 .await;
                             router_clone.decrement_peer_count(&peer_id);
-                            if let Err(e) = result {
-                                warn!(peer = %peer_id, error = ?e, "Notification stream handling failed");
+                            match result {
+                                Ok(()) => router_clone.record_success(&peer_id),
+                                Err(ref e) => {
+                                    router_clone.record_failure(&peer_id);
+                                    debug!(peer = %peer_id, error = ?e, "Notification stream handling failed");
+                                }
                             }
                         });
                     } else {
@@ -154,10 +207,29 @@ impl InboundRouter {
         }
     }
 
-    /// Try to admit an inbound stream, checking per-peer and global limits.
+    /// Try to admit an inbound stream, checking failure-rate cooldown,
+    /// per-peer concurrency, and global concurrency limits (in that order).
     ///
     /// Returns `Some(permit)` if admitted, `None` if rejected.
     fn try_admit(self: &Arc<Self>, peer_id: &PeerId) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        // ── Failure-rate cooldown check ──
+        if let Some(mut state) = self.per_peer_failures.get_mut(peer_id) {
+            if let Some(until) = state.cooldown_until {
+                if Instant::now() < until {
+                    // Peer is in cooldown — silently drop without logging each
+                    // stream (the cooldown-start log is sufficient).
+                    return None;
+                }
+                // Cooldown expired — clear it and reset the failure window so
+                // the peer gets a fresh chance. Backoff is preserved so the
+                // next cooldown (if it re-triggers) uses a longer duration.
+                state.cooldown_until = None;
+                state.failures = 0;
+                state.window_start = Instant::now();
+            }
+        }
+
+        // ── Per-peer concurrency check ──
         let peer_counter = self
             .per_peer
             .entry(*peer_id)
@@ -175,6 +247,7 @@ impl InboundRouter {
             return None;
         }
 
+        // ── Global concurrency check ──
         match self.global_semaphore.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
             Err(_) => {
@@ -193,6 +266,50 @@ impl InboundRouter {
     fn decrement_peer_count(&self, peer_id: &PeerId) {
         if let Some(counter) = self.per_peer.get(peer_id) {
             counter.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record a stream failure for a peer. If failures exceed the threshold
+    /// within the time window, the peer enters an exponential-backoff cooldown
+    /// during which all new streams are silently dropped.
+    fn record_failure(&self, peer_id: &PeerId) {
+        let now = Instant::now();
+        let mut entry = self
+            .per_peer_failures
+            .entry(*peer_id)
+            .or_insert_with(PeerRateState::new);
+        let state = entry.value_mut();
+
+        // Reset window if expired.
+        if now.duration_since(state.window_start) > FAILURE_WINDOW {
+            state.failures = 0;
+            state.window_start = now;
+        }
+
+        state.failures += 1;
+
+        if state.failures >= FAILURE_THRESHOLD && state.cooldown_until.is_none() {
+            let cooldown = state.backoff;
+            state.cooldown_until = Some(now + cooldown);
+            // Double backoff for next trigger, capped.
+            state.backoff = (cooldown * 2).min(MAX_COOLDOWN);
+            warn!(
+                peer = %peer_id,
+                failures = state.failures,
+                cooldown_secs = cooldown.as_secs_f32(),
+                "Peer entering failure cooldown — streams will be dropped"
+            );
+        }
+    }
+
+    /// Record a successful stream for a peer. Resets failure tracking so
+    /// recovered peers regain trust immediately.
+    fn record_success(&self, peer_id: &PeerId) {
+        if let Some(mut entry) = self.per_peer_failures.get_mut(peer_id) {
+            let state = entry.value_mut();
+            state.failures = 0;
+            state.cooldown_until = None;
+            state.backoff = INITIAL_COOLDOWN;
         }
     }
 
