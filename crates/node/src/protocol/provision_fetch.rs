@@ -26,6 +26,13 @@ pub struct ProvisionFetchConfig {
     pub max_concurrent: usize,
     /// Maximum full rounds through all peers before giving up.
     pub max_rounds: u32,
+    /// Maximum number of pending fetch entries per source shard.
+    ///
+    /// Prevents unbounded accumulation when a remote shard is down: without
+    /// this cap, every timed-out block height adds a new entry, each of which
+    /// goes through max_rounds × peers × RequestManager retries before draining.
+    /// When the cap is reached, new requests for that shard are dropped.
+    pub max_pending_per_shard: usize,
 }
 
 impl Default for ProvisionFetchConfig {
@@ -33,6 +40,7 @@ impl Default for ProvisionFetchConfig {
         Self {
             max_concurrent: 4,
             max_rounds: 3,
+            max_pending_per_shard: 8,
         }
     }
 }
@@ -147,6 +155,18 @@ impl ProvisionFetchProtocol {
         !self.pending.is_empty()
     }
 
+    /// Returns the number of pending fetches for a given source shard.
+    #[allow(dead_code)] // Used in tests; will be used for metrics/coordinator integration.
+    pub fn pending_count_for_shard(&self, shard: ShardGroupId) -> usize {
+        self.pending.keys().filter(|(s, _)| *s == shard).count()
+    }
+
+    /// Returns true if the given source shard has reached its pending fetch limit.
+    #[allow(dead_code)] // Used in tests; will be used for metrics/coordinator integration.
+    pub fn is_shard_saturated(&self, shard: ShardGroupId) -> bool {
+        self.pending_count_for_shard(shard) >= self.config.max_pending_per_shard
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Input Handlers
     // ═══════════════════════════════════════════════════════════════════════
@@ -172,6 +192,34 @@ impl ProvisionFetchProtocol {
                 "Refreshed peer list for pending provision fetch"
             );
             return vec![];
+        }
+
+        // Check per-shard cap to prevent unbounded accumulation when a shard is down.
+        // When the cap is reached, evict the oldest (lowest block height) entry for
+        // that shard. Newer heights are more relevant for making progress.
+        let shard_pending = self
+            .pending
+            .keys()
+            .filter(|(s, _)| *s == source_shard)
+            .count();
+        if shard_pending >= self.config.max_pending_per_shard {
+            // Find the oldest entry (lowest block height) for this shard.
+            let oldest_key = self
+                .pending
+                .keys()
+                .filter(|(s, _)| *s == source_shard)
+                .min_by_key(|(_, h)| *h)
+                .copied();
+            if let Some(oldest) = oldest_key {
+                warn!(
+                    source_shard = source_shard.0,
+                    evicted_height = oldest.1 .0,
+                    new_height = block_height.0,
+                    limit = self.config.max_pending_per_shard,
+                    "Evicting oldest provision fetch to make room (shard pending limit)"
+                );
+                self.pending.remove(&oldest);
+            }
         }
 
         debug!(
@@ -496,6 +544,7 @@ mod tests {
         let config = ProvisionFetchConfig::default();
         assert_eq!(config.max_concurrent, 4);
         assert_eq!(config.max_rounds, 3);
+        assert_eq!(config.max_pending_per_shard, 8);
     }
 
     #[test]
@@ -836,5 +885,99 @@ mod tests {
             !protocol.has_pending(),
             "Cancel should remove even in-flight fetches"
         );
+    }
+
+    #[test]
+    fn test_per_shard_pending_cap_evicts_oldest() {
+        let config = ProvisionFetchConfig {
+            max_pending_per_shard: 3,
+            ..default_config()
+        };
+        let mut protocol = ProvisionFetchProtocol::new(config);
+
+        // Fill up to the cap for shard 1.
+        for h in 10..13 {
+            protocol.handle(ProvisionFetchInput::Request {
+                source_shard: shard(1),
+                block_height: height(h),
+                target_shard: shard(0),
+                peers: vec![vid(1), vid(2)],
+                preferred_peer: vid(1),
+            });
+        }
+        assert_eq!(protocol.pending_count_for_shard(shard(1)), 3);
+        assert!(protocol.is_shard_saturated(shard(1)));
+
+        // 4th request should evict the oldest (height 10) and insert height 13.
+        protocol.handle(ProvisionFetchInput::Request {
+            source_shard: shard(1),
+            block_height: height(13),
+            target_shard: shard(0),
+            peers: vec![vid(1), vid(2)],
+            preferred_peer: vid(1),
+        });
+        assert_eq!(
+            protocol.pending_count_for_shard(shard(1)),
+            3,
+            "Should still be 3 after eviction"
+        );
+        // Height 10 should be gone, height 13 should be present.
+        assert!(
+            !protocol.pending.contains_key(&(shard(1), height(10))),
+            "Oldest entry (height 10) should have been evicted"
+        );
+        assert!(
+            protocol.pending.contains_key(&(shard(1), height(13))),
+            "New entry (height 13) should be present"
+        );
+
+        // Requests for a DIFFERENT shard should still be accepted independently.
+        protocol.handle(ProvisionFetchInput::Request {
+            source_shard: shard(2),
+            block_height: height(10),
+            target_shard: shard(0),
+            peers: vec![vid(3)],
+            preferred_peer: vid(3),
+        });
+        assert_eq!(protocol.pending_count_for_shard(shard(2)), 1);
+    }
+
+    #[test]
+    fn test_per_shard_cap_frees_on_receive() {
+        let config = ProvisionFetchConfig {
+            max_pending_per_shard: 2,
+            ..default_config()
+        };
+        let mut protocol = ProvisionFetchProtocol::new(config);
+
+        // Fill to cap.
+        for h in 10..12 {
+            protocol.handle(ProvisionFetchInput::Request {
+                source_shard: shard(1),
+                block_height: height(h),
+                target_shard: shard(0),
+                peers: vec![vid(1)],
+                preferred_peer: vid(1),
+            });
+        }
+        assert!(protocol.is_shard_saturated(shard(1)));
+
+        // Complete one fetch — should free a slot.
+        protocol.handle(ProvisionFetchInput::Received {
+            source_shard: shard(1),
+            block_height: height(10),
+            batch: ProvisionBatch::dummy(shard(1), height(10)),
+        });
+        assert!(!protocol.is_shard_saturated(shard(1)));
+
+        // New request should now be accepted without eviction.
+        protocol.handle(ProvisionFetchInput::Request {
+            source_shard: shard(1),
+            block_height: height(12),
+            target_shard: shard(0),
+            peers: vec![vid(1)],
+            preferred_peer: vid(1),
+        });
+        assert_eq!(protocol.pending_count_for_shard(shard(1)), 2);
     }
 }
