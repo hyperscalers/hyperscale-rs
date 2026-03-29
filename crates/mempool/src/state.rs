@@ -11,6 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::instrument;
 
+/// Default minimum dwell time for transactions before they become eligible for block inclusion.
+///
+/// Allows time for transaction gossip to propagate across validators before proposal,
+/// improving batching and fairness.
+pub const DEFAULT_MIN_DWELL_TIME: Duration = Duration::from_millis(150);
+
 /// Number of blocks to retain evicted transactions for peer fetch requests.
 /// This allows slow validators to catch up and fetch transactions from peers
 /// even after the transaction has been evicted from the active pool.
@@ -50,6 +56,14 @@ pub struct MempoolConfig {
     /// processing capacity. Set to approximately a few blocks worth of transactions.
     #[serde(default = "default_max_pending")]
     pub max_pending: usize,
+
+    /// Minimum time a transaction must spend in the mempool before it can be selected
+    /// for block inclusion. Transactions that have not yet met this dwell time are
+    /// skipped during proposal selection but remain in the ready set.
+    ///
+    /// Set to zero to disable (default).
+    #[serde(default = "default_min_dwell_time")]
+    pub min_dwell_time: Duration,
 }
 
 fn default_max_in_flight() -> usize {
@@ -60,11 +74,16 @@ fn default_max_pending() -> usize {
     DEFAULT_MAX_PENDING
 }
 
+fn default_min_dwell_time() -> Duration {
+    DEFAULT_MIN_DWELL_TIME
+}
+
 impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
             max_in_flight: DEFAULT_IN_FLIGHT_LIMIT,
             max_pending: DEFAULT_MAX_PENDING,
+            min_dwell_time: DEFAULT_MIN_DWELL_TIME,
         }
     }
 }
@@ -117,6 +136,7 @@ struct PoolEntry {
 #[derive(Debug, Clone)]
 struct ReadyEntry {
     tx: Arc<RoutableTransaction>,
+    added_at: Duration,
 }
 
 /// Mempool state machine.
@@ -320,7 +340,7 @@ impl MempoolState {
         );
 
         // Add to ready tracking
-        self.add_to_ready_tracking(hash, &tx, cross_shard);
+        self.add_to_ready_tracking(hash, &tx, cross_shard, self.now);
 
         tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
 
@@ -378,7 +398,7 @@ impl MempoolState {
         );
 
         // Add to ready tracking
-        self.add_to_ready_tracking(hash, &tx, cross_shard);
+        self.add_to_ready_tracking(hash, &tx, cross_shard, self.now);
 
         tracing::debug!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
 
@@ -873,7 +893,7 @@ impl MempoolState {
                     );
 
                     // Add to ready tracking
-                    self.add_to_ready_tracking(retry_hash, &retry_tx, cross_shard);
+                    self.add_to_ready_tracking(retry_hash, &retry_tx, cross_shard, self.now);
 
                     // Emit status for retry transaction
                     actions.push(Action::EmitTransactionStatus {
@@ -973,7 +993,7 @@ impl MempoolState {
                     );
 
                     // Add to ready tracking
-                    self.add_to_ready_tracking(retry_hash, &retry_tx, cross_shard);
+                    self.add_to_ready_tracking(retry_hash, &retry_tx, cross_shard, self.now);
 
                     // Emit status for retry
                     actions.push(Action::EmitTransactionStatus {
@@ -1052,7 +1072,7 @@ impl MempoolState {
             );
 
             // Add to ready tracking
-            self.add_to_ready_tracking(retry_hash, &retry_tx, cross_shard);
+            self.add_to_ready_tracking(retry_hash, &retry_tx, cross_shard, self.now);
 
             // Emit status for retry transaction
             actions.push(Action::EmitTransactionStatus {
@@ -1208,7 +1228,7 @@ impl MempoolState {
                 );
 
                 // Add to ready tracking
-                self.add_to_ready_tracking(retry_hash, &retry_tx, cross_shard);
+                self.add_to_ready_tracking(retry_hash, &retry_tx, cross_shard, self.now);
 
                 // Emit status for retry transaction
                 actions.push(Action::EmitTransactionStatus {
@@ -1402,6 +1422,7 @@ impl MempoolState {
         hash: Hash,
         tx: &Arc<RoutableTransaction>,
         cross_shard: bool,
+        added_at: Duration,
     ) {
         // Find all locked nodes that block this transaction
         let mut blocking_nodes: HashSet<NodeId> = tx
@@ -1438,14 +1459,23 @@ impl MempoolState {
         }
 
         // Transaction is not deferred - add to appropriate ready set
-        self.add_to_ready_set(hash, tx, cross_shard);
+        self.add_to_ready_set(hash, tx, cross_shard, added_at);
     }
 
     /// Add a transaction to the ready set.
     ///
     /// Precondition: transaction must not be deferred by any locked nodes.
-    fn add_to_ready_set(&mut self, hash: Hash, tx: &Arc<RoutableTransaction>, _cross_shard: bool) {
-        let ready_entry = ReadyEntry { tx: Arc::clone(tx) };
+    fn add_to_ready_set(
+        &mut self,
+        hash: Hash,
+        tx: &Arc<RoutableTransaction>,
+        _cross_shard: bool,
+        added_at: Duration,
+    ) {
+        let ready_entry = ReadyEntry {
+            tx: Arc::clone(tx),
+            added_at,
+        };
 
         // Add to reverse index for O(1) blocking when nodes become locked
         for node in tx.all_declared_nodes() {
@@ -1544,7 +1574,7 @@ impl MempoolState {
         };
 
         // Collect transactions to promote (to avoid borrow checker issues)
-        let mut to_promote: Vec<(Hash, Arc<RoutableTransaction>, bool)> = Vec::new();
+        let mut to_promote: Vec<(Hash, Arc<RoutableTransaction>, bool, Duration)> = Vec::new();
 
         for tx_hash in deferred_txs {
             if let Some(blocking_nodes) = self.deferred_by_nodes.get_mut(&tx_hash) {
@@ -1558,7 +1588,12 @@ impl MempoolState {
                     // Get transaction info from pool
                     if let Some(entry) = self.pool.get(&tx_hash) {
                         if entry.status == TransactionStatus::Pending {
-                            to_promote.push((tx_hash, Arc::clone(&entry.tx), entry.cross_shard));
+                            to_promote.push((
+                                tx_hash,
+                                Arc::clone(&entry.tx),
+                                entry.cross_shard,
+                                entry.added_at,
+                            ));
                         }
                     }
                 }
@@ -1566,8 +1601,8 @@ impl MempoolState {
         }
 
         // Now promote all collected transactions
-        for (hash, tx, cross_shard) in to_promote {
-            self.add_to_ready_set(hash, &tx, cross_shard);
+        for (hash, tx, cross_shard, added_at) in to_promote {
+            self.add_to_ready_set(hash, &tx, cross_shard, added_at);
         }
     }
 
@@ -1623,9 +1658,14 @@ impl MempoolState {
         let mut result = ReadyTransactions::default();
 
         // Iterate ready set in hash order (BTreeMap guarantees this)
+        let min_dwell = self.config.min_dwell_time;
         for entry in self.ready.values() {
             if result.transactions.len() >= max_count {
                 break;
+            }
+            // Skip transactions that haven't met minimum dwell time
+            if self.now.saturating_sub(entry.added_at) < min_dwell {
+                continue;
             }
             result.transactions.push(Arc::clone(&entry.tx));
         }
@@ -2804,6 +2844,7 @@ mod tests {
         MempoolConfig {
             max_in_flight: limit,
             max_pending: DEFAULT_MAX_PENDING,
+            min_dwell_time: Duration::ZERO,
         }
     }
 
@@ -2918,7 +2959,11 @@ mod tests {
     #[test]
     fn test_backpressure_not_at_limit_allows_all_txns() {
         let topology = make_cross_shard_topology();
-        let mut mempool = MempoolState::new();
+        let config = MempoolConfig {
+            min_dwell_time: Duration::ZERO,
+            ..MempoolConfig::default()
+        };
+        let mut mempool = MempoolState::with_config(config);
 
         // Mempool is not at limit (nothing committed)
         assert!(!mempool.at_in_flight_limit());
@@ -3000,5 +3045,133 @@ mod tests {
             TransactionStatus::Completed(TransactionDecision::Accept),
         );
         assert_eq!(mempool.in_flight(), 0, "All completed");
+    }
+
+    // =========================================================================
+    // Minimum Dwell Time Tests
+    // =========================================================================
+
+    #[test]
+    fn test_dwell_time_zero_selects_immediately() {
+        let config = MempoolConfig {
+            min_dwell_time: Duration::ZERO,
+            ..MempoolConfig::default()
+        };
+        let mut mempool = MempoolState::with_config(config);
+        let topology = make_test_topology();
+
+        mempool.set_time(Duration::from_secs(10));
+        let tx = test_transaction(1);
+        mempool.on_submit_transaction(&topology, tx);
+
+        let ready = mempool.ready_transactions(10, 0, 0);
+        assert_eq!(
+            ready.transactions.len(),
+            1,
+            "Zero dwell time should select immediately"
+        );
+    }
+
+    #[test]
+    fn test_dwell_time_default_150ms() {
+        // Default config has 150ms dwell time
+        let mut mempool = MempoolState::new();
+        let topology = make_test_topology();
+
+        mempool.set_time(Duration::from_secs(10));
+        let tx = test_transaction(1);
+        mempool.on_submit_transaction(&topology, tx);
+
+        // At t=10.1s — not yet eligible (100ms < 150ms)
+        mempool.set_time(Duration::from_millis(10_100));
+        let ready = mempool.ready_transactions(10, 0, 0);
+        assert_eq!(
+            ready.transactions.len(),
+            0,
+            "Should not select before 150ms default dwell"
+        );
+
+        // At t=10.15s — eligible (150ms >= 150ms)
+        mempool.set_time(Duration::from_millis(10_150));
+        let ready = mempool.ready_transactions(10, 0, 0);
+        assert_eq!(
+            ready.transactions.len(),
+            1,
+            "Should select after 150ms default dwell"
+        );
+    }
+
+    #[test]
+    fn test_dwell_time_filters_recent_transactions() {
+        let config = MempoolConfig {
+            min_dwell_time: Duration::from_millis(500),
+            ..MempoolConfig::default()
+        };
+        let mut mempool = MempoolState::with_config(config);
+        let topology = make_test_topology();
+
+        // Submit at t=10s
+        mempool.set_time(Duration::from_secs(10));
+        let tx = test_transaction(1);
+        mempool.on_submit_transaction(&topology, tx);
+
+        // Still at t=10s — dwell time not met
+        let ready = mempool.ready_transactions(10, 0, 0);
+        assert_eq!(
+            ready.transactions.len(),
+            0,
+            "Should not select before dwell time"
+        );
+
+        // Advance to t=10.3s — still not enough
+        mempool.set_time(Duration::from_millis(10_300));
+        let ready = mempool.ready_transactions(10, 0, 0);
+        assert_eq!(
+            ready.transactions.len(),
+            0,
+            "Should not select before dwell time elapses"
+        );
+
+        // Advance to t=10.5s — exactly at dwell time
+        mempool.set_time(Duration::from_millis(10_500));
+        let ready = mempool.ready_transactions(10, 0, 0);
+        assert_eq!(
+            ready.transactions.len(),
+            1,
+            "Should select after dwell time elapses"
+        );
+    }
+
+    #[test]
+    fn test_dwell_time_mixed_eligibility() {
+        let config = MempoolConfig {
+            min_dwell_time: Duration::from_millis(200),
+            ..MempoolConfig::default()
+        };
+        let mut mempool = MempoolState::with_config(config);
+        let topology = make_test_topology();
+
+        // Submit tx1 at t=1s
+        mempool.set_time(Duration::from_secs(1));
+        let tx1 = test_transaction(1);
+        mempool.on_submit_transaction(&topology, tx1);
+
+        // Submit tx2 at t=1.3s
+        mempool.set_time(Duration::from_millis(1_300));
+        let tx2 = test_transaction(2);
+        mempool.on_submit_transaction(&topology, tx2);
+
+        // At t=1.2s — tx1 has 200ms dwell (eligible), tx2 not yet submitted
+        // Actually we already submitted tx2 at 1.3s, so check at 1.4s:
+        // tx1 added at 1.0s, now 1.4s → 400ms dwell (eligible)
+        // tx2 added at 1.3s, now 1.4s → 100ms dwell (not eligible)
+        mempool.set_time(Duration::from_millis(1_400));
+        let ready = mempool.ready_transactions(10, 0, 0);
+        assert_eq!(ready.transactions.len(), 1, "Only tx1 should be eligible");
+
+        // At t=1.5s — both eligible
+        mempool.set_time(Duration::from_millis(1_500));
+        let ready = mempool.ready_transactions(10, 0, 0);
+        assert_eq!(ready.transactions.len(), 2, "Both should be eligible");
     }
 }
