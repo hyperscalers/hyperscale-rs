@@ -814,12 +814,7 @@ impl<D: Dispatch + 'static> ConsensusStore for SimStorage<D> {
     fn put_block(&self, height: BlockHeight, block: &Block, qc: &QuorumCertificate) {
         let mut c = self.consensus.write().unwrap();
         // Index all transactions by hash for batch lookups
-        for tx in block
-            .retry_transactions
-            .iter()
-            .chain(block.priority_transactions.iter())
-            .chain(block.transactions.iter())
-        {
+        for tx in block.transactions.iter() {
             c.transactions.insert(tx.hash(), tx.as_ref().clone());
         }
         c.blocks.insert(height, (block.clone(), qc.clone()));

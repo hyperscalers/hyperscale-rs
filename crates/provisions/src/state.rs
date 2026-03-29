@@ -126,13 +126,6 @@ pub struct ProvisionCoordinator {
     expected_provisions: HashMap<(ShardGroupId, BlockHeight), ExpectedProvision>,
 
     // ═══════════════════════════════════════════════════════════════════
-    // Priority Inclusion Proof Cache
-    // ═══════════════════════════════════════════════════════════════════
-    /// Cached inclusion proofs for priority transactions, fetched on demand.
-    /// Consumed at proposal time by `take_cached_inclusion_proof`.
-    inclusion_proof_cache: HashMap<Hash, hyperscale_types::PriorityInclusion>,
-
-    // ═══════════════════════════════════════════════════════════════════
     // Time
     // ═══════════════════════════════════════════════════════════════════
     /// Current time.
@@ -173,7 +166,6 @@ impl ProvisionCoordinator {
             verified_batches: HashMap::new(),
             local_committed_height: BlockHeight(0),
             expected_provisions: HashMap::new(),
-            inclusion_proof_cache: HashMap::new(),
             now: Duration::ZERO,
         }
     }
@@ -752,44 +744,6 @@ impl ProvisionCoordinator {
     /// Clean up all state for a transaction.
     fn cleanup_tx(&mut self, tx_hash: &Hash) {
         self.registered_txs.remove(tx_hash);
-        self.inclusion_proof_cache.remove(tx_hash);
-    }
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // Priority Inclusion Proof Cache
-    // ═══════════════════════════════════════════════════════════════════════
-
-    /// Get txs that have verified provisions but no cached inclusion proof.
-    ///
-    /// Returns `(tx_hash, source_shard, source_block_height)` for each.
-    pub fn txs_needing_inclusion_proofs(&self) -> Vec<(Hash, ShardGroupId, BlockHeight)> {
-        self.verified_batches
-            .iter()
-            .flat_map(|(&(shard, height), batch)| {
-                batch
-                    .transactions
-                    .iter()
-                    .filter(|tx| !self.inclusion_proof_cache.contains_key(&tx.tx_hash))
-                    .map(move |tx| (tx.tx_hash, shard, height))
-            })
-            .collect()
-    }
-
-    /// Cache an inclusion proof for a priority tx.
-    pub fn cache_inclusion_proof(
-        &mut self,
-        tx_hash: Hash,
-        inclusion: hyperscale_types::PriorityInclusion,
-    ) {
-        self.inclusion_proof_cache.insert(tx_hash, inclusion);
-    }
-
-    /// Take (consume) a cached inclusion proof for proposal.
-    pub fn take_cached_inclusion_proof(
-        &mut self,
-        tx_hash: &Hash,
-    ) -> Option<hyperscale_types::PriorityInclusion> {
-        self.inclusion_proof_cache.remove(tx_hash)
     }
 }
 

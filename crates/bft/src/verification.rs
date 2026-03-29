@@ -327,8 +327,6 @@ impl VerificationPipeline {
     ) -> Vec<Action> {
         debug!(
             block_hash = ?block_hash,
-            retry_count = block.retry_transactions.len(),
-            priority_count = block.priority_transactions.len(),
             tx_count = block.transactions.len(),
             expected_root = ?block.header.transaction_root,
             "Initiating transaction root verification"
@@ -340,8 +338,6 @@ impl VerificationPipeline {
         vec![Action::VerifyTransactionRoot {
             block_hash,
             expected_root: block.header.transaction_root,
-            retry_transactions: block.retry_transactions.clone(),
-            priority_transactions: block.priority_transactions.clone(),
             transactions: block.transactions.clone(),
         }]
     }

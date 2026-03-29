@@ -9,11 +9,6 @@ use sbor::prelude::BasicSbor;
 /// Notifies committee members of a block proposal (header + manifest, not full block).
 /// Validators construct the full Block locally from header + mempool transactions.
 ///
-/// Transaction hashes are split into three priority sections in the manifest:
-/// 1. **retry_hashes**: Retry transactions (highest priority, critical for liveness)
-/// 2. **priority_hashes**: Cross-shard transactions with commitment proofs
-/// 3. **tx_hashes**: All other transactions
-///
 /// The `proposer_signature` is a BLS signature by the proposer over a domain-separated
 /// message, ensuring that block proposals cannot be forged by non-proposers.
 #[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
@@ -101,9 +96,12 @@ mod tests {
     fn test_block_header_gossip_creation() {
         let header = make_header(1);
         let manifest = BlockManifest {
-            retry_hashes: vec![Hash::from_bytes(b"retry1")],
-            priority_hashes: vec![Hash::from_bytes(b"priority1")],
-            tx_hashes: vec![Hash::from_bytes(b"tx1"), Hash::from_bytes(b"tx2")],
+            tx_hashes: vec![
+                Hash::from_bytes(b"tx1"),
+                Hash::from_bytes(b"tx2"),
+                Hash::from_bytes(b"tx3"),
+                Hash::from_bytes(b"tx4"),
+            ],
             ..Default::default()
         };
 
@@ -129,22 +127,20 @@ mod tests {
 
     #[test]
     fn test_block_header_gossip_all_transaction_hashes() {
-        let retry = Hash::from_bytes(b"retry");
-        let priority = Hash::from_bytes(b"priority");
-        let other = Hash::from_bytes(b"other");
+        let tx1 = Hash::from_bytes(b"tx1");
+        let tx2 = Hash::from_bytes(b"tx2");
+        let tx3 = Hash::from_bytes(b"tx3");
 
         let gossip = BlockHeaderNotification::new(
             make_header(1),
             BlockManifest {
-                retry_hashes: vec![retry],
-                priority_hashes: vec![priority],
-                tx_hashes: vec![other],
+                tx_hashes: vec![tx1, tx2, tx3],
                 ..Default::default()
             },
             zero_sig(),
         );
 
-        let all: Vec<Hash> = gossip.manifest.all_tx_hashes().copied().collect();
-        assert_eq!(all, vec![retry, priority, other]);
+        let all: Vec<Hash> = gossip.manifest.tx_hashes.iter().copied().collect();
+        assert_eq!(all, vec![tx1, tx2, tx3]);
     }
 }

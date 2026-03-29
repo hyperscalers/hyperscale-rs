@@ -191,8 +191,9 @@ pub fn compute_receipt_root_with_proof(
         .map(|o| tx_outcome_leaf(&o.tx_hash, &o.receipt_hash, o.success))
         .collect();
 
+    let leaf_hash = leaves[tx_index];
     let (root, proof) = crate::compute_merkle_root_with_proof(&leaves, tx_index);
-    (root, proof.siblings, proof.leaf_index, proof.leaf_hash)
+    (root, proof.siblings, proof.leaf_index, leaf_hash)
 }
 
 #[cfg(test)]
@@ -295,10 +296,9 @@ mod tests {
             let inclusion = crate::TransactionInclusionProof {
                 siblings,
                 leaf_index,
-                leaf_hash,
             };
             assert!(
-                crate::verify_merkle_inclusion(root, &inclusion),
+                crate::verify_merkle_inclusion(root, leaf_hash, &inclusion),
                 "Proof failed for index {i}"
             );
         }

@@ -31,8 +31,7 @@ REMOTE_PATH="~/git/hyperscale-rs/distributed-cluster-data/"
 REMOTE_USER="$(whoami)"
 
 # Mempool configuration
-MEMPOOL_MAX_IN_FLIGHT=2048
-MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT=4096
+MEMPOOL_MAX_IN_FLIGHT=12288
 MEMPOOL_MAX_PENDING=8192
 
 while [[ $# -gt 0 ]]; do
@@ -98,7 +97,8 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --mempool-max-in-flight-hard-limit)
-            MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT="$2"
+            echo "Warning: --mempool-max-in-flight-hard-limit is deprecated, use --mempool-max-in-flight"
+            MEMPOOL_MAX_IN_FLIGHT="$2"
             shift 2
             ;;
         --mempool-max-pending)
@@ -370,7 +370,6 @@ bytes_per_sync_mb = 4
 
 [mempool]
 max_in_flight = $MEMPOOL_MAX_IN_FLIGHT
-max_in_flight_hard_limit = $MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT
 max_pending = $MEMPOOL_MAX_PENDING
 
 [metrics]

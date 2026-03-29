@@ -855,7 +855,7 @@ where
             mempool_executed: contention.executed_count as usize,
             mempool_total: mempool.len(),
             mempool_deferred: contention.deferred_count as usize,
-            accepting_rpc_transactions: !mempool.at_in_flight_hard_limit(),
+            accepting_rpc_transactions: !mempool.at_in_flight_limit(),
             at_pending_limit: mempool.at_pending_limit(),
         }
     }

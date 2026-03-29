@@ -96,7 +96,6 @@ struct ProposalInputs {
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
     certificates: Vec<Arc<TransactionCertificate>>,
-    priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
 }
 
 impl NodeStateMachine {
@@ -260,23 +259,11 @@ impl NodeStateMachine {
         );
         let certificates = self.execution.get_finalized_certificates();
 
-        // Under backpressure: collect cached inclusion proofs for priority txs.
-        let priority_inclusions = if self.mempool.at_in_flight_limit() {
-            ready_txs
-                .priority
-                .iter()
-                .filter_map(|tx| self.provisions.take_cached_inclusion_proof(&tx.hash()))
-                .collect()
-        } else {
-            vec![]
-        };
-
         ProposalInputs {
             ready_txs,
             deferred,
             aborted,
             certificates,
-            priority_inclusions,
         }
     }
 
@@ -389,7 +376,6 @@ impl NodeStateMachine {
             deferred,
             aborted,
             certificates,
-            vec![],
             collect_updates,
         )
     }
@@ -412,21 +398,15 @@ impl NodeStateMachine {
         if is_next_block {
             let current_in_flight = self.mempool.in_flight();
             let certs_in_block = manifest.cert_hashes.len();
-            let config = self.mempool.config();
-            let soft_limit = config.max_in_flight;
-            let hard_limit = config.max_in_flight_hard_limit;
-
-            // Retry and priority transactions bypass soft limit
-            // Only "other" transactions (tx_hashes) are subject to soft limit
-            let without_proofs = manifest.tx_hashes.len();
+            let limit = self.mempool.config().max_in_flight;
 
             let new_in_flight = current_in_flight
                 .saturating_add(total_tx_count)
                 .saturating_sub(certs_in_block);
 
-            // Reject if exceeding hard limit AND making things worse.
+            // Reject if exceeding limit AND making things worse.
             // Allow blocks that don't increase in-flight (prevents deadlock).
-            let would_exceed = new_in_flight > hard_limit;
+            let would_exceed = new_in_flight > limit;
             let would_increase = new_in_flight > current_in_flight;
 
             if would_exceed && would_increase {
@@ -435,24 +415,10 @@ impl NodeStateMachine {
                     certs_in_block,
                     proposed_tx_count = total_tx_count,
                     new_in_flight,
-                    hard_limit,
+                    limit,
                     block_hash = ?header.hash(),
                     height = header.height.0,
-                    "Rejecting block that would exceed in-flight hard limit"
-                );
-                return vec![];
-            }
-
-            // Soft limit: only allow TXs with proofs when at limit
-            // Note: retry_hashes and priority_hashes bypass this check
-            if current_in_flight >= soft_limit && without_proofs > 0 {
-                tracing::warn!(
-                    current_in_flight,
-                    soft_limit,
-                    txs_without_proofs = without_proofs,
-                    block_hash = ?header.hash(),
-                    height = header.height.0,
-                    "Rejecting block with non-priority transactions while at soft limit"
+                    "Rejecting block that would exceed in-flight limit"
                 );
                 return vec![];
             }
@@ -465,10 +431,10 @@ impl NodeStateMachine {
         // This hides execution latency behind consensus latency
         let block_hash = header.hash();
         let height = header.height.0;
-        let all_tx_hashes: Vec<_> = manifest.all_tx_hashes().collect();
-        let transactions: Vec<_> = all_tx_hashes
+        let transactions: Vec<_> = manifest
+            .tx_hashes
             .iter()
-            .filter_map(|h| mempool_txs.get(*h).cloned())
+            .filter_map(|h| mempool_txs.get(h).cloned())
             .collect();
         let spec_actions = self.execution.trigger_speculative_execution(
             self.topology.snapshot(),
@@ -519,7 +485,6 @@ impl NodeStateMachine {
             inputs.deferred,
             inputs.aborted,
             inputs.certificates,
-            inputs.priority_inclusions,
             collect_updates,
         )
     }
@@ -565,7 +530,7 @@ impl NodeStateMachine {
 
         // Register newly committed cross-shard TXs with livelock for cycle detection.
         // Must happen BEFORE livelock.on_block_committed() processes deferrals.
-        for tx in block.all_transactions() {
+        for tx in block.transactions.iter() {
             if self.livelock.is_cross_shard(self.topology.snapshot(), tx) {
                 self.livelock
                     .on_cross_shard_committed(self.topology.snapshot(), tx, block_height);
@@ -625,11 +590,11 @@ impl NodeStateMachine {
         // When a retry T' is committed, the original T's execution state must be
         // cleaned up so T' can execute fresh. The mempool marks T as Retried and
         // releases its locks; here we clean up execution tracking.
-        for retry_tx in &block.retry_transactions {
+        for retry_tx in block.transactions.iter().filter(|tx| tx.is_retry()) {
             let original_hash = retry_tx.original_hash();
             // Only cleanup if the original is different from the retry
-            // (original_hash returns self.hash() for non-retries, but retry_transactions
-            // should only contain actual retries)
+            // (original_hash returns self.hash() for non-retries, but retries
+            // are filtered above via is_retry())
             if original_hash != retry_tx.hash() {
                 // Resolve in execution accumulator before cleanup
                 if let Some(completion) = self.execution.record_deferral(original_hash) {
@@ -679,7 +644,7 @@ impl NodeStateMachine {
         // Pass all transactions from block to execution (no need for mempool lookup).
         // NOTE: execution.on_block_committed emits CrossShardTxRegistered events, which
         // will be processed by the coordinator via Continuation actions.
-        let all_txs: Vec<_> = block.all_transactions().cloned().collect();
+        let all_txs = block.transactions.clone();
         let exec_actions = self.execution.on_block_committed(
             self.topology.snapshot(),
             block_hash,
@@ -735,42 +700,6 @@ impl NodeStateMachine {
         }
         actions.extend(provision_actions);
 
-        // Request priority inclusion proofs under backpressure if likely next proposer.
-        // This is best-effort: if proofs arrive before proposal time, priority txs get
-        // promoted with proofs. If not, they stay in the normal section — no correctness impact.
-        if self.mempool.at_in_flight_limit() {
-            let topology = self.topology.snapshot();
-            let next_height = self.bft.committed_height() + 1;
-            if topology.proposer_for(next_height, 0) == topology.local_validator_id() {
-                // Group by (source_shard, block_height) so each action batches
-                // all proofs needed from the same block.
-                let mut grouped: std::collections::HashMap<
-                    (ShardGroupId, BlockHeight),
-                    Vec<(Hash, hyperscale_core::InclusionProofFetchReason)>,
-                > = std::collections::HashMap::new();
-                for (tx_hash, source_shard, source_block_height) in
-                    self.provisions.txs_needing_inclusion_proofs()
-                {
-                    grouped
-                        .entry((source_shard, source_block_height))
-                        .or_default()
-                        .push((
-                            tx_hash,
-                            hyperscale_core::InclusionProofFetchReason::Priority,
-                        ));
-                }
-                for ((source_shard, source_block_height), entries) in grouped {
-                    let peers = topology.committee_for_shard(source_shard).to_vec();
-                    actions.push(Action::RequestTxInclusionProofs {
-                        source_shard,
-                        source_block_height,
-                        entries,
-                        peers,
-                    });
-                }
-            }
-        }
-
         actions
     }
 
@@ -785,9 +714,6 @@ impl NodeStateMachine {
             // Share verified header with BFT for deferral merkle proof verification
             if let Some(ref header) = committed_header {
                 self.bft.update_remote_header(header.clone());
-            }
-            for tx in &batch.transactions {
-                self.mempool.on_provision_verified(tx.tx_hash);
             }
         }
         self.provisions.on_state_provisions_verified(
@@ -816,28 +742,6 @@ impl NodeStateMachine {
             proof,
             source_shard,
             source_block_height,
-        );
-        vec![]
-    }
-
-    /// Handle a priority inclusion proof received from a source shard.
-    ///
-    /// Caches the proof in the provision coordinator for use at proposal time.
-    pub(crate) fn on_priority_inclusion_proof_received(
-        &mut self,
-        tx_hash: Hash,
-        source_shard: ShardGroupId,
-        source_block_height: BlockHeight,
-        proof: hyperscale_types::TransactionInclusionProof,
-    ) -> Vec<Action> {
-        self.provisions.cache_inclusion_proof(
-            tx_hash,
-            hyperscale_types::PriorityInclusion {
-                tx_hash,
-                source_shard,
-                source_block_height,
-                proof,
-            },
         );
         vec![]
     }

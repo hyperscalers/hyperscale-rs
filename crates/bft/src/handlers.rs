@@ -187,24 +187,17 @@ pub fn verify_qc_signature(qc: &QuorumCertificate, public_keys: &[Bls12381G1Publ
 }
 
 /// Verify that the computed transaction merkle root matches the expected root.
-///
-/// Pure computation over the three transaction sections (retry, priority, normal).
 pub fn verify_transaction_root(
     expected_root: Hash,
-    retry_transactions: &[Arc<RoutableTransaction>],
-    priority_transactions: &[Arc<RoutableTransaction>],
     transactions: &[Arc<RoutableTransaction>],
 ) -> bool {
-    let computed_root =
-        compute_transaction_root(retry_transactions, priority_transactions, transactions);
+    let computed_root = compute_transaction_root(transactions);
     let valid = computed_root == expected_root;
 
     if !valid {
         tracing::warn!(
             ?expected_root,
             ?computed_root,
-            retry_count = retry_transactions.len(),
-            priority_count = priority_transactions.len(),
             tx_count = transactions.len(),
             "Transaction root verification FAILED"
         );
@@ -286,7 +279,7 @@ pub struct ProposalResult<P: Send> {
 /// 1. Check JVT ready: `storage.state_root_hash() == parent_state_root`
 /// 2. If ready + certs non-empty: `prepare_block_commit()` for certs, get state_root + handle
 /// 3. Else: inherit parent_state_root, empty certs, no handle
-/// 4. Compute tx root: `compute_transaction_root(retry, priority, normal)`
+/// 4. Compute tx root: `compute_transaction_root(transactions)`
 /// 5. Build BlockHeader + Block, hash it
 /// 6. Return block, hash, optional prepared commit handle
 #[allow(clippy::too_many_arguments)]
@@ -300,14 +293,11 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
     timestamp: u64,
     is_fallback: bool,
     parent_state_root: Hash,
-    retry_transactions: Vec<Arc<RoutableTransaction>>,
-    priority_transactions: Vec<Arc<RoutableTransaction>>,
     transactions: Vec<Arc<RoutableTransaction>>,
     certificates: Vec<Arc<TransactionCertificate>>,
     merged_updates: DatabaseUpdates,
     deferred: Vec<TransactionDefer>,
     aborted: Vec<TransactionAbort>,
-    priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
     local_shard: ShardGroupId,
     provision_targets: Vec<ShardGroupId>,
 ) -> ProposalResult<S::PreparedCommit> {
@@ -338,14 +328,9 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
         (parent_state_root, vec![], None)
     };
 
-    // Compute transaction root from all transaction sections
-    let transaction_root =
-        compute_transaction_root(&retry_transactions, &priority_transactions, &transactions);
-
-    // Compute receipt root from certificate receipt hashes
+    let transaction_root = compute_transaction_root(&transactions);
     let receipt_root = compute_receipt_root(&certs_to_include);
 
-    // Build the block
     let header = BlockHeader {
         shard_group_id: local_shard,
         height,
@@ -363,13 +348,10 @@ pub fn build_proposal<S: CommitStore + SubstateStore>(
 
     let block = Block {
         header,
-        retry_transactions,
-        priority_transactions,
         transactions,
         certificates: certs_to_include,
         deferred,
         aborted,
-        priority_inclusions,
     };
 
     let block_hash = block.hash();

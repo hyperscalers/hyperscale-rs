@@ -753,7 +753,6 @@ impl BftState {
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
         collect_updates: F,
     ) -> Vec<Action>
     where
@@ -839,10 +838,8 @@ impl BftState {
             (self.committed_hash, QuorumCertificate::genesis())
         };
 
-        // Use sectioned transactions directly from mempool (already hash-sorted per section)
-        let retry_transactions: Vec<Arc<RoutableTransaction>> = ready_txs.retries.clone();
-        let priority_transactions: Vec<Arc<RoutableTransaction>> = ready_txs.priority.clone();
-        let other_transactions: Vec<Arc<RoutableTransaction>> = ready_txs.others.clone();
+        // Use transactions directly from mempool (already hash-sorted)
+        let transactions: Vec<Arc<RoutableTransaction>> = ready_txs.transactions.clone();
 
         let timestamp = self.now.as_millis() as u64;
         let block_height = BlockHeight(next_height);
@@ -930,7 +927,7 @@ impl BftState {
             validator = ?topology.local_validator_id(),
             height = next_height,
             round = round,
-            transactions = retry_transactions.len() + priority_transactions.len() + other_transactions.len(),
+            transactions = transactions.len(),
             certificates = certificates_to_propose.len(),
             "Requesting block build for proposal"
         );
@@ -940,11 +937,7 @@ impl BftState {
         // block hash), so target shards can detect missing provisions.
         let local_shard = topology.local_shard();
         let mut provision_target_set = std::collections::BTreeSet::new();
-        for tx in retry_transactions
-            .iter()
-            .chain(priority_transactions.iter())
-            .chain(other_transactions.iter())
-        {
+        for tx in transactions.iter() {
             if !topology.is_single_shard_transaction(tx) {
                 for shard in topology.all_shards_for_transaction(tx) {
                     if shard != local_shard {
@@ -977,15 +970,12 @@ impl BftState {
                 timestamp,
                 is_fallback: false,
                 parent_state_root,
-                retry_transactions,
-                priority_transactions,
-                transactions: other_transactions,
+                transactions,
                 certificates: certificates_to_propose,
                 per_cert_updates,
                 deferred: deferred_filtered,
                 aborted: aborted_with_height,
                 provision_targets,
-                priority_inclusions,
             },
         ]
     }
@@ -1051,13 +1041,10 @@ impl BftState {
 
         let block = Block {
             header: header.clone(),
-            retry_transactions: vec![], // Empty - fallback blocks have no transactions
-            priority_transactions: vec![], // Empty
-            transactions: vec![],       // Empty
-            certificates: vec![],       // Empty
+            transactions: vec![], // Empty - fallback blocks have no transactions
+            certificates: vec![], // Empty
             deferred: vec![],
             aborted: vec![],
-            priority_inclusions: vec![],
         };
 
         let block_hash = block.hash();
@@ -1174,13 +1161,10 @@ impl BftState {
 
         let block = Block {
             header: header.clone(),
-            retry_transactions: vec![],
-            priority_transactions: vec![],
             transactions: vec![],
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            priority_inclusions: vec![],
         };
 
         let block_hash = block.hash();
@@ -1490,12 +1474,7 @@ impl BftState {
         // Create pending block and fill in transactions/certificates from local stores
         let mut pending = PendingBlock::from_manifest(header.clone(), manifest);
 
-        for tx_hash in pending
-            .manifest()
-            .all_tx_hashes()
-            .copied()
-            .collect::<Vec<_>>()
-        {
+        for tx_hash in pending.manifest().tx_hashes.clone() {
             if let Some(tx) = mempool.get(&tx_hash) {
                 pending.add_transaction_arc(Arc::clone(tx));
             }
@@ -1954,7 +1933,7 @@ impl BftState {
     /// - Hash ordering: deferred_hash > winner_hash (lower hash wins cycles)
     /// - Staleness: winner cert not in same block
     /// - Staleness: loser cert not in same block (loser already completed)
-    /// - Merkle inclusion proof: `leaf_hash` must verify against the source block's
+    /// - Merkle inclusion proof: winner tx hash must verify against the source block's
     ///   `transaction_root` via the `tx_inclusion_proof`
     ///
     /// Note: Merkle proof verification requires the remote block header's
@@ -2008,22 +1987,9 @@ impl BftState {
             // This is synchronous (pure hash computation) — no async dispatch needed.
             let header_key = (deferral.source_shard, deferral.source_block_height);
             if let Some(committed_header) = self.remote_headers.get(&header_key) {
-                // Verify the leaf_hash corresponds to the winner tx with a valid tag
-                let valid_leaf = [b"RETRY" as &[u8], b"PRIORITY", b"NORMAL"]
-                    .iter()
-                    .any(|tag| {
-                        Hash::from_parts(&[tag, winner_tx_hash.as_bytes()])
-                            == deferral.tx_inclusion_proof.leaf_hash
-                    });
-                if !valid_leaf {
-                    return Err(format!(
-                        "Invalid deferral: leaf_hash does not match any tagged hash of winner {}",
-                        winner_tx_hash
-                    ));
-                }
-
                 if !verify_merkle_inclusion(
                     committed_header.header.transaction_root,
+                    *winner_tx_hash,
                     &deferral.tx_inclusion_proof,
                 ) {
                     return Err(format!(
@@ -2073,92 +2039,9 @@ impl BftState {
 
     /// Validate transaction ordering in a proposed block.
     ///
-    /// # Sectioned Block Structure
-    ///
-    /// Blocks have three explicit transaction sections:
-    /// 1. **retry_transactions**: Retry transactions (highest priority)
-    /// 2. **priority_transactions**: Cross-shard TXs with CommitmentProof
-    /// 3. **transactions**: All other TXs (normal priority)
-    ///
-    /// Within each section, transactions must be sorted by hash (ascending).
-    ///
-    /// # Validation Rules
-    ///
-    /// 1. Each section must be internally hash-sorted
-    /// 2. retry_transactions must contain ONLY retry transactions
-    /// 3. priority_transactions must contain ONLY non-retry TXs with commitment proofs
-    /// 4. transactions must contain no retries and no TXs with commitment proofs
+    /// Transactions must be sorted by hash (ascending).
     fn validate_transaction_ordering(&self, block: &Block) -> Result<(), String> {
-        // 1. Verify each section is internally hash-sorted
-        Self::verify_hash_sorted(&block.retry_transactions, "retry")?;
-        Self::verify_hash_sorted(&block.priority_transactions, "priority")?;
-        Self::verify_hash_sorted(&block.transactions, "other")?;
-
-        // 2. Verify retry section contains only retry transactions
-        for tx in &block.retry_transactions {
-            if !tx.is_retry() {
-                return Err(format!(
-                    "Transaction {} in retry section but is_retry() = false",
-                    tx.hash()
-                ));
-            }
-        }
-
-        // 3. Verify priority section contains only non-retry TXs
-        for tx in &block.priority_transactions {
-            let tx_hash = tx.hash();
-            if tx.is_retry() {
-                return Err(format!(
-                    "Retry transaction {} in priority section (should be in retry section)",
-                    tx_hash
-                ));
-            }
-        }
-
-        // 4. Verify priority inclusion proofs (if present)
-        for inclusion in &block.priority_inclusions {
-            // Verify leaf_hash corresponds to the tx_hash with a valid tag
-            let valid_leaf = [b"RETRY" as &[u8], b"PRIORITY", b"NORMAL"]
-                .iter()
-                .any(|tag| {
-                    Hash::from_parts(&[tag, inclusion.tx_hash.as_bytes()])
-                        == inclusion.proof.leaf_hash
-                });
-            if !valid_leaf {
-                return Err(format!(
-                    "Invalid priority inclusion: leaf_hash does not match any tagged hash of {}",
-                    inclusion.tx_hash
-                ));
-            }
-
-            // Verify merkle proof against the remote block's transaction_root
-            let header_key = (inclusion.source_shard, inclusion.source_block_height);
-            if let Some(committed_header) = self.remote_headers.get(&header_key) {
-                if !verify_merkle_inclusion(
-                    committed_header.header.transaction_root,
-                    &inclusion.proof,
-                ) {
-                    return Err(format!(
-                        "Invalid priority inclusion: merkle proof failed for {} against source block ({}, {})",
-                        inclusion.tx_hash, inclusion.source_shard.0, inclusion.source_block_height.0
-                    ));
-                }
-            }
-            // If we don't have the remote header yet, accept optimistically
-            // (same policy as deferrals).
-        }
-
-        // 5. Verify other section contains no retries
-        for tx in &block.transactions {
-            let tx_hash = tx.hash();
-            if tx.is_retry() {
-                return Err(format!(
-                    "Retry transaction {} in other section (should be in retry section)",
-                    tx_hash
-                ));
-            }
-        }
-
+        Self::verify_hash_sorted(&block.transactions, "transactions")?;
         Ok(())
     }
 
@@ -2174,7 +2057,7 @@ impl BftState {
     ) -> Result<(), String> {
         let local_shard = topology.local_shard();
         let mut expected = std::collections::BTreeSet::new();
-        for tx in block.all_transactions() {
+        for tx in block.transactions.iter() {
             if !topology.is_single_shard_transaction(tx) {
                 for shard in topology.all_shards_for_transaction(tx) {
                     if shard != local_shard {
@@ -3029,7 +2912,6 @@ impl BftState {
         deferred: Vec<TransactionDefer>,
         aborted: Vec<TransactionAbort>,
         certificates: Vec<Arc<TransactionCertificate>>,
-        priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
         collect_updates: F,
     ) -> Vec<Action>
     where
@@ -3143,7 +3025,6 @@ impl BftState {
                 deferred,
                 aborted,
                 certificates,
-                priority_inclusions,
                 collect_updates,
             ));
         } else if should_try_proposal && rate_limited {
@@ -5361,7 +5242,6 @@ mod tests {
             tx_inclusion_proof: TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
-                leaf_hash: Hash::ZERO,
             },
         }
     }
@@ -5374,13 +5254,10 @@ mod tests {
     ) -> Block {
         Block {
             header: make_header_at_height(height, 100_000),
-            retry_transactions: vec![],
-            priority_transactions: vec![],
             transactions: vec![],
             certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
-            priority_inclusions: vec![],
         }
     }
 
@@ -5417,7 +5294,6 @@ mod tests {
             tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
-                leaf_hash: Hash::ZERO,
             },
         };
         let block = make_test_block(5, vec![valid_deferral], vec![], vec![]);
@@ -5435,7 +5311,6 @@ mod tests {
             tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
-                leaf_hash: Hash::ZERO,
             },
         };
         let block = make_test_block(5, vec![invalid_deferral], vec![], vec![]);
@@ -5473,7 +5348,6 @@ mod tests {
             tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
-                leaf_hash: Hash::ZERO,
             },
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![winner_cert]);
@@ -5511,7 +5385,6 @@ mod tests {
             tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
-                leaf_hash: Hash::ZERO,
             },
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![loser_cert]);
@@ -5542,7 +5415,6 @@ mod tests {
             tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
-                leaf_hash: Hash::ZERO,
             },
         };
         let block = make_test_block(5, vec![deferral], vec![], vec![]);
@@ -6959,7 +6831,6 @@ mod tests {
             vec![],                        // no deferrals
             vec![],                        // no aborts
             vec![],                        // no certificates
-            vec![],                        // no priority inclusions
             |_certs| vec![],
         );
 
@@ -7008,7 +6879,6 @@ mod tests {
             vec![deferral],                // has a deferral
             vec![],                        // no aborts
             vec![],                        // no certificates
-            vec![],                        // no priority inclusions
             |_certs| vec![],
         );
 
@@ -7169,32 +7039,24 @@ mod tests {
     ) -> Block {
         Block {
             header: make_header_at_height(height, 100_000),
-            retry_transactions: vec![],
-            priority_transactions: vec![],
             transactions,
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            priority_inclusions: vec![],
         }
     }
 
-    /// Create a sectioned test block with transactions properly classified into sections.
+    /// Create a test block with transactions.
     fn make_sectioned_test_block(
         height: u64,
-        retry_transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
-        priority_transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
         transactions: Vec<Arc<hyperscale_types::RoutableTransaction>>,
     ) -> Block {
         Block {
             header: make_header_at_height(height, 100_000),
-            retry_transactions,
-            priority_transactions,
             transactions,
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            priority_inclusions: vec![],
         }
     }
 
@@ -7210,13 +7072,6 @@ mod tests {
     }
 
     /// Create a retry transaction for testing.
-    fn make_retry_tx(seed: u8) -> Arc<hyperscale_types::RoutableTransaction> {
-        use hyperscale_types::test_utils;
-        let original = test_utils::test_transaction(seed);
-        let winner_hash = Hash::from_bytes(&[seed.wrapping_add(100); 32]);
-        Arc::new(original.create_retry(winner_hash, BlockHeight(1)))
-    }
-
     /// Sort transactions by hash for test setup
     fn sort_txs_by_hash(txs: &mut [Arc<hyperscale_types::RoutableTransaction>]) {
         txs.sort_by_key(|tx| tx.hash());
@@ -7273,148 +7128,36 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_transaction_ordering_valid_with_proofs_first() {
+    fn test_validate_transaction_ordering_valid_sorted() {
         let (state, _topology) = make_test_state();
 
-        // Create TXs for priority group and non-priority group
         let tx1 = make_test_tx_with_seed(10);
         let tx2 = make_test_tx_with_seed(20);
         let tx3 = make_test_tx_with_seed(30);
         let tx4 = make_test_tx_with_seed(40);
 
-        // Sort each group
-        let mut priority_txs = vec![tx1.clone(), tx2.clone()];
-        sort_txs_by_hash(&mut priority_txs);
+        let mut txs = vec![tx1, tx2, tx3, tx4];
+        sort_txs_by_hash(&mut txs);
 
-        let mut other_txs = vec![tx3, tx4];
-        sort_txs_by_hash(&mut other_txs);
-
-        // Use sectioned block with priority TXs in priority section
-        let block = make_sectioned_test_block(5, vec![], priority_txs, other_txs);
+        let block = make_sectioned_test_block(5, txs);
         assert!(state.validate_transaction_ordering(&block).is_ok());
     }
 
     #[test]
-    fn test_validate_transaction_ordering_invalid_proof_group_unsorted() {
+    fn test_validate_transaction_ordering_unsorted() {
         let (state, _topology) = make_test_state();
 
-        // Create priority TXs
         let tx1 = make_test_tx_with_seed(10);
         let tx2 = make_test_tx_with_seed(20);
 
-        // Sort, then reverse (invalid order within priority section)
-        let mut priority_txs = vec![tx1.clone(), tx2.clone()];
-        sort_txs_by_hash(&mut priority_txs);
-        priority_txs.reverse();
+        let mut txs = vec![tx1, tx2];
+        sort_txs_by_hash(&mut txs);
+        txs.reverse(); // Make invalid
 
-        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![]);
+        let block = make_sectioned_test_block(5, txs);
         let result = state.validate_transaction_ordering(&block);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("priority section not in hash order"));
-    }
-
-    #[test]
-    fn test_validate_transaction_ordering_all_priority() {
-        let (state, _topology) = make_test_state();
-
-        // All TXs in priority section - valid as long as sorted
-        let tx1 = make_test_tx_with_seed(10);
-        let tx2 = make_test_tx_with_seed(20);
-        let tx3 = make_test_tx_with_seed(30);
-
-        let mut priority_txs = vec![tx1.clone(), tx2.clone(), tx3.clone()];
-        sort_txs_by_hash(&mut priority_txs);
-
-        let block = make_sectioned_test_block(5, vec![], priority_txs, vec![]);
-        assert!(state.validate_transaction_ordering(&block).is_ok());
-    }
-
-    #[test]
-    fn test_validate_transaction_ordering_retries_first() {
-        let (state, _topology) = make_test_state();
-
-        // Create retry TXs, priority TXs, and regular TXs
-        let retry1 = make_retry_tx(10);
-        let retry2 = make_retry_tx(20);
-        let priority_tx = make_test_tx_with_seed(30);
-        let regular = make_test_tx(40, false);
-
-        // Sort each tier by hash
-        let mut retries = vec![retry1.clone(), retry2.clone()];
-        sort_txs_by_hash(&mut retries);
-
-        let priority_txs = vec![priority_tx.clone()];
-
-        let others = vec![regular.clone()];
-
-        // Use sectioned block: retries in retry section, priority TX in priority, regular in others
-        let block = make_sectioned_test_block(5, retries, priority_txs, others);
-        assert!(state.validate_transaction_ordering(&block).is_ok());
-    }
-
-    #[test]
-    fn test_validate_transaction_ordering_invalid_retry_after_proof() {
-        let (state, _topology) = make_test_state();
-
-        // Create a retry TX
-        let retry = make_retry_tx(10);
-
-        // Invalid: put retry in priority section (retries belong in retry section)
-        let block = make_sectioned_test_block(5, vec![], vec![retry], vec![]);
-        let result = state.validate_transaction_ordering(&block);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().contains("Retry transaction"),
-            "Should detect retry in priority section"
-        );
-    }
-
-    #[test]
-    fn test_validate_transaction_ordering_invalid_retry_after_other() {
-        let (state, _topology) = make_test_state();
-
-        // Create a retry and a regular TX
-        let retry = make_retry_tx(10);
-
-        // Invalid: put retry in other section (should be in retry section)
-        let block = make_sectioned_test_block(5, vec![], vec![], vec![retry]);
-        let result = state.validate_transaction_ordering(&block);
-        assert!(result.is_err());
-        assert!(
-            result.unwrap_err().contains("Retry transaction"),
-            "Should detect retry in other section"
-        );
-    }
-
-    #[test]
-    fn test_validate_transaction_ordering_retries_only() {
-        let (state, _topology) = make_test_state();
-
-        // All retries in retry section - valid as long as sorted
-        let mut retries = vec![make_retry_tx(10), make_retry_tx(20), make_retry_tx(30)];
-        sort_txs_by_hash(&mut retries);
-
-        let block = make_sectioned_test_block(5, retries, vec![], vec![]);
-        assert!(state.validate_transaction_ordering(&block).is_ok());
-    }
-
-    #[test]
-    fn test_validate_transaction_ordering_retries_unsorted() {
-        let (state, _topology) = make_test_state();
-
-        // Retries not sorted by hash in retry section
-        let mut retries = vec![make_retry_tx(10), make_retry_tx(20), make_retry_tx(30)];
-        sort_txs_by_hash(&mut retries);
-        retries.reverse(); // Make invalid
-
-        let block = make_sectioned_test_block(5, retries, vec![], vec![]);
-        let result = state.validate_transaction_ordering(&block);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("retry section not in hash order"));
+        assert!(result.unwrap_err().contains("not in hash order"));
     }
 
     #[test]
@@ -7456,7 +7199,6 @@ mod tests {
             vec![deferral],                // has content
             vec![],
             vec![],
-            vec![], // no priority inclusions
             |_certs| vec![],
         );
 
@@ -7510,7 +7252,6 @@ mod tests {
             vec![deferral],                // has content
             vec![],
             vec![],
-            vec![], // no priority inclusions
             |_certs| vec![],
         );
 
@@ -7591,7 +7332,6 @@ mod tests {
             vec![deferral],
             vec![],
             vec![],
-            vec![],
             |_certs| vec![],
         );
 
@@ -7667,7 +7407,6 @@ mod tests {
             vec![deferral],
             vec![],
             vec![],
-            vec![],
             |_certs| vec![],
         );
 
@@ -7711,7 +7450,6 @@ mod tests {
             qc.block_hash,
             qc,
             &ReadyTransactions::default(),
-            vec![],
             vec![],
             vec![],
             vec![],
@@ -7932,15 +7670,12 @@ mod tests {
 
         // Trigger proposal timer with transactions (which should be ignored)
         let ready_txs = ReadyTransactions {
-            retries: vec![],
-            priority: vec![],
-            others: vec![Arc::new(hyperscale_types::test_utils::test_transaction(1))],
+            transactions: vec![Arc::new(hyperscale_types::test_utils::test_transaction(1))],
         };
 
         let actions = state.on_proposal_timer(
             &topology,
             &ready_txs,
-            vec![],
             vec![],
             vec![],
             vec![],
@@ -7969,14 +7704,6 @@ mod tests {
         assert!(
             gossip.manifest.tx_hashes.is_empty(),
             "Sync block should have no transactions"
-        );
-        assert!(
-            gossip.manifest.retry_hashes.is_empty(),
-            "Sync block should have no retry transactions"
-        );
-        assert!(
-            gossip.manifest.priority_hashes.is_empty(),
-            "Sync block should have no priority transactions"
         );
         assert!(
             gossip.manifest.cert_hashes.is_empty(),
@@ -8016,7 +7743,6 @@ mod tests {
         let actions = state.on_proposal_timer(
             &topology,
             &ReadyTransactions::default(),
-            vec![],
             vec![],
             vec![],
             vec![],
@@ -8249,13 +7975,10 @@ mod tests {
                 receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             },
-            retry_transactions: vec![],
-            priority_transactions: vec![],
             transactions: vec![],
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            priority_inclusions: vec![],
         };
 
         let qc = QuorumCertificate {
@@ -8306,7 +8029,6 @@ mod tests {
         let _actions = state.on_proposal_timer(
             &topology,
             &ReadyTransactions::default(),
-            vec![],
             vec![],
             vec![],
             vec![],
@@ -8426,7 +8148,6 @@ mod tests {
         let actions1 = state.on_proposal_timer(
             &topology,
             &ReadyTransactions::default(),
-            vec![],
             vec![],
             vec![],
             vec![],

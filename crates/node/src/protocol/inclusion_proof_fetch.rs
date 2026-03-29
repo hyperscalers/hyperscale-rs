@@ -400,7 +400,6 @@ mod tests {
         TransactionInclusionProof {
             siblings: vec![],
             leaf_index: 0,
-            leaf_hash: Hash::ZERO,
         }
     }
 
@@ -681,7 +680,9 @@ mod tests {
                 source_shard: shard(1),
                 source_block_height: height(10),
                 winner_tx_hash: tx_hash(i),
-                reason: InclusionProofFetchReason::Priority,
+                reason: InclusionProofFetchReason::Deferral {
+                    loser_tx_hash: tx_hash(0),
+                },
                 peers: vec![vid(1), vid(2)],
                 preferred_peer: vid(1),
             });
@@ -711,7 +712,9 @@ mod tests {
             source_shard: shard(1),
             source_block_height: height(10),
             winner_tx_hash: tx_hash(1),
-            reason: InclusionProofFetchReason::Priority,
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(0),
+            },
             peers: vec![vid(1)],
             preferred_peer: vid(1),
         });
@@ -719,7 +722,9 @@ mod tests {
             source_shard: shard(1),
             source_block_height: height(20),
             winner_tx_hash: tx_hash(2),
-            reason: InclusionProofFetchReason::Priority,
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(0),
+            },
             peers: vec![vid(1)],
             preferred_peer: vid(1),
         });
@@ -746,7 +751,9 @@ mod tests {
             source_shard: shard(1),
             source_block_height: height(10),
             winner_tx_hash: tx_hash(1),
-            reason: InclusionProofFetchReason::Priority,
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(0),
+            },
             peers: vec![vid(1)],
             preferred_peer: vid(1),
         });
@@ -754,7 +761,9 @@ mod tests {
             source_shard: shard(2),
             source_block_height: height(10),
             winner_tx_hash: tx_hash(2),
-            reason: InclusionProofFetchReason::Priority,
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(0),
+            },
             peers: vec![vid(3)],
             preferred_peer: vid(3),
         });
@@ -773,7 +782,9 @@ mod tests {
                 source_shard: shard(1),
                 source_block_height: height(10),
                 winner_tx_hash: tx_hash(i),
-                reason: InclusionProofFetchReason::Priority,
+                reason: InclusionProofFetchReason::Deferral {
+                    loser_tx_hash: tx_hash(0),
+                },
                 peers: vec![vid(1), vid(2)],
                 preferred_peer: vid(1),
             });
@@ -785,7 +796,9 @@ mod tests {
         // Receive proofs for tx 1 and 3 (success), fail tx 2.
         let outputs = protocol.handle(InclusionProofFetchInput::Received {
             winner_tx_hash: tx_hash(1),
-            reason: InclusionProofFetchReason::Priority,
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(0),
+            },
             source_shard: shard(1),
             source_block_height: height(10),
             proof: dummy_proof(),
@@ -794,7 +807,9 @@ mod tests {
 
         let outputs = protocol.handle(InclusionProofFetchInput::Received {
             winner_tx_hash: tx_hash(3),
-            reason: InclusionProofFetchReason::Priority,
+            reason: InclusionProofFetchReason::Deferral {
+                loser_tx_hash: tx_hash(0),
+            },
             source_shard: shard(1),
             source_block_height: height(10),
             proof: dummy_proof(),

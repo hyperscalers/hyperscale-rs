@@ -416,11 +416,7 @@ pub fn serve_provision_request(
 
     let jvt_version = block.header.height.0;
 
-    let all_txs = block
-        .retry_transactions
-        .iter()
-        .chain(block.priority_transactions.iter())
-        .chain(block.transactions.iter());
+    let all_txs = block.transactions.iter();
 
     // Phase 1: Fetch state entries for all matching transactions.
     let mut per_tx: Vec<(

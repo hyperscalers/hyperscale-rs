@@ -8,13 +8,6 @@ use crate::{
 use sbor::prelude::*;
 use std::sync::Arc;
 
-/// Tag prefixes for transaction slot provability in merkle tree.
-/// Each transaction's leaf hash is `hash(TAG || tx_hash)`, allowing
-/// merkle proofs to prove both inclusion AND which slot the tx belongs to.
-const RETRY_TAG: &[u8] = b"RETRY";
-const PRIORITY_TAG: &[u8] = b"PRIORITY";
-const NORMAL_TAG: &[u8] = b"NORMAL";
-
 /// Compute the receipt merkle root for a block's certificates.
 ///
 /// Each certificate's `receipt_hash` (hash of outcome + event_root) becomes a leaf.
@@ -30,40 +23,13 @@ pub fn compute_receipt_root(certificates: &[Arc<TransactionCertificate>]) -> Has
 
 /// Compute the transaction merkle root for a block.
 ///
-/// Transactions are organized into three sections with tagged leaf hashes:
-/// - Retry transactions: `hash(RETRY || tx_hash)`
-/// - Priority transactions: `hash(PRIORITY || tx_hash)`
-/// - Normal transactions: `hash(NORMAL || tx_hash)`
-///
-/// The root is computed over the concatenation of all tagged hashes in order.
-/// Returns `Hash::ZERO` if all sections are empty.
-pub fn compute_transaction_root(
-    retry_transactions: &[Arc<RoutableTransaction>],
-    priority_transactions: &[Arc<RoutableTransaction>],
-    transactions: &[Arc<RoutableTransaction>],
-) -> Hash {
-    let total_count = retry_transactions.len() + priority_transactions.len() + transactions.len();
-
-    if total_count == 0 {
+/// Each transaction's hash becomes a leaf directly. Returns `Hash::ZERO` if empty.
+pub fn compute_transaction_root(transactions: &[Arc<RoutableTransaction>]) -> Hash {
+    if transactions.is_empty() {
         return Hash::ZERO;
     }
 
-    let mut leaves = Vec::with_capacity(total_count);
-
-    // Add retry transaction leaves
-    for tx in retry_transactions {
-        leaves.push(Hash::from_parts(&[RETRY_TAG, tx.hash().as_bytes()]));
-    }
-
-    // Add priority transaction leaves
-    for tx in priority_transactions {
-        leaves.push(Hash::from_parts(&[PRIORITY_TAG, tx.hash().as_bytes()]));
-    }
-
-    // Add normal transaction leaves
-    for tx in transactions {
-        leaves.push(Hash::from_parts(&[NORMAL_TAG, tx.hash().as_bytes()]));
-    }
+    let leaves: Vec<Hash> = transactions.iter().map(|tx| tx.hash()).collect();
 
     // Use padded merkle root (power-of-2 padding with Hash::ZERO) so that
     // merkle inclusion proofs can be generated and verified for any leaf.
@@ -72,41 +38,18 @@ pub fn compute_transaction_root(
 
 /// Compute a transaction inclusion proof for a specific transaction in a block.
 ///
-/// Reconstructs the tagged leaf list in the same order as `compute_transaction_root`
-/// (retry, priority, normal), finds the leaf matching `tx_hash`, and returns a
-/// merkle inclusion proof plus the tagged leaf hash.
+/// Reconstructs the leaf list in the same order as `compute_transaction_root`,
+/// finds the leaf matching `tx_hash`, and returns a merkle inclusion proof.
 ///
 /// Returns `None` if the transaction is not in the block.
 pub fn tx_inclusion_proof(block: &Block, tx_hash: &Hash) -> Option<TransactionInclusionProof> {
-    let total_count = block.retry_transactions.len()
-        + block.priority_transactions.len()
-        + block.transactions.len();
-
-    if total_count == 0 {
+    if block.transactions.is_empty() {
         return None;
     }
 
-    // Build tagged leaves in the same order as compute_transaction_root
-    let mut leaves = Vec::with_capacity(total_count);
+    let leaves: Vec<Hash> = block.transactions.iter().map(|tx| tx.hash()).collect();
 
-    for tx in &block.retry_transactions {
-        leaves.push(Hash::from_parts(&[RETRY_TAG, tx.hash().as_bytes()]));
-    }
-    for tx in &block.priority_transactions {
-        leaves.push(Hash::from_parts(&[PRIORITY_TAG, tx.hash().as_bytes()]));
-    }
-    for tx in &block.transactions {
-        leaves.push(Hash::from_parts(&[NORMAL_TAG, tx.hash().as_bytes()]));
-    }
-
-    // Find which leaf matches tx_hash (check all tag variants)
-    let target_retry = Hash::from_parts(&[RETRY_TAG, tx_hash.as_bytes()]);
-    let target_priority = Hash::from_parts(&[PRIORITY_TAG, tx_hash.as_bytes()]);
-    let target_normal = Hash::from_parts(&[NORMAL_TAG, tx_hash.as_bytes()]);
-
-    let index = leaves.iter().position(|leaf| {
-        *leaf == target_retry || *leaf == target_priority || *leaf == target_normal
-    })?;
+    let index = leaves.iter().position(|leaf| leaf == tx_hash)?;
 
     let (_root, proof) = compute_merkle_root_with_proof(&leaves, index);
     Some(proof)
@@ -118,37 +61,16 @@ pub fn tx_inclusion_proofs(
     block: &Block,
     tx_hashes: &[Hash],
 ) -> Vec<(Hash, Option<TransactionInclusionProof>)> {
-    let total_count = block.retry_transactions.len()
-        + block.priority_transactions.len()
-        + block.transactions.len();
-
-    if total_count == 0 {
+    if block.transactions.is_empty() {
         return tx_hashes.iter().map(|h| (*h, None)).collect();
     }
 
-    // Build tagged leaves once (same order as compute_transaction_root)
-    let mut leaves = Vec::with_capacity(total_count);
-
-    for tx in &block.retry_transactions {
-        leaves.push(Hash::from_parts(&[RETRY_TAG, tx.hash().as_bytes()]));
-    }
-    for tx in &block.priority_transactions {
-        leaves.push(Hash::from_parts(&[PRIORITY_TAG, tx.hash().as_bytes()]));
-    }
-    for tx in &block.transactions {
-        leaves.push(Hash::from_parts(&[NORMAL_TAG, tx.hash().as_bytes()]));
-    }
+    let leaves: Vec<Hash> = block.transactions.iter().map(|tx| tx.hash()).collect();
 
     tx_hashes
         .iter()
         .map(|tx_hash| {
-            let target_retry = Hash::from_parts(&[RETRY_TAG, tx_hash.as_bytes()]);
-            let target_priority = Hash::from_parts(&[PRIORITY_TAG, tx_hash.as_bytes()]);
-            let target_normal = Hash::from_parts(&[NORMAL_TAG, tx_hash.as_bytes()]);
-
-            let index = leaves.iter().position(|leaf| {
-                *leaf == target_retry || *leaf == target_priority || *leaf == target_normal
-            });
+            let index = leaves.iter().position(|leaf| leaf == tx_hash);
 
             match index {
                 Some(idx) => {
@@ -159,27 +81,6 @@ pub fn tx_inclusion_proofs(
             }
         })
         .collect()
-}
-
-// ============================================================================
-// PriorityInclusion
-// ============================================================================
-
-/// Proof that a priority transaction was committed on a remote shard.
-///
-/// Lightweight: ~400 bytes per tx (merkle proof against transaction_root).
-/// Verified by validators against the QC-attested `CommittedBlockHeader`
-/// from the source shard.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
-pub struct PriorityInclusion {
-    /// Hash of the priority transaction.
-    pub tx_hash: Hash,
-    /// Remote shard where this transaction was committed.
-    pub source_shard: ShardGroupId,
-    /// Block height on the remote shard.
-    pub source_block_height: BlockHeight,
-    /// Merkle inclusion proof against the remote block's transaction_root.
-    pub proof: TransactionInclusionProof,
 }
 
 /// Block header containing consensus metadata.
@@ -224,14 +125,7 @@ pub struct BlockHeader {
 
     /// Merkle root of all transactions in this block.
     ///
-    /// Computed over tagged transaction hashes from all three sections in order:
-    /// `[RETRY || hash, ...] ++ [PRIORITY || hash, ...] ++ [NORMAL || hash, ...]`
-    ///
-    /// This enables:
-    /// - Proving a transaction is in the block (merkle inclusion proof)
-    /// - Proving which slot a transaction belongs to (via tag prefix)
-    /// - Proving transaction ordering (via merkle path position)
-    ///
+    /// Each transaction's hash is a leaf in a padded binary merkle tree.
     /// For empty blocks (fallback, sync), this is `Hash::ZERO`.
     pub transaction_root: Hash,
 
@@ -297,17 +191,13 @@ impl BlockHeader {
 
 /// Complete block with header and transaction data.
 ///
-/// Blocks contain transactions in three priority sections:
-/// 1. **retry_transactions**: Retry transactions (highest priority, critical for liveness)
-/// 2. **priority_transactions**: Cross-shard transactions with verified provisions
-/// 3. **transactions**: All other transactions
+/// Transactions are stored in a single flat list, sorted by hash for deterministic ordering.
 ///
 /// Additional block contents:
 /// - **certificates**: Finalized transaction certificates (Accept/Reject decisions)
 /// - **deferred**: Transactions deferred due to cross-shard cycles (livelock prevention)
 /// - **aborted**: Transactions aborted due to timeout or rejection
 ///
-/// Each section is sorted by transaction hash for deterministic ordering.
 /// Transactions and certificates are stored as `Arc` for efficient cloning
 /// and sharing across the system. When serialized (for storage or network),
 /// the underlying data is written directly.
@@ -316,47 +206,17 @@ pub struct Block {
     /// Block header with consensus metadata.
     pub header: BlockHeader,
 
-    /// Retry transactions (highest priority).
-    ///
-    /// These are transactions that were previously deferred due to cross-shard
-    /// cycles and are being retried. They bypass backpressure limits because
-    /// completing them is critical for liveness.
-    pub retry_transactions: Vec<Arc<RoutableTransaction>>,
-
-    /// Priority transactions (cross-shard with commitment proofs).
-    ///
-    /// These are cross-shard transactions where other shards have already
-    /// committed and are waiting for us. They bypass soft backpressure limits.
-    pub priority_transactions: Vec<Arc<RoutableTransaction>>,
-
-    /// Other transactions (normal priority).
-    ///
-    /// Fresh transactions with no special priority. Subject to backpressure limits.
+    /// All transactions in this block, sorted by hash.
     pub transactions: Vec<Arc<RoutableTransaction>>,
 
     /// Transaction certificates for finalized transactions.
     pub certificates: Vec<Arc<TransactionCertificate>>,
 
     /// Transactions deferred due to cross-shard livelock cycles.
-    ///
-    /// When cycle detection identifies a bidirectional cycle, the losing
-    /// transaction (higher hash) is deferred. This releases its locks and
-    /// queues it for retry after the winner completes.
     pub deferred: Vec<TransactionDefer>,
 
     /// Transactions aborted due to timeout or explicit rejection.
-    ///
-    /// Aborts are terminal - the transaction will not be retried. This is
-    /// used for N-way cycles that cannot be resolved via simple deferral,
-    /// or for transactions that explicitly failed during execution.
     pub aborted: Vec<TransactionAbort>,
-
-    /// Inclusion proofs for priority transactions.
-    ///
-    /// Each entry proves that the corresponding priority transaction was
-    /// committed on the source shard, verified against the QC-attested
-    /// `transaction_root` from `CommittedBlockHeader`.
-    pub priority_inclusions: Vec<PriorityInclusion>,
 }
 
 // Manual PartialEq - compare transaction/certificate content, not Arc pointers
@@ -367,8 +227,6 @@ impl PartialEq for Block {
         }
 
         self.header == other.header
-            && tx_lists_equal(&self.retry_transactions, &other.retry_transactions)
-            && tx_lists_equal(&self.priority_transactions, &other.priority_transactions)
             && tx_lists_equal(&self.transactions, &other.transactions)
             && self.certificates.len() == other.certificates.len()
             && self
@@ -378,7 +236,6 @@ impl PartialEq for Block {
                 .all(|(a, b)| a.as_ref() == b.as_ref())
             && self.deferred == other.deferred
             && self.aborted == other.aborted
-            && self.priority_inclusions == other.priority_inclusions
     }
 }
 
@@ -409,13 +266,8 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
     }
 
     fn encode_body(&self, encoder: &mut E) -> Result<(), sbor::EncodeError> {
-        encoder.write_size(8)?;
+        encoder.write_size(5)?;
         encoder.encode(&self.header)?;
-        // Retry transactions
-        encode_tx_vec(encoder, &self.retry_transactions)?;
-        // Priority transactions
-        encode_tx_vec(encoder, &self.priority_transactions)?;
-        // Other transactions
         encode_tx_vec(encoder, &self.transactions)?;
         // Certificates (manual encoding to unwrap Arc)
         encoder.write_value_kind(sbor::ValueKind::Array)?;
@@ -426,7 +278,6 @@ impl<E: sbor::Encoder<sbor::NoCustomValueKind>> sbor::Encode<sbor::NoCustomValue
         }
         encoder.encode(&self.deferred)?;
         encoder.encode(&self.aborted)?;
-        encoder.encode(&self.priority_inclusions)?;
         Ok(())
     }
 }
@@ -470,18 +321,14 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
         decoder.check_preloaded_value_kind(value_kind, sbor::ValueKind::Tuple)?;
         let length = decoder.read_size()?;
 
-        if length != 8 {
+        if length != 5 {
             return Err(sbor::DecodeError::UnexpectedSize {
-                expected: 8,
+                expected: 5,
                 actual: length,
             });
         }
 
         let header: BlockHeader = decoder.decode()?;
-
-        // Transaction sections
-        let retry_transactions = decode_tx_vec(decoder)?;
-        let priority_transactions = decode_tx_vec(decoder)?;
         let transactions = decode_tx_vec(decoder)?;
 
         // Certificates (manual decoding to wrap in Arc)
@@ -503,17 +350,13 @@ impl<D: sbor::Decoder<sbor::NoCustomValueKind>> sbor::Decode<sbor::NoCustomValue
 
         let deferred: Vec<TransactionDefer> = decoder.decode()?;
         let aborted: Vec<TransactionAbort> = decoder.decode()?;
-        let priority_inclusions: Vec<PriorityInclusion> = decoder.decode()?;
 
         Ok(Self {
             header,
-            retry_transactions,
-            priority_transactions,
             transactions,
             certificates,
             deferred,
             aborted,
-            priority_inclusions,
         })
     }
 }
@@ -537,13 +380,10 @@ impl Block {
     pub fn genesis(shard_group_id: ShardGroupId, proposer: ValidatorId, state_root: Hash) -> Self {
         Self {
             header: BlockHeader::genesis(shard_group_id, proposer, state_root),
-            retry_transactions: vec![],
-            priority_transactions: vec![],
             transactions: vec![],
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            priority_inclusions: vec![],
         }
     }
 
@@ -557,43 +397,17 @@ impl Block {
         self.header.height
     }
 
-    /// Get total number of transactions across all sections.
+    /// Get total number of transactions.
     pub fn transaction_count(&self) -> usize {
-        self.retry_transactions.len() + self.priority_transactions.len() + self.transactions.len()
-    }
-
-    /// Iterate all transactions in priority order (retries, priority, others).
-    pub fn all_transactions(&self) -> impl Iterator<Item = &Arc<RoutableTransaction>> {
-        self.retry_transactions
-            .iter()
-            .chain(self.priority_transactions.iter())
-            .chain(self.transactions.iter())
+        self.transactions.len()
     }
 
     /// Check if this block contains a specific transaction by hash.
     pub fn contains_transaction(&self, tx_hash: &Hash) -> bool {
-        self.all_transactions().any(|tx| tx.hash() == *tx_hash)
+        self.transactions.iter().any(|tx| tx.hash() == *tx_hash)
     }
 
-    /// Get all transaction hashes in priority order.
-    pub fn all_transaction_hashes(&self) -> Vec<Hash> {
-        self.all_transactions().map(|tx| tx.hash()).collect()
-    }
-
-    /// Get retry transaction hashes.
-    pub fn retry_hashes(&self) -> Vec<Hash> {
-        self.retry_transactions.iter().map(|tx| tx.hash()).collect()
-    }
-
-    /// Get priority transaction hashes.
-    pub fn priority_hashes(&self) -> Vec<Hash> {
-        self.priority_transactions
-            .iter()
-            .map(|tx| tx.hash())
-            .collect()
-    }
-
-    /// Get other transaction hashes.
+    /// Get all transaction hashes.
     pub fn transaction_hashes(&self) -> Vec<Hash> {
         self.transactions.iter().map(|tx| tx.hash()).collect()
     }
@@ -671,13 +485,7 @@ impl Block {
 /// eliminates copy-paste across those sites.
 #[derive(Debug, Clone, Default, PartialEq, Eq, BasicSbor)]
 pub struct BlockManifest {
-    /// Retry transaction hashes (highest priority section).
-    pub retry_hashes: Vec<Hash>,
-
-    /// Priority transaction hashes (cross-shard with proofs).
-    pub priority_hashes: Vec<Hash>,
-
-    /// Other transaction hashes (normal priority section).
+    /// Transaction hashes in block order.
     pub tx_hashes: Vec<Hash>,
 
     /// Certificate hashes in block order.
@@ -688,38 +496,17 @@ pub struct BlockManifest {
 
     /// Aborted transactions (small, stored inline).
     pub aborted: Vec<TransactionAbort>,
-
-    /// Inclusion proofs for priority transactions.
-    pub priority_inclusions: Vec<PriorityInclusion>,
 }
 
 impl BlockManifest {
-    /// Get total transaction count across all sections.
+    /// Get total transaction count.
     pub fn transaction_count(&self) -> usize {
-        self.retry_hashes.len() + self.priority_hashes.len() + self.tx_hashes.len()
-    }
-
-    /// Iterate all transaction hashes in priority order.
-    pub fn all_tx_hashes(&self) -> impl Iterator<Item = &Hash> {
-        self.retry_hashes
-            .iter()
-            .chain(self.priority_hashes.iter())
-            .chain(self.tx_hashes.iter())
+        self.tx_hashes.len()
     }
 
     /// Build a manifest from a full block (extracting hashes).
     pub fn from_block(block: &Block) -> Self {
         Self {
-            retry_hashes: block
-                .retry_transactions
-                .iter()
-                .map(|tx| tx.hash())
-                .collect(),
-            priority_hashes: block
-                .priority_transactions
-                .iter()
-                .map(|tx| tx.hash())
-                .collect(),
             tx_hashes: block.transactions.iter().map(|tx| tx.hash()).collect(),
             cert_hashes: block
                 .certificates
@@ -728,7 +515,6 @@ impl BlockManifest {
                 .collect(),
             deferred: block.deferred.clone(),
             aborted: block.aborted.clone(),
-            priority_inclusions: block.priority_inclusions.clone(),
         }
     }
 }
@@ -783,14 +569,9 @@ impl BlockMetadata {
         self.header.hash()
     }
 
-    /// Get total transaction count across all sections.
+    /// Get total transaction count.
     pub fn transaction_count(&self) -> usize {
         self.manifest.transaction_count()
-    }
-
-    /// Iterate all transaction hashes in priority order.
-    pub fn all_tx_hashes(&self) -> impl Iterator<Item = &Hash> {
-        self.manifest.all_tx_hashes()
     }
 }
 
@@ -874,7 +655,7 @@ mod tests {
 
     #[test]
     fn test_compute_transaction_root_empty() {
-        let root = compute_transaction_root(&[], &[], &[]);
+        let root = compute_transaction_root(&[]);
         assert_eq!(root, Hash::ZERO);
     }
 
@@ -890,32 +671,10 @@ mod tests {
         let notarized = crate::sign_and_notarize(manifest, &network, 1, &key).unwrap();
         let tx = Arc::new(RoutableTransaction::try_from(notarized).unwrap());
 
-        let root1 = compute_transaction_root(&[], &[], std::slice::from_ref(&tx));
-        let root2 = compute_transaction_root(&[], &[], std::slice::from_ref(&tx));
+        let root1 = compute_transaction_root(std::slice::from_ref(&tx));
+        let root2 = compute_transaction_root(std::slice::from_ref(&tx));
         assert_eq!(root1, root2);
         assert_ne!(root1, Hash::ZERO);
-    }
-
-    #[test]
-    fn test_compute_transaction_root_slot_affects_hash() {
-        use radix_common::network::NetworkDefinition;
-        use radix_transactions::builder::ManifestBuilder;
-
-        // Create a transaction
-        let manifest = ManifestBuilder::new().drop_all_proofs().build();
-        let network = NetworkDefinition::simulator();
-        let key = crate::generate_ed25519_keypair();
-        let notarized = crate::sign_and_notarize(manifest, &network, 1, &key).unwrap();
-        let tx = Arc::new(RoutableTransaction::try_from(notarized).unwrap());
-
-        // Same tx in different slots should produce different roots
-        let root_retry = compute_transaction_root(std::slice::from_ref(&tx), &[], &[]);
-        let root_priority = compute_transaction_root(&[], std::slice::from_ref(&tx), &[]);
-        let root_normal = compute_transaction_root(&[], &[], std::slice::from_ref(&tx));
-
-        assert_ne!(root_retry, root_priority);
-        assert_ne!(root_priority, root_normal);
-        assert_ne!(root_retry, root_normal);
     }
 
     #[test]

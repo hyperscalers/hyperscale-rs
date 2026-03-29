@@ -16,20 +16,14 @@ use tracing::instrument;
 /// even after the transaction has been evicted from the active pool.
 const TRANSACTION_RETENTION_BLOCKS: u64 = 50;
 
-/// Default backpressure limit (soft limit).
+/// Default backpressure limit.
 ///
 /// This limits how many transactions can be in-flight (holding state locks) at once.
-/// When at this limit, new transactions without provisions are delayed.
-/// Cross-shard TXs WITH provisions (committed on another shard) can still be proposed,
-/// ensuring we don't block transactions that other shards are waiting on.
-pub const DEFAULT_IN_FLIGHT_LIMIT: usize = 2048;
-
-/// Default hard limit on transactions in-flight.
+/// When at this limit, no new transactions are proposed.
 ///
-/// This is an absolute cap on transactions holding state locks. When at this limit,
-/// NO new transactions are proposed (even cross-shard TXs with provisions). This prevents
-/// unbounded growth and controls execution/crypto verification pressure.
-pub const DEFAULT_IN_FLIGHT_HARD_LIMIT: usize = 4096;
+/// Set to 3× the block transaction limit to allow a full pipeline of blocks
+/// (commit → execute → certify) without stalling proposal of new transactions.
+pub const DEFAULT_IN_FLIGHT_LIMIT: usize = 12288;
 
 /// Default limit on pending transactions for RPC backpressure.
 ///
@@ -42,21 +36,12 @@ pub const DEFAULT_MAX_PENDING: usize = 8192;
 /// Mempool configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MempoolConfig {
-    /// Maximum transactions allowed in-flight (soft limit).
+    /// Maximum transactions allowed in-flight (holding state locks).
     ///
-    /// When at this limit, new transactions without provisions are delayed.
-    /// Cross-shard TXs WITH provisions (committed on another shard) can still be proposed,
-    /// ensuring we don't block transactions that other shards are waiting on.
+    /// When at this limit, no new transactions are proposed and RPC submissions
+    /// are rejected. Controls execution/crypto verification pressure.
     #[serde(default = "default_max_in_flight")]
     pub max_in_flight: usize,
-
-    /// Hard limit on transactions in-flight.
-    ///
-    /// When at this limit, NO new transactions are proposed (even cross-shard TXs with
-    /// provisions). This prevents unbounded growth and controls execution/crypto pressure.
-    /// RPC transaction submissions are also rejected when this limit is reached.
-    #[serde(default = "default_max_in_flight_hard_limit")]
-    pub max_in_flight_hard_limit: usize,
 
     /// Maximum pending transactions before RPC backpressure kicks in.
     ///
@@ -71,10 +56,6 @@ fn default_max_in_flight() -> usize {
     DEFAULT_IN_FLIGHT_LIMIT
 }
 
-fn default_max_in_flight_hard_limit() -> usize {
-    DEFAULT_IN_FLIGHT_HARD_LIMIT
-}
-
 fn default_max_pending() -> usize {
     DEFAULT_MAX_PENDING
 }
@@ -83,7 +64,6 @@ impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
             max_in_flight: DEFAULT_IN_FLIGHT_LIMIT,
-            max_in_flight_hard_limit: DEFAULT_IN_FLIGHT_HARD_LIMIT,
             max_pending: DEFAULT_MAX_PENDING,
         }
     }
@@ -137,8 +117,6 @@ struct PoolEntry {
 #[derive(Debug, Clone)]
 struct ReadyEntry {
     tx: Arc<RoutableTransaction>,
-    /// Whether this transaction has verified provisions (for cross-shard priority).
-    has_provisions: bool,
 }
 
 /// Mempool state machine.
@@ -147,15 +125,12 @@ struct ReadyEntry {
 /// Uses `BTreeMap` for the pool to maintain hash ordering, which allows
 /// ready_transactions() to iterate in sorted order without sorting.
 ///
-/// # Incremental Ready Sets
+/// # Incremental Ready Set
 ///
 /// To avoid O(n) scans on every `ready_transactions()` call, we maintain
-/// three pre-computed ready sets that are updated incrementally:
-/// - `ready_retries`: Retry transactions (highest priority)
-/// - `ready_priority`: Cross-shard TXs with verified provisions
-/// - `ready_others`: All other ready transactions
+/// a pre-computed ready set that is updated incrementally.
 ///
-/// Transactions are added to these sets when they become ready (Pending status,
+/// Transactions are added to this set when they become ready (Pending status,
 /// no conflicts with locked nodes) and removed when they are no longer ready
 /// (status changes, conflicts arise, or evicted).
 pub struct MempoolState {
@@ -219,25 +194,17 @@ pub struct MempoolState {
     /// This avoids O(n) scan on every lock_contention_stats() call.
     executed_count: usize,
 
-    // ========== Incremental Ready Sets ==========
+    // ========== Incremental Ready Set ==========
     //
-    // These sets are maintained incrementally to provide O(1) ready_transactions().
+    // This set is maintained incrementally to provide O(1) ready_transactions().
     // Invariants:
-    // 1. A transaction is in exactly one of: ready_retries, ready_priority, ready_others,
-    //    deferred_by_nodes, or none (if not Pending or not in pool).
-    // 2. ready_* sets contain only Pending transactions with no locked node conflicts.
+    // 1. A transaction is in exactly one of: ready, deferred_by_nodes, or none
+    //    (if not Pending or not in pool).
+    // 2. ready contains only Pending transactions with no locked node conflicts.
     // 3. deferred_by_nodes contains Pending transactions deferred by locked nodes.
-    /// Ready retry transactions (highest priority, bypass soft limit).
+    /// Ready transactions (subject to backpressure limit).
     /// BTreeMap maintains hash order for deterministic iteration.
-    ready_retries: BTreeMap<Hash, ReadyEntry>,
-
-    /// Ready cross-shard transactions with verified provisions (high priority, bypass soft limit).
-    /// BTreeMap maintains hash order for deterministic iteration.
-    ready_priority: BTreeMap<Hash, ReadyEntry>,
-
-    /// Ready normal transactions (subject to soft limit).
-    /// BTreeMap maintains hash order for deterministic iteration.
-    ready_others: BTreeMap<Hash, ReadyEntry>,
+    ready: BTreeMap<Hash, ReadyEntry>,
 
     /// Pending transactions deferred by locked nodes.
     /// Maps tx_hash -> set of blocking node IDs.
@@ -266,9 +233,7 @@ impl std::fmt::Debug for MempoolState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MempoolState")
             .field("pool_size", &self.pool.len())
-            .field("ready_retries", &self.ready_retries.len())
-            .field("ready_priority", &self.ready_priority.len())
-            .field("ready_others", &self.ready_others.len())
+            .field("ready", &self.ready.len())
             .field("deferred_by_nodes", &self.deferred_by_nodes.len())
             .field("in_flight", &self.in_flight())
             .finish()
@@ -301,9 +266,7 @@ impl MempoolState {
             locked_nodes_cache: HashSet::new(),
             committed_count: 0,
             executed_count: 0,
-            ready_retries: BTreeMap::new(),
-            ready_priority: BTreeMap::new(),
-            ready_others: BTreeMap::new(),
+            ready: BTreeMap::new(),
             deferred_by_nodes: HashMap::new(),
             txs_deferred_by_node: HashMap::new(),
             ready_txs_by_node: HashMap::new(),
@@ -543,7 +506,7 @@ impl MempoolState {
         // This handles the case where we fetched transactions to vote on a block
         // but didn't receive them via gossip. We need them in the mempool for
         // status tracking (deferrals, retries, execution status updates).
-        for tx in block.all_transactions() {
+        for tx in block.transactions.iter() {
             let hash = tx.hash();
             if !self.pool.contains_key(&hash) {
                 let cross_shard = tx.is_cross_shard(topology.num_shards());
@@ -586,9 +549,8 @@ impl MempoolState {
         // When a retry T' is committed, its original T must be marked as Retried and evicted.
         // This releases T's locks so T' can acquire them. This is consensus-agreed: the retry
         // being in the block means all validators agree T is superseded.
-        // Only iterate retry_transactions to avoid overhead in the common case.
         // Note: Execution state cleanup is handled by NodeStateMachine, similar to deferrals.
-        for retry_tx in &block.retry_transactions {
+        for retry_tx in block.transactions.iter().filter(|tx| tx.is_retry()) {
             let original_hash = retry_tx.original_hash();
             let retry_hash = retry_tx.hash();
 
@@ -624,7 +586,7 @@ impl MempoolState {
         // Update transaction status to Committed and add locks.
         // This must happen synchronously to prevent the same transactions from being
         // re-proposed before the status update is processed.
-        for tx in block.all_transactions() {
+        for tx in block.transactions.iter() {
             let hash = tx.hash();
             if let Some(entry) = self.pool.get_mut(&hash) {
                 // Only update if still Pending (avoid overwriting later states during sync)
@@ -1479,14 +1441,11 @@ impl MempoolState {
         self.add_to_ready_set(hash, tx, cross_shard);
     }
 
-    /// Add a transaction to the appropriate ready set based on its properties.
+    /// Add a transaction to the ready set.
     ///
     /// Precondition: transaction must not be deferred by any locked nodes.
-    fn add_to_ready_set(&mut self, hash: Hash, tx: &Arc<RoutableTransaction>, cross_shard: bool) {
-        let ready_entry = ReadyEntry {
-            tx: Arc::clone(tx),
-            has_provisions: false, // Updated by on_provision_verified
-        };
+    fn add_to_ready_set(&mut self, hash: Hash, tx: &Arc<RoutableTransaction>, _cross_shard: bool) {
+        let ready_entry = ReadyEntry { tx: Arc::clone(tx) };
 
         // Add to reverse index for O(1) blocking when nodes become locked
         for node in tx.all_declared_nodes() {
@@ -1496,26 +1455,15 @@ impl MempoolState {
                 .insert(hash);
         }
 
-        if tx.is_retry() {
-            self.ready_retries.insert(hash, ready_entry);
-        } else if cross_shard {
-            // Cross-shard starts in others, promoted to priority when provisions verified
-            self.ready_others.insert(hash, ready_entry);
-        } else {
-            self.ready_others.insert(hash, ready_entry);
-        }
+        self.ready.insert(hash, ready_entry);
     }
 
     /// Remove a transaction from all ready tracking structures.
     ///
     /// Called when a transaction is no longer Pending (committed, evicted, etc.).
     fn remove_from_ready_tracking(&mut self, hash: &Hash) {
-        // Remove from ready sets and clean reverse index
-        if let Some(entry) = self.ready_retries.remove(hash) {
-            self.remove_from_ready_txs_by_node(hash, &entry.tx);
-        } else if let Some(entry) = self.ready_priority.remove(hash) {
-            self.remove_from_ready_txs_by_node(hash, &entry.tx);
-        } else if let Some(entry) = self.ready_others.remove(hash) {
+        // Remove from ready set and clean reverse index
+        if let Some(entry) = self.ready.remove(hash) {
             self.remove_from_ready_txs_by_node(hash, &entry.tx);
         }
 
@@ -1559,12 +1507,8 @@ impl MempoolState {
 
         // Move each transaction from its ready set to deferred
         for hash in tx_hashes {
-            // Try to remove from each ready set (transaction is in exactly one)
-            let removed_entry = self
-                .ready_retries
-                .remove(&hash)
-                .or_else(|| self.ready_priority.remove(&hash))
-                .or_else(|| self.ready_others.remove(&hash));
+            // Remove from ready set
+            let removed_entry = self.ready.remove(&hash);
 
             if let Some(entry) = removed_entry {
                 // Clean remaining nodes from ready_txs_by_node (except the one we already removed)
@@ -1627,45 +1571,22 @@ impl MempoolState {
         }
     }
 
-    /// Promote a cross-shard transaction from ready_others to ready_priority.
-    ///
-    /// Called when provisions are verified for a transaction.
-    pub fn on_provision_verified(&mut self, tx_hash: Hash) {
-        if let Some(mut entry) = self.ready_others.remove(&tx_hash) {
-            entry.has_provisions = true;
-            self.ready_priority.insert(tx_hash, entry);
-        }
-    }
-
     /// Get transactions ready for inclusion in a block with backpressure support.
     ///
-    /// Returns transactions in three priority groups:
-    /// 1. **Highest**: Retry transactions (must be included quickly to avoid stalls)
-    /// 2. **High**: Cross-shard TXs with verified provisions (other shards waiting on us)
-    /// 3. **Normal**: All other TXs (subject to backpressure limit)
-    ///
-    /// Within each group, transactions are sorted by hash (ascending) for determinism.
+    /// Returns transactions sorted by hash (ascending) for determinism.
+    /// All transactions are subject to the same backpressure limit.
     ///
     /// Backpressure rules:
-    /// - Retry TXs bypass soft limit (critical path - deferred TX needs fast retry)
-    /// - Cross-shard TXs WITH verified provisions bypass soft limit (other shards waiting on us)
-    /// - All other TXs (single-shard and cross-shard without provisions) subject to soft limit
-    /// - At hard limit, NO transactions proposed (even retries or those with provisions)
+    /// - At hard limit, NO transactions are proposed
+    /// - Otherwise, transactions are returned up to `max_count`, capped by headroom
+    ///   to the hard limit
     ///
     /// The backpressure limit is based on how many transactions are currently holding
     /// state locks (Committed or Executed status). This controls execution and crypto
     /// verification pressure across the system.
     ///
-    /// Retry priority is critical: when a transaction is deferred due to livelock, a retry
-    /// is created with a new hash. The retry must be included quickly so it can complete
-    /// before hitting more conflicts. Without this priority, retries would compete with
-    /// new transactions and potentially stall indefinitely.
-    ///
-    /// Returns transactions organized by priority section, each sorted by hash.
-    /// This allows block building without reclassification, preserving sort order.
-    ///
     /// Parameters:
-    /// - `max_count`: Maximum total transactions across all sections
+    /// - `max_count`: Maximum total transactions
     /// - `pending_commit_tx_count`: Transactions about to be committed (INCREASES in-flight)
     /// - `pending_commit_cert_count`: Certificates about to be committed (DECREASES in-flight)
     ///
@@ -1674,7 +1595,7 @@ impl MempoolState {
     /// # Performance
     ///
     /// This method is O(min(ready_set_size, max_count)) instead of O(pool_size) because
-    /// it reads from pre-computed ready sets that are maintained incrementally.
+    /// it reads from a pre-computed ready set that is maintained incrementally.
     pub fn ready_transactions(
         &self,
         max_count: usize,
@@ -1686,53 +1607,27 @@ impl MempoolState {
             .in_flight()
             .saturating_add(pending_commit_tx_count)
             .saturating_sub(pending_commit_cert_count);
-        let at_soft_limit = effective_in_flight >= self.config.max_in_flight;
-        let at_hard_limit = effective_in_flight >= self.config.max_in_flight_hard_limit;
+        let at_limit = effective_in_flight >= self.config.max_in_flight;
 
-        // At hard limit: no TXs at all
-        if at_hard_limit {
+        if at_limit {
             return ReadyTransactions::default();
         }
 
-        // Cap max_count to stay within hard limit
-        // We can add at most (hard_limit - effective_in_flight) transactions
-        let room_to_hard_limit = self
+        // Cap max_count to stay within limit
+        let room = self
             .config
-            .max_in_flight_hard_limit
+            .max_in_flight
             .saturating_sub(effective_in_flight);
-        let max_count = max_count.min(room_to_hard_limit);
+        let max_count = max_count.min(room);
 
-        let mut remaining = max_count;
         let mut result = ReadyTransactions::default();
 
-        // Tier 1: Retry transactions (highest priority, bypass soft limit)
-        // BTreeMap iteration is in hash order
-        for entry in self.ready_retries.values() {
-            if remaining == 0 {
+        // Iterate ready set in hash order (BTreeMap guarantees this)
+        for entry in self.ready.values() {
+            if result.transactions.len() >= max_count {
                 break;
             }
-            result.retries.push(Arc::clone(&entry.tx));
-            remaining -= 1;
-        }
-
-        // Tier 2: Priority transactions (cross-shard with provisions, bypass soft limit)
-        for entry in self.ready_priority.values() {
-            if remaining == 0 {
-                break;
-            }
-            result.priority.push(Arc::clone(&entry.tx));
-            remaining -= 1;
-        }
-
-        // Tier 3: Other transactions (subject to soft limit)
-        if !at_soft_limit {
-            for entry in self.ready_others.values() {
-                if remaining == 0 {
-                    break;
-                }
-                result.others.push(Arc::clone(&entry.tx));
-                remaining -= 1;
-            }
+            result.transactions.push(Arc::clone(&entry.tx));
         }
 
         result
@@ -1753,9 +1648,8 @@ impl MempoolState {
         let locked_nodes = self.locked_nodes_cache.len() as u64;
         let deferred_count = self.deferred_by.len() as u64;
 
-        // Pending counts are O(1) from ready sets
-        let ready_count =
-            self.ready_retries.len() + self.ready_priority.len() + self.ready_others.len();
+        // Pending counts are O(1) from ready set
+        let ready_count = self.ready.len();
         let pending_deferred = self.deferred_by_nodes.len() as u64;
         let pending_count = (ready_count + self.deferred_by_nodes.len()) as u64;
 
@@ -1782,20 +1676,11 @@ impl MempoolState {
         self.committed_count + self.executed_count
     }
 
-    /// Check if we're at the backpressure soft limit.
+    /// Check if we're at the in-flight limit.
     ///
-    /// At this limit, new transactions without provisions are delayed.
-    /// Cross-shard TXs WITH provisions can still be proposed (other shards waiting on us).
+    /// At this limit, no new transactions are proposed.
     pub fn at_in_flight_limit(&self) -> bool {
         self.in_flight() >= self.config.max_in_flight
-    }
-
-    /// Check if we're at the hard limit.
-    ///
-    /// At this limit, NO new transactions are proposed, even cross-shard TXs
-    /// with provisions. This prevents unbounded growth and controls system pressure.
-    pub fn at_in_flight_hard_limit(&self) -> bool {
-        self.in_flight() >= self.config.max_in_flight_hard_limit
     }
 
     /// Get the number of pending transactions.
@@ -2100,13 +1985,10 @@ mod tests {
                 receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             },
-            retry_transactions: vec![],
-            priority_transactions: vec![],
             transactions: transactions.into_iter().map(Arc::new).collect(),
             certificates: certificates.into_iter().map(Arc::new).collect(),
             deferred,
             aborted,
-            priority_inclusions: vec![],
         }
     }
 
@@ -2130,7 +2012,6 @@ mod tests {
             tx_inclusion_proof: hyperscale_types::TransactionInclusionProof {
                 siblings: vec![],
                 leaf_index: 0,
-                leaf_hash: Hash::ZERO,
             },
         }
     }
@@ -2912,25 +2793,16 @@ mod tests {
     fn test_config_defaults() {
         let config = MempoolConfig::default();
         assert_eq!(config.max_in_flight, DEFAULT_IN_FLIGHT_LIMIT);
-        assert_eq!(
-            config.max_in_flight_hard_limit,
-            DEFAULT_IN_FLIGHT_HARD_LIMIT
-        );
     }
 
     // =========================================================================
     // Backpressure Tests
     // =========================================================================
 
-    fn make_provision_coordinator() -> hyperscale_provisions::ProvisionCoordinator {
-        hyperscale_provisions::ProvisionCoordinator::new()
-    }
-
     /// Create a mempool config with a low in-flight limit for testing.
     fn make_mempool_config_with_limit(limit: usize) -> MempoolConfig {
         MempoolConfig {
             max_in_flight: limit,
-            max_in_flight_hard_limit: limit * 2, // Hard limit is 2x soft limit
             max_pending: DEFAULT_MAX_PENDING,
         }
     }
@@ -3002,66 +2874,44 @@ mod tests {
     }
 
     #[test]
-    fn test_backpressure_rejects_all_txns_at_soft_limit() {
-        // Use a low limit for testing
-        let config = make_mempool_config_with_limit(2);
+    fn test_backpressure_allows_txns_below_limit() {
+        // Use a limit that leaves room
+        let config = make_mempool_config_with_limit(10);
         let mut mempool = MempoolState::with_config(config);
         let topology = make_cross_shard_topology();
-
-        // Put mempool at the backpressure limit
-        put_mempool_at_limit(&mut mempool, &topology);
 
         // Add a single-shard transaction
         let single_shard_tx = test_transaction(1);
         mempool.on_submit_transaction(&topology, single_shard_tx.clone());
 
-        // Add a cross-shard transaction (no provisions)
+        // Add a cross-shard transaction
         let cross_shard_tx = test_cross_shard_transaction(50);
         mempool.on_submit_transaction(&topology, cross_shard_tx.clone());
 
-        // At soft limit: ALL new TXs without provisions should be rejected
+        // Below limit: all TXs should be returned
         let ready = mempool.ready_transactions(10, 0, 0);
-        assert!(
-            ready.is_empty(),
-            "All TXs without provisions should be rejected at soft limit"
-        );
+        assert_eq!(ready.len(), 2, "All TXs should be allowed below limit");
     }
 
     #[test]
-    fn test_backpressure_allows_cross_shard_with_provisions() {
-        // Use a low limit for testing
+    fn test_backpressure_rejects_all_at_limit() {
         let config = make_mempool_config_with_limit(2);
         let mut mempool = MempoolState::with_config(config);
         let topology = make_cross_shard_topology();
 
-        // Create coordinator and add verified provisions for our TX
-        let mut coordinator = make_provision_coordinator();
-
-        // Put mempool at the backpressure limit
+        // Put mempool at the in-flight limit
         put_mempool_at_limit(&mut mempool, &topology);
+        assert!(mempool.at_in_flight_limit());
 
-        // Add cross-shard transaction
-        let tx = test_cross_shard_transaction(1);
-        let tx_hash = tx.hash();
+        // Add a transaction
+        let tx = test_transaction(1);
         mempool.on_submit_transaction(&topology, tx.clone());
 
-        // Simulate that another shard has committed this TX by adding verified provisions
-        // First register the TX
-        let reg = hyperscale_provisions::TxRegistration {
-            required_shards: std::iter::once(ShardGroupId(1)).collect(),
-            registered_at: BlockHeight(1),
-        };
-        coordinator.on_tx_registered(tx_hash, reg);
-
-        // Simulate a verified provision being added (need to call internal method)
-        // For this test, we'll just verify the logic by checking has_any_verified_provisions
-        // In a real scenario, provisions would be verified via the QC + merkle proof verification flow
-
-        // Without provisions, TX should be rejected at limit
+        // At limit: no TXs should be returned
         let ready = mempool.ready_transactions(10, 0, 0);
         assert!(
             ready.is_empty(),
-            "Cross-shard TX without provisions should be rejected at limit"
+            "No TXs should be returned at in-flight limit"
         );
     }
 
@@ -3150,94 +3000,5 @@ mod tests {
             TransactionStatus::Completed(TransactionDecision::Accept),
         );
         assert_eq!(mempool.in_flight(), 0, "All completed");
-    }
-
-    #[test]
-    fn test_retry_transactions_have_highest_priority() {
-        // Use a low limit for testing
-        let config = make_mempool_config_with_limit(2);
-        let mut mempool = MempoolState::with_config(config);
-        let topology = make_cross_shard_topology();
-
-        // Put mempool at the backpressure limit
-        put_mempool_at_limit(&mut mempool, &topology);
-
-        // Add a normal single-shard transaction (use seed that won't conflict with limit TXs)
-        let normal_tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, normal_tx.clone());
-
-        // Create a retry transaction (simulating a deferred TX that was retried)
-        // Use seed 200 to avoid conflicting with the limit TXs (seeds 100, 101)
-        let original_tx = test_transaction(200);
-        let retry_tx = original_tx.create_retry(Hash::from_bytes(b"winner"), BlockHeight(5));
-        let retry_hash = retry_tx.hash();
-        mempool.on_submit_transaction(&topology, retry_tx.clone());
-
-        // At soft limit: normal TXs should be rejected, but retries should be allowed
-        let ready = mempool.ready_transactions(10, 0, 0);
-
-        // Should contain ONLY the retry (normal TX deferred by backpressure)
-        assert_eq!(
-            ready.len(),
-            1,
-            "Only retry should be returned at soft limit"
-        );
-        assert_eq!(
-            ready.retries.len(),
-            1,
-            "Retry should be in the retries section"
-        );
-        assert_eq!(
-            ready.retries[0].hash(),
-            retry_hash,
-            "Retry transaction should have priority over normal transactions"
-        );
-        assert!(
-            ready.retries[0].is_retry(),
-            "The returned transaction should be a retry"
-        );
-    }
-
-    #[test]
-    fn test_retry_priority_ordering() {
-        let topology = make_cross_shard_topology();
-        let mut mempool = MempoolState::new();
-
-        // Add transactions in mixed order: normal, retry, normal
-        let normal1 = test_transaction(1);
-        let normal2 = test_transaction(2);
-        let original = test_transaction(100);
-        let retry = original.create_retry(Hash::from_bytes(b"winner"), BlockHeight(5));
-
-        mempool.on_submit_transaction(&topology, normal1.clone());
-        mempool.on_submit_transaction(&topology, retry.clone());
-        mempool.on_submit_transaction(&topology, normal2.clone());
-
-        // Request transactions - retry should be in retries section, others in others section
-        let ready = mempool.ready_transactions(10, 0, 0);
-
-        assert_eq!(ready.len(), 3, "All transactions should be returned");
-
-        // Retry section should contain exactly the retry
-        assert_eq!(ready.retries.len(), 1, "Should have exactly one retry");
-        assert!(
-            ready.retries[0].is_retry(),
-            "Retry transaction should be in retries section"
-        );
-        assert_eq!(
-            ready.retries[0].hash(),
-            retry.hash(),
-            "Retry should have correct hash"
-        );
-
-        // Others section should contain the normal transactions
-        assert_eq!(
-            ready.others.len(),
-            2,
-            "Should have two normal transactions in others"
-        );
-        for tx in &ready.others {
-            assert!(!tx.is_retry(), "Normal transactions should not be retries");
-        }
     }
 }

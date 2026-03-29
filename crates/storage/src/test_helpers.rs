@@ -112,13 +112,10 @@ pub fn make_test_block(height: u64) -> Block {
             receipt_root: Hash::ZERO,
             provision_targets: vec![],
         },
-        retry_transactions: vec![],
-        priority_transactions: vec![],
         transactions: vec![],
         certificates: vec![],
         deferred: vec![],
         aborted: vec![],
-        priority_inclusions: vec![],
     }
 }
 

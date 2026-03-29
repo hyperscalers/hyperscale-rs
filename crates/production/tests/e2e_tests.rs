@@ -67,13 +67,10 @@ async fn test_storage_operations() {
 
     let block = Block {
         header: header.clone(),
-        retry_transactions: vec![],
-        priority_transactions: vec![],
         transactions: vec![],
         certificates: vec![],
         deferred: vec![],
         aborted: vec![],
-        priority_inclusions: vec![],
     };
 
     let qc = QuorumCertificate::genesis();

@@ -53,7 +53,8 @@ impl PendingBlock {
     /// Create a pending block from a header and manifest.
     pub fn from_manifest(header: BlockHeader, manifest: BlockManifest) -> Self {
         let total_tx_count = manifest.transaction_count();
-        let missing_transaction_hashes: HashSet<Hash> = manifest.all_tx_hashes().copied().collect();
+        let missing_transaction_hashes: HashSet<Hash> =
+            manifest.tx_hashes.iter().copied().collect();
         let missing_certificate_hashes: HashSet<Hash> =
             manifest.cert_hashes.iter().copied().collect();
 
@@ -84,16 +85,6 @@ impl PendingBlock {
             constructed_block: None,
         };
         // Fill in all transactions and certificates so construct_block works
-        for tx in &block.retry_transactions {
-            pending
-                .received_transactions
-                .insert(tx.hash(), Arc::clone(tx));
-        }
-        for tx in &block.priority_transactions {
-            pending
-                .received_transactions
-                .insert(tx.hash(), Arc::clone(tx));
-        }
         for tx in &block.transactions {
             pending
                 .received_transactions
@@ -192,21 +183,6 @@ impl PendingBlock {
         }
 
         // Build transactions in the ORIGINAL order from the gossip message.
-        // Each section is built separately to maintain the correct Block structure.
-        let retry_transactions: Vec<Arc<RoutableTransaction>> = self
-            .manifest
-            .retry_hashes
-            .iter()
-            .filter_map(|hash| self.received_transactions.remove(hash))
-            .collect();
-
-        let priority_transactions: Vec<Arc<RoutableTransaction>> = self
-            .manifest
-            .priority_hashes
-            .iter()
-            .filter_map(|hash| self.received_transactions.remove(hash))
-            .collect();
-
         let transactions: Vec<Arc<RoutableTransaction>> = self
             .manifest
             .tx_hashes
@@ -227,13 +203,10 @@ impl PendingBlock {
 
         let block = Arc::new(Block {
             header: self.header.clone(),
-            retry_transactions,
-            priority_transactions,
             transactions,
             certificates,
             deferred,
             aborted,
-            priority_inclusions: self.manifest.priority_inclusions.clone(),
         });
 
         self.constructed_block = Some(Arc::clone(&block));
@@ -294,12 +267,10 @@ mod tests {
         let tx2 = Hash::from_bytes(b"tx2");
         let header = make_header(1);
 
-        // Put tx1 in retry section, tx2 in other section
         let pb = PendingBlock::from_manifest(
             header.clone(),
             BlockManifest {
-                retry_hashes: vec![tx1],
-                tx_hashes: vec![tx2],
+                tx_hashes: vec![tx1, tx2],
                 ..Default::default()
             },
         );

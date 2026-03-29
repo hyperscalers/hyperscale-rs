@@ -42,8 +42,7 @@ PACKET_LOSS_PERCENT=""                          # Packet loss percentage (empty 
 JVT_HISTORY_LENGTH=256                          # Number of block heights of JVT history to retain (default: 256)
 
 # Mempool configuration
-MEMPOOL_MAX_IN_FLIGHT=2048                      # Soft limit on in-flight transactions
-MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT=4096           # Hard limit on in-flight transactions
+MEMPOOL_MAX_IN_FLIGHT=12288                     # Max in-flight transactions (3x block limit)
 MEMPOOL_MAX_PENDING=8192                        # Max pending before RPC backpressure
 
 # Define explicit port ranges for Docker and firewall whitelisting
@@ -119,7 +118,8 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --mempool-max-in-flight-hard-limit)
-            MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT="$2"
+            echo "Warning: --mempool-max-in-flight-hard-limit is deprecated, use --mempool-max-in-flight"
+            MEMPOOL_MAX_IN_FLIGHT="$2"
             shift 2
             ;;
         --mempool-max-pending)
@@ -454,7 +454,6 @@ jvt_history_length = $JVT_HISTORY_LENGTH
 
 [mempool]
 max_in_flight = $MEMPOOL_MAX_IN_FLIGHT
-max_in_flight_hard_limit = $MEMPOOL_MAX_IN_FLIGHT_HARD_LIMIT
 max_pending = $MEMPOOL_MAX_PENDING
 
 [metrics]

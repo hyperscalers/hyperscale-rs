@@ -1603,37 +1603,30 @@ pub fn sign_and_notarize_with_options(
     })
 }
 
-/// Ready transactions organized by priority section.
+/// Ready transactions for block proposal.
 ///
-/// Each section is sorted by transaction hash (from BTreeMap iteration order).
-/// This structure allows block building without reclassification.
+/// Transactions are sorted by hash (from BTreeMap iteration order) for determinism.
+/// All transactions are subject to the same backpressure limit.
 #[derive(Clone, Debug, Default)]
 pub struct ReadyTransactions {
-    /// Retry transactions (highest priority, bypass soft limit).
-    pub retries: Vec<std::sync::Arc<RoutableTransaction>>,
-    /// Priority transactions (cross-shard with verified provisions, bypass soft limit).
-    pub priority: Vec<std::sync::Arc<RoutableTransaction>>,
-    /// Other transactions (subject to soft limit).
-    pub others: Vec<std::sync::Arc<RoutableTransaction>>,
+    /// Transactions ready for inclusion, sorted by hash.
+    pub transactions: Vec<std::sync::Arc<RoutableTransaction>>,
 }
 
 impl ReadyTransactions {
-    /// Total number of transactions across all sections.
+    /// Total number of transactions.
     pub fn len(&self) -> usize {
-        self.retries.len() + self.priority.len() + self.others.len()
+        self.transactions.len()
     }
 
     /// Whether there are no transactions.
     pub fn is_empty(&self) -> bool {
-        self.retries.is_empty() && self.priority.is_empty() && self.others.is_empty()
+        self.transactions.is_empty()
     }
 
-    /// Iterate all transactions in priority order (retries, then priority, then others).
+    /// Iterate all transactions.
     pub fn iter(&self) -> impl Iterator<Item = &std::sync::Arc<RoutableTransaction>> {
-        self.retries
-            .iter()
-            .chain(self.priority.iter())
-            .chain(self.others.iter())
+        self.transactions.iter()
     }
 }
 

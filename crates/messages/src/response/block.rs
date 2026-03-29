@@ -103,13 +103,10 @@ mod tests {
                 receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             },
-            retry_transactions: vec![],
-            priority_transactions: vec![],
             transactions: vec![std::sync::Arc::new(tx)],
             certificates: vec![],
             deferred: vec![],
             aborted: vec![],
-            priority_inclusions: vec![],
         }
     }
 

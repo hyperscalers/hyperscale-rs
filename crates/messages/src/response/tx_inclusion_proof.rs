@@ -45,7 +45,6 @@ mod tests {
                     proof: Some(TransactionInclusionProof {
                         siblings: vec![Hash::from_bytes(b"sib1"), Hash::from_bytes(b"sib2")],
                         leaf_index: 3,
-                        leaf_hash: Hash::from_bytes(b"leaf1"),
                     }),
                 },
                 TxInclusionProofEntry {

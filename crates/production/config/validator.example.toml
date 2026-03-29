@@ -148,13 +148,8 @@ jvt_history_length = 256
 # Maximum transactions allowed in-flight (soft limit).
 # When at this limit, new transactions without provisions are delayed.
 # Cross-shard TXs WITH provisions can still be proposed.
-max_in_flight = 2048
+max_in_flight = 12288
 
-# Hard limit on transactions in-flight.
-# When at this limit, NO new transactions are proposed (even cross-shard TXs
-# with provisions). This prevents unbounded growth and controls execution/crypto
-# pressure. RPC submissions are also rejected when this limit is reached.
-max_in_flight_hard_limit = 4096
 
 # Maximum pending transactions before RPC backpressure kicks in.
 # When the number of Pending transactions exceeds this limit, new RPC submissions

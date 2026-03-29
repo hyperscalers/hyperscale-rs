@@ -1356,8 +1356,7 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         batch.put_cf(blocks_cf, height_key, metadata_value);
 
         // 2. Store transactions (deduplicated - RocksDB overwrites are idempotent)
-        // Must store all transaction sections: retry, priority, and normal
-        for tx in block.all_transactions() {
+        for tx in block.transactions.iter() {
             let tx_hash = tx.hash();
             let tx_value =
                 sbor::basic_encode(tx.as_ref()).expect("transaction encoding must succeed");
@@ -1410,22 +1409,16 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             .flatten()
             .and_then(|v| sbor::basic_decode(&v).ok())?;
 
-        // 2. Batch-fetch transactions for each section (preserving order)
-        let retry_transactions =
-            self.get_transactions_batch_ordered(&metadata.manifest.retry_hashes);
-        let priority_transactions =
-            self.get_transactions_batch_ordered(&metadata.manifest.priority_hashes);
+        // 2. Batch-fetch transactions (preserving order)
         let transactions = self.get_transactions_batch_ordered(&metadata.manifest.tx_hashes);
 
         // Verify we got ALL transactions - return None if any are missing
         let total_expected = metadata.manifest.transaction_count();
-        let total_found =
-            retry_transactions.len() + priority_transactions.len() + transactions.len();
-        if total_found != total_expected {
+        if transactions.len() != total_expected {
             tracing::warn!(
                 height = height.0,
                 expected = total_expected,
-                found = total_found,
+                found = transactions.len(),
                 "Block has missing transactions - cannot serve sync request"
             );
             return None;
@@ -1448,13 +1441,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         // 4. Reconstruct block
         let block = Block {
             header: metadata.header,
-            retry_transactions,
-            priority_transactions,
             transactions,
             certificates,
             deferred: metadata.manifest.deferred,
             aborted: metadata.manifest.aborted,
-            priority_inclusions: metadata.manifest.priority_inclusions,
         };
 
         let elapsed = start.elapsed().as_secs_f64();
@@ -1516,22 +1506,16 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
             .flatten()
             .and_then(|v| sbor::basic_decode(&v).ok())?;
 
-        // 2. Try to batch-fetch transactions for each section (preserving order)
-        let retry_transactions =
-            self.get_transactions_batch_ordered(&metadata.manifest.retry_hashes);
-        let priority_transactions =
-            self.get_transactions_batch_ordered(&metadata.manifest.priority_hashes);
+        // 2. Try to batch-fetch transactions (preserving order)
         let transactions = self.get_transactions_batch_ordered(&metadata.manifest.tx_hashes);
 
         // Check if all transactions are present - if not, return None
         let total_expected = metadata.manifest.transaction_count();
-        let total_found =
-            retry_transactions.len() + priority_transactions.len() + transactions.len();
-        if total_found != total_expected {
+        if transactions.len() != total_expected {
             tracing::debug!(
                 height = height.0,
                 expected = total_expected,
-                found = total_found,
+                found = transactions.len(),
                 "Block has missing transactions - cannot serve sync request"
             );
             let elapsed = start.elapsed().as_secs_f64();
@@ -1558,13 +1542,10 @@ impl<D: Dispatch + 'static> RocksDbStorage<D> {
         // 4. Full block available - reconstruct it
         let block = Block {
             header: metadata.header,
-            retry_transactions,
-            priority_transactions,
             transactions,
             certificates,
             deferred: metadata.manifest.deferred,
             aborted: metadata.manifest.aborted,
-            priority_inclusions: metadata.manifest.priority_inclusions,
         };
 
         let elapsed = start.elapsed().as_secs_f64();

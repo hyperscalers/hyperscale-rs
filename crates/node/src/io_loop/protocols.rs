@@ -305,14 +305,6 @@ where
                                 proof,
                             )
                         }
-                        InclusionProofFetchReason::Priority => {
-                            self.state.on_priority_inclusion_proof_received(
-                                winner_tx_hash,
-                                source_shard,
-                                source_block_height,
-                                proof,
-                            )
-                        }
                     };
                     for action in actions {
                         self.process_action(action);

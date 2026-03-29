@@ -599,7 +599,6 @@ mod tests {
         TransactionInclusionProof {
             siblings: vec![],
             leaf_index: 0,
-            leaf_hash: Hash::ZERO,
         }
     }
 
@@ -870,13 +869,10 @@ mod tests {
                 receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             },
-            retry_transactions: vec![],
-            priority_transactions: vec![],
             transactions: vec![],
             certificates: vec![],
             deferred: vec![deferral],
             aborted: vec![],
-            priority_inclusions: vec![],
         };
 
         state.on_block_committed(&block);
@@ -926,13 +922,10 @@ mod tests {
                 receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             },
-            retry_transactions: vec![],
-            priority_transactions: vec![],
             transactions: vec![],
             certificates: vec![std::sync::Arc::new(cert)],
             deferred: vec![],
             aborted: vec![],
-            priority_inclusions: vec![],
         };
 
         state.on_block_committed(&block);
@@ -1004,13 +997,10 @@ mod tests {
                 receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             },
-            retry_transactions: vec![],
-            priority_transactions: vec![],
             transactions: vec![],
             certificates: vec![std::sync::Arc::new(cert)],
             deferred: vec![],
             aborted: vec![],
-            priority_inclusions: vec![],
         };
 
         state.on_block_committed(&block);
@@ -1063,13 +1053,10 @@ mod tests {
                 receipt_root: Hash::ZERO,
                 provision_targets: vec![],
             },
-            retry_transactions: vec![],
-            priority_transactions: vec![],
             transactions: vec![],
             certificates: vec![],
             deferred: vec![],
             aborted: vec![abort],
-            priority_inclusions: vec![],
         };
 
         state.on_block_committed(&block);

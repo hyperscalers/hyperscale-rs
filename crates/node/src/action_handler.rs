@@ -147,17 +147,11 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
         Action::VerifyTransactionRoot {
             block_hash,
             expected_root,
-            retry_transactions,
-            priority_transactions,
             transactions,
         } => {
             let start = std::time::Instant::now();
-            let valid = hyperscale_bft::handlers::verify_transaction_root(
-                expected_root,
-                &retry_transactions,
-                &priority_transactions,
-                &transactions,
-            );
+            let valid =
+                hyperscale_bft::handlers::verify_transaction_root(expected_root, &transactions);
             metrics::record_signature_verification_latency(
                 "transaction_root",
                 start.elapsed().as_secs_f64(),
@@ -233,14 +227,11 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             timestamp,
             is_fallback,
             parent_state_root,
-            retry_transactions,
-            priority_transactions,
             transactions,
             certificates,
             per_cert_updates,
             deferred,
             aborted,
-            priority_inclusions,
             provision_targets,
         } => {
             let merged_updates =
@@ -255,14 +246,11 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 timestamp,
                 is_fallback,
                 parent_state_root,
-                retry_transactions,
-                priority_transactions,
                 transactions,
                 certificates,
                 merged_updates,
                 deferred,
                 aborted,
-                priority_inclusions,
                 shard_group_id,
                 provision_targets,
             );

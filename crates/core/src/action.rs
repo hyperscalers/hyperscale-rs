@@ -21,8 +21,6 @@ pub enum InclusionProofFetchReason {
         /// The transaction being deferred (loser in cycle detection).
         loser_tx_hash: Hash,
     },
-    /// Priority tx — cache proof for proposal under backpressure.
-    Priority,
 }
 
 /// A request to execute a cross-shard transaction with its provisions.
@@ -331,8 +329,8 @@ pub enum Action {
 
     /// Verify a block's transaction root.
     ///
-    /// Computes the merkle root from the block's transactions (retry, priority, normal)
-    /// and compares against the block header's claimed transaction_root.
+    /// Computes the merkle root from the block's transactions and compares
+    /// against the block header's claimed transaction_root.
     /// Returns `ProtocolEvent::TransactionRootVerified`.
     ///
     /// This is a pure CPU operation (no JVT dependency) so it can be verified
@@ -341,11 +339,7 @@ pub enum Action {
         block_hash: Hash,
         /// Expected transaction root from block header.
         expected_root: Hash,
-        /// Retry transactions (highest priority section).
-        retry_transactions: Vec<Arc<RoutableTransaction>>,
-        /// Priority transactions (cross-shard with commitment proofs).
-        priority_transactions: Vec<Arc<RoutableTransaction>>,
-        /// Normal transactions.
+        /// Transactions in the block.
         transactions: Vec<Arc<RoutableTransaction>>,
     },
 
@@ -384,8 +378,6 @@ pub enum Action {
         is_fallback: bool,
         /// Parent's state root. Certs included only if local JVT matches this.
         parent_state_root: Hash,
-        retry_transactions: Vec<Arc<RoutableTransaction>>,
-        priority_transactions: Vec<Arc<RoutableTransaction>>,
         transactions: Vec<Arc<RoutableTransaction>>,
         certificates: Vec<Arc<TransactionCertificate>>,
         /// Per-certificate DatabaseUpdates (pre-filtered to local shard).
@@ -395,8 +387,6 @@ pub enum Action {
         aborted: Vec<TransactionAbort>,
         /// Shard groups that need provisions from this block's transactions.
         provision_targets: Vec<ShardGroupId>,
-        /// Inclusion proofs for priority transactions (populated under backpressure).
-        priority_inclusions: Vec<hyperscale_types::PriorityInclusion>,
     },
 
     /// Execute a batch of single-shard transactions.
