@@ -570,7 +570,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 Vec<ShardGroupId>,
                 Arc<Vec<hyperscale_types::StateEntry>>,
             )> = Vec::with_capacity(requests.len());
-            let mut all_storage_keys: Vec<Vec<u8>> = Vec::new();
 
             for req in &requests {
                 let entries =
@@ -590,9 +589,6 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                             continue;
                         }
                     };
-                for e in &entries {
-                    all_storage_keys.push(e.storage_key.clone());
-                }
                 per_tx.push((req.tx_hash, req.target_shards.clone(), Arc::new(entries)));
             }
             if per_tx.is_empty() {
@@ -611,32 +607,9 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 });
             }
 
-            // Phase 2: Generate ONE batched proof covering all entries across all transactions.
-            all_storage_keys.sort();
-            all_storage_keys.dedup();
-            let proof = match ctx
-                .storage
-                .generate_verkle_proofs(&all_storage_keys, block_height.0)
-            {
-                Some(p) => Arc::new(p),
-                None => {
-                    warn!(
-                        source_shard = source_shard.0,
-                        block_height = block_height.0,
-                        key_count = all_storage_keys.len(),
-                        "generate_verkle_proofs returned None — JVT version unavailable"
-                    );
-                    return Some(DelegatedResult {
-                        events: vec![NodeInput::ProvisionsReady {
-                            batches: vec![],
-                            block_timestamp: 0,
-                        }],
-                        prepared_commit: None,
-                    });
-                }
-            };
-            // Phase 3: Build provisions sharing the single proof.
-            // Group entries per target shard.
+            // Phase 2: Group entries per target shard, then generate a separate
+            // proof per shard. Verkle multipoint proofs are not subset-verifiable,
+            // so each batch must carry a proof covering exactly its own entries.
             let mut shard_tx_entries: HashMap<ShardGroupId, Vec<TxEntries>> = HashMap::new();
             for (tx_hash, target_shards, entries) in per_tx {
                 for &target_shard in &target_shards {
@@ -650,19 +623,42 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
                 }
             }
 
-            let batches: Vec<_> = shard_tx_entries
-                .into_iter()
-                .map(|(shard, transactions)| {
-                    let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
-                    let batch = ProvisionBatch {
-                        source_shard,
-                        block_height,
-                        proof: (*proof).clone(),
-                        transactions,
-                    };
-                    (shard, batch, recipients)
-                })
-                .collect();
+            let mut batches: Vec<_> = Vec::with_capacity(shard_tx_entries.len());
+            for (shard, transactions) in shard_tx_entries {
+                // Collect deduplicated storage keys for this shard's entries only.
+                let mut shard_keys: Vec<Vec<u8>> = transactions
+                    .iter()
+                    .flat_map(|te| te.entries.iter().map(|e| e.storage_key.clone()))
+                    .collect();
+                shard_keys.sort();
+                shard_keys.dedup();
+
+                let proof = match ctx
+                    .storage
+                    .generate_verkle_proofs(&shard_keys, block_height.0)
+                {
+                    Some(p) => p,
+                    None => {
+                        warn!(
+                            source_shard = source_shard.0,
+                            block_height = block_height.0,
+                            target_shard = shard.0,
+                            key_count = shard_keys.len(),
+                            "generate_verkle_proofs returned None — JVT version unavailable"
+                        );
+                        continue;
+                    }
+                };
+
+                let recipients = shard_recipients.get(&shard).cloned().unwrap_or_default();
+                let batch = ProvisionBatch {
+                    source_shard,
+                    block_height,
+                    proof,
+                    transactions,
+                };
+                batches.push((shard, batch, recipients));
+            }
             Some(DelegatedResult {
                 events: vec![NodeInput::ProvisionsReady {
                     batches,
