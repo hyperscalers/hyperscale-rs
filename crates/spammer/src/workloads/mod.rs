@@ -3,8 +3,10 @@
 //! Provides the `WorkloadGenerator` trait and implementations for various
 //! transaction types.
 
+mod funding;
 mod transfer;
 
+pub use funding::FundingWorkload;
 pub use transfer::TransferWorkload;
 
 use crate::accounts::AccountPool;

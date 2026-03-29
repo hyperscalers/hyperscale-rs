@@ -1,11 +1,21 @@
 //! Account management for transaction generation.
 //!
 //! Provides a `FundedAccount` type and `AccountPool` for managing accounts
-//! distributed across shards. Accounts are funded at genesis time.
+//! distributed across shards. The first [`MAX_GENESIS_ACCOUNTS_PER_SHARD`]
+//! accounts per shard are funded at genesis time; any beyond that limit are
+//! funded via runtime transactions before the main workload starts.
 
 use hyperscale_types::{
     ed25519_keypair_from_seed, shard_for_node, Ed25519PrivateKey, NodeId, ShardGroupId,
 };
+
+/// Maximum number of accounts that can be created per shard at genesis.
+///
+/// The Radix Engine panics when a single node's genesis includes more than
+/// approximately 16,000 accounts. Since each node only processes its own
+/// shard's accounts at genesis, this is the per-shard limit. Accounts beyond
+/// this limit must be funded via runtime transactions after genesis.
+pub const MAX_GENESIS_ACCOUNTS_PER_SHARD: usize = 16_000;
 use radix_common::math::Decimal;
 use radix_common::types::ComponentAddress;
 use std::collections::HashMap;
@@ -268,6 +278,86 @@ impl AccountPool {
             .values()
             .flat_map(|accounts| accounts.iter().map(|a| (a.address, balance)))
             .collect()
+    }
+
+    /// Whether any shard has more accounts than the genesis limit.
+    ///
+    /// When true, the caller must run a funding phase after genesis to create
+    /// the remaining accounts via runtime transactions.
+    pub fn needs_runtime_funding(&self) -> bool {
+        self.by_shard
+            .values()
+            .any(|accounts| accounts.len() > MAX_GENESIS_ACCOUNTS_PER_SHARD)
+    }
+
+    /// Get capped genesis balances for a shard, respecting the engine limit.
+    ///
+    /// Returns balances for at most [`MAX_GENESIS_ACCOUNTS_PER_SHARD`] accounts.
+    /// Accounts that will serve as funding sources for runtime-funded accounts
+    /// receive extra balance to cover those transfers (amount + fee per funded account).
+    pub fn genesis_balances_capped(
+        &self,
+        shard: ShardGroupId,
+        balance: Decimal,
+        fee_per_funding_tx: Decimal,
+    ) -> Vec<(ComponentAddress, Decimal)> {
+        let accounts = match self.by_shard.get(&shard) {
+            Some(a) => a,
+            None => return Vec::new(),
+        };
+
+        let genesis_count = accounts.len().min(MAX_GENESIS_ACCOUNTS_PER_SHARD);
+        let unfunded_count = accounts
+            .len()
+            .saturating_sub(MAX_GENESIS_ACCOUNTS_PER_SHARD);
+
+        if unfunded_count == 0 {
+            // All accounts fit in genesis — no extra balance needed.
+            return accounts.iter().map(|a| (a.address, balance)).collect();
+        }
+
+        // Distribute unfunded accounts round-robin across genesis accounts.
+        // Compute how many extra accounts each genesis account will fund.
+        let base_extra = unfunded_count / genesis_count;
+        let remainder = unfunded_count % genesis_count;
+        let cost_per_funded = balance + fee_per_funding_tx;
+
+        accounts[..genesis_count]
+            .iter()
+            .enumerate()
+            .map(|(i, account)| {
+                let num_to_fund = base_extra + if i < remainder { 1 } else { 0 };
+                let extra = cost_per_funded * Decimal::from(num_to_fund as u32);
+                (account.address, balance + extra)
+            })
+            .collect()
+    }
+
+    /// Build a plan of funding operations for accounts beyond the genesis limit.
+    ///
+    /// Each operation pairs a genesis account (source) with an unfunded account
+    /// (destination) on the same shard. Sources are assigned round-robin.
+    pub fn runtime_funding_plan(&self, funding_amount: Decimal) -> Vec<FundingOp> {
+        let mut plan = Vec::new();
+
+        for (&shard, accounts) in &self.by_shard {
+            let genesis_count = accounts.len().min(MAX_GENESIS_ACCOUNTS_PER_SHARD);
+            if accounts.len() <= genesis_count {
+                continue;
+            }
+
+            for (i, dest) in accounts[genesis_count..].iter().enumerate() {
+                let source_idx = i % genesis_count;
+                plan.push(FundingOp {
+                    source_shard: shard,
+                    source_idx,
+                    dest_address: dest.address,
+                    amount: funding_amount,
+                });
+            }
+        }
+
+        plan
     }
 
     /// Get a pair of accounts on the same shard.
@@ -589,6 +679,20 @@ impl AccountPool {
             account_count,
         }
     }
+}
+
+/// A single runtime-funding operation: transfer from a genesis account to an
+/// unfunded account on the same shard.
+#[derive(Clone, Debug)]
+pub struct FundingOp {
+    /// Shard of the source (genesis) account.
+    pub source_shard: ShardGroupId,
+    /// Index of the source account within its shard's account vec.
+    pub source_idx: usize,
+    /// Address of the destination (unfunded) account.
+    pub dest_address: ComponentAddress,
+    /// Amount of XRD to transfer.
+    pub amount: Decimal,
 }
 
 /// Statistics about account usage distribution.

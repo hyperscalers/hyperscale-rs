@@ -9,16 +9,20 @@ use hyperscale_core::NodeInput;
 use hyperscale_mempool::LockContentionStats;
 use hyperscale_simulation::NodeIndex;
 use hyperscale_simulation::SimulationRunner;
-use hyperscale_spammer::{AccountPool, AccountPoolError, TransferWorkload, WorkloadGenerator};
+use hyperscale_spammer::{
+    AccountPool, AccountPoolError, FundingWorkload, TransferWorkload, WorkloadGenerator,
+};
 use hyperscale_types::{
     shard_for_node, Hash, ShardGroupId, TransactionDecision, TransactionStatus,
 };
+use radix_common::math::Decimal;
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Main simulator that orchestrates workload generation and metrics collection.
 pub struct Simulator {
@@ -88,53 +92,170 @@ impl Simulator {
         })
     }
 
-    /// Initialize the simulation (genesis, etc).
+    /// Initialize the simulation (genesis + optional runtime funding).
     ///
-    /// This funds all generated accounts at genesis time with the configured
-    /// initial balance, allowing transactions to execute without failing due
-    /// to insufficient funds.
+    /// If the requested account count fits within the engine's genesis limit
+    /// (~8000 per shard), all accounts are funded at genesis. Otherwise a
+    /// two-phase approach is used:
     ///
-    /// Also runs a warmup period to let the consensus establish before
-    /// transaction submission begins. This ensures cross-shard provisioning
-    /// works correctly from the start.
+    /// 1. **Genesis phase** — fund up to 8000 accounts per shard, giving
+    ///    funding-source accounts extra balance to cover what they'll transfer.
+    /// 2. **Runtime funding phase** — after consensus warmup, submit transfer
+    ///    transactions from genesis accounts to the remaining unfunded accounts.
     pub fn initialize(&mut self) {
-        // Collect all account balances for genesis
+        let balance = self.config.initial_balance;
+
+        if self.accounts.needs_runtime_funding() {
+            self.initialize_with_runtime_funding(balance);
+        } else {
+            self.initialize_genesis_only(balance);
+        }
+    }
+
+    /// Fast path: all accounts fit in genesis.
+    fn initialize_genesis_only(&mut self, balance: Decimal) {
+        let balances: Vec<_> = self
+            .accounts
+            .shards()
+            .flat_map(|shard| self.accounts.genesis_balances_for_shard(shard, balance))
+            .collect();
+
+        info!(
+            num_accounts = balances.len(),
+            initial_balance = %balance,
+            "Funding accounts at genesis"
+        );
+
+        self.runner.initialize_genesis_with_balances(balances);
+        self.run_warmup();
+        info!("Genesis initialized with funded accounts");
+    }
+
+    /// Two-phase path: genesis for first 8000/shard, then runtime funding.
+    fn initialize_with_runtime_funding(&mut self, balance: Decimal) {
+        let funding_workload = FundingWorkload::new(NetworkDefinition::simulator());
+        let plan = self.accounts.runtime_funding_plan(balance);
+
+        info!(
+            funding_txs = plan.len(),
+            "Accounts exceed genesis limit, using two-phase funding"
+        );
+
+        // Phase 1: Genesis with capped accounts (funders get extra balance).
         let balances: Vec<_> = self
             .accounts
             .shards()
             .flat_map(|shard| {
                 self.accounts
-                    .genesis_balances_for_shard(shard, self.config.initial_balance)
+                    .genesis_balances_capped(shard, balance, funding_workload.fee())
             })
             .collect();
 
         info!(
-            num_accounts = balances.len(),
-            initial_balance = %self.config.initial_balance,
-            "Funding accounts at genesis"
+            genesis_accounts = balances.len(),
+            initial_balance = %balance,
+            "Funding genesis accounts (capped)"
         );
 
         self.runner.initialize_genesis_with_balances(balances);
+        self.run_warmup();
 
-        // Run a warmup period to let consensus establish.
-        // This ensures at least a few blocks are committed before we start
-        // submitting transactions. Without this, cross-shard transactions
-        // submitted immediately after genesis may fail because provisioning
-        // requires blocks to be committed first.
-        //
-        // Warmup time: 3 block intervals (default 300ms each = 900ms)
-        // This allows:
-        // - Block 1 to be proposed and committed
-        // - Block 2 to be proposed and committed
-        // - Consensus to stabilize across all shards
+        // Phase 2: Fund remaining accounts via transactions.
+        let txs_by_shard = funding_workload.generate_funding_transactions(&self.accounts, &plan);
+        self.submit_funding_transactions(txs_by_shard);
+
+        info!("Two-phase funding complete");
+    }
+
+    /// Run a warmup period to let consensus establish.
+    fn run_warmup(&mut self) {
         let warmup_duration = Duration::from_millis(900);
         info!(
             warmup_ms = warmup_duration.as_millis(),
             "Running warmup period for consensus to establish"
         );
         self.runner.run_until(self.runner.now() + warmup_duration);
+    }
 
-        info!("Genesis initialized with funded accounts");
+    /// Submit funding transactions in batches and wait for completion.
+    fn submit_funding_transactions(
+        &mut self,
+        txs_by_shard: HashMap<ShardGroupId, Vec<hyperscale_types::RoutableTransaction>>,
+    ) {
+        let batch_size = 500;
+        let mut total_submitted = 0u64;
+        let mut total_completed = 0u64;
+        let mut total_failed = 0u64;
+
+        // Flatten into (shard, tx) pairs so we can batch across shards.
+        let all_txs: Vec<_> = txs_by_shard
+            .into_iter()
+            .flat_map(|(shard, txs)| txs.into_iter().map(move |tx| (shard, tx)))
+            .collect();
+
+        for chunk in all_txs.chunks(batch_size) {
+            let mut pending: HashMap<Hash, ShardGroupId> = HashMap::new();
+
+            // Submit the batch.
+            for (shard, tx) in chunk {
+                let hash = tx.hash();
+                let tx = Arc::new(tx.clone());
+                let shard_nodes = self.nodes_for_shard(*shard);
+                for node_idx in shard_nodes {
+                    self.runner.schedule_initial_event(
+                        node_idx,
+                        Duration::ZERO,
+                        NodeInput::SubmitTransaction {
+                            tx: Arc::clone(&tx),
+                        },
+                    );
+                }
+                pending.insert(hash, *shard);
+                total_submitted += 1;
+            }
+
+            // Process until all complete (with a timeout to avoid infinite loops).
+            let deadline = self.runner.now() + Duration::from_secs(30);
+            let step = Duration::from_millis(100);
+
+            while !pending.is_empty() && self.runner.now() < deadline {
+                self.runner.run_until(self.runner.now() + step);
+
+                let hashes: Vec<Hash> = pending.keys().copied().collect();
+                for hash in hashes {
+                    if let Some(&shard) = pending.get(&hash) {
+                        let node_idx = self.get_node_for_shard(shard);
+                        if let Some(status) = self.runner.tx_status(node_idx, &hash) {
+                            if status.is_final() {
+                                pending.remove(&hash);
+                                match status {
+                                    TransactionStatus::Completed(TransactionDecision::Accept) => {
+                                        total_completed += 1;
+                                    }
+                                    _ => {
+                                        total_failed += 1;
+                                        warn!(?hash, %status, "Funding transaction failed");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !pending.is_empty() {
+                warn!(
+                    remaining = pending.len(),
+                    "Some funding transactions did not complete within timeout"
+                );
+                total_failed += pending.len() as u64;
+            }
+        }
+
+        info!(
+            total_submitted,
+            total_completed, total_failed, "Runtime funding transactions processed"
+        );
     }
 
     /// Run the simulation for the specified duration.

@@ -20,8 +20,9 @@ use hyperscale_storage::{ConsensusStore, GenesisWrapper};
 use hyperscale_storage_memory::SimStorage;
 use hyperscale_topology::TopologyState;
 use hyperscale_types::{
-    bls_keypair_from_seed, Bls12381G1PrivateKey, Bls12381G1PublicKey, Hash as TxHash, ShardGroupId,
-    TransactionStatus, ValidatorId, ValidatorInfo, ValidatorSet,
+    bls_keypair_from_seed, shard_for_node, Bls12381G1PrivateKey, Bls12381G1PublicKey,
+    Hash as TxHash, NodeId, ShardGroupId, TransactionStatus, ValidatorId, ValidatorInfo,
+    ValidatorSet,
 };
 use radix_common::network::NetworkDefinition;
 use rand::SeedableRng;
@@ -401,6 +402,10 @@ impl SimulationRunner {
     }
 
     /// Initialize genesis with pre-funded accounts.
+    ///
+    /// Each node only receives the accounts that belong to its shard, avoiding
+    /// the Radix Engine genesis limit (~8000 accounts per node). The balances
+    /// list may contain accounts from all shards — they are filtered per-node.
     pub fn initialize_genesis_with_balances(
         &mut self,
         balances: Vec<(
@@ -410,16 +415,36 @@ impl SimulationRunner {
     ) {
         use hyperscale_engine::GenesisConfig;
 
-        // Run Radix Engine genesis on each node's storage with balances.
+        let num_shards = self.network.config().num_shards as u64;
+        let validators_per_shard = self.network.config().validators_per_shard;
+
+        // Pre-group balances by shard so we don't re-filter for every node.
+        let mut balances_by_shard: HashMap<ShardGroupId, Vec<_>> = HashMap::new();
+        for (address, balance) in &balances {
+            let radix_node_id = address.into_node_id();
+            let det_node_id = NodeId(radix_node_id.0[..30].try_into().unwrap());
+            let shard = shard_for_node(&det_node_id, num_shards);
+            balances_by_shard
+                .entry(shard)
+                .or_default()
+                .push((*address, *balance));
+        }
+
+        // Run Radix Engine genesis on each node's storage with only its shard's accounts.
         // SimGenesisWrapper writes substates only (no JVT) during bootstrap,
         // then computes JVT once at version 0 to avoid collisions with block 1.
         for node_idx in 0..self.io_loops.len() {
             if !self.genesis_executed[node_idx] {
-                let balances = balances.clone();
+                let shard_id = ShardGroupId(node_idx as u64 / validators_per_shard as u64);
+                let shard_balances = balances_by_shard
+                    .get(&shard_id)
+                    .cloned()
+                    .unwrap_or_default();
+
                 self.io_loops[node_idx].with_storage_and_executor(|storage, executor| {
                     let mut wrapper = SimGenesisWrapper::new(storage);
                     let config = GenesisConfig {
-                        xrd_balances: balances,
+                        xrd_balances: shard_balances,
                         ..GenesisConfig::test_default()
                     };
                     if let Err(e) = executor.run_genesis_with_config(&mut wrapper, config) {
