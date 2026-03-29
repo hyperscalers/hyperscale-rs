@@ -87,6 +87,13 @@ pub enum ProtocolEvent {
     /// QC signature verification completed.
     QcSignatureVerified { block_hash: Hash, valid: bool },
 
+    /// Remote header QC verification completed.
+    RemoteHeaderQcVerified {
+        shard: ShardGroupId,
+        height: BlockHeight,
+        valid: bool,
+    },
+
     /// State root verification completed.
     StateRootVerified { block_hash: Hash, valid: bool },
 
@@ -151,7 +158,7 @@ pub enum ProtocolEvent {
         batch: ProvisionBatch,
         /// The committed header whose QC passed verification.
         /// `None` if no candidate header passed QC verification.
-        committed_header: Option<CommittedBlockHeader>,
+        committed_header: Option<Arc<CommittedBlockHeader>>,
         /// Whether the batch passed verification.
         valid: bool,
     },
@@ -342,6 +349,7 @@ impl ProtocolEvent {
             ProtocolEvent::BlockCommitted { .. } => "BlockCommitted",
             ProtocolEvent::QuorumCertificateResult { .. } => "QuorumCertificateResult",
             ProtocolEvent::QcSignatureVerified { .. } => "QcSignatureVerified",
+            ProtocolEvent::RemoteHeaderQcVerified { .. } => "RemoteHeaderQcVerified",
             ProtocolEvent::StateRootVerified { .. } => "StateRootVerified",
             ProtocolEvent::TransactionRootVerified { .. } => "TransactionRootVerified",
             ProtocolEvent::ReceiptRootVerified { .. } => "ReceiptRootVerified",

@@ -54,6 +54,7 @@ pub(crate) fn dispatch_pool_for(action: &Action) -> Option<DispatchPool> {
         // Consensus-critical crypto
         Action::VerifyAndBuildQuorumCertificate { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyQcSignature { .. } => Some(DispatchPool::ConsensusCrypto),
+        Action::VerifyRemoteHeaderQc { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyStateRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyTransactionRoot { .. } => Some(DispatchPool::ConsensusCrypto),
         Action::VerifyReceiptRoot { .. } => Some(DispatchPool::ConsensusCrypto),
@@ -138,6 +139,64 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             Some(DelegatedResult {
                 events: vec![NodeInput::Protocol(ProtocolEvent::QcSignatureVerified {
                     block_hash,
+                    valid,
+                })],
+                prepared_commit: None,
+            })
+        }
+
+        Action::VerifyRemoteHeaderQc {
+            header,
+            committee_public_keys,
+            committee_voting_power,
+            quorum_threshold,
+            shard,
+            height,
+        } => {
+            // Fast path: skip crypto if already verified.
+            if header.is_qc_verified() {
+                return Some(DelegatedResult {
+                    events: vec![NodeInput::Protocol(ProtocolEvent::RemoteHeaderQcVerified {
+                        shard,
+                        height,
+                        valid: true,
+                    })],
+                    prepared_commit: None,
+                });
+            }
+
+            let start = std::time::Instant::now();
+
+            // Verify QC signature (BLS pairing)
+            let qc_valid =
+                hyperscale_bft::handlers::verify_qc_signature(&header.qc, &committee_public_keys);
+
+            // Verify voting power meets quorum and block_hash matches header
+            let valid = if qc_valid {
+                let total_power: u64 = header
+                    .qc
+                    .signers
+                    .set_indices()
+                    .filter_map(|idx| committee_voting_power.get(idx).copied())
+                    .sum();
+                total_power >= quorum_threshold && header.qc.block_hash == header.header.hash()
+            } else {
+                false
+            };
+
+            if valid {
+                header.mark_qc_verified(true);
+            }
+
+            metrics::record_signature_verification_latency(
+                "remote_header_qc",
+                start.elapsed().as_secs_f64(),
+            );
+
+            Some(DelegatedResult {
+                events: vec![NodeInput::Protocol(ProtocolEvent::RemoteHeaderQcVerified {
+                    shard,
+                    height,
                     valid,
                 })],
                 prepared_commit: None,
@@ -343,13 +402,23 @@ pub(crate) fn handle_delegated_action<S: CommitStore + SubstateStore + Consensus
             quorum_threshold,
         } => {
             // Try each candidate header until one passes QC verification.
+            // Prefer already-verified candidates (skip BLS).
             let qc_start = std::time::Instant::now();
             let verified_header = committed_headers.into_iter().find(|candidate| {
-                // Verify QC signature (BLS pairing — expensive)
-                let qc_valid = hyperscale_bft::handlers::verify_qc_signature(
-                    &candidate.qc,
-                    &committee_public_keys,
-                );
+                // OnceLock fast path: BFT already verified this Arc instance.
+                let qc_valid = if candidate.is_qc_verified() {
+                    true
+                } else {
+                    // Verify QC signature (BLS pairing — expensive)
+                    let valid = hyperscale_bft::handlers::verify_qc_signature(
+                        &candidate.qc,
+                        &committee_public_keys,
+                    );
+                    if valid {
+                        candidate.mark_qc_verified(true);
+                    }
+                    valid
+                };
                 if !qc_valid {
                     return false;
                 }

@@ -89,14 +89,14 @@ pub struct ProvisionCoordinator {
     /// Pruned when a header from the same shard arrives with a height
     /// exceeding the current tip by more than `REMOTE_HEADER_RETENTION_BLOCKS`.
     unverified_remote_headers:
-        HashMap<(ShardGroupId, BlockHeight), HashMap<ValidatorId, CommittedBlockHeader>>,
+        HashMap<(ShardGroupId, BlockHeight), HashMap<ValidatorId, Arc<CommittedBlockHeader>>>,
 
     /// Verified committed block headers from remote shards.
     ///
     /// Promoted from `unverified_remote_headers` when QC verification succeeds
     /// (lazy verification on provision arrival).
     /// Indexed by `(shard, height)` for efficient lookup.
-    verified_remote_headers: HashMap<(ShardGroupId, BlockHeight), CommittedBlockHeader>,
+    verified_remote_headers: HashMap<(ShardGroupId, BlockHeight), Arc<CommittedBlockHeader>>,
 
     /// Highest seen block height per remote shard.
     /// Used for pruning old entries from both header buffers.
@@ -264,7 +264,7 @@ impl ProvisionCoordinator {
     pub fn on_remote_block_committed(
         &mut self,
         topology: &TopologySnapshot,
-        committed_header: CommittedBlockHeader,
+        committed_header: Arc<CommittedBlockHeader>,
         sender: ValidatorId,
     ) -> Vec<Action> {
         let shard = committed_header.shard_group_id();
@@ -312,7 +312,7 @@ impl ProvisionCoordinator {
         self.unverified_remote_headers
             .entry((shard, height))
             .or_default()
-            .insert(sender, committed_header.clone());
+            .insert(sender, Arc::clone(&committed_header));
 
         // Update tip and prune old headers for this shard.
         let tip = self
@@ -447,7 +447,7 @@ impl ProvisionCoordinator {
 
         if let Some(by_sender) = self.unverified_remote_headers.get(&key) {
             // Collect ALL unverified candidates (one per validator sender)
-            let candidates: Vec<CommittedBlockHeader> = by_sender.values().cloned().collect();
+            let candidates: Vec<Arc<CommittedBlockHeader>> = by_sender.values().cloned().collect();
             return self.emit_provision_verification(batch, candidates, topology);
         }
 
@@ -484,7 +484,7 @@ impl ProvisionCoordinator {
     fn emit_provision_verification(
         &self,
         batch: ProvisionBatch,
-        committed_headers: Vec<CommittedBlockHeader>,
+        committed_headers: Vec<Arc<CommittedBlockHeader>>,
         topology: &TopologySnapshot,
     ) -> Vec<Action> {
         let source_shard = batch.source_shard;
@@ -528,7 +528,7 @@ impl ProvisionCoordinator {
         &mut self,
         _topology: &TopologySnapshot,
         batch: ProvisionBatch,
-        committed_header: Option<CommittedBlockHeader>,
+        committed_header: Option<Arc<CommittedBlockHeader>>,
         valid: bool,
     ) -> Vec<Action> {
         let mut actions = vec![];
@@ -681,7 +681,7 @@ impl ProvisionCoordinator {
         &self,
         shard: ShardGroupId,
         height: BlockHeight,
-    ) -> Option<&CommittedBlockHeader> {
+    ) -> Option<&Arc<CommittedBlockHeader>> {
         self.verified_remote_headers.get(&(shard, height))
     }
 
@@ -801,7 +801,7 @@ mod tests {
 
     /// Build a CommittedBlockHeader with a QC whose block_hash matches
     /// the header's hash (structural invariant from commit 638c352).
-    fn make_committed_header(shard: ShardGroupId, height: u64) -> CommittedBlockHeader {
+    fn make_committed_header(shard: ShardGroupId, height: u64) -> Arc<CommittedBlockHeader> {
         let header = BlockHeader {
             shard_group_id: shard,
             height: BlockHeight(height),
@@ -820,7 +820,7 @@ mod tests {
         let mut qc = QuorumCertificate::genesis();
         qc.block_hash = header_hash;
         qc.shard_group_id = shard;
-        CommittedBlockHeader { header, qc }
+        Arc::new(CommittedBlockHeader::new(header, qc))
     }
 
     #[test]
@@ -938,7 +938,7 @@ mod tests {
         let mut qc = QuorumCertificate::genesis();
         qc.block_hash = Hash::from_bytes(b"wrong_hash"); // Mismatch!
         qc.shard_group_id = ShardGroupId(1);
-        let committed = CommittedBlockHeader { header, qc };
+        let committed = Arc::new(CommittedBlockHeader::new(header, qc));
 
         let actions = coordinator.on_remote_block_committed(&topology, committed, ValidatorId(3));
         assert!(actions.is_empty());
@@ -969,7 +969,7 @@ mod tests {
         let mut qc = QuorumCertificate::genesis();
         qc.block_hash = header_hash;
         qc.shard_group_id = ShardGroupId(2); // Mismatch!
-        let committed = CommittedBlockHeader { header, qc };
+        let committed = Arc::new(CommittedBlockHeader::new(header, qc));
 
         let actions = coordinator.on_remote_block_committed(&topology, committed, ValidatorId(3));
         assert!(actions.is_empty());
@@ -1451,7 +1451,7 @@ mod tests {
         shard: ShardGroupId,
         height: u64,
         provision_targets: Vec<ShardGroupId>,
-    ) -> CommittedBlockHeader {
+    ) -> Arc<CommittedBlockHeader> {
         let header = BlockHeader {
             shard_group_id: shard,
             height: BlockHeight(height),
@@ -1470,7 +1470,7 @@ mod tests {
         let mut qc = QuorumCertificate::genesis();
         qc.block_hash = header_hash;
         qc.shard_group_id = shard;
-        CommittedBlockHeader { header, qc }
+        Arc::new(CommittedBlockHeader::new(header, qc))
     }
 
     /// Make a minimal Block at the given height for on_block_committed calls.

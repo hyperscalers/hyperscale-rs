@@ -585,16 +585,57 @@ impl BlockMetadata {
 /// a remote shard can verify the QC against the source shard's validator public keys
 /// (from topology), confirm the `block_hash` matches `hash(header)`, and then trust
 /// the `state_root` in the header for merkle inclusion proof verification.
-#[derive(Debug, Clone, PartialEq, Eq, BasicSbor)]
+#[derive(BasicSbor)]
 pub struct CommittedBlockHeader {
     /// The block header.
     pub header: BlockHeader,
 
     /// The quorum certificate that committed this block.
     pub qc: QuorumCertificate,
+
+    /// Cached QC verification result (set by handler, not serialized).
+    #[sbor(skip)]
+    qc_verified: std::sync::OnceLock<bool>,
 }
 
+impl Clone for CommittedBlockHeader {
+    fn clone(&self) -> Self {
+        Self {
+            header: self.header.clone(),
+            qc: self.qc.clone(),
+            qc_verified: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for CommittedBlockHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommittedBlockHeader")
+            .field("header", &self.header)
+            .field("qc", &self.qc)
+            .field("qc_verified", &self.is_qc_verified())
+            .finish()
+    }
+}
+
+impl PartialEq for CommittedBlockHeader {
+    fn eq(&self, other: &Self) -> bool {
+        self.header == other.header && self.qc == other.qc
+    }
+}
+
+impl Eq for CommittedBlockHeader {}
+
 impl CommittedBlockHeader {
+    /// Create a new committed block header.
+    pub fn new(header: BlockHeader, qc: QuorumCertificate) -> Self {
+        Self {
+            header,
+            qc,
+            qc_verified: std::sync::OnceLock::new(),
+        }
+    }
+
     /// Compute the block hash (hashes the header).
     pub fn block_hash(&self) -> Hash {
         self.header.hash()
@@ -613,6 +654,16 @@ impl CommittedBlockHeader {
     /// Get the state root committed by this block.
     pub fn state_root(&self) -> Hash {
         self.header.state_root
+    }
+
+    /// Check if the QC on this header has been verified.
+    pub fn is_qc_verified(&self) -> bool {
+        self.qc_verified.get().copied().unwrap_or(false)
+    }
+
+    /// Mark the QC as verified (or failed). Idempotent — second call is ignored.
+    pub fn mark_qc_verified(&self, valid: bool) {
+        let _ = self.qc_verified.set(valid);
     }
 }
 

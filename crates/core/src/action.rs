@@ -209,7 +209,7 @@ pub enum Action {
         /// Candidate committed block headers to try.
         /// In normal operation there is one; with byzantine validators
         /// there may be multiple (one per sender for the same (shard, height)).
-        committed_headers: Vec<CommittedBlockHeader>,
+        committed_headers: Vec<Arc<CommittedBlockHeader>>,
         /// Public keys for the source shard's committee (from topology).
         committee_public_keys: Vec<Bls12381G1PublicKey>,
         /// Voting power for each committee member (parallel to `committee_public_keys`).
@@ -280,6 +280,28 @@ pub enum Action {
         /// The block hash this QC verification is associated with (for correlation).
         /// This is the hash of the block whose header contains this QC as parent_qc.
         block_hash: Hash,
+    },
+
+    /// Verify a remote block header's QC for cross-shard deferral validation.
+    ///
+    /// Verifies the aggregated BLS signature on the QC, checks voting power meets
+    /// quorum, and confirms block_hash matches hash(header).
+    ///
+    /// Delegated to `ConsensusCrypto` thread pool.
+    /// Returns `ProtocolEvent::RemoteHeaderQcVerified` when complete.
+    VerifyRemoteHeaderQc {
+        /// The remote header to verify.
+        header: Arc<CommittedBlockHeader>,
+        /// Public keys for the remote shard's committee (from topology).
+        committee_public_keys: Vec<Bls12381G1PublicKey>,
+        /// Voting power for each committee member (parallel to `committee_public_keys`).
+        committee_voting_power: Vec<u64>,
+        /// Quorum threshold for the remote shard.
+        quorum_threshold: u64,
+        /// Remote shard ID (for correlation in callback).
+        shard: ShardGroupId,
+        /// Remote block height (for correlation in callback).
+        height: BlockHeight,
     },
 
     /// Request a transaction inclusion proof from a source shard for livelock deferral.
@@ -759,6 +781,7 @@ impl Action {
                 | Action::VerifyAndAggregateExecutionVotes { .. }
                 | Action::VerifyExecutionCertificateSignature { .. }
                 | Action::VerifyQcSignature { .. }
+                | Action::VerifyRemoteHeaderQc { .. }
                 | Action::VerifyStateRoot { .. }
                 | Action::VerifyTransactionRoot { .. }
                 | Action::VerifyReceiptRoot { .. }
@@ -809,6 +832,7 @@ impl Action {
                 "VerifyExecutionCertificateSignature"
             }
             Action::VerifyQcSignature { .. } => "VerifyQcSignature",
+            Action::VerifyRemoteHeaderQc { .. } => "VerifyRemoteHeaderQc",
             Action::VerifyStateRoot { .. } => "VerifyStateRoot",
             Action::VerifyTransactionRoot { .. } => "VerifyTransactionRoot",
             Action::VerifyReceiptRoot { .. } => "VerifyReceiptRoot",

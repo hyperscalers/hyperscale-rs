@@ -82,7 +82,7 @@ mod tests {
         let qc = QuorumCertificate::genesis();
 
         let gossip = CommittedBlockHeaderGossip {
-            committed_header: CommittedBlockHeader { header, qc },
+            committed_header: CommittedBlockHeader::new(header, qc),
             sender: ValidatorId(0),
             sender_signature: zero_bls_signature(),
         };

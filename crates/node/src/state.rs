@@ -707,13 +707,16 @@ impl NodeStateMachine {
     fn on_state_provisions_verified(
         &mut self,
         batch: ProvisionBatch,
-        committed_header: Option<CommittedBlockHeader>,
+        committed_header: Option<Arc<CommittedBlockHeader>>,
         valid: bool,
     ) -> Vec<Action> {
         if valid {
-            // Share verified header with BFT for deferral merkle proof verification
+            // Promote the verified header into BFT.
             if let Some(ref header) = committed_header {
-                self.bft.update_remote_header(header.clone());
+                let shard = header.shard_group_id();
+                let height = header.height();
+                self.bft
+                    .promote_verified_remote_header(shard, height, Arc::clone(header));
             }
         }
         self.provisions.on_state_provisions_verified(
@@ -831,13 +834,15 @@ impl StateMachine for NodeStateMachine {
                 committed_header,
                 sender,
             } => {
-                // Share remote header with BFT for deferral merkle proof verification
-                self.bft.update_remote_header(committed_header.clone());
-                self.provisions.on_remote_block_committed(
-                    self.topology.snapshot(),
-                    committed_header,
-                    sender,
-                )
+                // Arc-wrap and share with both BFT and provisions.
+                let header = Arc::new(committed_header);
+                let topology = self.topology.snapshot();
+                let mut actions = self.bft.insert_remote_header(topology, Arc::clone(&header));
+                actions.extend(
+                    self.provisions
+                        .on_remote_block_committed(topology, header, sender),
+                );
+                actions
             }
             ProtocolEvent::BlockVoteReceived { vote } => {
                 self.bft.on_block_vote(self.topology.snapshot(), vote)
@@ -855,6 +860,11 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::QcSignatureVerified { block_hash, valid } => self
                 .bft
                 .on_qc_signature_verified(self.topology.snapshot(), block_hash, valid),
+            ProtocolEvent::RemoteHeaderQcVerified {
+                shard,
+                height,
+                valid,
+            } => self.bft.on_remote_header_qc_verified(shard, height, valid),
             ProtocolEvent::StateRootVerified { block_hash, valid } => self
                 .bft
                 .on_state_root_verified(self.topology.snapshot(), block_hash, valid),

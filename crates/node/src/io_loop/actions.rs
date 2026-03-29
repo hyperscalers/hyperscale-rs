@@ -155,6 +155,7 @@ where
             // ═══════════════════════════════════════════════════════════
             Action::VerifyAndBuildQuorumCertificate { .. }
             | Action::VerifyQcSignature { .. }
+            | Action::VerifyRemoteHeaderQc { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyTransactionRoot { .. }
             | Action::VerifyReceiptRoot { .. }
