@@ -24,12 +24,15 @@ use tracing::{debug, trace, warn};
 pub struct InclusionProofFetchConfig {
     /// Maximum number of retries per peer before rotating to the next.
     pub max_retries_per_peer: u32,
+    /// Maximum number of concurrent in-flight fetch batches.
+    pub max_concurrent: usize,
 }
 
 impl Default for InclusionProofFetchConfig {
     fn default() -> Self {
         Self {
             max_retries_per_peer: 3,
+            max_concurrent: 8,
         }
     }
 }
@@ -279,7 +282,15 @@ impl InclusionProofFetchProtocol {
     ///
     /// Groups ready-to-fetch entries by `(source_shard, block_height, peer)` and
     /// emits one `FetchBatch` output per group to reduce network round-trips.
+    /// Respects `max_concurrent` to avoid saturating the network.
     fn spawn_pending_fetches(&mut self) -> Vec<InclusionProofFetchOutput> {
+        // Respect concurrency limit — count current in-flight entries.
+        let in_flight_count = self.pending.values().filter(|s| s.in_flight).count();
+        if in_flight_count >= self.config.max_concurrent {
+            return vec![];
+        }
+        let mut available_slots = self.config.max_concurrent - in_flight_count;
+
         // Phase 1: determine peer for each non-in-flight pending entry.
         // Collect (tx_hash, resolved_peer) for entries that have a peer,
         // and tx_hashes for entries that have exhausted all peers.
@@ -289,6 +300,9 @@ impl InclusionProofFetchProtocol {
         for (&winner_tx_hash, state) in &self.pending {
             if state.in_flight {
                 continue;
+            }
+            if available_slots == 0 {
+                break;
             }
 
             // If we have a current peer that hasn't exhausted retries, reuse it.
@@ -311,6 +325,7 @@ impl InclusionProofFetchProtocol {
             match peer {
                 Some(peer) => {
                     ready.push((winner_tx_hash, peer));
+                    available_slots -= 1;
                 }
                 None => {
                     warn!(
@@ -461,6 +476,7 @@ mod tests {
     fn test_retry_same_peer_then_rotate() {
         let config = InclusionProofFetchConfig {
             max_retries_per_peer: 2,
+            ..default_config()
         };
         let mut protocol = InclusionProofFetchProtocol::new(config);
 
@@ -501,6 +517,7 @@ mod tests {
     fn test_all_peers_exhausted() {
         let config = InclusionProofFetchConfig {
             max_retries_per_peer: 1,
+            ..default_config()
         };
         let mut protocol = InclusionProofFetchProtocol::new(config);
 
