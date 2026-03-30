@@ -103,8 +103,8 @@ fn test_recovered_votes_prevent_equivocation() {
         topology.snapshot(),
         header_b,
         hyperscale_types::BlockManifest::default(),
-        &HashMap::new(),
-        &HashMap::new(),
+        |_| None,
+        |_| None,
     );
 
     // Check that no vote was broadcast

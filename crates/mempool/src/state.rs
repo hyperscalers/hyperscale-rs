@@ -1794,16 +1794,6 @@ impl MempoolState {
         self.pool.get(hash).map(|e| e.status.clone())
     }
 
-    /// Get all transactions as a HashMap (for block header validation).
-    ///
-    /// This allows BFT to look up transactions by hash when receiving block headers.
-    pub fn transactions_by_hash(&self) -> HashMap<Hash, Arc<RoutableTransaction>> {
-        self.pool
-            .iter()
-            .map(|(hash, entry)| (*hash, Arc::clone(&entry.tx)))
-            .collect()
-    }
-
     /// Get mempool memory statistics for monitoring collection sizes.
     pub fn memory_stats(&self) -> MempoolMemoryStats {
         MempoolMemoryStats {

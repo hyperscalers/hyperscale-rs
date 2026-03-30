@@ -1372,7 +1372,7 @@ impl BftState {
     /// Sender identity comes from the header's proposer field (ValidatorId),
     /// which is signed and verified. For sync detection, we don't need
     /// the network peer ID.
-    #[instrument(skip(self, header, manifest, mempool, certificates), fields(
+    #[instrument(skip(self, header, manifest, lookup_tx, lookup_cert), fields(
         height = header.height.0,
         round = header.round,
         proposer = ?header.proposer,
@@ -1383,8 +1383,8 @@ impl BftState {
         topology: &TopologySnapshot,
         header: BlockHeader,
         manifest: BlockManifest,
-        mempool: &HashMap<Hash, Arc<RoutableTransaction>>,
-        certificates: &HashMap<Hash, Arc<TransactionCertificate>>,
+        lookup_tx: impl Fn(&Hash) -> Option<Arc<RoutableTransaction>>,
+        lookup_cert: impl Fn(&Hash) -> Option<Arc<TransactionCertificate>>,
     ) -> Vec<Action> {
         let block_hash = header.hash();
         let height = header.height.0;
@@ -1526,13 +1526,13 @@ impl BftState {
         let mut pending = PendingBlock::from_manifest(header.clone(), manifest);
 
         for tx_hash in pending.manifest().tx_hashes.clone() {
-            if let Some(tx) = mempool.get(&tx_hash) {
-                pending.add_transaction_arc(Arc::clone(tx));
+            if let Some(tx) = lookup_tx(&tx_hash) {
+                pending.add_transaction_arc(tx);
             }
         }
         for cert_hash in pending.manifest().cert_hashes.clone() {
-            if let Some(cert) = certificates.get(&cert_hash) {
-                pending.add_certificate(Arc::clone(cert));
+            if let Some(cert) = lookup_cert(&cert_hash) {
+                pending.add_certificate(cert);
             }
         }
 
@@ -4064,7 +4064,7 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         cert_hash: Hash,
-        certificates: &HashMap<Hash, Arc<TransactionCertificate>>,
+        cert: &Arc<TransactionCertificate>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -4078,10 +4078,7 @@ impl BftState {
 
         for block_hash in block_hashes {
             if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
-                // Try to add the certificate
-                if let Some(cert) = certificates.get(&cert_hash) {
-                    pending.add_certificate(Arc::clone(cert));
-                }
+                pending.add_certificate(Arc::clone(cert));
 
                 // Check if block is now complete
                 if pending.is_complete() {
@@ -4925,8 +4922,8 @@ mod tests {
             &topology,
             header,
             BlockManifest::default(),
-            &HashMap::new(), // mempool
-            &HashMap::new(), // certificates
+            |_| None, // mempool lookup
+            |_| None, // certificate lookup
         );
 
         // Should emit VerifyQcSignature action
@@ -5011,8 +5008,8 @@ mod tests {
             &topology,
             header,
             BlockManifest::default(),
-            &HashMap::new(),
-            &HashMap::new(),
+            |_| None,
+            |_| None,
         );
 
         // Now simulate QC signature verified successfully
@@ -5099,8 +5096,8 @@ mod tests {
             &topology,
             header,
             BlockManifest::default(),
-            &HashMap::new(),
-            &HashMap::new(),
+            |_| None,
+            |_| None,
         );
 
         // Verify block is pending
@@ -5172,8 +5169,8 @@ mod tests {
             &topology,
             header,
             BlockManifest::default(),
-            &HashMap::new(),
-            &HashMap::new(),
+            |_| None,
+            |_| None,
         );
 
         // Should NOT emit VerifyQcSignature (genesis QC)
@@ -7121,8 +7118,8 @@ mod tests {
             &topology,
             header1,
             BlockManifest::default(),
-            &HashMap::new(),
-            &HashMap::new(),
+            |_| None,
+            |_| None,
         );
 
         // Should emit VerifyQcSignature for the first block
@@ -7156,8 +7153,8 @@ mod tests {
             &topology,
             header2,
             BlockManifest::default(),
-            &HashMap::new(),
-            &HashMap::new(),
+            |_| None,
+            |_| None,
         );
 
         // Should NOT emit VerifyQcSignature since QC is already verified

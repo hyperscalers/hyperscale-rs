@@ -443,9 +443,6 @@ impl NodeStateMachine {
             }
         }
 
-        let mempool_txs = self.mempool.transactions_by_hash();
-        let local_certs = self.execution.finalized_certificates_by_hash();
-
         // Trigger speculative execution for single-shard transactions
         // This hides execution latency behind consensus latency
         let block_hash = header.hash();
@@ -453,7 +450,7 @@ impl NodeStateMachine {
         let transactions: Vec<_> = manifest
             .tx_hashes
             .iter()
-            .filter_map(|h| mempool_txs.get(h).cloned())
+            .filter_map(|h| self.mempool.get_transaction(h))
             .collect();
         let spec_actions = self.execution.trigger_speculative_execution(
             self.topology.snapshot(),
@@ -466,8 +463,8 @@ impl NodeStateMachine {
             self.topology.snapshot(),
             header,
             manifest,
-            &mempool_txs,
-            &local_certs,
+            |h| self.mempool.get_transaction(h),
+            |h| self.execution.get_finalized_certificate(h),
         );
         actions.extend(spec_actions);
         actions
@@ -776,12 +773,13 @@ impl NodeStateMachine {
                 .on_transaction_executed(self.topology.snapshot(), tx_hash, accepted);
 
         // Check if any pending blocks are now complete with this certificate
-        let local_certs = self.execution.finalized_certificates_by_hash();
-        actions.extend(self.bft.check_pending_blocks_for_certificate(
-            self.topology.snapshot(),
-            tx_hash,
-            &local_certs,
-        ));
+        if let Some(cert) = self.execution.get_finalized_certificate(&tx_hash) {
+            actions.extend(self.bft.check_pending_blocks_for_certificate(
+                self.topology.snapshot(),
+                tx_hash,
+                &cert,
+            ));
+        }
 
         actions
     }

@@ -1498,16 +1498,6 @@ impl ExecutionState {
             .collect()
     }
 
-    /// Get finalized certificates as a HashMap for block validation.
-    pub fn finalized_certificates_by_hash(
-        &self,
-    ) -> std::collections::HashMap<Hash, Arc<TransactionCertificate>> {
-        self.finalized_certificates
-            .iter()
-            .map(|(h, (c, _))| (*h, Arc::clone(c)))
-            .collect()
-    }
-
     /// Get a single finalized certificate by transaction hash.
     ///
     /// Returns certificates that have been finalized but not yet committed to a block.
