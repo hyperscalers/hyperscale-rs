@@ -231,11 +231,14 @@ pub struct BftState {
     /// Timestamp when the last QC formed (for any proposer, not just us).
     /// Used for global rate limiting: ensures min_block_interval between
     /// successive blocks regardless of which validator proposed them.
-    last_qc_time: Duration,
+    /// `None` until the first QC forms.
+    last_qc_time: Option<Duration>,
 
     /// Time of last leader activity (for round timeout detection).
     /// Reset when we see leader activity (proposal, header receipt, QC, commit).
-    last_leader_activity: Duration,
+    /// `None` until the first activity is recorded — prevents spurious view
+    /// changes before any leader has had a chance to act.
+    last_leader_activity: Option<Duration>,
 
     /// Last (height, round) for which we reset the leader activity timer on header receipt.
     /// Prevents a Byzantine leader from spamming headers to delay view changes.
@@ -311,8 +314,8 @@ impl BftState {
             remote_header_tips: HashMap::new(),
             config,
             now: Duration::ZERO,
-            last_qc_time: Duration::ZERO,
-            last_leader_activity: Duration::ZERO,
+            last_qc_time: None,
+            last_leader_activity: None,
             last_header_reset: None,
             view_changes: 0,
         }
@@ -450,7 +453,7 @@ impl BftState {
                 "Exiting sync mode - resuming normal block production"
             );
             // Reset leader activity timeout since we've caught up
-            self.last_leader_activity = self.now;
+            self.last_leader_activity = Some(self.now);
         }
         self.sync.set_syncing(syncing);
     }
@@ -561,7 +564,7 @@ impl BftState {
     /// - A block commits
     /// - We receive a valid header (rate-limited per height/round)
     fn record_leader_activity(&mut self) {
-        self.last_leader_activity = self.now;
+        self.last_leader_activity = Some(self.now);
     }
 
     /// Sign a block header for gossip broadcast.
@@ -590,7 +593,7 @@ impl BftState {
     fn record_header_activity(&mut self, height: u64, round: u64) {
         let header_key = (height, round);
         if self.last_header_reset != Some(header_key) {
-            self.last_leader_activity = self.now;
+            self.last_leader_activity = Some(self.now);
             self.last_header_reset = Some(header_key);
         }
     }
@@ -639,8 +642,13 @@ impl BftState {
     /// the view if the leader fails. When a syncing node becomes the proposer
     /// after a view change, they propose an empty sync block.
     fn should_advance_round(&self) -> bool {
+        let Some(last_activity) = self.last_leader_activity else {
+            // No leader activity recorded yet — don't view-change before
+            // the first proposal has had a chance to arrive.
+            return false;
+        };
         let timeout = self.current_view_change_timeout();
-        self.now.saturating_sub(self.last_leader_activity) >= timeout
+        self.now.saturating_sub(last_activity) >= timeout
     }
 
     /// Check for round timeout and advance if needed.
@@ -656,7 +664,7 @@ impl BftState {
         }
 
         // Reset the timeout so we don't immediately trigger another view change.
-        self.last_leader_activity = self.now;
+        self.last_leader_activity = Some(self.now);
         // Clear the header reset tracker since we're changing rounds
         self.last_header_reset = None;
 
@@ -841,7 +849,10 @@ impl BftState {
         // Global rate limit: ensure min_block_interval since the last QC from
         // any proposer. Without this, the timer path bypasses the rate limit
         // that on_qc_formed enforces, since the timer fires independently.
-        let time_since_last_qc = self.now.saturating_sub(self.last_qc_time);
+        // When no QC has formed yet, ZERO ensures we're never rate-limited.
+        let time_since_last_qc = self
+            .now
+            .saturating_sub(self.last_qc_time.unwrap_or(Duration::ZERO));
         if time_since_last_qc < self.config.min_block_interval {
             // Reschedule for exactly when the rate limit expires instead of
             // waiting for the next full proposal_interval.
@@ -3064,7 +3075,9 @@ impl BftState {
         // last proposal. With rotating proposers, per-validator tracking doesn't
         // throttle the global block rate — per-validator tracking would be
         // stale by the time it's their turn again with rotating proposers.
-        let time_since_last_qc = self.now.saturating_sub(self.last_qc_time);
+        let time_since_last_qc = self
+            .now
+            .saturating_sub(self.last_qc_time.unwrap_or(Duration::ZERO));
         let rate_limited = time_since_last_qc < self.config.min_block_interval;
 
         // Attempt immediate proposal if:
@@ -3107,7 +3120,7 @@ impl BftState {
 
         // Update last_qc_time AFTER the rate limit check so this QC's time
         // gates the NEXT proposal, not the one we just decided about.
-        self.last_qc_time = self.now;
+        self.last_qc_time = Some(self.now);
 
         actions
     }
@@ -7308,7 +7321,7 @@ mod tests {
 
         // Set current time and simulate that a QC formed very recently
         state.set_time(Duration::from_millis(1000));
-        state.last_qc_time = Duration::from_millis(950); // 50ms ago
+        state.last_qc_time = Some(Duration::from_millis(950)); // 50ms ago
 
         // min_block_interval is 800ms by default, so we're within the rate limit window
 
@@ -7361,7 +7374,7 @@ mod tests {
 
         // Set current time and simulate that enough time passed since last QC
         state.set_time(Duration::from_millis(1000));
-        state.last_qc_time = Duration::from_millis(100); // 900ms ago
+        state.last_qc_time = Some(Duration::from_millis(100)); // 900ms ago
 
         // min_block_interval is 800ms by default, so 900ms > 800ms - should be allowed
 
@@ -7443,7 +7456,7 @@ mod tests {
 
         // Set current time and simulate that QC formed 200ms ago
         state.set_time(Duration::from_millis(1000));
-        state.last_qc_time = Duration::from_millis(800); // 200ms ago
+        state.last_qc_time = Some(Duration::from_millis(800)); // 200ms ago
 
         // With min_block_interval of 500ms, 200ms is not enough - should be rate limited
 
@@ -7520,7 +7533,7 @@ mod tests {
 
         // QC just now (0ms ago) - normally would be rate limited
         state.set_time(Duration::from_millis(1000));
-        state.last_qc_time = Duration::from_millis(1000);
+        state.last_qc_time = Some(Duration::from_millis(1000));
 
         let qc = QuorumCertificate {
             block_hash: Hash::from_bytes(b"block_3"),
@@ -7569,8 +7582,8 @@ mod tests {
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_millis(5000));
 
-        // Ensure last_qc_time starts at zero
-        assert_eq!(state.last_qc_time, Duration::ZERO);
+        // Ensure last_qc_time starts at None
+        assert_eq!(state.last_qc_time, None);
 
         // Create a QC at height 3
         let qc = QuorumCertificate {
@@ -7598,7 +7611,7 @@ mod tests {
         // Verify last_qc_time was updated to current time
         assert_eq!(
             state.last_qc_time,
-            Duration::from_millis(5000),
+            Some(Duration::from_millis(5000)),
             "last_qc_time should be updated to current time after on_qc_formed"
         );
     }
@@ -7970,7 +7983,7 @@ mod tests {
 
         // Set up time so that view change would trigger
         state.set_time(Duration::from_secs(100));
-        state.last_leader_activity = Duration::from_secs(0); // Very old
+        state.last_leader_activity = Some(Duration::from_secs(0)); // Very old
 
         // Without sync mode, should want to advance round
         assert!(
@@ -8004,7 +8017,7 @@ mod tests {
 
         // Set up stale leader activity
         state.set_time(Duration::from_secs(100));
-        state.last_leader_activity = Duration::from_secs(0);
+        state.last_leader_activity = Some(Duration::from_secs(0));
 
         // Enter and exit sync mode
         state.set_syncing(&topology, true);
@@ -8013,7 +8026,7 @@ mod tests {
         // Leader activity should be reset to current time
         assert_eq!(
             state.last_leader_activity,
-            Duration::from_secs(100),
+            Some(Duration::from_secs(100)),
             "Leader activity should be reset when exiting sync mode"
         );
     }
@@ -8146,7 +8159,7 @@ mod tests {
     fn test_sync_block_records_leader_activity() {
         let (mut state, topology) = make_test_state();
         state.set_time(Duration::from_secs(100));
-        state.last_leader_activity = Duration::from_secs(0);
+        state.last_leader_activity = Some(Duration::from_secs(0));
 
         // Set up QC so we're the proposer for height 4
         let qc = QuorumCertificate {
@@ -8177,7 +8190,7 @@ mod tests {
         // Leader activity should be updated
         assert_eq!(
             state.last_leader_activity,
-            Duration::from_secs(100),
+            Some(Duration::from_secs(100)),
             "Sync block proposal should record leader activity"
         );
     }
@@ -8448,7 +8461,7 @@ mod tests {
         // Set up: we're at round 0, last_leader_activity = 0
         state.view = 0;
         state.view_at_height_start = 0;
-        state.last_leader_activity = Duration::ZERO;
+        state.last_leader_activity = Some(Duration::ZERO);
 
         // Base timeout is 5s
         // At exactly 5s, should trigger (rounds_at_height = 0)
@@ -8461,7 +8474,7 @@ mod tests {
         // Now at round 1, timeout should be 6s
         // Reset and simulate we're at round 1
         state.view = 1;
-        state.last_leader_activity = Duration::from_secs(10);
+        state.last_leader_activity = Some(Duration::from_secs(10));
 
         // At 5s after last activity, should NOT trigger (need 6s)
         state.set_time(Duration::from_secs(15));
@@ -8479,7 +8492,7 @@ mod tests {
 
         // At round 5, timeout should be 10s
         state.view = 5;
-        state.last_leader_activity = Duration::from_secs(20);
+        state.last_leader_activity = Some(Duration::from_secs(20));
 
         // At 9s after last activity, should NOT trigger
         state.set_time(Duration::from_secs(29));
