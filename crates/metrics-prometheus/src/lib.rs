@@ -1264,6 +1264,14 @@ impl MetricsRecorder for PrometheusRecorder {
             .memory_mempool
             .with_label_values(&["locked_nodes"])
             .set(m.mempool_locked_nodes as f64);
+        self.metrics
+            .memory_mempool
+            .with_label_values(&["in_flight_heights"])
+            .set(m.mempool_in_flight_heights as f64);
+        self.metrics
+            .memory_mempool
+            .with_label_values(&["retry_exceeded"])
+            .set(m.mempool_retry_exceeded as f64);
 
         // Remote Headers
         self.metrics

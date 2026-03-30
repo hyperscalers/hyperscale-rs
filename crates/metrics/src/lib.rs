@@ -107,6 +107,10 @@ pub struct MemoryMetrics {
     pub mempool_recently_evicted: usize,
     /// Cached set of locked nodes.
     pub mempool_locked_nodes: usize,
+    /// Distinct committed_at heights tracked for timeout scanning.
+    pub mempool_in_flight_heights: usize,
+    /// Retry-exceeded transactions pending abort.
+    pub mempool_retry_exceeded: usize,
 
     // ── Remote Headers ──
     /// Remote headers pending QC verification.

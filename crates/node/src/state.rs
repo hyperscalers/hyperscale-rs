@@ -26,9 +26,6 @@ pub type NodeIndex = u32;
 /// How many blocks a cross-shard transaction can wait before being aborted.
 const EXECUTION_TIMEOUT_BLOCKS: u64 = 10;
 
-/// Maximum number of times a timed-out transaction can be retried.
-const MAX_RETRIES: u32 = 3;
-
 /// How many blocks to retain tombstones in the mempool (gossip deduplication).
 const TOMBSTONE_RETENTION_BLOCKS: u64 = 500;
 
@@ -267,11 +264,9 @@ impl NodeStateMachine {
             .ready_transactions(max_txs, pending_txs, pending_certs);
         let deferred = self.livelock.get_pending_deferrals().to_vec();
         let current_height = BlockHeight(self.bft.committed_height() + 1);
-        let aborted = self.mempool.get_timed_out_transactions(
-            current_height,
-            EXECUTION_TIMEOUT_BLOCKS,
-            MAX_RETRIES,
-        );
+        let aborted = self
+            .mempool
+            .get_timed_out_transactions(current_height, EXECUTION_TIMEOUT_BLOCKS);
         let certificates = self.execution.get_finalized_certificates();
 
         ProposalInputs {
@@ -370,11 +365,9 @@ impl NodeStateMachine {
         );
         let deferred = self.livelock.get_pending_deferrals().to_vec();
         let current_height = BlockHeight(self.bft.committed_height() + 1);
-        let aborted = self.mempool.get_timed_out_transactions(
-            current_height,
-            EXECUTION_TIMEOUT_BLOCKS,
-            MAX_RETRIES,
-        );
+        let aborted = self
+            .mempool
+            .get_timed_out_transactions(current_height, EXECUTION_TIMEOUT_BLOCKS);
 
         // Collect per-certificate Arc<DatabaseUpdates> from execution cache.
         // The closure captures the cache; BftState calls it with the final
@@ -800,7 +793,7 @@ impl NodeStateMachine {
         let tx_for_pending = Arc::clone(&tx);
         let mut actions =
             self.mempool
-                .on_transaction_gossip_arc(self.topology.snapshot(), tx, submitted_locally);
+                .on_transaction_gossip(self.topology.snapshot(), tx, submitted_locally);
 
         // Check if any pending blocks are now complete
         actions.extend(self.bft.check_pending_blocks_for_transaction(

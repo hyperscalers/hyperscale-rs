@@ -64,6 +64,10 @@ pub struct MempoolConfig {
     /// Set to zero to disable (default).
     #[serde(default = "default_min_dwell_time")]
     pub min_dwell_time: Duration,
+
+    /// Maximum retry attempts before a transaction is aborted.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
 }
 
 fn default_max_in_flight() -> usize {
@@ -78,12 +82,17 @@ fn default_min_dwell_time() -> Duration {
     DEFAULT_MIN_DWELL_TIME
 }
 
+const fn default_max_retries() -> u32 {
+    3
+}
+
 impl Default for MempoolConfig {
     fn default() -> Self {
         Self {
             max_in_flight: DEFAULT_IN_FLIGHT_LIMIT,
             max_pending: DEFAULT_MAX_PENDING,
             min_dwell_time: DEFAULT_MIN_DWELL_TIME,
+            max_retries: default_max_retries(),
         }
     }
 }
@@ -125,6 +134,8 @@ pub struct MempoolMemoryStats {
     pub tombstones: usize,
     pub recently_evicted: usize,
     pub locked_nodes: usize,
+    pub in_flight_heights: usize,
+    pub retry_exceeded: usize,
 }
 
 /// Entry in the transaction pool.
@@ -250,6 +261,14 @@ pub struct MempoolState {
     /// Enables O(1) blocking when a node becomes locked.
     ready_txs_by_node: HashMap<NodeId, HashSet<Hash>>,
 
+    /// In-flight transactions indexed by committed_at height.
+    /// Enables efficient timeout scanning: only entries at old heights are checked.
+    in_flight_by_height: BTreeMap<BlockHeight, Vec<Hash>>,
+
+    /// Transactions that have exceeded the maximum retry count.
+    /// Populated at retry creation time, drained during `get_timed_out_transactions`.
+    retry_exceeded: Vec<TransactionAbort>,
+
     /// Current time.
     now: Duration,
 
@@ -301,6 +320,8 @@ impl MempoolState {
             deferred_by_nodes: HashMap::new(),
             txs_deferred_by_node: HashMap::new(),
             ready_txs_by_node: HashMap::new(),
+            in_flight_by_height: BTreeMap::new(),
+            retry_exceeded: Vec::new(),
             now: Duration::ZERO,
             current_height: BlockHeight(0),
             config,
@@ -314,7 +335,7 @@ impl MempoolState {
 
     /// Handle transaction submission from client.
     #[instrument(skip(self, topology, tx), fields(tx_hash = ?tx.hash()))]
-    pub fn on_submit_transaction_arc(
+    pub fn on_submit_transaction(
         &mut self,
         topology: &TopologySnapshot,
         tx: Arc<RoutableTransaction>,
@@ -352,6 +373,7 @@ impl MempoolState {
 
         // Add to ready tracking
         self.add_to_ready_tracking(hash, &tx, cross_shard, self.now);
+        self.check_retry_exceeded(hash, &tx);
 
         tracing::info!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via submit");
 
@@ -366,16 +388,6 @@ impl MempoolState {
         }]
     }
 
-    /// Handle transaction submission from client.
-    #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
-    pub fn on_submit_transaction(
-        &mut self,
-        topology: &TopologySnapshot,
-        tx: RoutableTransaction,
-    ) -> Vec<Action> {
-        self.on_submit_transaction_arc(topology, Arc::new(tx))
-    }
-
     /// Handle transaction received via gossip (or validated RPC submission).
     ///
     /// `submitted_locally` is `true` when the transaction originated from this
@@ -383,7 +395,7 @@ impl MempoolState {
     /// propagated to `PoolEntry` so that finalization metrics are recorded only
     /// on the submitting node.
     #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
-    pub fn on_transaction_gossip_arc(
+    pub fn on_transaction_gossip(
         &mut self,
         topology: &TopologySnapshot,
         tx: Arc<RoutableTransaction>,
@@ -410,22 +422,13 @@ impl MempoolState {
 
         // Add to ready tracking
         self.add_to_ready_tracking(hash, &tx, cross_shard, self.now);
+        self.check_retry_exceeded(hash, &tx);
 
         tracing::debug!(tx_hash = ?hash, pool_size = self.pool.len(), "Transaction added to mempool via gossip");
 
         // No events emitted — gossip acceptance is silent to avoid flooding
         // the consensus channel under high transaction load.
         vec![]
-    }
-
-    /// Handle transaction received via gossip.
-    #[instrument(skip(self, tx), fields(tx_hash = ?tx.hash()))]
-    pub fn on_transaction_gossip(
-        &mut self,
-        topology: &TopologySnapshot,
-        tx: RoutableTransaction,
-    ) -> Vec<Action> {
-        self.on_transaction_gossip_arc(topology, Arc::new(tx), false)
     }
 
     /// Broadcast a transaction to all shards involved in it.
@@ -471,14 +474,24 @@ impl MempoolState {
         });
         if let Some((tx, status)) = info_to_unlock {
             self.remove_locked_nodes(&tx);
-            match status {
-                TransactionStatus::Committed(_) => {
+            let committed_at = match status {
+                TransactionStatus::Committed(h) => {
                     self.committed_count = self.committed_count.saturating_sub(1);
+                    Some(h)
                 }
-                TransactionStatus::Executed { .. } => {
+                TransactionStatus::Executed { committed_at, .. } => {
                     self.executed_count = self.executed_count.saturating_sub(1);
+                    Some(committed_at)
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(h) = committed_at {
+                if let Some(hashes) = self.in_flight_by_height.get_mut(&h) {
+                    hashes.retain(|hash| *hash != tx_hash);
+                    if hashes.is_empty() {
+                        self.in_flight_by_height.remove(&h);
+                    }
+                }
             }
         }
 
@@ -631,6 +644,10 @@ impl MempoolState {
                     // Add locks for committed transactions and update counter
                     self.add_locked_nodes(tx);
                     self.committed_count += 1;
+                    self.in_flight_by_height
+                        .entry(height)
+                        .or_default()
+                        .push(hash);
                     actions.push(Action::EmitTransactionStatus {
                         tx_hash: hash,
                         status: TransactionStatus::Committed(height),
@@ -1116,6 +1133,10 @@ impl MempoolState {
                 if let Some(tx) = tx_clone {
                     self.add_locked_nodes(&tx);
                     self.committed_count += 1;
+                    self.in_flight_by_height
+                        .entry(height)
+                        .or_default()
+                        .push(*hash);
                 }
             }
 
@@ -1402,6 +1423,19 @@ impl MempoolState {
                 // Block any ready transactions that conflict with this newly locked node
                 self.block_transactions_for_node(*node);
             }
+        }
+    }
+
+    /// Flag a transaction for abort if it exceeds the maximum retry count.
+    fn check_retry_exceeded(&mut self, hash: Hash, tx: &RoutableTransaction) {
+        if tx.exceeds_max_retries(self.config.max_retries) {
+            self.retry_exceeded.push(TransactionAbort {
+                tx_hash: hash,
+                reason: AbortReason::TooManyRetries {
+                    retry_count: tx.retry_count(),
+                },
+                block_height: BlockHeight(0),
+            });
         }
     }
 
@@ -1803,6 +1837,8 @@ impl MempoolState {
             tombstones: self.tombstones.len(),
             recently_evicted: self.recently_evicted.len(),
             locked_nodes: self.locked_nodes_cache.len(),
+            in_flight_heights: self.in_flight_by_height.len(),
+            retry_exceeded: self.retry_exceeded.len(),
         }
     }
 
@@ -1847,70 +1883,46 @@ impl MempoolState {
     /// - `timeout_blocks`: Number of blocks after which a TX is considered timed out
     /// - `max_retries`: Maximum retry count before aborting
     pub fn get_timed_out_transactions(
-        &self,
+        &mut self,
         current_height: BlockHeight,
         timeout_blocks: u64,
-        max_retries: u32,
     ) -> Vec<TransactionAbort> {
         let mut aborts = Vec::new();
 
-        for (hash, entry) in &self.pool {
-            // Skip transactions that are already finalized (Completed is terminal)
-            if matches!(entry.status, TransactionStatus::Completed(_)) {
-                continue;
-            }
-
-            // Check for execution timeout (TX stuck in lock-holding state too long)
-            // Both Committed and Executed states hold locks and need timeout checks.
-            // Cross-shard transactions can get stuck in Executed state if certificate
-            // inclusion fails on another shard (e.g., the other shard aborted first).
-            let committed_at = match &entry.status {
-                TransactionStatus::Committed(height) => Some(*height),
-                TransactionStatus::Executed { committed_at, .. } => Some(*committed_at),
-                _ => None,
-            };
-
-            if let Some(committed_at) = committed_at {
-                let blocks_elapsed = current_height.0.saturating_sub(committed_at.0);
-                if blocks_elapsed >= timeout_blocks {
+        // Scan only in-flight transactions at heights old enough to have timed out.
+        let cutoff = BlockHeight(current_height.0.saturating_sub(timeout_blocks));
+        for (committed_at, hashes) in self.in_flight_by_height.range(..=cutoff) {
+            for hash in hashes {
+                if let Some(entry) = self.pool.get(hash) {
+                    // Skip already-finalized transactions
+                    if matches!(entry.status, TransactionStatus::Completed(_)) {
+                        continue;
+                    }
                     let status_name = match &entry.status {
                         TransactionStatus::Committed(_) => "Committed",
                         TransactionStatus::Executed { .. } => "Executed",
-                        _ => "Unknown",
+                        _ => continue, // Not in-flight
                     };
                     tracing::debug!(
                         tx_hash = %hash,
                         committed_at = committed_at.0,
                         current_height = current_height.0,
-                        blocks_elapsed = blocks_elapsed,
                         status = status_name,
                         "Transaction timed out waiting for completion"
                     );
                     aborts.push(TransactionAbort {
                         tx_hash: *hash,
-                        reason: AbortReason::ExecutionTimeout { committed_at },
+                        reason: AbortReason::ExecutionTimeout {
+                            committed_at: *committed_at,
+                        },
                         block_height: BlockHeight(0), // Filled in by proposer
                     });
                 }
             }
-
-            // Check for too many retries
-            if entry.tx.exceeds_max_retries(max_retries) {
-                tracing::info!(
-                    tx_hash = %hash,
-                    retry_count = entry.tx.retry_count(),
-                    max_retries = max_retries,
-                    "Transaction exceeded maximum retry count"
-                );
-                aborts.push(TransactionAbort {
-                    tx_hash: *hash,
-                    reason: AbortReason::TooManyRetries {
-                        retry_count: entry.tx.retry_count(),
-                    },
-                    block_height: BlockHeight(0), // Filled in by proposer
-                });
-            }
         }
+
+        // Drain retry-exceeded flags (accumulated at retry creation time)
+        aborts.append(&mut self.retry_exceeded);
 
         aborts
     }
@@ -2080,7 +2092,7 @@ mod tests {
         // Create and add a transaction
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        mempool.on_submit_transaction(&topology, tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
         // Commit the transaction first (deferrals apply to committed TXs)
         let commit_block = make_test_block(1, vec![tx.clone()], vec![], vec![], vec![]);
@@ -2098,7 +2110,7 @@ mod tests {
         // Create another TX as the "winner"
         let winner_tx = test_transaction(2);
         let winner_hash = winner_tx.hash();
-        mempool.on_submit_transaction(&topology, winner_tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(winner_tx.clone()));
 
         // Create a deferral for our TX
         let deferral = make_test_deferral(tx_hash, winner_hash, 2);
@@ -2126,12 +2138,12 @@ mod tests {
         // Create loser TX and submit
         let loser_tx = test_transaction(1);
         let loser_hash = loser_tx.hash();
-        mempool.on_submit_transaction(&topology, loser_tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(loser_tx.clone()));
 
         // Create winner TX and submit
         let winner_tx = test_transaction(2);
         let winner_hash = winner_tx.hash();
-        mempool.on_submit_transaction(&topology, winner_tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(winner_tx.clone()));
 
         // Commit both
         let commit_block = make_test_block(
@@ -2203,7 +2215,7 @@ mod tests {
         // Create and commit a TX
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        mempool.on_submit_transaction(&topology, tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
         let commit_block = make_test_block(1, vec![tx], vec![], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
@@ -2212,11 +2224,11 @@ mod tests {
         mempool.update_status(&tx_hash, TransactionStatus::Committed(BlockHeight(1)));
 
         // Check for timeouts - not enough blocks elapsed
-        let aborts = mempool.get_timed_out_transactions(BlockHeight(20), 30, 3);
+        let aborts = mempool.get_timed_out_transactions(BlockHeight(20), 30);
         assert!(aborts.is_empty(), "Should not timeout yet");
 
         // Check for timeouts - now enough blocks
-        let aborts = mempool.get_timed_out_transactions(BlockHeight(35), 30, 3);
+        let aborts = mempool.get_timed_out_transactions(BlockHeight(35), 30);
         assert_eq!(aborts.len(), 1);
         assert_eq!(aborts[0].tx_hash, tx_hash);
         assert!(matches!(
@@ -2236,7 +2248,7 @@ mod tests {
         // Create and commit a TX
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        mempool.on_submit_transaction(&topology, tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
         let commit_block = make_test_block(1, vec![tx], vec![], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
@@ -2263,11 +2275,11 @@ mod tests {
         );
 
         // Check for timeouts - not enough blocks elapsed
-        let aborts = mempool.get_timed_out_transactions(BlockHeight(20), 30, 3);
+        let aborts = mempool.get_timed_out_transactions(BlockHeight(20), 30);
         assert!(aborts.is_empty(), "Should not timeout yet");
 
         // Check for timeouts - now enough blocks (31 blocks since committed at height 1)
-        let aborts = mempool.get_timed_out_transactions(BlockHeight(35), 30, 3);
+        let aborts = mempool.get_timed_out_transactions(BlockHeight(35), 30);
         assert_eq!(aborts.len(), 1, "Executed transaction should timeout");
         assert_eq!(aborts[0].tx_hash, tx_hash);
         assert!(matches!(
@@ -2295,10 +2307,10 @@ mod tests {
         assert_eq!(retry3.retry_count(), 3);
 
         // Submit the multiply-retried TX
-        mempool.on_submit_transaction(&topology, retry3.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(retry3.clone()));
 
         // Should detect too many retries (max_retries = 3 means 3 retries allowed, 4th would be rejected)
-        let aborts = mempool.get_timed_out_transactions(BlockHeight(10), 100, 3);
+        let aborts = mempool.get_timed_out_transactions(BlockHeight(10), 100);
         assert_eq!(aborts.len(), 1);
         assert!(matches!(
             aborts[0].reason,
@@ -2314,7 +2326,7 @@ mod tests {
         // Create and commit a TX
         let tx = test_transaction(1);
         let tx_hash = tx.hash();
-        mempool.on_submit_transaction(&topology, tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
         let commit_block = make_test_block(1, vec![tx], vec![], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
@@ -2615,7 +2627,7 @@ mod tests {
         let tx_hash = tx.hash();
 
         // Submit and commit the transaction
-        mempool.on_submit_transaction(&topology, tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
         let commit_block = make_test_block(1, vec![tx], vec![], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
@@ -2638,7 +2650,7 @@ mod tests {
         let tx_hash = tx.hash();
 
         // Submit and complete the transaction
-        mempool.on_submit_transaction(&topology, tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
         let commit_block = make_test_block(1, vec![tx.clone()], vec![], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
@@ -2650,7 +2662,7 @@ mod tests {
         assert!(mempool.is_tombstoned(&tx_hash));
 
         // Try to re-add via gossip - should be rejected
-        let actions = mempool.on_transaction_gossip(&topology, tx.clone());
+        let actions = mempool.on_transaction_gossip(&topology, Arc::new(tx.clone()), false);
         assert!(actions.is_empty(), "Tombstoned tx should be rejected");
 
         // Should still not be in pool
@@ -2666,7 +2678,7 @@ mod tests {
         let tx_hash = tx.hash();
 
         // Submit and complete the transaction
-        mempool.on_submit_transaction(&topology, tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
         let commit_block = make_test_block(1, vec![tx.clone()], vec![], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
@@ -2675,7 +2687,7 @@ mod tests {
         mempool.on_block_committed_full(&topology, &cert_block);
 
         // Try to re-submit - should be rejected (no status emitted)
-        let actions = mempool.on_submit_transaction(&topology, tx.clone());
+        let actions = mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
         assert!(actions.is_empty(), "Tombstoned tx should be rejected");
 
         // Should still not be in pool
@@ -2691,7 +2703,7 @@ mod tests {
         let tx_hash = tx.hash();
 
         // Submit and commit the transaction
-        mempool.on_submit_transaction(&topology, tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
         // Abort the transaction
         let abort = TransactionAbort {
@@ -2708,7 +2720,7 @@ mod tests {
         assert!(mempool.is_tombstoned(&tx_hash));
 
         // Try to re-add via gossip - should be rejected
-        let actions = mempool.on_transaction_gossip(&topology, tx);
+        let actions = mempool.on_transaction_gossip(&topology, Arc::new(tx.clone()), false);
         assert!(actions.is_empty(), "Aborted tx should be rejected");
     }
 
@@ -2723,8 +2735,8 @@ mod tests {
         let winner_hash = winner.hash();
 
         // Submit both transactions
-        mempool.on_submit_transaction(&topology, loser.clone());
-        mempool.on_submit_transaction(&topology, winner.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(loser.clone()));
+        mempool.on_submit_transaction(&topology, Arc::new(winner.clone()));
 
         // Commit both
         let commit_block = make_test_block(
@@ -2750,7 +2762,7 @@ mod tests {
         assert!(mempool.is_tombstoned(&loser_hash));
 
         // Try to re-add via gossip - should be rejected
-        let actions = mempool.on_transaction_gossip(&topology, loser);
+        let actions = mempool.on_transaction_gossip(&topology, Arc::new(loser.clone()), false);
         assert!(actions.is_empty(), "Retried tx should be rejected");
     }
 
@@ -2764,7 +2776,7 @@ mod tests {
             let tx = test_transaction(i);
             let tx_hash = tx.hash();
 
-            mempool.on_submit_transaction(&topology, tx.clone());
+            mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
             let commit_block = make_test_block(i as u64, vec![tx], vec![], vec![], vec![]);
             mempool.on_block_committed_full(&topology, &commit_block);
 
@@ -2798,7 +2810,7 @@ mod tests {
         let tx_hash = tx.hash();
 
         // Commit the transaction
-        mempool.on_submit_transaction(&topology, tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
         let commit_block = make_test_block(10, vec![tx.clone()], vec![], vec![], vec![]);
         mempool.on_block_committed_full(&topology, &commit_block);
 
@@ -2811,7 +2823,7 @@ mod tests {
         assert_eq!(mempool.len(), 0);
 
         // Simulate late-arriving gossip
-        let _actions = mempool.on_transaction_gossip(&topology, tx);
+        let actions = mempool.on_transaction_gossip(&topology, Arc::new(tx.clone()), false);
 
         // Pool should still be empty - tombstone prevented resurrection
         assert_eq!(mempool.len(), 0);
@@ -2827,7 +2839,7 @@ mod tests {
         let tx_hash = tx.hash();
 
         // Submit the transaction
-        mempool.on_submit_transaction(&topology, tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
         // Mark as completed directly
         mempool.mark_completed(&tx_hash, TransactionDecision::Accept);
@@ -2837,7 +2849,7 @@ mod tests {
         assert!(mempool.status(&tx_hash).is_none());
 
         // Should reject gossip
-        let actions = mempool.on_transaction_gossip(&topology, tx);
+        let actions = mempool.on_transaction_gossip(&topology, Arc::new(tx.clone()), false);
         assert!(actions.is_empty());
     }
 
@@ -2861,6 +2873,7 @@ mod tests {
             max_in_flight: limit,
             max_pending: DEFAULT_MAX_PENDING,
             min_dwell_time: Duration::ZERO,
+            max_retries: default_max_retries(),
         }
     }
 
@@ -2872,7 +2885,7 @@ mod tests {
         for i in 0..limit {
             let tx = test_transaction(100 + i as u8);
             let tx_hash = tx.hash();
-            mempool.on_submit_transaction(topology, tx);
+            mempool.on_submit_transaction(topology, Arc::new(tx));
             // Mark as Committed so it holds state locks
             mempool.update_status(&tx_hash, TransactionStatus::Committed(BlockHeight(1)));
         }
@@ -2939,11 +2952,11 @@ mod tests {
 
         // Add a single-shard transaction
         let single_shard_tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, single_shard_tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(single_shard_tx.clone()));
 
         // Add a cross-shard transaction
         let cross_shard_tx = test_cross_shard_transaction(50);
-        mempool.on_submit_transaction(&topology, cross_shard_tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(cross_shard_tx.clone()));
 
         // Below limit: all TXs should be returned
         let ready = mempool.ready_transactions(10, 0, 0);
@@ -2962,7 +2975,7 @@ mod tests {
 
         // Add a transaction
         let tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(tx.clone()));
 
         // At limit: no TXs should be returned
         let ready = mempool.ready_transactions(10, 0, 0);
@@ -2986,11 +2999,11 @@ mod tests {
 
         // Add a single-shard transaction
         let single_tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, single_tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(single_tx.clone()));
 
         // Add a cross-shard transaction
         let cross_tx = test_cross_shard_transaction(50);
-        mempool.on_submit_transaction(&topology, cross_tx.clone());
+        mempool.on_submit_transaction(&topology, Arc::new(cross_tx.clone()));
 
         // Not at limit: all TXs should be allowed
         let ready = mempool.ready_transactions(10, 0, 0);
@@ -3007,7 +3020,7 @@ mod tests {
         // Add a single-shard TX and commit it - SHOULD count (all TXs count now)
         let single_tx = test_transaction(200);
         let single_hash = single_tx.hash();
-        mempool.on_submit_transaction(&topology, single_tx);
+        mempool.on_submit_transaction(&topology, Arc::new(single_tx));
         mempool.update_status(&single_hash, TransactionStatus::Committed(BlockHeight(1)));
         assert_eq!(
             mempool.in_flight(),
@@ -3018,7 +3031,7 @@ mod tests {
         // Add a cross-shard TX in Pending - should NOT count (not holding locks)
         let cross_tx = test_cross_shard_transaction(1);
         let cross_hash = cross_tx.hash();
-        mempool.on_submit_transaction(&topology, cross_tx);
+        mempool.on_submit_transaction(&topology, Arc::new(cross_tx));
         assert_eq!(mempool.in_flight(), 1, "Pending TX should not count");
 
         // Commit the cross-shard TX - should count
@@ -3078,7 +3091,7 @@ mod tests {
 
         mempool.set_time(Duration::from_secs(10));
         let tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, tx);
+        mempool.on_submit_transaction(&topology, Arc::new(tx));
 
         let ready = mempool.ready_transactions(10, 0, 0);
         assert_eq!(
@@ -3096,7 +3109,7 @@ mod tests {
 
         mempool.set_time(Duration::from_secs(10));
         let tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, tx);
+        mempool.on_submit_transaction(&topology, Arc::new(tx));
 
         // At t=10.1s — not yet eligible (100ms < 150ms)
         mempool.set_time(Duration::from_millis(10_100));
@@ -3129,7 +3142,7 @@ mod tests {
         // Submit at t=10s
         mempool.set_time(Duration::from_secs(10));
         let tx = test_transaction(1);
-        mempool.on_submit_transaction(&topology, tx);
+        mempool.on_submit_transaction(&topology, Arc::new(tx));
 
         // Still at t=10s — dwell time not met
         let ready = mempool.ready_transactions(10, 0, 0);
@@ -3170,12 +3183,12 @@ mod tests {
         // Submit tx1 at t=1s
         mempool.set_time(Duration::from_secs(1));
         let tx1 = test_transaction(1);
-        mempool.on_submit_transaction(&topology, tx1);
+        mempool.on_submit_transaction(&topology, Arc::new(tx1));
 
         // Submit tx2 at t=1.3s
         mempool.set_time(Duration::from_millis(1_300));
         let tx2 = test_transaction(2);
-        mempool.on_submit_transaction(&topology, tx2);
+        mempool.on_submit_transaction(&topology, Arc::new(tx2));
 
         // At t=1.2s — tx1 has 200ms dwell (eligible), tx2 not yet submitted
         // Actually we already submitted tx2 at 1.3s, so check at 1.4s:

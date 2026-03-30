@@ -972,6 +972,8 @@ where
             mempool_tombstones: mempool_mem.tombstones,
             mempool_recently_evicted: mempool_mem.recently_evicted,
             mempool_locked_nodes: mempool_mem.locked_nodes,
+            mempool_in_flight_heights: mempool_mem.in_flight_heights,
+            mempool_retry_exceeded: mempool_mem.retry_exceeded,
             // Remote Headers
             rh_pending_headers: rh_mem.pending_headers,
             rh_verified_headers: rh_mem.verified_headers,
