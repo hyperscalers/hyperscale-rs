@@ -355,6 +355,8 @@ impl ProvisionCoordinator {
                 .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
             self.pending_provisions
                 .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
+            self.verified_batches
+                .retain(|&(s, h), _| s != shard || h.0 >= cutoff);
         }
 
         // Track expected provisions: if this block's waves target
