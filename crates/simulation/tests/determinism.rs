@@ -1214,7 +1214,7 @@ fn test_mempool_to_block_integration() {
         NodeInput::SubmitTransaction { tx: Arc::new(tx3) },
     );
 
-    // Run for 100ms - before first proposal timer fires (100ms default)
+    // Run past transaction submission (50-52ms) but before dwell time expires
     runner.run_until(Duration::from_millis(99));
 
     // Check that transactions are in node 0's mempool
@@ -1232,11 +1232,14 @@ fn test_mempool_to_block_integration() {
         "Transaction 3 should be in mempool"
     );
 
-    // Get ready transactions count
+    // Transactions submitted at ~50ms with 150ms min dwell time are not yet ready
     let ready_count = node0.mempool().ready_transactions(100, 0, 0).len();
-    assert_eq!(ready_count, 3, "Should have 3 ready transactions");
+    assert_eq!(
+        ready_count, 0,
+        "Transactions should not be ready before dwell time (150ms) elapses"
+    );
 
-    println!("Mempool state before proposals:");
+    println!("Mempool state before dwell time elapses:");
     println!("  Total transactions: {}", node0.mempool().len());
     println!("  Ready transactions: {}", ready_count);
 
