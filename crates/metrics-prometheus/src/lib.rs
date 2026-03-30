@@ -11,7 +11,7 @@
 //! ```
 #![allow(dead_code)]
 
-use hyperscale_metrics::{ChannelDepths, MetricsRecorder};
+use hyperscale_metrics::{ChannelDepths, MemoryMetrics, MetricsRecorder};
 use prometheus::{
     register_counter, register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
     register_histogram_vec, Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec,
@@ -122,6 +122,14 @@ pub struct Metrics {
     pub signature_verification_failures: Counter,
     pub invalid_messages_received: Counter,
     pub transactions_rejected: CounterVec,
+
+    // === Memory ===
+    pub memory_bft: GaugeVec,
+    pub memory_exec: GaugeVec,
+    pub memory_mempool: GaugeVec,
+    pub memory_provisions: GaugeVec,
+    pub memory_livelock: GaugeVec,
+    pub memory_storage: GaugeVec,
 
     // === Cross-Shard Message Delivery ===
     pub dispatch_failures: CounterVec,
@@ -624,6 +632,49 @@ impl Metrics {
             )
             .unwrap(),
 
+            // Memory
+            memory_bft: register_gauge_vec!(
+                "hyperscale_memory_bft_collections",
+                "BFT state machine collection sizes (entry count)",
+                &["collection"]
+            )
+            .unwrap(),
+
+            memory_exec: register_gauge_vec!(
+                "hyperscale_memory_exec_collections",
+                "Execution state machine collection sizes (entry count)",
+                &["collection"]
+            )
+            .unwrap(),
+
+            memory_mempool: register_gauge_vec!(
+                "hyperscale_memory_mempool_collections",
+                "Mempool collection sizes (entry count)",
+                &["collection"]
+            )
+            .unwrap(),
+
+            memory_provisions: register_gauge_vec!(
+                "hyperscale_memory_provisions_collections",
+                "Provisions coordinator collection sizes (entry count)",
+                &["collection"]
+            )
+            .unwrap(),
+
+            memory_livelock: register_gauge_vec!(
+                "hyperscale_memory_livelock_collections",
+                "Livelock state machine collection sizes (entry count)",
+                &["collection"]
+            )
+            .unwrap(),
+
+            memory_storage: register_gauge_vec!(
+                "hyperscale_memory_storage",
+                "Storage cache memory usage",
+                &["cache"]
+            )
+            .unwrap(),
+
             // Cross-Shard Message Delivery
             dispatch_failures: register_counter_vec!(
                 "hyperscale_dispatch_failures_total",
@@ -1099,6 +1150,170 @@ impl MetricsRecorder for PrometheusRecorder {
     fn set_lock_contention(&self, deferred: u64, ratio: f64) {
         self.metrics.lock_contention_deferred.set(deferred as f64);
         self.metrics.lock_contention_ratio.set(ratio);
+    }
+
+    // ── Memory ──────────────────────────────────────────────────────
+
+    fn set_memory_metrics(&self, m: &MemoryMetrics) {
+        // BFT
+        self.metrics
+            .memory_bft
+            .with_label_values(&["pending_blocks"])
+            .set(m.bft_pending_blocks as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["vote_sets"])
+            .set(m.bft_vote_sets as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["certified_blocks"])
+            .set(m.bft_certified_blocks as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["pending_commits"])
+            .set(m.bft_pending_commits as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["remote_headers"])
+            .set(m.bft_remote_headers as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["pending_qc_verifications"])
+            .set(m.bft_pending_qc_verifications as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["verified_qcs"])
+            .set(m.bft_verified_qcs as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["pending_state_root_verifications"])
+            .set(m.bft_pending_state_root_verifications as f64);
+        self.metrics
+            .memory_bft
+            .with_label_values(&["buffered_synced_blocks"])
+            .set(m.bft_buffered_synced_blocks as f64);
+
+        // Execution
+        self.metrics
+            .memory_exec
+            .with_label_values(&["cache_entries"])
+            .set(m.exec_cache_entries as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["finalized_certificates"])
+            .set(m.exec_finalized_certificates as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["pending_provisioning"])
+            .set(m.exec_pending_provisioning as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["accumulators"])
+            .set(m.exec_accumulators as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["vote_trackers"])
+            .set(m.exec_vote_trackers as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["early_votes"])
+            .set(m.exec_early_votes as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["certificate_trackers"])
+            .set(m.exec_certificate_trackers as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["speculative_results"])
+            .set(m.exec_speculative_results as f64);
+        self.metrics
+            .memory_exec
+            .with_label_values(&["expected_exec_certs"])
+            .set(m.exec_expected_exec_certs as f64);
+
+        // Mempool
+        self.metrics
+            .memory_mempool
+            .with_label_values(&["pool"])
+            .set(m.mempool_pool as f64);
+        self.metrics
+            .memory_mempool
+            .with_label_values(&["ready"])
+            .set(m.mempool_ready as f64);
+        self.metrics
+            .memory_mempool
+            .with_label_values(&["deferred"])
+            .set(m.mempool_deferred as f64);
+        self.metrics
+            .memory_mempool
+            .with_label_values(&["tombstones"])
+            .set(m.mempool_tombstones as f64);
+        self.metrics
+            .memory_mempool
+            .with_label_values(&["recently_evicted"])
+            .set(m.mempool_recently_evicted as f64);
+        self.metrics
+            .memory_mempool
+            .with_label_values(&["locked_nodes"])
+            .set(m.mempool_locked_nodes as f64);
+
+        // Provisions
+        self.metrics
+            .memory_provisions
+            .with_label_values(&["registered_txs"])
+            .set(m.prov_registered_txs as f64);
+        self.metrics
+            .memory_provisions
+            .with_label_values(&["unverified_remote_headers"])
+            .set(m.prov_unverified_remote_headers as f64);
+        self.metrics
+            .memory_provisions
+            .with_label_values(&["verified_remote_headers"])
+            .set(m.prov_verified_remote_headers as f64);
+        self.metrics
+            .memory_provisions
+            .with_label_values(&["pending_provisions"])
+            .set(m.prov_pending_provisions as f64);
+        self.metrics
+            .memory_provisions
+            .with_label_values(&["verified_batches"])
+            .set(m.prov_verified_batches as f64);
+        self.metrics
+            .memory_provisions
+            .with_label_values(&["expected_provisions"])
+            .set(m.prov_expected_provisions as f64);
+
+        // Livelock
+        self.metrics
+            .memory_livelock
+            .with_label_values(&["tombstones"])
+            .set(m.livelock_tombstones as f64);
+        self.metrics
+            .memory_livelock
+            .with_label_values(&["pending_proof_fetches"])
+            .set(m.livelock_pending_proof_fetches as f64);
+        self.metrics
+            .memory_livelock
+            .with_label_values(&["pending_deferrals"])
+            .set(m.livelock_pending_deferrals as f64);
+        self.metrics
+            .memory_livelock
+            .with_label_values(&["tracked_txs"])
+            .set(m.livelock_tracked_txs as f64);
+
+        // Storage
+        self.metrics
+            .memory_storage
+            .with_label_values(&["jvt_node_cache_entries"])
+            .set(m.jvt_node_cache_entries as f64);
+        self.metrics
+            .memory_storage
+            .with_label_values(&["rocksdb_block_cache_bytes"])
+            .set(m.rocksdb_block_cache_usage_bytes as f64);
+        self.metrics
+            .memory_storage
+            .with_label_values(&["rocksdb_memtable_bytes"])
+            .set(m.rocksdb_memtable_usage_bytes as f64);
     }
 }
 

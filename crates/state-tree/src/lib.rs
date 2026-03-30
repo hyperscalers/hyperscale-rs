@@ -57,6 +57,16 @@ impl NodeCache {
     pub fn insert(&self, key: jvt::NodeKey, node: Arc<jvt::Node>) {
         self.inner.insert(key, node);
     }
+
+    /// Number of entries currently in the cache.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.len() == 0
+    }
 }
 
 /// Hash a storage key to a 32-byte JVT key.

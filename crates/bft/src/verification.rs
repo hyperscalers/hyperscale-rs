@@ -585,4 +585,19 @@ impl VerificationPipeline {
         self.verified_qcs
             .retain(|_, height| *height > committed_height.saturating_sub(2));
     }
+
+    /// Number of pending QC verifications.
+    pub(crate) fn pending_qc_verifications_len(&self) -> usize {
+        self.pending_qc_verifications.len()
+    }
+
+    /// Number of cached verified QCs.
+    pub(crate) fn verified_qcs_len(&self) -> usize {
+        self.verified_qcs.len()
+    }
+
+    /// Number of pending state root verifications.
+    pub(crate) fn pending_state_root_verifications_len(&self) -> usize {
+        self.pending_state_root_verifications.len()
+    }
 }

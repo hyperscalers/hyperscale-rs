@@ -67,5 +67,5 @@ mod verification;
 mod vote_set;
 
 pub use config::BftConfig;
-pub use state::{BftState, BftStats, RecoveredState};
+pub use state::{BftMemoryStats, BftState, BftStats, RecoveredState};
 pub use verification::ReadyStateRootVerification;

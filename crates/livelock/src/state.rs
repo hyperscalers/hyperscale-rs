@@ -539,6 +539,7 @@ impl LivelockState {
             pending_deferrals: self.pending_deferrals.len(),
             active_tombstones: self.tombstones.len(),
             tracked_transactions: self.committed_tracker.len(),
+            pending_proof_fetches: self.pending_proof_fetches.len(),
         }
     }
 }
@@ -552,6 +553,8 @@ pub struct LivelockStats {
     pub active_tombstones: usize,
     /// Number of transactions being tracked for cycle detection.
     pub tracked_transactions: usize,
+    /// Number of loser transactions awaiting inclusion proof fetch.
+    pub pending_proof_fetches: usize,
 }
 
 #[cfg(test)]

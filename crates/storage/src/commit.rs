@@ -88,4 +88,18 @@ pub trait CommitStore: Send + Sync {
         block_height: u64,
         consensus: Option<ConsensusCommitData>,
     ) -> Hash;
+
+    /// Memory usage of storage caches in bytes: `(block_cache, memtable)`.
+    ///
+    /// Returns `(0, 0)` by default. Overridden by RocksDB to report actual usage.
+    fn memory_usage_bytes(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
+    /// Number of entries in the JVT node cache.
+    ///
+    /// Returns `0` by default. Overridden by implementations with a node cache.
+    fn node_cache_len(&self) -> usize {
+        0
+    }
 }

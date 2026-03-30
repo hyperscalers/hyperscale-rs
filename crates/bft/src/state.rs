@@ -28,6 +28,20 @@ pub struct BftStats {
     pub committed_height: u64,
 }
 
+/// BFT memory statistics for monitoring collection sizes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BftMemoryStats {
+    pub pending_blocks: usize,
+    pub vote_sets: usize,
+    pub certified_blocks: usize,
+    pub pending_commits: usize,
+    pub remote_headers: usize,
+    pub pending_qc_verifications: usize,
+    pub verified_qcs: usize,
+    pub pending_state_root_verifications: usize,
+    pub buffered_synced_blocks: usize,
+}
+
 /// Index type for simulation-only node routing.
 /// Production uses ValidatorId (from message signatures) and PeerId (libp2p).
 pub type NodeIndex = u32;
@@ -4489,6 +4503,23 @@ impl BftState {
             view_changes: self.view_changes,
             current_round: self.view,
             committed_height: self.committed_height,
+        }
+    }
+
+    /// Get BFT memory statistics for monitoring collection sizes.
+    pub fn memory_stats(&self) -> BftMemoryStats {
+        BftMemoryStats {
+            pending_blocks: self.pending_blocks.len(),
+            vote_sets: self.vote_sets.len(),
+            certified_blocks: self.certified_blocks.len(),
+            pending_commits: self.pending_commits.len(),
+            remote_headers: self.remote_headers.len(),
+            pending_qc_verifications: self.verification.pending_qc_verifications_len(),
+            verified_qcs: self.verification.verified_qcs_len(),
+            pending_state_root_verifications: self
+                .verification
+                .pending_state_root_verifications_len(),
+            buffered_synced_blocks: self.sync.buffered_synced_blocks_len(),
         }
     }
 

@@ -21,4 +21,4 @@
 
 mod state;
 
-pub use state::{ProvisionCoordinator, TxRegistration};
+pub use state::{ProvisionCoordinator, ProvisionMemoryStats, TxRegistration};

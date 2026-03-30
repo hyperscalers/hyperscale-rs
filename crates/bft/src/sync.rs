@@ -271,6 +271,11 @@ impl SyncManager {
         self.pending_synced_block_verifications
             .retain(|_, pending| pending.block.header.height.0 > committed_height);
     }
+
+    /// Number of buffered out-of-order synced blocks.
+    pub(crate) fn buffered_synced_blocks_len(&self) -> usize {
+        self.buffered_synced_blocks.len()
+    }
 }
 
 /// Result of a synced block QC verification.

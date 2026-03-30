@@ -844,7 +844,61 @@ where
         metrics::set_fetch_in_flight(fetch_status.in_flight_operations);
 
         // ── Livelock ──
-        metrics::set_livelock_deferred_count(self.state.livelock().stats().pending_deferrals);
+        let livelock_stats = self.state.livelock().stats();
+        metrics::set_livelock_deferred_count(livelock_stats.pending_deferrals);
+
+        // ── Memory ──
+        let bft_mem = self.state.bft().memory_stats();
+        let exec_mem = self.state.execution().memory_stats();
+        let mempool_mem = self.state.mempool().memory_stats();
+        let prov_mem = self.state.provisions().memory_stats();
+        let (rocksdb_bc, rocksdb_mt) = self.storage.memory_usage_bytes();
+
+        metrics::set_memory_metrics(&metrics::MemoryMetrics {
+            // BFT
+            bft_pending_blocks: bft_mem.pending_blocks,
+            bft_vote_sets: bft_mem.vote_sets,
+            bft_certified_blocks: bft_mem.certified_blocks,
+            bft_pending_commits: bft_mem.pending_commits,
+            bft_remote_headers: bft_mem.remote_headers,
+            bft_pending_qc_verifications: bft_mem.pending_qc_verifications,
+            bft_verified_qcs: bft_mem.verified_qcs,
+            bft_pending_state_root_verifications: bft_mem.pending_state_root_verifications,
+            bft_buffered_synced_blocks: bft_mem.buffered_synced_blocks,
+            // Execution
+            exec_cache_entries: exec_mem.cache_entries,
+            exec_finalized_certificates: exec_mem.finalized_certificates,
+            exec_pending_provisioning: exec_mem.pending_provisioning,
+            exec_accumulators: exec_mem.accumulators,
+            exec_vote_trackers: exec_mem.vote_trackers,
+            exec_early_votes: exec_mem.early_votes,
+            exec_certificate_trackers: exec_mem.certificate_trackers,
+            exec_speculative_results: exec_mem.speculative_results,
+            exec_expected_exec_certs: exec_mem.expected_exec_certs,
+            // Mempool
+            mempool_pool: mempool_mem.pool,
+            mempool_ready: mempool_mem.ready,
+            mempool_deferred: mempool_mem.deferred,
+            mempool_tombstones: mempool_mem.tombstones,
+            mempool_recently_evicted: mempool_mem.recently_evicted,
+            mempool_locked_nodes: mempool_mem.locked_nodes,
+            // Provisions
+            prov_registered_txs: prov_mem.registered_txs,
+            prov_unverified_remote_headers: prov_mem.unverified_remote_headers,
+            prov_verified_remote_headers: prov_mem.verified_remote_headers,
+            prov_pending_provisions: prov_mem.pending_provisions,
+            prov_verified_batches: prov_mem.verified_batches,
+            prov_expected_provisions: prov_mem.expected_provisions,
+            // Livelock
+            livelock_tombstones: livelock_stats.active_tombstones,
+            livelock_pending_proof_fetches: livelock_stats.pending_proof_fetches,
+            livelock_pending_deferrals: livelock_stats.pending_deferrals,
+            livelock_tracked_txs: livelock_stats.tracked_transactions,
+            // Storage
+            jvt_node_cache_entries: self.storage.node_cache_len(),
+            rocksdb_block_cache_usage_bytes: rocksdb_bc,
+            rocksdb_memtable_usage_bytes: rocksdb_mt,
+        });
     }
 
     /// Capture a snapshot of node state for external status APIs.

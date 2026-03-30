@@ -102,6 +102,20 @@ pub struct SpeculativeResult {
     pub created_at: Duration,
 }
 
+/// Execution memory statistics for monitoring collection sizes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ExecutionMemoryStats {
+    pub cache_entries: usize,
+    pub finalized_certificates: usize,
+    pub pending_provisioning: usize,
+    pub accumulators: usize,
+    pub vote_trackers: usize,
+    pub early_votes: usize,
+    pub certificate_trackers: usize,
+    pub speculative_results: usize,
+    pub expected_exec_certs: usize,
+}
+
 /// Execution state machine.
 ///
 /// Handles transaction execution after blocks are committed.
@@ -2136,6 +2150,21 @@ impl ExecutionState {
     /// Get the number of transactions with speculative execution in flight.
     pub fn speculative_in_flight_count(&self) -> usize {
         self.speculative_in_flight_txs.len()
+    }
+
+    /// Get execution memory statistics for monitoring collection sizes.
+    pub fn memory_stats(&self) -> ExecutionMemoryStats {
+        ExecutionMemoryStats {
+            cache_entries: self.execution_cache.len(),
+            finalized_certificates: self.finalized_certificates.len(),
+            pending_provisioning: self.pending_provisioning.len(),
+            accumulators: self.accumulators.len(),
+            vote_trackers: self.vote_trackers.len(),
+            early_votes: self.early_votes.len(),
+            certificate_trackers: self.certificate_trackers.len(),
+            speculative_results: self.speculative_results.len(),
+            expected_exec_certs: self.expected_exec_certs.len(),
+        }
     }
 
     /// Get and reset speculative execution metrics.

@@ -48,6 +48,99 @@ pub struct ChannelDepths {
     pub cert_request: usize,
 }
 
+/// Memory usage statistics for monitoring state machine growth.
+///
+/// All values are collection lengths (entry counts), not byte sizes,
+/// unless the field name explicitly says `_bytes`.
+#[derive(Debug, Default, Clone)]
+pub struct MemoryMetrics {
+    // ── BFT ──
+    /// Blocks being assembled from headers + transactions.
+    pub bft_pending_blocks: usize,
+    /// Vote sets per block (unverified + verified votes).
+    pub bft_vote_sets: usize,
+    /// Blocks with QC but not yet committed.
+    pub bft_certified_blocks: usize,
+    /// Out-of-order commits buffered.
+    pub bft_pending_commits: usize,
+    /// Remote shard headers for merkle proof validation.
+    pub bft_remote_headers: usize,
+    /// Block headers pending QC verification.
+    pub bft_pending_qc_verifications: usize,
+    /// Cache of verified QC signatures.
+    pub bft_verified_qcs: usize,
+    /// Blocks waiting for JVT to reach parent state.
+    pub bft_pending_state_root_verifications: usize,
+    /// Out-of-order synced blocks.
+    pub bft_buffered_synced_blocks: usize,
+
+    // ── Execution ──
+    /// In-memory write sets per transaction.
+    pub exec_cache_entries: usize,
+    /// Certificates ready for block inclusion.
+    pub exec_finalized_certificates: usize,
+    /// Transactions waiting for provisioning.
+    pub exec_pending_provisioning: usize,
+    /// Per-tx results collection per wave.
+    pub exec_accumulators: usize,
+    /// Execution votes collection per wave.
+    pub exec_vote_trackers: usize,
+    /// Votes that arrived before tracking started.
+    pub exec_early_votes: usize,
+    /// Cross-shard finalization trackers.
+    pub exec_certificate_trackers: usize,
+    /// Cached speculative execution results.
+    pub exec_speculative_results: usize,
+    /// Expected execution certificates from remote shards.
+    pub exec_expected_exec_certs: usize,
+
+    // ── Mempool ──
+    /// All transactions in the pool.
+    pub mempool_pool: usize,
+    /// Ready transactions (no node conflicts).
+    pub mempool_ready: usize,
+    /// Deferred transactions with their winner.
+    pub mempool_deferred: usize,
+    /// Terminal state transactions (for dedup).
+    pub mempool_tombstones: usize,
+    /// Evicted transactions (for peer fetch).
+    pub mempool_recently_evicted: usize,
+    /// Cached set of locked nodes.
+    pub mempool_locked_nodes: usize,
+
+    // ── Provisions ──
+    /// Cross-shard transactions being tracked.
+    pub prov_registered_txs: usize,
+    /// Unverified headers from remote shards.
+    pub prov_unverified_remote_headers: usize,
+    /// Verified remote shard headers.
+    pub prov_verified_remote_headers: usize,
+    /// Provision batches waiting for corresponding header.
+    pub prov_pending_provisions: usize,
+    /// Verified provision batches.
+    pub prov_verified_batches: usize,
+    /// Expected provisions that haven't arrived yet.
+    pub prov_expected_provisions: usize,
+
+    // ── Livelock ──
+    /// Completed transactions (for late-arrival filtering).
+    pub livelock_tombstones: usize,
+    /// Loser txs awaiting inclusion proof.
+    pub livelock_pending_proof_fetches: usize,
+    /// Deferrals ready for next block proposal.
+    pub livelock_pending_deferrals: usize,
+    /// Cross-shard transactions being tracked for cycle detection.
+    pub livelock_tracked_txs: usize,
+
+    // ── Storage (byte-level where available) ──
+    /// JVT node hydration cache entries.
+    pub jvt_node_cache_entries: usize,
+    /// RocksDB block cache usage in bytes.
+    pub rocksdb_block_cache_usage_bytes: u64,
+    /// RocksDB memtable usage in bytes.
+    pub rocksdb_memtable_usage_bytes: u64,
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Trait
 // ═══════════════════════════════════════════════════════════════════════
@@ -286,6 +379,11 @@ pub trait MetricsRecorder: Send + Sync + 'static {
 
     /// Set lock contention metrics.
     fn set_lock_contention(&self, deferred: u64, ratio: f64) {}
+
+    // ── Memory ────────────────────────────────────────────────────────
+
+    /// Set memory usage metrics for all sub-state machines and storage.
+    fn set_memory_metrics(&self, metrics: &MemoryMetrics) {}
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -745,4 +843,12 @@ pub fn set_livelock_deferred_count(count: usize) {
 #[inline]
 pub fn set_lock_contention(deferred: u64, ratio: f64) {
     recorder().set_lock_contention(deferred, ratio);
+}
+
+// ── Memory ────────────────────────────────────────────────────────
+
+/// Set memory usage metrics for all sub-state machines and storage.
+#[inline]
+pub fn set_memory_metrics(metrics: &MemoryMetrics) {
+    recorder().set_memory_metrics(metrics);
 }

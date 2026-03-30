@@ -116,6 +116,17 @@ impl LockContentionStats {
     }
 }
 
+/// Mempool memory statistics for monitoring collection sizes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MempoolMemoryStats {
+    pub pool: usize,
+    pub ready: usize,
+    pub deferred: usize,
+    pub tombstones: usize,
+    pub recently_evicted: usize,
+    pub locked_nodes: usize,
+}
+
 /// Entry in the transaction pool.
 #[derive(Debug)]
 struct PoolEntry {
@@ -1780,6 +1791,18 @@ impl MempoolState {
             .iter()
             .map(|(hash, entry)| (*hash, Arc::clone(&entry.tx)))
             .collect()
+    }
+
+    /// Get mempool memory statistics for monitoring collection sizes.
+    pub fn memory_stats(&self) -> MempoolMemoryStats {
+        MempoolMemoryStats {
+            pool: self.pool.len(),
+            ready: self.ready.len(),
+            deferred: self.deferred_by.len(),
+            tombstones: self.tombstones.len(),
+            recently_evicted: self.recently_evicted.len(),
+            locked_nodes: self.locked_nodes_cache.len(),
+        }
     }
 
     /// Get the number of transactions in the pool.

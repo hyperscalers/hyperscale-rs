@@ -15,4 +15,6 @@
 
 mod state;
 
-pub use state::{LockContentionStats, MempoolConfig, MempoolState, DEFAULT_MIN_DWELL_TIME};
+pub use state::{
+    LockContentionStats, MempoolConfig, MempoolMemoryStats, MempoolState, DEFAULT_MIN_DWELL_TIME,
+};

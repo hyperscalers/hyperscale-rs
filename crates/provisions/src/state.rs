@@ -31,6 +31,17 @@ const REMOTE_HEADER_RETENTION_BLOCKS: u64 = 50;
 /// This gives the source shard proposer time to send provisions normally.
 const PROVISION_FALLBACK_TIMEOUT_BLOCKS: u64 = 10;
 
+/// Provision coordinator memory statistics for monitoring collection sizes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProvisionMemoryStats {
+    pub registered_txs: usize,
+    pub unverified_remote_headers: usize,
+    pub verified_remote_headers: usize,
+    pub pending_provisions: usize,
+    pub verified_batches: usize,
+    pub expected_provisions: usize,
+}
+
 /// Tracks an expected provision that hasn't arrived yet.
 ///
 /// Created when a remote block header's `waves` field targets our shard.
@@ -167,6 +178,18 @@ impl ProvisionCoordinator {
             local_committed_height: BlockHeight(0),
             expected_provisions: HashMap::new(),
             now: Duration::ZERO,
+        }
+    }
+
+    /// Get provision coordinator memory statistics for monitoring collection sizes.
+    pub fn memory_stats(&self) -> ProvisionMemoryStats {
+        ProvisionMemoryStats {
+            registered_txs: self.registered_txs.len(),
+            unverified_remote_headers: self.unverified_remote_headers.len(),
+            verified_remote_headers: self.verified_remote_headers.len(),
+            pending_provisions: self.pending_provisions.len(),
+            verified_batches: self.verified_batches.len(),
+            expected_provisions: self.expected_provisions.len(),
         }
     }
 

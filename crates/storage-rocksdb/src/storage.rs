@@ -2587,6 +2587,52 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for RocksDbStorage<D
 
         new_root
     }
+
+    fn memory_usage_bytes(&self) -> (u64, u64) {
+        let mut block_cache_usage = 0u64;
+        let mut memtable_usage = 0u64;
+
+        const CF_NAMES: &[&str] = &[
+            "default",
+            "blocks",
+            "transactions",
+            STATE_CF,
+            "certificates",
+            "votes",
+            JVT_NODES_CF,
+            ASSOCIATED_STATE_TREE_VALUES_CF,
+            STALE_STATE_HASH_TREE_PARTS_CF,
+            VERSIONED_SUBSTATES_CF,
+            "ledger_receipts",
+            "local_executions",
+        ];
+
+        for cf_name in CF_NAMES {
+            if let Some(cf) = self.db.cf_handle(cf_name) {
+                // Block cache is shared — reading from any CF gives the total.
+                // We read it once from the first CF we find.
+                if block_cache_usage == 0 {
+                    if let Ok(Some(val)) = self
+                        .db
+                        .property_int_value_cf(&cf, "rocksdb.block-cache-usage")
+                    {
+                        block_cache_usage = val;
+                    }
+                }
+                if let Ok(Some(val)) = self
+                    .db
+                    .property_int_value_cf(&cf, "rocksdb.cur-size-all-mem-tables")
+                {
+                    memtable_usage += val;
+                }
+            }
+        }
+        (block_cache_usage, memtable_usage)
+    }
+
+    fn node_cache_len(&self) -> usize {
+        self.node_cache.len()
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2832,6 +2878,14 @@ impl<D: Dispatch + 'static> hyperscale_storage::CommitStore for SharedStorage<D>
     ) -> hyperscale_types::Hash {
         self.0
             .commit_block(merged_updates, certificates, block_height, consensus)
+    }
+
+    fn memory_usage_bytes(&self) -> (u64, u64) {
+        self.0.memory_usage_bytes()
+    }
+
+    fn node_cache_len(&self) -> usize {
+        self.0.node_cache_len()
     }
 }
 

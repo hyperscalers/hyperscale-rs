@@ -35,4 +35,4 @@
 mod state;
 mod tracker;
 
-pub use state::{LivelockOutput, LivelockState};
+pub use state::{LivelockOutput, LivelockState, LivelockStats};
