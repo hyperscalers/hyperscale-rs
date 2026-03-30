@@ -1,6 +1,7 @@
 //! Sync, fetch, and provision fetch protocol output processing.
 
 use super::{IoLoop, TimerOp};
+use crate::protocol::execution_cert_fetch::ExecCertFetchOutput;
 use crate::protocol::fetch::FetchOutput;
 use crate::protocol::inclusion_proof_fetch::InclusionProofFetchOutput;
 use crate::protocol::provision_fetch::ProvisionFetchOutput;
@@ -314,6 +315,63 @@ where
         }
     }
 
+    /// Process ExecCertFetchProtocol outputs.
+    ///
+    /// `Fetch` sends a single-peer network request for execution certificates.
+    /// `Deliver` feeds certificates into the state machine via `ExecutionCertificateReceived`.
+    pub(super) fn process_exec_cert_fetch_outputs(&mut self, outputs: Vec<ExecCertFetchOutput>) {
+        for output in outputs {
+            match output {
+                ExecCertFetchOutput::Fetch {
+                    source_shard,
+                    block_height,
+                    wave_ids,
+                    peer,
+                } => {
+                    use hyperscale_messages::request::GetExecutionCertsRequest;
+                    let request = GetExecutionCertsRequest {
+                        block_height,
+                        wave_ids,
+                    };
+                    let sender = self.event_sender.clone();
+                    self.network.request(
+                        &[peer],
+                        None,
+                        request,
+                        Box::new(move |result| match result {
+                            Ok(response) => match response.certificates {
+                                Some(certs) if !certs.is_empty() => {
+                                    let _ = sender.send(NodeInput::ExecCertFetchReceived {
+                                        source_shard,
+                                        block_height,
+                                        certificates: certs,
+                                    });
+                                }
+                                _ => {
+                                    let _ = sender.send(NodeInput::ExecCertFetchFailed {
+                                        source_shard,
+                                        block_height,
+                                    });
+                                }
+                            },
+                            Err(_) => {
+                                let _ = sender.send(NodeInput::ExecCertFetchFailed {
+                                    source_shard,
+                                    block_height,
+                                });
+                            }
+                        }),
+                    );
+                }
+                ExecCertFetchOutput::Deliver { certificates } => {
+                    for cert in certificates {
+                        self.feed_event(ProtocolEvent::ExecutionCertificateReceived { cert });
+                    }
+                }
+            }
+        }
+    }
+
     /// Set or cancel the periodic fetch tick timer based on protocol state.
     ///
     /// When the fetch protocol has pending work, a recurring timer fires
@@ -324,7 +382,8 @@ where
         let has_fetch_work = status.pending_tx_blocks > 0;
         let has_provision_work = self.provision_fetch_protocol.has_pending();
         let has_inclusion_proof_work = self.inclusion_proof_fetch_protocol.has_pending();
-        if has_fetch_work || has_provision_work || has_inclusion_proof_work {
+        let has_exec_cert_work = self.exec_cert_fetch_protocol.has_pending();
+        if has_fetch_work || has_provision_work || has_inclusion_proof_work || has_exec_cert_work {
             self.pending_timer_ops.push(TimerOp::Set {
                 id: TimerId::FetchTick,
                 duration: Self::FETCH_TICK_INTERVAL,

@@ -2,6 +2,7 @@
 
 use super::{IoLoop, TimerOp};
 use crate::action_handler::{self, ActionContext, DispatchPool};
+use crate::protocol::execution_cert_fetch::ExecCertFetchInput;
 use crate::protocol::fetch::FetchInput;
 use crate::protocol::provision_fetch::ProvisionFetchInput;
 use crate::protocol::sync::SyncInput;
@@ -722,27 +723,20 @@ where
                     peer_count = peers.len(),
                     "Requesting missing execution certs from source shard"
                 );
-                let request = hyperscale_messages::request::GetExecutionCertsRequest {
-                    block_height,
-                    wave_ids,
-                };
-                let event_sender = self.event_sender.clone();
-                self.network.request(
-                    &peers,
-                    None, // no preferred peer
-                    request,
-                    Box::new(move |result| {
-                        if let Ok(response) = result {
-                            if let Some(certs) = response.certificates {
-                                for cert in certs {
-                                    let _ = event_sender.send(NodeInput::Protocol(
-                                        ProtocolEvent::ExecutionCertificateReceived { cert },
-                                    ));
-                                }
-                            }
-                        }
-                    }),
-                );
+                let outputs = self
+                    .exec_cert_fetch_protocol
+                    .handle(ExecCertFetchInput::Request {
+                        source_shard,
+                        block_height,
+                        wave_ids,
+                        peers,
+                    });
+                self.process_exec_cert_fetch_outputs(outputs);
+                let tick_outputs = self
+                    .exec_cert_fetch_protocol
+                    .handle(ExecCertFetchInput::Tick);
+                self.process_exec_cert_fetch_outputs(tick_outputs);
+                self.update_fetch_tick_timer();
             }
             _ => unreachable!(),
         }

@@ -2,9 +2,9 @@
 
 use crate::ProtocolEvent;
 use hyperscale_types::{
-    Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader, Hash,
-    LedgerReceiptEntry, ProvisionBatch, QuorumCertificate, RoutableTransaction, ShardGroupId,
-    TransactionInclusionProof, ValidatorId,
+    Block, BlockHeight, Bls12381G1PublicKey, Bls12381G2Signature, CommittedBlockHeader,
+    ExecutionCertificate, Hash, LedgerReceiptEntry, ProvisionBatch, QuorumCertificate,
+    RoutableTransaction, ShardGroupId, TransactionInclusionProof, ValidatorId,
 };
 use std::sync::Arc;
 
@@ -132,6 +132,19 @@ pub enum NodeInput {
 
     /// Transaction inclusion proof fetch failed (network error or peer returned None).
     InclusionProofFetchFailed { winner_tx_hash: Hash },
+
+    /// Execution certificates successfully fetched from a source shard.
+    ExecCertFetchReceived {
+        source_shard: ShardGroupId,
+        block_height: u64,
+        certificates: Vec<ExecutionCertificate>,
+    },
+
+    /// An execution certificate fetch request failed.
+    ExecCertFetchFailed {
+        source_shard: ShardGroupId,
+        block_height: u64,
+    },
 }
 
 impl NodeInput {
@@ -177,6 +190,8 @@ impl NodeInput {
             NodeInput::ProvisionFetchFailed { .. } => EventPriority::Internal,
             NodeInput::InclusionProofFetchReceived { .. } => EventPriority::Internal,
             NodeInput::InclusionProofFetchFailed { .. } => EventPriority::Internal,
+            NodeInput::ExecCertFetchReceived { .. } => EventPriority::Internal,
+            NodeInput::ExecCertFetchFailed { .. } => EventPriority::Internal,
         }
     }
 
@@ -214,6 +229,8 @@ impl NodeInput {
             NodeInput::ProvisionFetchFailed { .. } => "ProvisionFetchFailed",
             NodeInput::InclusionProofFetchReceived { .. } => "InclusionProofFetchReceived",
             NodeInput::InclusionProofFetchFailed { .. } => "InclusionProofFetchFailed",
+            NodeInput::ExecCertFetchReceived { .. } => "ExecCertFetchReceived",
+            NodeInput::ExecCertFetchFailed { .. } => "ExecCertFetchFailed",
         }
     }
 }
