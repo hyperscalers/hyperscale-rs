@@ -45,10 +45,10 @@ use crate::accumulator::ExecutionAccumulator;
 use crate::execution_cache::ExecutionCache;
 use crate::trackers::{CertificateTracker, VoteTracker};
 
-/// Number of blocks to retain executed transaction hashes for deduplication.
-/// This prevents re-execution of recently committed transactions while allowing
-/// cleanup of old entries to prevent unbounded memory growth.
-const EXECUTED_TX_RETENTION_BLOCKS: u64 = 50;
+/// Number of blocks to retain wave state (accumulators, vote trackers) and
+/// speculative execution results before cleanup. Blocks older than this are
+/// assumed to have fully finalized or been abandoned.
+const WAVE_RETENTION_BLOCKS: u64 = 50;
 
 /// Number of blocks to retain early arrival votes/certificates before cleanup.
 /// If an early arrival hasn't been processed within this many blocks, it's
@@ -112,10 +112,6 @@ pub struct ExecutionState {
     /// In-memory cache of execution write sets (DatabaseUpdates), keyed by tx hash.
     /// Populated when execution completes, read during block commit, evicted after commit.
     execution_cache: ExecutionCache,
-
-    /// Transactions that have been executed (deduplication).
-    /// Maps tx_hash -> block_height when executed, enabling height-based cleanup.
-    executed_txs: HashMap<Hash, u64>,
 
     /// Finalized transaction certificates ready for block inclusion.
     /// Uses BTreeMap for deterministic iteration order.
@@ -288,7 +284,6 @@ impl ExecutionState {
         Self {
             now: Duration::ZERO,
             execution_cache: ExecutionCache::new(),
-            executed_txs: HashMap::new(),
             finalized_certificates: BTreeMap::new(),
             committed_height: 0,
             pending_provisioning: HashMap::new(),
@@ -973,11 +968,9 @@ impl ExecutionState {
 
         // ── Provision broadcasting (proposer only) ─────────────────────
         //
-        // This runs on the FULL transaction list, before dedup filtering.
         // Provisioning is a block-level proposer duty: the proposer must
         // broadcast state entries for all cross-shard transactions in the
-        // committed block, regardless of local execution state. The dedup
-        // filter below controls re-execution, not provisioning.
+        // committed block, regardless of local execution state.
         let local_shard = topology.local_shard();
         let is_proposer = topology.local_validator_id() == proposer;
 
@@ -1049,39 +1042,25 @@ impl ExecutionState {
         // Must run every block, not just when there are new transactions.
         actions.extend(self.check_exec_cert_timeouts(topology));
 
-        // ── Execution (dedup-filtered) ─────────────────────────────────
-        //
-        // Filter out already-executed transactions so we don't re-execute
-        // or re-vote for transactions seen in earlier blocks.
-        let new_txs: Vec<_> = transactions
-            .into_iter()
-            .filter(|tx| !self.executed_txs.contains_key(&tx.hash()))
-            .collect();
-
-        if new_txs.is_empty() {
+        if transactions.is_empty() {
             return actions;
         }
 
         tracing::debug!(
             height = height,
-            tx_count = new_txs.len(),
+            tx_count = transactions.len(),
             "Starting execution for new transactions"
         );
 
-        // Mark all as executed (for dedup) with current height for later cleanup
-        for tx in &new_txs {
-            self.executed_txs.insert(tx.hash(), height);
-        }
-
         // Set up wave tracking for this block's transactions.
         // Returns any early execution votes that arrived before tracking was ready.
-        let early_votes = self.setup_execution_tracking(topology, block_hash, height, &new_txs);
+        let early_votes =
+            self.setup_execution_tracking(topology, block_hash, height, &transactions);
         for vote in early_votes {
             actions.extend(self.on_execution_vote(topology, vote));
         }
 
         // Prune old entries to prevent unbounded growth
-        self.prune_executed_txs();
         self.prune_early_arrivals();
         self.prune_execution_state();
         self.prune_finalized_certificates();
@@ -1092,7 +1071,7 @@ impl ExecutionState {
         self.cleanup_stale_speculative(SPECULATIVE_MAX_AGE);
 
         // Separate single-shard and cross-shard transactions
-        let (single_shard, cross_shard): (Vec<_>, Vec<_>) = new_txs
+        let (single_shard, cross_shard): (Vec<_>, Vec<_>) = transactions
             .into_iter()
             .partition(|tx| topology.is_single_shard_transaction(tx));
 
@@ -1146,6 +1125,7 @@ impl ExecutionState {
                 // Speculation in-flight - results will arrive when it completes
                 // This counts as a hit since we're skipping re-execution
                 self.speculative_cache_hit_count += 1;
+                self.speculative_in_flight_txs.remove(&tx_hash);
                 tracing::debug!(
                     tx_hash = ?tx_hash,
                     "SPECULATIVE IN-FLIGHT: Results will arrive soon, skipping execution"
@@ -1191,6 +1171,11 @@ impl ExecutionState {
             }
         }
 
+        // Block is now committed — remove the pending_speculative_executions
+        // entry so that a late-arriving on_speculative_execution_complete knows
+        // to discard results instead of caching zombies.
+        self.pending_speculative_executions.remove(&block_hash);
+
         // Start execution tracking for transactions that need execution
         for tx in &txs_needing_execution {
             actions.extend(self.start_single_shard_execution(topology, tx.clone()));
@@ -1205,7 +1190,7 @@ impl ExecutionState {
             });
         }
 
-        // Handle cross-shard execution tracking (dedup-filtered — don't re-track)
+        // Handle cross-shard execution tracking
         let mut cross_shard_requests = Vec::new();
         for tx in cross_shard {
             actions.extend(self.start_cross_shard_execution(
@@ -1543,19 +1528,6 @@ impl ExecutionState {
         self.early_certificates.remove(tx_hash);
     }
 
-    /// Check if a transaction has been executed.
-    pub fn is_executed(&self, tx_hash: &Hash) -> bool {
-        self.executed_txs.contains_key(tx_hash)
-    }
-
-    /// Prune old executed transaction entries to prevent unbounded growth.
-    fn prune_executed_txs(&mut self) {
-        let cutoff = self
-            .committed_height
-            .saturating_sub(EXECUTED_TX_RETENTION_BLOCKS);
-        self.executed_txs.retain(|_, height| *height > cutoff);
-    }
-
     /// Prune stale early arrival entries to prevent unbounded growth.
     ///
     /// Early arrivals (votes, certificates, and provisioning events that arrive
@@ -1591,15 +1563,12 @@ impl ExecutionState {
     ///
     /// Execution accumulators and vote trackers are keyed by (block_hash, wave_id).
     /// Once a block is old enough that all its txs must have finalized or been
-    /// cleaned up, the wave state can be removed. Uses the same retention window
-    /// as executed_txs.
+    /// cleaned up, the wave state can be removed.
     ///
     /// Also prunes wave_assignments for txs no longer in any active accumulator,
     /// and early_votes for waves that were never set up.
     fn prune_execution_state(&mut self) {
-        let cutoff = self
-            .committed_height
-            .saturating_sub(EXECUTED_TX_RETENTION_BLOCKS);
+        let cutoff = self.committed_height.saturating_sub(WAVE_RETENTION_BLOCKS);
 
         // Prune accumulators by block height
         let before_acc = self.accumulators.len();
@@ -1751,9 +1720,7 @@ impl ExecutionState {
 
     /// Prune stale pending speculative executions whose callbacks never arrived.
     fn prune_pending_speculative(&mut self) {
-        let cutoff = self
-            .committed_height
-            .saturating_sub(EXECUTED_TX_RETENTION_BLOCKS);
+        let cutoff = self.committed_height.saturating_sub(WAVE_RETENTION_BLOCKS);
 
         let before = self.pending_speculative_executions.len();
         self.pending_speculative_executions
@@ -1821,9 +1788,6 @@ impl ExecutionState {
             );
             return;
         }
-
-        // Remove from executed set so retry can be processed
-        self.executed_txs.remove(tx_hash);
 
         // Evict from execution cache — transaction is being retried or abandoned.
         self.execution_cache.remove(tx_hash);
@@ -1921,13 +1885,12 @@ impl ExecutionState {
             return vec![];
         }
 
-        // Filter to single-shard transactions that haven't been executed, cached, or in-flight
+        // Filter to single-shard transactions that aren't already cached or in-flight
         let single_shard_txs: Vec<_> = transactions
             .into_iter()
             .filter(|tx| topology.is_single_shard_transaction(tx))
             .filter(|tx| !self.speculative_results.contains_key(&tx.hash()))
             .filter(|tx| !self.speculative_in_flight_txs.contains(&tx.hash()))
-            .filter(|tx| !self.executed_txs.contains_key(&tx.hash()))
             .collect();
 
         if single_shard_txs.is_empty() {
@@ -1975,12 +1938,21 @@ impl ExecutionState {
             "SPECULATIVE COMPLETE: Votes already sent, updating cache tracking"
         );
 
-        // Get the transactions we were executing to retrieve their declared_reads
-        let transactions = self
-            .pending_speculative_executions
-            .remove(&block_hash)
-            .map(|(txs, _)| txs)
-            .unwrap_or_default();
+        // Get the transactions we were executing to retrieve their declared_reads.
+        // If the entry is gone, the block already committed — just clean up
+        // in-flight tracking and return. This prevents zombie entries from
+        // accumulating in speculative_results and exhausting capacity.
+        let Some((transactions, _)) = self.pending_speculative_executions.remove(&block_hash)
+        else {
+            for tx_hash in tx_hashes {
+                self.speculative_in_flight_txs.remove(&tx_hash);
+            }
+            tracing::debug!(
+                block_hash = ?block_hash,
+                "Speculation completed for already-committed block, discarding results"
+            );
+            return Vec::new();
+        };
 
         // Build a map from tx_hash to transaction for quick lookup
         let tx_map: HashMap<Hash, &Arc<RoutableTransaction>> =
@@ -1990,15 +1962,6 @@ impl ExecutionState {
         for tx_hash in tx_hashes {
             // Remove from in-flight tracking
             self.speculative_in_flight_txs.remove(&tx_hash);
-
-            // Skip if already executed through some other path
-            if self.executed_txs.contains_key(&tx_hash) {
-                tracing::debug!(
-                    tx_hash = ?tx_hash,
-                    "Skipping speculative cache - tx already executed"
-                );
-                continue;
-            }
 
             // Get the read set from the transaction's declared_reads
             let read_set: HashSet<NodeId> = tx_map
@@ -2226,7 +2189,6 @@ impl ExecutionState {
 impl std::fmt::Debug for ExecutionState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutionState")
-            .field("executed_txs", &self.executed_txs.len())
             .field("finalized_certificates", &self.finalized_certificates.len())
             .field("pending_provisioning", &self.pending_provisioning.len())
             .field("certificate_trackers", &self.certificate_trackers.len())
@@ -2295,45 +2257,8 @@ mod tests {
             .iter()
             .any(|a| matches!(a, Action::ExecuteTransactions { .. })));
 
-        // Transaction should be marked as executed
-        assert!(state.is_executed(&tx_hash));
-
         // Certificate tracker should be set up for finalization
         assert!(state.certificate_trackers.contains_key(&tx_hash));
-    }
-
-    #[test]
-    fn test_deduplication() {
-        let mut state = make_test_state();
-        let topology = make_test_topology();
-
-        let tx = test_transaction(1);
-        let block_hash = Hash::from_bytes(b"block1");
-
-        // First commit - should produce status change + execute transaction actions
-        let actions1 = state.on_block_committed(
-            &topology,
-            block_hash,
-            1,
-            1000,
-            ValidatorId(0),
-            vec![Arc::new(tx.clone())],
-        );
-        assert!(!actions1.is_empty()); // Status change + execute
-
-        // Second commit of same transaction
-        let block_hash2 = Hash::from_bytes(b"block2");
-        let actions2 = state.on_block_committed(
-            &topology,
-            block_hash2,
-            2,
-            2000,
-            ValidatorId(0),
-            vec![Arc::new(tx)],
-        );
-
-        // Should be empty (deduplicated)
-        assert!(actions2.is_empty());
     }
 
     #[test]
@@ -2421,16 +2346,24 @@ mod tests {
             .iter()
             .any(|a| matches!(a, Action::ExecuteTransactions { .. })));
 
-        // Still in-flight
-        assert!(state.speculative_in_flight_txs.contains(&tx_hash));
+        // In-flight cleaned up on commit — no lingering entries
+        assert!(!state.speculative_in_flight_txs.contains(&tx_hash));
+
+        // pending_speculative_executions removed on commit
+        assert!(!state
+            .pending_speculative_executions
+            .contains_key(&block_hash));
 
         // Speculation completes later (votes already sent by runner)
+        // Since the block already committed, results are discarded — no zombies
         let tx_hashes = vec![tx_hash];
         let complete_actions = state.on_speculative_execution_complete(block_hash, tx_hashes);
 
         // No actions needed - votes were already sent by the runner
         assert!(complete_actions.is_empty());
         assert!(!state.speculative_in_flight_txs.contains(&tx_hash));
+        // No zombie entries in speculative_results
+        assert!(!state.speculative_results.contains_key(&tx_hash));
     }
 
     #[test]

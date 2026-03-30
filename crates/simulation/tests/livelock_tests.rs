@@ -396,7 +396,7 @@ fn test_retry_completion_after_winner() {
             }
         }
 
-        if !executed && node0.execution().is_executed(&tx_hash) {
+        if !executed && node0.execution().is_finalized(&tx_hash) {
             println!("  ✓ Transaction executed (iteration {})", iteration);
             executed = true;
         }

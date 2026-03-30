@@ -246,7 +246,12 @@ impl NodeStateMachine {
         pending_txs: usize,
         pending_certs: usize,
     ) -> ProposalInputs {
-        let max_txs = self.bft.config().max_transactions_per_block;
+        // Request extra transactions from the mempool to compensate for QC-chain
+        // duplicates that will be filtered by the proposer. This keeps blocks
+        // full despite dedup filtering.
+        let parent_hash = self.bft.proposal_parent_hash();
+        let (_, qc_chain_tx_hashes) = self.bft.collect_qc_chain_hashes(parent_hash);
+        let max_txs = self.bft.config().max_transactions_per_block + qc_chain_tx_hashes.len();
         let ready_txs = self
             .mempool
             .ready_transactions(max_txs, pending_txs, pending_certs);
@@ -343,7 +348,11 @@ impl NodeStateMachine {
         let certificates = self.execution.get_finalized_certificates();
         let new_certs = certificates.len();
 
-        let max_txs = self.bft.config().max_transactions_per_block;
+        // Request extra transactions to compensate for QC-chain duplicates
+        // that the proposer will filter out, keeping blocks full.
+        let parent_hash = self.bft.proposal_parent_hash();
+        let (_, qc_chain_tx_hashes) = self.bft.collect_qc_chain_hashes(parent_hash);
+        let max_txs = self.bft.config().max_transactions_per_block + qc_chain_tx_hashes.len();
         let ready_txs = self.mempool.ready_transactions(
             max_txs,
             pending_txs,               // txs in uncommitted pipeline blocks

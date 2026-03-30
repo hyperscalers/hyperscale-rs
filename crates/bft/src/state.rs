@@ -932,9 +932,6 @@ impl BftState {
             (self.committed_hash, QuorumCertificate::genesis())
         };
 
-        // Use transactions directly from mempool (already hash-sorted)
-        let transactions: Vec<Arc<RoutableTransaction>> = ready_txs.transactions.clone();
-
         let timestamp = self.now.as_millis() as u64;
         let block_height = BlockHeight(next_height);
 
@@ -956,28 +953,35 @@ impl BftState {
             })
             .collect();
 
-        // Walk the QC chain to find certificates already in pending blocks.
-        // We exclude these from our proposal to avoid duplicates.
-        let mut qc_chain_cert_hashes: std::collections::HashSet<Hash> =
-            std::collections::HashSet::new();
+        // Walk the QC chain to find certificates and transactions already in
+        // pending/certified blocks above committed height. Excluding these
+        // prevents the same item appearing in consecutive blocks during the
+        // two-chain commit window (mempool ready-set is only cleared on commit).
+        let (qc_chain_cert_hashes, qc_chain_tx_hashes) = self.collect_qc_chain_hashes(parent_hash);
 
-        let mut current_hash = parent_hash;
-        while let Some(block) = self.get_block_by_hash(current_hash) {
-            let block_height = block.header.height.0;
-
-            // Stop when we reach or go below committed height
-            if block_height <= self.committed_height {
-                break;
+        // Filter transactions and certificates already in the QC chain.
+        let transactions: Vec<Arc<RoutableTransaction>> = if qc_chain_tx_hashes.is_empty() {
+            ready_txs.transactions.clone()
+        } else {
+            let before = ready_txs.transactions.len();
+            let filtered: Vec<_> = ready_txs
+                .transactions
+                .iter()
+                .filter(|tx| !qc_chain_tx_hashes.contains(&tx.hash()))
+                .cloned()
+                .collect();
+            let deduped = before - filtered.len();
+            if deduped > 0 {
+                debug!(
+                    deduped,
+                    before,
+                    after = filtered.len(),
+                    "Filtered transactions already in QC chain"
+                );
             }
+            filtered
+        };
 
-            for cert in &block.certificates {
-                qc_chain_cert_hashes.insert(cert.transaction_hash);
-            }
-
-            current_hash = block.header.parent_hash;
-        }
-
-        // Include certificates (limit by config), excluding those already in QC chain blocks
         let certificates_to_propose: Vec<_> = certificates
             .into_iter()
             .filter(|c| !qc_chain_cert_hashes.contains(&c.transaction_hash))
@@ -1958,6 +1962,17 @@ impl BftState {
                     return vec![];
                 }
 
+                // Reject blocks containing transactions already in QC chain ancestors
+                if let Err(e) = self.validate_no_duplicate_transactions(&block) {
+                    warn!(
+                        validator = ?topology.local_validator_id(),
+                        block_hash = ?block_hash,
+                        error = %e,
+                        "Block has duplicate transactions from QC chain - not voting"
+                    );
+                    return vec![];
+                }
+
                 // Initiate all async verifications in parallel.
                 // StateRoot, TransactionRoot, and ReceiptRoot verifications run concurrently.
                 let mut verification_actions = Vec::new();
@@ -2152,6 +2167,30 @@ impl BftState {
             ));
         }
 
+        Ok(())
+    }
+
+    /// Validate that no transaction in the block also appears in an ancestor
+    /// block above committed height (the QC chain). Intra-block duplicates are
+    /// already prevented by the strict hash-ordering check.
+    ///
+    /// Uses the same unified QC-chain walk as the proposer, including the
+    /// pending-block manifest fallback for unassembled ancestors.
+    fn validate_no_duplicate_transactions(&self, block: &Block) -> Result<(), String> {
+        if block.transactions.is_empty() {
+            return Ok(());
+        }
+
+        let (_, qc_chain_tx_hashes) = self.collect_qc_chain_hashes(block.header.parent_hash);
+
+        for tx in &block.transactions {
+            if qc_chain_tx_hashes.contains(&tx.hash()) {
+                return Err(format!(
+                    "transaction {} already in QC chain ancestor",
+                    tx.hash(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -4461,6 +4500,73 @@ impl BftState {
             .map(|qc| qc.height.0 + 1)
             .unwrap_or(self.committed_height + 1);
         topology.should_propose(next_height, self.view)
+    }
+
+    /// Compute the parent hash for the next proposal.
+    ///
+    /// This is the latest certified block hash, or the committed hash if no QC
+    /// exists yet (genesis case).
+    pub fn proposal_parent_hash(&self) -> Hash {
+        self.latest_qc
+            .as_ref()
+            .map(|qc| qc.block_hash)
+            .unwrap_or(self.committed_hash)
+    }
+
+    /// Walk the QC chain from `parent_hash` back to committed height, collecting
+    /// transaction and certificate hashes from ancestor blocks.
+    ///
+    /// This combines two walks:
+    /// 1. Full blocks via `get_block_by_hash` (certified + assembled pending)
+    /// 2. Fallback via pending block manifests for ancestors not yet assembled
+    ///
+    /// Used by both the proposer (to filter duplicates) and the validator
+    /// (to reject blocks containing already-included items).
+    pub fn collect_qc_chain_hashes(
+        &self,
+        parent_hash: Hash,
+    ) -> (
+        std::collections::HashSet<Hash>,
+        std::collections::HashSet<Hash>,
+    ) {
+        let mut cert_hashes: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+        let mut tx_hashes: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+
+        // Walk full blocks (certified_blocks + assembled pending_blocks + genesis)
+        let mut current_hash = parent_hash;
+        while let Some(block) = self.get_block_by_hash(current_hash) {
+            if block.header.height.0 <= self.committed_height {
+                break;
+            }
+            for cert in &block.certificates {
+                cert_hashes.insert(cert.transaction_hash);
+            }
+            for tx in &block.transactions {
+                tx_hashes.insert(tx.hash());
+            }
+            current_hash = block.header.parent_hash;
+        }
+
+        // Fallback: walk pending blocks whose full block data hasn't been
+        // assembled yet. The manifest tx_hashes are always available from
+        // the header.
+        {
+            let mut current_hash = parent_hash;
+            while let Some(pending) = self.pending_blocks.get(&current_hash) {
+                let h = pending.header().height.0;
+                if h <= self.committed_height {
+                    break;
+                }
+                if pending.block().is_none() {
+                    for tx_hash in &pending.manifest().tx_hashes {
+                        tx_hashes.insert(*tx_hash);
+                    }
+                }
+                current_hash = pending.header().parent_hash;
+            }
+        }
+
+        (cert_hashes, tx_hashes)
     }
 
     /// Get the BFT configuration.
@@ -8613,5 +8719,142 @@ mod tests {
         // Solo validator — no one to send to (own vote processed internally).
         let (state, topology) = make_test_state_with_validators(1);
         assert!(state.vote_recipients(&topology, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn test_validate_no_duplicate_transactions_ok() {
+        let (state, _topology) = make_test_state();
+
+        let tx1 = make_test_tx_with_seed(10);
+        let tx2 = make_test_tx_with_seed(20);
+
+        // Block has unique transactions, no ancestors to conflict with
+        let block = make_test_block_with_transactions(5, vec![tx1, tx2]);
+        assert!(state.validate_no_duplicate_transactions(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_no_duplicate_transactions_rejects_cross_block_dup() {
+        let (mut state, _topology) = make_test_state();
+        state.committed_height = 3;
+
+        let tx1 = make_test_tx_with_seed(10);
+        let tx2 = make_test_tx_with_seed(20);
+        // Ancestor block at height 5 contains tx1
+        let ancestor_block = Block {
+            header: BlockHeader {
+                shard_group_id: ShardGroupId(0),
+                height: BlockHeight(5),
+                parent_hash: Hash::from_bytes(b"grandparent"),
+                parent_qc: QuorumCertificate::genesis(),
+                proposer: ValidatorId(1),
+                timestamp: 100_000,
+                round: 0,
+                is_fallback: false,
+                state_root: Hash::ZERO,
+                transaction_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
+                waves: vec![],
+            },
+            transactions: vec![tx1.clone()],
+            certificates: vec![],
+            deferred: vec![],
+            aborted: vec![],
+        };
+        let ancestor_hash = ancestor_block.hash();
+        state.certified_blocks.insert(ancestor_hash, ancestor_block);
+
+        // New block at height 6, parent = ancestor, contains tx1 (duplicate) + tx2
+        let mut txs = vec![tx1, tx2];
+        sort_txs_by_hash(&mut txs);
+        let block = Block {
+            header: BlockHeader {
+                shard_group_id: ShardGroupId(0),
+                height: BlockHeight(6),
+                parent_hash: ancestor_hash,
+                parent_qc: QuorumCertificate::genesis(),
+                proposer: ValidatorId(2),
+                timestamp: 100_001,
+                round: 0,
+                is_fallback: false,
+                state_root: Hash::ZERO,
+                transaction_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
+                waves: vec![],
+            },
+            transactions: txs,
+            certificates: vec![],
+            deferred: vec![],
+            aborted: vec![],
+        };
+
+        let result = state.validate_no_duplicate_transactions(&block);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already in QC chain ancestor"));
+    }
+
+    #[test]
+    fn test_validate_no_duplicate_transactions_ignores_committed_ancestors() {
+        let (mut state, _topology) = make_test_state();
+        state.committed_height = 5;
+
+        let tx1 = make_test_tx_with_seed(10);
+
+        // Ancestor at height 5 (== committed_height) contains tx1
+        let ancestor_block = Block {
+            header: BlockHeader {
+                shard_group_id: ShardGroupId(0),
+                height: BlockHeight(5),
+                parent_hash: Hash::from_bytes(b"grandparent"),
+                parent_qc: QuorumCertificate::genesis(),
+                proposer: ValidatorId(1),
+                timestamp: 100_000,
+                round: 0,
+                is_fallback: false,
+                state_root: Hash::ZERO,
+                transaction_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
+                waves: vec![],
+            },
+            transactions: vec![tx1.clone()],
+            certificates: vec![],
+            deferred: vec![],
+            aborted: vec![],
+        };
+        let ancestor_hash = ancestor_block.hash();
+        state.certified_blocks.insert(ancestor_hash, ancestor_block);
+
+        // Block at height 6, parent = ancestor. tx1 is in ancestor but ancestor
+        // is at committed height so the walk stops — this should be allowed.
+        let block = Block {
+            header: BlockHeader {
+                shard_group_id: ShardGroupId(0),
+                height: BlockHeight(6),
+                parent_hash: ancestor_hash,
+                parent_qc: QuorumCertificate::genesis(),
+                proposer: ValidatorId(2),
+                timestamp: 100_001,
+                round: 0,
+                is_fallback: false,
+                state_root: Hash::ZERO,
+                transaction_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
+                waves: vec![],
+            },
+            transactions: vec![tx1],
+            certificates: vec![],
+            deferred: vec![],
+            aborted: vec![],
+        };
+
+        // Ancestor is at committed height, so walk stops before checking it
+        assert!(state.validate_no_duplicate_transactions(&block).is_ok());
+    }
+
+    #[test]
+    fn test_validate_no_duplicate_transactions_empty_block() {
+        let (state, _topology) = make_test_state();
+        let block = make_test_block_with_transactions(5, vec![]);
+        assert!(state.validate_no_duplicate_transactions(&block).is_ok());
     }
 }
