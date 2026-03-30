@@ -46,6 +46,12 @@ const BIND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Maximum frame size for bind messages (~200 bytes SBOR-encoded).
 const MAX_BIND_FRAME: usize = 4096;
 
+/// Maximum number of retry attempts for a failed outbound bind.
+const MAX_BIND_RETRIES: u32 = 5;
+
+/// Base delay for exponential backoff on bind retries.
+const BIND_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+
 // ─── Wire format ────────────────────────────────────────────────────────
 
 /// Encode a bind message: `[8-byte LE validator_id][96-byte BLS signature]`.
@@ -183,6 +189,12 @@ pub(crate) fn spawn_validator_bind_service(
     }
 }
 
+/// A retry request: peer ID + which attempt this is (0-based).
+struct BindRetry {
+    peer_id: Libp2pPeerId,
+    attempt: u32,
+}
+
 /// Main service loop: select between inbound streams and outbound triggers.
 async fn run_service(
     incoming: &mut stream::IncomingStreams,
@@ -194,6 +206,9 @@ async fn run_service(
     validator_keys: SharedValidatorKeys,
 ) {
     use futures::StreamExt;
+
+    // Internal channel for scheduling bind retries with backoff.
+    let (retry_tx, mut retry_rx) = mpsc::unbounded_channel::<BindRetry>();
 
     loop {
         tokio::select! {
@@ -225,11 +240,55 @@ async fn run_service(
                 let vp = validator_peers.clone();
                 let keys = validator_keys.clone();
                 let sig = local_sig;
+                let rtx = retry_tx.clone();
 
                 tokio::spawn(async move {
                     let keys_guard = keys.load();
                     if let Err(e) = handle_outbound(peer_id, ctrl, &vp, local_vid, &sig, &keys_guard).await {
-                        warn!(peer = %peer_id, error = %e, "Outbound validator-bind failed");
+                        warn!(peer = %peer_id, error = %e, "Outbound validator-bind failed, scheduling retry");
+                        schedule_retry(rtx, peer_id, 0);
+                    }
+                });
+            }
+
+            // Retry: a previous outbound bind failed — try again with backoff.
+            Some(retry) = retry_rx.recv() => {
+                // Skip if the peer got bound in the meantime (e.g. via inbound).
+                let already_bound = validator_peers
+                    .iter()
+                    .any(|entry| *entry.value() == retry.peer_id);
+                if already_bound {
+                    continue;
+                }
+
+                let peer_id = retry.peer_id;
+                let attempt = retry.attempt;
+                let ctrl = control.clone();
+                let vp = validator_peers.clone();
+                let keys = validator_keys.clone();
+                let sig = local_sig;
+                let rtx = retry_tx.clone();
+
+                tokio::spawn(async move {
+                    let keys_guard = keys.load();
+                    if let Err(e) = handle_outbound(peer_id, ctrl, &vp, local_vid, &sig, &keys_guard).await {
+                        if attempt + 1 < MAX_BIND_RETRIES {
+                            warn!(
+                                peer = %peer_id,
+                                error = %e,
+                                attempt = attempt + 1,
+                                max = MAX_BIND_RETRIES,
+                                "Outbound validator-bind retry failed, will retry again"
+                            );
+                            schedule_retry(rtx, peer_id, attempt + 1);
+                        } else {
+                            warn!(
+                                peer = %peer_id,
+                                error = %e,
+                                attempts = MAX_BIND_RETRIES,
+                                "Outbound validator-bind exhausted all retries"
+                            );
+                        }
                     }
                 });
             }
@@ -237,6 +296,18 @@ async fn run_service(
             else => break,
         }
     }
+}
+
+/// Schedule a bind retry after exponential backoff.
+///
+/// Spawns a background task that sleeps for `BIND_RETRY_BASE_DELAY * 2^attempt`
+/// then sends the peer ID back to the retry channel.
+fn schedule_retry(retry_tx: mpsc::UnboundedSender<BindRetry>, peer_id: Libp2pPeerId, attempt: u32) {
+    let delay = BIND_RETRY_BASE_DELAY * 2u32.saturating_pow(attempt);
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let _ = retry_tx.send(BindRetry { peer_id, attempt });
+    });
 }
 
 /// Handle an inbound bind stream (we are the listener).
