@@ -1821,14 +1821,6 @@ impl MempoolState {
         self.pool.len()
     }
 
-    /// Get the mempool as a hash map for BFT pending block completion.
-    pub fn as_hash_map(&self) -> std::collections::HashMap<Hash, Arc<RoutableTransaction>> {
-        self.pool
-            .iter()
-            .map(|(hash, entry)| (*hash, Arc::clone(&entry.tx)))
-            .collect()
-    }
-
     /// Check if the pool is empty.
     pub fn is_empty(&self) -> bool {
         self.pool.is_empty()

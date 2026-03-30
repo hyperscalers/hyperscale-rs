@@ -799,16 +799,16 @@ impl NodeStateMachine {
         }
 
         let tx_hash = tx.hash();
+        let tx_for_pending = Arc::clone(&tx);
         let mut actions =
             self.mempool
                 .on_transaction_gossip_arc(self.topology.snapshot(), tx, submitted_locally);
 
         // Check if any pending blocks are now complete
-        let mempool_map = self.mempool.as_hash_map();
         actions.extend(self.bft.check_pending_blocks_for_transaction(
             self.topology.snapshot(),
             tx_hash,
-            &mempool_map,
+            &tx_for_pending,
         ));
 
         actions

@@ -4007,7 +4007,7 @@ impl BftState {
         &mut self,
         topology: &TopologySnapshot,
         tx_hash: Hash,
-        mempool: &HashMap<Hash, Arc<RoutableTransaction>>,
+        tx: &Arc<RoutableTransaction>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -4021,9 +4021,7 @@ impl BftState {
 
         for block_hash in block_hashes {
             if let Some(pending) = self.pending_blocks.get_mut(&block_hash) {
-                if let Some(tx) = mempool.get(&tx_hash) {
-                    pending.add_transaction_arc(Arc::clone(tx));
-                }
+                pending.add_transaction_arc(Arc::clone(tx));
 
                 // Check if block is now complete
                 if pending.is_complete() {
