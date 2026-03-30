@@ -24,7 +24,10 @@ pub type NodeIndex = u32;
 // ─── Constants ──────────────────────────────────────────────────────────
 
 /// How many blocks a cross-shard transaction can wait before being aborted.
-const EXECUTION_TIMEOUT_BLOCKS: u64 = 10;
+/// Must be comfortably longer than the exec cert fallback fetch timeout (10 blocks)
+/// plus the fallback retry cycle (~15 blocks) to avoid aborting transactions that
+/// the fallback path would have recovered.
+const EXECUTION_TIMEOUT_BLOCKS: u64 = 50;
 
 /// How many blocks to retain tombstones in the mempool (gossip deduplication).
 const TOMBSTONE_RETENTION_BLOCKS: u64 = 500;
